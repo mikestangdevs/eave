@@ -35,8 +35,28 @@ fn emit_raw(s: &str) {
     out.flush().unwrap();
 }
 
+/// The session id the real CLI would use: `--resume <id>` or
+/// `--session-id <id>` from argv (the caller-chosen id is honored verbatim,
+/// as the real CLI does — verified 2026-08-15, claude-stream-notes.md), with
+/// `FAKE_SESSION_ID` env as an override and a fixed fallback.
+fn argv_session() -> (Option<String>, bool) {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--resume" {
+            return (args.get(i + 1).cloned(), true);
+        }
+        if a == "--session-id" {
+            return (args.get(i + 1).cloned(), false);
+        }
+    }
+    (None, false)
+}
+
 fn session_id() -> String {
-    std::env::var("FAKE_SESSION_ID").unwrap_or_else(|_| "fake-session-1".into())
+    if let Ok(id) = std::env::var("FAKE_SESSION_ID") {
+        return id;
+    }
+    argv_session().0.unwrap_or_else(|| "fake-session-1".into())
 }
 
 fn emit_init() {
@@ -170,6 +190,66 @@ fn main() {
             emit_text("tool cycle done");
             emit_result();
             std::thread::sleep(Duration::from_millis(100));
+        }
+        "term-143" => {
+            // Mimic the real CLI's SIGTERM behavior: catch it and exit with
+            // code 143, not a raw signal status (claude-stream-notes.md
+            // §Kill/exit facts).
+            let handler: extern "C" fn(libc::c_int) = note_term;
+            unsafe {
+                libc::signal(libc::SIGTERM, handler as usize);
+            }
+            emit_init();
+            emit_text("alive and catching TERM");
+            loop {
+                if TERM_SEEN.load(Ordering::SeqCst) {
+                    std::process::exit(143);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        "tool-hang" => {
+            // Open a turn, start a tool, never resolve it — the deterministic
+            // mid-turn shape for kill -9 acceptance tests (a tool is
+            // outstanding for as long as the test needs).
+            emit_init();
+            emit(json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": "toolu_hang", "name": "Bash" },
+                },
+            }));
+            emit(json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "tool_use", "id": "toolu_hang", "name": "Bash", "input": {} }
+                ]},
+                "session_id": session_id(),
+            }));
+            hang_forever();
+        }
+        "flood" => {
+            // Emit text events continuously so the recorder is writing the
+            // journal near-constantly — the substrate for the
+            // kill-during-a-journal-write acceptance test (build directive).
+            emit_init();
+            let blob = "x".repeat(512);
+            let mut i: u64 = 0;
+            loop {
+                emit_text(&format!("flood {i} {blob}"));
+                i += 1;
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        }
+        "resume-probe" => {
+            // Report whether this process was continued via --resume and
+            // with which id — proves the cold-resume wiring end to end.
+            let (_, resumed) = argv_session();
+            emit_init();
+            emit_text(&format!("RESUME_FLAG:{resumed} ID:{}", session_id()));
+            emit_result();
         }
         "env-report" => {
             emit_init();

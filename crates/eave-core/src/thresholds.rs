@@ -29,3 +29,9 @@ pub const KILL_VERIFY_WINDOW: Duration = Duration::from_secs(5);
 /// research: bb.md pain points — the spec's 1 s window is subsumed by
 /// dropping everything after initiation, which is strictly safer).
 pub const STALE_PIPE_DROP: Duration = Duration::from_secs(1);
+
+/// Journal write-behind: appends buffer in memory and reach the OS on this
+/// tick — the same ~120 ms coalesce cadence as the wire (spec 02
+/// §Durability; research: deepseek-harness.md §3). Terminal records are
+/// additionally fsynced at append time.
+pub const JOURNAL_FLUSH_INTERVAL: Duration = Duration::from_millis(120);

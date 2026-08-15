@@ -60,7 +60,19 @@ impl ClaudeStream {
                         None => vec![malformed(line, "init without session_id".into())],
                     }
                 } else {
-                    Vec::new()
+                    // Every non-init system line is surfaced with its raw
+                    // bytes so the journal can persist it verbatim — Stage E
+                    // consumes `status`/`task_*`, and future subtypes must be
+                    // recorded without a parser change (build directive
+                    // 2026-08-15; research: claude-stream-notes.md).
+                    vec![SessionEvent::System {
+                        subtype: v
+                            .get("subtype")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        raw: line.to_string(),
+                    }]
                 }
             }
             Some("stream_event") => self.parse_stream_event(&v["event"]),
@@ -76,6 +88,7 @@ impl ClaudeStream {
             }],
             Some(other) => vec![SessionEvent::Unknown {
                 event_type: other.to_string(),
+                raw: line.to_string(),
             }],
             None => vec![malformed(line, "missing type tag".into())],
         }

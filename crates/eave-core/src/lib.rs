@@ -1,12 +1,16 @@
 //! eave-core: engine-side session lifecycle for driving coding-agent CLIs.
 //!
-//! Stage A of the v0 slice (docs/spec/04-slice.md): spawn, stream-JSON parse,
-//! process-group identity, verified kill. No UI, no journal, no wire protocol.
+//! Stages A+B of the v0 slice (docs/spec/04-slice.md): spawn, stream-JSON
+//! parse, process-group identity, verified kill, append-only journal with
+//! crash-tail repair, cold resume. No UI, no wire protocol.
 
 pub mod claude;
 pub mod events;
+pub mod journal;
 pub mod proc;
 pub mod process;
+pub mod recorder;
 pub mod session;
+pub mod store;
 pub mod stream;
 pub mod thresholds;

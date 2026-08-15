@@ -71,13 +71,15 @@ async fn normal_turn_streams_events_and_exits_cleanly() {
     let (session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
     let events = collect_until_exit(&mut rx).await;
 
+    // The fake honors argv --session-id like the real CLI does (verified
+    // live 2026-08-15): the caller-chosen id round-trips through Init.
     assert!(matches!(
         &events[0],
-        SessionEvent::Init { session_id } if session_id == "fake-session-1"
+        SessionEvent::Init { session_id } if *session_id == cfg.session_id
     ));
     assert_eq!(
         session.provider_session_id().as_deref(),
-        Some("fake-session-1")
+        Some(cfg.session_id.as_str())
     );
     assert!(events
         .iter()

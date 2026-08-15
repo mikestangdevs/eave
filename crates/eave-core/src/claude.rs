@@ -99,8 +99,24 @@ impl ClaudeCodeSession {
 
         let mut child = cmd.spawn().map_err(SessionError::Spawn)?;
         let pid = child.id().expect("freshly spawned child has a pid") as i32;
-        let identity =
-            proc::identity_of(pid).ok_or(SessionError::IdentityUnavailable { pid })?;
+        let identity = match proc::identity_of(pid) {
+            Some(id) => id,
+            // A fast child can exit before we fingerprint it, and a zombie
+            // is not inspectable via proc_pidinfo. That is not an error:
+            // confirm the exit and record a sentinel identity that can
+            // never match (start_time 0 — no live process predates 1970),
+            // so the guard refuses the pid forever. Exit facts still flow
+            // through the supervisor. A child that is alive yet
+            // uninspectable stays a hard error.
+            None => match child.try_wait() {
+                Ok(Some(_)) => ProcIdentity {
+                    pid,
+                    start_tvsec: 0,
+                    start_tvusec: 0,
+                },
+                _ => return Err(SessionError::IdentityUnavailable { pid }),
+            },
+        };
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout piped");

@@ -12,8 +12,9 @@ use std::mem;
 const SZOMB: u32 = 5;
 
 /// The identity recorded at spawn. Signals are only ever sent to a pid
-/// whose live start_time still matches this record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// whose live start_time still matches this record. Serialized into
+/// `meta.json` as the orphan-detection breadcrumb (spec 02 §Layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcIdentity {
     pub pid: i32,
     pub start_tvsec: u64,
