@@ -1,0 +1,3 @@
+[toolchain]
+# Pinned so builds don't silently drift versions mid-project.
+channel = "1.97.1"
