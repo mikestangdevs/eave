@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, list, prelude::*, px, rgb, size, AnyElement, App, Bounds, Context, Entity,
+    actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, Context, Entity,
     FocusHandle, Font, FontStyle, FontWeight, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
     ListOffset, ListState, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
-    TextRun, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowControlArea,
+    WindowOptions,
 };
 use gpui::Animation;
 use gpui::AnimationExt as _;
@@ -36,6 +37,7 @@ use eave_wire::{AttentionSnapshot, Cursor, SubscriptionItem, WaitReason};
 
 use crate::display::{DisplayList, RowId};
 use crate::markdown::{inline_runs, Block, InlineRun};
+use crate::theme;
 
 actions!(eave, [Quit]);
 
@@ -483,6 +485,14 @@ impl TranscriptState {
                 Some(f) => {
                     let cur = self.list.logical_scroll_top();
                     if cur.item_ix != f.item_ix || cur.offset_in_item != f.offset_in_item {
+                        println!(
+                            "REPLAY_JUMP from=({},{:?}) to=({},{:?}) rows={}",
+                            f.item_ix,
+                            f.offset_in_item,
+                            cur.item_ix,
+                            cur.offset_in_item,
+                            self.display.len()
+                        );
                         ra.jumps += 1;
                         ra.frozen = Some(cur);
                     }
@@ -566,6 +576,9 @@ impl VeiledBlock {
             }
             if run.style.italic {
                 font.style = FontStyle::Italic;
+            }
+            if run.style.code {
+                font.family = theme::MONO.into();
             }
             let color = if run.style.code { self.code_color } else { self.color };
             let underline = run.style.link.then(|| UnderlineStyle {
@@ -661,30 +674,29 @@ struct Shell {
     perf: Option<PerfProbe>,
 }
 
-const TEXT: u32 = 0xdddddd;
-const CODE: u32 = 0xa8d2a8;
-const DIM: u32 = 0x777777;
-
 impl Shell {
+    /// Send the composer draft (enter key and send button share this).
+    fn send_current(&mut self, cx: &mut Context<Self>) {
+        let text = self.composer.update(cx, |c, cx| {
+            let t = c.text.trim().to_string();
+            c.text.clear();
+            cx.notify();
+            t
+        });
+        if !text.is_empty() {
+            // Anchor flip on own send (spec 03 §Scroll): pin once the row
+            // lands in the feed.
+            self.transcript.update(cx, |t, _| {
+                t.scroll = ScrollMode::PinOnNextUserRow;
+            });
+            let _ = self.commands.send(Command::Send(text));
+        }
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         match ks.key.as_str() {
-            "enter" => {
-                let text = self.composer.update(cx, |c, cx| {
-                    let t = c.text.trim().to_string();
-                    c.text.clear();
-                    cx.notify();
-                    t
-                });
-                if !text.is_empty() {
-                    // Anchor flip on own send (spec 03 §Scroll): pin once
-                    // the row lands in the feed.
-                    self.transcript.update(cx, |t, _| {
-                        t.scroll = ScrollMode::PinOnNextUserRow;
-                    });
-                    let _ = self.commands.send(Command::Send(text));
-                }
-            }
+            "enter" => self.send_current(cx),
             "backspace" => {
                 self.composer.update(cx, |c, cx| {
                     c.text.pop();
@@ -726,6 +738,12 @@ impl Shell {
         // consequences).
         let up = ev.delta.pixel_delta(window.line_height()).y > px(0.);
         self.transcript.update(cx, |t, cx| {
+            // Nothing to scroll on an empty log: never leave Follow, so the
+            // ↓-bottom affordance can't appear over blank space (the Stage E
+            // cosmetic bug).
+            if t.display.is_empty() {
+                return;
+            }
             if up {
                 if t.scroll != ScrollMode::Free {
                     t.scroll = ScrollMode::Free;
@@ -742,33 +760,140 @@ impl Shell {
         });
     }
 
-    fn banner(&self, cx: &Context<Self>) -> gpui::Div {
-        let (text, color): (String, u32) = match &self.conn.read(cx).status {
-            ConnEvent::Connecting => ("connecting to engine…".into(), 0x8a8a5c),
-            ConnEvent::Connected { engine_pid } => {
-                (format!("engine pid {engine_pid}"), 0x4a6b4a)
-            }
-            ConnEvent::Reconnecting { attempt } => {
-                (format!("reconnecting (attempt {attempt})…"), 0x8a8a5c)
-            }
-            ConnEvent::Busy { holder_pid } => (
-                match holder_pid {
-                    Some(pid) => format!(
-                        "engine busy: another eave instance holds this data dir (pid {pid}) — quit it or use a different --data-dir"
-                    ),
-                    None => "engine busy: another eave instance holds this data dir (holder unknown) — quit it or use a different --data-dir".into(),
-                },
-                0x8a3a3a,
-            ),
-            ConnEvent::Failed { message } => (message.clone(), 0x8a3a3a),
-        };
+    /// Wrap content in the reading column: full-width gutter, centered cap
+    /// (every surface in the shell shares this rhythm).
+    fn column(inner: impl IntoElement) -> gpui::Div {
         div()
             .w_full()
-            .px_2()
-            .py_1()
-            .bg(rgb(color))
-            .text_color(rgb(0xffffff))
-            .child(text)
+            .flex()
+            .justify_center()
+            .px(px(theme::GUTTER))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(theme::CONTENT_MAX_W))
+                    .min_w(px(0.))
+                    .child(inner),
+            )
+    }
+
+    /// Custom titlebar: native drag/double-click via the window-control
+    /// area, traffic lights inset by the platform options.
+    fn titlebar(&self, cx: &Context<Self>) -> gpui::Div {
+        let session = self.transcript.read(cx).session_id.clone();
+        let short = session
+            .as_deref()
+            .map(|s| s.chars().take(8).collect::<String>());
+        div()
+            .w_full()
+            .h(px(theme::TITLEBAR_H))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .window_control_area(WindowControlArea::Drag)
+            .child(div().w(px(theme::TRAFFIC_CLEARANCE)).h_full().flex_none())
+            .child(
+                div()
+                    .text_size(px(theme::TITLE_SIZE))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_secondary())
+                    .child("eave"),
+            )
+            .children(short.map(|s| {
+                div()
+                    .ml_2()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .text_color(theme::text_ghost())
+                    .child(s)
+            }))
+    }
+
+    /// Footer status bar: connection state as a dot + plain fact, session
+    /// on the right. Rare loud states (busy/failed) additionally get a
+    /// panel from [`Self::conn_panel`].
+    fn footer(&self, cx: &Context<Self>) -> gpui::Div {
+        let (dot, label): (Hsla, String) = match &self.conn.read(cx).status {
+            ConnEvent::Connecting => (theme::warning(), "connecting to engine…".into()),
+            ConnEvent::Connected { engine_pid } => {
+                (theme::success(), format!("engine {engine_pid}"))
+            }
+            ConnEvent::Reconnecting { attempt } => {
+                (theme::warning(), format!("reconnecting (attempt {attempt})…"))
+            }
+            ConnEvent::Busy { .. } => (theme::danger(), "engine busy".into()),
+            ConnEvent::Failed { .. } => (theme::danger(), "engine unreachable".into()),
+        };
+        let session = self.transcript.read(cx).session_id.clone();
+        div().w_full().flex_none().pt(px(4.)).pb(px(10.)).child(
+            Self::column(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .size(px(theme::STATE_DOT))
+                                    .rounded_full()
+                                    .bg(dot),
+                            )
+                            .child(label),
+                    )
+                    .children(session.map(|s| {
+                        div().text_color(theme::text_ghost()).child(s)
+                    })),
+            ),
+        )
+    }
+
+    /// Loud connection states get a real panel above the composer with the
+    /// full actionable message; the footer only carries the short fact.
+    fn conn_panel(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let message = match &self.conn.read(cx).status {
+            ConnEvent::Busy { holder_pid } => match holder_pid {
+                Some(pid) => format!(
+                    "another eave instance holds this data dir (pid {pid}) — quit it or use a different --data-dir"
+                ),
+                None => "another eave instance holds this data dir (holder unknown) — quit it or use a different --data-dir".into(),
+            },
+            ConnEvent::Failed { message } => message.clone(),
+            _ => return None,
+        };
+        Some(
+            Self::column(
+                div()
+                    .w_full()
+                    .rounded(px(theme::RADIUS_PANEL))
+                    .border_1()
+                    .border_color(theme::danger_ring())
+                    .bg(theme::danger_wash())
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(theme::text_secondary())
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::danger())
+                            .child("engine unavailable"),
+                    )
+                    .child(message),
+            )
+            .pb(px(8.))
+            .into_any_element(),
+        )
     }
 
     /// The attention notice (spec 01 §States): `quiet` escalates subtle →
@@ -779,8 +904,42 @@ impl Shell {
     fn attention_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let attention = self.sessions.read(cx).attention.clone()?;
         let now = eave_core::journal::now_ms();
-        match attention {
-            AttentionSnapshot::Running => None,
+        let panel = |ring: Hsla, wash: Hsla| {
+            div()
+                .w_full()
+                .rounded(px(theme::RADIUS_PANEL))
+                .border_1()
+                .border_color(ring)
+                .bg(wash)
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_size(px(theme::DETAIL_SIZE))
+                .line_height(px(theme::DETAIL_LINE))
+                .text_color(theme::text_secondary())
+        };
+        let label = |dot: Hsla, text: String, strong: bool| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().size(px(theme::STATE_DOT)).rounded_full().bg(dot))
+                .child(
+                    div()
+                        .font_weight(if strong {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .text_color(dot)
+                        .child(text),
+                )
+        };
+        let inner: gpui::Div = match attention {
+            AttentionSnapshot::Running => return None,
             AttentionSnapshot::Quiet { since_ms, reason } => {
                 let held = now.saturating_sub(since_ms);
                 let what = match &reason {
@@ -794,69 +953,50 @@ impl Shell {
                     ),
                     WaitReason::Idle => "no output mid-turn, nothing in flight".to_string(),
                 };
-                let text = format!("⏳ quiet {} — {what}", fmt_elapsed(held));
-                Some(if held >= PROMINENT_AFTER_MS {
-                    div()
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .bg(rgb(0x5c4a14))
-                        .text_color(rgb(0xffdf8a))
-                        .font_weight(FontWeight::BOLD)
-                        .child(text)
-                        .into_any_element()
-                } else {
-                    div()
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .text_color(rgb(0xc9a86a))
-                        .child(text)
-                        .into_any_element()
-                })
+                let prominent = held >= PROMINENT_AFTER_MS;
+                panel(
+                    theme::warning_ring(),
+                    if prominent {
+                        theme::warning_wash_strong()
+                    } else {
+                        theme::warning_wash()
+                    },
+                )
+                .child(label(
+                    theme::warning(),
+                    format!("quiet for {}", fmt_elapsed(held)),
+                    prominent,
+                ))
+                .child(what)
             }
             AttentionSnapshot::Unresponsive {
                 since_ms,
                 zero_samples,
                 sampled_ms,
-            } => Some(
-                div()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .bg(rgb(0x4a1717))
-                    .text_color(rgb(0xffb3b3))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::BOLD)
-                            .child(format!(
-                                "⚠ unresponsive for {}",
-                                fmt_elapsed(now.saturating_sub(since_ms))
-                            )),
-                    )
-                    .child(div().child(format!(
-                        "evidence: zero CPU across {zero_samples} consecutive samples \
-                         ({} sampled) · no tool running · no API request in flight",
-                        fmt_elapsed(sampled_ms)
-                    )))
-                    .child(self.kill_affordance(cx, "it will never be killed automatically"))
-                    .into_any_element(),
-            ),
-            AttentionSnapshot::Failed { since_ms, cause } => Some(
-                div()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .bg(rgb(0x4a1717))
-                    .text_color(rgb(0xff8a8a))
-                    .child(div().font_weight(FontWeight::BOLD).child(format!(
-                        "✖ failed {} ago — {cause}",
-                        fmt_elapsed(now.saturating_sub(since_ms))
-                    )))
+            } => panel(theme::danger_ring(), theme::danger_wash())
+                .child(label(
+                    theme::danger(),
+                    format!("unresponsive for {}", fmt_elapsed(now.saturating_sub(since_ms))),
+                    true,
+                ))
+                .child(format!(
+                    "evidence: zero CPU across {zero_samples} consecutive samples \
+                     ({} sampled) · no tool running · no API request in flight",
+                    fmt_elapsed(sampled_ms)
+                ))
+                .child(self.kill_affordance(cx, "it will never be killed automatically")),
+            AttentionSnapshot::Failed { since_ms, cause } => {
+                panel(theme::danger_ring(), theme::danger_wash())
+                    .child(label(
+                        theme::danger(),
+                        format!("failed {} ago", fmt_elapsed(now.saturating_sub(since_ms))),
+                        true,
+                    ))
+                    .child(cause)
                     .child(self.kill_affordance(cx, "clean up the process when you're ready"))
-                    .into_any_element(),
-            ),
-        }
+            }
+        };
+        Some(Self::column(inner).pb(px(8.)).into_any_element())
     }
 
     fn kill_affordance(&self, cx: &Context<Self>, note: &str) -> gpui::Div {
@@ -868,11 +1008,15 @@ impl Shell {
             .pt_1()
             .child(
                 div()
-                    .px_2()
-                    .py_0p5()
-                    .bg(rgb(0x772222))
-                    .rounded_md()
-                    .text_color(rgb(0xffffff))
+                    .px(px(10.))
+                    .py(px(3.))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .border_1()
+                    .border_color(theme::danger_ring())
+                    .bg(theme::danger_wash_strong())
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::danger())
                     .id("attn-kill")
                     .on_click(cx.listener(|this, _, _, _| {
                         let _ = this.commands.send(Command::Kill);
@@ -881,12 +1025,16 @@ impl Shell {
             )
             .child(
                 div()
-                    .text_color(rgb(0xaa7777))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .text_color(theme::text_tertiary())
                     .child(SharedString::from(note.to_string())),
             )
     }
 
     /// Build one virtualized row. Called only for visible + overdraw rows.
+    /// Every row wraps its content in the shared reading column; vertical
+    /// rhythm lives on the row (turn gap before a directive, block gap
+    /// after prose) so virtualization owns all spacing.
     fn render_row(state: &TranscriptState, ix: usize) -> AnyElement {
         let Some(row) = state.display.row(ix).copied() else {
             return div().into_any_element();
@@ -895,57 +1043,115 @@ impl Shell {
         let Some(trow) = state.transcript.rows.get(id.msg as usize) else {
             return div().into_any_element();
         };
-        match trow {
+        // NOTE: row height must depend only on the row's identity and
+        // content — never its position (first/last). A position-dependent
+        // pad changes a row's height without a fingerprint change when a
+        // splice appends behind it, leaving a stale cached measure that
+        // moves the scroll anchor (caught by the replay assert). The log's
+        // top/bottom breathing room lives on the list container instead.
+        let first = ix == 0;
+        let inner: AnyElement = match trow {
+            // A user directive: the log's asymmetry made visible. Left-
+            // aligned raised block — an event in the run, not a chat
+            // bubble; the only raised full blocks in the stream are the
+            // operator's instructions.
             Row::User { text, delivery } => {
-                let line = div()
-                    .px_2()
-                    .pt_1()
-                    .text_color(rgb(0x9ecbff))
-                    .child(format!("you: {text}"));
+                let block = div()
+                    .max_w(px(theme::DIRECTIVE_MAX_W))
+                    .min_w(px(0.))
+                    .rounded(px(theme::RADIUS_DIRECTIVE))
+                    .bg(theme::raised())
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_size(px(theme::USER_SIZE))
+                    .line_height(px(theme::USER_LINE))
+                    .text_color(theme::text())
+                    .when(matches!(delivery, Delivery::Pending), |d| d.opacity(0.65))
+                    .child(SharedString::from(text.clone()));
+                let wrap = div()
+                    .when(!first, |d| d.pt(px(theme::TURN_GAP)))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_1()
+                    .child(block);
                 match delivery {
-                    Delivery::Delivered => line,
-                    Delivery::Pending => line.child(
-                        div().text_color(rgb(0x888888)).child("   (sending…)"),
-                    ),
                     // The acceptance-critical distinction: journaled but
                     // never reached the agent (spec 02 §Delivery state).
-                    Delivery::Undelivered => line.child(
-                        div()
-                            .text_color(rgb(0xff6b6b))
-                            .child("   ✗ NOT DELIVERED — the agent never saw this message"),
-                    ),
+                    Delivery::Undelivered => wrap
+                        .child(
+                            div()
+                                .text_size(px(theme::SMALL_SIZE))
+                                .line_height(px(theme::SMALL_LINE))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::danger())
+                                .child("not delivered — the agent never saw this message"),
+                        )
+                        .into_any_element(),
+                    _ => wrap.into_any_element(),
                 }
-                .into_any_element()
             }
-            Row::Tool { id: tid, name, status } => {
-                let (label, color) = match status {
-                    ToolStatus::Running => ("running…", 0xc9a86a),
-                    ToolStatus::Finished => ("done", 0x7aa87a),
-                    ToolStatus::Interrupted => ("interrupted", 0xff6b6b),
+            Row::Tool { id: _, name, status } => {
+                let (label, dot) = match status {
+                    ToolStatus::Running => ("running…", theme::live()),
+                    ToolStatus::Finished => ("done", theme::text_ghost()),
+                    ToolStatus::Interrupted => ("interrupted", theme::danger()),
                 };
                 div()
-                    .px_2()
-                    .text_color(rgb(color))
-                    .child(format!("[tool {name} {tid}: {label}]"))
+                    .pt(px(8.))
+                    .pb(px(2.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(theme::LABEL_SIZE))
+                    .line_height(px(theme::LABEL_LINE))
+                    .child(div().size(px(theme::TOOL_DOT)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(name.clone())),
+                    )
+                    .child(div().text_color(theme::text_tertiary()).child(label))
                     .into_any_element()
             }
             Row::Marker { text } => div()
-                .px_2()
-                .text_color(rgb(DIM))
-                .child(format!("— {text} —"))
+                .py(px(12.))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .px(px(10.))
+                        .py(px(4.))
+                        .rounded_full()
+                        .bg(theme::overlay())
+                        .text_size(px(theme::SMALL_SIZE))
+                        .line_height(px(theme::SMALL_LINE))
+                        .text_color(theme::text_tertiary())
+                        .child(SharedString::from(text.clone())),
+                )
                 .into_any_element(),
             Row::Assistant { text: msg_text, live } => {
                 let Some(block) = state.display.block(id) else {
                     // Placeholder row of an empty live message.
-                    return div()
-                        .px_2()
-                        .text_color(rgb(TEXT))
-                        .child("▌")
-                        .into_any_element();
+                    return Self::column(
+                        div()
+                            .pt(px(theme::MSG_TOP_GAP))
+                            .text_color(theme::live())
+                            .child("▌"),
+                    )
+                    .into_any_element();
                 };
-                Self::render_block(state, id, block, msg_text, *live)
+                let el = Self::render_block(state, id, block, msg_text, *live);
+                div()
+                    .when(id.block == 0, |d| d.pt(px(theme::MSG_TOP_GAP)))
+                    .pb(px(theme::BLOCK_GAP))
+                    .child(el)
+                    .into_any_element()
             }
-        }
+        };
+        Self::column(inner).into_any_element()
     }
 
     fn render_block(
@@ -967,37 +1173,57 @@ impl Shell {
             Block::Fence { lang, code, .. } => {
                 let label = if lang.is_empty() { "code" } else { lang };
                 div()
-                    .mx_2()
                     .my_1()
-                    .px_2()
-                    .py_1()
-                    .bg(rgb(0x242424))
-                    .rounded_md()
+                    .rounded(px(theme::RADIUS_CODE))
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::inset())
+                    .overflow_hidden()
                     .child(
                         div()
-                            .text_color(rgb(0x8a8a8a))
-                            .text_xs()
+                            .h(px(24.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(theme::border())
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::text_ghost())
                             .child(SharedString::from(label.to_string())),
                     )
                     .child(
                         div()
-                            .text_color(rgb(CODE))
+                            .px(px(10.))
+                            .py(px(8.))
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::CODE_SIZE))
+                            .line_height(px(theme::CODE_LINE))
+                            .text_color(theme::code_block_text())
                             .child(SharedString::from(code.trim_end().to_string())),
                     )
                     .into_any_element()
             }
-            Block::Heading { text, .. } => div()
-                .px_2()
-                .pt_1()
-                .text_color(rgb(0xffffff))
-                .font_weight(FontWeight::BOLD)
-                .child(SharedString::from(text.clone()))
-                .into_any_element(),
+            Block::Heading { level, text } => {
+                let (size, line, bold) = theme::heading(*level);
+                div()
+                    .pt_1()
+                    .text_size(size)
+                    .line_height(line)
+                    .text_color(theme::text())
+                    .font_weight(if bold {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::SEMIBOLD
+                    })
+                    .child(SharedString::from(text.clone()))
+                    .into_any_element()
+            }
             Block::Rule => div()
-                .mx_2()
                 .my_1()
                 .h(px(1.))
-                .bg(rgb(0x3a3a3a))
+                .bg(theme::border())
                 .into_any_element(),
             Block::List { text } | Block::Table { text } | Block::Paragraph { text } => {
                 let runs = inline_runs(text);
@@ -1024,8 +1250,8 @@ impl Shell {
                         None => total_chars,
                     },
                     alpha: 1.0,
-                    color: rgb(TEXT).into(),
-                    code_color: rgb(CODE).into(),
+                    color: theme::text(),
+                    code_color: theme::code_text(),
                 };
                 let el: AnyElement = match veil {
                     Some(v) => block_el
@@ -1040,7 +1266,7 @@ impl Shell {
                         .into_any_element(),
                     None => block_el.into_any_element(),
                 };
-                div().px_2().child(el).into_any_element()
+                div().child(el).into_any_element()
             }
         }
     }
@@ -1112,80 +1338,151 @@ impl Render for Shell {
 
         let transcript_entity = self.transcript.clone();
         let state = self.transcript.read(cx);
-        let session_line = match &state.session_id {
-            Some(id) => format!("session {id}"),
-            None => "no session".to_string(),
-        };
         let list_state = state.list.clone();
-        let show_affordance = state.scroll != ScrollMode::Follow;
+        // The ↓-bottom affordance needs something to return to: never on an
+        // empty log (the Stage E cosmetic bug), only when follow is broken.
+        let show_affordance = state.scroll != ScrollMode::Follow && !state.display.is_empty();
         let composer_text = self.composer.read(cx).text.clone();
+        let has_draft = !composer_text.is_empty();
 
         let transcript_el = list(list_state, move |ix, _window, cx| {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix))
         })
         .size_full();
 
-        // Opaque window, plain chrome — locked decision (spec 03 §No-fork
-        // consequences).
+        let composer = Self::column(
+            div()
+                .w_full()
+                .rounded(px(theme::RADIUS_COMPOSER))
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::composer())
+                .p(px(10.))
+                .child(
+                    div()
+                        .min_h(px(24.))
+                        .px(px(4.))
+                        .pt(px(2.))
+                        .text_size(px(theme::BODY_SIZE))
+                        .line_height(px(22.))
+                        .text_color(theme::text())
+                        .child(if has_draft {
+                            div().child(format!("{composer_text}▏")).into_any_element()
+                        } else {
+                            div()
+                                .flex()
+                                .flex_row()
+                                .child(div().text_color(theme::text()).child("▏"))
+                                .child(
+                                    div()
+                                        .text_color(theme::text_ghost())
+                                        .child("Message eave…"),
+                                )
+                                .into_any_element()
+                        }),
+                )
+                .child(
+                    div()
+                        .mt(px(8.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(theme::MICRO_SIZE))
+                                .text_color(theme::text_ghost())
+                                .child("return to send"),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .size(px(theme::SEND_BUTTON))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(if has_draft {
+                                    theme::inverse()
+                                } else {
+                                    theme::overlay_strong()
+                                })
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(if has_draft {
+                                    theme::on_inverse()
+                                } else {
+                                    theme::text_ghost()
+                                })
+                                .id("send")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.send_current(cx);
+                                }))
+                                .child("↑"),
+                        ),
+                ),
+        )
+        .flex_none();
+
+        // Opaque window, custom titlebar — locked decision (spec 03
+        // §No-fork consequences) plus the Stage F visual pass.
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x1b1b1b))
-            .text_color(rgb(TEXT))
-            .font_family("Menlo")
-            .text_sm()
+            .bg(theme::canvas())
+            .text_color(theme::text())
+            .font_family(theme::SANS)
+            .text_size(px(theme::BODY_SIZE))
+            .line_height(px(theme::BODY_LINE))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
-            .child(self.banner(cx))
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_color(rgb(0x666666))
-                    .child(session_line),
-            )
-            .children(self.attention_notice(cx))
+            .child(self.titlebar(cx))
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.))
                     .relative()
+                    .pt(px(theme::LOG_TOP_PAD))
+                    .pb(px(theme::LOG_BOTTOM_PAD))
                     .child(transcript_el)
                     .when(show_affordance, |d| {
                         d.child(
                             div()
                                 .absolute()
-                                .bottom_2()
-                                .right_4()
-                                .px_2()
-                                .py_1()
-                                .bg(rgb(0x333333))
-                                .rounded_md()
-                                .text_color(rgb(0xaaaaaa))
-                                .id("to-bottom")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.transcript.update(cx, |t, cx| {
-                                        t.scroll = ScrollMode::Follow;
-                                        t.assert_scroll();
-                                        t.list.scroll_to_end();
-                                        cx.notify();
-                                    });
-                                }))
-                                .child("↓ bottom"),
+                                .bottom_3()
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .px(px(12.))
+                                        .py(px(5.))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(theme::border_strong())
+                                        .bg(theme::raised())
+                                        .text_size(px(theme::LABEL_SIZE))
+                                        .text_color(theme::text_secondary())
+                                        .id("to-bottom")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.transcript.update(cx, |t, cx| {
+                                                t.scroll = ScrollMode::Follow;
+                                                t.assert_scroll();
+                                                t.list.scroll_to_end();
+                                                cx.notify();
+                                            });
+                                        }))
+                                        .child("↓ bottom"),
+                                ),
                         )
                     }),
             )
-            .child(
-                div()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .bg(rgb(0x252525))
-                    .text_color(rgb(0xffffff))
-                    .child(format!("> {composer_text}▏")),
-            )
+            .children(self.conn_panel(cx))
+            .children(self.attention_notice(cx))
+            .child(composer)
+            .child(self.footer(cx))
     }
 }
 
@@ -1328,10 +1625,16 @@ pub fn run(data_dir: PathBuf) -> ! {
             .detach();
         }
 
-        let bounds = Bounds::centered(None, size(px(760.), px(560.)), cx);
+        let bounds = Bounds::centered(None, size(px(theme::WINDOW_W), px(theme::WINDOW_H)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("eave".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
+                }),
                 ..Default::default()
             },
             |window, cx| {

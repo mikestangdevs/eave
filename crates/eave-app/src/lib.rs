@@ -6,4 +6,5 @@
 pub mod display;
 pub mod fixture;
 pub mod markdown;
+pub mod theme;
 pub mod ui;
