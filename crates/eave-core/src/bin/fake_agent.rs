@@ -243,6 +243,17 @@ fn main() {
                 std::thread::sleep(Duration::from_micros(500));
             }
         }
+        "stdin-closed" => {
+            // Close our stdin so the parent's next pipe write fails with
+            // EPIPE while we are demonstrably alive — the deterministic
+            // shape for the journaled-but-undelivered send test (spec 02
+            // §Delivery state).
+            unsafe {
+                libc::close(0);
+            }
+            emit_init();
+            hang_forever();
+        }
         "resume-probe" => {
             // Report whether this process was continued via --resume and
             // with which id — proves the cold-resume wiring end to end.

@@ -13,7 +13,7 @@ use eave_core::journal::{
 };
 use eave_core::proc;
 use eave_core::process::{self, OrphanOutcome};
-use eave_core::recorder::record_session;
+use eave_core::recorder::{record_session, send_and_journal};
 use eave_core::session::{AgentSession, SpawnConfig};
 use eave_core::store::{EngineLock, Meta, Store, META_FORMAT_VERSION};
 use eave_core::stream::ClaudeStream;
@@ -54,6 +54,16 @@ fn provider(event: SessionEvent) -> JournalEvent {
 
 /// Spawn an engine-stub process against the fake agent.
 fn spawn_stub(root: &Path, session_id: &str, fake_mode: &str, message: Option<&str>) -> Child {
+    spawn_stub_env(root, session_id, fake_mode, message, &[])
+}
+
+fn spawn_stub_env(
+    root: &Path,
+    session_id: &str,
+    fake_mode: &str,
+    message: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engine-stub"));
     cmd.env("STUB_DATA_DIR", root)
         .env("STUB_SESSION_ID", session_id)
@@ -62,7 +72,20 @@ fn spawn_stub(root: &Path, session_id: &str, fake_mode: &str, message: Option<&s
     if let Some(m) = message {
         cmd.env("STUB_MESSAGE", m);
     }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.spawn().expect("spawn engine-stub")
+}
+
+/// Run the lock probe from a separate process; returns (exit code, stdout).
+fn probe_lock(root: &Path) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_engine-stub"))
+        .env("STUB_TRY_LOCK", "1")
+        .env("STUB_DATA_DIR", root)
+        .output()
+        .expect("run lock probe");
+    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Poll a file until its contents satisfy `pred` (the journal flushes every
@@ -96,6 +119,7 @@ fn journal_round_trips_records() {
         }))
         .unwrap(),
         w.append(JournalEvent::UserSent { text: "hi".into() }).unwrap(),
+        w.append(JournalEvent::UserDelivered {}).unwrap(),
         w.append(provider(SessionEvent::TextDelta {
             text: "hel".into(),
         }))
@@ -116,7 +140,9 @@ fn journal_round_trips_records() {
     assert_eq!(loaded.header, header);
     assert_eq!(loaded.records, written);
     assert!(loaded.is_terminal());
+    assert!(loaded.repair.already_terminal, "load must not have appended");
     assert!(!loaded.torn_tail_repaired);
+    assert!(loaded.undelivered_user_sends().is_empty());
 }
 
 #[test]
@@ -231,11 +257,28 @@ fn torn_tail_truncates_to_last_valid_record_at_every_byte() {
             .unwrap_or_else(|e| panic!("cut at byte {cut} must load, got {e}"));
         // A partial final record must never surface; the only complete-parse
         // cut is at original.len()-1 (the record intact minus its newline).
-        let expect = if cut == original.len() - 1 { 5 } else { 4 };
-        assert_eq!(loaded.records.len(), expect, "cut at byte {cut}");
+        // Load also applies crash-tail repair: the streaming turn settles
+        // as interrupted (+TurnInterrupted, +Closed).
+        let surviving = if cut == original.len() - 1 { 5 } else { 4 };
+        assert_eq!(loaded.records.len(), surviving + 2, "cut at byte {cut}");
+        for rec in &loaded.records[..surviving] {
+            assert!(matches!(
+                &rec.event,
+                JournalEvent::Provider { event: SessionEvent::TextDelta { .. } }
+            ));
+        }
+        assert!(matches!(
+            &loaded.records[surviving].event,
+            JournalEvent::TurnInterrupted { .. }
+        ));
+        assert!(matches!(
+            &loaded.records[surviving + 1].event,
+            JournalEvent::Closed { outcome: Outcome::Interrupted }
+        ));
         // Loading repaired the file: a reload is clean and identical.
         let reloaded = journal::load(&case).unwrap();
         assert!(!reloaded.torn_tail_repaired);
+        assert!(reloaded.repair.already_terminal);
         assert_eq!(reloaded.records, loaded.records);
     }
 }
@@ -324,16 +367,14 @@ fn crash_tail_repair_settles_open_turn_as_interrupted() {
     .unwrap();
     w.sync().unwrap();
 
-    let mut loaded = journal::load(&path).unwrap();
-    assert!(!loaded.is_terminal());
-    let repair = journal::repair(&path, &mut loaded).unwrap();
-    assert!(!repair.already_terminal);
-    assert_eq!(repair.tools_interrupted, vec!["toolu_x".to_string()]);
-    assert!(repair.turn_interrupted);
+    // Load is the single door and repairs on the way through.
+    let loaded = journal::load(&path).unwrap();
+    assert!(loaded.is_terminal());
+    assert!(!loaded.repair.already_terminal);
+    assert_eq!(loaded.repair.tools_interrupted, vec!["toolu_x".to_string()]);
+    assert!(loaded.repair.turn_interrupted);
 
-    let reloaded = journal::load(&path).unwrap();
-    assert!(reloaded.is_terminal());
-    let tail: Vec<&JournalEvent> = reloaded.records.iter().map(|r| &r.event).collect();
+    let tail: Vec<&JournalEvent> = loaded.records.iter().map(|r| &r.event).collect();
     assert!(matches!(
         tail[tail.len() - 3],
         JournalEvent::ToolInterrupted { id } if id == "toolu_x"
@@ -344,9 +385,21 @@ fn crash_tail_repair_settles_open_turn_as_interrupted() {
         JournalEvent::Closed { outcome: Outcome::Interrupted }
     ));
 
-    // Repair is idempotent.
-    let mut again = journal::load(&path).unwrap();
-    assert!(journal::repair(&path, &mut again).unwrap().already_terminal);
+    // The send was journaled but never confirmed: undelivered backfill.
+    let sent_seq = loaded
+        .records
+        .iter()
+        .find_map(|r| match &r.event {
+            JournalEvent::UserSent { .. } => Some(r.seq),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(loaded.undelivered_user_sends(), vec![sent_seq]);
+
+    // Repair is idempotent across loads.
+    let again = journal::load(&path).unwrap();
+    assert!(again.repair.already_terminal);
+    assert_eq!(again.records, loaded.records);
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +440,7 @@ async fn exit_143_is_recorded_as_killed_not_crashed() {
     );
 
     let loaded = journal::load(&jpath).unwrap();
+    assert!(loaded.repair.already_terminal);
     assert!(matches!(
         &loaded.records.last().unwrap().event,
         JournalEvent::Closed { outcome: Outcome::Killed { code: Some(143), .. } }
@@ -394,6 +448,81 @@ async fn exit_143_is_recorded_as_killed_not_crashed() {
     let meta = Meta::load(&dir).unwrap();
     assert_eq!(meta.state, "killed");
     assert!(meta.child.is_none());
+}
+
+#[tokio::test]
+async fn journaled_but_undelivered_send_is_distinct_from_sent() {
+    // The agent closes its stdin (alive, but the pipe is dead): the journal
+    // write succeeds, the pipe write fails. On reload the message must be
+    // in the undelivered state, never rendered as sent (spec 02 §Delivery
+    // state).
+    let root = scratch();
+    let store = Store::open(&root).unwrap();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let dir = store.create_session_dir(&sid).unwrap();
+    let jpath = Store::journal_path(&dir);
+    let writer = JournalWriter::create(&jpath, &test_header(&sid)).unwrap();
+
+    let mut cfg = SpawnConfig::new(
+        env!("CARGO_BIN_EXE_fake-agent"),
+        std::env::temp_dir(),
+        sid.clone(),
+    );
+    cfg.extra_env.push(("FAKE_MODE".into(), "stdin-closed".into()));
+    let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    let (extra_tx, extra_rx) = mpsc::channel(8);
+    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid)));
+    wait_for_file(&jpath, |c| c.contains("init")).await;
+
+    let delivered = send_and_journal(&mut session, &extra_tx, "into the void")
+        .await
+        .unwrap();
+    assert!(!delivered, "pipe write to a closed stdin must fail");
+    drop(extra_tx);
+    session.kill().await.expect("kill must be provable");
+    rec.await.unwrap().unwrap();
+
+    let loaded = journal::load(&jpath).unwrap();
+    let sent_seq = loaded
+        .records
+        .iter()
+        .find_map(|r| match &r.event {
+            JournalEvent::UserSent { text } if text == "into the void" => Some(r.seq),
+            _ => None,
+        })
+        .expect("the attempt itself must be journaled");
+    assert_eq!(
+        loaded.undelivered_user_sends(),
+        vec![sent_seq],
+        "unconfirmed send in a terminal journal is undelivered"
+    );
+
+    // Control: the same flow over a live pipe confirms delivery.
+    let sid2 = uuid::Uuid::new_v4().to_string();
+    let dir2 = store.create_session_dir(&sid2).unwrap();
+    let jpath2 = Store::journal_path(&dir2);
+    let writer2 = JournalWriter::create(&jpath2, &test_header(&sid2)).unwrap();
+    let mut cfg2 = SpawnConfig::new(
+        env!("CARGO_BIN_EXE_fake-agent"),
+        std::env::temp_dir(),
+        sid2.clone(),
+    );
+    cfg2.extra_env.push(("FAKE_MODE".into(), "tool-cycle".into()));
+    let (mut session2, events2) = ClaudeCodeSession::spawn(&cfg2).unwrap();
+    let (extra_tx2, extra_rx2) = mpsc::channel(8);
+    let rec2 = tokio::spawn(record_session(
+        events2,
+        extra_rx2,
+        writer2,
+        dir2.clone(),
+        test_meta(&sid2),
+    ));
+    assert!(send_and_journal(&mut session2, &extra_tx2, "hello there")
+        .await
+        .unwrap());
+    drop(extra_tx2);
+    tokio::time::timeout(TEST_TIMEOUT, rec2).await.unwrap().unwrap().unwrap();
+    assert!(journal::load(&jpath2).unwrap().undelivered_user_sends().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -407,8 +536,13 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
     let dir = root.join("sessions").join(&sid);
     let jpath = dir.join("journal.jsonl");
 
-    // Wait until the outstanding tool is on disk — we are provably mid-turn.
-    wait_for_file(&jpath, |c| c.contains("tool_use_started")).await;
+    // Wait until the outstanding tool AND the send records are on disk —
+    // provably mid-turn, with nothing left in the write-behind buffer
+    // (the agent hangs, so no further records will ever arrive).
+    wait_for_file(&jpath, |c| {
+        c.contains("tool_use_started") && c.contains("user_sent") && c.contains("user_delivered")
+    })
+    .await;
     unsafe {
         libc::kill(stub.id() as i32, libc::SIGKILL);
     }
@@ -429,18 +563,19 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
     );
     assert!(!proc::identity_matches(&child));
 
-    // Transcript intact; repair settles the turn as interrupted.
-    let mut loaded = journal::load(&jpath).unwrap();
+    // Transcript intact; the load itself settles the turn as interrupted.
+    let loaded = journal::load(&jpath).unwrap();
     assert_eq!(loaded.header.session_id, sid);
     assert!(loaded.records.iter().any(|r| matches!(
         &r.event,
         JournalEvent::UserSent { text } if text == "please hang in a tool"
     )));
-    assert!(!loaded.is_terminal());
-    let repair = journal::repair(&jpath, &mut loaded).unwrap();
-    assert_eq!(repair.tools_interrupted, vec!["toolu_hang".to_string()]);
-    assert!(repair.turn_interrupted);
-    assert!(journal::load(&jpath).unwrap().is_terminal());
+    assert!(!loaded.repair.already_terminal);
+    assert_eq!(loaded.repair.tools_interrupted, vec!["toolu_hang".to_string()]);
+    assert!(loaded.repair.turn_interrupted);
+    assert!(loaded.is_terminal());
+    // The message reached the agent's stdin before the engine died.
+    assert!(loaded.undelivered_user_sends().is_empty());
 
     // Continuation: next message goes to a fresh process continuing the
     // same provider session via --resume <session_id>.
@@ -495,16 +630,16 @@ async fn kill9_during_journal_writes_loads_to_last_valid_event() {
     }
 
     // Whatever instant the kill landed at, the journal loads to the last
-    // valid event and no partial record surfaces.
-    let mut loaded = journal::load(&jpath).unwrap();
+    // valid event and no partial record surfaces; the load settles it.
+    let loaded = journal::load(&jpath).unwrap();
     assert!(
         !loaded.records.is_empty(),
         "flood ran long enough to journal events"
     );
-    assert!(!loaded.is_terminal());
-    journal::repair(&jpath, &mut loaded).unwrap();
+    assert!(!loaded.repair.already_terminal);
+    assert!(loaded.is_terminal());
     let reloaded = journal::load(&jpath).unwrap();
-    assert!(reloaded.is_terminal());
+    assert!(reloaded.repair.already_terminal);
     assert!(!reloaded.torn_tail_repaired);
 }
 
@@ -517,27 +652,93 @@ fn engine_lock_is_exclusive_per_data_dir() {
     // engine must be refused (spec 02 §Layout). Same-process double-open
     // flock semantics are quirky on macOS and not part of the contract, so
     // the probe runs as a separate process (engine-stub STUB_TRY_LOCK).
-    let try_lock = |root: &Path| {
-        Command::new(env!("CARGO_BIN_EXE_engine-stub"))
-            .env("STUB_TRY_LOCK", "1")
-            .env("STUB_DATA_DIR", root)
-            .status()
-            .expect("run lock probe")
-            .code()
-    };
     let root = scratch();
     let held = EngineLock::acquire(&root).expect("first acquire");
-    assert_eq!(
-        try_lock(&root),
-        Some(42),
-        "a second instance must see Busy while the lock is held"
+    let (code, stdout) = probe_lock(&root);
+    assert_eq!(code, Some(42), "a second instance must see Busy while held");
+    // Busy names the holder — this test process wrote its identity.
+    assert!(
+        stdout.contains(&format!("holder_pid={}", std::process::id())),
+        "loser must learn the holder pid: {stdout}"
     );
     drop(held);
-    assert_eq!(
-        try_lock(&root),
-        Some(0),
-        "the lock must be free once the holder releases it"
+    let (code, _) = probe_lock(&root);
+    assert_eq!(code, Some(0), "the lock must be free once released");
+}
+
+#[tokio::test]
+async fn contended_start_fails_fast_and_leaves_the_winner_undisturbed() {
+    // A real engine process holds the lock mid-turn; a second engine's
+    // start must fail fast, name the holder, and be provably inert
+    // (spec 02 §Layout, contended-start contract).
+    let root = scratch();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut winner = spawn_stub_env(
+        &root,
+        &sid,
+        "tool-hang",
+        Some("hold the fort"),
+        &[("STUB_TAKE_LOCK", "1")],
     );
+    let dir = root.join("sessions").join(&sid);
+    let jpath = dir.join("journal.jsonl");
+    // All records the hanging agent will ever produce, fully flushed —
+    // so any later change to the file would be the loser's doing.
+    wait_for_file(&jpath, |c| {
+        c.contains("tool_use_started") && c.contains("user_sent") && c.contains("user_delivered")
+    })
+    .await;
+
+    let journal_before = std::fs::read(&jpath).unwrap();
+    let meta_before = std::fs::read(dir.join("meta.json")).unwrap();
+
+    let (code, stdout) = probe_lock(&root);
+    assert_eq!(code, Some(42), "loser must fail fast, not block or retry");
+    assert!(
+        stdout.contains(&format!("holder_pid={}", winner.id())),
+        "loser must name the winning engine: {stdout}"
+    );
+
+    // Winner undisturbed: still alive, lock still held, session state
+    // byte-identical.
+    assert_eq!(unsafe { libc::kill(winner.id() as i32, 0) }, 0);
+    assert_eq!(probe_lock(&root).0, Some(42), "lock must still be held");
+    assert_eq!(std::fs::read(&jpath).unwrap(), journal_before);
+    assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), meta_before);
+
+    // Cleanup: kill the winner, reap its orphaned agent.
+    unsafe {
+        libc::kill(winner.id() as i32, libc::SIGKILL);
+    }
+    winner.wait().unwrap();
+    if let Some(child) = Meta::load(&dir).unwrap().child {
+        let outcome = process::reap_orphan(&child).await;
+        assert!(!matches!(outcome, OrphanOutcome::Unproven), "{outcome:?}");
+    }
+}
+
+#[test]
+fn stale_lock_content_from_a_dead_holder_never_blocks() {
+    // flock cannot go stale — the kernel releases it on holder death,
+    // SIGKILL included. What a dead holder leaves behind is only advisory
+    // *content*, which must neither block nor confuse the next winner
+    // (spec 02 §Layout).
+    let root = scratch();
+    std::fs::write(
+        root.join("engine.lock"),
+        r#"{"pid":999999,"start_tvsec":1,"start_tvusec":1}"#,
+    )
+    .unwrap();
+    let held = EngineLock::acquire(&root).expect("dead holder's content must not block");
+    // The winner rewrote the holder record with its own identity.
+    let content = std::fs::read(root.join("engine.lock")).unwrap();
+    let holder: Option<proc::ProcIdentity> = serde_json::from_slice(&content).unwrap();
+    assert_eq!(holder.unwrap().pid, std::process::id() as i32);
+    drop(held);
+
+    // Garbage content is equally harmless.
+    std::fs::write(root.join("engine.lock"), "!!garbage!!").unwrap();
+    EngineLock::acquire(&root).expect("garbage content must not block");
 }
 
 #[test]
@@ -568,6 +769,7 @@ fn concurrent_sessions_in_one_store_do_not_cross_contaminate() {
             !text.contains(other),
             "session {sid} journal contains the other session's message"
         );
+        assert!(loaded.undelivered_user_sends().is_empty(), "delivered send");
         let meta = Meta::load(&dir).unwrap();
         assert_eq!(&meta.session_id, sid);
         assert_eq!(meta.state, "done");

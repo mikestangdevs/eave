@@ -13,8 +13,34 @@ use tokio::time::MissedTickBehavior;
 
 use crate::events::SessionEvent;
 use crate::journal::{classify_exit, JournalEvent, JournalWriter, Outcome};
+use crate::session::AgentSession;
 use crate::store::Meta;
 use crate::thresholds::JOURNAL_FLUSH_INTERVAL;
+
+/// Journal-then-send: append `UserSent` *before* touching the pipe, and
+/// confirm with `UserDelivered` only after the write succeeds. Returns
+/// whether the message was delivered. A pipe failure is not an error —
+/// the send stays journaled as undelivered, which is exactly the state
+/// the UI must distinguish from sent (spec 02 §Delivery state). `Err`
+/// only if the recorder is gone (nothing can be journaled at all).
+pub async fn send_and_journal<S: AgentSession + ?Sized>(
+    session: &mut S,
+    extra: &mpsc::Sender<JournalEvent>,
+    text: &str,
+) -> io::Result<bool> {
+    let gone = |_| io::Error::new(io::ErrorKind::BrokenPipe, "recorder is gone");
+    extra
+        .send(JournalEvent::UserSent { text: text.into() })
+        .await
+        .map_err(gone)?;
+    match session.send_user_message(text).await {
+        Ok(()) => {
+            extra.send(JournalEvent::UserDelivered {}).await.map_err(gone)?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
 
 /// Run until the session's `Exited` event, which is classified into the
 /// journal's terminal `Closed` record (exit 143 = killed, not crashed —

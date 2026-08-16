@@ -13,10 +13,10 @@
 //! (path to the agent binary), `STUB_FAKE_MODE`, `STUB_MESSAGE` (optional).
 
 use eave_core::claude::ClaudeCodeSession;
-use eave_core::journal::{now_ms, Header, JournalEvent, JournalWriter, FORMAT_VERSION};
-use eave_core::recorder::record_session;
+use eave_core::journal::{now_ms, Header, JournalWriter, FORMAT_VERSION};
+use eave_core::recorder::{record_session, send_and_journal};
 use eave_core::session::{AgentSession, SpawnConfig};
-use eave_core::store::{Meta, Store, META_FORMAT_VERSION};
+use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use tokio::sync::mpsc;
 
 fn env_required(key: &str) -> String {
@@ -26,13 +26,22 @@ fn env_required(key: &str) -> String {
 #[tokio::main]
 async fn main() {
     // Lock-probe mode: attempt the engine instance lock and report via exit
-    // code (0 = acquired, 42 = busy). Used by the two-instances acceptance
-    // test, which must probe from a separate process.
+    // code (0 = acquired, 42 = busy, naming the holder on stdout). Used by
+    // the contended-start acceptance tests, which must probe from a
+    // separate process.
     if std::env::var("STUB_TRY_LOCK").is_ok() {
-        use eave_core::store::{EngineLock, LockError};
         match EngineLock::acquire(std::path::Path::new(&env_required("STUB_DATA_DIR"))) {
-            Ok(_held) => std::process::exit(0),
-            Err(LockError::Busy) => std::process::exit(42),
+            Ok(_held) => {
+                println!("LOCK_ACQUIRED");
+                std::process::exit(0);
+            }
+            Err(LockError::Busy { holder }) => {
+                match holder {
+                    Some(h) => println!("LOCK_BUSY holder_pid={}", h.pid),
+                    None => println!("LOCK_BUSY holder_pid=none"),
+                }
+                std::process::exit(42);
+            }
             Err(e) => {
                 eprintln!("engine-stub lock probe: {e}");
                 std::process::exit(1);
@@ -47,6 +56,12 @@ async fn main() {
     let message = std::env::var("STUB_MESSAGE").ok();
 
     let store = Store::open(&data_dir).expect("open store");
+    // A real engine always holds the instance lock; the stub takes it only
+    // on request because some tests run several stubs against one store to
+    // model multiple sessions under a single engine.
+    let _lock = std::env::var("STUB_TAKE_LOCK")
+        .ok()
+        .map(|_| EngineLock::acquire(store.root()).expect("engine lock"));
     let dir = store.create_session_dir(&session_id).expect("session dir");
     let cwd = std::env::temp_dir();
 
@@ -76,13 +91,11 @@ async fn main() {
 
     let (extra_tx, extra_rx) = mpsc::channel(16);
     if let Some(text) = message {
-        extra_tx
-            .send(JournalEvent::UserSent { text: text.clone() })
+        // Journal-then-send; a failed pipe write leaves the message in the
+        // journaled-but-undelivered state (spec 02 §Delivery state).
+        let _delivered = send_and_journal(&mut session, &extra_tx, &text)
             .await
-            .expect("queue UserSent");
-        // The fake agent may exit before reading stdin; the send itself is
-        // already journaled, so a broken pipe here is not fatal.
-        let _ = session.send_user_message(&text).await;
+            .expect("recorder must be alive");
     }
     drop(extra_tx);
 

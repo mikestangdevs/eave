@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::proc::ProcIdentity;
+use crate::proc::{self, ProcIdentity};
 
 pub const META_FORMAT_VERSION: u32 = 1;
 
@@ -74,16 +74,27 @@ impl Store {
     }
 }
 
+/// Contended-start contract (spec 02 §Layout): acquisition is fail-fast
+/// (`LOCK_NB`) — never blocks, never retries. The loser gets `Busy` naming
+/// the holder and must exit inert: no journal, meta, or session writes.
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("another engine instance holds the lock for this data dir")]
-    Busy,
+    /// Another engine instance holds the flock. `holder` is the winner's
+    /// identity as recorded in the lock file (`None` if unreadable — the
+    /// content is advisory; liveness comes from the flock itself). The
+    /// meta breadcrumb was deliberately not used here: it names the
+    /// session *child*, not the engine holding the lock.
+    #[error("another engine instance holds the lock for this data dir{}", match holder { Some(h) => format!(" (pid {})", h.pid), None => " (holder unknown)".to_string() })]
+    Busy { holder: Option<ProcIdentity> },
     #[error("io error acquiring engine lock: {0}")]
     Io(#[from] io::Error),
 }
 
 /// Held for the engine's lifetime; the flock releases on drop/exit —
 /// including SIGKILL, which is what makes it safe as a liveness signal.
+/// A *stale* lock therefore cannot exist: a dead holder's flock is gone
+/// the moment the process is; only its advisory content lingers, which
+/// never blocks and is overwritten by the next winner.
 #[derive(Debug)]
 pub struct EngineLock {
     _file: File,
@@ -91,17 +102,29 @@ pub struct EngineLock {
 
 impl EngineLock {
     pub fn acquire(data_dir: &Path) -> Result<Self, LockError> {
+        let path = data_dir.join("engine.lock");
+        // No O_TRUNC: a losing open must not erase the winner's record.
         let file = OpenOptions::new()
             .create(true)
+            .read(true)
             .write(true)
-            .open(data_dir.join("engine.lock"))?;
+            .open(&path)?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
+            // Winner: record our identity for losers to display.
+            let me = proc::identity_of(std::process::id() as i32);
+            file.set_len(0)?;
+            (&file).write_all(&serde_json::to_vec(&me).unwrap_or_default())?;
+            let _ = file.sync_all();
             Ok(Self { _file: file })
         } else {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                Err(LockError::Busy)
+                let holder = fs::read(&path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Option<ProcIdentity>>(&b).ok())
+                    .flatten();
+                Err(LockError::Busy { holder })
             } else {
                 Err(LockError::Io(err))
             }

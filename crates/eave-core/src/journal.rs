@@ -69,10 +69,17 @@ pub struct Record {
 pub enum JournalEvent {
     /// A parsed provider event, verbatim from the stream parser.
     Provider { event: SessionEvent },
-    /// A user message at the moment the engine sent it — journaled at send
-    /// time so an interrupted turn still shows what was asked, even if the
-    /// CLI died before echoing it back.
+    /// A user message at the moment the engine *attempted* to send it —
+    /// journaled before the pipe write, so an interrupted turn still shows
+    /// what was asked even if the CLI died first. Delivery is a separate
+    /// fact: without a matching `UserDelivered`, this record is
+    /// journaled-but-undelivered (spec 02 §Delivery state).
     UserSent { text: String },
+    /// Confirmation that the pipe write for the most recent unconfirmed
+    /// `UserSent` reached the agent's stdin (order-paired; sends are
+    /// sequential in v0). Absent confirmation in a terminal journal =
+    /// undelivered — the UI must not render the message as sent.
+    UserDelivered {},
     /// Synthetic closer: a tool that was outstanding when the session ended
     /// without a terminal event. Outcome unknown — never invented.
     ToolInterrupted { id: String },
@@ -226,6 +233,9 @@ pub struct LoadedJournal {
     pub records: Vec<Record>,
     /// A partial final line was found and truncated away.
     pub torn_tail_repaired: bool,
+    /// What crash-tail repair did during this load (`already_terminal` when
+    /// the journal needed nothing).
+    pub repair: RepairOutcome,
 }
 
 impl LoadedJournal {
@@ -233,17 +243,41 @@ impl LoadedJournal {
         self.records.last().map(|r| r.seq + 1).unwrap_or(1)
     }
 
-    /// Terminal = the last record is `Closed` (spec 02: crash-tail repair
-    /// runs on any journal for which this is false).
+    /// Terminal = the last record is `Closed`. Always true after `load`,
+    /// which applies crash-tail repair itself.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.records.last(),
-            Some(Record {
-                event: JournalEvent::Closed { .. },
-                ..
-            })
-        )
+        is_terminal(&self.records)
     }
+
+    /// Seqs of `UserSent` records with no `UserDelivered` confirmation.
+    /// `load` always returns a terminal journal, so unconfirmed means
+    /// undelivered — the UI must render these as not-sent (spec 02
+    /// §Delivery state).
+    pub fn undelivered_user_sends(&self) -> Vec<u64> {
+        let mut pending: Vec<u64> = Vec::new();
+        for rec in &self.records {
+            match &rec.event {
+                JournalEvent::UserSent { .. } => pending.push(rec.seq),
+                JournalEvent::UserDelivered {} => {
+                    if !pending.is_empty() {
+                        pending.remove(0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        pending
+    }
+}
+
+fn is_terminal(records: &[Record]) -> bool {
+    matches!(
+        records.last(),
+        Some(Record {
+            event: JournalEvent::Closed { .. },
+            ..
+        })
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,9 +296,13 @@ pub enum LoadError {
     },
 }
 
-/// Load a journal, applying torn-tail repair (truncation) as needed.
-/// Corruption before the tail refuses the whole file — never a silent
-/// partial load (spec 02 §Corruption).
+/// **The single read path** (spec 02 §Resume contract; build directive
+/// 2026-08-16): parse, apply torn-tail repair, apply crash-tail repair,
+/// and return header + events + repair outcome together. There is no
+/// header-only read — Stage C takes the `--resume` cursor from
+/// `LoadedJournal::header`, so one parser owns one set of corruption
+/// semantics. Corruption before the tail refuses the whole file — never a
+/// silent partial load (spec 02 §Corruption).
 pub fn load(path: &Path) -> Result<LoadedJournal, LoadError> {
     let bytes = fs::read(path)?;
 
@@ -356,10 +394,12 @@ pub fn load(path: &Path) -> Result<LoadedJournal, LoadError> {
         f.sync_all()?;
     }
 
+    let repair = crash_tail_repair(path, &mut records)?;
     Ok(LoadedJournal {
         header,
         records,
         torn_tail_repaired,
+        repair,
     })
 }
 
@@ -390,8 +430,10 @@ pub struct RepairOutcome {
 /// closers for in-flight tools, an interrupted turn end if a turn was open,
 /// and a `Closed { Interrupted }` terminal record. Ambiguity settles as
 /// interrupted — never invented completion (spec 02 §Resume contract).
-pub fn repair(path: &Path, loaded: &mut LoadedJournal) -> io::Result<RepairOutcome> {
-    if loaded.is_terminal() {
+/// Private on purpose: `load` is the only door, so no caller can see an
+/// unrepaired journal.
+fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<RepairOutcome> {
+    if is_terminal(records) {
         return Ok(RepairOutcome {
             already_terminal: true,
             tools_interrupted: Vec::new(),
@@ -401,9 +443,10 @@ pub fn repair(path: &Path, loaded: &mut LoadedJournal) -> io::Result<RepairOutco
 
     // Derive in-flight tools and turn-openness purely from the log —
     // log-derived state is the whole point of the format (spec 02 §Choice).
+    // Any assistant activity (deltas, snapshots) means a turn was open.
     let mut in_flight: BTreeSet<String> = BTreeSet::new();
     let mut turn_open = false;
-    for rec in &loaded.records {
+    for rec in records.iter() {
         match &rec.event {
             JournalEvent::Provider { event } => match event {
                 SessionEvent::ToolUseStarted { id, .. } => {
@@ -413,11 +456,13 @@ pub fn repair(path: &Path, loaded: &mut LoadedJournal) -> io::Result<RepairOutco
                 SessionEvent::ToolUseFinished { id } => {
                     in_flight.remove(id);
                 }
-                SessionEvent::UserEcho { .. } => turn_open = true,
+                SessionEvent::UserEcho { .. }
+                | SessionEvent::TextDelta { .. }
+                | SessionEvent::AssistantText { .. } => turn_open = true,
                 SessionEvent::TurnCompleted { .. } => turn_open = false,
                 _ => {}
             },
-            JournalEvent::UserSent { .. } => turn_open = true,
+            JournalEvent::UserSent { .. } | JournalEvent::UserDelivered {} => turn_open = true,
             JournalEvent::ToolInterrupted { id } => {
                 in_flight.remove(id);
             }
@@ -426,22 +471,23 @@ pub fn repair(path: &Path, loaded: &mut LoadedJournal) -> io::Result<RepairOutco
         }
     }
 
-    let mut writer = JournalWriter::append_existing(path, loaded.next_seq())?;
+    let next_seq = records.last().map(|r| r.seq + 1).unwrap_or(1);
+    let mut writer = JournalWriter::append_existing(path, next_seq)?;
     let tools_interrupted: Vec<String> = in_flight.into_iter().collect();
     for id in &tools_interrupted {
         let rec = writer.append(JournalEvent::ToolInterrupted { id: id.clone() })?;
-        loaded.records.push(rec);
+        records.push(rec);
     }
     if turn_open {
         let rec = writer.append(JournalEvent::TurnInterrupted {
             reason: "session ended without a terminal event".into(),
         })?;
-        loaded.records.push(rec);
+        records.push(rec);
     }
     let rec = writer.append(JournalEvent::Closed {
         outcome: Outcome::Interrupted,
     })?;
-    loaded.records.push(rec);
+    records.push(rec);
     writer.sync()?;
 
     Ok(RepairOutcome {
