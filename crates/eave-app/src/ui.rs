@@ -788,6 +788,8 @@ impl Shell {
             .w_full()
             .h(px(theme::TITLEBAR_H))
             .flex_none()
+            .border_b_1()
+            .border_color(theme::border())
             .flex()
             .flex_row()
             .items_center()
@@ -825,7 +827,14 @@ impl Shell {
             ConnEvent::Failed { .. } => (theme::danger(), "engine unreachable".into()),
         };
         let session = self.transcript.read(cx).session_id.clone();
-        div().w_full().flex_none().pt(px(4.)).pb(px(10.)).child(
+        div()
+            .w_full()
+            .flex_none()
+            .border_t_1()
+            .border_color(theme::border())
+            .pt(px(4.))
+            .pb(px(10.))
+            .child(
             Self::column(
                 div()
                     .w_full()
@@ -1469,7 +1478,7 @@ impl Render for Shell {
                                         .rounded_full()
                                         .border_1()
                                         .border_color(theme::border_strong())
-                                        .bg(theme::raised())
+                                        .bg(theme::panel())
                                         .shadow(theme::shadow_panel())
                                         .text_size(px(theme::LABEL_SIZE))
                                         .text_color(theme::text_secondary())

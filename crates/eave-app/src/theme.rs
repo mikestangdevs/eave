@@ -22,9 +22,13 @@ pub fn canvas() -> Hsla {
 pub fn raised() -> Hsla {
     rgb(0x232323).into()
 }
-/// The composer card plate.
+/// L2 chrome plate: floating pills, cards above the log.
+pub fn panel() -> Hsla {
+    rgb(0x282828).into()
+}
+/// The composer card plate — L2 chrome, same rung as [`panel`].
 pub fn composer() -> Hsla {
-    rgb(0x212121).into()
+    panel()
 }
 /// Sunken panels: code blocks.
 pub fn inset() -> Hsla {
@@ -41,23 +45,42 @@ pub fn overlay_strong() -> Hsla {
 }
 
 // ---------------------------------------------------------------------------
-// Elevation — separates layers, never decorates. L0 is the canvas (the
-// log's ground). L1 is raised-in-log: directive blocks, pills, code
-// plates — separated by surface value + hairline alone; shadows inside
-// the scrolling log would decorate, not separate, and cost paint per
-// row. L2 is chrome above the log — composer, attention/connection
-// panels, the jump affordance — hairline (or state ring) + panel
-// shadow. L3 is a modal layer; token reserved, no modal surface exists.
+// Elevation — separates layers, never decorates. On a dark canvas the
+// mechanism is SURFACE LUMINANCE: each layer steps lighter, and its
+// hairline steps up in alpha with it; a shadow is only a minor accent
+// on L2/L3, never the carrier (a dark shadow on a dark ground is
+// invisible). The ladder, below the canvas upward:
+//
+//   inset  #151515  sunken plates (code)          hairline α.07
+//   L0     #1A1A1A  canvas — the log's ground
+//   L1     #232323  raised-in-log (directives,     hairline α.07
+//                   pills); never shadowed — per-
+//                   row shadows decorate + cost
+//   L2     #282828  chrome above the log           hairline α.14 + accent
+//                   (composer, floating pills)     shadow
+//   L3     #2E2E2E  modal layer (reserved)         hairline α.20 + accent
+//
+// `canvas`/`raised`/`composer`/`panel`/`inset` below are the semantic
+// names for these rungs; `border`/`border_strong`/`edge_modal` are the
+// hairline ladder.
+
+/// L3 surface — reserved; no modal exists yet.
+pub fn surface_modal() -> Hsla {
+    rgb(0x2e2e2e).into()
+}
+/// L3 hairline — reserved with it.
+pub fn edge_modal() -> Hsla {
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.20)
+}
 
 fn shadow_ink(alpha: f32) -> Hsla {
     hsla(0.0, 0.0, 0.0, alpha)
 }
-/// L2 panel lift.
+/// L2 accent shadow (minor — luminance carries the layer).
 pub fn shadow_panel() -> Vec<BoxShadow> {
     vec![BoxShadow::new(px(0.0), px(2.0), shadow_ink(0.35)).blur_radius(px(8.0))]
 }
-/// L3 modal lift — reserved so the value already lives here when a
-/// modal surface first appears.
+/// L3 accent shadow — reserved.
 pub fn shadow_modal() -> Vec<BoxShadow> {
     vec![BoxShadow::new(px(0.0), px(8.0), shadow_ink(0.50)).blur_radius(px(24.0))]
 }
