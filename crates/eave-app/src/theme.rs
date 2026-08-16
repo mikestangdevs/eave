@@ -9,7 +9,7 @@
 //! hairlines) — the closest reference that works on our upstream gpui
 //! pin and locked opaque window (spec 03 §No-fork consequences).
 
-use gpui::{hsla, px, rgb, Hsla, Pixels};
+use gpui::{hsla, px, rgb, BoxShadow, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
 // Surfaces (opaque — locked decision, no vibrancy/blur)
@@ -38,6 +38,28 @@ pub fn overlay() -> Hsla {
 }
 pub fn overlay_strong() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.09)
+}
+
+// ---------------------------------------------------------------------------
+// Elevation — separates layers, never decorates. L0 is the canvas (the
+// log's ground). L1 is raised-in-log: directive blocks, pills, code
+// plates — separated by surface value + hairline alone; shadows inside
+// the scrolling log would decorate, not separate, and cost paint per
+// row. L2 is chrome above the log — composer, attention/connection
+// panels, the jump affordance — hairline (or state ring) + panel
+// shadow. L3 is a modal layer; token reserved, no modal surface exists.
+
+fn shadow_ink(alpha: f32) -> Hsla {
+    hsla(0.0, 0.0, 0.0, alpha)
+}
+/// L2 panel lift.
+pub fn shadow_panel() -> Vec<BoxShadow> {
+    vec![BoxShadow::new(px(0.0), px(2.0), shadow_ink(0.35)).blur_radius(px(8.0))]
+}
+/// L3 modal lift — reserved so the value already lives here when a
+/// modal surface first appears.
+pub fn shadow_modal() -> Vec<BoxShadow> {
+    vec![BoxShadow::new(px(0.0), px(8.0), shadow_ink(0.50)).blur_radius(px(24.0))]
 }
 
 // ---------------------------------------------------------------------------
