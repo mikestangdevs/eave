@@ -146,6 +146,9 @@ async fn drain_records(
                 transcript.apply(epoch, &records).expect("no seq gaps");
                 got.extend(records);
             }
+            // Transient overlay — not part of the record stream these
+            // helpers assert on (Stage E has its own suite).
+            SubscriptionItem::Attention { .. } => {}
         }
     }
     got
@@ -321,6 +324,7 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
                 rx_records += records.len();
                 t2.apply(epoch, &records).unwrap();
             }
+            SubscriptionItem::Attention { .. } => {}
         }
     }
     assert!(rx_records > 0);
@@ -560,6 +564,7 @@ async fn deltas_fold_into_120ms_frames() {
             .expect("stream open");
         match item {
             SubscriptionItem::Reset { .. } => t.reset(),
+            SubscriptionItem::Attention { .. } => {}
             SubscriptionItem::Events { epoch, records, .. } => {
                 t.apply(epoch, &records).expect("no seq gaps");
                 let all_deltas = records.iter().all(|r| {

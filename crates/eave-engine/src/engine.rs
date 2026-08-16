@@ -17,13 +17,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{unix::OwnedWriteHalf, UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 
+use eave_core::attention::{probe_failure, AttentionSnapshot, Classifier, ProbeFacts};
 use eave_core::claude::ClaudeCodeSession;
 use eave_core::journal::{self, now_ms, Header, JournalEvent, JournalWriter, Record, FORMAT_VERSION};
-use eave_core::proc::{self, ProcIdentity};
+use eave_core::proc::{self, PidState, ProcIdentity};
 use eave_core::process;
 use eave_core::recorder::{record_session, send_and_journal};
-use eave_core::session::{AgentSession, SpawnConfig};
+use eave_core::session::{AgentSession, SessionWatch, SpawnConfig};
 use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
+use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
     socket_path, Cursor, HelloOk, KillOk, ListOk, OpenOk, Request, RequestEnvelope, ResponseBody,
     ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, PROTO_VERSION,
@@ -92,6 +94,19 @@ struct Shared {
     records: Vec<Record>,
     state: String,
     live: bool,
+    /// The live attention overlay (spec 01), maintained by the monitor
+    /// task; `None` when no process is attached. Transient — never
+    /// journaled.
+    attention: Option<AttentionSnapshot>,
+}
+
+/// What the per-session broadcast fans out: seq'd journal records, plus
+/// transient attention transitions that ride the same channel so a
+/// subscriber sees them in one ordered stream.
+#[derive(Debug, Clone)]
+enum Fanout {
+    Record(Record),
+    Attention(AttentionSnapshot),
 }
 
 struct Live {
@@ -103,7 +118,7 @@ pub struct SessionHandle {
     session_id: String,
     dir: PathBuf,
     shared: StdMutex<Shared>,
-    bcast: broadcast::Sender<Record>,
+    bcast: broadcast::Sender<Fanout>,
     /// Serializes spawn/send/kill — sends stay sequential, which the
     /// order-paired delivery state depends on (spec 02 §Delivery state).
     live: TokioMutex<Option<Live>>,
@@ -116,12 +131,21 @@ fn new_epoch() -> u64 {
 impl SessionHandle {
     fn info(&self) -> SessionInfo {
         let s = self.shared.lock().unwrap();
+        // While live, the attention overlay is the reported state
+        // (spec 01 §States: quiet/unresponsive/failed are what the badge
+        // shows); terminal names still come from the journal's truth.
+        let state = match (&s.attention, s.live) {
+            (Some(a), true) if !matches!(a, AttentionSnapshot::Running) => {
+                a.state_name().to_string()
+            }
+            _ => s.state.clone(),
+        };
         SessionInfo {
             session_id: self.session_id.clone(),
             provider: s.header.provider.clone(),
             cwd: s.header.cwd.clone(),
             created_ts_ms: s.header.created_ts_ms,
-            state: s.state.clone(),
+            state,
             live: s.live,
             epoch: s.epoch,
             last_seq: s.records.last().map(|r| r.seq).unwrap_or(0),
@@ -132,14 +156,22 @@ impl SessionHandle {
     /// receiver registered *under the same lock* so nothing can fall
     /// between replay and follow (no gap, no dup — the receiver may still
     /// see records already in the snapshot; the caller filters by seq).
+    /// The current attention overlay rides along so a fresh subscriber
+    /// renders an in-progress notice without waiting for a transition.
     fn snapshot(
         &self,
         cursor: Option<Cursor>,
-    ) -> (broadcast::Receiver<Record>, Vec<SubscriptionItem>, u64) {
+    ) -> (broadcast::Receiver<Fanout>, Vec<SubscriptionItem>, u64) {
         let s = self.shared.lock().unwrap();
         let rx = self.bcast.subscribe();
         let last_seq = s.records.last().map(|r| r.seq).unwrap_or(0);
-        match cursor {
+        // Always authoritative: `Running` when no overlay stands, so a
+        // resubscribing client sheds any notice it held from before.
+        let attn_item = Some(SubscriptionItem::Attention {
+            session_id: self.session_id.clone(),
+            attention: s.attention.clone().unwrap_or(AttentionSnapshot::Running),
+        });
+        let (mut items, floor) = match cursor {
             Some(c) if c.epoch == s.epoch && c.seq <= last_seq => {
                 let tail: Vec<Record> =
                     s.records.iter().filter(|r| r.seq > c.seq).cloned().collect();
@@ -151,7 +183,7 @@ impl SessionHandle {
                         records: tail,
                     });
                 }
-                (rx, items, last_seq.max(c.seq))
+                (items, last_seq.max(c.seq))
             }
             _ => {
                 let mut items = vec![SubscriptionItem::Reset {
@@ -166,13 +198,22 @@ impl SessionHandle {
                         records: s.records.clone(),
                     });
                 }
-                (rx, items, last_seq)
+                (items, last_seq)
             }
-        }
+        };
+        items.extend(attn_item);
+        (rx, items, floor)
     }
 
     fn epoch(&self) -> u64 {
         self.shared.lock().unwrap().epoch
+    }
+
+    /// Publish an attention transition: overlay for late subscribers +
+    /// broadcast for live ones.
+    fn set_attention(&self, snap: AttentionSnapshot) {
+        self.shared.lock().unwrap().attention = Some(snap.clone());
+        let _ = self.bcast.send(Fanout::Attention(snap));
     }
 }
 
@@ -238,6 +279,7 @@ impl Engine {
                     records: Vec::new(),
                     state: "new".into(),
                     live: false,
+                    attention: None,
                 }),
                 bcast,
                 live: TokioMutex::new(None),
@@ -282,6 +324,7 @@ impl Engine {
                 records: loaded.records,
                 state,
                 live: false,
+                attention: None,
             }),
             bcast,
             live: TokioMutex::new(None),
@@ -377,9 +420,22 @@ impl Engine {
         tokio::spawn(async move {
             while let Some(rec) = tap_rx.recv().await {
                 tap_handle.shared.lock().unwrap().records.push(rec.clone());
-                let _ = tap_handle.bcast.send(rec);
+                let _ = tap_handle.bcast.send(Fanout::Record(rec));
             }
         });
+
+        // Attention monitor (spec 01 §Attention clocks): subscribe to the
+        // fan-out BEFORE the recorder starts so no record is missed, and
+        // publish a fresh Running so any stale notice from a prior segment
+        // provably clears.
+        handle.set_attention(AttentionSnapshot::Running);
+        let monitor_rx = handle.bcast.subscribe();
+        tokio::spawn(monitor_session(
+            Arc::clone(handle),
+            session.watch(),
+            std::process::id() as i32,
+            monitor_rx,
+        ));
 
         let rec_task = tokio::spawn(record_session(
             events,
@@ -404,7 +460,11 @@ impl Engine {
                 let mut s = done_handle.shared.lock().unwrap();
                 s.live = false;
                 s.state = state;
+                // The overlay is per-process; the journal's terminal truth
+                // governs now. Broadcast the clear so a live notice drops.
+                s.attention = None;
             }
+            let _ = done_handle.bcast.send(Fanout::Attention(AttentionSnapshot::Running));
             *done_handle.live.lock().await = None;
         });
 
@@ -600,6 +660,116 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Attention monitor (spec 01 §Attention clocks, §States)
+
+/// One task per live process segment: folds the record fan-out into the
+/// pure [`Classifier`], probes OS facts for provable death, samples CPU as
+/// the `unresponsive` tiebreaker, and publishes every transition. Exits
+/// when the segment closes. Never touches the journal and never kills —
+/// classification only.
+async fn monitor_session(
+    handle: Arc<SessionHandle>,
+    watch: SessionWatch,
+    engine_pid: i32,
+    mut rx: broadcast::Receiver<Fanout>,
+) {
+    let th = AttentionThresholds::from_env();
+    let mut cls = Classifier::new(th, now_ms());
+    let mut tick = tokio::time::interval(Duration::from_millis(th.tick_ms()));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut cpu_tick =
+        tokio::time::interval(Duration::from_millis(th.cpu_sample_interval_ms.max(1)));
+    cpu_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_cpu: Option<u64> = None;
+    // A normal exit races the OS facts (stdout EOF and pid teardown land
+    // moments before the exit waiter fires), so `failed` requires the same
+    // verdict on two consecutive ticks with the exit flag still unset.
+    let mut pending_cause: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            f = rx.recv() => match f {
+                Ok(Fanout::Record(rec)) => {
+                    let closed = matches!(rec.event, JournalEvent::Closed { .. });
+                    if let Some(snap) = cls.on_record(&rec, now_ms()) {
+                        handle.set_attention(snap);
+                    }
+                    if closed {
+                        return; // completion task owns the clear
+                    }
+                }
+                Ok(Fanout::Attention(_)) => {} // our own echo
+                // Lagged is harmless here: classification is heuristics
+                // over a live stream, not a projection — keep going.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            _ = tick.tick() => {
+                // Provable death first — immediate, no timer (spec 01).
+                let facts = probe_facts(&watch, engine_pid, cls.in_turn());
+                match probe_failure(&facts) {
+                    Some(cause) if pending_cause.as_deref() == Some(cause.as_str()) => {
+                        if let Some(snap) = cls.fail(cause, now_ms()) {
+                            handle.set_attention(snap);
+                        }
+                    }
+                    other => pending_cause = other,
+                }
+                if let Some(snap) = cls.on_tick(now_ms()) {
+                    handle.set_attention(snap);
+                }
+            }
+            _ = cpu_tick.tick() => {
+                if cls.wants_cpu_sampling() {
+                    match proc::cpu_time(watch.identity.pid) {
+                        Some(cpu) => {
+                            if let Some(prev) = last_cpu.replace(cpu) {
+                                if let Some(snap) = cls.on_cpu_sample(cpu == prev, now_ms()) {
+                                    handle.set_attention(snap);
+                                }
+                            }
+                            // First reading is the baseline, not a sample.
+                        }
+                        None => last_cpu = None, // pid gone: the probe owns it
+                    }
+                } else {
+                    last_cpu = None;
+                }
+            }
+        }
+    }
+}
+
+/// Assemble one tick's OS facts (spec 01 `failed` inputs) from the pid
+/// probe + the adapter's flags. Once the exit waiter has facts, the normal
+/// `Exited → Closed` path owns everything — report nothing.
+fn probe_facts(watch: &SessionWatch, engine_pid: i32, in_turn: bool) -> ProbeFacts {
+    let exited = watch.exited();
+    let (vanished, zombie, parent_ok) = if exited {
+        (false, false, true)
+    } else {
+        match proc::pid_state(watch.identity.pid) {
+            PidState::Gone => (true, false, true),
+            PidState::Zombie => (false, true, true),
+            PidState::Uninspectable => (false, false, true),
+            PidState::Live(info) => {
+                let identity_ok = info.start_tvsec == watch.identity.start_tvsec
+                    && info.start_tvusec == watch.identity.start_tvusec;
+                (!identity_ok, info.is_zombie, info.ppid == engine_pid)
+            }
+        }
+    };
+    ProbeFacts {
+        exited,
+        vanished,
+        zombie,
+        parent_ok,
+        stdout_eof: watch.stdout_eof(),
+        in_turn,
+    }
+}
+
 async fn run_subscription(
     handle: Arc<SessionHandle>,
     cursor: Option<Cursor>,
@@ -642,7 +812,19 @@ async fn run_subscription(
             return;
         }
         let rec = match rx.recv().await {
-            Ok(rec) => rec,
+            Ok(Fanout::Record(rec)) => rec,
+            // Attention frames are transient state, not sequenced records:
+            // pass through immediately, outside the fold (spec 05).
+            Ok(Fanout::Attention(attention)) => {
+                let item = SubscriptionItem::Attention {
+                    session_id: handle.session_id.clone(),
+                    attention,
+                };
+                if send_item(&w, id, item).await.is_err() {
+                    return;
+                }
+                continue;
+            }
             Err(broadcast::error::RecvError::Lagged(_)) => {
                 lagged = true;
                 continue;
@@ -654,6 +836,7 @@ async fn run_subscription(
         }
         let mut flush = !is_delta(&rec);
         let mut records = vec![rec];
+        let mut attn_after: Vec<AttentionSnapshot> = Vec::new();
         while !flush {
             let since = last_emit.elapsed();
             if since >= COALESCE {
@@ -661,11 +844,17 @@ async fn run_subscription(
             }
             match tokio::time::timeout(COALESCE - since, rx.recv()).await {
                 Err(_window_elapsed) => break,
-                Ok(Ok(more)) => {
+                Ok(Ok(Fanout::Record(more))) => {
                     if more.seq > records.last().unwrap().seq {
                         flush = !is_delta(&more);
                         records.push(more);
                     }
+                }
+                // An attention transition mid-window flushes: the notice
+                // must not sit behind buffered prose.
+                Ok(Ok(Fanout::Attention(attention))) => {
+                    attn_after.push(attention);
+                    flush = true;
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
                     lagged = true;
@@ -686,6 +875,15 @@ async fn run_subscription(
         };
         if send_item(&w, id, item).await.is_err() {
             return;
+        }
+        for attention in attn_after {
+            let item = SubscriptionItem::Attention {
+                session_id: handle.session_id.clone(),
+                attention,
+            };
+            if send_item(&w, id, item).await.is_err() {
+                return;
+            }
         }
     }
 }

@@ -32,9 +32,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{Delivery, Row, ToolStatus, Transcript};
-use eave_wire::{Cursor, SubscriptionItem};
+use eave_wire::{AttentionSnapshot, Cursor, SubscriptionItem, WaitReason};
 
-use crate::display::{DisplayList, RowId, CLOSED_MSG};
+use crate::display::{DisplayList, RowId};
 use crate::markdown::{inline_runs, Block, InlineRun};
 
 actions!(eave, [Quit]);
@@ -63,6 +63,10 @@ enum FeedEvent {
     },
 }
 
+/// One drained attention burst; last frame wins (the overlay is a current-
+/// state broadcast, not a log).
+type AttnEvent = AttentionSnapshot;
+
 #[derive(Debug)]
 enum Command {
     Send(String),
@@ -75,6 +79,7 @@ enum Command {
 struct Queues {
     conn: Mutex<VecDeque<ConnEvent>>,
     feed: Mutex<VecDeque<FeedEvent>>,
+    attn: Mutex<VecDeque<AttnEvent>>,
 }
 
 struct Plumbing {
@@ -89,6 +94,10 @@ impl Plumbing {
     }
     fn push_feed(&self, ev: FeedEvent) {
         self.queues.feed.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
+    fn push_attn(&self, ev: AttnEvent) {
+        self.queues.attn.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
 }
@@ -171,6 +180,9 @@ async fn feed_loop(
                             cursor = Some(Cursor { epoch, seq: last.seq });
                         }
                         plumbing.push_feed(FeedEvent::Records { epoch, records });
+                    }
+                    Some(SubscriptionItem::Attention { attention, .. }) => {
+                        plumbing.push_attn(attention);
                     }
                     None => break, // connection gone → outer reconnect loop
                 },
@@ -268,6 +280,9 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
                         records,
                     });
                 }
+                SubscriptionItem::Attention { attention, .. } => {
+                    plumbing.push_attn(attention.clone());
+                }
             }
         }
     }
@@ -278,6 +293,36 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
 
 struct ConnectionState {
     status: ConnEvent,
+}
+
+/// Session status badges (spec 03 §View tree: `SessionsState`): the
+/// engine's transient attention overlay for the v0 session. The UI derives
+/// nothing here — it renders exactly what the engine classified, plus
+/// wall-clock elapsed off the snapshot's `since_ms`.
+struct SessionsState {
+    attention: Option<AttentionSnapshot>,
+}
+
+impl SessionsState {
+    fn notice_standing(&self) -> bool {
+        matches!(&self.attention, Some(a) if !matches!(a, AttentionSnapshot::Running))
+    }
+}
+
+/// Quiet escalates from a subtle line to a prominent bar at 10 min
+/// (build directive 2026-08-16: "subtle at threshold, prominent at 10min,
+/// then steady elapsed reporting").
+const PROMINENT_AFTER_MS: u64 = 10 * 60 * 1000;
+
+fn fmt_elapsed(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
+    }
 }
 
 /// Anchor-flip scroll (spec 03 §Scroll): bottom-follow at rest; own send
@@ -609,6 +654,7 @@ fn thread_cpu_time() -> Duration {
 struct Shell {
     focus: FocusHandle,
     conn: Entity<ConnectionState>,
+    sessions: Entity<SessionsState>,
     transcript: Entity<TranscriptState>,
     composer: Entity<ComposerState>,
     commands: tokio_mpsc::UnboundedSender<Command>,
@@ -725,20 +771,127 @@ impl Shell {
             .child(text)
     }
 
+    /// The attention notice (spec 01 §States): `quiet` escalates subtle →
+    /// prominent and reports elapsed steadily; `unresponsive` and `failed`
+    /// are prominent panels with the evidence/cause and a kill affordance.
+    /// Nothing here ever auto-dismisses or auto-kills — notices persist
+    /// until the engine reclassifies or the user acts.
+    fn attention_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let attention = self.sessions.read(cx).attention.clone()?;
+        let now = eave_core::journal::now_ms();
+        match attention {
+            AttentionSnapshot::Running => None,
+            AttentionSnapshot::Quiet { since_ms, reason } => {
+                let held = now.saturating_sub(since_ms);
+                let what = match &reason {
+                    WaitReason::Tool { name, since_ms } => format!(
+                        "waiting on tool {name} for {}",
+                        fmt_elapsed(now.saturating_sub(*since_ms))
+                    ),
+                    WaitReason::Api { since_ms } => format!(
+                        "awaiting API response for {}",
+                        fmt_elapsed(now.saturating_sub(*since_ms))
+                    ),
+                    WaitReason::Idle => "no output mid-turn, nothing in flight".to_string(),
+                };
+                let text = format!("⏳ quiet {} — {what}", fmt_elapsed(held));
+                Some(if held >= PROMINENT_AFTER_MS {
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(0x5c4a14))
+                        .text_color(rgb(0xffdf8a))
+                        .font_weight(FontWeight::BOLD)
+                        .child(text)
+                        .into_any_element()
+                } else {
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(0xc9a86a))
+                        .child(text)
+                        .into_any_element()
+                })
+            }
+            AttentionSnapshot::Unresponsive {
+                since_ms,
+                zero_samples,
+                sampled_ms,
+            } => Some(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(0x4a1717))
+                    .text_color(rgb(0xffb3b3))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .child(format!(
+                                "⚠ unresponsive for {}",
+                                fmt_elapsed(now.saturating_sub(since_ms))
+                            )),
+                    )
+                    .child(div().child(format!(
+                        "evidence: zero CPU across {zero_samples} consecutive samples \
+                         ({} sampled) · no tool running · no API request in flight",
+                        fmt_elapsed(sampled_ms)
+                    )))
+                    .child(self.kill_affordance(cx, "it will never be killed automatically"))
+                    .into_any_element(),
+            ),
+            AttentionSnapshot::Failed { since_ms, cause } => Some(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(0x4a1717))
+                    .text_color(rgb(0xff8a8a))
+                    .child(div().font_weight(FontWeight::BOLD).child(format!(
+                        "✖ failed {} ago — {cause}",
+                        fmt_elapsed(now.saturating_sub(since_ms))
+                    )))
+                    .child(self.kill_affordance(cx, "clean up the process when you're ready"))
+                    .into_any_element(),
+            ),
+        }
+    }
+
+    fn kill_affordance(&self, cx: &Context<Self>, note: &str) -> gpui::Div {
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .items_center()
+            .pt_1()
+            .child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .bg(rgb(0x772222))
+                    .rounded_md()
+                    .text_color(rgb(0xffffff))
+                    .id("attn-kill")
+                    .on_click(cx.listener(|this, _, _, _| {
+                        let _ = this.commands.send(Command::Kill);
+                    }))
+                    .child("kill session"),
+            )
+            .child(
+                div()
+                    .text_color(rgb(0xaa7777))
+                    .child(SharedString::from(note.to_string())),
+            )
+    }
+
     /// Build one virtualized row. Called only for visible + overdraw rows.
     fn render_row(state: &TranscriptState, ix: usize) -> AnyElement {
         let Some(row) = state.display.row(ix).copied() else {
             return div().into_any_element();
         };
         let id = row.id;
-        if id.msg == CLOSED_MSG {
-            let closed = state.transcript.closed.clone().unwrap_or_default();
-            return div()
-                .px_2()
-                .text_color(rgb(DIM))
-                .child(format!("— session closed: {closed} —"))
-                .into_any_element();
-        }
         let Some(trow) = state.transcript.rows.get(id.msg as usize) else {
             return div().into_any_element();
         };
@@ -993,6 +1146,7 @@ impl Render for Shell {
                     .text_color(rgb(0x666666))
                     .child(session_line),
             )
+            .children(self.attention_notice(cx))
             .child(
                 div()
                     .flex_1()
@@ -1085,6 +1239,7 @@ pub fn run(data_dir: PathBuf) -> ! {
         let conn = cx.new(|_| ConnectionState {
             status: ConnEvent::Connecting,
         });
+        let sessions = cx.new(|_| SessionsState { attention: None });
         let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
         let transcript = cx.new(|_| {
             let mut t = TranscriptState::new();
@@ -1100,11 +1255,28 @@ pub fn run(data_dir: PathBuf) -> ! {
             t
         });
 
+        // Steady elapsed reporting (build directive): while a notice
+        // stands, re-render the badge once a second so its elapsed text
+        // moves. Costs one entity read per second when idle.
+        {
+            let sessions = sessions.clone();
+            cx.spawn(async move |cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
+                if sessions.read_with(cx, |s, _| s.notice_standing()) {
+                    sessions.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+        }
+
         // The pump (spec 03 §Wake & notify): one wake per burst, drain
         // every non-empty queue, ≤1 notify per entity per burst.
         {
             let queues = Arc::clone(&queues);
             let conn = conn.clone();
+            let sessions = sessions.clone();
             let transcript = transcript.clone();
             let cmd_tx = cmd_tx.clone();
             cx.spawn(async move |cx| {
@@ -1114,6 +1286,16 @@ pub fn run(data_dir: PathBuf) -> ! {
                     if let Some(last) = conn_events.into_iter().last() {
                         let _ = conn.update(cx, |state, cx| {
                             state.status = last;
+                            cx.notify();
+                        });
+                    }
+                    // Attention is current-state, not a log: the last
+                    // frame of the burst wins.
+                    let attn_events: Vec<AttnEvent> =
+                        queues.attn.lock().unwrap().drain(..).collect();
+                    if let Some(last) = attn_events.into_iter().last() {
+                        let _ = sessions.update(cx, |state, cx| {
+                            state.attention = Some(last);
                             cx.notify();
                         });
                     }
@@ -1156,11 +1338,13 @@ pub fn run(data_dir: PathBuf) -> ! {
                 let shell = cx.new(|cx| {
                     let composer = cx.new(|_| ComposerState { text: String::new() });
                     cx.observe(&conn, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
                     cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
                         conn: conn.clone(),
+                        sessions: sessions.clone(),
                         transcript: transcript.clone(),
                         composer,
                         commands: cmd_tx.clone(),

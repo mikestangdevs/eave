@@ -25,7 +25,11 @@ pub struct RowId {
     pub block: u32,
 }
 
-/// The terminal-outcome marker row hangs off this sentinel message index.
+/// Reserved sentinel message index (kept out of the id space). The
+/// terminal-outcome line itself is the shared projection's `Row::Marker`
+/// ("session closed: …") — the display list adds no row of its own for it
+/// (a duplicate closed line shipped in Stage D and was caught by Stage E's
+/// kill-affordance verification).
 pub const CLOSED_MSG: u32 = u32::MAX;
 
 /// One virtualized row: identity + version. Content is fetched through
@@ -250,16 +254,6 @@ impl DisplayList {
                 }),
             }
         }
-        if let Some(closed) = &transcript.closed {
-            next.push(DisplayRow {
-                id: RowId {
-                    msg: CLOSED_MSG,
-                    block: 0,
-                },
-                fingerprint: fnv1a_more(fnv1a(&[4]), closed.as_bytes()),
-            });
-        }
-
         // 3. Diff.
         let ops = if shrunk || (self.rows.is_empty() && next.is_empty()) {
             // A shrink only happens on reset/replay-from-scratch.

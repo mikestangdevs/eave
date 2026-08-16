@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 use eave_core::journal::{Header, Record};
 use eave_core::proc::ProcIdentity;
 
+pub use eave_core::attention::{AttentionSnapshot, WaitReason};
+
 pub const PROTO_VERSION: u32 = 1;
 
 /// Subscription resume position: the last (epoch, seq) the client has.
@@ -123,6 +125,17 @@ pub enum SubscriptionItem {
         session_id: String,
         epoch: u64,
         records: Vec<Record>,
+    },
+    /// Transient attention overlay (spec 01 §States): the engine's live
+    /// classification of `running`/`quiet`/`unresponsive`/`failed` with
+    /// its evidence. Deliberately NOT a journal record — attention is
+    /// derived, reversible surface state, not history; it carries no seq
+    /// and never advances the cursor. Emitted on every transition, again
+    /// on evidence updates, and once after replay on subscribe; `Running`
+    /// means "clear any notice".
+    Attention {
+        session_id: String,
+        attention: AttentionSnapshot,
     },
 }
 

@@ -22,7 +22,7 @@ pub struct ProcIdentity {
 }
 
 /// A snapshot of OS facts about a live pid.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcInfo {
     pub start_tvsec: u64,
     pub start_tvusec: u64,
@@ -73,5 +73,126 @@ pub fn identity_matches(id: &ProcIdentity) -> bool {
             info.start_tvsec == id.start_tvsec && info.start_tvusec == id.start_tvusec
         }
         None => false,
+    }
+}
+
+/// Three-way liveness verdict for the `failed` classification (spec 01).
+///
+/// `proc_pidinfo` cannot see zombies at all (returns 0 bytes — verified on
+/// this OS 2026-08-16), so `inspect` alone cannot distinguish "exited
+/// unreaped" from "gone". `sysctl KERN_PROC_PID` still returns a
+/// `kinfo_proc` for a zombie with `p_stat == SZOMB`, and returns nothing
+/// once the pid is reaped/gone — that is the tiebreaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidState {
+    /// No such process (or reaped): `sysctl` has nothing for the pid.
+    Gone,
+    /// Exited but unreaped.
+    Zombie,
+    /// Alive and inspectable.
+    Live(ProcInfo),
+    /// Exists per `sysctl` yet uninspectable via `proc_pidinfo` — a
+    /// transient window (exec, teardown). Never provable death.
+    Uninspectable,
+}
+
+/// Byte offset of `extern_proc.p_stat` inside a `kinfo_proc` buffer on
+/// LP64 macOS: `p_un` union (2 ptrs, 16) + `p_vmspace` (8) + `p_sigacts`
+/// (8) + `p_flag` (4). libc does not export `kinfo_proc` for this target;
+/// the layout is pinned by `pid_state_sees_zombies_and_gone_pids`
+/// (verified against a real zombie on this OS, 2026-08-16).
+const KINFO_P_STAT_OFFSET: usize = 36;
+
+pub fn pid_state(pid: i32) -> PidState {
+    if let Some(info) = inspect(pid) {
+        return PidState::Live(info);
+    }
+    let mut mib: [libc::c_int; 4] = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut buf = [0u8; 1024];
+    let mut size = buf.len() as libc::size_t;
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r == 0 && size > KINFO_P_STAT_OFFSET {
+        if u32::from(buf[KINFO_P_STAT_OFFSET]) == SZOMB {
+            PidState::Zombie
+        } else {
+            PidState::Uninspectable
+        }
+    } else {
+        PidState::Gone
+    }
+}
+
+/// Cumulative CPU time (user + system) consumed by the process, in opaque
+/// units — only deltas are meaningful (zero delta across a sample interval
+/// = "no CPU", the `unresponsive` evidence input, spec 01). `None` when the
+/// process is gone or uninspectable.
+pub fn cpu_time(pid: i32) -> Option<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { mem::zeroed() };
+    let size = mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    Some(info.pti_total_user + info.pti_total_system)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_state_sees_zombies_and_gone_pids() {
+        // A child we deliberately do not reap is a zombie; after reaping,
+        // the pid is gone. This is the OS-facts input to `failed`.
+        let child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id() as i32;
+        // Wait for it to exit without reaping it (no wait() call).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match pid_state(pid) {
+                PidState::Zombie => break,
+                _ if std::time::Instant::now() > deadline => {
+                    panic!("child never became a zombie")
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(inspect(pid).is_none(), "zombies are proc_pidinfo-invisible");
+        let mut child = child;
+        child.wait().expect("reap");
+        assert_eq!(pid_state(pid), PidState::Gone);
+    }
+
+    #[test]
+    fn cpu_time_reads_own_process_and_advances() {
+        let pid = std::process::id() as i32;
+        let a = cpu_time(pid).expect("own cpu time");
+        // Burn a little CPU so the counter provably moves.
+        let mut x: u64 = 0;
+        for i in 0..20_000_000u64 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(i);
+        }
+        std::hint::black_box(x);
+        let b = cpu_time(pid).expect("own cpu time again");
+        assert!(b > a, "cpu counter advanced: {a} -> {b}");
     }
 }

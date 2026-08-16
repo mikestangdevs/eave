@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, watch};
 use crate::events::SessionEvent;
 use crate::proc::{self, ProcIdentity};
 use crate::process;
-use crate::session::{AgentSession, KillReport, SessionError, SpawnConfig};
+use crate::session::{AgentSession, KillReport, SessionError, SessionWatch, SpawnConfig};
 use crate::stream::ClaudeStream;
 use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
 
@@ -46,6 +46,10 @@ pub struct ClaudeCodeSession {
     stdin: Option<ChildStdin>,
     shared: Arc<Shared>,
     exit_rx: watch::Receiver<Option<ExitFacts>>,
+    /// OS-fact flags for the attention monitor (spec 01 `failed`): stdout
+    /// EOF and exit, maintained by the reader/supervisor tasks.
+    stdout_eof: Arc<AtomicBool>,
+    exited_flag: Arc<AtomicBool>,
 }
 
 impl ClaudeCodeSession {
@@ -130,8 +134,12 @@ impl ClaudeCodeSession {
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let (exit_tx, exit_rx) = watch::channel(None);
 
+        let stdout_eof = Arc::new(AtomicBool::new(false));
+        let exited_flag = Arc::new(AtomicBool::new(false));
+
         let reader_shared = Arc::clone(&shared);
         let reader_tx = events_tx.clone();
+        let reader_eof = Arc::clone(&stdout_eof);
         let stdout_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -146,6 +154,11 @@ impl ClaudeCodeSession {
                     let _ = reader_tx.send(event).await;
                 }
             }
+            // EOF (or read error): with the process still alive this is
+            // provable stream death — the attention monitor's `failed`
+            // input (spec 01). On a normal exit the exit flag lands within
+            // moments and wins.
+            reader_eof.store(true, Ordering::SeqCst);
         });
 
         let ring: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -167,8 +180,12 @@ impl ClaudeCodeSession {
 
         // Supervisor: reap the leader, drain both readers, then emit the
         // terminal Exited event and publish the exit facts.
+        let super_exited = Arc::clone(&exited_flag);
         tokio::spawn(async move {
             let status = child.wait().await;
+            // Set before draining the readers so a monitor tick between
+            // stdout-EOF and this flag sees the exit promptly.
+            super_exited.store(true, Ordering::SeqCst);
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             let facts: ExitFacts = match &status {
@@ -196,6 +213,8 @@ impl ClaudeCodeSession {
                 stdin,
                 shared,
                 exit_rx,
+                stdout_eof,
+                exited_flag,
             },
             events_rx,
         ))
@@ -243,6 +262,14 @@ impl AgentSession for ClaudeCodeSession {
 
     fn last_activity(&self) -> Instant {
         *self.shared.last_activity.lock().unwrap()
+    }
+
+    fn watch(&self) -> SessionWatch {
+        SessionWatch::new(
+            self.identity,
+            Arc::clone(&self.stdout_eof),
+            Arc::clone(&self.exited_flag),
+        )
     }
 
     async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {

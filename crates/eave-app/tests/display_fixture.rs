@@ -44,6 +44,7 @@ fn replay(mut check: impl FnMut(usize, &eave_app::display::DiffOps, usize, usize
                 transcript.reset();
                 display.update(&transcript);
             }
+            SubscriptionItem::Attention { .. } => {}
             SubscriptionItem::Events { epoch, records, .. } => {
                 let before = open_fences(&display);
                 transcript
@@ -124,6 +125,7 @@ fn incremental_fold_equals_batch_rebuild() {
                 transcript.apply(epoch, &records).unwrap();
                 incremental.update(&transcript);
             }
+            SubscriptionItem::Attention { .. } => {}
         }
     }
     let mut batch = DisplayList::new();

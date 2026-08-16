@@ -270,6 +270,49 @@ fn main() {
                 std::thread::sleep(Duration::from_micros(500));
             }
         }
+        "linger" => {
+            // The real CLI's between-turns shape (claude-stream-notes.md):
+            // answer each stdin line with a complete turn, then sit idle on
+            // stdin at zero CPU. The attention regression that matters most:
+            // this idleness is NORMAL — no clock may run after
+            // turn_completed (build directive 2026-08-16).
+            emit_init();
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stdin.read_line(&mut line) {
+                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(_) => {
+                        emit_text("turn done, lingering on stdin");
+                        emit_result();
+                    }
+                }
+            }
+        }
+        "requesting-hang" => {
+            // Mark an API request in flight, then hang: the quiet notice
+            // must name "awaiting API", and zero CPU must NOT harden it to
+            // unresponsive (a request in flight burns no CPU by design).
+            emit_init();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            emit(json!({ "type": "system", "subtype": "status", "status": "requesting" }));
+            hang_forever();
+        }
+        "stdout-close" => {
+            // Close stdout mid-turn while staying alive: provable stream
+            // death → `failed` with the concrete cause, immediately, no
+            // timer (spec 01) — and never auto-killed.
+            emit_init();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            emit_text("closing my stdout now");
+            unsafe {
+                libc::close(1);
+            }
+            hang_forever();
+        }
         "stdin-closed" => {
             // Close our stdin so the parent's next pipe write fails with
             // EPIPE while we are demonstrably alive — the deterministic

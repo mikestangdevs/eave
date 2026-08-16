@@ -41,6 +41,44 @@ impl SpawnConfig {
     }
 }
 
+/// A cheap, clonable window onto the OS-facts the attention monitor needs
+/// every tick (spec 01 §Attention clocks / `failed`): shared flags the
+/// adapter's own reader/exit tasks maintain. Deliberately not the session
+/// itself — the monitor must never contend with send/kill for the live
+/// handle.
+#[derive(Clone)]
+pub struct SessionWatch {
+    pub identity: ProcIdentity,
+    stdout_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SessionWatch {
+    pub fn new(
+        identity: ProcIdentity,
+        stdout_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            identity,
+            stdout_eof,
+            exited,
+        }
+    }
+
+    /// The CLI's stdout reader saw EOF (or a read error). With the process
+    /// still alive this is provable death of the stream (spec 01 `failed`).
+    pub fn stdout_eof(&self) -> bool {
+        self.stdout_eof.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The exit waiter has facts; the `Exited → Closed` path owns
+    /// everything from here.
+    pub fn exited(&self) -> bool {
+        self.exited.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// What a verified kill established (spec 01 §Kill & verify).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillReport {
@@ -83,6 +121,9 @@ pub trait AgentSession: Send {
 
     /// Last byte received from the CLI (attention-clock activity source).
     fn last_activity(&self) -> Instant;
+
+    /// Clonable OS-facts window for the attention monitor (spec 01).
+    fn watch(&self) -> SessionWatch;
 
     /// Send one user message into the running session.
     async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError>;
