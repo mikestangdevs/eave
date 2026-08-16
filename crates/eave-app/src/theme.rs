@@ -307,3 +307,18 @@ pub const RADIUS_BUTTON: f32 = 7.0;
 pub const SEND_BUTTON: f32 = 26.0;
 pub const STATE_DOT: f32 = 6.0;
 pub const TOOL_DOT: f32 = 5.0;
+
+// ---------------------------------------------------------------------------
+// Session rail (Slice A) — chrome at L2, left of the transcript.
+
+/// Rail width (62 × the 4 px unit).
+pub const RAIL_W: f32 = 248.0;
+/// Provider identity chip: self-drawn monochrome initials on a bordered
+/// rounded square. Deliberately never a third-party mark — one uniform,
+/// self-drawn set for every provider (Slice A directive).
+pub const PROVIDER_CHIP: f32 = 18.0;
+pub const RADIUS_CHIP: f32 = 5.0;
+/// The rail collapse toggle's self-drawn sidebar pictogram (titlebar).
+pub const RAIL_TOGGLE_W: f32 = 16.0;
+pub const RAIL_TOGGLE_H: f32 = 12.0;
+pub const RADIUS_GLYPH: f32 = 3.0;

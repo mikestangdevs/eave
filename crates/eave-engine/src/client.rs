@@ -256,6 +256,23 @@ impl Client {
         .await
     }
 
+    /// Watch the session set (spec 05 §Watch): yields `Sessions` snapshot
+    /// frames — one immediately, one on every session-set/state change.
+    /// Fold by replacement. Carries no transcript content, ever.
+    pub async fn watch(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
+        self.write(&RequestEnvelope {
+            id,
+            request: Request::Watch,
+        })
+        .await?;
+        Ok(rx)
+    }
+
     /// Subscribe per the cursor contract (spec 05-wire.md). The stream ends
     /// when the connection dies; resubscribe on a fresh client with the
     /// last cursor (or `None` if you hold no projection).

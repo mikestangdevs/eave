@@ -84,6 +84,13 @@ pub enum Request {
     Send { session_id: String, text: String },
     /// Kill the session's live process (verified kill ladder, spec 01).
     Kill { session_id: String },
+    /// Observe the session SET (spec 05 §Watch): items flow on this
+    /// request's id as `Sessions` snapshots — one immediately, one on
+    /// every session-set / state / attention change. This is the only
+    /// cross-session broadcast in the protocol and it is content-free by
+    /// construction: its sole payload type is [`SessionInfo`]. A client
+    /// must `Subscribe` to a specific session to receive records.
+    Watch,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +144,14 @@ pub enum SubscriptionItem {
         session_id: String,
         attention: AttentionSnapshot,
     },
+    /// Watch frame (spec 05 §Watch): a full session-set snapshot taken at
+    /// emission time. Clients fold by REPLACEMENT, never merge — there
+    /// are no deltas, so there are no ordering hazards. Isolation
+    /// invariant (enforced by test): this is the only frame a `watch`
+    /// subscription ever carries, and [`SessionInfo`] holds session
+    /// identity and state ONLY — never journal records, never provider
+    /// output, never transcript content of any session.
+    Sessions { sessions: Vec<SessionInfo> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,6 +251,38 @@ mod tests {
         };
         let line = serde_json::to_string(&resp).unwrap();
         assert!(line.contains("\"item\""), "{line}");
+        let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn watch_frames_round_trip() {
+        let req = RequestEnvelope {
+            id: 3,
+            request: Request::Watch,
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"method\":\"watch\""), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.request, Request::Watch);
+
+        let resp = ResponseEnvelope {
+            id: 3,
+            body: ResponseBody::Item(SubscriptionItem::Sessions {
+                sessions: vec![SessionInfo {
+                    session_id: "s1".into(),
+                    provider: "claude-code".into(),
+                    cwd: "/tmp".into(),
+                    created_ts_ms: 1,
+                    state: "running".into(),
+                    live: true,
+                    epoch: 9,
+                    last_seq: 41,
+                }],
+            }),
+        };
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains("\"sessions\""), "{line}");
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back, resp);
     }

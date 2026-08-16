@@ -32,6 +32,9 @@ use eave_wire::{
 };
 
 const BROADCAST_CAP: usize = 4096;
+/// Watch pokes carry no payload (snapshots are taken at emission), so the
+/// channel can be tiny; lag just coalesces into the next snapshot.
+const WATCH_CAP: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -122,6 +125,10 @@ pub struct SessionHandle {
     /// Serializes spawn/send/kill — sends stay sequential, which the
     /// order-paired delivery state depends on (spec 02 §Delivery state).
     live: TokioMutex<Option<Live>>,
+    /// Pokes the engine-wide watch channel (spec 05 §Watch) on state /
+    /// attention changes. Deliberately NEVER poked per record — record
+    /// flow must be invisible on watch (isolation invariant).
+    watch_tx: broadcast::Sender<()>,
 }
 
 fn new_epoch() -> u64 {
@@ -210,10 +217,20 @@ impl SessionHandle {
     }
 
     /// Publish an attention transition: overlay for late subscribers +
-    /// broadcast for live ones.
+    /// broadcast for live ones. Attention is part of the reported state
+    /// name, so watchers are poked too.
     fn set_attention(&self, snap: AttentionSnapshot) {
         self.shared.lock().unwrap().attention = Some(snap.clone());
         let _ = self.bcast.send(Fanout::Attention(snap));
+        self.poke_watch();
+    }
+
+    /// Something a watcher can see changed (session appeared, process
+    /// attached/detached, state or attention moved). Payload-free: every
+    /// watch emission is a fresh consistent snapshot, so there is nothing
+    /// to get stale or out of order.
+    fn poke_watch(&self) {
+        let _ = self.watch_tx.send(());
     }
 }
 
@@ -225,6 +242,9 @@ pub struct Engine {
     store: Store,
     identity: ProcIdentity,
     sessions: StdMutex<HashMap<String, Arc<SessionHandle>>>,
+    /// Engine-wide watch poke channel (spec 05 §Watch). Held here so it
+    /// outlives every session; handles carry clones.
+    watch_tx: broadcast::Sender<()>,
 }
 
 impl Engine {
@@ -283,9 +303,13 @@ impl Engine {
                 }),
                 bcast,
                 live: TokioMutex::new(None),
+                watch_tx: self.watch_tx.clone(),
             })
         };
         sessions.insert(id, Arc::clone(&handle));
+        drop(sessions);
+        // The session set changed — watchers re-snapshot.
+        handle.poke_watch();
         Ok(handle)
     }
 
@@ -328,6 +352,7 @@ impl Engine {
             }),
             bcast,
             live: TokioMutex::new(None),
+            watch_tx: self.watch_tx.clone(),
         }))
     }
 
@@ -410,6 +435,7 @@ impl Engine {
             s.live = true;
             s.state = "running".into();
         }
+        handle.poke_watch();
 
         let (extra_tx, extra_rx) = mpsc::channel(16);
         let (tap_tx, mut tap_rx) = mpsc::unbounded_channel::<Record>();
@@ -465,6 +491,7 @@ impl Engine {
                 s.attention = None;
             }
             let _ = done_handle.bcast.send(Fanout::Attention(AttentionSnapshot::Running));
+            done_handle.poke_watch();
             *done_handle.live.lock().await = None;
         });
 
@@ -539,11 +566,13 @@ async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Res
         start_tvsec: 0,
         start_tvusec: 0,
     });
+    let (watch_tx, _) = broadcast::channel(WATCH_CAP);
     let engine = Arc::new(Engine {
         cfg,
         store,
         identity,
         sessions: StdMutex::new(HashMap::new()),
+        watch_tx,
     });
 
     // Startup scan (spec 02 §Resume contract): reap orphans from the meta
@@ -645,6 +674,11 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 }
                 Err(message) => ResponseBody::Err { message },
             },
+            Request::Watch => {
+                let w = Arc::clone(&w);
+                subs.push(tokio::spawn(run_watch(Arc::clone(&engine), w, id)));
+                continue; // snapshots flow on this id; no unary reply
+            }
         };
         if write_frame(&w, &ResponseEnvelope { id, body }).await.is_err() {
             break;
@@ -884,6 +918,32 @@ async fn run_subscription(
             if send_item(&w, id, item).await.is_err() {
                 return;
             }
+        }
+    }
+}
+
+/// The watch subscription (spec 05 §Watch): send one full session-set
+/// snapshot now, then a fresh one after every poke. Every emission is a
+/// consistent read taken at emission time, so replacement-folding on the
+/// client can never go stale or reorder; a lagged poke channel just means
+/// the next snapshot covers more changes at once. This task never touches
+/// a session's record log — the only thing it can serialize is
+/// `SessionInfo` (isolation invariant, enforced by test).
+async fn run_watch(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+    let mut rx = engine.watch_tx.subscribe();
+    loop {
+        let item = SubscriptionItem::Sessions {
+            sessions: engine.list().sessions,
+        };
+        if send_item(&w, id, item).await.is_err() {
+            return;
+        }
+        match rx.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                // Coalesce a burst of pokes into one snapshot.
+                while rx.try_recv().is_ok() {}
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
         }
     }
 }

@@ -33,7 +33,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{Delivery, Row, ToolStatus, Transcript};
-use eave_wire::{AttentionSnapshot, Cursor, SubscriptionItem, WaitReason};
+use eave_wire::{AttentionSnapshot, Cursor, SessionInfo, SubscriptionItem, WaitReason};
 
 use crate::display::{DisplayList, RowId};
 use crate::markdown::{inline_runs, Block, InlineRun};
@@ -55,19 +55,31 @@ enum ConnEvent {
     Failed { message: String },
 }
 
+/// Feed frames are tagged with the session they belong to: a selection
+/// switch drops the old subscription, but frames from it may already sit
+/// in the queue — the pump discards anything not matching the transcript's
+/// current session (no event bleed between sessions).
 #[derive(Debug)]
 enum FeedEvent {
     Session { id: String },
-    Reset,
+    Reset {
+        id: String,
+    },
     Records {
+        id: String,
         epoch: u64,
         records: Vec<eave_core::journal::Record>,
     },
 }
 
 /// One drained attention burst; last frame wins (the overlay is a current-
-/// state broadcast, not a log).
-type AttnEvent = AttentionSnapshot;
+/// state broadcast, not a log). Tagged with its session so a notice from a
+/// deselected session can never render over the selected one.
+type AttnEvent = (String, AttentionSnapshot);
+
+/// One watch snapshot (spec 05 §Watch): the full session set, folded by
+/// replacement — never merged.
+type RailEvent = Vec<SessionInfo>;
 
 #[derive(Debug)]
 enum Command {
@@ -75,6 +87,11 @@ enum Command {
     Kill,
     /// Projection lost sync (seq gap): drop and fully resubscribe.
     Resubscribe,
+    /// Rail row click: subscribe this session instead (cursorless — the
+    /// UI holds no projection for it; full replay, never merge).
+    Select(String),
+    /// Rail "+ new": open a fresh session and select it.
+    NewSession,
 }
 
 #[derive(Default)]
@@ -82,6 +99,7 @@ struct Queues {
     conn: Mutex<VecDeque<ConnEvent>>,
     feed: Mutex<VecDeque<FeedEvent>>,
     attn: Mutex<VecDeque<AttnEvent>>,
+    rail: Mutex<VecDeque<RailEvent>>,
 }
 
 struct Plumbing {
@@ -102,12 +120,20 @@ impl Plumbing {
         self.queues.attn.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
+    fn push_rail(&self, ev: RailEvent) {
+        self.queues.rail.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
 }
 
-/// The client task: connect (spawning the engine if absent), pick the v0
-/// session, subscribe, forward frames; on disconnect, reconnect with
-/// doubling backoff and a 5-attempt breaker (spec 01 §Topology) and
-/// resubscribe from the held cursor — replay, never merge.
+/// The client task: connect (spawning the engine if absent), watch the
+/// session set, subscribe the selected session, forward frames. On
+/// disconnect, reconnect with doubling backoff and a 5-attempt breaker
+/// (spec 01 §Topology) and resubscribe from the held cursor — replay,
+/// never merge. Selection lives here as "which session am I subscribed
+/// to"; the UI only ever requests a switch (`Command::Select`) and renders
+/// what the feed reports back — the rail's highlight is a projection of
+/// the actual subscription, not a UI-held selection.
 async fn feed_loop(
     data_dir: PathBuf,
     plumbing: Plumbing,
@@ -123,7 +149,8 @@ async fn feed_loop(
     };
     let mut attempt: u32 = 0;
     let mut cursor: Option<Cursor> = None;
-    loop {
+    let mut selected: Option<String> = None;
+    'conn: loop {
         plumbing.push_conn(if attempt == 0 {
             ConnEvent::Connecting
         } else {
@@ -152,70 +179,112 @@ async fn feed_loop(
             }
         };
         attempt = 0;
-
-        // v0 slice: exactly one session — adopt the first on disk or open
-        // a fresh one (spec 04 §In the slice).
-        let session_id = match pick_session(&client).await {
-            Ok(id) => id,
-            Err(_) => continue,
+        let mut watch_rx = match client.watch().await {
+            Ok(rx) => rx,
+            Err(_) => continue 'conn,
         };
         plumbing.push_conn(ConnEvent::Connected {
             engine_pid: client.engine.pid,
         });
-        plumbing.push_feed(FeedEvent::Session {
-            id: session_id.clone(),
-        });
 
-        let mut rx = match client.subscribe(&session_id, cursor).await {
-            Ok(rx) => rx,
-            Err(_) => continue,
-        };
-        loop {
-            tokio::select! {
-                item = rx.recv() => match item {
-                    Some(SubscriptionItem::Reset { .. }) => {
-                        cursor = None;
-                        plumbing.push_feed(FeedEvent::Reset);
-                    }
-                    Some(SubscriptionItem::Events { epoch, records, .. }) => {
-                        if let Some(last) = records.last() {
-                            cursor = Some(Cursor { epoch, seq: last.seq });
-                        }
-                        plumbing.push_feed(FeedEvent::Records { epoch, records });
-                    }
-                    Some(SubscriptionItem::Attention { attention, .. }) => {
-                        plumbing.push_attn(attention);
-                    }
-                    None => break, // connection gone → outer reconnect loop
+        'session: loop {
+            // Validate the held selection against the engine's set; a
+            // vanished session (fresh data dir, changed disk) degrades to
+            // the most recent session, or a fresh one on an empty engine.
+            let sessions = match client.list().await {
+                Ok(s) => s,
+                Err(_) => continue 'conn,
+            };
+            let session_id = match selected
+                .clone()
+                .filter(|id| sessions.iter().any(|s| &s.session_id == id))
+            {
+                Some(id) => id,
+                None => match sessions.iter().max_by_key(|s| s.created_ts_ms) {
+                    Some(s) => s.session_id.clone(),
+                    None => match client.open(None, None).await {
+                        Ok(info) => info.session_id,
+                        Err(_) => continue 'conn,
+                    },
                 },
-                cmd = commands.recv() => match cmd {
-                    Some(Command::Send(text)) => {
-                        // Delivery truth arrives as journal records
-                        // (UserSent/UserDelivered); a transport error means
-                        // the connection is gone.
-                        if client.send(&session_id, &text).await.is_err() {
-                            break;
+            };
+            // The cursor belongs to one session's log: a switch always
+            // subscribes cursorless (full replay — the UI holds no
+            // projection of the new session).
+            if selected.as_deref() != Some(session_id.as_str()) {
+                cursor = None;
+            }
+            selected = Some(session_id.clone());
+            plumbing.push_feed(FeedEvent::Session {
+                id: session_id.clone(),
+            });
+
+            let mut rx = match client.subscribe(&session_id, cursor).await {
+                Ok(rx) => rx,
+                Err(_) => continue 'conn,
+            };
+            loop {
+                tokio::select! {
+                    item = watch_rx.recv() => match item {
+                        Some(SubscriptionItem::Sessions { sessions }) => {
+                            plumbing.push_rail(sessions);
                         }
-                    }
-                    Some(Command::Kill) => {
-                        let _ = client.kill(&session_id).await;
-                    }
-                    Some(Command::Resubscribe) => {
-                        cursor = None;
-                        break;
-                    }
-                    None => return, // UI gone
-                },
+                        Some(_) => {} // watch carries nothing else
+                        None => continue 'conn,
+                    },
+                    item = rx.recv() => match item {
+                        Some(SubscriptionItem::Reset { session_id: sid, .. }) => {
+                            cursor = None;
+                            plumbing.push_feed(FeedEvent::Reset { id: sid });
+                        }
+                        Some(SubscriptionItem::Events { session_id: sid, epoch, records }) => {
+                            if let Some(last) = records.last() {
+                                cursor = Some(Cursor { epoch, seq: last.seq });
+                            }
+                            plumbing.push_feed(FeedEvent::Records { id: sid, epoch, records });
+                        }
+                        Some(SubscriptionItem::Attention { session_id: sid, attention }) => {
+                            plumbing.push_attn((sid, attention));
+                        }
+                        Some(SubscriptionItem::Sessions { .. }) => {} // never on this id
+                        None => continue 'conn, // connection gone → reconnect
+                    },
+                    cmd = commands.recv() => match cmd {
+                        Some(Command::Send(text)) => {
+                            // Delivery truth arrives as journal records
+                            // (UserSent/UserDelivered); a transport error means
+                            // the connection is gone.
+                            if client.send(&session_id, &text).await.is_err() {
+                                continue 'conn;
+                            }
+                        }
+                        Some(Command::Kill) => {
+                            let _ = client.kill(&session_id).await;
+                        }
+                        Some(Command::Resubscribe) => {
+                            cursor = None;
+                            continue 'session;
+                        }
+                        Some(Command::Select(id)) => {
+                            if selected.as_deref() != Some(id.as_str()) {
+                                selected = Some(id);
+                                cursor = None;
+                                continue 'session;
+                            }
+                        }
+                        Some(Command::NewSession) => match client.open(None, None).await {
+                            Ok(info) => {
+                                selected = Some(info.session_id);
+                                cursor = None;
+                                continue 'session;
+                            }
+                            Err(_) => continue 'conn,
+                        },
+                        None => return, // UI gone
+                    },
+                }
             }
         }
-    }
-}
-
-async fn pick_session(client: &Client) -> Result<String, ClientError> {
-    let sessions = client.list().await?;
-    match sessions.into_iter().next() {
-        Some(info) => Ok(info.session_id),
-        None => Ok(client.open(None, None).await?.session_id),
     }
 }
 
@@ -233,9 +302,20 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         }
     };
     plumbing.push_conn(ConnEvent::Connected { engine_pid: 0 });
-    plumbing.push_feed(FeedEvent::Session {
-        id: format!("replay:{}", path.file_name().unwrap_or_default().to_string_lossy()),
-    });
+    let sid = format!("replay:{}", path.file_name().unwrap_or_default().to_string_lossy());
+    plumbing.push_feed(FeedEvent::Session { id: sid.clone() });
+    // A synthetic rail snapshot so harness runs (replay assert, captures)
+    // exercise the real constrained-width layout with the rail present.
+    plumbing.push_rail(vec![SessionInfo {
+        session_id: sid.clone(),
+        provider: "replay".into(),
+        cwd: path.display().to_string(),
+        created_ts_ms: 0,
+        state: "running".into(),
+        live: true,
+        epoch: 0,
+        last_seq: 0,
+    }]);
     // `EAVE_REPLAY_LOOP=n` replays the capture n times back to back with
     // seq/ts rebased — a 9-minute fixture ×4 is the "30+ min of frames"
     // acceptance stream (each pass appends like a resumed segment).
@@ -262,10 +342,13 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
             if let Some(wait) = due.checked_sub(started.elapsed()) {
                 std::thread::sleep(wait);
             }
+            // Frames are re-tagged with the replay session id: the pump
+            // discards frames whose session doesn't match the current one,
+            // and a fixture's captured ids are not this session.
             match &step.item {
                 SubscriptionItem::Reset { .. } => {
                     if iter == 0 {
-                        plumbing.push_feed(FeedEvent::Reset);
+                        plumbing.push_feed(FeedEvent::Reset { id: sid.clone() });
                     }
                 }
                 SubscriptionItem::Events { epoch, records, .. } => {
@@ -278,13 +361,15 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
                         })
                         .collect();
                     plumbing.push_feed(FeedEvent::Records {
+                        id: sid.clone(),
                         epoch: *epoch,
                         records,
                     });
                 }
                 SubscriptionItem::Attention { attention, .. } => {
-                    plumbing.push_attn(attention.clone());
+                    plumbing.push_attn((sid.clone(), attention.clone()));
                 }
+                SubscriptionItem::Sessions { .. } => {}
             }
         }
     }
@@ -297,17 +382,23 @@ struct ConnectionState {
     status: ConnEvent,
 }
 
-/// Session status badges (spec 03 §View tree: `SessionsState`): the
-/// engine's transient attention overlay for the v0 session. The UI derives
-/// nothing here — it renders exactly what the engine classified, plus
-/// wall-clock elapsed off the snapshot's `since_ms`.
+/// The session rail's state (spec 03 §View tree: `SessionsState`), all of
+/// it ephemeral projection: the last watch snapshot (rebuilt from the
+/// engine on every reconnect — nothing persisted app-side), the transient
+/// attention overlay for the *selected* session (tagged with its session
+/// id so a stale notice can't outlive a switch), and the rail's collapsed
+/// flag (pure view preference). The selected session itself is NOT held
+/// here — it is `TranscriptState::session_id`, i.e. whatever the feed
+/// task actually subscribed; the rail highlights that fact.
 struct SessionsState {
-    attention: Option<AttentionSnapshot>,
+    sessions: Vec<SessionInfo>,
+    collapsed: bool,
+    attention: Option<(String, AttentionSnapshot)>,
 }
 
 impl SessionsState {
     fn notice_standing(&self) -> bool {
-        matches!(&self.attention, Some(a) if !matches!(a, AttentionSnapshot::Running))
+        matches!(&self.attention, Some((_, a)) if !matches!(a, AttentionSnapshot::Running))
     }
 }
 
@@ -315,6 +406,56 @@ impl SessionsState {
 /// (build directive 2026-08-16: "subtle at threshold, prominent at 10min,
 /// then steady elapsed reporting").
 const PROMINENT_AFTER_MS: u64 = 10 * 60 * 1000;
+
+/// Self-drawn provider identity (Slice A directive): one uniform,
+/// monochrome initials chip + a plain text label, generated from the
+/// provider string — deliberately never a third-party mark, not even
+/// where a provider publishes assets. `claude-code` → ("CC", "claude
+/// code"); a one-word provider takes its first two letters.
+fn provider_identity(provider: &str) -> (String, String) {
+    let segs: Vec<&str> = provider
+        .split(['-', '_', ' '])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let glyph: String = match segs.as_slice() {
+        [] => "?".to_string(),
+        [one] => one.chars().take(2).collect(),
+        [a, b, ..] => a.chars().take(1).chain(b.chars().take(1)).collect(),
+    };
+    let label = if segs.is_empty() {
+        provider.to_string()
+    } else {
+        segs.join(" ")
+    };
+    (glyph.to_uppercase(), label)
+}
+
+/// State pigment per the stance: color only when state deserves attention.
+/// `running` is live activity; quiet/unresponsive/failed are the
+/// engine-classified notices; every settled or not-yet-started state is
+/// neutral.
+fn state_color(state: &str) -> Hsla {
+    match state {
+        "running" => theme::live(),
+        "quiet" => theme::warning(),
+        "unresponsive" | "failed" => theme::danger(),
+        _ => theme::text_ghost(),
+    }
+}
+
+/// Attention badge: only the states the operator may need to act on get a
+/// word in the rail; everything else is just the neutral dot.
+fn state_badge(state: &str) -> Option<&str> {
+    matches!(state, "quiet" | "unresponsive" | "failed").then_some(state)
+}
+
+/// Home-relative cwd for the rail's meta line.
+fn short_cwd(cwd: &str, home: Option<&str>) -> String {
+    match home {
+        Some(h) if !h.is_empty() && cwd.starts_with(h) => format!("~{}", &cwd[h.len()..]),
+        _ => cwd.to_string(),
+    }
+}
 
 fn fmt_elapsed(ms: u64) -> String {
     let s = ms / 1000;
@@ -737,6 +878,12 @@ impl Shell {
     	// handler (known ListState borrow papercut, spec 03 §No-fork
         // consequences).
         let up = ev.delta.pixel_delta(window.line_height()).y > px(0.);
+        if std::env::var("EAVE_DEBUG_SCROLL").is_ok() {
+            eprintln!(
+                "WHEEL delta={:?} up={up}",
+                ev.delta.pixel_delta(window.line_height()).y
+            );
+        }
         self.transcript.update(cx, |t, cx| {
             // Nothing to scroll on an empty log: never leave Follow, so the
             // ↓-bottom affordance can't appear over blank space (the Stage E
@@ -796,6 +943,37 @@ impl Shell {
             .window_control_area(WindowControlArea::Drag)
             .child(div().w(px(theme::TRAFFIC_CLEARANCE)).h_full().flex_none())
             .child(
+                // Rail collapse toggle: a self-drawn sidebar pictogram
+                // (bordered rect + one vertical hairline), monochrome.
+                div()
+                    .id("rail-toggle")
+                    .p(px(theme::SPACE_1))
+                    .mr_2()
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .hover(|s| s.bg(theme::overlay()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sessions.update(cx, |s, cx| {
+                            s.collapsed = !s.collapsed;
+                            cx.notify();
+                        });
+                    }))
+                    .child(
+                        div()
+                            .w(px(theme::RAIL_TOGGLE_W))
+                            .h(px(theme::RAIL_TOGGLE_H))
+                            .rounded(px(theme::RADIUS_GLYPH))
+                            .border_1()
+                            .border_color(theme::text_tertiary())
+                            .child(
+                                div()
+                                    .w(px(theme::HAIRLINE))
+                                    .h_full()
+                                    .ml(px(theme::RAIL_TOGGLE_W / 3.0))
+                                    .bg(theme::text_tertiary()),
+                            ),
+                    ),
+            )
+            .child(
                 div()
                     .text_size(px(theme::TITLE_SIZE))
                     .font_weight(theme::WEIGHT_LABEL)
@@ -809,6 +987,161 @@ impl Shell {
                     .text_color(theme::text_ghost())
                     .child(s)
             }))
+    }
+
+    /// The session rail (Slice A): chrome at L2, an instrument list of
+    /// every session the engine holds — recency-ordered (newest first),
+    /// one row per session: state dot, self-drawn provider identity,
+    /// attention badge only when a state deserves it, cwd as quiet meta.
+    /// The highlight is a projection of the feed task's actual
+    /// subscription (`TranscriptState::session_id`); clicking only
+    /// *requests* a switch.
+    fn rail(&self, cx: &Context<Self>) -> AnyElement {
+        let mut sessions = self.sessions.read(cx).sessions.clone();
+        sessions.sort_by(|a, b| b.created_ts_ms.cmp(&a.created_ts_ms));
+        let selected = self.transcript.read(cx).session_id.clone();
+        let home = std::env::var("HOME").ok();
+        // The meta line aligns under the provider label: dot + gap +
+        // chip + gap.
+        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
+        let rows: Vec<AnyElement> = sessions
+            .into_iter()
+            .map(|info| {
+                let is_sel = selected.as_deref() == Some(info.session_id.as_str());
+                let (glyph, label) = provider_identity(&info.provider);
+                let dot = state_color(&info.state);
+                let badge = state_badge(&info.state).map(str::to_string);
+                let sid = info.session_id.clone();
+                div()
+                    .id(SharedString::from(format!("rail-{}", info.session_id)))
+                    .px(px(theme::SPACE_2))
+                    .py(px(theme::SPACE_2))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .when(is_sel, |d| d.bg(theme::overlay_strong()))
+                    .when(!is_sel, |d| d.hover(|s| s.bg(theme::overlay())))
+                    .on_click(cx.listener(move |this, _, _, _| {
+                        let _ = this.commands.send(Command::Select(sid.clone()));
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(theme::STATE_DOT)).flex_none().rounded_full().bg(dot))
+                            .child(
+                                div()
+                                    .size(px(theme::PROVIDER_CHIP))
+                                    .flex_none()
+                                    .rounded(px(theme::RADIUS_CHIP))
+                                    .border_1()
+                                    .border_color(theme::border_strong())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .font_family(theme::MONO)
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .text_color(theme::text_secondary())
+                                    .child(SharedString::from(glyph)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(theme::DETAIL_SIZE))
+                                    .line_height(px(theme::DETAIL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(if is_sel {
+                                        theme::text()
+                                    } else {
+                                        theme::text_secondary()
+                                    })
+                                    .child(SharedString::from(label)),
+                            )
+                            .children(badge.map(|word| {
+                                div()
+                                    .flex_none()
+                                    .text_size(px(theme::SMALL_SIZE))
+                                    .line_height(px(theme::SMALL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(dot)
+                                    .child(SharedString::from(word))
+                            })),
+                    )
+                    .child(
+                        div()
+                            .pl(px(meta_indent))
+                            .truncate()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_ghost())
+                            .child(SharedString::from(short_cwd(&info.cwd, home.as_deref()))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .w(px(theme::RAIL_W))
+            .h_full()
+            .flex_none()
+            .bg(theme::panel())
+            .border_r_1()
+            .border_color(theme::border_strong())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(theme::SPACE_3))
+                    .pt(px(theme::SPACE_3))
+                    .pb(px(theme::SPACE_2))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .font_weight(theme::WEIGHT_LABEL)
+                            .text_color(theme::text_tertiary())
+                            .child("sessions"),
+                    )
+                    .child(
+                        div()
+                            .id("new-session")
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_BUTTON))
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_secondary())
+                            .hover(|s| s.bg(theme::overlay()))
+                            .on_click(cx.listener(|this, _, _, _| {
+                                let _ = this.commands.send(Command::NewSession);
+                            }))
+                            .child("+ new"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("rail-rows")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .px(px(theme::SPACE_2))
+                    .pb(px(theme::SPACE_2))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACE_1))
+                    .children(rows),
+            )
+            .into_any_element()
     }
 
     /// Footer status bar: connection state as a dot + plain fact, session
@@ -912,7 +1245,12 @@ impl Shell {
     /// Nothing here ever auto-dismisses or auto-kills — notices persist
     /// until the engine reclassifies or the user acts.
     fn attention_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let attention = self.sessions.read(cx).attention.clone()?;
+        let (attn_session, attention) = self.sessions.read(cx).attention.clone()?;
+        // A notice belongs to one session; never render it over another
+        // (a switch mid-notice must not carry the panel across).
+        if self.transcript.read(cx).session_id.as_deref() != Some(attn_session.as_str()) {
+            return None;
+        }
         let now = eave_core::journal::now_ms();
         let panel = |ring: Hsla, wash: Hsla| {
             div()
@@ -1329,8 +1667,20 @@ impl Render for Shell {
                         .count();
                     let mut c: Vec<Duration> =
                         perf.cpu_times.iter().skip(10).copied().collect();
+                    // Where did the worst CPU frame land? Deterministic
+                    // position across runs = content-driven (e.g. first-use
+                    // font shaping); wandering position = load noise.
+                    let max_at = perf
+                        .cpu_times
+                        .iter()
+                        .enumerate()
+                        .skip(10)
+                        .max_by_key(|(_, d)| **d)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                     c.sort();
                     let pc = |q: f64| c[((c.len() - 1) as f64 * q) as usize];
+                    println!("PERF cpu_max_at_frame={max_at} (~row {})", max_at * PERF_ROWS_PER_FRAME);
                     println!(
                         "PERF frames={} rows={} wall[p50={:?} p95={:?} p99={:?} max={:?} missed_vsync={}] cpu[p50={:?} p95={:?} p99={:?} max={:?}]",
                         t.len(),
@@ -1361,6 +1711,7 @@ impl Render for Shell {
         // The ↓-bottom affordance needs something to return to: never on an
         // empty log (the Stage E cosmetic bug), only when follow is broken.
         let show_affordance = state.scroll != ScrollMode::Follow && !state.display.is_empty();
+        let rail_collapsed = self.sessions.read(cx).collapsed;
         let composer_text = self.composer.read(cx).text.clone();
         let has_draft = !composer_text.is_empty();
 
@@ -1462,48 +1813,63 @@ impl Render for Shell {
                 div()
                     .flex_1()
                     .min_h(px(0.))
-                    .relative()
-                    .pt(px(theme::LOG_TOP_PAD))
-                    .pb(px(theme::LOG_BOTTOM_PAD))
-                    .child(transcript_el)
-                    .when(show_affordance, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .bottom_3()
-                                .left_0()
-                                .right_0()
-                                .flex()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .px(px(theme::SPACE_3))
-                                        .py(px(theme::SPACE_1))
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(theme::border_strong())
-                                        .bg(theme::panel())
-                                        .shadow(theme::shadow_panel())
-                                        .text_size(px(theme::LABEL_SIZE))
-                                        .text_color(theme::text_secondary())
-                                        .id("to-bottom")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.transcript.update(cx, |t, cx| {
-                                                t.scroll = ScrollMode::Follow;
-                                                t.assert_scroll();
-                                                t.list.scroll_to_end();
-                                                cx.notify();
-                                            });
-                                        }))
-                                        .child("↓ bottom"),
-                                ),
-                        )
-                    }),
+                    .flex()
+                    .flex_row()
+                    .when(!rail_collapsed, |d| d.child(self.rail(cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .relative()
+                                    .pt(px(theme::LOG_TOP_PAD))
+                                    .pb(px(theme::LOG_BOTTOM_PAD))
+                                    .child(transcript_el)
+                                    .when(show_affordance, |d| {
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .bottom_3()
+                                                .left_0()
+                                                .right_0()
+                                                .flex()
+                                                .justify_center()
+                                                .child(
+                                                    div()
+                                                        .px(px(theme::SPACE_3))
+                                                        .py(px(theme::SPACE_1))
+                                                        .rounded_full()
+                                                        .border_1()
+                                                        .border_color(theme::border_strong())
+                                                        .bg(theme::panel())
+                                                        .shadow(theme::shadow_panel())
+                                                        .text_size(px(theme::LABEL_SIZE))
+                                                        .text_color(theme::text_secondary())
+                                                        .id("to-bottom")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.transcript.update(cx, |t, cx| {
+                                                                t.scroll = ScrollMode::Follow;
+                                                                t.assert_scroll();
+                                                                t.list.scroll_to_end();
+                                                                cx.notify();
+                                                            });
+                                                        }))
+                                                        .child("↓ bottom"),
+                                                ),
+                                        )
+                                    }),
+                            )
+                            .children(self.conn_panel(cx))
+                            .children(self.attention_notice(cx))
+                            .child(composer)
+                            .child(self.footer(cx)),
+                    ),
             )
-            .children(self.conn_panel(cx))
-            .children(self.attention_notice(cx))
-            .child(composer)
-            .child(self.footer(cx))
     }
 }
 
@@ -1557,7 +1923,11 @@ pub fn run(data_dir: PathBuf) -> ! {
         let conn = cx.new(|_| ConnectionState {
             status: ConnEvent::Connecting,
         });
-        let sessions = cx.new(|_| SessionsState { attention: None });
+        let sessions = cx.new(|_| SessionsState {
+            sessions: Vec::new(),
+            collapsed: false,
+            attention: None,
+        });
         let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
         let transcript = cx.new(|_| {
             let mut t = TranscriptState::new();
@@ -1611,9 +1981,20 @@ pub fn run(data_dir: PathBuf) -> ! {
                     // frame of the burst wins.
                     let attn_events: Vec<AttnEvent> =
                         queues.attn.lock().unwrap().drain(..).collect();
-                    if let Some(last) = attn_events.into_iter().last() {
+                    let rail_events: Vec<RailEvent> =
+                        queues.rail.lock().unwrap().drain(..).collect();
+                    let last_attn = attn_events.into_iter().last();
+                    let last_rail = rail_events.into_iter().last();
+                    if last_attn.is_some() || last_rail.is_some() {
                         let _ = sessions.update(cx, |state, cx| {
-                            state.attention = Some(last);
+                            if let Some(tagged) = last_attn {
+                                state.attention = Some(tagged);
+                            }
+                            // Watch snapshots fold by replacement — the
+                            // engine's set is the truth, never merged.
+                            if let Some(snapshot) = last_rail {
+                                state.sessions = snapshot;
+                            }
                             cx.notify();
                         });
                     }
@@ -1625,8 +2006,18 @@ pub fn run(data_dir: PathBuf) -> ! {
                             for ev in feed_events {
                                 match ev {
                                     FeedEvent::Session { id } => state.session_id = Some(id),
-                                    FeedEvent::Reset => state.reset(),
-                                    FeedEvent::Records { epoch, records } => {
+                                    // Frames tagged with another session are
+                                    // stragglers from a dropped subscription
+                                    // — discard, never apply (no bleed).
+                                    FeedEvent::Reset { id } => {
+                                        if state.session_id.as_deref() == Some(id.as_str()) {
+                                            state.reset();
+                                        }
+                                    }
+                                    FeedEvent::Records { id, epoch, records } => {
+                                        if state.session_id.as_deref() != Some(id.as_str()) {
+                                            continue;
+                                        }
                                         if state.apply_records(epoch, &records).is_err() {
                                             // Out-of-sequence: drop local
                                             // state, resubscribe; a fresh
@@ -1728,4 +2119,41 @@ fn perf_fill_10k(state: &mut TranscriptState) {
         item_ix: 0,
         offset_in_item: px(0.),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_identity_is_uniform_and_never_a_mark() {
+        assert_eq!(
+            provider_identity("claude-code"),
+            ("CC".to_string(), "claude code".to_string())
+        );
+        assert_eq!(provider_identity("codex"), ("CO".into(), "codex".into()));
+        assert_eq!(provider_identity("cursor"), ("CU".into(), "cursor".into()));
+        assert_eq!(
+            provider_identity("fake-agent"),
+            ("FA".into(), "fake agent".into())
+        );
+        assert_eq!(provider_identity(""), ("?".into(), "".into()));
+    }
+
+    #[test]
+    fn state_badges_only_for_attention_worthy_states() {
+        for s in ["quiet", "unresponsive", "failed"] {
+            assert_eq!(state_badge(s), Some(s));
+        }
+        for s in ["new", "running", "done", "killed", "interrupted"] {
+            assert_eq!(state_badge(s), None, "{s} must not badge");
+        }
+    }
+
+    #[test]
+    fn short_cwd_is_home_relative() {
+        assert_eq!(short_cwd("/Users/x/proj", Some("/Users/x")), "~/proj");
+        assert_eq!(short_cwd("/opt/proj", Some("/Users/x")), "/opt/proj");
+        assert_eq!(short_cwd("/opt/proj", None), "/opt/proj");
+    }
 }
