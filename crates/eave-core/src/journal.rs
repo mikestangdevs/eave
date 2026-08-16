@@ -85,7 +85,12 @@ pub enum JournalEvent {
     ToolInterrupted { id: String },
     /// Synthetic closer: the open turn ended without a `result`.
     TurnInterrupted { reason: String },
-    /// Terminal record — exactly one per journal, always last.
+    /// Terminal record for one **process segment**. A journal that was
+    /// continued via `--resume` (spec 02 §Resume contract) holds one
+    /// segment per CLI process, each ending in `Closed`; the journal as a
+    /// whole is terminal iff its *last* record is `Closed`. A `Closed`
+    /// finalizes everything in flight in its segment: unconfirmed sends
+    /// become undelivered, outstanding tools can never resolve.
     Closed { outcome: Outcome },
 }
 
@@ -252,9 +257,12 @@ impl LoadedJournal {
     /// Seqs of `UserSent` records with no `UserDelivered` confirmation.
     /// `load` always returns a terminal journal, so unconfirmed means
     /// undelivered — the UI must render these as not-sent (spec 02
-    /// §Delivery state).
+    /// §Delivery state). Pairing never crosses a `Closed` segment boundary:
+    /// a later `--resume` segment's confirmation cannot apply to a send
+    /// whose process is already gone.
     pub fn undelivered_user_sends(&self) -> Vec<u64> {
         let mut pending: Vec<u64> = Vec::new();
+        let mut undelivered: Vec<u64> = Vec::new();
         for rec in &self.records {
             match &rec.event {
                 JournalEvent::UserSent { .. } => pending.push(rec.seq),
@@ -263,10 +271,12 @@ impl LoadedJournal {
                         pending.remove(0);
                     }
                 }
+                JournalEvent::Closed { .. } => undelivered.append(&mut pending),
                 _ => {}
             }
         }
-        pending
+        undelivered.append(&mut pending);
+        undelivered
     }
 }
 
@@ -433,7 +443,10 @@ pub struct RepairOutcome {
 /// Private on purpose: `load` is the only door, so no caller can see an
 /// unrepaired journal.
 fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<RepairOutcome> {
-    if is_terminal(records) {
+    // A header-only journal is a session that was opened but never ran —
+    // nothing was in flight, so there is nothing to settle as interrupted
+    // (Stage C opens the journal at `Open`, before any spawn).
+    if records.is_empty() || is_terminal(records) {
         return Ok(RepairOutcome {
             already_terminal: true,
             tools_interrupted: Vec::new(),
@@ -467,7 +480,13 @@ fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<Repai
                 in_flight.remove(id);
             }
             JournalEvent::TurnInterrupted { .. } => turn_open = false,
-            JournalEvent::Closed { .. } => {}
+            // A segment end settles everything in flight — a tool from a
+            // previous process segment can never resolve, so repair of a
+            // later segment must not close it again.
+            JournalEvent::Closed { .. } => {
+                in_flight.clear();
+                turn_open = false;
+            }
         }
     }
 

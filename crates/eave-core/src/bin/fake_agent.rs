@@ -230,6 +230,19 @@ fn main() {
             }));
             hang_forever();
         }
+        "slow-stream" => {
+            // A long-running turn at human cadence: one small text event
+            // every 50 ms, never a result. The deterministic substrate for
+            // warm-reconnect acceptance ("kill the UI mid-turn; relaunch;
+            // the turn is still streaming") without flood's volume.
+            emit_init();
+            let mut i: u64 = 0;
+            loop {
+                emit_text(&format!("tick {i} "));
+                i += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         "flood" => {
             // Emit text events continuously so the recorder is writing the
             // journal near-constantly — the substrate for the
@@ -257,8 +270,13 @@ fn main() {
         "resume-probe" => {
             // Report whether this process was continued via --resume and
             // with which id — proves the cold-resume wiring end to end.
+            // Like the real CLI, wait for the user message before answering
+            // (also makes engine-side delivery deterministic: we are alive
+            // and blocked on stdin when the pipe write lands).
             let (_, resumed) = argv_session();
             emit_init();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
             emit_text(&format!("RESUME_FLAG:{resumed} ID:{}", session_id()));
             emit_result();
         }

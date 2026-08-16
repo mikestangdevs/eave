@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use crate::events::SessionEvent;
-use crate::journal::{classify_exit, JournalEvent, JournalWriter, Outcome};
+use crate::journal::{classify_exit, JournalEvent, JournalWriter, Outcome, Record};
 use crate::session::AgentSession;
 use crate::store::Meta;
 use crate::thresholds::JOURNAL_FLUSH_INTERVAL;
@@ -45,13 +45,25 @@ pub async fn send_and_journal<S: AgentSession + ?Sized>(
 /// Run until the session's `Exited` event, which is classified into the
 /// journal's terminal `Closed` record (exit 143 = killed, not crashed —
 /// research: claude-stream-notes.md). Returns the outcome.
+///
+/// `tap`, when present, receives every record as it is appended (seq and
+/// timestamp stamped) — the engine's fan-out to wire subscribers. The tap
+/// sees records before the write-behind flush reaches disk; that is sound
+/// because a crash that loses the tail also changes the epoch on reload,
+/// which forces subscribers through a `Reset` (spec 05-wire.md).
 pub async fn record_session(
     mut events: mpsc::Receiver<SessionEvent>,
     mut extra: mpsc::Receiver<JournalEvent>,
     mut writer: JournalWriter,
     session_dir: PathBuf,
     mut meta: Meta,
+    tap: Option<mpsc::UnboundedSender<Record>>,
 ) -> io::Result<Outcome> {
+    let tap_send = |rec: Record| {
+        if let Some(tap) = &tap {
+            let _ = tap.send(rec);
+        }
+    };
     let mut tick = tokio::time::interval(JOURNAL_FLUSH_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut extra_open = true;
@@ -72,8 +84,9 @@ pub async fn record_session(
                 match ev {
                     SessionEvent::Exited { code, signal, stderr_tail } => {
                         let outcome = classify_exit(code, signal, &stderr_tail);
-                        writer.append(JournalEvent::Closed { outcome: outcome.clone() })?;
+                        let rec = writer.append(JournalEvent::Closed { outcome: outcome.clone() })?;
                         writer.sync()?;
+                        tap_send(rec);
                         meta.state = outcome.state_name().into();
                         meta.child = None;
                         meta.save(&session_dir)?;
@@ -85,16 +98,20 @@ pub async fn record_session(
                             meta.save(&session_dir)?;
                         }
                         let terminal = matches!(ev, SessionEvent::TurnCompleted { .. });
-                        writer.append(JournalEvent::Provider { event: ev })?;
+                        let rec = writer.append(JournalEvent::Provider { event: ev })?;
                         if terminal {
                             writer.sync()?;
                         }
+                        tap_send(rec);
                     }
                 }
             }
             ev = extra.recv(), if extra_open => {
                 match ev {
-                    Some(ev) => { writer.append(ev)?; }
+                    Some(ev) => {
+                        let rec = writer.append(ev)?;
+                        tap_send(rec);
+                    }
                     None => extra_open = false,
                 }
             }

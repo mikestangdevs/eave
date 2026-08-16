@@ -1,0 +1,280 @@
+//! Headless wire client: connect (spawning the engine if absent), speak
+//! the handshake, multiplex unary calls and subscriptions over one socket.
+//!
+//! This is the layer every surface sits on — the GPUI shell holds no wire
+//! state of its own. Connect-first, spawn-on-refused is the UI-supervises-
+//! engine contract (spec 01 §Topology); a spawned engine that loses the
+//! instance lock exits `ENGINE_BUSY_EXIT` naming the holder, which
+//! surfaces here as [`ClientError::Busy`] — renderable, not a crash
+//! (spec 02 §Contended start).
+
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{unix::OwnedWriteHalf, UnixStream};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+
+use eave_core::proc::ProcIdentity;
+use eave_wire::{
+    socket_path, BusyReport, Cursor, HelloOk, KillOk, ListOk, OpenOk, Request, RequestEnvelope,
+    ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, ENGINE_BUSY_EXIT,
+    PROTO_VERSION,
+};
+
+const SPAWN_CONNECT_WINDOW: Duration = Duration::from_secs(10);
+const SPAWN_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// Another engine instance holds the data dir's lock and ours exited
+    /// inert. `holder` may be `None` ("holder unknown") — still actionable.
+    #[error("engine busy: another instance holds the lock{}", match holder { Some(h) => format!(" (pid {})", h.pid), None => " (holder unknown)".to_string() })]
+    Busy { holder: Option<ProcIdentity> },
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("engine error: {0}")]
+    Engine(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("engine connection lost")]
+    Disconnected,
+    #[error("engine spawn failed: {0}")]
+    Spawn(String),
+}
+
+/// How to start an engine when the socket refuses. `None` = never spawn
+/// (tests that manage the engine process themselves).
+#[derive(Debug, Clone)]
+pub struct EngineSpawn {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+enum Pending {
+    Unary(oneshot::Sender<Result<serde_json::Value, String>>),
+    Stream(mpsc::UnboundedSender<SubscriptionItem>),
+}
+
+pub struct Client {
+    writer: Arc<TokioMutex<OwnedWriteHalf>>,
+    pending: Arc<StdMutex<HashMap<u64, Pending>>>,
+    next_id: AtomicU64,
+    pub engine: ProcIdentity,
+}
+
+impl Client {
+    /// Connect to a running engine; fail if none is serving.
+    pub async fn connect(data_dir: &Path) -> Result<Self, ClientError> {
+        let stream = UnixStream::connect(socket_path(data_dir)).await?;
+        Self::handshake(stream).await
+    }
+
+    /// Connect-first, spawn-on-refused (spec 01 §Topology). The spawned
+    /// engine is its own process group and outlives us by design.
+    pub async fn connect_or_spawn(
+        data_dir: &Path,
+        spawn: &EngineSpawn,
+    ) -> Result<Self, ClientError> {
+        if let Ok(stream) = UnixStream::connect(socket_path(data_dir)).await {
+            return Self::handshake(stream).await;
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("engine.log"))
+            .map_err(|e| ClientError::Spawn(format!("open engine.log: {e}")))?;
+        let mut child = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new(&spawn.program)
+                .args(&spawn.args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(log)
+                .process_group(0)
+                .spawn()
+                .map_err(|e| ClientError::Spawn(format!("spawn engine: {e}")))?
+        };
+        let deadline = std::time::Instant::now() + SPAWN_CONNECT_WINDOW;
+        loop {
+            if let Ok(stream) = UnixStream::connect(socket_path(data_dir)).await {
+                // The engine is detached on purpose; we never wait on it.
+                drop(child.stdout.take());
+                return Self::handshake(stream).await;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.code() == Some(ENGINE_BUSY_EXIT) {
+                        // The engine lost the instance lock and reported the
+                        // holder on stdout before exiting inert.
+                        let holder = child
+                            .stdout
+                            .take()
+                            .and_then(|mut out| {
+                                use std::io::Read;
+                                let mut s = String::new();
+                                out.read_to_string(&mut s).ok()?;
+                                serde_json::from_str::<BusyReport>(s.lines().next()?).ok()
+                            })
+                            .and_then(|r| r.busy.holder);
+                        return Err(ClientError::Busy { holder });
+                    }
+                    return Err(ClientError::Spawn(format!(
+                        "engine exited during startup: {status}"
+                    )));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(ClientError::Spawn(format!("waitpid: {e}"))),
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(ClientError::Spawn("engine never opened its socket".into()));
+            }
+            tokio::time::sleep(SPAWN_POLL).await;
+        }
+    }
+
+    async fn handshake(stream: UnixStream) -> Result<Self, ClientError> {
+        let (r, w) = stream.into_split();
+        let pending: Arc<StdMutex<HashMap<u64, Pending>>> = Arc::default();
+        let client = Self {
+            writer: Arc::new(TokioMutex::new(w)),
+            pending: Arc::clone(&pending),
+            next_id: AtomicU64::new(1),
+            engine: ProcIdentity {
+                pid: 0,
+                start_tvsec: 0,
+                start_tvusec: 0,
+            },
+        };
+
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(r).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let env: ResponseEnvelope = match serde_json::from_str(&line) {
+                    Ok(env) => env,
+                    Err(_) => continue,
+                };
+                let mut pending = pending.lock().unwrap();
+                match env.body {
+                    ResponseBody::Ok(v) => {
+                        if let Some(Pending::Unary(tx)) = pending.remove(&env.id) {
+                            let _ = tx.send(Ok(v));
+                        }
+                    }
+                    ResponseBody::Err { message } => {
+                        if let Some(Pending::Unary(tx)) = pending.remove(&env.id) {
+                            let _ = tx.send(Err(message));
+                        }
+                    }
+                    ResponseBody::Item(item) => {
+                        if let Some(Pending::Stream(tx)) = pending.get(&env.id) {
+                            if tx.send(item).is_err() {
+                                pending.remove(&env.id);
+                            }
+                        }
+                    }
+                }
+            }
+            // Connection gone: wake every waiter (dropped senders read as
+            // Disconnected / ended streams on the other side).
+            pending.lock().unwrap().clear();
+        });
+
+        let hello: HelloOk = client.request(Request::Hello { proto: PROTO_VERSION }).await?;
+        if hello.proto != PROTO_VERSION {
+            return Err(ClientError::Protocol(format!(
+                "engine speaks proto {}, we speak {PROTO_VERSION}",
+                hello.proto
+            )));
+        }
+        Ok(Self {
+            engine: hello.engine,
+            ..client
+        })
+    }
+
+    async fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        request: Request,
+    ) -> Result<T, ClientError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, Pending::Unary(tx));
+        self.write(&RequestEnvelope { id, request }).await?;
+        let value = rx
+            .await
+            .map_err(|_| ClientError::Disconnected)?
+            .map_err(ClientError::Engine)?;
+        serde_json::from_value(value).map_err(|e| ClientError::Protocol(e.to_string()))
+    }
+
+    async fn write(&self, env: &RequestEnvelope) -> Result<(), ClientError> {
+        let mut line = serde_json::to_vec(env).expect("request envelopes serialize");
+        line.push(b'\n');
+        let mut w = self.writer.lock().await;
+        w.write_all(&line).await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    pub async fn list(&self) -> Result<Vec<SessionInfo>, ClientError> {
+        Ok(self.request::<ListOk>(Request::List).await?.sessions)
+    }
+
+    pub async fn open(
+        &self,
+        session_id: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<SessionInfo, ClientError> {
+        Ok(self
+            .request::<OpenOk>(Request::Open { session_id, cwd })
+            .await?
+            .info)
+    }
+
+    /// Sequential sends only — the delivery state is order-paired
+    /// (spec 02 §Delivery state). Await each send before the next.
+    pub async fn send(&self, session_id: &str, text: &str) -> Result<bool, ClientError> {
+        Ok(self
+            .request::<SendOk>(Request::Send {
+                session_id: session_id.into(),
+                text: text.into(),
+            })
+            .await?
+            .delivered)
+    }
+
+    pub async fn kill(&self, session_id: &str) -> Result<KillOk, ClientError> {
+        self.request::<KillOk>(Request::Kill {
+            session_id: session_id.into(),
+        })
+        .await
+    }
+
+    /// Subscribe per the cursor contract (spec 05-wire.md). The stream ends
+    /// when the connection dies; resubscribe on a fresh client with the
+    /// last cursor (or `None` if you hold no projection).
+    pub async fn subscribe(
+        &self,
+        session_id: &str,
+        cursor: Option<Cursor>,
+    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
+        self.write(&RequestEnvelope {
+            id,
+            request: Request::Subscribe {
+                session_id: session_id.into(),
+                cursor,
+            },
+        })
+        .await?;
+        Ok(rx)
+    }
+}

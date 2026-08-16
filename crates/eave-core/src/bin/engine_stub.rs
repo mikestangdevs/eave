@@ -99,7 +99,7 @@ async fn main() {
     }
     drop(extra_tx);
 
-    let outcome = record_session(events, extra_rx, writer, dir, meta)
+    let outcome = record_session(events, extra_rx, writer, dir, meta, None)
         .await
         .expect("record session");
     println!("engine-stub outcome: {outcome:?}");

@@ -420,7 +420,7 @@ async fn exit_143_is_recorded_as_killed_not_crashed() {
 
     let (extra_tx, extra_rx) = mpsc::channel(1);
     drop(extra_tx);
-    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid)));
+    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid), None));
 
     wait_for_file(&jpath, |c| c.contains("alive and catching TERM")).await;
     session.kill().await.expect("kill must be provable");
@@ -471,7 +471,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
     cfg.extra_env.push(("FAKE_MODE".into(), "stdin-closed".into()));
     let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
     let (extra_tx, extra_rx) = mpsc::channel(8);
-    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid)));
+    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid), None));
     wait_for_file(&jpath, |c| c.contains("init")).await;
 
     let delivered = send_and_journal(&mut session, &extra_tx, "into the void")
@@ -516,6 +516,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         writer2,
         dir2.clone(),
         test_meta(&sid2),
+        None,
     ));
     assert!(send_and_journal(&mut session2, &extra_tx2, "hello there")
         .await
@@ -586,7 +587,13 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
     );
     cfg.resume = true;
     cfg.extra_env.push(("FAKE_MODE".into(), "resume-probe".into()));
-    let (_session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    let (mut session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    // resume-probe answers the continuation message, like the real CLI —
+    // cold resume is always user-initiated (spec 02: no auto-redispatch).
+    session
+        .send_user_message("continue")
+        .await
+        .expect("send continuation message");
     let probe = tokio::time::timeout(TEST_TIMEOUT, async {
         while let Some(ev) = rx.recv().await {
             if let SessionEvent::AssistantText { text } = ev {
@@ -795,7 +802,7 @@ async fn real_claude_journal_and_cold_resume() {
     let cfg = SpawnConfig::new("claude", std::env::temp_dir(), sid.clone());
     let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
     let (extra_tx, extra_rx) = mpsc::channel(4);
-    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid)));
+    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid), None));
 
     let msg = format!("Remember the codeword: {CODEWORD}. Reply with exactly: noted");
     extra_tx

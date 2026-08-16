@@ -1,0 +1,30 @@
+[package]
+name = "eave-app"
+version = "0.1.0"
+edition = "2021"
+
+# One binary, two roles: `eave` (GPUI shell) / `eave --engine` (spec 01
+# §Topology, comet-style).
+[[bin]]
+name = "eave"
+path = "src/main.rs"
+
+[dependencies]
+eave-core = { path = "../eave-core" }
+eave-wire = { path = "../eave-wire" }
+eave-engine = { path = "../eave-engine" }
+
+# Pinned fixed upstream rev — no fork, no branch pin (locked decision;
+# crates.io gpui is stale, research: gpui-fork-cost.md §6). f14fea9 is the
+# upstream base rev comet's fork stacks on, so it is known to build on this
+# class of machine. `runtime_shaders` avoids a build-time Metal toolchain
+# dependency; `font-kit` is the macOS text system.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "f14fea9bf3c93797d5161f7440ed418655bc6c57" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "f14fea9bf3c93797d5161f7440ed418655bc6c57", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
+
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+futures = "0.3"
+serde_json = "1"

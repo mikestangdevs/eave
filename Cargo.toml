@@ -1,3 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/eave-core"]
+members = [
+    "crates/eave-core",
+    "crates/eave-wire",
+    "crates/eave-engine",
+    "crates/eave-app",
+]
+
+# gpui is unusably slow unoptimized; optimize deps even in dev (zed's own
+# approach, mirrored in comet's workspace manifest).
+[profile.dev.package."*"]
+opt-level = 2
