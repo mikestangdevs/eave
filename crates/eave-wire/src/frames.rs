@@ -116,8 +116,9 @@ pub enum SubscriptionItem {
         epoch: u64,
         header: Header,
     },
-    /// A batch of records, contiguous by seq. Batching is opportunistic
-    /// coalescing — a batch boundary carries no meaning.
+    /// A batch of records, contiguous by seq. Batching is the engine's
+    /// strict 120 ms delta folding (spec 05 §Engine semantics) — pacing
+    /// only; a batch boundary carries no meaning.
     Events {
         session_id: String,
         epoch: u64,
