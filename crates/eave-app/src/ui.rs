@@ -582,7 +582,7 @@ impl VeiledBlock {
             }
             let color = if run.style.code { self.code_color } else { self.color };
             let underline = run.style.link.then(|| UnderlineStyle {
-                thickness: px(1.),
+                thickness: px(theme::HAIRLINE),
                 color: None,
                 wavy: false,
             });
@@ -798,7 +798,7 @@ impl Shell {
             .child(
                 div()
                     .text_size(px(theme::TITLE_SIZE))
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(theme::WEIGHT_LABEL)
                     .text_color(theme::text_secondary())
                     .child("eave"),
             )
@@ -832,8 +832,8 @@ impl Shell {
             .flex_none()
             .border_t_1()
             .border_color(theme::border())
-            .pt(px(4.))
-            .pb(px(10.))
+            .pt(px(theme::SPACE_1))
+            .pb(px(theme::SPACE_3))
             .child(
             Self::column(
                 div()
@@ -886,22 +886,22 @@ impl Shell {
                     .rounded(px(theme::RADIUS_PANEL))
                     .border_1()
                     .border_color(theme::danger_ring())
-                    .bg(theme::danger_wash())
+                    .bg(theme::danger_plate())
                     .shadow(theme::shadow_panel())
-                    .px(px(12.))
-                    .py(px(8.))
+                    .px(px(theme::SPACE_3))
+                    .py(px(theme::SPACE_2))
                     .text_size(px(theme::DETAIL_SIZE))
                     .line_height(px(theme::DETAIL_LINE))
                     .text_color(theme::text_secondary())
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(theme::WEIGHT_LABEL)
                             .text_color(theme::danger())
                             .child("engine unavailable"),
                     )
                     .child(message),
             )
-            .pb(px(8.))
+            .pb(px(theme::SPACE_2))
             .into_any_element(),
         )
     }
@@ -922,8 +922,8 @@ impl Shell {
                 .border_color(ring)
                 .bg(wash)
                 .shadow(theme::shadow_panel())
-                .px(px(12.))
-                .py(px(8.))
+                .px(px(theme::SPACE_3))
+                .py(px(theme::SPACE_2))
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -941,9 +941,9 @@ impl Shell {
                 .child(
                     div()
                         .font_weight(if strong {
-                            FontWeight::SEMIBOLD
+                            theme::WEIGHT_STRONG
                         } else {
-                            FontWeight::MEDIUM
+                            theme::WEIGHT_LABEL
                         })
                         .text_color(dot)
                         .child(text),
@@ -968,9 +968,9 @@ impl Shell {
                 panel(
                     theme::warning_ring(),
                     if prominent {
-                        theme::warning_wash_strong()
+                        theme::warning_plate_strong()
                     } else {
-                        theme::warning_wash()
+                        theme::warning_plate()
                     },
                 )
                 .child(label(
@@ -984,7 +984,7 @@ impl Shell {
                 since_ms,
                 zero_samples,
                 sampled_ms,
-            } => panel(theme::danger_ring(), theme::danger_wash())
+            } => panel(theme::danger_ring(), theme::danger_plate())
                 .child(label(
                     theme::danger(),
                     format!("unresponsive for {}", fmt_elapsed(now.saturating_sub(since_ms))),
@@ -997,7 +997,7 @@ impl Shell {
                 ))
                 .child(self.kill_affordance(cx, "it will never be killed automatically")),
             AttentionSnapshot::Failed { since_ms, cause } => {
-                panel(theme::danger_ring(), theme::danger_wash())
+                panel(theme::danger_ring(), theme::danger_plate())
                     .child(label(
                         theme::danger(),
                         format!("failed {} ago", fmt_elapsed(now.saturating_sub(since_ms))),
@@ -1007,7 +1007,7 @@ impl Shell {
                     .child(self.kill_affordance(cx, "clean up the process when you're ready"))
             }
         };
-        Some(Self::column(inner).pb(px(8.)).into_any_element())
+        Some(Self::column(inner).pb(px(theme::SPACE_2)).into_any_element())
     }
 
     fn kill_affordance(&self, cx: &Context<Self>, note: &str) -> gpui::Div {
@@ -1019,14 +1019,14 @@ impl Shell {
             .pt_1()
             .child(
                 div()
-                    .px(px(10.))
-                    .py(px(3.))
+                    .px(px(theme::SPACE_3))
+                    .py(px(theme::SPACE_1))
                     .rounded(px(theme::RADIUS_BUTTON))
                     .border_1()
                     .border_color(theme::danger_ring())
                     .bg(theme::danger_wash_strong())
                     .text_size(px(theme::DETAIL_SIZE))
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(theme::WEIGHT_LABEL)
                     .text_color(theme::danger())
                     .id("attn-kill")
                     .on_click(cx.listener(|this, _, _, _| {
@@ -1074,8 +1074,8 @@ impl Shell {
                     .border_1()
                     .border_color(theme::border())
                     .bg(theme::raised())
-                    .px(px(12.))
-                    .py(px(8.))
+                    .px(px(theme::SPACE_3))
+                    .py(px(theme::SPACE_2))
                     .text_size(px(theme::USER_SIZE))
                     .line_height(px(theme::USER_LINE))
                     .text_color(theme::text())
@@ -1096,7 +1096,7 @@ impl Shell {
                             div()
                                 .text_size(px(theme::SMALL_SIZE))
                                 .line_height(px(theme::SMALL_LINE))
-                                .font_weight(FontWeight::MEDIUM)
+                                .font_weight(theme::WEIGHT_LABEL)
                                 .text_color(theme::danger())
                                 .child("not delivered — the agent never saw this message"),
                         )
@@ -1111,32 +1111,40 @@ impl Shell {
                     ToolStatus::Interrupted => ("interrupted", theme::danger()),
                 };
                 div()
-                    .pt(px(8.))
-                    .pb(px(2.))
+                    .pt(px(theme::SPACE_2))
+                    .pb(px(theme::SPACE_1))
+                    .pl(px(theme::TOOL_INDENT))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .text_size(px(theme::LABEL_SIZE))
-                    .line_height(px(theme::LABEL_LINE))
                     .child(div().size(px(theme::TOOL_DOT)).rounded_full().bg(dot))
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::TOOL_NAME_SIZE))
+                            .line_height(px(theme::TOOL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_LABEL)
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(name.clone())),
                     )
-                    .child(div().text_color(theme::text_tertiary()).child(label))
+                    .child(
+                        div()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(label),
+                    )
                     .into_any_element()
             }
             Row::Marker { text } => div()
-                .py(px(12.))
+                .py(px(theme::SPACE_3))
                 .flex()
                 .justify_center()
                 .child(
                     div()
-                        .px(px(10.))
-                        .py(px(4.))
+                        .px(px(theme::SPACE_3))
+                        .py(px(theme::SPACE_1))
                         .rounded_full()
                         .border_1()
                         .border_color(theme::border())
@@ -1196,22 +1204,22 @@ impl Shell {
                     .overflow_hidden()
                     .child(
                         div()
-                            .h(px(24.))
-                            .px(px(10.))
+                            .h(px(theme::CODE_STRIP_H))
+                            .px(px(theme::SPACE_3))
                             .flex()
                             .items_center()
                             .border_b_1()
                             .border_color(theme::border())
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::MICRO_LINE))
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(theme::WEIGHT_LABEL)
                             .text_color(theme::text_ghost())
                             .child(SharedString::from(label.to_string())),
                     )
                     .child(
                         div()
-                            .px(px(10.))
-                            .py(px(8.))
+                            .px(px(theme::SPACE_3))
+                            .py(px(theme::SPACE_2))
                             .font_family(theme::MONO)
                             .text_size(px(theme::CODE_SIZE))
                             .line_height(px(theme::CODE_LINE))
@@ -1221,23 +1229,19 @@ impl Shell {
                     .into_any_element()
             }
             Block::Heading { level, text } => {
-                let (size, line, bold) = theme::heading(*level);
+                let (size, line, weight) = theme::heading(*level);
                 div()
                     .pt_1()
                     .text_size(size)
                     .line_height(line)
                     .text_color(theme::text())
-                    .font_weight(if bold {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::SEMIBOLD
-                    })
+                    .font_weight(weight)
                     .child(SharedString::from(text.clone()))
                     .into_any_element()
             }
             Block::Rule => div()
                 .my_1()
-                .h(px(1.))
+                .h(px(theme::HAIRLINE))
                 .bg(theme::border())
                 .into_any_element(),
             Block::List { text } | Block::Table { text } | Block::Paragraph { text } => {
@@ -1373,14 +1377,14 @@ impl Render for Shell {
                 .border_color(theme::border_strong())
                 .bg(theme::composer())
                 .shadow(theme::shadow_panel())
-                .p(px(10.))
+                .p(px(theme::SPACE_3))
                 .child(
                     div()
-                        .min_h(px(24.))
-                        .px(px(4.))
-                        .pt(px(2.))
+                        .min_h(px(theme::COMPOSER_MIN_H))
+                        .px(px(theme::SPACE_1))
+                        .pt(px(theme::SPACE_HALF))
                         .text_size(px(theme::BODY_SIZE))
-                        .line_height(px(22.))
+                        .line_height(px(theme::COMPOSER_LINE))
                         .text_color(theme::text())
                         .child(if has_draft {
                             div().child(format!("{composer_text}▏")).into_any_element()
@@ -1399,7 +1403,7 @@ impl Render for Shell {
                 )
                 .child(
                     div()
-                        .mt(px(8.))
+                        .mt(px(theme::SPACE_2))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -1422,8 +1426,8 @@ impl Render for Shell {
                                 } else {
                                     theme::overlay_strong()
                                 })
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(theme::SEND_GLYPH_SIZE))
+                                .font_weight(theme::WEIGHT_STRONG)
                                 .text_color(if has_draft {
                                     theme::on_inverse()
                                 } else {
@@ -1473,8 +1477,8 @@ impl Render for Shell {
                                 .justify_center()
                                 .child(
                                     div()
-                                        .px(px(12.))
-                                        .py(px(5.))
+                                        .px(px(theme::SPACE_3))
+                                        .py(px(theme::SPACE_1))
                                         .rounded_full()
                                         .border_1()
                                         .border_color(theme::border_strong())

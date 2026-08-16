@@ -9,7 +9,7 @@
 //! hairlines) — the closest reference that works on our upstream gpui
 //! pin and locked opaque window (spec 03 §No-fork consequences).
 
-use gpui::{hsla, px, rgb, BoxShadow, Hsla, Pixels};
+use gpui::{hsla, px, rgb, BoxShadow, FontWeight, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
 // Surfaces (opaque — locked decision, no vibrancy/blur)
@@ -157,6 +157,21 @@ pub fn danger_wash_strong() -> Hsla {
     danger().opacity(0.14)
 }
 
+/// Attention/connection panels sit at L2: their tint is pre-composited
+/// over [`panel`] (the wash alpha blended into `#282828`) so the panel
+/// is never darker than the chrome beneath it — a state surface must
+/// read raised, not sunken. Keep in sync with `panel()` and the wash
+/// alphas above.
+pub fn warning_plate() -> Hsla {
+    rgb(0x312f2b).into()
+}
+pub fn warning_plate_strong() -> Hsla {
+    rgb(0x3e3930).into()
+}
+pub fn danger_plate() -> Hsla {
+    rgb(0x332c2c).into()
+}
+
 // ---------------------------------------------------------------------------
 // Code
 
@@ -168,6 +183,22 @@ pub fn code_text() -> Hsla {
 pub fn code_block_text() -> Hsla {
     text()
 }
+
+// ---------------------------------------------------------------------------
+// Rhythm — every gap and padding derives from a 4 px base unit.
+// SPACE_HALF exists only for sub-grid baseline nudges (caret alignment),
+// never for gaps between elements.
+
+pub const UNIT: f32 = 4.0;
+pub const SPACE_HALF: f32 = UNIT / 2.0;
+pub const SPACE_1: f32 = UNIT;
+pub const SPACE_2: f32 = UNIT * 2.0;
+pub const SPACE_3: f32 = UNIT * 3.0;
+pub const SPACE_4: f32 = UNIT * 4.0;
+pub const SPACE_6: f32 = UNIT * 6.0;
+
+/// 1 px rules and dividers (the markdown `---` rule).
+pub const HAIRLINE: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Typography
@@ -199,14 +230,32 @@ pub const MICRO_SIZE: f32 = 10.0;
 pub const MICRO_LINE: f32 = 14.0;
 /// Titlebar title.
 pub const TITLE_SIZE: f32 = 13.0;
+/// Tool rows: the tool name is a machine identifier — mono, so tool
+/// events read as instrument facts, not prose.
+pub const TOOL_NAME_SIZE: f32 = 12.0;
+pub const TOOL_NAME_LINE: f32 = 16.0;
+/// The send button glyph.
+pub const SEND_GLYPH_SIZE: f32 = 13.0;
+/// Composer input line (slightly airier than body so the caret row
+/// doesn't feel cramped inside the card).
+pub const COMPOSER_LINE: f32 = 22.0;
+pub const COMPOSER_MIN_H: f32 = 24.0;
 
-/// Heading ladder relative to body (waku's scale): size, line, bold?.
-pub fn heading(level: u8) -> (Pixels, Pixels, bool) {
+/// Weight roles — the only weights the shell uses. Prose is NORMAL;
+/// labels/names are MEDIUM; STRONG is reserved for escalated notices
+/// and the armed send glyph. (Markdown `**bold**` inside prose keeps
+/// semantic BOLD — that's content, not chrome.)
+pub const WEIGHT_BODY: FontWeight = FontWeight::NORMAL;
+pub const WEIGHT_LABEL: FontWeight = FontWeight::MEDIUM;
+pub const WEIGHT_STRONG: FontWeight = FontWeight::SEMIBOLD;
+
+/// Heading ladder relative to body (waku's scale): size, line, weight.
+pub fn heading(level: u8) -> (Pixels, Pixels, FontWeight) {
     match level {
-        1 => (px(19.5), px(28.0), true),
-        2 => (px(17.5), px(25.0), true),
-        3 => (px(15.5), px(22.0), false),
-        _ => (px(BODY_SIZE), px(BODY_LINE), false),
+        1 => (px(19.5), px(28.0), FontWeight::BOLD),
+        2 => (px(17.5), px(25.0), FontWeight::BOLD),
+        3 => (px(15.5), px(22.0), FontWeight::SEMIBOLD),
+        _ => (px(BODY_SIZE), px(BODY_LINE), FontWeight::SEMIBOLD),
     }
 }
 
@@ -230,12 +279,19 @@ pub const TRAFFIC_CLEARANCE: f32 = 86.0;
 pub const GUTTER: f32 = 20.0;
 pub const CONTENT_MAX_W: f32 = 720.0;
 
-/// Vertical rhythm in the log.
-pub const TURN_GAP: f32 = 24.0;
-pub const MSG_TOP_GAP: f32 = 14.0;
-pub const BLOCK_GAP: f32 = 10.0;
-pub const LOG_TOP_PAD: f32 = 22.0;
-pub const LOG_BOTTOM_PAD: f32 = 22.0;
+/// Vertical rhythm in the log (all on the 4 px grid). TURN_GAP marks
+/// an operator directive as a section break; MSG_TOP_GAP opens a
+/// message; BLOCK_GAP separates blocks inside one message.
+pub const TURN_GAP: f32 = SPACE_6;
+pub const MSG_TOP_GAP: f32 = SPACE_4;
+pub const BLOCK_GAP: f32 = SPACE_3;
+pub const LOG_TOP_PAD: f32 = SPACE_6;
+pub const LOG_BOTTOM_PAD: f32 = SPACE_6;
+/// Tool rows indent under their message's prose — sub-events of the
+/// turn, not peers of it.
+pub const TOOL_INDENT: f32 = SPACE_4;
+/// Code plate: language strip height and interior padding.
+pub const CODE_STRIP_H: f32 = SPACE_6;
 
 /// Directive block cap: don't let a one-liner span the whole column.
 pub const DIRECTIVE_MAX_W: f32 = 560.0;
