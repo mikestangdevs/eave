@@ -180,7 +180,8 @@ async fn warm_reconnect_streams_across_client_generations() {
     // Generation 2: resume from cursor — replay continues at seq+1.
     let c2 = Client::connect(&dir).await.expect("connect gen2");
     let mut rx2 = c2.subscribe("s1", Some(cursor1)).await.expect("subscribe gen2");
-    let mut t2 = Transcript { cursor: Some(cursor1), ..Default::default() };
+    let mut t2 = Transcript::new();
+    t2.cursor = Some(cursor1);
     let second = drain_records(&mut rx2, &mut t2, 8, Duration::from_secs(15)).await;
     assert_eq!(
         second.first().unwrap().seq,
@@ -201,7 +202,8 @@ async fn warm_reconnect_streams_across_client_generations() {
     // (a relaunched UI holds no projection): full replay from seq 1.
     let c3 = Client::connect(&dir).await.expect("connect gen3");
     let mut rx3 = c3.subscribe("s1", Some(cursor2)).await.expect("subscribe gen3");
-    let mut t3 = Transcript { cursor: Some(cursor2), ..Default::default() };
+    let mut t3 = Transcript::new();
+    t3.cursor = Some(cursor2);
     let third = drain_records(&mut rx3, &mut t3, 4, Duration::from_secs(15)).await;
     assert_eq!(third.first().unwrap().seq, cursor2.seq + 1);
 
@@ -528,6 +530,75 @@ async fn send_after_terminal_outcome_resumes_same_provider_session() {
     assert_eq!(flags.len(), 2, "{flags:?}");
     assert!(flags[1].contains("RESUME_FLAG:true"), "{flags:?}");
     assert!(flags[1].contains("ID:s1"), "{flags:?}");
+
+    drop(engine);
+}
+
+/// Strict delta-folding (Stage D; spec 03 §Streaming commit): the fake
+/// emits a text delta every 50 ms; the wire must carry at most one
+/// delta-only Events frame per ~120 ms window, each folding several
+/// records — not one frame per record.
+#[tokio::test]
+async fn deltas_fold_into_120ms_frames() {
+    let dir = scratch();
+    let engine = EngineProc::spawn(&dir, "slow-stream");
+
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open");
+    assert!(c.send("s1", "go").await.expect("send"));
+    let mut rx = c.subscribe("s1", None).await.expect("subscribe");
+
+    // Collect ~2s of steady streaming with arrival timestamps.
+    let mut t = Transcript::new();
+    let mut frames: Vec<(Instant, usize, bool)> = Vec::new(); // (arrival, records, all_deltas)
+    let end = Instant::now() + Duration::from_secs(4);
+    while frames.len() < 12 {
+        assert!(Instant::now() < end, "not enough frames: {}", frames.len());
+        let item = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("frame in time")
+            .expect("stream open");
+        match item {
+            SubscriptionItem::Reset { .. } => t.reset(),
+            SubscriptionItem::Events { epoch, records, .. } => {
+                t.apply(epoch, &records).expect("no seq gaps");
+                let all_deltas = records.iter().all(|r| {
+                    matches!(
+                        &r.event,
+                        JournalEvent::Provider {
+                            event: eave_core::events::SessionEvent::TextDelta { .. }
+                        }
+                    )
+                });
+                frames.push((Instant::now(), records.len(), all_deltas));
+            }
+        }
+    }
+    drop(rx);
+
+    // Steady state: skip the leading edge (replay + turn start), measure
+    // consecutive delta-only frames.
+    let steady: Vec<&(Instant, usize, bool)> =
+        frames.iter().skip(3).filter(|f| f.2).collect();
+    assert!(steady.len() >= 6, "expected a steady delta stream, got {}", steady.len());
+    let mut folded = 0;
+    for pair in steady.windows(2) {
+        let gap = pair[1].0.duration_since(pair[0].0);
+        assert!(
+            gap >= Duration::from_millis(90),
+            "delta frames only {gap:?} apart — coalesce window not enforced"
+        );
+        if pair[1].1 >= 2 {
+            folded += 1;
+        }
+    }
+    // 50 ms cadence into 120 ms windows: nearly every frame folds ≥2
+    // records (allow one scheduler hiccup).
+    assert!(
+        folded + 1 >= steady.len() - 1,
+        "frames are not folding deltas: {:?}",
+        steady.iter().map(|f| f.1).collect::<Vec<_>>()
+    );
 
     drop(engine);
 }

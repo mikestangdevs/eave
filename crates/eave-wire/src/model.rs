@@ -48,11 +48,18 @@ pub enum Row {
 #[derive(Debug, Default)]
 pub struct Transcript {
     pub rows: Vec<Row>,
+    /// Per-row revision, parallel to `rows`: bumped on every mutation of
+    /// that row. Lets projections (the display tree) skip unchanged rows
+    /// without rehashing content — O(changed) folds instead of
+    /// O(transcript) per burst. If you mutate `rows` directly (tests),
+    /// call [`Transcript::touch`]; `apply` maintains this itself.
+    pub revs: Vec<u64>,
     /// Last applied (epoch, seq) — the subscribe cursor for a mid-life
     /// reconnect. A relaunched client starts with `None` and full replay.
     pub cursor: Option<Cursor>,
     /// Terminal state name once a `Closed` record was applied.
     pub closed: Option<String>,
+    rev_counter: u64,
 }
 
 impl Transcript {
@@ -61,9 +68,13 @@ impl Transcript {
     }
 
     /// Drop everything — a `Reset` frame arrived (epoch change or first
-    /// subscribe); replay from seq 1 follows.
+    /// subscribe); replay from seq 1 follows. The revision counter
+    /// survives so rows of the replayed transcript never reuse a revision
+    /// a stale projection cache may still hold.
     pub fn reset(&mut self) {
+        let counter = self.rev_counter;
         *self = Self::default();
+        self.rev_counter = counter;
     }
 
     /// Apply records in seq order. Records at or below the cursor are
@@ -91,19 +102,39 @@ impl Transcript {
         Ok(())
     }
 
+    /// Mark row `ix` as changed. `apply` calls this on every mutation;
+    /// call it yourself only when mutating `rows` directly.
+    pub fn touch(&mut self, ix: usize) {
+        self.rev_counter += 1;
+        if self.revs.len() < self.rows.len() {
+            self.revs.resize(self.rows.len(), self.rev_counter);
+        }
+        if let Some(r) = self.revs.get_mut(ix) {
+            *r = self.rev_counter;
+        }
+    }
+
+    /// Append a row with its revision tracked.
+    pub fn push_row(&mut self, row: Row) {
+        self.rev_counter += 1;
+        self.rows.push(row);
+        self.revs.push(self.rev_counter);
+    }
+
     fn apply_event(&mut self, event: &JournalEvent) {
         match event {
             JournalEvent::Provider { event } => self.apply_provider(event),
-            JournalEvent::UserSent { text } => self.rows.push(Row::User {
+            JournalEvent::UserSent { text } => self.push_row(Row::User {
                 text: text.clone(),
                 delivery: Delivery::Pending,
             }),
             JournalEvent::UserDelivered {} => {
                 // Order-paired: confirm the oldest pending send.
-                for row in self.rows.iter_mut() {
-                    if let Row::User { delivery, .. } = row {
+                for ix in 0..self.rows.len() {
+                    if let Row::User { delivery, .. } = &mut self.rows[ix] {
                         if *delivery == Delivery::Pending {
                             *delivery = Delivery::Delivered;
+                            self.touch(ix);
                             break;
                         }
                     }
@@ -114,7 +145,7 @@ impl Transcript {
             }
             JournalEvent::TurnInterrupted { reason } => {
                 self.settle_live_rows();
-                self.rows.push(Row::Marker {
+                self.push_row(Row::Marker {
                     text: format!("turn interrupted: {reason}"),
                 });
             }
@@ -124,32 +155,40 @@ impl Transcript {
 
     fn apply_provider(&mut self, event: &SessionEvent) {
         match event {
-            SessionEvent::Init { session_id } => self.rows.push(Row::Marker {
+            SessionEvent::Init { session_id } => self.push_row(Row::Marker {
                 text: format!("session started ({session_id})"),
             }),
             // Deltas and their snapshot pair with the *live* assistant row,
             // which is not necessarily the last row — engine-side records
             // (UserSent/UserDelivered) interleave with provider events.
-            SessionEvent::TextDelta { text } => match self.last_live_assistant() {
-                Some((t, _)) => t.push_str(text),
-                None => self.rows.push(Row::Assistant {
+            SessionEvent::TextDelta { text } => match self.last_live_assistant_ix() {
+                Some(ix) => {
+                    if let Row::Assistant { text: t, .. } = &mut self.rows[ix] {
+                        t.push_str(text);
+                    }
+                    self.touch(ix);
+                }
+                None => self.push_row(Row::Assistant {
                     text: text.clone(),
                     live: true,
                 }),
             },
             // The post-stream snapshot replaces the deltas that built it —
             // replaced, never merged (spec 03 §Streaming commit).
-            SessionEvent::AssistantText { text } => match self.last_live_assistant() {
-                Some((t, live)) => {
-                    *t = text.clone();
-                    *live = false;
+            SessionEvent::AssistantText { text } => match self.last_live_assistant_ix() {
+                Some(ix) => {
+                    if let Row::Assistant { text: t, live } = &mut self.rows[ix] {
+                        *t = text.clone();
+                        *live = false;
+                    }
+                    self.touch(ix);
                 }
-                None => self.rows.push(Row::Assistant {
+                None => self.push_row(Row::Assistant {
                     text: text.clone(),
                     live: false,
                 }),
             },
-            SessionEvent::ToolUseStarted { id, name } => self.rows.push(Row::Tool {
+            SessionEvent::ToolUseStarted { id, name } => self.push_row(Row::Tool {
                 id: id.clone(),
                 name: name.clone(),
                 status: ToolStatus::Running,
@@ -183,45 +222,54 @@ impl Transcript {
     /// interrupted (the process that ran it is gone), and open streaming
     /// text settles. A later `--resume` segment appends after this.
     fn apply_closed(&mut self, outcome: &Outcome) {
-        for row in self.rows.iter_mut() {
-            match row {
+        for ix in 0..self.rows.len() {
+            let changed = match &mut self.rows[ix] {
                 Row::User { delivery, .. } if *delivery == Delivery::Pending => {
                     *delivery = Delivery::Undelivered;
+                    true
                 }
                 Row::Tool { status, .. } if *status == ToolStatus::Running => {
                     *status = ToolStatus::Interrupted;
+                    true
                 }
-                _ => {}
+                _ => false,
+            };
+            if changed {
+                self.touch(ix);
             }
         }
         self.settle_live_rows();
         let state = outcome.state_name();
         self.closed = Some(state.to_string());
-        self.rows.push(Row::Marker {
+        self.push_row(Row::Marker {
             text: format!("session closed: {state}"),
         });
     }
 
-    fn last_live_assistant(&mut self) -> Option<(&mut String, &mut bool)> {
-        self.rows.iter_mut().rev().find_map(|row| match row {
-            Row::Assistant { text, live } if *live => Some((text, live)),
+    fn last_live_assistant_ix(&self) -> Option<usize> {
+        self.rows.iter().enumerate().rev().find_map(|(ix, row)| match row {
+            Row::Assistant { live, .. } if *live => Some(ix),
             _ => None,
         })
     }
 
     fn settle_live_rows(&mut self) {
-        for row in self.rows.iter_mut() {
-            if let Row::Assistant { live, .. } = row {
-                *live = false;
+        for ix in 0..self.rows.len() {
+            if let Row::Assistant { live, .. } = &mut self.rows[ix] {
+                if *live {
+                    *live = false;
+                    self.touch(ix);
+                }
             }
         }
     }
 
     fn set_tool_status(&mut self, id: &str, status: ToolStatus) {
-        for row in self.rows.iter_mut() {
-            if let Row::Tool { id: rid, status: s, .. } = row {
+        for ix in 0..self.rows.len() {
+            if let Row::Tool { id: rid, status: s, .. } = &mut self.rows[ix] {
                 if rid == id {
                     *s = status;
+                    self.touch(ix);
                     return;
                 }
             }

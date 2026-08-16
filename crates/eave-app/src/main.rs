@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-mod ui;
+use eave_app::ui;
 
 fn main() {
     let mut engine = false;

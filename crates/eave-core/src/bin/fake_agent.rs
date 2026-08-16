@@ -79,6 +79,20 @@ fn emit_text(text: &str) {
     }));
 }
 
+/// A bare streaming delta with no per-tick snapshot — how the real CLI
+/// actually streams (the captured fixture holds 136 deltas against 3
+/// snapshots; snapshots come at content-block end, not per delta).
+fn emit_delta(text: &str) {
+    emit(json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": text },
+        },
+    }));
+}
+
 fn emit_result() {
     emit(json!({ "type": "result", "subtype": "success", "is_error": false }));
 }
@@ -238,7 +252,7 @@ fn main() {
             emit_init();
             let mut i: u64 = 0;
             loop {
-                emit_text(&format!("tick {i} "));
+                emit_delta(&format!("tick {i} "));
                 i += 1;
                 std::thread::sleep(Duration::from_millis(50));
             }

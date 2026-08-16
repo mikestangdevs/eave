@@ -1362,6 +1362,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "libc",
  "serde_json",
  "tokio",
 ]

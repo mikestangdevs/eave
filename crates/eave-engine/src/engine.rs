@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{unix::OwnedWriteHalf, UnixListener, UnixStream};
@@ -611,45 +612,92 @@ async fn run_subscription(
             return;
         }
     }
+    // Strict delta-folding at the 120 ms coalesce (spec 03 §Streaming
+    // commit): text deltas are held and folded into one Events frame per
+    // window — at most one delta frame per 120 ms sustained. The leading
+    // edge of a burst after quiet flashes through immediately (the window
+    // is measured from the last emit, not the first pending record), and
+    // any non-delta record (tool events, snapshots, turn ends, Closed)
+    // flushes the batch at once — only prose is latency-tolerant.
+    const COALESCE: Duration = Duration::from_millis(120);
+    let mut last_emit = Instant::now() - COALESCE;
+    let mut lagged = false;
+    let mut closed = false;
     loop {
-        match rx.recv().await {
-            Ok(rec) => {
-                if rec.seq <= last_sent {
-                    continue; // already covered by the replay snapshot
-                }
-                // Opportunistic coalescing: drain whatever else is ready
-                // into one Events frame.
-                let mut records = vec![rec];
-                while let Ok(more) = rx.try_recv() {
-                    if more.seq > records.last().unwrap().seq {
-                        records.push(more);
-                    }
-                }
-                last_sent = records.last().unwrap().seq;
-                let item = SubscriptionItem::Events {
-                    session_id: handle.session_id.clone(),
-                    epoch: handle.epoch(),
-                    records,
-                };
+        if lagged {
+            // Fell behind the broadcast ring: heal with a fresh full
+            // replay (spec 03 §Streaming commit — a fresh Reset heals).
+            lagged = false;
+            let (nrx, items, nlast) = handle.snapshot(None);
+            rx = nrx;
+            last_sent = nlast;
+            for item in items {
                 if send_item(&w, id, item).await.is_err() {
                     return;
                 }
             }
-            // Fell behind the broadcast ring: heal with a fresh full replay
-            // (spec 03 §Streaming commit — a fresh Reset heals).
+            continue;
+        }
+        if closed {
+            return;
+        }
+        let rec = match rx.recv().await {
+            Ok(rec) => rec,
             Err(broadcast::error::RecvError::Lagged(_)) => {
-                let (nrx, items, nlast) = handle.snapshot(None);
-                rx = nrx;
-                last_sent = nlast;
-                for item in items {
-                    if send_item(&w, id, item).await.is_err() {
-                        return;
-                    }
-                }
+                lagged = true;
+                continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
+        };
+        if rec.seq <= last_sent {
+            continue; // already covered by the replay snapshot
+        }
+        let mut flush = !is_delta(&rec);
+        let mut records = vec![rec];
+        while !flush {
+            let since = last_emit.elapsed();
+            if since >= COALESCE {
+                break;
+            }
+            match tokio::time::timeout(COALESCE - since, rx.recv()).await {
+                Err(_window_elapsed) => break,
+                Ok(Ok(more)) => {
+                    if more.seq > records.last().unwrap().seq {
+                        flush = !is_delta(&more);
+                        records.push(more);
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    lagged = true;
+                    break;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        last_sent = records.last().unwrap().seq;
+        last_emit = Instant::now();
+        let item = SubscriptionItem::Events {
+            session_id: handle.session_id.clone(),
+            epoch: handle.epoch(),
+            records,
+        };
+        if send_item(&w, id, item).await.is_err() {
+            return;
         }
     }
+}
+
+/// Only text deltas are folded; everything else flushes the window.
+fn is_delta(rec: &Record) -> bool {
+    matches!(
+        &rec.event,
+        eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::TextDelta { .. }
+        }
+    )
 }
 
 async fn send_item(
