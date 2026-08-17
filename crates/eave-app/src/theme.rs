@@ -112,16 +112,55 @@ pub fn panel() -> Hsla {
         rgb(0x282828).into()
     }
 }
-/// L2 chrome that floats OVER in-window content (the ↓-bottom pill):
-/// must occlude, so it keeps the pre-blended opaque plate in both modes
-/// (in-window compositing is plain alpha — a wash would ghost the log
-/// through it).
-pub fn panel_floating() -> Hsla {
-    rgb(0x282828).into()
-}
 /// The composer card plate — L2 chrome, same rung as [`panel`].
 pub fn composer() -> Hsla {
     panel()
+}
+
+// ---------------------------------------------------------------------------
+// In-app glass (fork pin, Stage H) — chrome FLOATING OVER THE LOG paints
+// a backdrop blur (the fork's BackdropBlur primitive) under a translucent
+// tint. This supersedes the vibrancy spike's occlusion compromise: a
+// floating surface no longer needs to be opaque to be legible, because
+// the content beneath it is blurred before the tint composites.
+//
+// The retune logic, distinct from the vibrancy ladder's: here the
+// backdrop is our OWN dark content (blurred log ≈ canvas 26/255 in empty
+// regions, ~56/255 through text-dense regions), not an arbitrary
+// desktop. A single tint alpha for the whole chrome rung keeps the rung
+// coherent; the hex stays the rung's own value so hue identity holds.
+// α 0.72 is the most-solid tint (stance: chrome is an instrument
+// surface) at which the blurred content still registers: surface
+// luminance breathes ~36→45/255 as content passes beneath (the depth
+// cue), while body text keeps >8:1 and ghost text ~2:1 against it —
+// the same ratios the opaque plates gave. At 0.80 the breath drops
+// under ±6/255 (imperceptible); below ~0.6 ghost-tier text fogs out.
+// These tints are EAVE_VIBRANCY-independent: in-app blur samples the
+// scene, window vibrancy handles what's behind the window.
+
+/// Backdrop-blur radius for L2 floating chrome (comet's composer class
+/// runs 12–16; menus/modals take 44 — reserved with L3).
+pub const BLUR_CHROME: f32 = 16.0;
+const CHROME_GLASS_ALPHA: f32 = 0.72;
+
+fn glass_tint(hex: u32) -> Hsla {
+    let c: Hsla = rgb(hex).into();
+    c.opacity(CHROME_GLASS_ALPHA)
+}
+/// L2 glass: floating chrome over the log (composer, ↓-bottom pill).
+pub fn chrome_glass() -> Hsla {
+    glass_tint(0x282828)
+}
+/// Attention/connection plates as glass — same hexes as the opaque
+/// plates, same single chrome alpha.
+pub fn warning_plate_glass() -> Hsla {
+    glass_tint(0x312f2b)
+}
+pub fn warning_plate_strong_glass() -> Hsla {
+    glass_tint(0x3e3930)
+}
+pub fn danger_plate_glass() -> Hsla {
+    glass_tint(0x332c2c)
 }
 /// Sunken panels: code blocks.
 pub fn inset() -> Hsla {
@@ -435,6 +474,17 @@ pub const RADIUS_CHIP: f32 = 5.0;
 pub const RAIL_TOGGLE_W: f32 = 16.0;
 pub const RAIL_TOGGLE_H: f32 = 12.0;
 pub const RADIUS_GLYPH: f32 = 3.0;
+
+// ---------------------------------------------------------------------------
+// Floating chrome geometry (Stage H glass)
+
+/// The list's trailing spacer: keeps Follow's newest row above the
+/// floating composer stack (resting composer card ≈ 86 px + stack gap +
+/// breathing room, on the 4 px grid).
+pub const COMPOSER_CLEARANCE: f32 = 116.0;
+/// The ↓-bottom pill's rounding (content 26 px tall → full round = 13);
+/// the pill's frost pass must state the radius explicitly.
+pub const RADIUS_PILL: f32 = 13.0;
 
 #[cfg(test)]
 mod tests {

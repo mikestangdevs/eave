@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, Context, Entity,
-    FocusHandle, Font, FontStyle, FontWeight, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
-    ListOffset, ListState, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
-    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
+    actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, Context, Corners,
+    Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
+    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
+    Pixels, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextRun,
+    TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowOptions,
 };
 use gpui::Animation;
@@ -519,7 +520,9 @@ struct TranscriptState {
 
 impl TranscriptState {
     fn new() -> Self {
-        let list = ListState::new(0, ListAlignment::Bottom, px(512.));
+        // Count 1, not 0: the trailing under-glass spacer exists from
+        // birth so every later count is uniformly display len + 1.
+        let list = ListState::new(1, ListAlignment::Bottom, px(512.));
         list.set_follow_mode(gpui::FollowMode::Tail);
         Self {
             session_id: None,
@@ -551,8 +554,12 @@ impl TranscriptState {
             return Err(());
         }
         let ops = self.display.update(&self.transcript);
+        // List item count is always display rows + 1: the trailing
+        // under-glass spacer (Stage H). Content splices carry indices
+        // < len, so an append at old_len inserts BEFORE the spacer and
+        // the spacer stays terminal without bookkeeping.
         if ops.reset {
-            self.list.reset(self.display.len());
+            self.list.reset(self.display.len() + 1);
         } else {
             if let Some(range) = &ops.remeasure {
                 self.list.remeasure_items(range.clone());
@@ -680,7 +687,7 @@ impl TranscriptState {
     fn reset(&mut self) {
         self.transcript.reset();
         self.display.update(&self.transcript);
-        self.list.reset(self.display.len());
+        self.list.reset(self.display.len() + 1);
         self.veil = None;
     }
 }
@@ -1213,13 +1220,14 @@ impl Shell {
             _ => return None,
         };
         Some(
-            Self::column(
+            Self::column(frost(
+                theme::RADIUS_PANEL,
                 div()
                     .w_full()
                     .rounded(px(theme::RADIUS_PANEL))
                     .border_1()
                     .border_color(theme::danger_ring())
-                    .bg(theme::danger_plate())
+                    .bg(theme::danger_plate_glass())
                     .shadow(theme::shadow_panel())
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_2))
@@ -1233,7 +1241,7 @@ impl Shell {
                             .child("engine unavailable"),
                     )
                     .child(message),
-            )
+            ))
             .pb(px(theme::SPACE_2))
             .into_any_element(),
         )
@@ -1306,9 +1314,9 @@ impl Shell {
                 panel(
                     theme::warning_ring(),
                     if prominent {
-                        theme::warning_plate_strong()
+                        theme::warning_plate_strong_glass()
                     } else {
-                        theme::warning_plate()
+                        theme::warning_plate_glass()
                     },
                 )
                 .child(label(
@@ -1322,7 +1330,7 @@ impl Shell {
                 since_ms,
                 zero_samples,
                 sampled_ms,
-            } => panel(theme::danger_ring(), theme::danger_plate())
+            } => panel(theme::danger_ring(), theme::danger_plate_glass())
                 .child(label(
                     theme::danger(),
                     format!("unresponsive for {}", fmt_elapsed(now.saturating_sub(since_ms))),
@@ -1335,7 +1343,7 @@ impl Shell {
                 ))
                 .child(self.kill_affordance(cx, "it will never be killed automatically")),
             AttentionSnapshot::Failed { since_ms, cause } => {
-                panel(theme::danger_ring(), theme::danger_plate())
+                panel(theme::danger_ring(), theme::danger_plate_glass())
                     .child(label(
                         theme::danger(),
                         format!("failed {} ago", fmt_elapsed(now.saturating_sub(since_ms))),
@@ -1345,7 +1353,11 @@ impl Shell {
                     .child(self.kill_affordance(cx, "clean up the process when you're ready"))
             }
         };
-        Some(Self::column(inner).pb(px(theme::SPACE_2)).into_any_element())
+        Some(
+            Self::column(frost(theme::RADIUS_PANEL, inner))
+                .pb(px(theme::SPACE_2))
+                .into_any_element(),
+        )
     }
 
     fn kill_affordance(&self, cx: &Context<Self>, note: &str) -> gpui::Div {
@@ -1386,7 +1398,12 @@ impl Shell {
     /// after prose) so virtualization owns all spacing.
     fn render_row(state: &TranscriptState, ix: usize) -> AnyElement {
         let Some(row) = state.display.row(ix).copied() else {
-            return div().into_any_element();
+            // The one index past the content is the under-glass spacer
+            // (Stage H): it holds Follow's newest row above the floating
+            // chrome while the list's viewport extends beneath it.
+            // Constant height, position-independent — the anchor
+            // invariant below applies to it too.
+            return div().h(px(theme::COMPOSER_CLEARANCE)).into_any_element();
         };
         let id = row.id;
         let Some(trow) = state.transcript.rows.get(id.msg as usize) else {
@@ -1720,13 +1737,14 @@ impl Render for Shell {
         })
         .size_full();
 
-        let composer = Self::column(
+        let composer = Self::column(frost(
+            theme::RADIUS_COMPOSER,
             div()
                 .w_full()
                 .rounded(px(theme::RADIUS_COMPOSER))
                 .border_1()
                 .border_color(theme::border_strong())
-                .bg(theme::composer())
+                .bg(theme::chrome_glass())
                 .shadow(theme::shadow_panel())
                 .p(px(theme::SPACE_3))
                 .child(
@@ -1791,7 +1809,7 @@ impl Render for Shell {
                                 .child("↑"),
                         ),
                 ),
-        )
+        ))
         .flex_none();
 
         // Opaque window by default, custom titlebar — locked decision
@@ -1824,30 +1842,38 @@ impl Render for Shell {
                             .flex()
                             .flex_col()
                             .child(
+                                // Stage H glass: the list's viewport runs
+                                // the full column height and the composer
+                                // stack FLOATS over it (content passes
+                                // beneath the frost when scrolled; the
+                                // trailing spacer keeps Follow's newest
+                                // row above the glass).
                                 div()
                                     .flex_1()
                                     .min_h(px(0.))
                                     .relative()
                                     .pt(px(theme::LOG_TOP_PAD))
-                                    .pb(px(theme::LOG_BOTTOM_PAD))
                                     .child(transcript_el)
                                     .when(show_affordance, |d| {
                                         d.child(
                                             div()
                                                 .absolute()
-                                                .bottom_3()
+                                                .bottom(px(
+                                                    theme::COMPOSER_CLEARANCE + theme::SPACE_3
+                                                ))
                                                 .left_0()
                                                 .right_0()
                                                 .flex()
                                                 .justify_center()
-                                                .child(
+                                                .child(frost(
+                                                    theme::RADIUS_PILL,
                                                     div()
                                                         .px(px(theme::SPACE_3))
                                                         .py(px(theme::SPACE_1))
                                                         .rounded_full()
                                                         .border_1()
                                                         .border_color(theme::border_strong())
-                                                        .bg(theme::panel_floating())
+                                                        .bg(theme::chrome_glass())
                                                         .shadow(theme::shadow_panel())
                                                         .text_size(px(theme::LABEL_SIZE))
                                                         .text_color(theme::text_secondary())
@@ -1861,16 +1887,111 @@ impl Render for Shell {
                                                             });
                                                         }))
                                                         .child("↓ bottom"),
-                                                ),
+                                                )),
                                         )
-                                    }),
+                                    })
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .bottom_0()
+                                            .left_0()
+                                            .right_0()
+                                            .pb(px(theme::SPACE_3))
+                                            .flex()
+                                            .flex_col()
+                                            .children(self.conn_panel(cx))
+                                            .children(self.attention_notice(cx))
+                                            .child(composer),
+                                    ),
                             )
-                            .children(self.conn_panel(cx))
-                            .children(self.attention_notice(cx))
-                            .child(composer)
                             .child(self.footer(cx)),
                     ),
             )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frost — the fork's BackdropBlur behind floating chrome (Stage H).
+// The child paints inside ONE scene layer with the blur painted first:
+// the single layer makes the blur/content order structural. (With
+// bounds-tree ordering a repaint elsewhere can reassign the card's quads
+// below the blur and wash them away — comet hit exactly this; their
+// frost element documents it.)
+
+struct Frost {
+    corner_radius: f32,
+    child: AnyElement,
+}
+
+/// Blur the scene behind `child` (radius [`theme::BLUR_CHROME`]), then
+/// paint it. `corner_radius` must match the child card's rounding.
+fn frost(corner_radius: f32, child: impl IntoElement) -> Frost {
+    Frost {
+        corner_radius,
+        child: child.into_any_element(),
+    }
+}
+
+impl Element for Frost {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.paint_layer(bounds, |window| {
+            window.paint_backdrop_blur(
+                bounds,
+                Corners::all(px(self.corner_radius)),
+                px(theme::BLUR_CHROME),
+            );
+            self.child.paint(window, cx);
+        });
+    }
+}
+
+impl IntoElement for Frost {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
 
@@ -2120,7 +2241,7 @@ fn perf_fill_10k(state: &mut TranscriptState) {
     }
     state.session_id = Some("perf:10k".into());
     state.display.update(&state.transcript);
-    state.list.reset(state.display.len());
+    state.list.reset(state.display.len() + 1);
     state.scroll = ScrollMode::Free;
     state.assert_scroll();
     state.list.scroll_to(ListOffset {
