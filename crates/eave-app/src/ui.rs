@@ -34,7 +34,10 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{Delivery, Row, ToolStatus, Transcript};
-use eave_wire::{AttentionSnapshot, Cursor, SessionInfo, SubscriptionItem, WaitReason};
+use eave_wire::{
+    AttentionSnapshot, ChangedFile, Cursor, FileStatus, FilesSnapshot, GitState, SessionInfo,
+    SubscriptionItem, WaitReason,
+};
 
 use crate::display::{DisplayList, RowId};
 use crate::markdown::{inline_runs, Block, InlineRun};
@@ -82,6 +85,12 @@ type AttnEvent = (String, AttentionSnapshot);
 /// replacement — never merged.
 type RailEvent = Vec<SessionInfo>;
 
+/// One files snapshot (spec 05 §Files), session-tagged like attention so
+/// a deselected session's file list can never render over the selected
+/// one. `None` snapshot = the engine refused the subscription (an engine
+/// predating the method) — a stated fact, not silence.
+type FilesEvent = (String, Option<FilesSnapshot>);
+
 #[derive(Debug)]
 enum Command {
     Send(String),
@@ -101,6 +110,7 @@ struct Queues {
     feed: Mutex<VecDeque<FeedEvent>>,
     attn: Mutex<VecDeque<AttnEvent>>,
     rail: Mutex<VecDeque<RailEvent>>,
+    files: Mutex<VecDeque<FilesEvent>>,
 }
 
 struct Plumbing {
@@ -123,6 +133,10 @@ impl Plumbing {
     }
     fn push_rail(&self, ev: RailEvent) {
         self.queues.rail.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
+    fn push_files(&self, ev: FilesEvent) {
+        self.queues.files.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
 }
@@ -224,8 +238,33 @@ async fn feed_loop(
                 Ok(rx) => rx,
                 Err(_) => continue 'conn,
             };
+            // The selected session's changed-file overview rides its own
+            // per-session subscription (spec 05 §Files); a switch drops
+            // it with the loop. `None` after open = transport gone.
+            let mut files_rx = match client.files(&session_id).await {
+                Ok(rx) => Some(rx),
+                Err(_) => continue 'conn,
+            };
             loop {
                 tokio::select! {
+                    item = async {
+                        match files_rx.as_mut() {
+                            Some(frx) => frx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match item {
+                        Some(SubscriptionItem::Files { session_id: sid, snapshot }) => {
+                            plumbing.push_files((sid, Some(snapshot)));
+                        }
+                        Some(_) => {} // files carries nothing else
+                        None => {
+                            // The engine refused the method (it predates
+                            // files) or closed the stream alone: state the
+                            // fact and stop polling the dead receiver.
+                            plumbing.push_files((session_id.clone(), None));
+                            files_rx = None;
+                        }
+                    },
                     item = watch_rx.recv() => match item {
                         Some(SubscriptionItem::Sessions { sessions }) => {
                             plumbing.push_rail(sessions);
@@ -247,7 +286,10 @@ async fn feed_loop(
                         Some(SubscriptionItem::Attention { session_id: sid, attention }) => {
                             plumbing.push_attn((sid, attention));
                         }
-                        Some(SubscriptionItem::Sessions { .. }) => {} // never on this id
+                        // Never on this id: sessions ride watch, files
+                        // ride the files subscription.
+                        Some(SubscriptionItem::Sessions { .. })
+                        | Some(SubscriptionItem::Files { .. }) => {}
                         None => continue 'conn, // connection gone → reconnect
                     },
                     cmd = commands.recv() => match cmd {
@@ -317,6 +359,9 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         epoch: 0,
         last_seq: 0,
     }]);
+    // Same for the files rail (Slice B): the reading column must be
+    // constrained on BOTH sides during asserts and captures.
+    plumbing.push_files((sid.clone(), Some(synthetic_files_snapshot())));
     // `EAVE_REPLAY_LOOP=n` replays the capture n times back to back with
     // seq/ts rebased — a 9-minute fixture ×4 is the "30+ min of frames"
     // acceptance stream (each pass appends like a resumed segment).
@@ -370,9 +415,44 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
                 SubscriptionItem::Attention { attention, .. } => {
                     plumbing.push_attn((sid.clone(), attention.clone()));
                 }
-                SubscriptionItem::Sessions { .. } => {}
+                SubscriptionItem::Sessions { .. } | SubscriptionItem::Files { .. } => {}
             }
         }
+    }
+}
+
+/// The harness's files snapshot (replay + perf): plausible rows covering
+/// every status silhouette, so asserts and captures exercise the rail
+/// the shell actually ships.
+fn synthetic_files_snapshot() -> FilesSnapshot {
+    FilesSnapshot {
+        state: GitState::Ok,
+        files: vec![
+            ChangedFile {
+                path: "crates/eave-app/src/ui.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(124),
+                dels: Some(38),
+            },
+            ChangedFile {
+                path: "crates/eave-engine/src/git.rs".into(),
+                status: FileStatus::Added,
+                adds: Some(310),
+                dels: Some(0),
+            },
+            ChangedFile {
+                path: "docs/notes/scratch.md".into(),
+                status: FileStatus::Deleted,
+                adds: Some(0),
+                dels: Some(57),
+            },
+            ChangedFile {
+                path: "assets/icon.png".into(),
+                status: FileStatus::Modified,
+                adds: None,
+                dels: None,
+            },
+        ],
     }
 }
 
@@ -400,6 +480,29 @@ struct SessionsState {
 impl SessionsState {
     fn notice_standing(&self) -> bool {
         matches!(&self.attention, Some((_, a)) if !matches!(a, AttentionSnapshot::Running))
+    }
+}
+
+/// The files rail's state (Slice B, spec 05 §Files) — pure projection of
+/// the engine's git polling, session-tagged so a snapshot can never
+/// outlive a switch. `snapshot` holds the LAST files event: `None` =
+/// nothing received yet; `Some((sid, None))` = the engine refused the
+/// subscription (stated fact); `Some((sid, Some(snap)))` = data.
+struct FilesState {
+    snapshot: Option<FilesEvent>,
+    collapsed: bool,
+}
+
+/// Right-aligned count labels for one changed file; `None` when the
+/// counts are unknowable (binary / oversized) — rendered as one ghost
+/// dash instead of fake zeros.
+fn count_labels(adds: Option<u64>, dels: Option<u64>) -> Option<(String, String)> {
+    match (adds, dels) {
+        (None, None) => None,
+        (a, d) => Some((
+            format!("+{}", a.unwrap_or(0)),
+            format!("−{}", d.unwrap_or(0)),
+        )),
     }
 }
 
@@ -816,6 +919,7 @@ struct Shell {
     focus: FocusHandle,
     conn: Entity<ConnectionState>,
     sessions: Entity<SessionsState>,
+    files: Entity<FilesState>,
     transcript: Entity<TranscriptState>,
     composer: Entity<ComposerState>,
     commands: tokio_mpsc::UnboundedSender<Command>,
@@ -994,6 +1098,38 @@ impl Shell {
                     .text_color(theme::text_ghost())
                     .child(s)
             }))
+            .child(div().flex_1())
+            .child(
+                // Files-rail collapse toggle: the sidebar pictogram
+                // mirrored (hairline on the right third).
+                div()
+                    .id("files-toggle")
+                    .p(px(theme::SPACE_1))
+                    .mr_2()
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .hover(|s| s.bg(theme::overlay()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.files.update(cx, |f, cx| {
+                            f.collapsed = !f.collapsed;
+                            cx.notify();
+                        });
+                    }))
+                    .child(
+                        div()
+                            .w(px(theme::RAIL_TOGGLE_W))
+                            .h(px(theme::RAIL_TOGGLE_H))
+                            .rounded(px(theme::RADIUS_GLYPH))
+                            .border_1()
+                            .border_color(theme::text_tertiary())
+                            .child(
+                                div()
+                                    .w(px(theme::HAIRLINE))
+                                    .h_full()
+                                    .ml(px(theme::RAIL_TOGGLE_W * 2.0 / 3.0))
+                                    .bg(theme::text_tertiary()),
+                            ),
+                    ),
+            )
     }
 
     /// The session rail (Slice A): chrome at L2, an instrument list of
@@ -1148,6 +1284,187 @@ impl Shell {
                     .gap(px(theme::SPACE_1))
                     .children(rows),
             )
+            .into_any_element()
+    }
+
+    /// The files rail (Slice B1): chrome at L2, right of the transcript —
+    /// the selected session's changed files as git states them. Every
+    /// body is a stated fact: not-a-repo, a git failure, and a clean repo
+    /// all render as plain words, never as an error or an empty void.
+    /// Session-tagged like the attention overlay: data from a deselected
+    /// session never renders.
+    fn files_rail(&self, cx: &Context<Self>) -> AnyElement {
+        let selected = self.transcript.read(cx).session_id.clone();
+        let held = self.files.read(cx).snapshot.clone();
+        // Some(None) = engine refused; Some(Some) = snapshot; None = no
+        // data for the selected session yet.
+        let current: Option<Option<FilesSnapshot>> = match (held, selected) {
+            (Some((sid, snap)), Some(sel)) if sid == sel => Some(snap),
+            _ => None,
+        };
+        let fact = |text: &str| {
+            div()
+                .px(px(theme::SPACE_2))
+                .text_size(px(theme::DETAIL_SIZE))
+                .line_height(px(theme::DETAIL_LINE))
+                .text_color(theme::text_ghost())
+                .child(SharedString::from(text.to_string()))
+                .into_any_element()
+        };
+        let (count_label, body): (Option<usize>, AnyElement) = match &current {
+            None => (None, fact("…")),
+            Some(None) => (None, fact("file status unavailable — engine predates it")),
+            Some(Some(snap)) => match &snap.state {
+                GitState::NotARepo => (None, fact("not a git repository")),
+                GitState::Error { message } => (
+                    None,
+                    div()
+                        .px(px(theme::SPACE_2))
+                        .text_size(px(theme::DETAIL_SIZE))
+                        .line_height(px(theme::DETAIL_LINE))
+                        .text_color(theme::text_tertiary())
+                        .child(SharedString::from(format!("git failed: {message}")))
+                        .into_any_element(),
+                ),
+                GitState::Ok if snap.files.is_empty() => (Some(0), fact("no changes")),
+                GitState::Ok => {
+                    let rows: Vec<AnyElement> = snap
+                        .files
+                        .iter()
+                        .map(|f| Self::file_row(f))
+                        .collect();
+                    (
+                        Some(rows.len()),
+                        div().flex().flex_col().children(rows).into_any_element(),
+                    )
+                }
+            },
+        };
+        div()
+            .w(px(theme::FILES_RAIL_W))
+            .h_full()
+            .flex_none()
+            .bg(theme::panel())
+            .border_l_1()
+            .border_color(theme::border_strong())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(theme::SPACE_3))
+                    .pt(px(theme::SPACE_3))
+                    .pb(px(theme::SPACE_2))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .font_weight(theme::WEIGHT_LABEL)
+                            .text_color(theme::text_tertiary())
+                            .child("changes"),
+                    )
+                    .children(count_label.map(|n| {
+                        div()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .font_family(theme::MONO)
+                            .text_color(theme::text_ghost())
+                            .child(SharedString::from(n.to_string()))
+                    })),
+            )
+            .child(
+                div()
+                    .id("files-rows")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .px(px(theme::SPACE_2))
+                    .pb(px(theme::SPACE_2))
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// One changed file: status glyph in a fixed slot, path, +/− counts.
+    /// Counts wear the existing state pigments (adds success, removals
+    /// danger); the diff-view washes are B2 tokens, not built here.
+    /// The path renders as truncating-directory + always-visible
+    /// basename: the filename is the identity and must survive any
+    /// width; the directory is context and may lose its tail.
+    fn file_row(f: &ChangedFile) -> AnyElement {
+        let counts = count_labels(f.adds, f.dels);
+        let (dir, base) = match f.path.rfind('/') {
+            Some(ix) => (f.path[..=ix].to_string(), f.path[ix + 1..].to_string()),
+            None => (String::new(), f.path.clone()),
+        };
+        div()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(theme::FILE_STATUS_W))
+                    .flex_none()
+                    .font_family(theme::MONO)
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(f.status.glyph()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .when(!dir.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(theme::text_ghost())
+                                .child(SharedString::from(dir)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(base)),
+                    ),
+            )
+            .child(match counts {
+                Some((adds, dels)) => div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .font_family(theme::MONO)
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .child(div().text_color(theme::success()).child(SharedString::from(adds)))
+                    .child(div().text_color(theme::danger()).child(SharedString::from(dels)))
+                    .into_any_element(),
+                // Unknowable (binary / oversized): one honest dash.
+                None => div()
+                    .flex_none()
+                    .font_family(theme::MONO)
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::text_ghost())
+                    .child("—")
+                    .into_any_element(),
+            })
             .into_any_element()
     }
 
@@ -1729,6 +2046,7 @@ impl Render for Shell {
         // empty log (the Stage E cosmetic bug), only when follow is broken.
         let show_affordance = state.scroll != ScrollMode::Follow && !state.display.is_empty();
         let rail_collapsed = self.sessions.read(cx).collapsed;
+        let files_collapsed = self.files.read(cx).collapsed;
         let composer_text = self.composer.read(cx).text.clone();
         let has_draft = !composer_text.is_empty();
 
@@ -1905,7 +2223,8 @@ impl Render for Shell {
                                     ),
                             )
                             .child(self.footer(cx)),
-                    ),
+                    )
+                    .when(!files_collapsed, |d| d.child(self.files_rail(cx))),
             )
     }
 }
@@ -2050,6 +2369,13 @@ pub fn run(data_dir: PathBuf) -> ! {
             collapsed: false,
             attention: None,
         });
+        let files = cx.new(|_| FilesState {
+            // Perf runs have no feed: seed a synthetic snapshot so the
+            // measured layout includes a populated files rail.
+            snapshot: perf_10k
+                .then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
+            collapsed: false,
+        });
         let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
         let transcript = cx.new(|_| {
             let mut t = TranscriptState::new();
@@ -2087,6 +2413,7 @@ pub fn run(data_dir: PathBuf) -> ! {
             let queues = Arc::clone(&queues);
             let conn = conn.clone();
             let sessions = sessions.clone();
+            let files = files.clone();
             let transcript = transcript.clone();
             let cmd_tx = cmd_tx.clone();
             cx.spawn(async move |cx| {
@@ -2105,6 +2432,16 @@ pub fn run(data_dir: PathBuf) -> ! {
                         queues.attn.lock().unwrap().drain(..).collect();
                     let rail_events: Vec<RailEvent> =
                         queues.rail.lock().unwrap().drain(..).collect();
+                    // Files snapshots fold by replacement — last of the
+                    // burst wins; the render filters by session tag.
+                    let files_events: Vec<FilesEvent> =
+                        queues.files.lock().unwrap().drain(..).collect();
+                    if let Some(last) = files_events.into_iter().last() {
+                        let _ = files.update(cx, |state, cx| {
+                            state.snapshot = Some(last);
+                            cx.notify();
+                        });
+                    }
                     let last_attn = attn_events.into_iter().last();
                     let last_rail = rail_events.into_iter().last();
                     if last_attn.is_some() || last_rail.is_some() {
@@ -2183,12 +2520,14 @@ pub fn run(data_dir: PathBuf) -> ! {
                     let composer = cx.new(|_| ComposerState { text: String::new() });
                     cx.observe(&conn, |_, _, cx| cx.notify()).detach();
                     cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&files, |_, _, cx| cx.notify()).detach();
                     cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
                         conn: conn.clone(),
                         sessions: sessions.clone(),
+                        files: files.clone(),
                         transcript: transcript.clone(),
                         composer,
                         commands: cmd_tx.clone(),
@@ -2277,6 +2616,20 @@ mod tests {
         for s in ["new", "running", "done", "killed", "interrupted"] {
             assert_eq!(state_badge(s), None, "{s} must not badge");
         }
+    }
+
+    #[test]
+    fn count_labels_never_fake_a_number() {
+        assert_eq!(
+            count_labels(Some(12), Some(4)),
+            Some(("+12".into(), "−4".into()))
+        );
+        assert_eq!(
+            count_labels(Some(0), Some(57)),
+            Some(("+0".into(), "−57".into()))
+        );
+        // Binary / oversized: unknowable, not zero.
+        assert_eq!(count_labels(None, None), None);
     }
 
     #[test]

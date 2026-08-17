@@ -143,7 +143,9 @@ async fn drain_records(
                 transcript.apply(epoch, &records).expect("no seq gaps");
                 got.extend(records);
             }
-            SubscriptionItem::Attention { .. } | SubscriptionItem::Sessions { .. } => {}
+            SubscriptionItem::Attention { .. }
+            | SubscriptionItem::Sessions { .. }
+            | SubscriptionItem::Files { .. } => {}
         }
     }
     got

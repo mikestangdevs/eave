@@ -27,14 +27,16 @@ use eave_core::session::{AgentSession, SessionWatch, SpawnConfig};
 use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, Cursor, HelloOk, KillOk, ListOk, OpenOk, Request, RequestEnvelope, ResponseBody,
-    ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, PROTO_VERSION,
+    socket_path, Cursor, FilesSnapshot, HelloOk, KillOk, ListOk, OpenOk, Request, RequestEnvelope,
+    ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
 /// Watch pokes carry no payload (snapshots are taken at emission), so the
 /// channel can be tiny; lag just coalesces into the next snapshot.
 const WATCH_CAP: usize = 64;
+/// Files pokes are payload-free for the same reason (spec 05 §Files).
+const FILES_CAP: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -129,6 +131,16 @@ pub struct SessionHandle {
     /// attention changes. Deliberately NEVER poked per record — record
     /// flow must be invisible on watch (isolation invariant).
     watch_tx: broadcast::Sender<()>,
+    /// Changed-file overview (spec 05 §Files): latest git poll of the
+    /// session cwd. Ephemeral engine state, never journaled — git is the
+    /// store of record and survives restarts for free. `None` until the
+    /// first scan (the first `files` subscription triggers one).
+    files: StdMutex<Option<FilesSnapshot>>,
+    /// Pokes this session's `files` subscribers; payload-free like watch
+    /// (every emission is a fresh read of `files`).
+    files_tx: broadcast::Sender<()>,
+    /// Serializes git scans so overlapping triggers can't interleave.
+    files_gate: TokioMutex<()>,
 }
 
 fn new_epoch() -> u64 {
@@ -290,6 +302,7 @@ impl Engine {
             };
             meta.save(&dir).map_err(|e| format!("save meta: {e}"))?;
             let (bcast, _) = broadcast::channel(BROADCAST_CAP);
+            let (files_tx, _) = broadcast::channel(FILES_CAP);
             Arc::new(SessionHandle {
                 session_id: id.clone(),
                 dir,
@@ -304,12 +317,17 @@ impl Engine {
                 bcast,
                 live: TokioMutex::new(None),
                 watch_tx: self.watch_tx.clone(),
+                files: StdMutex::new(None),
+                files_tx,
+                files_gate: TokioMutex::new(()),
             })
         };
         sessions.insert(id, Arc::clone(&handle));
         drop(sessions);
         // The session set changed — watchers re-snapshot.
         handle.poke_watch();
+        // Session open is a files poll boundary (spec 05 §Files).
+        tokio::spawn(refresh_files(Arc::clone(&handle)));
         Ok(handle)
     }
 
@@ -339,6 +357,7 @@ impl Engine {
             }
         }
         let (bcast, _) = broadcast::channel(BROADCAST_CAP);
+        let (files_tx, _) = broadcast::channel(FILES_CAP);
         Ok(Arc::new(SessionHandle {
             session_id: id.to_string(),
             dir,
@@ -353,6 +372,12 @@ impl Engine {
             bcast,
             live: TokioMutex::new(None),
             watch_tx: self.watch_tx.clone(),
+            // No eager scan here: this path also runs for every on-disk
+            // session at engine startup, and file state rebuilds lazily
+            // from git on the first `files` subscription instead.
+            files: StdMutex::new(None),
+            files_tx,
+            files_gate: TokioMutex::new(()),
         }))
     }
 
@@ -445,8 +470,21 @@ impl Engine {
         let tap_handle = Arc::clone(handle);
         tokio::spawn(async move {
             while let Some(rec) = tap_rx.recv().await {
+                // Turn boundaries are the files poll trigger (spec 05
+                // §Files, Slice B1: no FS watcher, no debouncing) — the
+                // scan runs as its own task, never in the record path.
+                let turn_boundary = matches!(
+                    &rec.event,
+                    JournalEvent::Closed { .. }
+                        | JournalEvent::Provider {
+                            event: eave_core::events::SessionEvent::TurnCompleted { .. }
+                        }
+                );
                 tap_handle.shared.lock().unwrap().records.push(rec.clone());
                 let _ = tap_handle.bcast.send(Fanout::Record(rec));
+                if turn_boundary {
+                    tokio::spawn(refresh_files(Arc::clone(&tap_handle)));
+                }
             }
         });
 
@@ -633,11 +671,20 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
         let env: RequestEnvelope = match serde_json::from_str(&line) {
             Ok(env) => env,
             Err(e) => {
-                // Unparseable request: best-effort error with id 0.
+                // Echo the envelope's id even when the body is
+                // unparseable — a newer client calling a method this
+                // engine predates must get an error IT can correlate,
+                // not a reply with id 0 that matches nothing and leaves
+                // its call pending forever (the 2026-08-17 stale-engine
+                // hang; the fix progress.md designated).
+                let id = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
+                    .unwrap_or(0);
                 let _ = write_frame(
                     &w,
                     &ResponseEnvelope {
-                        id: 0,
+                        id,
                         body: ResponseBody::Err {
                             message: format!("bad request: {e}"),
                         },
@@ -679,6 +726,14 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 subs.push(tokio::spawn(run_watch(Arc::clone(&engine), w, id)));
                 continue; // snapshots flow on this id; no unary reply
             }
+            Request::Files { session_id } => match engine.session(&session_id) {
+                Ok(handle) => {
+                    let w = Arc::clone(&w);
+                    subs.push(tokio::spawn(run_files(handle, w, id)));
+                    continue; // snapshots flow on this id; no unary reply
+                }
+                Err(message) => ResponseBody::Err { message },
+            },
         };
         if write_frame(&w, &ResponseEnvelope { id, body }).await.is_err() {
             break;
@@ -944,6 +999,66 @@ async fn run_watch(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: 
                 while rx.try_recv().is_ok() {}
             }
             Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// One git poll of the session cwd (spec 05 §Files): serialized per
+/// session by the gate, stored as the current snapshot, then this
+/// session's files subscribers are poked. Always its own task — git runs
+/// as an async child process with every call timeout-bounded (`git.rs`),
+/// so a pathological repo slows its own snapshot but never the event
+/// loop; sessions keep streaming while git runs (build-directive
+/// constraint). Never journaled: git is the store of record.
+async fn refresh_files(handle: Arc<SessionHandle>) {
+    let _gate = handle.files_gate.lock().await;
+    let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+    let snapshot = crate::git::scan(&cwd).await;
+    *handle.files.lock().unwrap() = Some(snapshot);
+    let _ = handle.files_tx.send(());
+}
+
+/// The files subscription (spec 05 §Files): send the current snapshot
+/// now — triggering the first scan if none exists yet, which is also how
+/// a restarted engine lazily rebuilds file state from git — then a fresh
+/// read after every poke. Strictly per-session by construction: this
+/// task holds one session's handle and can serialize nothing but that
+/// session's [`FilesSnapshot`]; the raw-byte leak test in
+/// `tests/files.rs` enforces it end-to-end.
+async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+    let mut rx = handle.files_tx.subscribe();
+    let current = handle.files.lock().unwrap().clone();
+    match current {
+        Some(snapshot) => {
+            let item = SubscriptionItem::Files {
+                session_id: handle.session_id.clone(),
+                snapshot,
+            };
+            if send_item(&w, id, item).await.is_err() {
+                return;
+            }
+        }
+        None => {
+            tokio::spawn(refresh_files(Arc::clone(&handle)));
+        }
+    }
+    loop {
+        match rx.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                // Coalesce a burst of pokes into one snapshot read.
+                while rx.try_recv().is_ok() {}
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+        let Some(snapshot) = handle.files.lock().unwrap().clone() else {
+            continue;
+        };
+        let item = SubscriptionItem::Files {
+            session_id: handle.session_id.clone(),
+            snapshot,
+        };
+        if send_item(&w, id, item).await.is_err() {
+            return;
         }
     }
 }

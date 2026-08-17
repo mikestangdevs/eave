@@ -476,6 +476,17 @@ pub const RAIL_TOGGLE_H: f32 = 12.0;
 pub const RADIUS_GLYPH: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
+// Files rail (Slice B) — chrome at L2, right of the transcript. Same
+// width as the session rail: the two rails frame the reading column
+// symmetrically. B1 carries no new pigment — statuses use the text
+// tiers, counts use the existing success/danger state colors; the
+// add/remove diff washes are B2 tokens.
+
+pub const FILES_RAIL_W: f32 = RAIL_W;
+/// Fixed slot for the one-letter status glyph so paths align.
+pub const FILE_STATUS_W: f32 = 12.0;
+
+// ---------------------------------------------------------------------------
 // Floating chrome geometry (Stage H glass)
 
 /// The list's trailing spacer: keeps Follow's newest row above the

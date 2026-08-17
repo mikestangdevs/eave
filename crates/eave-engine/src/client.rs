@@ -166,11 +166,18 @@ impl Client {
                             let _ = tx.send(Ok(v));
                         }
                     }
-                    ResponseBody::Err { message } => {
-                        if let Some(Pending::Unary(tx)) = pending.remove(&env.id) {
+                    ResponseBody::Err { message } => match pending.remove(&env.id) {
+                        Some(Pending::Unary(tx)) => {
                             let _ = tx.send(Err(message));
                         }
-                    }
+                        // An error on a subscription id ends that stream
+                        // (dropping the sender surfaces as a closed
+                        // receiver) — e.g. an older engine rejecting a
+                        // method it doesn't know. The caller degrades;
+                        // it must never wait forever on a stream the
+                        // engine refused.
+                        Some(Pending::Stream(_)) | None => {}
+                    },
                     ResponseBody::Item(item) => {
                         if let Some(Pending::Stream(tx)) = pending.get(&env.id) {
                             if tx.send(item).is_err() {
@@ -268,6 +275,28 @@ impl Client {
         self.write(&RequestEnvelope {
             id,
             request: Request::Watch,
+        })
+        .await?;
+        Ok(rx)
+    }
+
+    /// Observe one session's changed-file overview (spec 05 §Files):
+    /// yields `Files` snapshot frames — the current one immediately, a
+    /// fresh one after every engine-side git poll. Fold by replacement.
+    /// The stream ends if the engine refuses the method (older engine)
+    /// or the connection dies — render "unavailable", don't wait.
+    pub async fn files(
+        &self,
+        session_id: &str,
+    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
+        self.write(&RequestEnvelope {
+            id,
+            request: Request::Files {
+                session_id: session_id.into(),
+            },
         })
         .await?;
         Ok(rx)

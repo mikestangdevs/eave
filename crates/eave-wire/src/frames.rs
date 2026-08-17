@@ -91,6 +91,13 @@ pub enum Request {
     /// construction: its sole payload type is [`SessionInfo`]. A client
     /// must `Subscribe` to a specific session to receive records.
     Watch,
+    /// Observe ONE session's changed-file overview (spec 05 §Files):
+    /// items flow on this request's id as `Files` snapshots — the current
+    /// one immediately (triggering a scan if none exists yet), a fresh
+    /// one after every engine-side git poll. Strictly per-session: file
+    /// data for session A never flows on any other session's files id,
+    /// and never on watch (isolation invariant, enforced by test).
+    Files { session_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +159,14 @@ pub enum SubscriptionItem {
     /// identity and state ONLY — never journal records, never provider
     /// output, never transcript content of any session.
     Sessions { sessions: Vec<SessionInfo> },
+    /// Files frame (spec 05 §Files): one session's full changed-file
+    /// snapshot, taken by the engine's git poll at emission time. Fold by
+    /// REPLACEMENT — no deltas, nothing to merge or go stale. Flows only
+    /// on the `files` subscription for exactly this session.
+    Files {
+        session_id: String,
+        snapshot: FilesSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +187,74 @@ pub struct SessionInfo {
     pub live: bool,
     pub epoch: u64,
     pub last_seq: u64,
+}
+
+/// One session's changed-file overview (Slice B, spec 05 §Files).
+///
+/// Truth source is engine-side `git status` / `git diff` in the session
+/// cwd — NEVER derived from tool records, which describe intent, not
+/// disk. Ephemeral engine state, never journaled: git itself is the
+/// store of record and survives restarts for free. A non-git cwd or a
+/// failed git invocation is a stated fact (`state`), not an error path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilesSnapshot {
+    pub state: GitState,
+    /// Empty when `state` is not `Ok` — and also when the repo is clean.
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitState {
+    /// The cwd is a work tree and the scan succeeded (`files` may still
+    /// be empty: a clean repo is a fact, not an absence).
+    Ok,
+    /// The session cwd is not inside a git work tree. A fact to render,
+    /// not a failure.
+    NotARepo,
+    /// Git could not answer (timeout, missing binary, vanished cwd, …).
+    /// The message is shown verbatim; the previous snapshot is gone.
+    Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    /// Repo-relative path (the post-rename path for renames).
+    pub path: String,
+    pub status: FileStatus,
+    /// Added/removed line counts from `git diff --numstat` (untracked
+    /// files are counted by the engine). `None` = unknowable: binary
+    /// file, or too large to count.
+    pub adds: Option<u64>,
+    pub dels: Option<u64>,
+}
+
+/// Worktree-level status, folded from git's two-letter XY codes: the
+/// rail states what happened to the file, not the index/worktree split
+/// (staging is explicitly out of scope for Slice B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatus {
+    /// New relative to HEAD — includes untracked files.
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    /// Unmerged (conflict) entry.
+    Conflicted,
+}
+
+impl FileStatus {
+    /// One-letter glyph for compact rendering.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            FileStatus::Added => "A",
+            FileStatus::Modified => "M",
+            FileStatus::Deleted => "D",
+            FileStatus::Renamed => "R",
+            FileStatus::Conflicted => "U",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,6 +368,48 @@ mod tests {
         assert!(line.contains("\"sessions\""), "{line}");
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn files_frames_round_trip() {
+        let req = RequestEnvelope {
+            id: 5,
+            request: Request::Files {
+                session_id: "s1".into(),
+            },
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"method\":\"files\""), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
+
+        for state in [
+            GitState::Ok,
+            GitState::NotARepo,
+            GitState::Error {
+                message: "git status timed out".into(),
+            },
+        ] {
+            let resp = ResponseEnvelope {
+                id: 5,
+                body: ResponseBody::Item(SubscriptionItem::Files {
+                    session_id: "s1".into(),
+                    snapshot: FilesSnapshot {
+                        state,
+                        files: vec![ChangedFile {
+                            path: "src/lib.rs".into(),
+                            status: FileStatus::Modified,
+                            adds: Some(12),
+                            dels: None,
+                        }],
+                    },
+                }),
+            };
+            let line = serde_json::to_string(&resp).unwrap();
+            assert!(line.contains("\"snapshot\""), "{line}");
+            let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, resp);
+        }
     }
 
     #[test]
