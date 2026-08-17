@@ -265,18 +265,29 @@ async fn feed_loop(
                 id: session_id.clone(),
             });
 
-            let mut rx = match client.subscribe(&session_id, cursor).await {
-                Ok(rx) => rx,
+            let (sub_id, mut rx) = match client.subscribe_with_id(&session_id, cursor).await {
+                Ok(pair) => pair,
                 Err(_) => continue 'conn,
             };
             // The selected session's changed-file overview rides its own
             // per-session subscription (spec 05 §Files); a switch drops
             // it with the loop. `None` after open = transport gone.
-            let mut files_rx = match client.files(&session_id).await {
-                Ok(rx) => Some(rx),
+            let (files_id, mut files_rx) = match client.files_with_id(&session_id).await {
+                Ok((id, rx)) => (id, Some(rx)),
                 Err(_) => continue 'conn,
             };
-            loop {
+            // Why the loop breaks with a reason instead of continuing its
+            // labels directly: a switch must first unsubscribe the old
+            // streams (Slice I1) — without that the engine keeps streaming
+            // the deselected session and holds its FS watcher for the
+            // connection's whole life. Connection loss skips the cleanup
+            // (the dying connection is the cleanup).
+            enum StreamEnd {
+                Switch,
+                Conn,
+                Quit,
+            }
+            let end = loop {
                 tokio::select! {
                     item = async {
                         match files_rx.as_mut() {
@@ -301,7 +312,7 @@ async fn feed_loop(
                             plumbing.push_rail(sessions);
                         }
                         Some(_) => {} // watch carries nothing else
-                        None => continue 'conn,
+                        None => break StreamEnd::Conn,
                     },
                     item = rx.recv() => match item {
                         Some(SubscriptionItem::Reset { session_id: sid, .. }) => {
@@ -321,7 +332,7 @@ async fn feed_loop(
                         // ride the files subscription.
                         Some(SubscriptionItem::Sessions { .. })
                         | Some(SubscriptionItem::Files { .. }) => {}
-                        None => continue 'conn, // connection gone → reconnect
+                        None => break StreamEnd::Conn, // connection gone → reconnect
                     },
                     cmd = commands.recv() => match cmd {
                         Some(Command::Send(text)) => {
@@ -329,7 +340,7 @@ async fn feed_loop(
                             // (UserSent/UserDelivered); a transport error means
                             // the connection is gone.
                             if client.send(&session_id, &text).await.is_err() {
-                                continue 'conn;
+                                break StreamEnd::Conn;
                             }
                         }
                         Some(Command::Kill) => {
@@ -352,26 +363,43 @@ async fn feed_loop(
                         }
                         Some(Command::Resubscribe) => {
                             cursor = None;
-                            continue 'session;
+                            break StreamEnd::Switch;
                         }
                         Some(Command::Select(id)) => {
                             if selected.as_deref() != Some(id.as_str()) {
                                 selected = Some(id);
                                 cursor = None;
-                                continue 'session;
+                                break StreamEnd::Switch;
                             }
                         }
                         Some(Command::NewSession) => match client.open(None, None).await {
                             Ok(info) => {
                                 selected = Some(info.session_id);
                                 cursor = None;
-                                continue 'session;
+                                break StreamEnd::Switch;
                             }
-                            Err(_) => continue 'conn,
+                            Err(_) => break StreamEnd::Conn,
                         },
-                        None => return, // UI gone
+                        None => break StreamEnd::Quit, // UI gone
                     },
                 }
+            };
+            match end {
+                StreamEnd::Switch => {
+                    // Release the deselected session's streams engine-side
+                    // (Slice I1): stops the old subscription's socket
+                    // traffic and drops the files stream's FS-watcher
+                    // refcount — "subscriber-scoped watcher" means the
+                    // SELECTED session's, not every session ever visited.
+                    // Errors are ignored: an older engine refuses the
+                    // method (connection close still cleans up), a dead
+                    // connection is discovered by the next subscribe.
+                    let _ = client.unsubscribe(sub_id).await;
+                    let _ = client.unsubscribe(files_id).await;
+                    continue 'session;
+                }
+                StreamEnd::Conn => continue 'conn,
+                StreamEnd::Quit => return,
             }
         }
     }

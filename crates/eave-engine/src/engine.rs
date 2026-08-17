@@ -29,7 +29,7 @@ use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
     socket_path, ChangedFile, Cursor, DiffOk, FileStatus, FilesSnapshot, HelloOk, KillOk, ListOk,
     OpenOk, Request, RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo,
-    SubscriptionItem, PROTO_VERSION,
+    SubscriptionItem, UnsubscribeOk, PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -751,7 +751,12 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
     let (r, w) = stream.into_split();
     let w = Arc::new(TokioMutex::new(w));
     let mut lines = BufReader::new(r).lines();
-    let mut subs: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Streaming tasks keyed by their request envelope id, so `unsubscribe`
+    // can name and stop one (Slice I1). Aborting a task drops its future
+    // at the current await point — RAII guards inside (the files stream's
+    // `FilesSubGuard`) run their drops, releasing subscriber-scoped
+    // resources. Connection close aborts whatever remains.
+    let mut subs: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let env: RequestEnvelope = match serde_json::from_str(&line) {
@@ -802,20 +807,20 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
             Request::Subscribe { session_id, cursor } => match engine.session(&session_id) {
                 Ok(handle) => {
                     let w = Arc::clone(&w);
-                    subs.push(tokio::spawn(run_subscription(handle, cursor, w, id)));
+                    subs.insert(id, tokio::spawn(run_subscription(handle, cursor, w, id)));
                     continue; // items flow on this id; no unary reply
                 }
                 Err(message) => ResponseBody::Err { message },
             },
             Request::Watch => {
                 let w = Arc::clone(&w);
-                subs.push(tokio::spawn(run_watch(Arc::clone(&engine), w, id)));
+                subs.insert(id, tokio::spawn(run_watch(Arc::clone(&engine), w, id)));
                 continue; // snapshots flow on this id; no unary reply
             }
             Request::Files { session_id } => match engine.session(&session_id) {
                 Ok(handle) => {
                     let w = Arc::clone(&w);
-                    subs.push(tokio::spawn(run_files(handle, w, id)));
+                    subs.insert(id, tokio::spawn(run_files(handle, w, id)));
                     continue; // snapshots flow on this id; no unary reply
                 }
                 Err(message) => ResponseBody::Err { message },
@@ -826,11 +831,31 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                     // repo delays only its own reply — sends and kills on
                     // this connection keep flowing while git works.
                     let w = Arc::clone(&w);
-                    subs.push(tokio::spawn(run_diff(handle, w, id, path)));
+                    subs.insert(id, tokio::spawn(run_diff(handle, w, id, path)));
                     continue;
                 }
                 Err(message) => ResponseBody::Err { message },
             },
+            Request::Unsubscribe { id: target } => {
+                // Stop the named stream and release what it held (the
+                // files stream's watcher refcount drops via guard drop).
+                // Idempotent by design — see the wire doc.
+                let stopped = match subs.remove(&target) {
+                    Some(task) => {
+                        // Hold the write lock across the abort: a stream
+                        // mid-frame holds it too, so waiting here means the
+                        // abort can never land inside a `write_all` and
+                        // tear a frame on the shared socket.
+                        let gate = w.lock().await;
+                        let live = !task.is_finished();
+                        task.abort();
+                        drop(gate);
+                        live
+                    }
+                    None => false,
+                };
+                ok_value(&UnsubscribeOk { stopped })
+            }
         };
         if write_frame(&w, &ResponseEnvelope { id, body }).await.is_err() {
             break;
@@ -841,7 +866,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
     // identically): stop its subscriptions. Sessions are untouched; the
     // engine owns them (spec 01 §Crash & engine shutdown: UI quit is a
     // no-op for sessions).
-    for s in subs {
+    for s in subs.into_values() {
         s.abort();
     }
 }

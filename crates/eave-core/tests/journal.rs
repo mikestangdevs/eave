@@ -750,18 +750,22 @@ fn stale_lock_content_from_a_dead_holder_never_blocks() {
 
 #[test]
 fn concurrent_sessions_in_one_store_do_not_cross_contaminate() {
+    // N=6 since Slice I1 (was 2): the multi-session build leans on
+    // concurrent journal writes staying clean well past a pair.
+    const N: usize = 6;
     let root = scratch();
-    let sid_a = uuid::Uuid::new_v4().to_string();
-    let sid_b = uuid::Uuid::new_v4().to_string();
-    let mut a = spawn_stub(&root, &sid_a, "tool-cycle", Some("message for A"));
-    let mut b = spawn_stub(&root, &sid_b, "tool-cycle", Some("message for B"));
-    assert!(a.wait().unwrap().success());
-    assert!(b.wait().unwrap().success());
+    let sids: Vec<String> = (0..N).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    let messages: Vec<String> = (0..N).map(|i| format!("message for session #{i}")).collect();
+    let mut children: Vec<_> = sids
+        .iter()
+        .zip(&messages)
+        .map(|(sid, msg)| spawn_stub(&root, sid, "tool-cycle", Some(msg)))
+        .collect();
+    for child in &mut children {
+        assert!(child.wait().unwrap().success());
+    }
 
-    for (sid, own, other) in [
-        (&sid_a, "message for A", "message for B"),
-        (&sid_b, "message for B", "message for A"),
-    ] {
+    for (i, sid) in sids.iter().enumerate() {
         let dir = root.join("sessions").join(sid);
         let loaded = journal::load(&dir.join("journal.jsonl")).unwrap();
         assert_eq!(&loaded.header.session_id, sid);
@@ -771,11 +775,13 @@ fn concurrent_sessions_in_one_store_do_not_cross_contaminate() {
             JournalEvent::Closed { outcome: Outcome::Done }
         ));
         let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
-        assert!(text.contains(own));
-        assert!(
-            !text.contains(other),
-            "session {sid} journal contains the other session's message"
-        );
+        assert!(text.contains(&messages[i]));
+        for (j, other) in messages.iter().enumerate() {
+            assert!(
+                j == i || !text.contains(other),
+                "session {sid} journal contains session #{j}'s message"
+            );
+        }
         assert!(loaded.undelivered_user_sends().is_empty(), "delivered send");
         let meta = Meta::load(&dir).unwrap();
         assert_eq!(&meta.session_id, sid);

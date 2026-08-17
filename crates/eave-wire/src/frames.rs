@@ -106,6 +106,15 @@ pub enum Request {
     /// Every failure shape is a stated fact inside [`FileDiff`], never a
     /// hang — and every underlying git call is timeout-bounded.
     Diff { session_id: String, path: String },
+    /// Cancel a streaming request (`subscribe` / `watch` / `files`) by its
+    /// envelope id, on this connection (Slice I1). The engine stops the
+    /// stream's task and releases any subscriber-scoped resource it held
+    /// (a `files` stream's FS-watcher refcount). Idempotent: an unknown or
+    /// already-finished id still replies ok — the caller may race a
+    /// disconnect or a stream the engine ended on its own. Without this, a
+    /// client that switches sessions leaks the old stream for the
+    /// connection's whole life; connection close remains the backstop.
+    Unsubscribe { id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +390,15 @@ pub struct KillOk {
     pub already_exited: bool,
 }
 
+/// Reply to [`Request::Unsubscribe`] (Slice I1). `stopped` is a fact, not
+/// a success bit: `false` means the id named no live stream on this
+/// connection (already ended, never existed, or a raced disconnect) —
+/// equally fine from the caller's side, stated rather than silent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnsubscribeOk {
+    pub stopped: bool,
+}
+
 /// What a spawned engine process reports on stdout before exiting 42 when
 /// it lost the instance lock: the holder from `engine.lock`, so the UI can
 /// render Busy with a pid even though it never got a socket to talk to
@@ -435,6 +453,26 @@ mod tests {
         assert!(line.contains("\"item\""), "{line}");
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn unsubscribe_round_trips_with_distinct_ids() {
+        // The envelope id and the TARGET id are different fields on the
+        // same line — the wire shape must keep them apart.
+        let req = RequestEnvelope {
+            id: 11,
+            request: Request::Unsubscribe { id: 10 },
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"method\":\"unsubscribe\""), "{line}");
+        assert!(line.contains("\"params\":{\"id\":10}"), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
+
+        let ok = UnsubscribeOk { stopped: true };
+        let back: UnsubscribeOk =
+            serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+        assert_eq!(back, ok);
     }
 
     #[test]

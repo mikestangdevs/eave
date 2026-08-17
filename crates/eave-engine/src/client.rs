@@ -289,6 +289,18 @@ impl Client {
         &self,
         session_id: &str,
     ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        Ok(self.files_with_id(session_id).await?.1)
+    }
+
+    /// Like [`files`](Self::files), but also returns the stream's request
+    /// id — the handle [`unsubscribe`](Self::unsubscribe) takes. A caller
+    /// that switches sessions must unsubscribe the old id, or the engine
+    /// keeps the stream (and its FS watcher) alive for the connection's
+    /// whole life (Slice I1).
+    pub async fn files_with_id(
+        &self,
+        session_id: &str,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<SubscriptionItem>), ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
@@ -299,7 +311,20 @@ impl Client {
             },
         })
         .await?;
-        Ok(rx)
+        Ok((id, rx))
+    }
+
+    /// Cancel a streaming request by its id (Slice I1): the engine stops
+    /// the task and releases what it held; this side drops the pending
+    /// entry so stray in-flight frames on the id fall on the floor.
+    /// Returns the engine's `stopped` fact. Idempotent both sides; an
+    /// older engine errors on the method — surfaced, callers ignore.
+    pub async fn unsubscribe(&self, id: u64) -> Result<bool, ClientError> {
+        self.pending.lock().unwrap().remove(&id);
+        Ok(self
+            .request::<eave_wire::UnsubscribeOk>(Request::Unsubscribe { id })
+            .await?
+            .stopped)
     }
 
     /// One file's diff content (B2), computed by the engine at request
@@ -329,6 +354,17 @@ impl Client {
         session_id: &str,
         cursor: Option<Cursor>,
     ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        Ok(self.subscribe_with_id(session_id, cursor).await?.1)
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but also returns the stream's
+    /// request id for [`unsubscribe`](Self::unsubscribe) — see
+    /// [`files_with_id`](Self::files_with_id) for why switchers need it.
+    pub async fn subscribe_with_id(
+        &self,
+        session_id: &str,
+        cursor: Option<Cursor>,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<SubscriptionItem>), ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
@@ -340,6 +376,6 @@ impl Client {
             },
         })
         .await?;
-        Ok(rx)
+        Ok((id, rx))
     }
 }
