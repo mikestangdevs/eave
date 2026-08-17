@@ -1042,12 +1042,13 @@ impl Shell {
         let short = session
             .as_deref()
             .map(|s| s.chars().take(8).collect::<String>());
+        // No seam below: the titlebar sits on the same continuous glass
+        // ground as the rails (comet's shell) — the content card carries
+        // its own outline.
         div()
             .w_full()
             .h(px(theme::TITLEBAR_H))
             .flex_none()
-            .border_b_1()
-            .border_color(theme::border())
             .flex()
             .flex_row()
             .items_center()
@@ -1132,7 +1133,7 @@ impl Shell {
             )
     }
 
-    /// The session rail (Slice A): chrome at L2, an instrument list of
+    /// The session rail (Slice A): rows on the glass ground, an instrument list of
     /// every session the engine holds — recency-ordered (newest first),
     /// one row per session: state dot, self-drawn provider identity,
     /// attention badge only when a state deserves it, cwd as quiet meta.
@@ -1227,13 +1228,15 @@ impl Shell {
                     .into_any_element()
             })
             .collect();
+        // No surface of its own: rail rows sit directly on the glass
+        // ground (comet's shell model, 2026-08-17). The content well
+        // beside it is the differentiated card; painting the rail would
+        // put a plate where the frost should read through.
         div()
             .w(px(theme::RAIL_W))
             .h_full()
             .flex_none()
-            .bg(theme::panel())
-            .border_r_1()
-            .border_color(theme::border_strong())
+            .pl(px(theme::PLATE_MARGIN))
             .flex()
             .flex_col()
             .child(
@@ -1287,7 +1290,8 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The files rail (Slice B1): chrome at L2, right of the transcript —
+    /// The files rail (Slice B1): rows on the glass ground, right of the
+    /// content card —
     /// the selected session's changed files as git states them. Every
     /// body is a stated fact: not-a-repo, a git failure, and a clean repo
     /// all render as plain words, never as an error or an empty void.
@@ -1340,13 +1344,12 @@ impl Shell {
                 }
             },
         };
+        // Rows on the bare glass ground, mirroring rail() — no plate.
         div()
             .w(px(theme::FILES_RAIL_W))
             .h_full()
             .flex_none()
-            .bg(theme::panel())
-            .border_l_1()
-            .border_color(theme::border_strong())
+            .pr(px(theme::PLATE_MARGIN))
             .flex()
             .flex_col()
             .child(
@@ -2154,9 +2157,21 @@ impl Render for Shell {
                     .flex_row()
                     .when(!rail_collapsed, |d| d.child(self.rail(cx)))
                     .child(
+                        // The content well: an inset rounded card floating
+                        // over the glass ground (comet's shell model) — the
+                        // rails sit on the bare frost around it, the card's
+                        // black wash keeps a solid floor under the reading
+                        // column.
                         div()
                             .flex_1()
                             .min_w(px(0.))
+                            .mx(px(theme::PLATE_MARGIN))
+                            .mb(px(theme::PLATE_MARGIN))
+                            .rounded(px(theme::RADIUS_PANEL))
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::content_plate())
+                            .overflow_hidden()
                             .flex()
                             .flex_col()
                             .child(

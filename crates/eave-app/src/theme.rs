@@ -14,20 +14,24 @@ use std::sync::OnceLock;
 use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
-// Vibrancy spike (`EAVE_VIBRANCY=1`) — behind a flag, opaque stays the
-// shipped default. The flag flips the window to Blurred and every surface
-// token below to its glass variant; nothing outside theme.rs branches on
-// it except the window-background option itself.
+// The glass ground (default since the 2026-08-17 ruling; `EAVE_VIBRANCY=0`
+// keeps the opaque ladder as the tested fallback). The default flips the
+// window to Blurred and every surface token below to its glass variant;
+// nothing outside theme.rs branches on it except the window-background
+// option itself.
 //
 // The retune, not the flag, is the substance. Every element paints over
 // the one root canvas, and in-window compositing is plain alpha (the blur
 // samples only what is BEHIND the window — in-app scene-sampling blur
 // stays never). That forces the architecture:
 //
-//   - The canvas is the single glass layer: `#212121` at α 0.80, source
-//     lifted from `#1A1A1A` so that over a black backdrop it composites
-//     to exactly the opaque canvas. The desktop participates at 20%
-//     through the ground, everywhere.
+//   - The canvas is the single glass layer: near-black `#0A0A0A` at
+//     α 0.80 (comet's frost is grey(8) @ 0.80 — the reference the
+//     2026-08-17 ruling pointed at). The tint must add almost no gray
+//     of its own: a mid-gray tint (the first cut used `#212121`) washes
+//     the desktop's hue toward gray, and the whole window reads as flat
+//     gray instead of dark colored glass. The desktop participates at
+//     20% through the ground, everywhere.
 //   - Elevation rungs CANNOT stay independent plates. A plate over the
 //     glass gains less backdrop light than the ground as the wallpaper
 //     brightens (an opaque plate gains none), so past a computable
@@ -43,22 +47,35 @@ use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 //     keeps the pre-blended opaque plate: any alpha there ghosts the
 //     log through it, and no blur will save it.
 
-/// True when `EAVE_VIBRANCY=1`: Blurred window + the glass ladder.
-/// Read once; the window cannot change appearance mid-run anyway.
+/// True (the default): Blurred window + the glass ladder — the shipped
+/// look per the 2026-08-17 ruling (comet's glass shell is the reference;
+/// the opaque build read as flat gray). `EAVE_VIBRANCY=0` forces the old
+/// opaque ladder — an escape hatch and the second tested mode, no longer
+/// a pending spike. Read once; the window cannot change appearance
+/// mid-run anyway.
 pub fn vibrancy() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("EAVE_VIBRANCY").map(|v| v == "1").unwrap_or(false))
+    *V.get_or_init(|| std::env::var("EAVE_VIBRANCY").map(|v| v != "0").unwrap_or(true))
 }
 
 // The glass variants (private so both modes stay unit-testable in one
 // process — the public fns branch on the env flag).
 
-/// Glass ground: α 0.80 (0xCC), source `#212121` = `#1A1A1A` / 0.80.
+/// Glass ground: α 0.80 (0xCC), source `#0A0A0A` — near-black so the
+/// blurred desktop's hue carries the surface (comet parity; see above).
 fn glass_canvas() -> Hsla {
-    rgba(0x212121cc).into()
+    rgba(0x0a0a0acc).into()
 }
-/// Rung washes share the hairline white (h 220, s .10, l .90 ≈ 229.5);
-/// β solved per rung: step-at-black = β·(229.5 − 26.4) = opaque step.
+/// The content well's darkening wash (glass variant of
+/// [`content_plate`]) — private so it stays unit-testable in both modes.
+fn wash_content() -> Hsla {
+    hsla(0.0, 0.0, 0.0, 0.25)
+}
+/// Rung washes share the hairline white (h 220, s .10, l .90 ≈ 229.5).
+/// The β values were solved for the old `#212121` ground's steps; over
+/// the darker comet-parity ground they give slightly tighter steps at
+/// black, which is fine — the ordering (not the absolute step) is the
+/// invariant, and the sweep test proves it on every backdrop.
 fn wash_raised() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.044)
 }
@@ -85,8 +102,8 @@ fn wash_danger_plate() -> Hsla {
 }
 
 // ---------------------------------------------------------------------------
-// Surfaces (opaque by default — the locked shipped path; glass behind
-// `EAVE_VIBRANCY=1`, decision pending)
+// Surfaces (glass by default — the 2026-08-17 ruling; `EAVE_VIBRANCY=0`
+// is the opaque fallback)
 
 /// Window ground; the transcript sits directly on it.
 pub fn canvas() -> Hsla {
@@ -148,8 +165,13 @@ fn glass_tint(hex: u32) -> Hsla {
     c.opacity(CHROME_GLASS_ALPHA)
 }
 /// L2 glass: floating chrome over the log (composer, ↓-bottom pill).
+/// Retuned with the comet-parity ground (2026-08-17): the old `#282828`
+/// tint read as a light-gray slab once the ground went near-black; this
+/// lands the card a quiet step above the ground, like comet's input
+/// pill, while α 0.72 keeps the occlusion that makes text legible over
+/// scrolled log content.
 pub fn chrome_glass() -> Hsla {
-    glass_tint(0x282828)
+    glass_tint(0x141414)
 }
 /// Attention/connection plates as glass — same hexes as the opaque
 /// plates, same single chrome alpha.
@@ -162,6 +184,20 @@ pub fn warning_plate_strong_glass() -> Hsla {
 pub fn danger_plate_glass() -> Hsla {
     glass_tint(0x332c2c)
 }
+/// The content well (comet's shell model, adopted 2026-08-17): the
+/// transcript + composer pane floats over the glass ground as an inset
+/// rounded card, darkened by a black wash so the desktop's bleed dims
+/// under the reading column (text keeps a solid floor) while the rails
+/// sit on the bare frost around it. Opaque fallback: the plain canvas —
+/// the hairline card outline alone carries the seam.
+pub fn content_plate() -> Hsla {
+    if vibrancy() {
+        wash_content()
+    } else {
+        canvas()
+    }
+}
+
 /// Sunken panels: code blocks.
 pub fn inset() -> Hsla {
     if vibrancy() {
@@ -461,10 +497,18 @@ pub const STATE_DOT: f32 = 6.0;
 pub const TOOL_DOT: f32 = 5.0;
 
 // ---------------------------------------------------------------------------
-// Session rail (Slice A) — chrome at L2, left of the transcript.
+// Session rail (Slice A) — comet's shell model (directive 2026-08-17):
+// the rails paint NO surface of their own. Their rows sit directly on
+// the glass ground, and the CONTENT WELL between them is the
+// differentiated card ([`content_plate`], inset by [`PLATE_MARGIN`]).
+// The old opaque L2 rail slabs read as gray cardboard next to the glass;
+// a sidebar on frost has no plate to get wrong.
 
 /// Rail width (62 × the 4 px unit).
 pub const RAIL_W: f32 = 248.0;
+/// Ground margin around the floating content card (and the air the rails
+/// keep from the window edges).
+pub const PLATE_MARGIN: f32 = SPACE_3;
 /// Provider identity chip: self-drawn monochrome initials on a bordered
 /// rounded square. Deliberately never a third-party mark — one uniform,
 /// self-drawn set for every provider (Slice A directive).
@@ -476,11 +520,11 @@ pub const RAIL_TOGGLE_H: f32 = 12.0;
 pub const RADIUS_GLYPH: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
-// Files rail (Slice B) — chrome at L2, right of the transcript. Same
-// width as the session rail: the two rails frame the reading column
-// symmetrically. B1 carries no new pigment — statuses use the text
-// tiers, counts use the existing success/danger state colors; the
-// add/remove diff washes are B2 tokens.
+// Files rail (Slice B) — rows on the bare glass ground, mirroring the
+// session rail (see above). Same width as the session rail: the two
+// rails frame the content card symmetrically. B1 carries no new pigment
+// — statuses use the text tiers, counts use the existing success/danger
+// state colors; the add/remove diff washes are B2 tokens.
 
 pub const FILES_RAIL_W: f32 = RAIL_W;
 /// Fixed slot for the one-letter status glyph so paths align.
@@ -520,20 +564,26 @@ mod tests {
         (c.0 + c.1 + c.2) / 3.0
     }
 
-    /// Over a black backdrop the glass ladder composites to the opaque
-    /// ladder exactly — flipping the flag on a black desktop changes
-    /// nothing about the shipped look.
+    /// The glass ground is comet-parity near-black (2026-08-17 ruling):
+    /// over a black backdrop it lands at `#080808`, adding almost no
+    /// gray of its own, so the desktop's hue carries the surface instead
+    /// of being washed toward gray (the retired `#212121` tint's failure
+    /// — and with it the retired opaque-identity invariant: glass IS the
+    /// look now, so it no longer needs to impersonate the opaque ladder
+    /// on a black desktop). The content well darkens below the ground;
+    /// attention plates stay above it.
     #[test]
-    fn glass_ladder_matches_opaque_over_black() {
+    fn glass_ground_is_near_black_and_content_sinks() {
         let ground = over(glass_canvas(), (0.0, 0.0, 0.0));
-        close(ground, rgb(0x1a1a1a).into());
-        close(over(wash_raised(), ground), rgb(0x232323).into());
-        close(over(wash_panel(), ground), rgb(0x282828).into());
-        close(over(wash_modal(), ground), rgb(0x2e2e2e).into());
-        close(over(wash_inset(), ground), rgb(0x151515).into());
-        close(over(wash_warning_plate(), ground), rgb(0x312f2b).into());
-        close(over(wash_warning_plate_strong(), ground), rgb(0x3e3930).into());
-        close(over(wash_danger_plate(), ground), rgb(0x332c2c).into());
+        close(ground, rgb(0x080808).into());
+        assert!(luma(over(wash_content(), ground)) < luma(ground));
+        for b in (0..=255).step_by(15) {
+            let v = b as f32 / 255.0;
+            let g = over(glass_canvas(), (v, v, v));
+            assert!(luma(over(wash_content(), g)) < luma(g), "backdrop {b}");
+            assert!(luma(over(wash_warning_plate(), g)) > luma(g), "backdrop {b}");
+            assert!(luma(over(wash_danger_plate(), g)) > luma(g), "backdrop {b}");
+        }
     }
 
     /// The reason rungs are washes, not plates: over EVERY backdrop
