@@ -178,6 +178,14 @@ async fn feed_loop(
             data_dir.display().to_string(),
         ],
     };
+    // `EAVE_NO_SPAWN=1` (dev-loop): never auto-spawn an engine, only
+    // connect. Closes the spawn race against a hand-launched engine with
+    // custom env: if that engine dies, the app's respawn (using the
+    // APP's env — agent defaults to real claude) would win the lock race
+    // inside its 250 ms backoff and quietly change what agent sessions
+    // spawn. With the gate set, the human relaunching their engine
+    // always wins.
+    let no_spawn = std::env::var("EAVE_NO_SPAWN").map(|v| v == "1").unwrap_or(false);
     let mut attempt: u32 = 0;
     let mut cursor: Option<Cursor> = None;
     let mut selected: Option<String> = None;
@@ -187,7 +195,12 @@ async fn feed_loop(
         } else {
             ConnEvent::Reconnecting { attempt }
         });
-        let client = match Client::connect_or_spawn(&data_dir, &spawn).await {
+        let connected = if no_spawn {
+            Client::connect(&data_dir).await
+        } else {
+            Client::connect_or_spawn(&data_dir, &spawn).await
+        };
+        let client = match connected {
             // Arc: diff requests run as their own tasks off this loop (a
             // slow repo's diff must not stall sends/kills or the feed).
             Ok(c) => Arc::new(c),
@@ -495,6 +508,9 @@ fn synthetic_files_snapshot() -> FilesSnapshot {
             },
         ],
         omitted: 0,
+        // The harness plays a live-looking rail; the mode line should
+        // state the live mode too.
+        watching: true,
     }
 }
 
@@ -633,6 +649,16 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch) -> AnyElement {
                 // engine's own 2000-line cap still bounds the data;
                 // `truncated` states that separately.)
                 let total: usize = hunks.iter().map(|h| h.lines.len()).sum();
+                // The cap is stated IN the pane, up front (directive
+                // 2026-08-17) — a reader mid-pane must know they are
+                // looking at a head, not the diff.
+                if total > theme::DIFF_PANE_MAX_LINES {
+                    children.push(fact(format!(
+                        "showing the first {} of {} lines",
+                        theme::DIFF_PANE_MAX_LINES,
+                        total
+                    )));
+                }
                 let mut budget = theme::DIFF_PANE_MAX_LINES;
                 'hunks: for hunk in hunks {
                     children.push(
@@ -1140,7 +1166,45 @@ struct Shell {
     composer: Entity<ComposerState>,
     commands: tokio_mpsc::UnboundedSender<Command>,
     perf: Option<PerfProbe>,
+    /// Transient ⌘L confirmation shown in the footer ("logged 14:52:03"
+    /// or the write error), cleared after a few seconds. The generation
+    /// counter keeps a stale clear-timer from eating a newer note.
+    friction: Option<(u64, String)>,
+    friction_gen: u64,
 }
+
+/// Where ⌘L appends its stamp: `EAVE_DOGFOOD_LOG` if set, else the
+/// dogfood log next to the project's other docs. A missing file is
+/// created; a missing directory is a stated write error in the footer.
+fn friction_log_path() -> PathBuf {
+    if let Ok(p) = std::env::var("EAVE_DOGFOOD_LOG") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Desktop/eave/docs/dogfood-log.md")
+}
+
+/// Local wall-clock stamp for the friction log (the log is read by a
+/// human at this desk — UTC would be friction in the friction log).
+fn local_timestamp() -> String {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}
+
+/// How long the ⌘L footer confirmation stands.
+const FRICTION_NOTE_TTL: Duration = Duration::from_secs(4);
 
 impl Shell {
     /// Send the composer draft (enter key and send button share this).
@@ -1161,6 +1225,60 @@ impl Shell {
         }
     }
 
+    /// ⌘L: append one timestamped context line — selected session id and
+    /// its reported state — to the dogfood friction log, and confirm (or
+    /// state the failure) in the footer. Deliberately nothing more: the
+    /// keystroke's job is to make the moment findable; the note is
+    /// written in the log file afterwards.
+    fn friction_log(&mut self, cx: &mut Context<Self>) {
+        let stamp = local_timestamp();
+        let session = self.transcript.read(cx).session_id.clone();
+        let context = match &session {
+            None => "no session".to_string(),
+            Some(id) => {
+                let state = self
+                    .sessions
+                    .read(cx)
+                    .sessions
+                    .iter()
+                    .find(|s| &s.session_id == id)
+                    .map(|s| s.state.clone());
+                let short = &id[..id.len().min(8)];
+                match state {
+                    Some(st) => format!("{short} {st}"),
+                    None => short.to_string(),
+                }
+            }
+        };
+        let path = friction_log_path();
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "- {stamp} · {context} · ")
+            });
+        let note = match written {
+            Ok(()) => format!("logged {}", &stamp[11..]),
+            Err(e) => format!("log failed: {e}"),
+        };
+        self.friction_gen += 1;
+        let gen = self.friction_gen;
+        self.friction = Some((gen, note));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FRICTION_NOTE_TTL).await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.friction.as_ref().is_some_and(|(g, _)| *g == gen) {
+                    shell.friction = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         match ks.key.as_str() {
@@ -1176,6 +1294,10 @@ impl Shell {
             "k" if ks.modifiers.control => {
                 let _ = self.commands.send(Command::Kill);
             }
+            // cmd-l: friction log (dogfood prep directive 2026-08-17) —
+            // append a context stamp to the dogfood log; the note itself
+            // is written there afterwards, out of band.
+            "l" if ks.modifiers.platform => self.friction_log(cx),
             // cmd-v: paste (Stage D build directive; IME stays deferred).
             "v" if ks.modifiers.platform => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -1585,6 +1707,18 @@ impl Shell {
                 }
             },
         };
+        // The refresh mode is a stated fact (directive 2026-08-17: the
+        // watcher degrades silently — a rail that looks live while
+        // polling would lie by omission). Only stated when there is a
+        // scanned repo to keep fresh; quiet ghost text, not an alarm.
+        let mode: Option<&'static str> = match &current {
+            Some(Some(snap)) if matches!(snap.state, GitState::Ok) => Some(if snap.watching {
+                "watching file events"
+            } else {
+                "refreshes at turn end"
+            }),
+            _ => None,
+        };
         // Rows on the bare glass ground, mirroring rail() — no plate.
         div()
             .w(px(theme::FILES_RAIL_W))
@@ -1629,6 +1763,16 @@ impl Shell {
                     .pb(px(theme::SPACE_2))
                     .child(body),
             )
+            .children(mode.map(|text| {
+                div()
+                    .flex_none()
+                    .px(px(theme::SPACE_3))
+                    .pb(px(theme::SPACE_2))
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(theme::text_ghost())
+                    .child(text)
+            }))
             .into_any_element()
     }
 
@@ -1820,7 +1964,12 @@ impl Shell {
                                     .rounded_full()
                                     .bg(dot),
                             )
-                            .child(label),
+                            .child(label)
+                            .children(self.friction.as_ref().map(|(_, note)| {
+                                div()
+                                    .text_color(theme::text_ghost())
+                                    .child(SharedString::from(note.clone()))
+                            })),
                     )
                     .children(session.map(|s| {
                         div().text_color(theme::text_ghost()).child(s)
@@ -2917,6 +3066,8 @@ pub fn run(data_dir: PathBuf) -> ! {
                             item_ix: 0,
                             done: false,
                         }),
+                        friction: None,
+                        friction_gen: 0,
                     }
                 });
                 let handle = shell.read(cx).focus.clone();

@@ -59,11 +59,11 @@ pub async fn scan(cwd: &Path) -> FilesSnapshot {
 pub async fn scan_with(git: &Path, cwd: &Path, timeout: Duration) -> FilesSnapshot {
     let status_bytes = match run(git, cwd, timeout, &["status", "--porcelain=v2", "-z", "--untracked-files=all"]).await {
         Ok(bytes) => bytes,
-        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0 },
+        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
     };
     let mut files = parse_status_v2(&status_bytes);
     if files.is_empty() {
-        return FilesSnapshot { state: GitState::Ok, files, omitted: 0 };
+        return FilesSnapshot { state: GitState::Ok, files, omitted: 0, watching: false };
     }
 
     // Line counts for tracked changes: one numstat against HEAD covers
@@ -78,13 +78,13 @@ pub async fn scan_with(git: &Path, cwd: &Path, timeout: Duration) -> FilesSnapsh
                     let tree = String::from_utf8_lossy(&tree).trim().to_string();
                     match run(git, cwd, timeout, &["diff", "--numstat", "-z", "-M", &tree, "--"]).await {
                         Ok(bytes) => bytes,
-                        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0 },
+                        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
                     }
                 }
-                Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0 },
+                Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
             }
         }
-        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0 },
+        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
     };
     let counts = parse_numstat(&numstat);
     for f in &mut files {
@@ -114,7 +114,7 @@ pub async fn scan_with(git: &Path, cwd: &Path, timeout: Duration) -> FilesSnapsh
             }
         }
     }
-    FilesSnapshot { state: GitState::Ok, files, omitted }
+    FilesSnapshot { state: GitState::Ok, files, omitted, watching: false }
 }
 
 /// Run one git command; classify failure as a stated fact. The child is

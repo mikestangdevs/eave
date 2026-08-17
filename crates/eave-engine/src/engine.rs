@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -346,6 +346,20 @@ impl Engine {
         let handle = if journal_path.exists() {
             self.load_from_disk(&id)?
         } else {
+            // The real claude CLI rejects `--session-id` values that are
+            // not UUIDs, so a named id against it dies at first spawn —
+            // refuse at open with the reason instead of creating a
+            // session that can only ever fail. Overridden agents
+            // (fake-agent, other CLIs) accept any id; generated ids are
+            // always UUIDs and pass. Existing journals are exempt: their
+            // history is real and loadable regardless.
+            if self.cfg.agent_program == Path::new("claude")
+                && uuid::Uuid::parse_str(&id).is_err()
+            {
+                return Err(format!(
+                    "session id {id:?} is not a UUID — the claude CLI rejects non-UUID session ids"
+                ));
+            }
             // Fresh session: journal header written now, durable before
             // anything else happens; nothing spawns until the first send.
             let dir = self
@@ -1115,7 +1129,14 @@ async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>
     let mut rx = handle.files_tx.subscribe();
     let current = handle.files.lock().unwrap().clone();
     match current {
-        Some(snapshot) => {
+        Some(mut snapshot) => {
+            // The refresh mode is stamped per FRAME, not per scan: it
+            // reports the mode at send time, so a watcher that starts or
+            // breaks between scans re-states the truth on the very next
+            // snapshot. (This first frame may still say `false` for the
+            // moment between subscribing and the watcher's startup scan
+            // — that scan's own frame corrects it.)
+            snapshot.watching = handle.watcher_active();
             let item = SubscriptionItem::Files {
                 session_id: handle.session_id.clone(),
                 snapshot,
@@ -1136,9 +1157,10 @@ async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
-        let Some(snapshot) = handle.files.lock().unwrap().clone() else {
+        let Some(mut snapshot) = handle.files.lock().unwrap().clone() else {
             continue;
         };
+        snapshot.watching = handle.watcher_active();
         let item = SubscriptionItem::Files {
             session_id: handle.session_id.clone(),
             snapshot,

@@ -215,6 +215,16 @@ pub struct FilesSnapshot {
     /// N more"), never silent truncation.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub omitted: u64,
+    /// True when an FS watcher covered the session cwd at send time —
+    /// the list refreshes live as files change. False = the polling
+    /// fallback: it refreshes at turn boundaries and may be stale during
+    /// a long turn. Stamped per frame (not per scan) so a watcher that
+    /// breaks mid-flight re-reports truthfully on the next snapshot; a
+    /// B1 engine's frames default to false, which is accurate — B1 only
+    /// polled. The rail states this mode (a list that looks live but
+    /// isn't would lie by omission).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub watching: bool,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -494,6 +504,7 @@ mod tests {
                             untracked: false,
                         }],
                         omitted: 0,
+                        watching: true,
                     },
                 }),
             };
@@ -553,6 +564,9 @@ mod tests {
         assert_eq!(snap.omitted, 0);
         assert_eq!(snap.files[0].orig_path, None);
         assert!(!snap.files[0].untracked);
+        // Absent `watching` = the polling fallback — exactly what a B1
+        // engine's list is.
+        assert!(!snap.watching);
     }
 
     #[test]

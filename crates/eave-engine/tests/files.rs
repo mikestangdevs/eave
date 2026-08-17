@@ -107,6 +107,27 @@ impl EngineProc {
         me
     }
 
+    /// An engine with NO agent override — its default agent is the real
+    /// `claude` CLI. Only for tests that never send: opens spawn
+    /// nothing, so these run on machines without claude installed.
+    fn spawn_real_claude(data_dir: &Path) -> Self {
+        let log = std::fs::File::create(data_dir.join("engine-test.log")).unwrap();
+        let mut cmd = Command::new(engined_bin());
+        cmd.args(["--data-dir", &data_dir.display().to_string()])
+            .env_remove("EAVE_AGENT")
+            .env_remove("EAVE_FAKE_MODE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log);
+        let child = cmd.spawn().expect("spawn eave-engined");
+        let me = Self {
+            child,
+            data_dir: data_dir.to_path_buf(),
+        };
+        me.await_socket();
+        me
+    }
+
     fn await_socket(&self) {
         let sock = socket_path(&self.data_dir);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -440,6 +461,9 @@ async fn turn_boundary_poll_is_the_fallback_without_a_watcher() {
 
     let snap = wait_for_snapshot(&mut rx, "post-turn snapshot", |s| !s.files.is_empty()).await;
     assert_eq!(snap.state, GitState::Ok);
+    // The mode is a stated fact on the wire: no watcher → the snapshot
+    // says so (the rail renders "refreshes at turn end" from this).
+    assert!(!snap.watching, "fallback snapshots must state watching=false");
     let f = &snap.files[0];
     assert_eq!(f.path, "base.txt");
     assert_eq!(f.status, FileStatus::Modified);
@@ -469,6 +493,42 @@ async fn fs_events_refresh_without_turn_boundaries() {
     let snap = wait_for_snapshot(&mut rx, "event-driven snapshot", |s| !s.files.is_empty()).await;
     assert_eq!(snap.files[0].path, "base.txt");
     assert_eq!(snap.files[0].status, FileStatus::Modified);
+    // The mode is a stated fact on the wire: a watcher covered this
+    // refresh, and the snapshot says so.
+    assert!(snap.watching, "watcher snapshots must state watching=true");
+
+    drop(engine);
+}
+
+/// Fixing a dogfood blocker (directive 2026-08-17): the real claude CLI
+/// rejects non-UUID `--session-id` values, so a named session opened
+/// against it could only ever die at its first spawn. The engine now
+/// refuses such an open with the reason — a stated error instead of a
+/// doomed session. Opens never spawn the agent, so this runs fine on a
+/// machine without claude; overridden agents (every other test here)
+/// keep accepting any id.
+#[tokio::test]
+async fn non_uuid_open_is_refused_for_the_real_claude() {
+    let dir = scratch();
+    let engine = EngineProc::spawn_real_claude(&dir);
+    let c = Client::connect(&dir).await.expect("connect");
+
+    let err = c
+        .open(Some("s-alpha".into()), None)
+        .await
+        .expect_err("non-UUID id must be refused");
+    let msg = format!("{err}");
+    assert!(msg.contains("not a UUID"), "unhelpful refusal: {msg}");
+
+    // A UUID opens normally, and the refused open created nothing.
+    let uuid = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    let info = c
+        .open(Some(uuid.into()), None)
+        .await
+        .expect("uuid open succeeds");
+    assert_eq!(info.session_id, uuid);
+    let sessions = c.list().await.expect("list");
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
 
     drop(engine);
 }
