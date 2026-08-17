@@ -9,21 +9,114 @@
 //! hairlines) — the closest reference that works on our upstream gpui
 //! pin and locked opaque window (spec 03 §No-fork consequences).
 
-use gpui::{hsla, px, rgb, BoxShadow, FontWeight, Hsla, Pixels};
+use std::sync::OnceLock;
+
+use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
-// Surfaces (opaque — locked decision, no vibrancy/blur)
+// Vibrancy spike (`EAVE_VIBRANCY=1`) — behind a flag, opaque stays the
+// shipped default. The flag flips the window to Blurred and every surface
+// token below to its glass variant; nothing outside theme.rs branches on
+// it except the window-background option itself.
+//
+// The retune, not the flag, is the substance. Every element paints over
+// the one root canvas, and in-window compositing is plain alpha (the blur
+// samples only what is BEHIND the window — in-app scene-sampling blur
+// stays never). That forces the architecture:
+//
+//   - The canvas is the single glass layer: `#212121` at α 0.80, source
+//     lifted from `#1A1A1A` so that over a black backdrop it composites
+//     to exactly the opaque canvas. The desktop participates at 20%
+//     through the ground, everywhere.
+//   - Elevation rungs CANNOT stay independent plates. A plate over the
+//     glass gains less backdrop light than the ground as the wallpaper
+//     brightens (an opaque plate gains none), so past a computable
+//     brightness the ladder inverts — raised blocks would read sunken.
+//     Instead each rung becomes a white-alpha wash over the shared
+//     ground (the [`overlay`] idiom): its step is β·(white − ground),
+//     which compresses on bright wallpapers but can never invert, on
+//     any wallpaper. β is solved so the step over a black backdrop
+//     equals the opaque ladder exactly.
+//   - `inset` inverts the trick: a black wash, denser ink — darker than
+//     the ground under any wallpaper.
+//   - Chrome that floats over in-window content (the ↓-bottom pill)
+//     keeps the pre-blended opaque plate: any alpha there ghosts the
+//     log through it, and no blur will save it.
+
+/// True when `EAVE_VIBRANCY=1`: Blurred window + the glass ladder.
+/// Read once; the window cannot change appearance mid-run anyway.
+pub fn vibrancy() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("EAVE_VIBRANCY").map(|v| v == "1").unwrap_or(false))
+}
+
+// The glass variants (private so both modes stay unit-testable in one
+// process — the public fns branch on the env flag).
+
+/// Glass ground: α 0.80 (0xCC), source `#212121` = `#1A1A1A` / 0.80.
+fn glass_canvas() -> Hsla {
+    rgba(0x212121cc).into()
+}
+/// Rung washes share the hairline white (h 220, s .10, l .90 ≈ 229.5);
+/// β solved per rung: step-at-black = β·(229.5 − 26.4) = opaque step.
+fn wash_raised() -> Hsla {
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.044)
+}
+fn wash_panel() -> Hsla {
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.067)
+}
+fn wash_modal() -> Hsla {
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.097)
+}
+/// Sunken = black wash: 26.4·(1−0.205) = 21 = opaque inset over black.
+fn wash_inset() -> Hsla {
+    hsla(0.0, 0.0, 0.0, 0.205)
+}
+/// Attention plates: single-color equivalents of (L2 wash, then state
+/// wash) stacked, so over a black backdrop they equal the opaque plates.
+fn wash_warning_plate() -> Hsla {
+    rgba(0xe3cfb11d).into()
+}
+fn wash_warning_plate_strong() -> Hsla {
+    rgba(0xe1c4932e).into()
+}
+fn wash_danger_plate() -> Hsla {
+    rgba(0xe3adab1f).into()
+}
+
+// ---------------------------------------------------------------------------
+// Surfaces (opaque by default — the locked shipped path; glass behind
+// `EAVE_VIBRANCY=1`, decision pending)
 
 /// Window ground; the transcript sits directly on it.
 pub fn canvas() -> Hsla {
-    rgb(0x1a1a1a).into()
+    if vibrancy() {
+        glass_canvas()
+    } else {
+        rgb(0x1a1a1a).into()
+    }
 }
 /// Raised blocks: user directive blocks, pills, cards.
 pub fn raised() -> Hsla {
-    rgb(0x232323).into()
+    if vibrancy() {
+        wash_raised()
+    } else {
+        rgb(0x232323).into()
+    }
 }
-/// L2 chrome plate: floating pills, cards above the log.
+/// L2 chrome plate: in-flow cards above the log (rail, composer, panels).
 pub fn panel() -> Hsla {
+    if vibrancy() {
+        wash_panel()
+    } else {
+        rgb(0x282828).into()
+    }
+}
+/// L2 chrome that floats OVER in-window content (the ↓-bottom pill):
+/// must occlude, so it keeps the pre-blended opaque plate in both modes
+/// (in-window compositing is plain alpha — a wash would ghost the log
+/// through it).
+pub fn panel_floating() -> Hsla {
     rgb(0x282828).into()
 }
 /// The composer card plate — L2 chrome, same rung as [`panel`].
@@ -32,7 +125,11 @@ pub fn composer() -> Hsla {
 }
 /// Sunken panels: code blocks.
 pub fn inset() -> Hsla {
-    rgb(0x151515).into()
+    if vibrancy() {
+        wash_inset()
+    } else {
+        rgb(0x151515).into()
+    }
 }
 
 /// Hover/selection wash composited over any surface (waku's idiom: no
@@ -66,7 +163,11 @@ pub fn overlay_strong() -> Hsla {
 
 /// L3 surface — reserved; no modal exists yet.
 pub fn surface_modal() -> Hsla {
-    rgb(0x2e2e2e).into()
+    if vibrancy() {
+        wash_modal()
+    } else {
+        rgb(0x2e2e2e).into()
+    }
 }
 /// L3 hairline — reserved with it.
 pub fn edge_modal() -> Hsla {
@@ -163,13 +264,25 @@ pub fn danger_wash_strong() -> Hsla {
 /// read raised, not sunken. Keep in sync with `panel()` and the wash
 /// alphas above.
 pub fn warning_plate() -> Hsla {
-    rgb(0x312f2b).into()
+    if vibrancy() {
+        wash_warning_plate()
+    } else {
+        rgb(0x312f2b).into()
+    }
 }
 pub fn warning_plate_strong() -> Hsla {
-    rgb(0x3e3930).into()
+    if vibrancy() {
+        wash_warning_plate_strong()
+    } else {
+        rgb(0x3e3930).into()
+    }
 }
 pub fn danger_plate() -> Hsla {
-    rgb(0x332c2c).into()
+    if vibrancy() {
+        wash_danger_plate()
+    } else {
+        rgb(0x332c2c).into()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,3 +435,64 @@ pub const RADIUS_CHIP: f32 = 5.0;
 pub const RAIL_TOGGLE_W: f32 = 16.0;
 pub const RAIL_TOGGLE_H: f32 = 12.0;
 pub const RADIUS_GLYPH: f32 = 3.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::Rgba;
+
+    fn over(top: Hsla, under: (f32, f32, f32)) -> (f32, f32, f32) {
+        let t: Rgba = top.into();
+        (
+            t.a * t.r + (1.0 - t.a) * under.0,
+            t.a * t.g + (1.0 - t.a) * under.1,
+            t.a * t.b + (1.0 - t.a) * under.2,
+        )
+    }
+    fn close(got: (f32, f32, f32), want: Hsla) {
+        let want: Rgba = want.into();
+        for (g, w) in [(got.0, want.r), (got.1, want.g), (got.2, want.b)] {
+            assert!((g - w).abs() < 2.5 / 255.0, "channel {g} vs {w}");
+        }
+    }
+    fn luma(c: (f32, f32, f32)) -> f32 {
+        (c.0 + c.1 + c.2) / 3.0
+    }
+
+    /// Over a black backdrop the glass ladder composites to the opaque
+    /// ladder exactly — flipping the flag on a black desktop changes
+    /// nothing about the shipped look.
+    #[test]
+    fn glass_ladder_matches_opaque_over_black() {
+        let ground = over(glass_canvas(), (0.0, 0.0, 0.0));
+        close(ground, rgb(0x1a1a1a).into());
+        close(over(wash_raised(), ground), rgb(0x232323).into());
+        close(over(wash_panel(), ground), rgb(0x282828).into());
+        close(over(wash_modal(), ground), rgb(0x2e2e2e).into());
+        close(over(wash_inset(), ground), rgb(0x151515).into());
+        close(over(wash_warning_plate(), ground), rgb(0x312f2b).into());
+        close(over(wash_warning_plate_strong(), ground), rgb(0x3e3930).into());
+        close(over(wash_danger_plate(), ground), rgb(0x332c2c).into());
+    }
+
+    /// The reason rungs are washes, not plates: over EVERY backdrop
+    /// brightness the elevation ordering holds — steps compress toward
+    /// white but never invert, and inset stays sunken. Independent
+    /// plates (opaque or translucent) over a glass ground fail this.
+    #[test]
+    fn glass_ladder_never_inverts_on_any_backdrop() {
+        for b in (0..=255).step_by(5) {
+            let v = b as f32 / 255.0;
+            let ground = over(glass_canvas(), (v, v, v));
+            let g = luma(ground);
+            let inset = luma(over(wash_inset(), ground));
+            let raised = luma(over(wash_raised(), ground));
+            let panel = luma(over(wash_panel(), ground));
+            let modal = luma(over(wash_modal(), ground));
+            assert!(
+                inset < g && g < raised && raised < panel && panel < modal,
+                "backdrop {b}: inset {inset} ground {g} raised {raised} panel {panel} modal {modal}"
+            );
+        }
+    }
+}

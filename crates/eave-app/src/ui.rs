@@ -23,8 +23,8 @@ use gpui::{
     actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, Context, Entity,
     FocusHandle, Font, FontStyle, FontWeight, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
     ListOffset, ListState, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
-    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowControlArea,
-    WindowOptions,
+    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowOptions,
 };
 use gpui::Animation;
 use gpui::AnimationExt as _;
@@ -1794,8 +1794,9 @@ impl Render for Shell {
         )
         .flex_none();
 
-        // Opaque window, custom titlebar — locked decision (spec 03
-        // §No-fork consequences) plus the Stage F visual pass.
+        // Opaque window by default, custom titlebar — locked decision
+        // (spec 03 §No-fork consequences) plus the Stage F visual pass.
+        // Under `EAVE_VIBRANCY=1` this root bg is the glass ground.
         div()
             .size_full()
             .flex()
@@ -1846,7 +1847,7 @@ impl Render for Shell {
                                                         .rounded_full()
                                                         .border_1()
                                                         .border_color(theme::border_strong())
-                                                        .bg(theme::panel())
+                                                        .bg(theme::panel_floating())
                                                         .shadow(theme::shadow_panel())
                                                         .text_size(px(theme::LABEL_SIZE))
                                                         .text_color(theme::text_secondary())
@@ -2042,6 +2043,13 @@ pub fn run(data_dir: PathBuf) -> ! {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
+                // Opaque is the shipped path; `EAVE_VIBRANCY=1` is the
+                // vibrancy spike (theme.rs owns the glass retune).
+                window_background: if theme::vibrancy() {
+                    WindowBackgroundAppearance::Blurred
+                } else {
+                    WindowBackgroundAppearance::Opaque
+                },
                 titlebar: Some(TitlebarOptions {
                     title: Some("eave".into()),
                     appears_transparent: true,
