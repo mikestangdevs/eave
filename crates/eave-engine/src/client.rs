@@ -302,6 +302,25 @@ impl Client {
         Ok(rx)
     }
 
+    /// One file's diff content (B2), computed by the engine at request
+    /// time — unary. Nothing is cached anywhere: a fresh snapshot on the
+    /// `files` subscription is the signal to re-request. An older engine
+    /// errors on this id (the B1 id-echo fix) — surface the message,
+    /// don't wait.
+    pub async fn diff(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<eave_wire::FileDiff, ClientError> {
+        Ok(self
+            .request::<eave_wire::DiffOk>(Request::Diff {
+                session_id: session_id.into(),
+                path: path.into(),
+            })
+            .await?
+            .diff)
+    }
+
     /// Subscribe per the cursor contract (spec 05-wire.md). The stream ends
     /// when the connection dies; resubscribe on a fresh client with the
     /// last cursor (or `None` if you hold no projection).

@@ -98,6 +98,14 @@ pub enum Request {
     /// data for session A never flows on any other session's files id,
     /// and never on watch (isolation invariant, enforced by test).
     Files { session_id: String },
+    /// One file's diff content (Slice B2), computed by the engine from
+    /// `git diff` in the session cwd at request time — unary, not a
+    /// subscription. There is deliberately no engine-held diff state to
+    /// go stale: invalidation rides the `files` channel (a fresh
+    /// [`FilesSnapshot`] means "re-request any diff you are showing").
+    /// Every failure shape is a stated fact inside [`FileDiff`], never a
+    /// hang — and every underlying git call is timeout-bounded.
+    Diff { session_id: String, path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +209,16 @@ pub struct FilesSnapshot {
     pub state: GitState,
     /// Empty when `state` is not `Ok` — and also when the repo is clean.
     pub files: Vec<ChangedFile>,
+    /// Files beyond the engine's list cap (a 10k-changed-file repo must
+    /// not ship a 10k-row frame on every refresh). Zero = the list is
+    /// complete; non-zero is a stated fact the rail must render ("… and
+    /// N more"), never silent truncation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -227,6 +245,14 @@ pub struct ChangedFile {
     /// file, or too large to count.
     pub adds: Option<u64>,
     pub dels: Option<u64>,
+    /// For renames: the pre-rename path (B2 — the diff needs both sides
+    /// in its pathspec, and "renamed from X" is a fact worth stating).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orig_path: Option<String>,
+    /// The porcelain entry described an untracked file (B2: its "diff"
+    /// is the file's own content — `git diff HEAD` cannot see it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub untracked: bool,
 }
 
 /// Worktree-level status, folded from git's two-letter XY codes: the
@@ -255,6 +281,69 @@ impl FileStatus {
             FileStatus::Conflicted => "U",
         }
     }
+}
+
+/// Unary reply to [`Request::Diff`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffOk {
+    pub diff: FileDiff,
+}
+
+/// One file's diff content (Slice B2), as git states it at request time.
+/// Ephemeral by construction: computed on demand, held nowhere — a fresh
+/// [`FilesSnapshot`] on the `files` channel is the invalidation signal.
+/// Every shape a diff can take is a stated fact, including the ones that
+/// have no text to show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub kind: DiffKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiffKind {
+    /// Unified-diff hunks. Empty `hunks` is itself a fact ("no line
+    /// changes" — a pure rename or a mode-only change).
+    Text {
+        hunks: Vec<DiffHunk>,
+        /// The engine hit its byte or line cap: these hunks are the head
+        /// of a larger diff. The rail states it; the full diff stays in
+        /// git where it belongs.
+        truncated: bool,
+    },
+    /// Binary content differs; there is no text diff to show.
+    Binary,
+    /// A submodule pointer moved (and/or its worktree is dirty). The
+    /// detail is the fact to render, e.g. `abc1234 → def5678 (dirty)`.
+    Submodule { detail: String },
+    /// An untracked symlink: its "content" is where it points.
+    Symlink { target: String },
+    /// Git could not answer (timeout, vanished file, unreadable repo).
+    Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    /// The `@@ -a,b +c,d @@ context` line, verbatim.
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub op: DiffOp,
+    /// Line content without the leading `+`/`-`/` ` marker — the op
+    /// carries that; the rail renders it as a wash, not a glyph.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffOp {
+    Add,
+    Del,
+    Ctx,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -401,7 +490,10 @@ mod tests {
                             status: FileStatus::Modified,
                             adds: Some(12),
                             dels: None,
+                            orig_path: None,
+                            untracked: false,
                         }],
+                        omitted: 0,
                     },
                 }),
             };
@@ -410,6 +502,57 @@ mod tests {
             let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
             assert_eq!(back, resp);
         }
+    }
+
+    #[test]
+    fn diff_frames_round_trip() {
+        let req = RequestEnvelope {
+            id: 6,
+            request: Request::Diff {
+                session_id: "s1".into(),
+                path: "src/lib.rs".into(),
+            },
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"method\":\"diff\""), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
+
+        for kind in [
+            DiffKind::Text {
+                hunks: vec![DiffHunk {
+                    header: "@@ -1,2 +1,3 @@".into(),
+                    lines: vec![
+                        DiffLine { op: DiffOp::Ctx, text: "one".into() },
+                        DiffLine { op: DiffOp::Del, text: "two".into() },
+                        DiffLine { op: DiffOp::Add, text: "TWO".into() },
+                    ],
+                }],
+                truncated: true,
+            },
+            DiffKind::Binary,
+            DiffKind::Submodule { detail: "abc1234 → def5678 (dirty)".into() },
+            DiffKind::Symlink { target: "../elsewhere".into() },
+            DiffKind::Error { message: "git diff timed out".into() },
+        ] {
+            let ok = DiffOk {
+                diff: FileDiff { path: "src/lib.rs".into(), kind },
+            };
+            let v = serde_json::to_value(&ok).unwrap();
+            let back: DiffOk = serde_json::from_value(v).unwrap();
+            assert_eq!(back, ok);
+        }
+    }
+
+    /// Wire-compat: a B1 engine's snapshot (no `omitted`, no `orig_path`,
+    /// no `untracked`) still parses — the new fields default.
+    #[test]
+    fn b1_files_frames_still_parse() {
+        let line = r#"{"state":{"kind":"ok"},"files":[{"path":"a.txt","status":"modified","adds":1,"dels":2}]}"#;
+        let snap: FilesSnapshot = serde_json::from_str(line).unwrap();
+        assert_eq!(snap.omitted, 0);
+        assert_eq!(snap.files[0].orig_path, None);
+        assert!(!snap.files[0].untracked);
     }
 
     #[test]

@@ -360,6 +360,31 @@ pub fn danger_plate() -> Hsla {
     }
 }
 
+/// Diff line fills (Slice B2) — the only place state pigment tints a
+/// surface inside the rails, because add/remove IS state (the stance:
+/// color speaks only when state deserves attention). Glass: state-color
+/// washes over the bare frost the rail rows sit on — on glass every
+/// rung is a wash by architecture, and the sweep test proves these
+/// always rise above the ground and keep their hue apart on any
+/// backdrop. Opaque: the same washes PRE-BLENDED over the canvas (the
+/// F.2 lesson — a translucent wash belongs to the surface it was solved
+/// for; pre-composite instead of hoping).
+const DIFF_WASH_ALPHA: f32 = 0.10;
+pub fn diff_add_bg() -> Hsla {
+    if vibrancy() {
+        success().opacity(DIFF_WASH_ALPHA)
+    } else {
+        rgb(0x212c25).into()
+    }
+}
+pub fn diff_del_bg() -> Hsla {
+    if vibrancy() {
+        danger().opacity(DIFF_WASH_ALPHA)
+    } else {
+        rgb(0x2e2322).into()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Code
 
@@ -416,6 +441,10 @@ pub const SMALL_LINE: f32 = 15.0;
 /// Code-block language strip, structural micro-labels.
 pub const MICRO_SIZE: f32 = 10.0;
 pub const MICRO_LINE: f32 = 14.0;
+/// Diff lines in the files rail (B2): smallest mono rank — the rail is
+/// 248 px, so the shape of the change is the signal; long lines wrap.
+pub const DIFF_SIZE: f32 = 10.0;
+pub const DIFF_LINE: f32 = 15.0;
 /// Titlebar title.
 pub const TITLE_SIZE: f32 = 13.0;
 /// Tool rows: the tool name is a machine identifier — mono, so tool
@@ -529,6 +558,13 @@ pub const RADIUS_GLYPH: f32 = 3.0;
 pub const FILES_RAIL_W: f32 = RAIL_W;
 /// Fixed slot for the one-letter status glyph so paths align.
 pub const FILE_STATUS_W: f32 = 12.0;
+/// Render cap for the inline diff pane (B2). The rail diff is a
+/// shape-of-change view, not a review surface — and the pane sits in a
+/// non-virtualized scroll container, so every rendered line is laid out
+/// every frame. At the engine's full 2000-line cap the pane alone cost
+/// ~13 ms/frame (measured, EAVE_PERF); at 240 it holds the budget. The
+/// remainder is a stated count, never silence.
+pub const DIFF_PANE_MAX_LINES: usize = 240;
 
 // ---------------------------------------------------------------------------
 // Floating chrome geometry (Stage H glass)
@@ -584,6 +620,35 @@ mod tests {
             assert!(luma(over(wash_warning_plate(), g)) > luma(g), "backdrop {b}");
             assert!(luma(over(wash_danger_plate(), g)) > luma(g), "backdrop {b}");
         }
+    }
+
+    /// The B2 diff washes obey the same law as every glass rung: on any
+    /// backdrop they rise above the ground (state surfaces never read
+    /// sunken) and keep their hues apart (add reads green, del reads
+    /// red — the ground is achromatic, so channel order is hue). The
+    /// opaque pre-blends must equal the same wash over the opaque
+    /// canvas — the F.2 pre-composite discipline, checked not assumed.
+    #[test]
+    fn diff_washes_rise_and_keep_their_hue_on_any_backdrop() {
+        for b in (0..=255).step_by(5) {
+            let v = b as f32 / 255.0;
+            let ground = over(glass_canvas(), (v, v, v));
+            for (wash, hue_hi, hue_lo) in [
+                (success().opacity(DIFF_WASH_ALPHA), 1, 0), // g over r
+                (danger().opacity(DIFF_WASH_ALPHA), 0, 1),  // r over g
+            ] {
+                let lit = over(wash, ground);
+                assert!(luma(lit) > luma(ground), "backdrop {b}: wash sank");
+                let chans = [lit.0, lit.1, lit.2];
+                assert!(
+                    chans[hue_hi] > chans[hue_lo],
+                    "backdrop {b}: hue collapsed ({chans:?})"
+                );
+            }
+        }
+        let opaque = (0x1a as f32 / 255.0, 0x1a as f32 / 255.0, 0x1a as f32 / 255.0);
+        close(over(success().opacity(DIFF_WASH_ALPHA), opaque), rgb(0x212c25).into());
+        close(over(danger().opacity(DIFF_WASH_ALPHA), opaque), rgb(0x2e2322).into());
     }
 
     /// The reason rungs are washes, not plates: over EVERY backdrop

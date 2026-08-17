@@ -22,8 +22,8 @@ use eave_core::proc::{self, ProcIdentity};
 use eave_core::store::Meta;
 use eave_engine::client::Client;
 use eave_wire::{
-    socket_path, FileStatus, FilesSnapshot, GitState, ResponseBody, ResponseEnvelope,
-    SubscriptionItem,
+    socket_path, DiffKind, DiffOp, FileStatus, FilesSnapshot, GitState, ResponseBody,
+    ResponseEnvelope, SubscriptionItem,
 };
 
 fn engined_bin() -> PathBuf {
@@ -83,16 +83,22 @@ struct EngineProc {
 
 impl EngineProc {
     fn spawn(data_dir: &Path, fake_mode: &str) -> Self {
+        Self::spawn_with_env(data_dir, fake_mode, &[])
+    }
+
+    fn spawn_with_env(data_dir: &Path, fake_mode: &str, envs: &[(&str, &str)]) -> Self {
         let log = std::fs::File::create(data_dir.join("engine-test.log")).unwrap();
-        let child = Command::new(engined_bin())
-            .args(["--data-dir", &data_dir.display().to_string()])
+        let mut cmd = Command::new(engined_bin());
+        cmd.args(["--data-dir", &data_dir.display().to_string()])
             .env("EAVE_AGENT", fake_agent_bin())
             .env("EAVE_FAKE_MODE", fake_mode)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("spawn eave-engined");
+            .stderr(log);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn eave-engined");
         let me = Self {
             child,
             data_dir: data_dir.to_path_buf(),
@@ -183,11 +189,15 @@ async fn wait_for_snapshot(
 async fn files_channel_never_crosses_sessions() {
     const CANARY_A: &str = "CANARY_A_3f9a.txt";
     const CANARY_B: &str = "CANARY_B_7c2b.txt";
+    // B2: diff CONTENT canaries — file contents must flow only on a diff
+    // reply's own envelope id, never on any subscription channel.
+    const CONTENT_A: &str = "CONTENT_CANARY_A_51d0";
+    const CONTENT_B: &str = "CONTENT_CANARY_B_92e7";
     let dir = scratch();
     let repo_a = repo();
     let repo_b = repo();
-    std::fs::write(repo_a.join(CANARY_A), "aaa\n").unwrap();
-    std::fs::write(repo_b.join(CANARY_B), "bbb\n").unwrap();
+    std::fs::write(repo_a.join(CANARY_A), format!("{CONTENT_A}\n")).unwrap();
+    std::fs::write(repo_b.join(CANARY_B), format!("{CONTENT_B}\n")).unwrap();
     let engine = EngineProc::spawn(&dir, "linger");
 
     let c = Client::connect(&dir).await.expect("connect client");
@@ -272,6 +282,62 @@ async fn files_channel_never_crosses_sessions() {
         }
     }
 
+    // B2: request each session's canary diff on this same raw socket —
+    // the content must arrive on the requesting envelope id and nowhere
+    // else. Keep collecting the subscription ids while we wait.
+    w.write_all(
+        format!(
+            "{{\"id\":5,\"method\":\"diff\",\"params\":{{\"session_id\":\"sA\",\"path\":\"{CANARY_A}\"}}}}\n{{\"id\":6,\"method\":\"diff\",\"params\":{{\"session_id\":\"sB\",\"path\":\"{CANARY_B}\"}}}}\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut diff_a_line: Option<String> = None;
+    let mut diff_b_line: Option<String> = None;
+    let end = Instant::now() + Duration::from_secs(15);
+    while diff_a_line.is_none() || diff_b_line.is_none() {
+        let remaining = end.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "diff replies never arrived");
+        let line = tokio::time::timeout(remaining, lines.next_line())
+            .await
+            .expect("frame in time")
+            .unwrap()
+            .expect("raw stream open");
+        let env: ResponseEnvelope = serde_json::from_str(&line).expect("valid frame");
+        match env.id {
+            2 => watch_lines.push(line),
+            3 => files_a_lines.push(line),
+            4 => files_b_lines.push(line),
+            5 => diff_a_line = Some(line),
+            6 => diff_b_line = Some(line),
+            _ => {}
+        }
+    }
+    // Positive controls: each diff reply carries its own file's content.
+    assert!(
+        diff_a_line.as_deref().unwrap().contains(CONTENT_A),
+        "sA diff missing its content: {diff_a_line:?}"
+    );
+    assert!(
+        diff_b_line.as_deref().unwrap().contains(CONTENT_B),
+        "sB diff missing its content: {diff_b_line:?}"
+    );
+    // And never each other's.
+    assert!(!diff_a_line.as_deref().unwrap().contains(CONTENT_B));
+    assert!(!diff_b_line.as_deref().unwrap().contains(CONTENT_A));
+    // Diff content never appears on ANY subscription channel.
+    for line in files_a_lines
+        .iter()
+        .chain(files_b_lines.iter())
+        .chain(watch_lines.iter())
+    {
+        assert!(
+            !line.contains(CONTENT_A) && !line.contains(CONTENT_B),
+            "diff content leaked onto a subscription channel: {line}"
+        );
+    }
+
     // The isolation invariant, on raw bytes.
     for line in &files_a_lines {
         assert!(
@@ -336,14 +402,15 @@ async fn non_git_and_broken_cwds_are_stated_facts() {
     drop(engine);
 }
 
-/// The B1 poll contract end to end: session open scans (clean repo → Ok
-/// and empty), and the next turn boundary picks up a modification made
-/// while the session idled — no FS watcher involved.
+/// The polling FALLBACK end to end (B2 keeps B1's contract alive for
+/// when watching is unavailable — here forced via `EAVE_NO_FSWATCH=1`):
+/// an idle-time modification does NOT refresh anything (no watcher, no
+/// turn), and the next turn boundary picks it up.
 #[tokio::test]
-async fn turn_boundary_poll_picks_up_changes() {
+async fn turn_boundary_poll_is_the_fallback_without_a_watcher() {
     let dir = scratch();
     let repo = repo();
-    let engine = EngineProc::spawn(&dir, "linger");
+    let engine = EngineProc::spawn_with_env(&dir, "linger", &[("EAVE_NO_FSWATCH", "1")]);
     let c = Client::connect(&dir).await.expect("connect");
     c.open(Some("s1".into()), Some(repo.display().to_string()))
         .await
@@ -353,10 +420,22 @@ async fn turn_boundary_poll_picks_up_changes() {
     let snap = wait_for_snapshot(&mut rx, "open-time snapshot", |_| true).await;
     assert_eq!(snap.state, GitState::Ok);
     assert!(snap.files.is_empty(), "repo starts clean: {:?}", snap.files);
+    // Drain the open-time/subscribe-time scan stragglers (both triggers
+    // may fire once each) so the quiet-check below sees only what the
+    // WRITE causes.
+    while tokio::time::timeout(Duration::from_millis(700), rx.recv())
+        .await
+        .is_ok()
+    {}
 
-    // Change the worktree while the session idles: with no live turn,
-    // nothing polls — B1 is turn-boundary polling by design.
+    // Change the worktree while the session idles: with the watcher
+    // disabled and no live turn, nothing may refresh.
     std::fs::write(repo.join("base.txt"), "one\nCHANGED\nthree\n").unwrap();
+    let quiet = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await;
+    assert!(
+        quiet.is_err(),
+        "fallback mode must not refresh on a bare fs write: {quiet:?}"
+    );
     assert!(c.send("s1", "go").await.expect("send"));
 
     let snap = wait_for_snapshot(&mut rx, "post-turn snapshot", |s| !s.files.is_empty()).await;
@@ -365,6 +444,128 @@ async fn turn_boundary_poll_picks_up_changes() {
     assert_eq!(f.path, "base.txt");
     assert_eq!(f.status, FileStatus::Modified);
     assert_eq!((f.adds, f.dels), (Some(2), Some(1)));
+
+    drop(engine);
+}
+
+/// B2's live invalidation: with a files subscriber attached, a bare fs
+/// write — no turn boundary anywhere near — refreshes the snapshot via
+/// the FS watcher.
+#[tokio::test]
+async fn fs_events_refresh_without_turn_boundaries() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+
+    let mut rx = c.files("s1").await.expect("files");
+    let _ = wait_for_snapshot(&mut rx, "initial snapshot", |_| true).await;
+
+    // No send, no turn — the write alone must surface.
+    std::fs::write(repo.join("base.txt"), "one\nLIVE\ntwo\n").unwrap();
+    let snap = wait_for_snapshot(&mut rx, "event-driven snapshot", |s| !s.files.is_empty()).await;
+    assert_eq!(snap.files[0].path, "base.txt");
+    assert_eq!(snap.files[0].status, FileStatus::Modified);
+
+    drop(engine);
+}
+
+/// The debounce constraint: an agent-style burst of 200 rapid writes
+/// produces a bounded number of refreshes (one or a few, never one per
+/// write), and the final snapshot covers every file.
+#[tokio::test]
+async fn burst_of_writes_coalesces_into_bounded_refreshes() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    let mut rx = c.files("s1").await.expect("files");
+    let _ = wait_for_snapshot(&mut rx, "initial snapshot", |_| true).await;
+
+    for i in 0..200 {
+        std::fs::write(repo.join(format!("burst{i:03}.txt")), "x\n").unwrap();
+    }
+
+    // Collect every frame for a fixed window past the burst; the last
+    // one must be complete, and the count must be a handful, not 200.
+    let mut frames: Vec<FilesSnapshot> = Vec::new();
+    let end = Instant::now() + Duration::from_secs(4);
+    loop {
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(SubscriptionItem::Files { snapshot, .. })) => frames.push(snapshot),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("files stream ended"),
+            Err(_) => break,
+        }
+    }
+    assert!(!frames.is_empty(), "burst produced no refresh at all");
+    assert!(
+        frames.len() <= 6,
+        "200 writes produced {} refreshes — debounce is thrashing",
+        frames.len()
+    );
+    let last = frames.last().unwrap();
+    assert_eq!(
+        last.files.len(),
+        200,
+        "final snapshot incomplete: {} files",
+        last.files.len()
+    );
+
+    drop(engine);
+}
+
+/// The diff request end to end: every requested shape comes back as a
+/// stated fact — text hunks for a modification, all-adds for untracked,
+/// binary stated, and a path the engine has no entry for still answers.
+#[tokio::test]
+async fn diff_over_the_wire_states_every_shape() {
+    let dir = scratch();
+    let repo = repo();
+    std::fs::write(repo.join("base.txt"), "one\nEDIT\ntwo\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "n1\nn2\n").unwrap();
+    std::fs::write(repo.join("blob.bin"), [0u8, 1, 0]).unwrap();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    // Prime the snapshot so diffs see untracked/orig facts.
+    let mut rx = c.files("s1").await.expect("files");
+    let _ = wait_for_snapshot(&mut rx, "snapshot", |s| s.files.len() == 3).await;
+
+    let d = c.diff("s1", "base.txt").await.expect("diff base");
+    match d.kind {
+        DiffKind::Text { hunks, truncated } => {
+            assert!(!truncated);
+            assert!(hunks[0]
+                .lines
+                .iter()
+                .any(|l| l.op == DiffOp::Add && l.text == "EDIT"));
+        }
+        other => panic!("expected text diff, got {other:?}"),
+    }
+
+    let d = c.diff("s1", "new.txt").await.expect("diff new");
+    match d.kind {
+        DiffKind::Text { hunks, .. } => {
+            assert!(hunks[0].lines.iter().all(|l| l.op == DiffOp::Add));
+        }
+        other => panic!("expected all-added diff, got {other:?}"),
+    }
+
+    let d = c.diff("s1", "blob.bin").await.expect("diff bin");
+    assert_eq!(d.kind, DiffKind::Binary);
 
     drop(engine);
 }

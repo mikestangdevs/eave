@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, Context, Corners,
-    Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
+    actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent, Context,
+    Corners, Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
     Pixels, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextRun,
     TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
@@ -35,8 +35,8 @@ use tokio::sync::mpsc as tokio_mpsc;
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{Delivery, Row, ToolStatus, Transcript};
 use eave_wire::{
-    AttentionSnapshot, ChangedFile, Cursor, FileStatus, FilesSnapshot, GitState, SessionInfo,
-    SubscriptionItem, WaitReason,
+    AttentionSnapshot, ChangedFile, Cursor, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff,
+    FileStatus, FilesSnapshot, GitState, SessionInfo, SubscriptionItem, WaitReason,
 };
 
 use crate::display::{DisplayList, RowId};
@@ -91,6 +91,12 @@ type RailEvent = Vec<SessionInfo>;
 /// predating the method) — a stated fact, not silence.
 type FilesEvent = (String, Option<FilesSnapshot>);
 
+/// One diff reply (B2), tagged with the session AND path it answers so a
+/// stale reply — a switch or a re-click raced the request — can never
+/// render under the wrong row. `Err` is the engine's stated message
+/// (including "unknown method" from an engine predating diffs).
+type DiffEvent = (String, String, Result<FileDiff, String>);
+
 #[derive(Debug)]
 enum Command {
     Send(String),
@@ -102,6 +108,10 @@ enum Command {
     Select(String),
     /// Rail "+ new": open a fresh session and select it.
     NewSession,
+    /// Files-rail row click (B2): fetch one file's diff. Unary and
+    /// re-issued on every fresh snapshot while the row stays expanded —
+    /// the files channel is the invalidation signal.
+    Diff(String),
 }
 
 #[derive(Default)]
@@ -111,8 +121,10 @@ struct Queues {
     attn: Mutex<VecDeque<AttnEvent>>,
     rail: Mutex<VecDeque<RailEvent>>,
     files: Mutex<VecDeque<FilesEvent>>,
+    diffs: Mutex<VecDeque<DiffEvent>>,
 }
 
+#[derive(Clone)]
 struct Plumbing {
     queues: Arc<Queues>,
     wake: futures::channel::mpsc::Sender<()>,
@@ -137,6 +149,10 @@ impl Plumbing {
     }
     fn push_files(&self, ev: FilesEvent) {
         self.queues.files.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
+    fn push_diff(&self, ev: DiffEvent) {
+        self.queues.diffs.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
 }
@@ -172,7 +188,9 @@ async fn feed_loop(
             ConnEvent::Reconnecting { attempt }
         });
         let client = match Client::connect_or_spawn(&data_dir, &spawn).await {
-            Ok(c) => c,
+            // Arc: diff requests run as their own tasks off this loop (a
+            // slow repo's diff must not stall sends/kills or the feed).
+            Ok(c) => Arc::new(c),
             Err(ClientError::Busy { holder }) => {
                 plumbing.push_conn(ConnEvent::Busy {
                     holder_pid: holder.map(|h| h.pid),
@@ -304,6 +322,21 @@ async fn feed_loop(
                         Some(Command::Kill) => {
                             let _ = client.kill(&session_id).await;
                         }
+                        Some(Command::Diff(path)) => {
+                            // Off-loop: the reply lands on the diffs
+                            // queue tagged (session, path); the pump
+                            // discards it if the slot moved on.
+                            let client = Arc::clone(&client);
+                            let sid = session_id.clone();
+                            let plumbing = plumbing.clone();
+                            tokio::spawn(async move {
+                                let res = client
+                                    .diff(&sid, &path)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                plumbing.push_diff((sid, path, res));
+                            });
+                        }
                         Some(Command::Resubscribe) => {
                             cursor = None;
                             continue 'session;
@@ -433,26 +466,64 @@ fn synthetic_files_snapshot() -> FilesSnapshot {
                 status: FileStatus::Modified,
                 adds: Some(124),
                 dels: Some(38),
+                orig_path: None,
+                untracked: false,
             },
             ChangedFile {
                 path: "crates/eave-engine/src/git.rs".into(),
                 status: FileStatus::Added,
                 adds: Some(310),
                 dels: Some(0),
+                orig_path: None,
+                untracked: true,
             },
             ChangedFile {
                 path: "docs/notes/scratch.md".into(),
                 status: FileStatus::Deleted,
                 adds: Some(0),
                 dels: Some(57),
+                orig_path: None,
+                untracked: false,
             },
             ChangedFile {
                 path: "assets/icon.png".into(),
                 status: FileStatus::Modified,
                 adds: None,
                 dels: None,
+                orig_path: None,
+                untracked: false,
             },
         ],
+        omitted: 0,
+    }
+}
+
+/// A [`git::DIFF_MAX_LINES`]-scale text diff for the perf harness: the
+/// long-diff render path is new in B2 and must be measured at its cap,
+/// not at a friendly size. Runs alternate ctx/del/add so the wash
+/// grouping is exercised, not short-circuited.
+fn synthetic_long_diff() -> FileDiff {
+    let hunks = (0..40)
+        .map(|h| DiffHunk {
+            header: format!("@@ -{},50 +{},50 @@ fn section_{h}()", h * 60 + 1, h * 60 + 1),
+            lines: (0..50)
+                .map(|i| DiffLine {
+                    op: match i % 5 {
+                        0 | 1 => DiffOp::Ctx,
+                        2 => DiffOp::Del,
+                        _ => DiffOp::Add,
+                    },
+                    text: format!("    let value_{h}_{i} = compute(input[{i}], flags | MASK_{h});"),
+                })
+                .collect(),
+        })
+        .collect();
+    FileDiff {
+        path: "crates/eave-app/src/ui.rs".into(),
+        kind: DiffKind::Text {
+            hunks,
+            truncated: false,
+        },
     }
 }
 
@@ -491,6 +562,27 @@ impl SessionsState {
 struct FilesState {
     snapshot: Option<FilesEvent>,
     collapsed: bool,
+    /// The one expanded diff (B2), session-tagged like everything else
+    /// in this rail: a switch clears it, a snapshot that no longer lists
+    /// its file closes it, and a fresh snapshot re-requests it (the
+    /// files channel is the invalidation signal — the diff itself is
+    /// never cached engine-side).
+    diff: Option<DiffSlot>,
+}
+
+struct DiffSlot {
+    session: String,
+    path: String,
+    fetch: DiffFetch,
+}
+
+#[derive(Clone)]
+enum DiffFetch {
+    Loading,
+    /// Arc: the pane clones out of the entity every render; a 2000-line
+    /// diff must not be a per-frame deep copy.
+    Ready(Arc<FileDiff>),
+    Failed(String),
 }
 
 /// Right-aligned count labels for one changed file; `None` when the
@@ -504,6 +596,130 @@ fn count_labels(adds: Option<u64>, dels: Option<u64>) -> Option<(String, String)
             format!("−{}", d.unwrap_or(0)),
         )),
     }
+}
+
+/// The inline diff pane (B2), rendered under its expanded row. Every
+/// shape is a stated fact — binary, symlink, submodule, rename, error,
+/// truncation all render as words; only add/remove lines get pigment
+/// (the washes), because add/remove IS state and nothing else here is.
+fn diff_pane(f: &ChangedFile, fetch: &DiffFetch) -> AnyElement {
+    let fact = |text: String| {
+        div()
+            .text_size(px(theme::DETAIL_SIZE))
+            .line_height(px(theme::DETAIL_LINE))
+            .text_color(theme::text_ghost())
+            .child(SharedString::from(text))
+            .into_any_element()
+    };
+    let mut children: Vec<AnyElement> = Vec::new();
+    if let Some(orig) = &f.orig_path {
+        children.push(fact(format!("renamed from {orig}")));
+    }
+    match fetch {
+        DiffFetch::Loading => children.push(fact("…".into())),
+        DiffFetch::Failed(message) => children.push(fact(format!("diff unavailable: {message}"))),
+        DiffFetch::Ready(diff) => match &diff.kind {
+            DiffKind::Binary => children.push(fact("binary file — no text diff".into())),
+            DiffKind::Symlink { target } => children.push(fact(format!("symlink → {target}"))),
+            DiffKind::Submodule { detail } => children.push(fact(format!("submodule {detail}"))),
+            DiffKind::Error { message } => children.push(fact(format!("git failed: {message}"))),
+            DiffKind::Text { hunks, truncated } => {
+                if hunks.is_empty() && !*truncated {
+                    children.push(fact("no line changes".into()));
+                }
+                // Render cap: the pane sits in a non-virtualized scroll
+                // container, so every line here is laid out every frame
+                // — past the cap the remainder is a stated count. (The
+                // engine's own 2000-line cap still bounds the data;
+                // `truncated` states that separately.)
+                let total: usize = hunks.iter().map(|h| h.lines.len()).sum();
+                let mut budget = theme::DIFF_PANE_MAX_LINES;
+                'hunks: for hunk in hunks {
+                    children.push(
+                        div()
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_ghost())
+                            .truncate()
+                            .child(SharedString::from(hunk.header.clone()))
+                            .into_any_element(),
+                    );
+                    // Consecutive same-op lines render as ONE element (a
+                    // multi-line text under one wash): element count
+                    // scales with runs, not lines.
+                    for (op, text, count) in diff_runs(&hunk.lines, budget) {
+                        budget -= count;
+                        let styled = div()
+                            .px(px(theme::SPACE_1))
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::DIFF_SIZE))
+                            .line_height(px(theme::DIFF_LINE))
+                            .child(SharedString::from(text));
+                        children.push(
+                            match op {
+                                DiffOp::Add => styled
+                                    .bg(theme::diff_add_bg())
+                                    .text_color(theme::text_secondary()),
+                                DiffOp::Del => styled
+                                    .bg(theme::diff_del_bg())
+                                    .text_color(theme::text_secondary()),
+                                DiffOp::Ctx => styled.text_color(theme::text_ghost()),
+                            }
+                            .into_any_element(),
+                        );
+                        if budget == 0 {
+                            break 'hunks;
+                        }
+                    }
+                }
+                let shown = total.min(theme::DIFF_PANE_MAX_LINES);
+                if shown < total {
+                    children.push(fact(format!(
+                        "… {} more lines — ⌘-click opens the file",
+                        total - shown
+                    )));
+                }
+                if *truncated {
+                    children.push(fact(
+                        "diff truncated by the engine — the full diff stays in git".into(),
+                    ));
+                }
+            }
+        },
+    }
+    // Indented under its row, scoped by a hairline edge (structure, not
+    // decoration); no plate — the diff sits on the same bare frost as
+    // the rows around it.
+    div()
+        .ml(px(theme::FILE_STATUS_W))
+        .pl(px(theme::SPACE_2))
+        .py(px(theme::SPACE_1))
+        .border_l_1()
+        .border_color(theme::border())
+        .flex()
+        .flex_col()
+        .children(children)
+        .into_any_element()
+}
+
+/// Group consecutive same-op diff lines into one multi-line string per
+/// run, taking at most `budget` lines (the render cap): element count
+/// scales with runs, line count is bounded, and each run reports how
+/// many lines it holds so the caller can spend the budget.
+fn diff_runs(lines: &[DiffLine], budget: usize) -> Vec<(DiffOp, String, usize)> {
+    let mut runs: Vec<(DiffOp, String, usize)> = Vec::new();
+    for l in lines.iter().take(budget) {
+        match runs.last_mut() {
+            Some((op, buf, count)) if *op == l.op => {
+                buf.push('\n');
+                buf.push_str(&l.text);
+                *count += 1;
+            }
+            _ => runs.push((l.op, l.text.clone(), 1)),
+        }
+    }
+    runs
 }
 
 /// Quiet escalates from a subtle line to a prominent bar at 10 min
@@ -1302,9 +1518,19 @@ impl Shell {
         let held = self.files.read(cx).snapshot.clone();
         // Some(None) = engine refused; Some(Some) = snapshot; None = no
         // data for the selected session yet.
-        let current: Option<Option<FilesSnapshot>> = match (held, selected) {
+        let current: Option<Option<FilesSnapshot>> = match (held, selected.clone()) {
             (Some((sid, snap)), Some(sel)) if sid == sel => Some(snap),
             _ => None,
+        };
+        // The expanded diff, only if it belongs to the selected session
+        // (a deselected session's diff never renders — same tag rule as
+        // the snapshot itself).
+        let diff_slot: Option<(String, DiffFetch)> = {
+            let st = self.files.read(cx);
+            st.diff.as_ref().and_then(|s| {
+                (selected.as_deref() == Some(s.session.as_str()))
+                    .then(|| (s.path.clone(), s.fetch.clone()))
+            })
         };
         let fact = |text: &str| {
             div()
@@ -1315,7 +1541,7 @@ impl Shell {
                 .child(SharedString::from(text.to_string()))
                 .into_any_element()
         };
-        let (count_label, body): (Option<usize>, AnyElement) = match &current {
+        let (count_label, body): (Option<String>, AnyElement) = match &current {
             None => (None, fact("…")),
             Some(None) => (None, fact("file status unavailable — engine predates it")),
             Some(Some(snap)) => match &snap.state {
@@ -1330,15 +1556,30 @@ impl Shell {
                         .child(SharedString::from(format!("git failed: {message}")))
                         .into_any_element(),
                 ),
-                GitState::Ok if snap.files.is_empty() => (Some(0), fact("no changes")),
+                GitState::Ok if snap.files.is_empty() => (Some("0".into()), fact("no changes")),
                 GitState::Ok => {
-                    let rows: Vec<AnyElement> = snap
-                        .files
-                        .iter()
-                        .map(|f| Self::file_row(f))
-                        .collect();
+                    let mut rows: Vec<AnyElement> = Vec::new();
+                    for f in &snap.files {
+                        let expanded =
+                            matches!(&diff_slot, Some((p, _)) if p.as_str() == f.path);
+                        rows.push(self.file_row(f, expanded, cx));
+                        if expanded {
+                            if let Some((_, fetch)) = &diff_slot {
+                                rows.push(diff_pane(f, fetch));
+                            }
+                        }
+                    }
+                    // The list cap is a stated fact, never silence.
+                    if snap.omitted > 0 {
+                        rows.push(fact(&format!("… and {} more files", snap.omitted)));
+                    }
+                    let label = if snap.omitted > 0 {
+                        format!("{} of {}", snap.files.len(), snap.files.len() as u64 + snap.omitted)
+                    } else {
+                        snap.files.len().to_string()
+                    };
                     (
-                        Some(rows.len()),
+                        Some(label),
                         div().flex().flex_col().children(rows).into_any_element(),
                     )
                 }
@@ -1393,20 +1634,40 @@ impl Shell {
 
     /// One changed file: status glyph in a fixed slot, path, +/− counts.
     /// Counts wear the existing state pigments (adds success, removals
-    /// danger); the diff-view washes are B2 tokens, not built here.
+    /// danger). B2: click toggles the file's inline diff; ⌘-click opens
+    /// the file in the system editor (nothing to open for a deleted
+    /// file — the click is ignored, not an error).
     /// The path renders as truncating-directory + always-visible
     /// basename: the filename is the identity and must survive any
     /// width; the directory is context and may lose its tail.
-    fn file_row(f: &ChangedFile) -> AnyElement {
+    fn file_row(&self, f: &ChangedFile, expanded: bool, cx: &Context<Self>) -> AnyElement {
         let counts = count_labels(f.adds, f.dels);
         let (dir, base) = match f.path.rfind('/') {
             Some(ix) => (f.path[..=ix].to_string(), f.path[ix + 1..].to_string()),
             None => (String::new(), f.path.clone()),
         };
+        let path = f.path.clone();
+        let status = f.status;
         div()
+            .id(SharedString::from(format!("file-{}", f.path)))
             .px(px(theme::SPACE_2))
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
+            .when(expanded, |d| d.bg(theme::overlay()))
+            .when(!expanded, |d| d.hover(|s| s.bg(theme::overlay())))
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                if ev.modifiers().platform {
+                    if status != FileStatus::Deleted {
+                        if let Some(cwd) = this.selected_cwd(cx) {
+                            let _ = std::process::Command::new("open")
+                                .arg(cwd.join(&path))
+                                .spawn();
+                        }
+                    }
+                    return;
+                }
+                this.toggle_diff(path.clone(), cx);
+            }))
             .flex()
             .flex_row()
             .items_center()
@@ -1469,6 +1730,48 @@ impl Shell {
                     .into_any_element(),
             })
             .into_any_element()
+    }
+
+    /// Toggle one file's inline diff (B2). Opening requests the content
+    /// (unary; the reply folds in via the diffs queue); the request is
+    /// re-issued by the pump on every fresh snapshot while the row stays
+    /// expanded, so the pane tracks the worktree without any engine-side
+    /// diff cache.
+    fn toggle_diff(&self, path: String, cx: &mut Context<Self>) {
+        let Some(sid) = self.transcript.read(cx).session_id.clone() else {
+            return;
+        };
+        let same = matches!(
+            self.files.read(cx).diff.as_ref(),
+            Some(slot) if slot.session == sid && slot.path == path
+        );
+        self.files.update(cx, |state, cx| {
+            state.diff = if same {
+                None
+            } else {
+                Some(DiffSlot {
+                    session: sid,
+                    path: path.clone(),
+                    fetch: DiffFetch::Loading,
+                })
+            };
+            cx.notify();
+        });
+        if !same {
+            let _ = self.commands.send(Command::Diff(path));
+        }
+    }
+
+    /// The selected session's cwd, for resolving a repo-relative path to
+    /// something the system `open` can take.
+    fn selected_cwd(&self, cx: &Context<Self>) -> Option<PathBuf> {
+        let sid = self.transcript.read(cx).session_id.clone()?;
+        self.sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .find(|s| s.session_id == sid)
+            .map(|s| PathBuf::from(&s.cwd))
     }
 
     /// Footer status bar: connection state as a dot + plain fact, session
@@ -2386,10 +2689,17 @@ pub fn run(data_dir: PathBuf) -> ! {
         });
         let files = cx.new(|_| FilesState {
             // Perf runs have no feed: seed a synthetic snapshot so the
-            // measured layout includes a populated files rail.
+            // measured layout includes a populated files rail — and (B2)
+            // a cap-size expanded diff, so the long-diff render path is
+            // measured at its worst, not at a friendly size.
             snapshot: perf_10k
                 .then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
             collapsed: false,
+            diff: perf_10k.then(|| DiffSlot {
+                session: "perf:10k".into(),
+                path: "crates/eave-app/src/ui.rs".into(),
+                fetch: DiffFetch::Ready(Arc::new(synthetic_long_diff())),
+            }),
         });
         let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
         let transcript = cx.new(|_| {
@@ -2451,9 +2761,47 @@ pub fn run(data_dir: PathBuf) -> ! {
                     // burst wins; the render filters by session tag.
                     let files_events: Vec<FilesEvent> =
                         queues.files.lock().unwrap().drain(..).collect();
-                    if let Some(last) = files_events.into_iter().last() {
+                    let diff_events: Vec<DiffEvent> =
+                        queues.diffs.lock().unwrap().drain(..).collect();
+                    if !files_events.is_empty() || !diff_events.is_empty() {
+                        let cmd_tx = cmd_tx.clone();
                         let _ = files.update(cx, |state, cx| {
-                            state.snapshot = Some(last);
+                            if let Some((sid, snap)) = files_events.into_iter().last() {
+                                // A fresh snapshot is the diff's
+                                // invalidation signal (B2): re-request
+                                // the open pane, or close it when its
+                                // file is no longer listed — "not
+                                // changed anymore" is stated by the
+                                // row's disappearance.
+                                if let Some(slot) = &state.diff {
+                                    if slot.session == sid {
+                                        let listed = snap.as_ref().is_some_and(|s| {
+                                            s.state == GitState::Ok
+                                                && s.files.iter().any(|f| f.path == slot.path)
+                                        });
+                                        if listed {
+                                            let _ =
+                                                cmd_tx.send(Command::Diff(slot.path.clone()));
+                                        } else {
+                                            state.diff = None;
+                                        }
+                                    }
+                                }
+                                state.snapshot = Some((sid, snap));
+                            }
+                            // Diff replies fold only into the slot they
+                            // were requested for — a reply that raced a
+                            // switch or a re-click is discarded.
+                            for (sid, path, res) in diff_events {
+                                if let Some(slot) = &mut state.diff {
+                                    if slot.session == sid && slot.path == path {
+                                        slot.fetch = match res {
+                                            Ok(d) => DiffFetch::Ready(Arc::new(d)),
+                                            Err(m) => DiffFetch::Failed(m),
+                                        };
+                                    }
+                                }
+                            }
                             cx.notify();
                         });
                     }
@@ -2476,10 +2824,16 @@ pub fn run(data_dir: PathBuf) -> ! {
                         queues.feed.lock().unwrap().drain(..).collect();
                     if !feed_events.is_empty() {
                         let cmd_tx = cmd_tx.clone();
+                        let mut switched = false;
                         let _ = transcript.update(cx, |state, cx| {
                             for ev in feed_events {
                                 match ev {
-                                    FeedEvent::Session { id } => state.session_id = Some(id),
+                                    FeedEvent::Session { id } => {
+                                        if state.session_id.as_deref() != Some(id.as_str()) {
+                                            switched = true;
+                                        }
+                                        state.session_id = Some(id)
+                                    }
                                     // Frames tagged with another session are
                                     // stragglers from a dropped subscription
                                     // — discard, never apply (no bleed).
@@ -2505,6 +2859,15 @@ pub fn run(data_dir: PathBuf) -> ! {
                             }
                             cx.notify();
                         });
+                        // A real selection switch closes the diff pane:
+                        // it belongs to the session that just left.
+                        if switched {
+                            let _ = files.update(cx, |state, cx| {
+                                if state.diff.take().is_some() {
+                                    cx.notify();
+                                }
+                            });
+                        }
                     }
                 }
             })

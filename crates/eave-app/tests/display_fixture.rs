@@ -142,6 +142,22 @@ fn incremental_fold_equals_batch_rebuild() {
     assert!(a.len() > 30, "expected a rich display list, got {} rows", a.len());
 }
 
+/// Per-thread CPU time — the fold is single-threaded pure compute, so
+/// this IS its cost. Wall-clock here measured the scheduler, not the
+/// fold (the documented trap: this machine idles at load >100, and the
+/// wall version of this assert failed 6/6 solo on B1 code and B2 code
+/// alike while the fold itself was unchanged).
+fn thread_cpu() -> std::time::Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+    }
+    std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
 #[test]
 fn update_cost_stays_flat_on_a_10k_row_transcript() {
     // CPU half of the 16 ms render budget: the per-burst fold on a
@@ -188,12 +204,12 @@ fn update_cost_stays_flat_on_a_10k_row_transcript() {
             text.push_str(if i % 17 == 0 { "\n\nnew para " } else { "more words " });
         }
         transcript.touch(live_ix);
-        let t = std::time::Instant::now();
+        let t = thread_cpu();
         let ops = display.update(&transcript);
-        worst = worst.max(t.elapsed());
+        worst = worst.max(thread_cpu() - t);
         assert!(!ops.reset);
     }
-    eprintln!("10k-row fold: cold build {cold:?}, worst streaming burst {worst:?}");
+    eprintln!("10k-row fold: cold build {cold:?} (wall), worst streaming burst {worst:?} (thread CPU)");
     assert!(
         worst < std::time::Duration::from_millis(4),
         "per-burst fold cost {worst:?} eats the 16 ms frame budget"

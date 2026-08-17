@@ -27,8 +27,9 @@ use eave_core::session::{AgentSession, SessionWatch, SpawnConfig};
 use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, Cursor, FilesSnapshot, HelloOk, KillOk, ListOk, OpenOk, Request, RequestEnvelope,
-    ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, PROTO_VERSION,
+    socket_path, ChangedFile, Cursor, DiffOk, FileStatus, FilesSnapshot, HelloOk, KillOk, ListOk,
+    OpenOk, Request, RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo,
+    SubscriptionItem, PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -141,6 +142,19 @@ pub struct SessionHandle {
     files_tx: broadcast::Sender<()>,
     /// Serializes git scans so overlapping triggers can't interleave.
     files_gate: TokioMutex<()>,
+    /// FS-event invalidation (B2): subscriber refcount plus the stop
+    /// handle of the watcher task serving them. The watcher runs only
+    /// while a `files` subscription is live; `active` gates the
+    /// turn-boundary fallback poll — polling resumes the moment watching
+    /// is unavailable (disabled, failed to start, or broken mid-flight).
+    fs_watch: StdMutex<FsWatchCtl>,
+}
+
+#[derive(Default)]
+struct FsWatchCtl {
+    subscribers: usize,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn new_epoch() -> u64 {
@@ -244,6 +258,61 @@ impl SessionHandle {
     fn poke_watch(&self) {
         let _ = self.watch_tx.send(());
     }
+
+    /// An FS watcher currently covers this session's cwd — the
+    /// turn-boundary poll stands down while this is true (B2: events
+    /// replace polling; polling is the fallback, not a duplicate).
+    fn watcher_active(&self) -> bool {
+        self.fs_watch
+            .lock()
+            .unwrap()
+            .active
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// `EAVE_NO_FSWATCH=1` forces the B1 polling fallback (dev/test only —
+/// it is also what the engine degrades to when the watch backend fails).
+fn fs_watch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EAVE_NO_FSWATCH").map(|v| v != "1").unwrap_or(true))
+}
+
+/// RAII refcount of one `files` subscription: the first subscriber
+/// starts the session's FS watcher, the last one's drop stops it (the
+/// subscription tasks are aborted on disconnect — drop still runs).
+struct FilesSubGuard {
+    handle: Arc<SessionHandle>,
+}
+
+fn files_subscriber(handle: &Arc<SessionHandle>) -> FilesSubGuard {
+    let mut ctl = handle.fs_watch.lock().unwrap();
+    ctl.subscribers += 1;
+    if ctl.subscribers == 1 && fs_watch_enabled() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ctl.stop = Some(stop_tx);
+        ctl.active = Arc::clone(&active);
+        tokio::spawn(watch_session_files(Arc::clone(handle), active, stop_rx));
+    }
+    FilesSubGuard {
+        handle: Arc::clone(handle),
+    }
+}
+
+impl Drop for FilesSubGuard {
+    fn drop(&mut self) {
+        let mut ctl = self.handle.fs_watch.lock().unwrap();
+        ctl.subscribers = ctl.subscribers.saturating_sub(1);
+        if ctl.subscribers == 0 {
+            if let Some(stop) = ctl.stop.take() {
+                let _ = stop.send(());
+            }
+            ctl.active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +389,7 @@ impl Engine {
                 files: StdMutex::new(None),
                 files_tx,
                 files_gate: TokioMutex::new(()),
+                fs_watch: StdMutex::new(FsWatchCtl::default()),
             })
         };
         sessions.insert(id, Arc::clone(&handle));
@@ -378,6 +448,7 @@ impl Engine {
             files: StdMutex::new(None),
             files_tx,
             files_gate: TokioMutex::new(()),
+            fs_watch: StdMutex::new(FsWatchCtl::default()),
         }))
     }
 
@@ -470,9 +541,10 @@ impl Engine {
         let tap_handle = Arc::clone(handle);
         tokio::spawn(async move {
             while let Some(rec) = tap_rx.recv().await {
-                // Turn boundaries are the files poll trigger (spec 05
-                // §Files, Slice B1: no FS watcher, no debouncing) — the
-                // scan runs as its own task, never in the record path.
+                // Turn boundaries are the files poll FALLBACK (B2): the
+                // FS watcher owns invalidation while it runs; the poll
+                // stands in whenever watching is unavailable. The scan
+                // runs as its own task, never in the record path.
                 let turn_boundary = matches!(
                     &rec.event,
                     JournalEvent::Closed { .. }
@@ -482,7 +554,7 @@ impl Engine {
                 );
                 tap_handle.shared.lock().unwrap().records.push(rec.clone());
                 let _ = tap_handle.bcast.send(Fanout::Record(rec));
-                if turn_boundary {
+                if turn_boundary && !tap_handle.watcher_active() {
                     tokio::spawn(refresh_files(Arc::clone(&tap_handle)));
                 }
             }
@@ -731,6 +803,17 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                     let w = Arc::clone(&w);
                     subs.push(tokio::spawn(run_files(handle, w, id)));
                     continue; // snapshots flow on this id; no unary reply
+                }
+                Err(message) => ResponseBody::Err { message },
+            },
+            Request::Diff { session_id, path } => match engine.session(&session_id) {
+                Ok(handle) => {
+                    // Unary, but computed off the connection loop: a slow
+                    // repo delays only its own reply — sends and kills on
+                    // this connection keep flowing while git works.
+                    let w = Arc::clone(&w);
+                    subs.push(tokio::spawn(run_diff(handle, w, id, path)));
+                    continue;
                 }
                 Err(message) => ResponseBody::Err { message },
             },
@@ -1026,6 +1109,9 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
 /// session's [`FilesSnapshot`]; the raw-byte leak test in
 /// `tests/files.rs` enforces it end-to-end.
 async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+    // B2: the first live subscriber starts the session's FS watcher; the
+    // last one's drop (including task abort on disconnect) stops it.
+    let _guard = files_subscriber(&handle);
     let mut rx = handle.files_tx.subscribe();
     let current = handle.files.lock().unwrap().clone();
     match current {
@@ -1061,6 +1147,129 @@ async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>
             return;
         }
     }
+}
+
+/// One unary diff computation (B2): the snapshot's entry for the path
+/// supplies the untracked/orig_path facts that pick the diff strategy; a
+/// path the cached snapshot no longer lists gets a plain tracked diff
+/// (racing a fresh scan is fine — a new snapshot on the files channel
+/// tells the client to re-request anyway). Strictly per-session by
+/// construction, like `run_files`: this task holds one session's handle
+/// and answers on the requesting connection's own envelope id.
+async fn run_diff(
+    handle: Arc<SessionHandle>,
+    w: Arc<TokioMutex<OwnedWriteHalf>>,
+    id: u64,
+    path: String,
+) {
+    let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+    let entry = handle
+        .files
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|s| s.files.iter().find(|f| f.path == path).cloned())
+        .unwrap_or(ChangedFile {
+            path,
+            status: FileStatus::Modified,
+            adds: None,
+            dels: None,
+            orig_path: None,
+            untracked: false,
+        });
+    let diff = crate::git::diff(&cwd, &entry).await;
+    let _ = write_frame(
+        &w,
+        &ResponseEnvelope {
+            id,
+            body: ok_value(&DiffOk { diff }),
+        },
+    )
+    .await;
+}
+
+/// Debounce for FS-event invalidation (B2): refresh after a quiet gap,
+/// but never lag a busy burst longer than the max — an agent writing 200
+/// files in a burst produces one refresh, and a continuous writer
+/// produces about one per second, not one per write.
+const FS_QUIET_MS: u64 = 200;
+const FS_MAX_LAG_MS: u64 = 1000;
+
+/// The session's FS watcher (B2): recursive watch of the session cwd,
+/// alive only while `files` subscribers exist. Every failure degrades to
+/// the B1 polling fallback (`active` stays/returns false, so turn
+/// boundaries poll again) — a broken watch backend must never mean
+/// silently-stale file state. The `.git` dir is deliberately included:
+/// commits and index changes move `git status` output, and our own scans
+/// are read-only (`GIT_OPTIONAL_LOCKS=0`), so there is no self-trigger
+/// loop.
+async fn watch_session_files(
+    handle: Arc<SessionHandle>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    use notify::Watcher;
+    use std::sync::atomic::Ordering;
+    let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), ()>>();
+    let mut watcher = match notify::recommended_watcher(
+        move |res: Result<notify::Event, notify::Error>| {
+            let _ = tx.send(res.map(|_| ()).map_err(|_| ()));
+        },
+    ) {
+        Ok(w) => w,
+        Err(_) => return, // polling fallback stands
+    };
+    if watcher
+        .watch(&cwd, notify::RecursiveMode::Recursive)
+        .is_err()
+    {
+        return; // non-existent / unwatchable cwd: polling fallback stands
+    }
+    active.store(true, Ordering::Relaxed);
+    // A subscriber just arrived: heal any staleness from the unwatched
+    // gap immediately.
+    refresh_files(Arc::clone(&handle)).await;
+    loop {
+        tokio::select! {
+            _ = &mut stop => break,
+            ev = rx.recv() => match ev {
+                None => break,
+                Some(Err(())) => {
+                    // Watch backend broke mid-flight: refresh once so
+                    // nothing is lost, then drop to the polling fallback.
+                    active.store(false, Ordering::Relaxed);
+                    refresh_files(Arc::clone(&handle)).await;
+                    return;
+                }
+                Some(Ok(())) => {
+                    let burst_start = tokio::time::Instant::now();
+                    loop {
+                        tokio::select! {
+                            _ = &mut stop => {
+                                active.store(false, Ordering::Relaxed);
+                                return;
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(FS_QUIET_MS)) => break,
+                            more = rx.recv() => {
+                                if more.is_none()
+                                    || burst_start.elapsed()
+                                        >= Duration::from_millis(FS_MAX_LAG_MS)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Events landing while this scan runs queue behind it
+                    // and trigger a trailing refresh — the final state
+                    // always gets scanned.
+                    refresh_files(Arc::clone(&handle)).await;
+                }
+            }
+        }
+    }
+    active.store(false, Ordering::Relaxed);
 }
 
 /// Only text deltas are folded; everything else flushes the window.
