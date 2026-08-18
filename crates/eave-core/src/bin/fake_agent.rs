@@ -337,6 +337,22 @@ fn main() {
             emit_text(&format!("RESUME_FLAG:{resumed} ID:{}", session_id()));
             emit_result();
         }
+        // One turn stating the process's own cwd, then exit (Slice I2:
+        // proves the engine spawns the agent IN the worktree — including
+        // on `--resume` respawns). Consumes the user send first so the
+        // delivery write never races our exit.
+        "cwd-report" => {
+            emit_init();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            emit_text(
+                &std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".into()),
+            );
+            emit_result();
+            std::thread::sleep(Duration::from_millis(100));
+        }
         "env-report" => {
             emit_init();
             let leaked: Vec<String> = std::env::vars()

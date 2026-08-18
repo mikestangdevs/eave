@@ -346,6 +346,35 @@ impl Client {
             .diff)
     }
 
+    /// Move a never-started session into its own worktree (Slice I2) —
+    /// the operator's opt-in isolation. The engine refuses (stated
+    /// reasons) once anything has spawned, while live, and for non-git
+    /// cwds; an older engine errors on the method.
+    pub async fn isolate(&self, session_id: &str) -> Result<SessionInfo, ClientError> {
+        Ok(self
+            .request::<eave_wire::IsolateOk>(Request::Isolate {
+                session_id: session_id.into(),
+            })
+            .await?
+            .info)
+    }
+
+    /// Delete a session's eave worktree (Slice I2). `removed: false` is
+    /// the engine's refusal restating freshly-measured dirty facts —
+    /// re-send with `force: true` only when the operator confirmed
+    /// against them (decision 2's two-step).
+    pub async fn remove_worktree(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<eave_wire::RemoveWorktreeOk, ClientError> {
+        self.request::<eave_wire::RemoveWorktreeOk>(Request::RemoveWorktree {
+            session_id: session_id.into(),
+            force,
+        })
+        .await
+    }
+
     /// Subscribe per the cursor contract (spec 05-wire.md). The stream ends
     /// when the connection dies; resubscribe on a fresh client with the
     /// last cursor (or `None` if you hold no projection).

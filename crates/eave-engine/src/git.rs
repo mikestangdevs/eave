@@ -294,6 +294,162 @@ async fn count_lines(path: &Path) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Worktree plumbing (Slice I2)
+//
+// Same discipline as the scanner: every call is a timeout-bounded child
+// process (`run`), never libgit2, never on the event loop. Failures are
+// stated strings (git's own first stderr line where git refused) — the
+// engine forwards them verbatim as `Err` replies.
+
+/// The canonical checkout root for a cwd: the git worktree toplevel when
+/// the cwd is inside one, the canonical cwd itself otherwise. Two
+/// sessions with equal roots operate on the SAME files — this is the
+/// collision fact (Slice I2 decision 1). Nested repos resolve to the
+/// innermost toplevel, which is the honest answer: that is the tree git
+/// commands in that cwd act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutProbe {
+    pub root: std::path::PathBuf,
+    pub is_repo: bool,
+}
+
+pub async fn checkout_root(cwd: &Path) -> CheckoutProbe {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    match run(Path::new("git"), cwd, GIT_TIMEOUT, &["rev-parse", "--show-toplevel"]).await {
+        Ok(out) => {
+            let top = String::from_utf8_lossy(&out).trim().to_string();
+            if top.is_empty() {
+                // Inside a bare repo / .git dir: no worktree. Fall back
+                // to the directory itself.
+                CheckoutProbe { root: canon(cwd), is_repo: false }
+            } else {
+                CheckoutProbe { root: canon(Path::new(&top)), is_repo: true }
+            }
+        }
+        Err(_) => CheckoutProbe { root: canon(cwd), is_repo: false },
+    }
+}
+
+/// The cwd's resolved git dir (worktree-private for linked worktrees:
+/// `<base>/.git/worktrees/<name>`). A linked worktree keeps its HEAD and
+/// index THERE — outside the worktree directory — so the session's FS
+/// watcher must cover it too or commits/index moves go stale until the
+/// next poll.
+pub async fn git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
+    let out = run(
+        Path::new("git"),
+        cwd,
+        GIT_TIMEOUT,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )
+    .await
+    .ok()?;
+    let dir = String::from_utf8_lossy(&out).trim().to_string();
+    (!dir.is_empty()).then(|| std::path::PathBuf::from(dir))
+}
+
+fn stated(err: GitState) -> String {
+    match err {
+        GitState::Error { message } => message,
+        GitState::NotARepo => "not a git repository".into(),
+        GitState::Ok => "git gave no answer".into(),
+    }
+}
+
+/// `git worktree add -b <branch> <path>` from the base repo: a fresh
+/// checkout of the base's HEAD commit on a new branch. A dirty base is
+/// fine and untouched — its uncommitted changes stay where they are; the
+/// worktree starts clean at HEAD (stated Slice I2 edge case). Submodules
+/// are NOT initialized in the new worktree (git's own behavior, stated).
+pub async fn worktree_add(base: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    run(
+        Path::new("git"),
+        base,
+        GIT_TIMEOUT,
+        &["worktree", "add", "-b", branch, &path.to_string_lossy()],
+    )
+    .await
+    .map(drop)
+    .map_err(stated)
+}
+
+/// `git worktree remove` — with `--force` only when the operator forced
+/// past the engine's own dirty check (decision 2's two-step). Without
+/// force, git's dirty refusal is a second, independent guard.
+pub async fn worktree_remove(base: &Path, path: &Path, force: bool) -> Result<(), String> {
+    let path = path.to_string_lossy();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path);
+    run(Path::new("git"), base, GIT_TIMEOUT, &args)
+        .await
+        .map(drop)
+        .map_err(stated)
+}
+
+pub async fn worktree_prune(base: &Path) -> Result<(), String> {
+    run(Path::new("git"), base, GIT_TIMEOUT, &["worktree", "prune"])
+        .await
+        .map(drop)
+        .map_err(stated)
+}
+
+/// `git branch -D` — the engine only ever calls this for `eave/`
+/// branches it created (the guard lives at the call site).
+pub async fn branch_delete(base: &Path, branch: &str) -> Result<(), String> {
+    run(Path::new("git"), base, GIT_TIMEOUT, &["branch", "-D", "--", branch])
+        .await
+        .map(drop)
+        .map_err(stated)
+}
+
+/// Worktree paths registered in the base repo (`git worktree list
+/// --porcelain`), main checkout first. This — never engine memory — is
+/// the ground truth restart re-detection checks a session's claimed
+/// worktree against (Slice I2).
+pub async fn worktree_list(base: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let out = run(
+        Path::new("git"),
+        base,
+        GIT_TIMEOUT,
+        &["worktree", "list", "--porcelain"],
+    )
+    .await
+    .map_err(stated)?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(|p| std::path::PathBuf::from(p.trim()))
+        .collect())
+}
+
+/// Commits reachable from `branch` but from no other ref — the work that
+/// `branch -D` would orphan. `None` = git could not answer (an unborn
+/// branch, a vanished repo): an honest unknown the caller must treat as
+/// "possibly some", never as zero.
+pub async fn unmerged_count(repo: &Path, branch: &str) -> Option<u64> {
+    // `--exclude` globs match the SHORTENED name of the next ref-listing
+    // option and apply to that option only; `--all` is unusable here
+    // because it also includes every linked worktree's HEAD — which IS
+    // the branch being measured. Tags and remotes stay unexcluded on
+    // purpose: a commit reachable from either is recoverable, not unique.
+    let exclude = format!("--exclude={branch}");
+    let out = run(
+        Path::new("git"),
+        repo,
+        GIT_TIMEOUT,
+        &[
+            "rev-list", "--count", branch, "--not", &exclude, "--branches", "--tags", "--remotes",
+        ],
+    )
+    .await
+    .ok()?;
+    String::from_utf8_lossy(&out).trim().parse().ok()
+}
+
+// ---------------------------------------------------------------------------
 // Per-file diff (Slice B2)
 
 /// One file's diff, computed on demand — nothing is cached, so nothing
@@ -1036,6 +1192,124 @@ mod tests {
         // tail states `—` instead of costing hundreds more reads.
         assert_eq!(snap.files[0].adds, Some(1));
         assert_eq!(snap.files[UNTRACKED_COUNT_MAX + 10].adds, None);
+    }
+
+    // -- Slice I2: worktree plumbing ---------------------------------------
+
+    #[tokio::test]
+    async fn checkout_root_resolves_toplevel_and_non_git() {
+        let dir = repo_with_commit();
+        let sub = dir.join("nested/deeper");
+        std::fs::create_dir_all(&sub).unwrap();
+        let probe = checkout_root(&sub).await;
+        assert!(probe.is_repo);
+        assert_eq!(probe.root, std::fs::canonicalize(&dir).unwrap());
+
+        let plain = scratch();
+        let probe = checkout_root(&plain).await;
+        assert!(!probe.is_repo);
+        assert_eq!(probe.root, std::fs::canonicalize(&plain).unwrap());
+    }
+
+    #[tokio::test]
+    async fn worktree_add_from_dirty_base_leaves_base_untouched() {
+        let base = repo_with_commit();
+        // Base is dirty at add time — the stated edge case: the worktree
+        // starts clean at HEAD; the base keeps its uncommitted change.
+        std::fs::write(base.join("a.txt"), "dirty edit\n").unwrap();
+        let wt = scratch().join("wt");
+        worktree_add(&base, &wt, "eave/test1234").await.unwrap();
+
+        let wt_probe = checkout_root(&wt).await;
+        assert!(wt_probe.is_repo);
+        assert_eq!(wt_probe.root, std::fs::canonicalize(&wt).unwrap());
+
+        let wt_snap = scan(&wt).await;
+        assert_eq!(wt_snap.state, GitState::Ok);
+        assert!(wt_snap.files.is_empty(), "worktree starts clean: {:?}", wt_snap.files);
+
+        let base_snap = scan(&base).await;
+        assert_eq!(base_snap.files.len(), 1, "base keeps its dirty edit");
+
+        // The worktree's git dir is the base's private stanza — the part
+        // the FS watcher must additionally cover.
+        let gd = git_dir(&wt).await.unwrap();
+        assert!(
+            gd.starts_with(std::fs::canonicalize(&base).unwrap().join(".git/worktrees"))
+                || gd.starts_with(base.join(".git/worktrees")),
+            "{}",
+            gd.display()
+        );
+
+        let listed = worktree_list(&base).await.unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn worktree_add_refusals_are_stated() {
+        let base = repo_with_commit();
+        let wt = scratch().join("wt");
+        worktree_add(&base, &wt, "eave/dup").await.unwrap();
+        // Same branch again: git refuses with its own message.
+        let err = worktree_add(&base, &scratch().join("wt2"), "eave/dup")
+            .await
+            .unwrap_err();
+        assert!(err.contains("dup") || err.contains("already"), "{err}");
+        // Non-git base: stated, not a crash.
+        let err = worktree_add(&scratch(), &scratch().join("wt3"), "eave/x")
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a git repository"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dirty_worktree_remove_needs_force_and_branch_cleanup_completes() {
+        let base = repo_with_commit();
+        let wt = scratch().join("wt");
+        worktree_add(&base, &wt, "eave/abcd1234").await.unwrap();
+        std::fs::write(wt.join("work.txt"), "uncommitted\n").unwrap();
+
+        // git's own dirty guard — the second, independent layer under the
+        // engine's check.
+        let err = worktree_remove(&base, &wt, false).await.unwrap_err();
+        assert!(
+            err.contains("dirty") || err.contains("--force") || err.contains("contains modified"),
+            "{err}"
+        );
+        assert!(wt.exists());
+
+        worktree_remove(&base, &wt, true).await.unwrap();
+        assert!(!wt.exists());
+        worktree_prune(&base).await.unwrap();
+        branch_delete(&base, "eave/abcd1234").await.unwrap();
+        assert_eq!(worktree_list(&base).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rm_rfed_worktree_prunes_clean() {
+        let base = repo_with_commit();
+        let wt = scratch().join("wt");
+        worktree_add(&base, &wt, "eave/gone0000").await.unwrap();
+        // The operator deleted the directory out from under git.
+        std::fs::remove_dir_all(&wt).unwrap();
+        worktree_prune(&base).await.unwrap();
+        branch_delete(&base, "eave/gone0000").await.unwrap();
+        assert_eq!(worktree_list(&base).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unmerged_count_sees_worktree_only_commits() {
+        let base = repo_with_commit();
+        let wt = scratch().join("wt");
+        worktree_add(&base, &wt, "eave/cnt00000").await.unwrap();
+        assert_eq!(unmerged_count(&base, "eave/cnt00000").await, Some(0));
+        std::fs::write(wt.join("new.txt"), "z\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "wt work"]);
+        assert_eq!(unmerged_count(&base, "eave/cnt00000").await, Some(1));
+        // Merge it into the base's branch: no longer unique, safe to drop.
+        git(&base, &["merge", "-q", "eave/cnt00000"]);
+        assert_eq!(unmerged_count(&base, "eave/cnt00000").await, Some(0));
     }
 
     /// The diff path honors the same hang discipline as the scan.

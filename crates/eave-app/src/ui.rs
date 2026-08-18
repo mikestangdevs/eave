@@ -97,6 +97,24 @@ type FilesEvent = (String, Option<FilesSnapshot>);
 /// (including "unknown method" from an engine predating diffs).
 type DiffEvent = (String, String, Result<FileDiff, String>);
 
+/// One worktree-action outcome (Slice I2), session-tagged. The rail
+/// states it on the session's row; `Settled` clears any standing note
+/// (an isolate landed, a removal completed — the watch snapshot carries
+/// the new facts).
+#[derive(Debug, Clone)]
+enum WtNote {
+    /// The engine refused a non-forced delete, restating fresh counts —
+    /// the delete affordance is now armed: the next click means it.
+    ConfirmDelete {
+        dirty_files: Option<u64>,
+        unmerged_commits: Option<u64>,
+    },
+    /// A stated refusal/error from isolate or remove (engine's words).
+    Error(String),
+}
+
+type WtEvent = (String, Option<WtNote>);
+
 #[derive(Debug)]
 enum Command {
     Send(String),
@@ -112,6 +130,15 @@ enum Command {
     /// re-issued on every fresh snapshot while the row stays expanded —
     /// the files channel is the invalidation signal.
     Diff(String),
+    /// Rail "isolate" click (Slice I2): opt this never-started session
+    /// into its own worktree. The watch snapshot carries the result;
+    /// refusals surface as a stated note on the row.
+    Isolate(String),
+    /// Rail "delete worktree" click (Slice I2). `force: false` first —
+    /// the engine refuses with fresh counts if anything would be lost,
+    /// which arms the affordance; the second click sends `force: true`
+    /// (decision 2's two-step).
+    RemoveWorktree { id: String, force: bool },
 }
 
 #[derive(Default)]
@@ -122,6 +149,7 @@ struct Queues {
     rail: Mutex<VecDeque<RailEvent>>,
     files: Mutex<VecDeque<FilesEvent>>,
     diffs: Mutex<VecDeque<DiffEvent>>,
+    wt: Mutex<VecDeque<WtEvent>>,
 }
 
 #[derive(Clone)]
@@ -153,6 +181,10 @@ impl Plumbing {
     }
     fn push_diff(&self, ev: DiffEvent) {
         self.queues.diffs.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
+    fn push_wt(&self, ev: WtEvent) {
+        self.queues.wt.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
 }
@@ -361,6 +393,35 @@ async fn feed_loop(
                                 plumbing.push_diff((sid, path, res));
                             });
                         }
+                        Some(Command::Isolate(sid)) => {
+                            // Off-loop like diffs; the watch snapshot
+                            // carries success, so only refusals need a
+                            // session-tagged note.
+                            let client = Arc::clone(&client);
+                            let plumbing = plumbing.clone();
+                            tokio::spawn(async move {
+                                let note = match client.isolate(&sid).await {
+                                    Ok(_) => None,
+                                    Err(e) => Some(WtNote::Error(e.to_string())),
+                                };
+                                plumbing.push_wt((sid, note));
+                            });
+                        }
+                        Some(Command::RemoveWorktree { id, force }) => {
+                            let client = Arc::clone(&client);
+                            let plumbing = plumbing.clone();
+                            tokio::spawn(async move {
+                                let note = match client.remove_worktree(&id, force).await {
+                                    Ok(ok) if ok.removed => None,
+                                    Ok(ok) => Some(WtNote::ConfirmDelete {
+                                        dirty_files: ok.dirty_files,
+                                        unmerged_commits: ok.unmerged_commits,
+                                    }),
+                                    Err(e) => Some(WtNote::Error(e.to_string())),
+                                };
+                                plumbing.push_wt((id, note));
+                            });
+                        }
                         Some(Command::Resubscribe) => {
                             cursor = None;
                             break StreamEnd::Switch;
@@ -432,6 +493,9 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         live: true,
         epoch: 0,
         last_seq: 0,
+        checkout_root: None,
+        shared_with: Vec::new(),
+        worktree: None,
     }]);
     // Same for the files rail (Slice B): the reading column must be
     // constrained on BOTH sides during asserts and captures.
@@ -590,6 +654,10 @@ struct SessionsState {
     sessions: Vec<SessionInfo>,
     collapsed: bool,
     attention: Option<(String, AttentionSnapshot)>,
+    /// Standing worktree-action notes per session (Slice I2): a stated
+    /// refusal, or an armed delete confirmation restating the engine's
+    /// fresh counts. Cleared by a settled action; folded by replacement.
+    wt_notes: std::collections::HashMap<String, WtNote>,
 }
 
 impl SessionsState {
@@ -821,6 +889,33 @@ fn state_color(state: &str) -> Hsla {
 /// word in the rail; everything else is just the neutral dot.
 fn state_badge(state: &str) -> Option<&str> {
     matches!(state, "quiet" | "unresponsive" | "failed").then_some(state)
+}
+
+/// The shared-checkout fact (Slice I2): who else works in these files,
+/// by 8-char session prefix — identity, never content.
+fn shares_line(shared_with: &[String]) -> String {
+    let names: Vec<String> = shared_with
+        .iter()
+        .map(|id| id.chars().take(8).collect())
+        .collect();
+    format!("shares files with {}", names.join(", "))
+}
+
+/// The worktree fact line (Slice I2). Every shape is a stated fact:
+/// clean, a dirty count, an honest unknown (`dirty —`, a failed scan),
+/// or the directory being gone. The branch is deliberately NOT repeated
+/// here — it is the predictable `eave/<sid8>` and the cwd line above
+/// already ends in `<sid8>`; at rail width the dirty count must never
+/// lose to truncation (it is the fact decision 2 protects).
+fn worktree_line(w: &eave_wire::WorktreeInfo) -> String {
+    if !w.present {
+        return "worktree missing".to_string();
+    }
+    match w.dirty_files {
+        Some(0) => "worktree · clean".to_string(),
+        Some(n) => format!("worktree · {n} dirty"),
+        None => "worktree · dirty —".to_string(),
+    }
 }
 
 /// Home-relative cwd for the rail's meta line.
@@ -1510,6 +1605,7 @@ impl Shell {
         let mut sessions = self.sessions.read(cx).sessions.clone();
         sessions.sort_by(|a, b| b.created_ts_ms.cmp(&a.created_ts_ms));
         let selected = self.transcript.read(cx).session_id.clone();
+        let wt_notes = self.sessions.read(cx).wt_notes.clone();
         let home = std::env::var("HOME").ok();
         // The meta line aligns under the provider label: dot + gap +
         // chip + gap.
@@ -1522,6 +1618,49 @@ impl Shell {
                 let dot = state_color(&info.state);
                 let badge = state_badge(&info.state).map(str::to_string);
                 let sid = info.session_id.clone();
+                // Slice I2 facts, stated as quiet meta lines. Sharing:
+                // sessions working in the same checkout (decision 1 —
+                // detection automatic, stated, never acted on).
+                let shares =
+                    (!info.shared_with.is_empty()).then(|| shares_line(&info.shared_with));
+                // Isolation is offered only while it is still possible:
+                // nothing ever spawned, and a collision actually stands.
+                let can_isolate = info.state == "new"
+                    && !info.live
+                    && info.worktree.is_none()
+                    && !info.shared_with.is_empty();
+                let wt_note = wt_notes.get(&info.session_id).cloned();
+                let armed = matches!(wt_note, Some(WtNote::ConfirmDelete { .. }));
+                let wt = info.worktree.clone();
+                let wt_line = wt.as_ref().map(worktree_line);
+                // Orphan affordances (decision 2): open in editor, or
+                // delete — never while a process is live in it.
+                let wt_present = wt.as_ref().map(|w| w.present).unwrap_or(false);
+                // The worktree directory IS the session cwd (isolate
+                // rewrote it) — that is what "open" opens.
+                let wt_path = info.cwd.clone();
+                let show_wt_buttons = wt.is_some() && !info.live;
+                let note_line = wt_note.as_ref().map(|n| match n {
+                    WtNote::ConfirmDelete {
+                        dirty_files,
+                        unmerged_commits,
+                    } => {
+                        let fmt = |v: &Option<u64>| {
+                            v.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
+                        };
+                        (
+                            format!(
+                                "{} uncommitted files, {} unmerged commits — delete again to mean it",
+                                fmt(dirty_files),
+                                fmt(unmerged_commits)
+                            ),
+                            theme::warning(),
+                        )
+                    }
+                    WtNote::Error(msg) => (msg.clone(), theme::danger()),
+                });
+                let sid_iso = info.session_id.clone();
+                let sid_del = info.session_id.clone();
                 div()
                     .id(SharedString::from(format!("rail-{}", info.session_id)))
                     .px(px(theme::SPACE_2))
@@ -1591,6 +1730,136 @@ impl Shell {
                             .text_color(theme::text_ghost())
                             .child(SharedString::from(short_cwd(&info.cwd, home.as_deref()))),
                     )
+                    // Slice I2: shared-checkout fact, full row width — at
+                    // rail width a fact must never lose to a button.
+                    .children(shares.map(|line| {
+                        div()
+                            .pl(px(meta_indent))
+                            .truncate()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_ghost())
+                            .child(SharedString::from(line))
+                    }))
+                    // Slice I2: worktree fact line, also full width.
+                    .children(wt_line.map(|line| {
+                        div()
+                            .pl(px(meta_indent))
+                            .truncate()
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::MICRO_SIZE))
+                            .text_color(if wt_present {
+                                theme::text_ghost()
+                            } else {
+                                theme::warning()
+                            })
+                            .child(SharedString::from(line))
+                    }))
+                    // The affordance row (isolate / open / delete) sits on
+                    // its own line beneath the facts it acts on.
+                    .when(can_isolate || show_wt_buttons, |d| {
+                        d.child(
+                            div()
+                                .pl(px(meta_indent))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACE_2))
+                                .when(can_isolate, |d| {
+                                    d.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "iso-{}",
+                                                info.session_id
+                                            )))
+                                            .flex_none()
+                                            .px(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_BUTTON))
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .text_size(px(theme::SMALL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .hover(|s| s.bg(theme::overlay()))
+                                            .on_click(cx.listener(move |this, _, _, _| {
+                                                let _ = this
+                                                    .commands
+                                                    .send(Command::Isolate(sid_iso.clone()));
+                                            }))
+                                            .child("isolate"),
+                                    )
+                                })
+                                .when(show_wt_buttons && wt_present, |d| {
+                                    d.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "wto-{}",
+                                                info.session_id
+                                            )))
+                                            .flex_none()
+                                            .px(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_BUTTON))
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .text_size(px(theme::SMALL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .hover(|s| s.bg(theme::overlay()))
+                                            .on_click(move |_, _, _| {
+                                                let _ = std::process::Command::new("open")
+                                                    .arg(&wt_path)
+                                                    .spawn();
+                                            })
+                                            .child("open"),
+                                    )
+                                })
+                                .when(show_wt_buttons, |d| {
+                                    d.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "wtd-{}",
+                                                info.session_id
+                                            )))
+                                            .flex_none()
+                                            .px(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_BUTTON))
+                                            .border_1()
+                                            .border_color(if armed {
+                                                theme::danger()
+                                            } else {
+                                                theme::border()
+                                            })
+                                            .text_size(px(theme::SMALL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(if armed {
+                                                theme::danger()
+                                            } else {
+                                                theme::text_secondary()
+                                            })
+                                            .hover(|s| s.bg(theme::overlay()))
+                                            .on_click(cx.listener(move |this, _, _, _| {
+                                                let _ = this.commands.send(
+                                                    Command::RemoveWorktree {
+                                                        id: sid_del.clone(),
+                                                        force: armed,
+                                                    },
+                                                );
+                                            }))
+                                            .child("delete"),
+                                    )
+                                }),
+                        )
+                    })
+                    // A standing worktree note: the armed confirmation's
+                    // restated counts, or the engine's stated refusal.
+                    .children(note_line.map(|(line, color)| {
+                        div()
+                            .pl(px(meta_indent))
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(color)
+                            .child(SharedString::from(line))
+                    }))
                     .into_any_element()
             })
             .collect();
@@ -2863,6 +3132,7 @@ pub fn run(data_dir: PathBuf) -> ! {
             sessions: Vec::new(),
             collapsed: false,
             attention: None,
+            wt_notes: std::collections::HashMap::new(),
         });
         let files = cx.new(|_| FilesState {
             // Perf runs have no feed: seed a synthetic snapshot so the
@@ -2984,7 +3254,9 @@ pub fn run(data_dir: PathBuf) -> ! {
                     }
                     let last_attn = attn_events.into_iter().last();
                     let last_rail = rail_events.into_iter().last();
-                    if last_attn.is_some() || last_rail.is_some() {
+                    let wt_events: Vec<WtEvent> =
+                        queues.wt.lock().unwrap().drain(..).collect();
+                    if last_attn.is_some() || last_rail.is_some() || !wt_events.is_empty() {
                         let _ = sessions.update(cx, |state, cx| {
                             if let Some(tagged) = last_attn {
                                 state.attention = Some(tagged);
@@ -2993,6 +3265,18 @@ pub fn run(data_dir: PathBuf) -> ! {
                             // engine's set is the truth, never merged.
                             if let Some(snapshot) = last_rail {
                                 state.sessions = snapshot;
+                            }
+                            // Worktree notes fold by replacement per
+                            // session; a settled action clears its note.
+                            for (sid, note) in wt_events {
+                                match note {
+                                    Some(n) => {
+                                        state.wt_notes.insert(sid, n);
+                                    }
+                                    None => {
+                                        state.wt_notes.remove(&sid);
+                                    }
+                                }
                             }
                             cx.notify();
                         });
@@ -3187,6 +3471,30 @@ mod tests {
         );
         // Binary / oversized: unknowable, not zero.
         assert_eq!(count_labels(None, None), None);
+    }
+
+    #[test]
+    fn worktree_facts_state_every_shape() {
+        use eave_wire::WorktreeInfo;
+        let mut w = WorktreeInfo {
+            base: "/repo".into(),
+            branch: "eave/abcd1234".into(),
+            present: true,
+            dirty_files: Some(0),
+        };
+        assert_eq!(worktree_line(&w), "worktree · clean");
+        w.dirty_files = Some(3);
+        assert_eq!(worktree_line(&w), "worktree · 3 dirty");
+        // A failed scan is an honest unknown, never a fake zero.
+        w.dirty_files = None;
+        assert_eq!(worktree_line(&w), "worktree · dirty —");
+        w.present = false;
+        assert_eq!(worktree_line(&w), "worktree missing");
+
+        assert_eq!(
+            shares_line(&["0a1b2c3d-4444-5555".into(), "ffff0000-1".into()]),
+            "shares files with 0a1b2c3d, ffff0000"
+        );
     }
 
     #[test]

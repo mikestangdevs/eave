@@ -115,6 +115,24 @@ pub enum Request {
     /// client that switches sessions leaks the old stream for the
     /// connection's whole life; connection close remains the backstop.
     Unsubscribe { id: u64 },
+    /// Move a session into its own git worktree (Slice I2). Allowed only
+    /// while nothing has ever spawned (state `new`, no records) — after
+    /// the first send the provider has seen the cwd and it is fixed for
+    /// the session's life (`--resume` finds its history by cwd). The
+    /// engine creates `<worktrees_root>/<repo>/<sid8>` on a fresh
+    /// `eave/<sid8>` branch off the base repo's HEAD and rewrites the
+    /// session's cwd to it. Isolation is the operator's choice, never
+    /// automatic (Slice I2 decision 1): detection of a shared checkout is
+    /// stated on `watch`; this method is the opt-in.
+    Isolate { session_id: String },
+    /// Delete a session's eave-created worktree (Slice I2). The engine
+    /// re-checks state freshly at call time: a LIVE session refuses (kill
+    /// first); uncommitted files or commits unreachable from any other
+    /// ref refuse unless `force` — the reply restates the counts so the
+    /// operator confirms against facts, not a stale rail row (decision 2:
+    /// eave never deletes dirty work without the operator meaning it).
+    /// Clean removal also prunes and deletes the `eave/` branch.
+    RemoveWorktree { session_id: String, force: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +222,46 @@ pub struct SessionInfo {
     pub live: bool,
     pub epoch: u64,
     pub last_seq: u64,
+    /// Canonical checkout root for the session cwd (Slice I2): the git
+    /// worktree toplevel when the cwd is inside one, the canonical cwd
+    /// itself otherwise. `None` = not determined yet (the probe runs off
+    /// the open/load path) or an engine predating I2. Two sessions with
+    /// the same root work in the SAME files — the collision fact
+    /// `shared_with` is derived from equality of this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_root: Option<String>,
+    /// Other sessions whose checkout root equals this one's (Slice I2),
+    /// stamped by the engine at snapshot time. Identity-only, like every
+    /// watch fact: session ids, no content. Empty = sole occupant (or
+    /// root not yet known). Sharing is legitimate and merely stated
+    /// (decision 1); isolation is the operator's opt-in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<String>,
+    /// Present when the session's cwd is an eave-created worktree
+    /// (Slice I2). Facts only — the rail states them; nothing acts on
+    /// them automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
+}
+
+/// A session's eave-created worktree, as last observed (Slice I2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    /// The base repo's worktree root the isolation was created from.
+    pub base: String,
+    /// The dedicated branch (`eave/<sid8>` — sid8 = the first 8 chars of
+    /// the session id; predictable, session-owned, safe to delete on
+    /// clean removal).
+    pub branch: String,
+    /// The worktree directory existed at the last check. `false` is the
+    /// stated "deleted out from under the session" fact — eave never
+    /// recreates it.
+    pub present: bool,
+    /// Changed-file count from the engine's last git scan of the
+    /// worktree (uncommitted work — the thing decision 2 protects).
+    /// `None` = not scanned yet, an honest unknown, never a fake zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_files: Option<u64>,
 }
 
 /// One session's changed-file overview (Slice B, spec 05 §Files).
@@ -399,6 +457,31 @@ pub struct UnsubscribeOk {
     pub stopped: bool,
 }
 
+/// Reply to [`Request::Isolate`] (Slice I2): the session as it now
+/// stands, cwd rewritten to the fresh worktree. Failure shapes (already
+/// spawned, live, non-git cwd, `git worktree add` refused) are `Err`
+/// replies carrying git's or the engine's stated reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IsolateOk {
+    pub info: SessionInfo,
+}
+
+/// Reply to [`Request::RemoveWorktree`] (Slice I2). `removed: false` is
+/// a refusal with its facts: the counts the operator must confirm
+/// against (`force: true` re-sends meaning it). The counts are measured
+/// freshly at call time — never the rail's possibly-stale numbers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoveWorktreeOk {
+    pub removed: bool,
+    /// Uncommitted changed files in the worktree at check time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_files: Option<u64>,
+    /// Commits on the `eave/` branch unreachable from any other ref —
+    /// removal deletes the branch, so these would be lost too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmerged_commits: Option<u64>,
+}
+
 /// What a spawned engine process reports on stdout before exiting 42 when
 /// it lost the instance lock: the holder from `engine.lock`, so the UI can
 /// render Busy with a pid even though it never got a socket to talk to
@@ -498,6 +581,14 @@ mod tests {
                     live: true,
                     epoch: 9,
                     last_seq: 41,
+                    checkout_root: Some("/tmp".into()),
+                    shared_with: vec!["s2".into()],
+                    worktree: Some(WorktreeInfo {
+                        base: "/repo".into(),
+                        branch: "eave/s1prefix".into(),
+                        present: true,
+                        dirty_files: Some(3),
+                    }),
                 }],
             }),
         };
@@ -605,6 +696,62 @@ mod tests {
         // Absent `watching` = the polling fallback — exactly what a B1
         // engine's list is.
         assert!(!snap.watching);
+    }
+
+    #[test]
+    fn worktree_methods_round_trip() {
+        let req = RequestEnvelope {
+            id: 12,
+            request: Request::Isolate {
+                session_id: "s1".into(),
+            },
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"method\":\"isolate\""), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
+
+        let req = RequestEnvelope {
+            id: 13,
+            request: Request::RemoveWorktree {
+                session_id: "s1".into(),
+                force: false,
+            },
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"method\":\"remove_worktree\""), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
+
+        // A refusal restates its facts; a clean removal omits them.
+        for ok in [
+            RemoveWorktreeOk {
+                removed: false,
+                dirty_files: Some(3),
+                unmerged_commits: Some(1),
+            },
+            RemoveWorktreeOk {
+                removed: true,
+                dirty_files: None,
+                unmerged_commits: None,
+            },
+        ] {
+            let back: RemoveWorktreeOk =
+                serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+            assert_eq!(back, ok);
+        }
+    }
+
+    /// Wire-compat: a pre-I2 engine's SessionInfo (no checkout/worktree
+    /// facts) still parses — root unknown, sharing unstated, no worktree.
+    /// That degradation is accurate: such an engine detects nothing.
+    #[test]
+    fn pre_i2_session_info_still_parses() {
+        let line = r#"{"session_id":"s1","provider":"claude-code","cwd":"/tmp","created_ts_ms":1,"state":"new","live":false,"epoch":9,"last_seq":0}"#;
+        let info: SessionInfo = serde_json::from_str(line).unwrap();
+        assert_eq!(info.checkout_root, None);
+        assert!(info.shared_with.is_empty());
+        assert_eq!(info.worktree, None);
     }
 
     #[test]

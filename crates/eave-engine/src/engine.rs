@@ -27,9 +27,9 @@ use eave_core::session::{AgentSession, SessionWatch, SpawnConfig};
 use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, ChangedFile, Cursor, DiffOk, FileStatus, FilesSnapshot, HelloOk, KillOk, ListOk,
-    OpenOk, Request, RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo,
-    SubscriptionItem, UnsubscribeOk, PROTO_VERSION,
+    socket_path, ChangedFile, Cursor, DiffOk, FileStatus, FilesSnapshot, HelloOk, IsolateOk,
+    KillOk, ListOk, OpenOk, RemoveWorktreeOk, Request, RequestEnvelope, ResponseBody,
+    ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, UnsubscribeOk, PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -49,6 +49,12 @@ pub struct EngineConfig {
     pub provider: String,
     /// cwd recorded for sessions opened without one.
     pub default_cwd: PathBuf,
+    /// Where isolation worktrees are created (Slice I2):
+    /// `<root>/<repo-name>/<sid8>`. Deliberately NOT the data dir —
+    /// worktrees are user-facing working checkouts the operator opens in
+    /// an editor (comet's stance, kept). `EAVE_WORKTREES_DIR` overrides
+    /// (tests).
+    pub worktrees_root: PathBuf,
 }
 
 impl EngineConfig {
@@ -71,12 +77,24 @@ impl EngineConfig {
             agent_env.push(("FAKE_MODE".to_string(), mode));
         }
         let default_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let worktrees_root = std::env::var_os("EAVE_WORKTREES_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/"))
+                    .join(".eave")
+                    .join("worktrees")
+            });
         Self {
             data_dir,
             agent_program: agent.into(),
             agent_env,
             provider,
             default_cwd,
+            worktrees_root,
         }
     }
 }
@@ -148,6 +166,54 @@ pub struct SessionHandle {
     /// turn-boundary fallback poll — polling resumes the moment watching
     /// is unavailable (disabled, failed to start, or broken mid-flight).
     fs_watch: StdMutex<FsWatchCtl>,
+    /// Canonical checkout root of the session cwd (Slice I2), probed off
+    /// the open/load path (git runs as its own task, never inline).
+    /// `None` until the probe lands; equality across sessions is the
+    /// shared-checkout collision fact.
+    checkout: StdMutex<Option<crate::git::CheckoutProbe>>,
+    /// The session's eave-created worktree, if any (Slice I2): identity
+    /// from `worktree.json` in the session dir (durable — crash
+    /// re-detection starts from it and verifies against `git worktree
+    /// list`, never engine memory); presence and dirty count stamped by
+    /// scans.
+    worktree: StdMutex<Option<WorktreeState>>,
+}
+
+/// Live view of a session's worktree facts (Slice I2).
+#[derive(Debug, Clone)]
+struct WorktreeState {
+    base: PathBuf,
+    path: PathBuf,
+    branch: String,
+    present: bool,
+    dirty_files: Option<u64>,
+}
+
+/// What `worktree.json` persists: the identity claim only — presence and
+/// dirtiness are always re-measured from git, never trusted from disk.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorktreeMeta {
+    format_version: u32,
+    base: PathBuf,
+    path: PathBuf,
+    branch: String,
+}
+
+const WORKTREE_META_VERSION: u32 = 1;
+
+fn worktree_meta_path(session_dir: &Path) -> PathBuf {
+    session_dir.join("worktree.json")
+}
+
+fn load_worktree_meta(session_dir: &Path) -> Option<WorktreeMeta> {
+    let bytes = std::fs::read(worktree_meta_path(session_dir)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_worktree_meta(session_dir: &Path, meta: &WorktreeMeta) -> io::Result<()> {
+    let tmp = session_dir.join("worktree.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(meta).expect("worktree meta serializes"))?;
+    std::fs::rename(&tmp, worktree_meta_path(session_dir))
 }
 
 #[derive(Default)]
@@ -182,6 +248,22 @@ impl SessionHandle {
             live: s.live,
             epoch: s.epoch,
             last_seq: s.records.last().map(|r| r.seq).unwrap_or(0),
+            checkout_root: self
+                .checkout
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.root.display().to_string()),
+            // Cross-session by definition; the engine's list() fills it.
+            shared_with: Vec::new(),
+            worktree: self.worktree.lock().unwrap().as_ref().map(|w| {
+                eave_wire::WorktreeInfo {
+                    base: w.base.display().to_string(),
+                    branch: w.branch.clone(),
+                    present: w.present,
+                    dirty_files: w.dirty_files,
+                }
+            }),
         }
     }
 
@@ -404,6 +486,8 @@ impl Engine {
                 files_tx,
                 files_gate: TokioMutex::new(()),
                 fs_watch: StdMutex::new(FsWatchCtl::default()),
+                checkout: StdMutex::new(None),
+                worktree: StdMutex::new(None),
             })
         };
         sessions.insert(id, Arc::clone(&handle));
@@ -412,6 +496,9 @@ impl Engine {
         handle.poke_watch();
         // Session open is a files poll boundary (spec 05 §Files).
         tokio::spawn(refresh_files(Arc::clone(&handle)));
+        // Checkout root probe (Slice I2): the shared-cwd collision fact,
+        // computed off-loop like everything git.
+        tokio::spawn(probe_checkout(Arc::clone(&handle)));
         Ok(handle)
     }
 
@@ -442,6 +529,16 @@ impl Engine {
         }
         let (bcast, _) = broadcast::channel(BROADCAST_CAP);
         let (files_tx, _) = broadcast::channel(FILES_CAP);
+        // The worktree identity claim loads from disk; presence and
+        // dirtiness stay unknown until verified against git
+        // (`verify_worktree` — never from memory, Slice I2).
+        let worktree = load_worktree_meta(&dir).map(|m| WorktreeState {
+            base: m.base,
+            path: m.path,
+            branch: m.branch,
+            present: false,
+            dirty_files: None,
+        });
         Ok(Arc::new(SessionHandle {
             session_id: id.to_string(),
             dir,
@@ -463,6 +560,8 @@ impl Engine {
             files_tx,
             files_gate: TokioMutex::new(()),
             fs_watch: StdMutex::new(FsWatchCtl::default()),
+            checkout: StdMutex::new(None),
+            worktree: StdMutex::new(worktree),
         }))
     }
 
@@ -637,11 +736,286 @@ impl Engine {
         })
     }
 
+    /// Slice I2: move a never-started session into its own worktree.
+    /// Isolation is the operator's opt-in (decision 1) and is only legal
+    /// while nothing has ever spawned — the provider CLI keys its resume
+    /// history off the cwd, so after the first send the cwd is fixed.
+    async fn isolate(self: &Arc<Self>, id: &str) -> Result<SessionInfo, String> {
+        let handle = self.session(id)?;
+        // Hold the live lock for the whole rewrite: `send` serializes on
+        // it, so no spawn can race the cwd change.
+        let live = handle.live.lock().await;
+        let attached = live
+            .as_ref()
+            .map(|l| !l.extra_tx.is_closed())
+            .unwrap_or(false);
+        if attached {
+            return Err("session is live — isolation is chosen before the first send".into());
+        }
+        {
+            let s = handle.shared.lock().unwrap();
+            if !s.records.is_empty() || s.state != "new" {
+                return Err(
+                    "session already started — its cwd is fixed after the first send".into(),
+                );
+            }
+        }
+        if handle.worktree.lock().unwrap().is_some() {
+            return Err("session is already isolated in a worktree".into());
+        }
+        let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+        let probe = crate::git::checkout_root(&cwd).await;
+        if !probe.is_repo {
+            return Err(format!(
+                "{} is not inside a git repository — no worktree is possible; sessions can only share it",
+                cwd.display()
+            ));
+        }
+        let base = probe.root;
+        // The stated naming scheme: dir `<root>/<repo>/<sid8>`, branch
+        // `eave/<sid8>` — sid8 = the session id's first 8 alphanumerics.
+        // Predictable, session-owned, and safe to delete on clean removal.
+        let sid8: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect::<String>()
+            .to_lowercase();
+        if sid8.is_empty() {
+            return Err("session id yields no worktree name".into());
+        }
+        let repo_name = base
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".into());
+        let wt_path = self.cfg.worktrees_root.join(&repo_name).join(&sid8);
+        if wt_path.exists() {
+            return Err(format!(
+                "worktree path already exists: {}",
+                wt_path.display()
+            ));
+        }
+        if let Some(parent) = wt_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create worktrees dir: {e}"))?;
+        }
+        let branch = format!("eave/{sid8}");
+        crate::git::worktree_add(&base, &wt_path, &branch)
+            .await
+            .map_err(|e| format!("git worktree add refused: {e}"))?;
+        // Rewrite the header-only journal with the new cwd: fresh journal
+        // at a temp path, rename over — atomic, header fsync'd by
+        // `create`. Legal precisely because no records exist (checked
+        // above, under the live lock).
+        let mut header = handle.shared.lock().unwrap().header.clone();
+        header.cwd = wt_path.display().to_string();
+        let journal_path = Store::journal_path(&handle.dir);
+        let tmp = handle.dir.join("journal.jsonl.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let rewrite = JournalWriter::create(&tmp, &header)
+            .map(drop)
+            .and_then(|()| std::fs::rename(&tmp, &journal_path));
+        if let Err(e) = rewrite {
+            // The worktree exists but the session still points at the old
+            // cwd — state exactly that; nothing is silently half-done.
+            return Err(format!(
+                "worktree created at {} but the session cwd rewrite failed: {e}",
+                wt_path.display()
+            ));
+        }
+        if let Ok(mut meta) = Meta::load(&handle.dir) {
+            meta.cwd = header.cwd.clone();
+            let _ = meta.save(&handle.dir);
+        }
+        save_worktree_meta(
+            &handle.dir,
+            &WorktreeMeta {
+                format_version: WORKTREE_META_VERSION,
+                base: base.clone(),
+                path: wt_path.clone(),
+                branch: branch.clone(),
+            },
+        )
+        .map_err(|e| format!("worktree created but worktree.json save failed: {e}"))?;
+        handle.shared.lock().unwrap().header = header;
+        *handle.worktree.lock().unwrap() = Some(WorktreeState {
+            base,
+            path: wt_path.clone(),
+            branch,
+            present: true,
+            // git just created it — clean by construction.
+            dirty_files: Some(0),
+        });
+        *handle.checkout.lock().unwrap() = Some(crate::git::CheckoutProbe {
+            root: std::fs::canonicalize(&wt_path).unwrap_or(wt_path),
+            is_repo: true,
+        });
+        drop(live);
+        handle.poke_watch();
+        tokio::spawn(refresh_files(Arc::clone(&handle)));
+        self.info_with_sharing(id)
+    }
+
+    /// Slice I2: delete a session's eave worktree. Decision 2 verbatim:
+    /// eave NEVER deletes dirty work unforced — the counts are measured
+    /// freshly here, restated in the refusal, and only a `force` call
+    /// (the operator's second, meant click) proceeds past them.
+    async fn remove_worktree(
+        self: &Arc<Self>,
+        id: &str,
+        force: bool,
+    ) -> Result<RemoveWorktreeOk, String> {
+        let handle = self.session(id)?;
+        let live = handle.live.lock().await;
+        let attached = live
+            .as_ref()
+            .map(|l| !l.extra_tx.is_closed())
+            .unwrap_or(false);
+        if attached {
+            return Err("session is live — kill it before deleting its worktree".into());
+        }
+        let Some(wt) = handle.worktree.lock().unwrap().clone() else {
+            return Err("session has no eave-created worktree".into());
+        };
+        let exists = wt.path.exists();
+        let dirty_files = if exists {
+            let snap = crate::git::scan(&wt.path).await;
+            match snap.state {
+                eave_wire::GitState::Ok => Some(snap.files.len() as u64 + snap.omitted),
+                // Unknown is not clean: refuses below unless forced.
+                _ => None,
+            }
+        } else {
+            Some(0) // the directory is gone; no files left to protect
+        };
+        let unmerged_commits = crate::git::unmerged_count(&wt.base, &wt.branch).await;
+        let protectable = dirty_files.map_or(true, |n| n > 0)
+            || unmerged_commits.map_or(true, |n| n > 0);
+        if protectable && !force {
+            // A refusal carrying its facts, not an error. Stamp the fresh
+            // count so the rail states what the reply states.
+            {
+                let mut slot = handle.worktree.lock().unwrap();
+                if let Some(w) = slot.as_mut() {
+                    w.dirty_files = dirty_files;
+                    w.present = exists;
+                }
+            }
+            drop(live);
+            handle.poke_watch();
+            return Ok(RemoveWorktreeOk {
+                removed: false,
+                dirty_files,
+                unmerged_commits,
+            });
+        }
+        if exists {
+            crate::git::worktree_remove(&wt.base, &wt.path, force)
+                .await
+                .map_err(|e| format!("git worktree remove refused: {e}"))?;
+        }
+        // Tidy is best-effort past the removal itself: prune the stale
+        // registration; delete the branch ONLY if it is eave's own
+        // naming — never a branch the operator checked out themselves.
+        let _ = crate::git::worktree_prune(&wt.base).await;
+        if wt.branch.starts_with("eave/") {
+            let _ = crate::git::branch_delete(&wt.base, &wt.branch).await;
+        }
+        let _ = std::fs::remove_file(worktree_meta_path(&handle.dir));
+        *handle.worktree.lock().unwrap() = None;
+        drop(live);
+        handle.poke_watch();
+        tokio::spawn(refresh_files(Arc::clone(&handle)));
+        Ok(RemoveWorktreeOk {
+            removed: true,
+            dirty_files,
+            unmerged_commits,
+        })
+    }
+
     fn list(&self) -> ListOk {
         let sessions = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = sessions.values().map(|h| h.info()).collect();
+        drop(sessions);
         infos.sort_by(|a, b| a.created_ts_ms.cmp(&b.created_ts_ms));
+        fill_sharing(&mut infos);
         ListOk { sessions: infos }
+    }
+
+    /// One session's info with the cross-session sharing fact filled —
+    /// what unary replies about a single session return.
+    fn info_with_sharing(&self, id: &str) -> Result<SessionInfo, String> {
+        self.list()
+            .sessions
+            .into_iter()
+            .find(|s| s.session_id == id)
+            .ok_or_else(|| format!("unknown session {id}"))
+    }
+}
+
+/// Stamp `shared_with` (Slice I2): sessions whose canonical checkout
+/// roots are equal work in the SAME files. Sessions with an unknown root
+/// (probe not landed / non-canonicalizable) share with nobody — stated
+/// as absence, never guessed.
+fn fill_sharing(infos: &mut [SessionInfo]) {
+    let mut by_root: HashMap<String, Vec<String>> = HashMap::new();
+    for s in infos.iter() {
+        if let Some(root) = &s.checkout_root {
+            by_root
+                .entry(root.clone())
+                .or_default()
+                .push(s.session_id.clone());
+        }
+    }
+    for s in infos.iter_mut() {
+        let Some(root) = &s.checkout_root else { continue };
+        let Some(ids) = by_root.get(root) else { continue };
+        s.shared_with = ids
+            .iter()
+            .filter(|id| **id != s.session_id)
+            .cloned()
+            .collect();
+    }
+}
+
+/// Probe the session cwd's canonical checkout root (Slice I2) and stamp
+/// it; watchers re-snapshot when the fact lands or changes.
+async fn probe_checkout(handle: Arc<SessionHandle>) {
+    let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+    let probe = crate::git::checkout_root(&cwd).await;
+    let changed = {
+        let mut slot = handle.checkout.lock().unwrap();
+        let changed = slot.as_ref() != Some(&probe);
+        *slot = Some(probe);
+        changed
+    };
+    if changed {
+        handle.poke_watch();
+    }
+}
+
+/// Verify a session's claimed worktree against git (Slice I2 restart
+/// re-detection): ground truth is `git worktree list` in the base repo —
+/// never engine memory, never the json alone. Present worktrees get an
+/// eager scan so an orphan's dirty count reaches the rail without anyone
+/// subscribing; absent ones are stated (`present: false`), never pruned
+/// automatically — the operator's delete affordance owns destruction.
+async fn verify_worktree(handle: Arc<SessionHandle>) {
+    let Some(wt) = handle.worktree.lock().unwrap().clone() else {
+        return;
+    };
+    let listed = crate::git::worktree_list(&wt.base).await.unwrap_or_default();
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canon(&wt.path);
+    let present = wt.path.exists() && listed.iter().any(|p| canon(p) == target);
+    {
+        let mut slot = handle.worktree.lock().unwrap();
+        if let Some(w) = slot.as_mut() {
+            w.present = present;
+        }
+    }
+    handle.poke_watch();
+    if present {
+        refresh_files(Arc::clone(&handle)).await;
     }
 }
 
@@ -713,10 +1087,51 @@ async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Res
         }
         match engine.load_from_disk(&id) {
             Ok(handle) => {
-                engine.sessions.lock().unwrap().insert(id, handle);
+                engine.sessions.lock().unwrap().insert(id, Arc::clone(&handle));
+                // Slice I2: checkout-root probe for the sharing fact, and
+                // worktree re-detection for sessions that claim one —
+                // verified against `git worktree list`, never memory, and
+                // eagerly scanned so a crash orphan's dirty count reaches
+                // the rail without a subscription. Off-loop, per session.
+                tokio::spawn(probe_checkout(Arc::clone(&handle)));
+                if handle.worktree.lock().unwrap().is_some() {
+                    tokio::spawn(verify_worktree(handle));
+                }
             }
             Err(e) => eprintln!("engine: skipping session {id}: {e}"),
         }
+    }
+
+    // Slice I2: sweep the worktrees root for directories no known session
+    // claims (a crashed isolate, a hand-deleted session dir). Stated in
+    // the log and left alone — eave never deletes what it cannot prove is
+    // an owned, clean worktree; the operator owns destruction.
+    {
+        let claimed: Vec<PathBuf> = engine
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|h| h.worktree.lock().unwrap().as_ref().map(|w| w.path.clone()))
+            .collect();
+        let root = engine.cfg.worktrees_root.clone();
+        tokio::spawn(async move {
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let claimed: Vec<PathBuf> = claimed.iter().map(|p| canon(p)).collect();
+            let Ok(repos) = std::fs::read_dir(&root) else { return };
+            for repo in repos.flatten().filter(|e| e.path().is_dir()) {
+                let Ok(trees) = std::fs::read_dir(repo.path()) else { continue };
+                for tree in trees.flatten().filter(|e| e.path().is_dir()) {
+                    let path = canon(&tree.path());
+                    if !claimed.contains(&path) {
+                        eprintln!(
+                            "engine: unclaimed worktree {} — no session owns it; left alone",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        });
     }
 
     // The lock proves no other engine lives; any socket file is stale.
@@ -836,6 +1251,37 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 }
                 Err(message) => ResponseBody::Err { message },
             },
+            Request::Isolate { session_id } => {
+                // Off the connection loop (git work), but deliberately NOT
+                // in `subs`: this call mutates session state (worktree +
+                // cwd rewrite) and must run to completion even if the
+                // client disconnects mid-way — an aborted half-isolate
+                // would leave an unclaimed worktree behind.
+                let w = Arc::clone(&w);
+                let engine = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    let body = match engine.isolate(&session_id).await {
+                        Ok(info) => ok_value(&IsolateOk { info }),
+                        Err(message) => ResponseBody::Err { message },
+                    };
+                    let _ = write_frame(&w, &ResponseEnvelope { id, body }).await;
+                });
+                continue;
+            }
+            Request::RemoveWorktree { session_id, force } => {
+                // Same discipline as isolate: run to completion, never
+                // abort a removal half-way through its git sequence.
+                let w = Arc::clone(&w);
+                let engine = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    let body = match engine.remove_worktree(&session_id, force).await {
+                        Ok(ok) => ok_value(&ok),
+                        Err(message) => ResponseBody::Err { message },
+                    };
+                    let _ = write_frame(&w, &ResponseEnvelope { id, body }).await;
+                });
+                continue;
+            }
             Request::Unsubscribe { id: target } => {
                 // Stop the named stream and release what it held (the
                 // files stream's watcher refcount drops via guard drop).
@@ -1136,8 +1582,34 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
     let _gate = handle.files_gate.lock().await;
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
     let snapshot = crate::git::scan(&cwd).await;
+    // Slice I2: for worktree sessions the scan doubles as the dirty-count
+    // and presence stamp — the facts the rail states on the session row
+    // (and the crash-orphan statement after a restart's eager scan).
+    let wt_changed = {
+        let mut slot = handle.worktree.lock().unwrap();
+        match slot.as_mut() {
+            Some(w) => {
+                let dirty = match snapshot.state {
+                    eave_wire::GitState::Ok => {
+                        Some(snapshot.files.len() as u64 + snapshot.omitted)
+                    }
+                    // Failed scan = unknown, never a fake zero.
+                    _ => None,
+                };
+                let present = w.path.exists();
+                let changed = w.dirty_files != dirty || w.present != present;
+                w.dirty_files = dirty;
+                w.present = present;
+                changed
+            }
+            None => false,
+        }
+    };
     *handle.files.lock().unwrap() = Some(snapshot);
     let _ = handle.files_tx.send(());
+    if wt_changed {
+        handle.poke_watch();
+    }
 }
 
 /// The files subscription (spec 05 §Files): send the current snapshot
@@ -1272,6 +1744,18 @@ async fn watch_session_files(
         .is_err()
     {
         return; // non-existent / unwatchable cwd: polling fallback stands
+    }
+    // Slice I2: a LINKED worktree keeps its HEAD and index in the base
+    // repo's private stanza (`<base>/.git/worktrees/<name>`) — OUTSIDE
+    // the cwd being watched, so commits and index moves there would
+    // never fire an event and the rail would go stale until a poll. Ask
+    // git where the real git dir is and cover it too when it lies
+    // outside the cwd. Best-effort: failure just means the poll fallback
+    // truth-level B2 already had.
+    if let Some(gd) = crate::git::git_dir(&cwd).await {
+        if !gd.starts_with(&cwd) {
+            let _ = watcher.watch(&gd, notify::RecursiveMode::Recursive);
+        }
     }
     active.store(true, Ordering::Relaxed);
     // A subscriber just arrived: heal any staleness from the unwatched
