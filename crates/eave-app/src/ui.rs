@@ -926,6 +926,28 @@ fn short_cwd(cwd: &str, home: Option<&str>) -> String {
     }
 }
 
+/// Open a path with the system handler (macOS `open`). Both call sites —
+/// the worktree "open" affordance and the diff pane's ⌘-click — route
+/// through here so the Stage J harness can assert the *intent* without
+/// launching Finder on the machine running the tests.
+fn open_in_system(path: &std::path::Path) {
+    #[cfg(test)]
+    {
+        OPENED.with(|o| o.borrow_mut().push(path.to_path_buf()));
+    }
+    #[cfg(not(test))]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every path the UI asked the system to open, in order (test-only).
+    static OPENED: std::cell::RefCell<Vec<PathBuf>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
 fn fmt_elapsed(ms: u64) -> String {
     let s = ms / 1000;
     if s < 60 {
@@ -1520,6 +1542,7 @@ impl Shell {
                 // (bordered rect + one vertical hairline), monochrome.
                 div()
                     .id("rail-toggle")
+                    .debug_selector(|| "rail-toggle".into())
                     .p(px(theme::SPACE_1))
                     .mr_2()
                     .rounded(px(theme::RADIUS_BUTTON))
@@ -1566,6 +1589,7 @@ impl Shell {
                 // mirrored (hairline on the right third).
                 div()
                     .id("files-toggle")
+                    .debug_selector(|| "files-toggle".into())
                     .p(px(theme::SPACE_1))
                     .mr_2()
                     .rounded(px(theme::RADIUS_BUTTON))
@@ -1663,6 +1687,7 @@ impl Shell {
                 let sid_del = info.session_id.clone();
                 div()
                     .id(SharedString::from(format!("rail-{}", info.session_id)))
+                    .debug_selector(|| format!("rail-{}", info.session_id))
                     .px(px(theme::SPACE_2))
                     .py(px(theme::SPACE_2))
                     .rounded(px(theme::RADIUS_BUTTON))
@@ -1713,6 +1738,7 @@ impl Shell {
                             )
                             .children(badge.map(|word| {
                                 div()
+                                    .debug_selector(|| format!("badge-{}", info.session_id))
                                     .flex_none()
                                     .text_size(px(theme::SMALL_SIZE))
                                     .line_height(px(theme::SMALL_LINE))
@@ -1723,6 +1749,7 @@ impl Shell {
                     )
                     .child(
                         div()
+                            .debug_selector(|| format!("cwd-{}", info.session_id))
                             .pl(px(meta_indent))
                             .truncate()
                             .text_size(px(theme::SMALL_SIZE))
@@ -1731,11 +1758,16 @@ impl Shell {
                             .child(SharedString::from(short_cwd(&info.cwd, home.as_deref()))),
                     )
                     // Slice I2: shared-checkout fact, full row width — at
-                    // rail width a fact must never lose to a button.
+                    // rail width a fact must never lose to a button. It
+                    // WRAPS rather than clips: the list grows with the
+                    // number of sharers (two 8-char ids already sit 3 px
+                    // from the edge), and a half-stated "shares files
+                    // with bbbb2222, cc…" names the wrong set. Found by
+                    // the Stage J harness, not by eye.
                     .children(shares.map(|line| {
                         div()
+                            .debug_selector(|| format!("shares-{}", info.session_id))
                             .pl(px(meta_indent))
-                            .truncate()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .text_color(theme::text_ghost())
@@ -1744,6 +1776,7 @@ impl Shell {
                     // Slice I2: worktree fact line, also full width.
                     .children(wt_line.map(|line| {
                         div()
+                            .debug_selector(|| format!("wt-line-{}", info.session_id))
                             .pl(px(meta_indent))
                             .truncate()
                             .font_family(theme::MONO)
@@ -1772,6 +1805,7 @@ impl Shell {
                                                 "iso-{}",
                                                 info.session_id
                                             )))
+                                            .debug_selector(|| format!("iso-{}", info.session_id))
                                             .flex_none()
                                             .px(px(theme::SPACE_2))
                                             .rounded(px(theme::RADIUS_BUTTON))
@@ -1781,7 +1815,12 @@ impl Shell {
                                             .line_height(px(theme::SMALL_LINE))
                                             .text_color(theme::text_secondary())
                                             .hover(|s| s.bg(theme::overlay()))
-                                            .on_click(cx.listener(move |this, _, _, _| {
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                // An affordance acts on the
+                                                // row; it does not select it
+                                                // (amendment 2 — selection is
+                                                // the row's own click).
+                                                cx.stop_propagation();
                                                 let _ = this
                                                     .commands
                                                     .send(Command::Isolate(sid_iso.clone()));
@@ -1796,6 +1835,7 @@ impl Shell {
                                                 "wto-{}",
                                                 info.session_id
                                             )))
+                                            .debug_selector(|| format!("wto-{}", info.session_id))
                                             .flex_none()
                                             .px(px(theme::SPACE_2))
                                             .rounded(px(theme::RADIUS_BUTTON))
@@ -1805,10 +1845,9 @@ impl Shell {
                                             .line_height(px(theme::SMALL_LINE))
                                             .text_color(theme::text_secondary())
                                             .hover(|s| s.bg(theme::overlay()))
-                                            .on_click(move |_, _, _| {
-                                                let _ = std::process::Command::new("open")
-                                                    .arg(&wt_path)
-                                                    .spawn();
+                                            .on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                open_in_system(std::path::Path::new(&wt_path));
                                             })
                                             .child("open"),
                                     )
@@ -1820,6 +1859,7 @@ impl Shell {
                                                 "wtd-{}",
                                                 info.session_id
                                             )))
+                                            .debug_selector(|| format!("wtd-{}", info.session_id))
                                             .flex_none()
                                             .px(px(theme::SPACE_2))
                                             .rounded(px(theme::RADIUS_BUTTON))
@@ -1837,7 +1877,8 @@ impl Shell {
                                                 theme::text_secondary()
                                             })
                                             .hover(|s| s.bg(theme::overlay()))
-                                            .on_click(cx.listener(move |this, _, _, _| {
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
                                                 let _ = this.commands.send(
                                                     Command::RemoveWorktree {
                                                         id: sid_del.clone(),
@@ -1854,6 +1895,7 @@ impl Shell {
                     // restated counts, or the engine's stated refusal.
                     .children(note_line.map(|(line, color)| {
                         div()
+                            .debug_selector(|| format!("wt-note-{}", info.session_id))
                             .pl(px(meta_indent))
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
@@ -1894,6 +1936,7 @@ impl Shell {
                     .child(
                         div()
                             .id("new-session")
+                    .debug_selector(|| "new-session".into())
                             .px(px(theme::SPACE_2))
                             .py(px(theme::SPACE_1))
                             .rounded(px(theme::RADIUS_BUTTON))
@@ -1912,6 +1955,7 @@ impl Shell {
             .child(
                 div()
                     .id("rail-rows")
+                    .debug_selector(|| "rail-rows".into())
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
@@ -2053,6 +2097,7 @@ impl Shell {
             .child(
                 div()
                     .id("files-rows")
+                    .debug_selector(|| "files-rows".into())
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
@@ -2062,6 +2107,7 @@ impl Shell {
             )
             .children(mode.map(|text| {
                 div()
+                    .debug_selector(|| "files-mode".into())
                     .flex_none()
                     .px(px(theme::SPACE_3))
                     .pb(px(theme::SPACE_2))
@@ -2091,6 +2137,7 @@ impl Shell {
         let status = f.status;
         div()
             .id(SharedString::from(format!("file-{}", f.path)))
+            .debug_selector(|| format!("file-{}", f.path))
             .px(px(theme::SPACE_2))
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
@@ -2100,9 +2147,7 @@ impl Shell {
                 if ev.modifiers().platform {
                     if status != FileStatus::Deleted {
                         if let Some(cwd) = this.selected_cwd(cx) {
-                            let _ = std::process::Command::new("open")
-                                .arg(cwd.join(&path))
-                                .spawn();
+                            open_in_system(&cwd.join(&path));
                         }
                     }
                     return;
@@ -2448,6 +2493,7 @@ impl Shell {
                     .font_weight(theme::WEIGHT_LABEL)
                     .text_color(theme::danger())
                     .id("attn-kill")
+                    .debug_selector(|| "attn-kill".into())
                     .on_click(cx.listener(|this, _, _, _| {
                         let _ = this.commands.send(Command::Kill);
                     }))
@@ -2873,6 +2919,7 @@ impl Render for Shell {
                                     theme::text_ghost()
                                 })
                                 .id("send")
+                    .debug_selector(|| "send".into())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.send_current(cx);
                                 }))
@@ -2960,6 +3007,7 @@ impl Render for Shell {
                                                         .text_size(px(theme::LABEL_SIZE))
                                                         .text_color(theme::text_secondary())
                                                         .id("to-bottom")
+                    .debug_selector(|| "to-bottom".into())
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.transcript.update(cx, |t, cx| {
                                                                 t.scroll = ScrollMode::Follow;
@@ -3455,6 +3503,10 @@ fn perf_fill_10k(state: &mut TranscriptState) {
         offset_in_item: px(0.),
     });
 }
+
+#[cfg(test)]
+#[path = "ui_harness.rs"]
+mod harness;
 
 #[cfg(test)]
 mod tests {

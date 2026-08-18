@@ -57,3 +57,14 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-
 futures = "0.3"
 serde_json = "1"
 libc = "0.2"
+
+# Stage J UI harness: gpui's own test scaffolding (TestAppContext /
+# VisualTestContext, the deterministic seeded scheduler, synthetic
+# input, `debug_bounds`). Same git+rev as the runtime dependency, so
+# cargo unifies them — `cargo test` builds gpui once WITH the feature,
+# `cargo build` once without. `.debug_selector()` calls compile to a
+# no-op in production builds (gpui elements/div.rs cfg gate).
+[dev-dependencies]
+gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
+    "test-support",
+] }
