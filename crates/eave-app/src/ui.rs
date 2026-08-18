@@ -25,7 +25,7 @@ use gpui::{
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
     Pixels, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextRun,
     TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowOptions,
+    WindowControlArea, WindowHandle, WindowOptions,
 };
 use gpui::Animation;
 use gpui::AnimationExt as _;
@@ -3092,11 +3092,8 @@ pub fn run(data_dir: PathBuf) -> ! {
     let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
 
     application().run(move |cx: &mut App| {
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-
         let queues = Arc::new(Queues::default());
-        let (wake_tx, mut wake_rx) = futures::channel::mpsc::channel::<()>(1);
+        let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
 
         // Feed source: live engine, or fixture replay (Stage D acceptance
@@ -3125,272 +3122,301 @@ pub fn run(data_dir: PathBuf) -> ! {
             }
         }
 
-        let conn = cx.new(|_| ConnectionState {
-            status: ConnEvent::Connecting,
-        });
-        let sessions = cx.new(|_| SessionsState {
-            sessions: Vec::new(),
-            collapsed: false,
-            attention: None,
-            wt_notes: std::collections::HashMap::new(),
-        });
-        let files = cx.new(|_| FilesState {
-            // Perf runs have no feed: seed a synthetic snapshot so the
-            // measured layout includes a populated files rail — and (B2)
-            // a cap-size expanded diff, so the long-diff render path is
-            // measured at its worst, not at a friendly size.
-            snapshot: perf_10k
-                .then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
-            collapsed: false,
-            diff: perf_10k.then(|| DiffSlot {
-                session: "perf:10k".into(),
-                path: "crates/eave-app/src/ui.rs".into(),
-                fetch: DiffFetch::Ready(Arc::new(synthetic_long_diff())),
-            }),
-        });
-        let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
-        let transcript = cx.new(|_| {
-            let mut t = TranscriptState::new();
-            if perf_10k {
-                perf_fill_10k(&mut t);
-            }
-            if replay_assert {
-                t.assert_replay = Some(ReplayAssert {
-                    frozen: None,
-                    jumps: 0,
-                });
-            }
-            t
-        });
-
-        // Steady elapsed reporting (build directive): while a notice
-        // stands, re-render the badge once a second so its elapsed text
-        // moves. Costs one entity read per second when idle.
-        {
-            let sessions = sessions.clone();
-            cx.spawn(async move |cx| loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(1))
-                    .await;
-                if sessions.read_with(cx, |s, _| s.notice_standing()) {
-                    sessions.update(cx, |_, cx| cx.notify());
-                }
-            })
-            .detach();
-        }
-
-        // The pump (spec 03 §Wake & notify): one wake per burst, drain
-        // every non-empty queue, ≤1 notify per entity per burst.
-        {
-            let queues = Arc::clone(&queues);
-            let conn = conn.clone();
-            let sessions = sessions.clone();
-            let files = files.clone();
-            let transcript = transcript.clone();
-            let cmd_tx = cmd_tx.clone();
-            cx.spawn(async move |cx| {
-                while wake_rx.next().await.is_some() {
-                    let conn_events: Vec<ConnEvent> =
-                        queues.conn.lock().unwrap().drain(..).collect();
-                    if let Some(last) = conn_events.into_iter().last() {
-                        let _ = conn.update(cx, |state, cx| {
-                            state.status = last;
-                            cx.notify();
-                        });
-                    }
-                    // Attention is current-state, not a log: the last
-                    // frame of the burst wins.
-                    let attn_events: Vec<AttnEvent> =
-                        queues.attn.lock().unwrap().drain(..).collect();
-                    let rail_events: Vec<RailEvent> =
-                        queues.rail.lock().unwrap().drain(..).collect();
-                    // Files snapshots fold by replacement — last of the
-                    // burst wins; the render filters by session tag.
-                    let files_events: Vec<FilesEvent> =
-                        queues.files.lock().unwrap().drain(..).collect();
-                    let diff_events: Vec<DiffEvent> =
-                        queues.diffs.lock().unwrap().drain(..).collect();
-                    if !files_events.is_empty() || !diff_events.is_empty() {
-                        let cmd_tx = cmd_tx.clone();
-                        let _ = files.update(cx, |state, cx| {
-                            if let Some((sid, snap)) = files_events.into_iter().last() {
-                                // A fresh snapshot is the diff's
-                                // invalidation signal (B2): re-request
-                                // the open pane, or close it when its
-                                // file is no longer listed — "not
-                                // changed anymore" is stated by the
-                                // row's disappearance.
-                                if let Some(slot) = &state.diff {
-                                    if slot.session == sid {
-                                        let listed = snap.as_ref().is_some_and(|s| {
-                                            s.state == GitState::Ok
-                                                && s.files.iter().any(|f| f.path == slot.path)
-                                        });
-                                        if listed {
-                                            let _ =
-                                                cmd_tx.send(Command::Diff(slot.path.clone()));
-                                        } else {
-                                            state.diff = None;
-                                        }
-                                    }
-                                }
-                                state.snapshot = Some((sid, snap));
-                            }
-                            // Diff replies fold only into the slot they
-                            // were requested for — a reply that raced a
-                            // switch or a re-click is discarded.
-                            for (sid, path, res) in diff_events {
-                                if let Some(slot) = &mut state.diff {
-                                    if slot.session == sid && slot.path == path {
-                                        slot.fetch = match res {
-                                            Ok(d) => DiffFetch::Ready(Arc::new(d)),
-                                            Err(m) => DiffFetch::Failed(m),
-                                        };
-                                    }
-                                }
-                            }
-                            cx.notify();
-                        });
-                    }
-                    let last_attn = attn_events.into_iter().last();
-                    let last_rail = rail_events.into_iter().last();
-                    let wt_events: Vec<WtEvent> =
-                        queues.wt.lock().unwrap().drain(..).collect();
-                    if last_attn.is_some() || last_rail.is_some() || !wt_events.is_empty() {
-                        let _ = sessions.update(cx, |state, cx| {
-                            if let Some(tagged) = last_attn {
-                                state.attention = Some(tagged);
-                            }
-                            // Watch snapshots fold by replacement — the
-                            // engine's set is the truth, never merged.
-                            if let Some(snapshot) = last_rail {
-                                state.sessions = snapshot;
-                            }
-                            // Worktree notes fold by replacement per
-                            // session; a settled action clears its note.
-                            for (sid, note) in wt_events {
-                                match note {
-                                    Some(n) => {
-                                        state.wt_notes.insert(sid, n);
-                                    }
-                                    None => {
-                                        state.wt_notes.remove(&sid);
-                                    }
-                                }
-                            }
-                            cx.notify();
-                        });
-                    }
-                    let feed_events: Vec<FeedEvent> =
-                        queues.feed.lock().unwrap().drain(..).collect();
-                    if !feed_events.is_empty() {
-                        let cmd_tx = cmd_tx.clone();
-                        let mut switched = false;
-                        let _ = transcript.update(cx, |state, cx| {
-                            for ev in feed_events {
-                                match ev {
-                                    FeedEvent::Session { id } => {
-                                        if state.session_id.as_deref() != Some(id.as_str()) {
-                                            switched = true;
-                                        }
-                                        state.session_id = Some(id)
-                                    }
-                                    // Frames tagged with another session are
-                                    // stragglers from a dropped subscription
-                                    // — discard, never apply (no bleed).
-                                    FeedEvent::Reset { id } => {
-                                        if state.session_id.as_deref() == Some(id.as_str()) {
-                                            state.reset();
-                                        }
-                                    }
-                                    FeedEvent::Records { id, epoch, records } => {
-                                        if state.session_id.as_deref() != Some(id.as_str()) {
-                                            continue;
-                                        }
-                                        if state.apply_records(epoch, &records).is_err() {
-                                            // Out-of-sequence: drop local
-                                            // state, resubscribe; a fresh
-                                            // Reset heals (spec 03
-                                            // §Streaming commit).
-                                            state.reset();
-                                            let _ = cmd_tx.send(Command::Resubscribe);
-                                        }
-                                    }
-                                }
-                            }
-                            cx.notify();
-                        });
-                        // A real selection switch closes the diff pane:
-                        // it belongs to the session that just left.
-                        if switched {
-                            let _ = files.update(cx, |state, cx| {
-                                if state.diff.take().is_some() {
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    }
-                }
-            })
-            .detach();
-        }
-
-        let bounds = Bounds::centered(None, size(px(theme::WINDOW_W), px(theme::WINDOW_H)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
-                // Opaque is the shipped path; `EAVE_VIBRANCY=1` is the
-                // vibrancy spike (theme.rs owns the glass retune).
-                window_background: if theme::vibrancy() {
-                    WindowBackgroundAppearance::Blurred
-                } else {
-                    WindowBackgroundAppearance::Opaque
-                },
-                titlebar: Some(TitlebarOptions {
-                    title: Some("eave".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
-                }),
-                ..Default::default()
-            },
-            |window, cx| {
-                let shell = cx.new(|cx| {
-                    let composer = cx.new(|_| ComposerState { text: String::new() });
-                    cx.observe(&conn, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&files, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&composer, |_, _, cx| cx.notify()).detach();
-                    Shell {
-                        focus: cx.focus_handle(),
-                        conn: conn.clone(),
-                        sessions: sessions.clone(),
-                        files: files.clone(),
-                        transcript: transcript.clone(),
-                        composer,
-                        commands: cmd_tx.clone(),
-                        perf: perf_10k.then(|| PerfProbe {
-                            frame_times: Vec::new(),
-                            cpu_times: Vec::new(),
-                            last_cpu: None,
-                            last_frame: None,
-                            item_ix: 0,
-                            done: false,
-                        }),
-                        friction: None,
-                        friction_gen: 0,
-                    }
-                });
-                let handle = shell.read(cx).focus.clone();
-                window.focus(&handle, cx);
-                shell
-            },
-        )
-        .expect("open window");
-        cx.activate(true);
+        bootstrap(cx, Feed { queues, wake_rx, cmd_tx });
     });
     std::process::exit(0);
+}
+
+/// One feed's worth of plumbing, handed to [`bootstrap`]: the shared
+/// queues, the wake receiver the pump blocks on, and the command sender
+/// the Shell emits intent through. `run()` wires the far ends into a
+/// live engine or a fixture replay; the stage-J harness holds them
+/// directly — the pump and entities cannot tell the difference.
+struct Feed {
+    queues: Arc<Queues>,
+    wake_rx: futures::channel::mpsc::Receiver<()>,
+    cmd_tx: tokio_mpsc::UnboundedSender<Command>,
+}
+
+/// Everything downstream of the feed — entities, elapsed ticker, pump,
+/// window, Shell — shared verbatim by `run()` and the harness tests:
+/// production and tests walk one spine (stage J).
+fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
+    let Feed {
+        queues,
+        mut wake_rx,
+        cmd_tx,
+    } = feed;
+    let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
+
+    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+
+    let conn = cx.new(|_| ConnectionState {
+        status: ConnEvent::Connecting,
+    });
+    let sessions = cx.new(|_| SessionsState {
+        sessions: Vec::new(),
+        collapsed: false,
+        attention: None,
+        wt_notes: std::collections::HashMap::new(),
+    });
+    let files = cx.new(|_| FilesState {
+        // Perf runs have no feed: seed a synthetic snapshot so the
+        // measured layout includes a populated files rail — and (B2)
+        // a cap-size expanded diff, so the long-diff render path is
+        // measured at its worst, not at a friendly size.
+        snapshot: perf_10k
+            .then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
+        collapsed: false,
+        diff: perf_10k.then(|| DiffSlot {
+            session: "perf:10k".into(),
+            path: "crates/eave-app/src/ui.rs".into(),
+            fetch: DiffFetch::Ready(Arc::new(synthetic_long_diff())),
+        }),
+    });
+    let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
+    let transcript = cx.new(|_| {
+        let mut t = TranscriptState::new();
+        if perf_10k {
+            perf_fill_10k(&mut t);
+        }
+        if replay_assert {
+            t.assert_replay = Some(ReplayAssert {
+                frozen: None,
+                jumps: 0,
+            });
+        }
+        t
+    });
+
+    // Steady elapsed reporting (build directive): while a notice
+    // stands, re-render the badge once a second so its elapsed text
+    // moves. Costs one entity read per second when idle.
+    {
+        let sessions = sessions.clone();
+        cx.spawn(async move |cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(1))
+                .await;
+            if sessions.read_with(cx, |s, _| s.notice_standing()) {
+                sessions.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
+    }
+
+    // The pump (spec 03 §Wake & notify): one wake per burst, drain
+    // every non-empty queue, ≤1 notify per entity per burst.
+    {
+        let queues = Arc::clone(&queues);
+        let conn = conn.clone();
+        let sessions = sessions.clone();
+        let files = files.clone();
+        let transcript = transcript.clone();
+        let cmd_tx = cmd_tx.clone();
+        cx.spawn(async move |cx| {
+            while wake_rx.next().await.is_some() {
+                let conn_events: Vec<ConnEvent> =
+                    queues.conn.lock().unwrap().drain(..).collect();
+                if let Some(last) = conn_events.into_iter().last() {
+                    let _ = conn.update(cx, |state, cx| {
+                        state.status = last;
+                        cx.notify();
+                    });
+                }
+                // Attention is current-state, not a log: the last
+                // frame of the burst wins.
+                let attn_events: Vec<AttnEvent> =
+                    queues.attn.lock().unwrap().drain(..).collect();
+                let rail_events: Vec<RailEvent> =
+                    queues.rail.lock().unwrap().drain(..).collect();
+                // Files snapshots fold by replacement — last of the
+                // burst wins; the render filters by session tag.
+                let files_events: Vec<FilesEvent> =
+                    queues.files.lock().unwrap().drain(..).collect();
+                let diff_events: Vec<DiffEvent> =
+                    queues.diffs.lock().unwrap().drain(..).collect();
+                if !files_events.is_empty() || !diff_events.is_empty() {
+                    let cmd_tx = cmd_tx.clone();
+                    let _ = files.update(cx, |state, cx| {
+                        if let Some((sid, snap)) = files_events.into_iter().last() {
+                            // A fresh snapshot is the diff's
+                            // invalidation signal (B2): re-request
+                            // the open pane, or close it when its
+                            // file is no longer listed — "not
+                            // changed anymore" is stated by the
+                            // row's disappearance.
+                            if let Some(slot) = &state.diff {
+                                if slot.session == sid {
+                                    let listed = snap.as_ref().is_some_and(|s| {
+                                        s.state == GitState::Ok
+                                            && s.files.iter().any(|f| f.path == slot.path)
+                                    });
+                                    if listed {
+                                        let _ =
+                                            cmd_tx.send(Command::Diff(slot.path.clone()));
+                                    } else {
+                                        state.diff = None;
+                                    }
+                                }
+                            }
+                            state.snapshot = Some((sid, snap));
+                        }
+                        // Diff replies fold only into the slot they
+                        // were requested for — a reply that raced a
+                        // switch or a re-click is discarded.
+                        for (sid, path, res) in diff_events {
+                            if let Some(slot) = &mut state.diff {
+                                if slot.session == sid && slot.path == path {
+                                    slot.fetch = match res {
+                                        Ok(d) => DiffFetch::Ready(Arc::new(d)),
+                                        Err(m) => DiffFetch::Failed(m),
+                                    };
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                let last_attn = attn_events.into_iter().last();
+                let last_rail = rail_events.into_iter().last();
+                let wt_events: Vec<WtEvent> =
+                    queues.wt.lock().unwrap().drain(..).collect();
+                if last_attn.is_some() || last_rail.is_some() || !wt_events.is_empty() {
+                    let _ = sessions.update(cx, |state, cx| {
+                        if let Some(tagged) = last_attn {
+                            state.attention = Some(tagged);
+                        }
+                        // Watch snapshots fold by replacement — the
+                        // engine's set is the truth, never merged.
+                        if let Some(snapshot) = last_rail {
+                            state.sessions = snapshot;
+                        }
+                        // Worktree notes fold by replacement per
+                        // session; a settled action clears its note.
+                        for (sid, note) in wt_events {
+                            match note {
+                                Some(n) => {
+                                    state.wt_notes.insert(sid, n);
+                                }
+                                None => {
+                                    state.wt_notes.remove(&sid);
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                let feed_events: Vec<FeedEvent> =
+                    queues.feed.lock().unwrap().drain(..).collect();
+                if !feed_events.is_empty() {
+                    let cmd_tx = cmd_tx.clone();
+                    let mut switched = false;
+                    let _ = transcript.update(cx, |state, cx| {
+                        for ev in feed_events {
+                            match ev {
+                                FeedEvent::Session { id } => {
+                                    if state.session_id.as_deref() != Some(id.as_str()) {
+                                        switched = true;
+                                    }
+                                    state.session_id = Some(id)
+                                }
+                                // Frames tagged with another session are
+                                // stragglers from a dropped subscription
+                                // — discard, never apply (no bleed).
+                                FeedEvent::Reset { id } => {
+                                    if state.session_id.as_deref() == Some(id.as_str()) {
+                                        state.reset();
+                                    }
+                                }
+                                FeedEvent::Records { id, epoch, records } => {
+                                    if state.session_id.as_deref() != Some(id.as_str()) {
+                                        continue;
+                                    }
+                                    if state.apply_records(epoch, &records).is_err() {
+                                        // Out-of-sequence: drop local
+                                        // state, resubscribe; a fresh
+                                        // Reset heals (spec 03
+                                        // §Streaming commit).
+                                        state.reset();
+                                        let _ = cmd_tx.send(Command::Resubscribe);
+                                    }
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                    // A real selection switch closes the diff pane:
+                    // it belongs to the session that just left.
+                    if switched {
+                        let _ = files.update(cx, |state, cx| {
+                            if state.diff.take().is_some() {
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    let bounds = Bounds::centered(None, size(px(theme::WINDOW_W), px(theme::WINDOW_H)), cx);
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
+            // Opaque is the shipped path; `EAVE_VIBRANCY=1` is the
+            // vibrancy spike (theme.rs owns the glass retune).
+            window_background: if theme::vibrancy() {
+                WindowBackgroundAppearance::Blurred
+            } else {
+                WindowBackgroundAppearance::Opaque
+            },
+            titlebar: Some(TitlebarOptions {
+                title: Some("eave".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
+            }),
+            ..Default::default()
+        },
+        |window, cx| {
+            let shell = cx.new(|cx| {
+                let composer = cx.new(|_| ComposerState { text: String::new() });
+                cx.observe(&conn, |_, _, cx| cx.notify()).detach();
+                cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
+                cx.observe(&files, |_, _, cx| cx.notify()).detach();
+                cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
+                cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+                Shell {
+                    focus: cx.focus_handle(),
+                    conn: conn.clone(),
+                    sessions: sessions.clone(),
+                    files: files.clone(),
+                    transcript: transcript.clone(),
+                    composer,
+                    commands: cmd_tx.clone(),
+                    perf: perf_10k.then(|| PerfProbe {
+                        frame_times: Vec::new(),
+                        cpu_times: Vec::new(),
+                        last_cpu: None,
+                        last_frame: None,
+                        item_ix: 0,
+                        done: false,
+                    }),
+                    friction: None,
+                    friction_gen: 0,
+                }
+            });
+            let handle = shell.read(cx).focus.clone();
+            window.focus(&handle, cx);
+            shell
+        },
+    )
+    .expect("open window");
+    cx.activate(true);
+    handle
 }
 
 /// Fill the transcript with 10k rows of real fixture-derived markdown and
