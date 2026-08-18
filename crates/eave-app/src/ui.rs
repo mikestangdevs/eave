@@ -14,7 +14,7 @@
 //! folding — no UI frame-pacing timer (spec 03 §Streaming commit).
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -527,6 +527,10 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         worktree: None,
         pending_approvals: 0,
         permission_mode: Some("default".into()),
+        // A real `claude` sits in this range; the replay rig is the only
+        // place the aggregate line renders through a real compositor, so
+        // it renders with a realistic number rather than none.
+        rss_bytes: Some(268_435_456),
     }]);
     // Same for the files rail (Slice B): the reading column must be
     // constrained on BOTH sides during asserts and captures.
@@ -961,6 +965,72 @@ fn posture_line(mode: &str) -> String {
         "default" | "manual" => format!("asks before it writes · {mode}"),
         other => format!("NEVER ASKS · {other}"),
     }
+}
+
+/// Above this share of the machine's physical memory held by agent
+/// processes, the aggregate fact turns from a statement into a warning
+/// (Stage L). Not a limit and not enforced — eave still starts whatever
+/// the operator starts. Half was chosen because that is roughly where a
+/// working Mac starts trading the rest of its memory away, and the number
+/// on screen is the operator's evidence either way.
+const AGENT_MEMORY_WARN_FRACTION: f64 = 0.5;
+
+/// The aggregate resource fact (Stage L): what every live agent costs
+/// right now, together, against the machine it runs on.
+///
+/// This exists because per-session honesty was not enough. eave states a
+/// failure per session accurately, but at N=10 (measured, Slice I1) the
+/// ceiling is not eave — engine ~8 MB — it is N × a real `claude` at
+/// 200–310 MB, and nothing anywhere said so; the machine simply started
+/// paging. One line, always the sum of what is actually resident.
+///
+/// Returns `None` when nothing live reports memory: no live session, an
+/// engine predating `rss_bytes`, or a probe that failed. Absence is
+/// stated by rendering nothing — a "0.0 GB" would be a lie about a
+/// running agent.
+///
+/// Both limits of the underlying number are real and are named where a
+/// reader can act on them (`eave_core::proc::resident_bytes`): leaders
+/// only, so tool children are uncounted, and resident sizes double-count
+/// shared pages, so the sum is an upper bound. Provider rate contention —
+/// the other thing that bites at high N — is not measurable here at all.
+fn resource_line(sessions: &[eave_wire::SessionInfo], physical: Option<u64>) -> Option<(String, bool)> {
+    let reporting: Vec<u64> = sessions
+        .iter()
+        .filter(|s| s.live)
+        .filter_map(|s| s.rss_bytes)
+        .collect();
+    if reporting.is_empty() {
+        return None;
+    }
+    let total: u64 = reporting.iter().sum();
+    let n = reporting.len();
+    let noun = if n == 1 { "agent" } else { "agents" };
+    match physical {
+        Some(phys) if phys > 0 => {
+            let frac = total as f64 / phys as f64;
+            Some((
+                format!("{n} {noun} · {} of {}", gib(total), gib(phys)),
+                frac >= AGENT_MEMORY_WARN_FRACTION,
+            ))
+        }
+        // No denominator rather than an invented one: the sum alone is
+        // still a true fact, and a fabricated machine size would not be.
+        _ => Some((format!("{n} {noun} · {} resident", gib(total)), false)),
+    }
+}
+
+/// The machine's physical memory, read once. It does not change while
+/// the app runs, and the fact renders on every rail paint.
+fn physical_memory_cached() -> Option<u64> {
+    static PHYS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PHYS.get_or_init(eave_core::proc::physical_memory)
+}
+
+/// Bytes as gibibytes at one decimal — the unit the operator's own
+/// Activity Monitor uses, so the two numbers can be compared directly.
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// The shared-checkout fact (Slice I2): who else works in these files,
@@ -1399,17 +1469,65 @@ struct Shell {
     /// counter keeps a stale clear-timer from eating a newer note.
     friction: Option<(u64, String)>,
     friction_gen: u64,
+    /// Whether the friction log's path has been stated in the footer yet
+    /// this run (Stage L).
+    friction_path_stated: bool,
 }
 
-/// Where ⌘L appends its stamp: `EAVE_DOGFOOD_LOG` if set, else the
-/// dogfood log next to the project's other docs. A missing file is
-/// created; a missing directory is a stated write error in the footer.
+/// The data dir this process is running against, recorded by [`run`] so
+/// code below the feed loop can resolve paths against it (Stage L).
+/// Unset under the test harness, which never calls `run`.
+static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Data dir per spec 02 §Layout — the default when neither `--data-dir`
+/// nor `EAVE_DATA_DIR` is given. Lives here rather than in `main.rs` so
+/// the friction log can fall back to the same place without a second copy
+/// of the layout rule.
+pub fn default_data_dir() -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME is set");
+    PathBuf::from(home).join("Library/Application Support/eave")
+}
+
+/// Where ⌘L appends its stamp (Stage L — this used to hardcode one
+/// person's desk, `~/Desktop/eave/docs/dogfood-log.md`, which existed on
+/// exactly one machine and silently failed to write on any other):
+///
+/// 1. `EAVE_DOGFOOD_LOG` if set — the dev-loop and test override, and now
+///    also how anyone keeps writing into a checkout's own docs.
+/// 2. `<data_dir>/dogfood-log.md` — beside the journals the notes are
+///    about, so the log follows `--data-dir` the way everything else does.
+///
+/// A missing file is created; a missing directory is a stated write error
+/// in the footer.
 fn friction_log_path() -> PathBuf {
-    if let Ok(p) = std::env::var("EAVE_DOGFOOD_LOG") {
-        return PathBuf::from(p);
+    resolve_friction_log(
+        std::env::var("EAVE_DOGFOOD_LOG").ok(),
+        DATA_DIR.get().cloned(),
+    )
+}
+
+/// The resolution rule itself, taking its inputs rather than reading
+/// them, so it is testable without touching process-wide env or the
+/// once-set data dir.
+fn resolve_friction_log(override_path: Option<String>, data_dir: Option<PathBuf>) -> PathBuf {
+    match override_path {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => data_dir
+            .unwrap_or_else(default_data_dir)
+            .join("dogfood-log.md"),
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Desktop/eave/docs/dogfood-log.md")
+}
+
+/// A path with `$HOME` collapsed to `~`, for stating a location in
+/// chrome without spending half the footer on it.
+fn tilde(path: &Path) -> String {
+    let text = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && text.starts_with(&home) => {
+            format!("~{}", &text[home.len()..])
+        }
+        _ => text,
+    }
 }
 
 /// Local wall-clock stamp for the friction log (the log is read by a
@@ -1488,6 +1606,12 @@ impl Shell {
                 writeln!(f, "- {stamp} · {context} · ")
             });
         let note = match written {
+            // The destination is stated on the first append of the
+            // session, once: the path moved with the data dir in Stage L,
+            // and a friction log whose location is a guess is friction.
+            Ok(()) if !std::mem::replace(&mut self.friction_path_stated, true) => {
+                format!("logged {} → {}", &stamp[11..], tilde(&path))
+            }
             Ok(()) => format!("logged {}", &stamp[11..]),
             Err(e) => format!("log failed: {e}"),
         };
@@ -1747,6 +1871,7 @@ impl Shell {
         let selected = self.transcript.read(cx).session_id.clone();
         let wt_notes = self.sessions.read(cx).wt_notes.clone();
         let home = std::env::var("HOME").ok();
+        let resource = resource_line(&sessions, physical_memory_cached());
         // The meta line aligns under the provider label: dot + gap +
         // chip + gap.
         let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
@@ -2116,6 +2241,23 @@ impl Shell {
                     .gap(px(theme::SPACE_1))
                     .children(rows),
             )
+            // Stage L: the aggregate resource fact, under the list it
+            // aggregates and outside the scroller — a ceiling the
+            // operator has to scroll to find is a ceiling they meet by
+            // surprise. Absent entirely when nothing live reports memory.
+            .children(resource.map(|(line, over)| {
+                div()
+                    .debug_selector(|| "rail-resource".into())
+                    .flex_none()
+                    .px(px(theme::SPACE_3))
+                    .pb(px(theme::SPACE_3))
+                    .pt(px(theme::SPACE_1))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .font_weight(if over { theme::WEIGHT_LABEL } else { theme::WEIGHT_BODY })
+                    .text_color(if over { theme::warning() } else { theme::text_ghost() })
+                    .child(SharedString::from(line))
+            }))
             .into_any_element()
     }
 
@@ -3575,6 +3717,9 @@ impl IntoElement for Frost {
 // Entry
 
 pub fn run(data_dir: PathBuf) -> ! {
+    // Recorded before anything renders: the friction log resolves against
+    // it (Stage L), and it must not differ from the dir the feed loop uses.
+    let _ = DATA_DIR.set(data_dir.clone());
     let replay: Option<(PathBuf, f64)> = std::env::var("EAVE_REPLAY").ok().map(|p| {
         let speed = std::env::var("EAVE_REPLAY_SPEED")
             .ok()
@@ -3915,6 +4060,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     }),
                     friction: None,
                     friction_gen: 0,
+                    friction_path_stated: false,
                 }
             });
             let handle = shell.read(cx).focus.clone();

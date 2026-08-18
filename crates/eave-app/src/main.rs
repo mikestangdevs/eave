@@ -21,7 +21,7 @@ fn main() {
     }
     let data_dir = data_dir
         .or_else(|| std::env::var_os("EAVE_DATA_DIR").map(Into::into))
-        .unwrap_or_else(default_data_dir);
+        .unwrap_or_else(ui::default_data_dir);
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         eprintln!("eave: cannot create data dir {}: {e}", data_dir.display());
         std::process::exit(1);
@@ -33,9 +33,7 @@ fn main() {
     }
 }
 
-/// Data dir per spec 02 §Layout. `EAVE_DATA_DIR` / `--data-dir` override
-/// for dev loops against the fake agent.
-fn default_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME is set");
-    PathBuf::from(home).join("Library/Application Support/eave")
-}
+// The layout rule itself lives in `ui::default_data_dir` (spec 02
+// §Layout), so the friction-log fallback resolves to the same place
+// without a second copy of it. `EAVE_DATA_DIR` / `--data-dir` override
+// for dev loops against the fake agent.

@@ -128,8 +128,42 @@ pub trait AgentSession: Send {
     /// The provider-native resume cursor, once the provider announced it.
     fn provider_session_id(&self) -> Option<String>;
 
-    /// Outstanding tool calls — the "nothing in flight" input to the
-    /// attention clocks (spec 01).
+    /// Outstanding provider `tool_use` ids the adapter has seen started
+    /// and not yet seen resolved.
+    ///
+    /// **Tool calls only. It does NOT count open permission questions**
+    /// (Slice K), and reconciling that is deliberately not done here:
+    ///
+    /// - The two are different facts with different consequences. A tool
+    ///   in flight means the agent is working; an open question means the
+    ///   agent is stopped and the operator is the blocker. Summing them
+    ///   into one "busy" number would erase exactly the distinction
+    ///   `awaiting_approval` exists to make (spec 01) — and `quiet` vs
+    ///   `awaiting_approval` is the difference between offering a kill
+    ///   and not.
+    /// - The doc comment here used to claim this was "the 'nothing in
+    ///   flight' input to the attention clocks". **It is not, and never
+    ///   was.** `eave_core::attention::Classifier` folds journal records
+    ///   and owns every in-flight notion the clocks use; nothing outside
+    ///   tests calls this method at all. The claim was the actual bug —
+    ///   a reader who believed it would wire this in and silently
+    ///   un-hold the approval carve-out.
+    ///
+    /// What the wire actually does today, checked rather than assumed
+    /// (`docs/research/approvals-capture-2026-08-18/`, captures C, D, E):
+    /// every `can_use_tool` request arrives AFTER that tool's own
+    /// `tool_use` content block, so a session parked on a permission
+    /// question already reports at least one tool in flight and the two
+    /// counts happen to agree. That agreement is a property of the CLI's
+    /// ordering, not of eave, and nothing enforces it —
+    /// `request_user_dialog` (AskUserQuestion, plan mode) is a control
+    /// request with no tool anywhere in it.
+    ///
+    /// So: this is an adapter-level count of one specific thing, and the
+    /// rule for any future caller is stated rather than encoded. If you
+    /// need "is this session doing anything at all?", you need this AND
+    /// [`AgentSession::pending_approvals`], and you must not add them —
+    /// today they would double-count the same tool.
     fn in_flight_tools(&self) -> usize;
 
     /// Last byte received from the CLI (attention-clock activity source).

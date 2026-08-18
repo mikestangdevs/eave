@@ -120,6 +120,40 @@ async fn malformed_lines_surface_without_breaking_the_parser() {
     ));
 }
 
+/// Stage L, reconciling the Slice K caveat: `in_flight_tools()` counts
+/// tool calls and `pending_approvals()` counts open questions, and the
+/// two are different facts that must never be summed.
+///
+/// This test pins the coupling that makes them *look* redundant. On the
+/// real wire (captures C/D/E, `docs/research/approvals-capture-2026-08-18/`)
+/// a `can_use_tool` request always follows that tool's own `tool_use`
+/// block, so a parked session reports one of each — for the SAME tool.
+/// That is the CLI's ordering, not eave's guarantee: if it ever changes,
+/// this test says so, and anything that had quietly started treating
+/// either number as "is this session busy?" needs revisiting.
+#[tokio::test]
+async fn an_open_question_and_an_in_flight_tool_are_separate_counts() {
+    let cfg = fake_cfg("approval-hang", &[]);
+    let (mut session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    recv_until(&mut rx, |e| matches!(e, SessionEvent::Init { .. })).await;
+    session.send_user_message("go").await.unwrap();
+    recv_until(&mut rx, |e| matches!(e, SessionEvent::ApprovalRequested { .. })).await;
+
+    assert_eq!(
+        session.pending_approvals(),
+        1,
+        "the session is parked on exactly one question"
+    );
+    assert_eq!(
+        session.in_flight_tools(),
+        1,
+        "and the tool that question is about is still outstanding — the \
+         CLI announces the tool before it asks (captures C/D/E). If this \
+         ever reads 0, the counts have come apart and nothing may assume \
+         a parked session shows a tool in flight"
+    );
+}
+
 #[tokio::test]
 async fn tool_use_tracking_counts_in_flight_tools() {
     let cfg = fake_cfg("tool-cycle", &[]);

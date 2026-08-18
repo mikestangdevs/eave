@@ -127,6 +127,12 @@ struct Shared {
     records: Vec<Record>,
     state: String,
     live: bool,
+    /// The live agent leader's pid, set beside `live` and cleared with it
+    /// (Stage L). Its only use is sampling resident memory for the
+    /// aggregate resource fact — the (pid, start_time) identity that
+    /// governs kills and probes lives in `meta.json` and the adapter, and
+    /// this must never be used in its place.
+    pid: Option<i32>,
     /// The live attention overlay (spec 01), maintained by the monitor
     /// task; `None` when no process is attached. Transient — never
     /// journaled.
@@ -288,6 +294,13 @@ impl SessionHandle {
                 a.pending.len() as u64
             },
             permission_mode: self.approvals.lock().unwrap().mode.clone(),
+            // Stage L: sampled here rather than cached, because `info()` is
+            // built only for `list` and `watch` snapshots — operator-paced,
+            // not record-paced — and one `proc_pidinfo` per live session
+            // per snapshot buys a number that is never stale. A cached
+            // value would freeze on an idle session, which is exactly the
+            // session whose cost the operator has stopped thinking about.
+            rss_bytes: s.pid.and_then(proc::resident_bytes),
             worktree: self.worktree.lock().unwrap().as_ref().map(|w| {
                 eave_wire::WorktreeInfo {
                     base: w.base.display().to_string(),
@@ -509,6 +522,7 @@ impl Engine {
                     records: Vec::new(),
                     state: "new".into(),
                     live: false,
+                    pid: None,
                     attention: None,
                 }),
                 bcast,
@@ -582,6 +596,7 @@ impl Engine {
                 records: loaded.records,
                 state,
                 live: false,
+                pid: None,
                 attention: None,
             }),
             bcast,
@@ -682,6 +697,7 @@ impl Engine {
         {
             let mut s = handle.shared.lock().unwrap();
             s.live = true;
+            s.pid = Some(session.identity().pid);
             s.state = "running".into();
         }
         handle.poke_watch();
@@ -765,6 +781,7 @@ impl Engine {
             {
                 let mut s = done_handle.shared.lock().unwrap();
                 s.live = false;
+                s.pid = None;
                 s.state = state;
                 // The overlay is per-process; the journal's terminal truth
                 // governs now. Broadcast the clear so a live notice drops.
@@ -1065,6 +1082,43 @@ impl Engine {
     }
 }
 
+/// Where the unclaimed-worktree sweep leaves its findings (Stage L).
+fn unclaimed_report_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("unclaimed-worktrees.txt")
+}
+
+/// State the sweep's result somewhere the operator can actually reach it.
+///
+/// The sweep has run since Slice I2 and reported only to engine stderr,
+/// which no operator ever sees — so directories eave itself created, and
+/// then lost track of, accumulated in total silence. They are never
+/// deleted (decision 2: the operator owns destruction), which is exactly
+/// why they have to be *findable*.
+///
+/// The file is rewritten from scratch on every engine start and **deleted
+/// when the sweep finds nothing**: a stale list of paths that have since
+/// been cleaned up would be worse than no list, because it would send
+/// someone looking for directories that are already gone. This is not a
+/// UI surface and does not pretend to be one — the rail has no
+/// engine-wide fact channel, and inventing one for this would mean a
+/// second cross-session broadcast beside `watch`.
+fn write_unclaimed_report(path: &Path, root: &Path, found: &[PathBuf]) {
+    if found.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let mut body = String::from(
+        "# Unclaimed eave worktrees\n\n         Directories under the worktrees root that no session in this data\n         dir claims — a crashed `isolate`, or a session dir removed by hand.\n         eave has NOT touched them and will not: it never deletes work it\n         cannot prove is owned and clean. Inspect them, and remove them\n         yourself when you are sure (`git worktree remove`, or `rm -rf` plus\n         `git worktree prune` in the base repo).\n\n         Rewritten on every engine start; deleted when the sweep comes back\n         empty, so this file is never a stale list.\n\n",
+    );
+    body.push_str(&format!("worktrees root: {}\n\n", root.display()));
+    for p in found {
+        body.push_str(&format!("{}\n", p.display()));
+    }
+    if let Err(e) = std::fs::write(path, body) {
+        eprintln!("engine: cannot write {}: {e}", path.display());
+    }
+}
+
 /// Stamp `shared_with` (Slice I2): sessions whose canonical checkout
 /// roots are equal work in the SAME files. Sessions with an unknown root
 /// (probe not landed / non-canonicalizable) share with nobody — stated
@@ -1297,22 +1351,27 @@ async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Res
             .filter_map(|h| h.worktree.lock().unwrap().as_ref().map(|w| w.path.clone()))
             .collect();
         let root = engine.cfg.worktrees_root.clone();
+        let report = unclaimed_report_path(&engine.cfg.data_dir);
         tokio::spawn(async move {
             let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let claimed: Vec<PathBuf> = claimed.iter().map(|p| canon(p)).collect();
-            let Ok(repos) = std::fs::read_dir(&root) else { return };
-            for repo in repos.flatten().filter(|e| e.path().is_dir()) {
-                let Ok(trees) = std::fs::read_dir(repo.path()) else { continue };
-                for tree in trees.flatten().filter(|e| e.path().is_dir()) {
-                    let path = canon(&tree.path());
-                    if !claimed.contains(&path) {
-                        eprintln!(
-                            "engine: unclaimed worktree {} — no session owns it; left alone",
-                            path.display()
-                        );
+            let mut found: Vec<PathBuf> = Vec::new();
+            if let Ok(repos) = std::fs::read_dir(&root) {
+                for repo in repos.flatten().filter(|e| e.path().is_dir()) {
+                    let Ok(trees) = std::fs::read_dir(repo.path()) else { continue };
+                    for tree in trees.flatten().filter(|e| e.path().is_dir()) {
+                        let path = canon(&tree.path());
+                        if !claimed.contains(&path) {
+                            eprintln!(
+                                "engine: unclaimed worktree {} — no session owns it; left alone",
+                                path.display()
+                            );
+                            found.push(path);
+                        }
                     }
                 }
             }
+            write_unclaimed_report(&report, &root, &found);
         });
     }
 

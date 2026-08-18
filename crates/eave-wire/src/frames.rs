@@ -276,6 +276,19 @@ pub struct SessionInfo {
     /// them automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
+    /// Resident memory held by this session's agent process right now, in
+    /// bytes (Stage L). `None` when nothing is live, when the probe
+    /// failed, or from an engine predating this field — never a zero,
+    /// which would read as "this agent costs nothing".
+    ///
+    /// A quantity, like `pending_approvals` is a count: the watch
+    /// isolation invariant (§Watch) bars transcript CONTENT, and how much
+    /// memory a process holds is a fact about the machine, not about what
+    /// the operator asked the agent to do. It is what lets the rail state
+    /// an aggregate ceiling for every session at once without subscribing
+    /// to any of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
     /// Open permission questions right now (Slice K). A COUNT, deliberately
     /// — the watch channel may say that a session is waiting on the
     /// operator and how many times, and may never say which tool or which
@@ -641,6 +654,7 @@ mod tests {
                     }),
                     pending_approvals: 2,
                     permission_mode: Some("default".into()),
+                    rss_bytes: Some(268_435_456),
                 }],
             }),
         };

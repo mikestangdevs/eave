@@ -23,7 +23,7 @@ use eave_core::proc::{self, ProcIdentity};
 use eave_core::store::Meta;
 use eave_engine::client::Client;
 use eave_wire::model::{Row, Transcript};
-use eave_wire::{socket_path, ResponseBody, ResponseEnvelope, SubscriptionItem};
+use eave_wire::{socket_path, ResponseEnvelope, SubscriptionItem};
 
 fn engined_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_eave-engined"))
@@ -714,6 +714,71 @@ async fn background_attention_reaches_watch_while_subscribed_elsewhere() {
 /// and across every byte it receives: no canary of any kind on watch, no
 /// s0/s2 canary (text or filename) anywhere at all. Positive controls
 /// keep it non-vacuous.
+/// Stage L: the aggregate resource fact is only worth rendering if the
+/// engine actually measures something. `rss_bytes` must be a real
+/// resident size for a live agent and **absent** the moment nothing is
+/// attached — a stale or zeroed number would let the rail claim a fleet
+/// costs nothing while the machine pages.
+#[tokio::test]
+async fn a_live_agent_reports_what_it_costs_and_a_dead_one_reports_nothing() {
+    let dir = scratch();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open");
+
+    // Before any spawn there is no process, so there is no number.
+    let before = c.list().await.expect("list");
+    assert_eq!(
+        before[0].rss_bytes, None,
+        "a session that never spawned holds no memory and must say so by \
+         absence, not by zero"
+    );
+
+    assert!(c.send("s1", "hello").await.expect("send"));
+    // Polled to a real size rather than asserted on the first reading:
+    // this is a LIVE sample, and a process caught microseconds after
+    // exec legitimately holds almost nothing (32 KB, observed) before its
+    // pages fault in. What must hold is that the number is a real
+    // resident set that grows into one, not a placeholder.
+    let end = Instant::now() + Duration::from_secs(15);
+    let mut first: Option<u64> = None;
+    let rss = loop {
+        assert!(
+            Instant::now() < end,
+            "live agent never reported a real size (first reading: {first:?})"
+        );
+        if let Some(rss) = c.list().await.expect("list")[0].rss_bytes {
+            first.get_or_insert(rss);
+            if rss > 500_000 {
+                break rss;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        rss > 500_000,
+        "a settled process holds real memory; got {rss} bytes, which means \
+         the probe is reporting something other than a resident set"
+    );
+
+    c.kill("s1").await.expect("kill");
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < end, "rss never cleared after the kill");
+        let info = c.list().await.expect("list").remove(0);
+        if !info.live {
+            assert_eq!(
+                info.rss_bytes, None,
+                "the process is gone — the fact must vanish with it, or the \
+                 rail keeps charging the operator for a dead agent"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(engine);
+}
+
 #[tokio::test]
 async fn no_content_crosses_sessions_on_any_channel_at_n() {
     const TEXT: [&str; 3] = ["TXT_CANARY_s0_e1", "TXT_CANARY_s1_e2", "TXT_CANARY_s2_e3"];

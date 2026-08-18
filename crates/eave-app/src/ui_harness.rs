@@ -79,6 +79,7 @@ fn session(id: &str) -> SessionInfo {
         worktree: None,
         pending_approvals: 0,
         permission_mode: None,
+        rss_bytes: None,
     }
 }
 
@@ -152,6 +153,132 @@ fn real_text_width(text: &str, family: &str, size: f32) -> Pixels {
 // font-kit metrics. Synthetic glyph advances would make every one of
 // them pass vacuously — which is the exact failure this amendment
 // exists to prevent.
+
+/// Stage L: ⌘L's destination. It used to be
+/// `~/Desktop/eave/docs/dogfood-log.md` — one person's desk, hardcoded,
+/// which on any other machine meant the keystroke wrote into a directory
+/// that did not exist and reported a failure the operator had no way to
+/// interpret. It now follows the data dir, so `--data-dir` moves it with
+/// everything else, and the explicit override still wins.
+#[test]
+fn the_friction_log_follows_the_data_dir_not_a_desk() {
+    let data = PathBuf::from("/tmp/eave-l/data");
+    assert_eq!(
+        resolve_friction_log(None, Some(data.clone())),
+        data.join("dogfood-log.md"),
+        "the log belongs beside the journals the notes are about"
+    );
+    assert_eq!(
+        resolve_friction_log(Some("/tmp/elsewhere.md".into()), Some(data.clone())),
+        PathBuf::from("/tmp/elsewhere.md"),
+        "EAVE_DOGFOOD_LOG still wins — it is how a checkout keeps writing \
+         into its own docs, and how every test avoids the real log"
+    );
+    assert_eq!(
+        resolve_friction_log(Some(String::new()), Some(data.clone())),
+        data.join("dogfood-log.md"),
+        "an empty override is not a path; it must not resolve to the \
+         filesystem root"
+    );
+    // No data dir recorded (nothing called `run`): the layout default,
+    // never a guess about anyone's home directory layout.
+    let fallback = resolve_friction_log(None, None);
+    assert_eq!(fallback, default_data_dir().join("dogfood-log.md"));
+    assert!(
+        !fallback.to_string_lossy().contains("Desktop"),
+        "the desk is gone: {fallback:?}"
+    );
+}
+
+/// Stage L: the aggregate resource fact. The shapes are asserted on the
+/// pure function (that is where the arithmetic lives) and the rendering
+/// is asserted through the shell — present when something live reports,
+/// gone when nothing does, and fitting the rail at real glyph widths,
+/// because a ceiling that truncates to "3 agents · 12.4 GB of…" states
+/// the one half that cannot be acted on.
+#[gpui::test]
+fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    // Arithmetic first, on the function itself.
+    let mut live_a = session("aaaa1111");
+    live_a.live = true;
+    live_a.rss_bytes = Some(GB / 4);
+    let mut live_b = session("bbbb2222");
+    live_b.live = true;
+    live_b.rss_bytes = Some(GB / 4);
+    // Dead sessions cost nothing and must not be counted...
+    let mut dead = session("cccc3333");
+    dead.rss_bytes = Some(99 * GB);
+    // ...and a live one whose probe failed is absent, never a zero.
+    let mut unprobed = session("dddd4444");
+    unprobed.live = true;
+
+    let all = vec![live_a.clone(), live_b.clone(), dead.clone(), unprobed.clone()];
+    let (line, over) = resource_line(&all, Some(32 * GB)).expect("two live agents report");
+    assert_eq!(line, "2 agents · 0.5 GB of 32.0 GB");
+    assert!(!over, "half a gig of thirty-two is not a warning");
+
+    let (one, _) = resource_line(&[live_a.clone()], Some(32 * GB)).unwrap();
+    assert_eq!(one, "1 agent · 0.2 GB of 32.0 GB", "singular reads as singular");
+
+    let mut hog = session("eeee5555");
+    hog.live = true;
+    hog.rss_bytes = Some(24 * GB);
+    let (_, over) = resource_line(&[hog.clone()], Some(32 * GB)).unwrap();
+    assert!(over, "three quarters of the machine is the warning case");
+
+    // No denominator is stated as absence, never invented.
+    let (bare, over) = resource_line(&all, None).unwrap();
+    assert_eq!(bare, "2 agents · 0.5 GB resident");
+    assert!(!over, "without a machine size there is no ratio to warn about");
+
+    // Nothing live that reports memory ⇒ no line at all. A "0.0 GB" over
+    // a running agent would be a lie; silence is the honest shape.
+    assert!(resource_line(&[dead.clone(), unprobed.clone()], Some(32 * GB)).is_none());
+    assert!(resource_line(&[], Some(32 * GB)).is_none());
+
+    // Now through the shell.
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![dead.clone(), unprobed.clone()]);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-resource"),
+        "nothing live reports memory — the rail must state nothing rather \
+         than a zero"
+    );
+
+    h.plumbing.push_rail(all.clone());
+    vcx.run_until_parked();
+    let bounds = vcx
+        .debug_bounds("rail-resource")
+        .expect("the aggregate fact renders once a live agent reports");
+
+    // The fact must fit the room it renders in, at REAL metrics (Stage J
+    // amendment 1). Room is the element's box minus its own horizontal
+    // padding — measuring the padded box would flatter the fit.
+    let room = bounds.size.width - px(theme::SPACE_3 * 2.);
+    // Worst case that can actually appear here: a big fleet, a big
+    // machine, and every number at its widest.
+    let fleet: Vec<eave_wire::SessionInfo> = (0..30)
+        .map(|i| {
+            let mut s = session(&format!("ffff{i:04}"));
+            s.live = true;
+            s.rss_bytes = Some(4 * GB);
+            s
+        })
+        .collect();
+    let (widest, _) = resource_line(&fleet, Some(512 * GB)).unwrap();
+    assert_eq!(widest, "30 agents · 120.0 GB of 512.0 GB");
+    for line in [widest, "2 agents · 0.5 GB of 32.0 GB".to_string()] {
+        let w = real_text_width(&line, ".SystemUIFont", theme::SMALL_SIZE);
+        assert!(
+            w <= room,
+            "the resource fact {line:?} needs {w:?} but the rail gives \
+             {room:?} — a ceiling stated half way is not stated"
+        );
+    }
+}
 
 /// The rail's fact lines are full-width, so the room a fact gets is set
 /// by the layout, not by the glyphs in it. Proven here (two facts of very

@@ -153,6 +153,62 @@ pub fn cpu_time(pid: i32) -> Option<u64> {
     Some(info.pti_total_user + info.pti_total_system)
 }
 
+/// Resident memory held by the process right now, in bytes (Stage L).
+///
+/// The aggregate-resource fact the rail states is built from these: at N
+/// concurrent sessions the ceiling is not eave's own footprint (engine ~8
+/// MB at N=10) but the agents', and a real `claude` runs 200–310 MB each.
+///
+/// Two honest limits, stated wherever this is rendered rather than
+/// papered over:
+/// - This is the **leader** only. Tool children (a `cargo build`, a test
+///   run) are the agent's memory in every sense that matters to the
+///   machine, and are not counted here — a bounded descendant walk per
+///   snapshot is the price of counting them, and v0 does not pay it.
+/// - Resident size double-counts shared pages across processes, so a sum
+///   over sessions is an upper bound on physical pressure, not an exact
+///   figure.
+///
+/// `None` when the process is gone or uninspectable — never a fake zero,
+/// which would read as "this agent costs nothing".
+pub fn resident_bytes(pid: i32) -> Option<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { mem::zeroed() };
+    let size = mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    Some(info.pti_resident_size)
+}
+
+/// Physical memory installed in the machine, in bytes — the denominator
+/// of the aggregate resource fact (Stage L). `None` if the sysctl fails,
+/// in which case the fact states the sum alone and no ratio: a made-up
+/// denominator would be worse than a missing one.
+pub fn physical_memory() -> Option<u64> {
+    let mut out: u64 = 0;
+    let mut len = mem::size_of::<u64>();
+    let name = c"hw.memsize";
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut out as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && out > 0).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +236,41 @@ mod tests {
         let mut child = child;
         child.wait().expect("reap");
         assert_eq!(pid_state(pid), PidState::Gone);
+    }
+
+    /// The aggregate resource fact is only worth rendering if the number
+    /// under it is real. Our own process holds a non-trivial resident set
+    /// and a reaped pid holds none — `None`, never a fake zero.
+    #[test]
+    fn resident_bytes_reads_a_live_process_and_refuses_a_dead_one() {
+        let pid = std::process::id() as i32;
+        let rss = resident_bytes(pid).expect("own resident size");
+        assert!(
+            rss > 1_000_000,
+            "a running test binary holds more than a megabyte; got {rss}"
+        );
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let dead = child.id() as i32;
+        child.wait().expect("reap");
+        assert_eq!(
+            resident_bytes(dead),
+            None,
+            "a reaped pid must report nothing — a zero would render as \
+             'this agent costs nothing'"
+        );
+    }
+
+    /// The denominator. If this ever returns `None` on a real Mac the
+    /// fact degrades to a bare sum, which is the intended fallback.
+    #[test]
+    fn physical_memory_is_a_plausible_machine_size() {
+        let bytes = physical_memory().expect("hw.memsize on macOS");
+        assert!(
+            bytes >= 1 << 30,
+            "at least a gigabyte installed; got {bytes}"
+        );
     }
 
     #[test]

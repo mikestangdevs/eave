@@ -642,6 +642,64 @@ async fn crash_orphan_is_redetected_with_dirty_count() {
     );
 }
 
+/// Stage L: the startup sweep has always found worktrees no session
+/// claims and has always left them alone — correctly — but it said so
+/// only on engine stderr, where nothing reads it. Now it also writes a
+/// file in the data dir, and **removes that file** when the sweep is
+/// clean, so the report can never outlive the thing it reports.
+#[tokio::test]
+async fn an_unclaimed_worktree_is_stated_where_it_can_be_found() {
+    let dir = scratch();
+    let wtroot = scratch();
+    let wtroot_s = wtroot.display().to_string();
+    let report = dir.join("unclaimed-worktrees.txt");
+
+    // A directory under the worktrees root that no session will ever own
+    // — the shape a crashed `isolate` or a hand-deleted session dir
+    // leaves behind.
+    let orphan = wtroot.join("somerepo").join("dead0000");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("precious.txt"), "not yours to delete\n").unwrap();
+
+    {
+        let _engine =
+            EngineProc::spawn_with_env(&dir, "linger", &[("EAVE_WORKTREES_DIR", &wtroot_s)]);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !report.exists() {
+            assert!(Instant::now() < deadline, "the sweep never stated its finding");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let body = std::fs::read_to_string(&report).unwrap();
+        let canon = std::fs::canonicalize(&orphan).unwrap();
+        assert!(
+            body.contains(&canon.display().to_string()),
+            "the report must name the directory; got:\n{body}"
+        );
+        assert!(
+            body.contains("git worktree prune"),
+            "and must say what to do about it, since eave will not: {body}"
+        );
+        assert!(
+            orphan.join("precious.txt").exists(),
+            "stating is not touching — the sweep must never delete"
+        );
+    }
+
+    // Clean the orphan up the way an operator would, restart, and the
+    // report must be GONE rather than left standing as a stale list.
+    std::fs::remove_dir_all(wtroot.join("somerepo")).unwrap();
+    let _engine2 = EngineProc::spawn_with_env(&dir, "linger", &[("EAVE_WORKTREES_DIR", &wtroot_s)]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while report.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "a clean sweep left a stale report behind — it would send \
+             someone looking for a directory that no longer exists"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider cwd: the agent spawns (and respawns via --resume) in the worktree
 
