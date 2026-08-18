@@ -173,6 +173,13 @@ fn glass_tint(hex: u32) -> Hsla {
 pub fn chrome_glass() -> Hsla {
     glass_tint(0x141414)
 }
+/// The ↓-bottom pill under the pointer: the same glass, one step
+/// lighter. Alpha is unchanged — the pill's whole job is to occlude the
+/// log scrolling behind it, and a hover that thinned it would undo that
+/// (Slice M).
+pub fn chrome_glass_hover() -> Hsla {
+    glass_tint(0x232323)
+}
 /// Attention/connection plates as glass — same hexes as the opaque
 /// plates, same single chrome alpha.
 pub fn warning_plate_glass() -> Hsla {
@@ -214,6 +221,14 @@ pub fn overlay() -> Hsla {
 }
 pub fn overlay_strong() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.09)
+}
+/// One step above [`overlay_strong`], for an element whose RESTING fill
+/// is already `overlay_strong` — the unarmed send button. A hover wash
+/// that composites over a surface is the app's idiom, but an element
+/// with its own `bg` replaces rather than composites, so the few filled
+/// controls need their hovered fill named outright (Slice M).
+pub fn overlay_strongest() -> Hsla {
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.14)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +310,13 @@ pub fn inverse() -> Hsla {
 pub fn on_inverse() -> Hsla {
     rgb(0x17181c).into()
 }
+/// The armed send button under the pointer: the same fill, lifted. The
+/// only direction available — [`inverse`] is already the brightest fill
+/// in the app, so hover goes to white rather than adding a wash that
+/// would darken it (Slice M).
+pub fn inverse_hover() -> Hsla {
+    rgb(0xf4f6f9).into()
+}
 
 // ---------------------------------------------------------------------------
 // State colors — the only saturated pigment in the app
@@ -331,6 +353,12 @@ pub fn danger_wash() -> Hsla {
 }
 pub fn danger_wash_strong() -> Hsla {
     danger().opacity(0.14)
+}
+/// The kill button under the pointer. Its resting fill is already
+/// `danger_wash_strong`, so the hover step is the same pigment again
+/// rather than the neutral wash (Slice M).
+pub fn danger_wash_hover() -> Hsla {
+    danger().opacity(0.24)
 }
 
 /// Attention/connection panels sit at L2: their tint is pre-composited
@@ -576,6 +604,64 @@ pub const COMPOSER_CLEARANCE: f32 = 116.0;
 /// The ↓-bottom pill's rounding (content 26 px tall → full round = 13);
 /// the pill's frost pass must state the radius explicitly.
 pub const RADIUS_PILL: f32 = 13.0;
+
+// ---------------------------------------------------------------------------
+// Scroll-edge fades (Slice M) — the fork's per-primitive `EdgeFade`, the
+// only mechanism that dissolves content over glass (a painted overlay
+// cannot fade anything out when what is behind it is the desktop). See
+// `crate::edge_fade` for the wrapper and comet's two production failure
+// modes.
+//
+// The rule both bands below follow: **the band equals the resting pad on
+// that edge.** Content at rest therefore sits exactly where the ramp
+// reaches full opacity, so nothing fades until it actually scrolls into
+// the chrome — the fade reads as occlusion, never as a dimmed first line.
+// comet learned this the other way round (their sidebar needed the
+// overflow gate because it has no resting top pad).
+
+/// Both rail scrollers, both edges. The rails have no resting top pad, so
+/// this band is gated on the scroll handle's overflow instead — a rail
+/// whose sessions fit shows no ramp at all.
+pub const RAIL_FADE_BAND: f32 = SPACE_6;
+
+/// Transcript, top edge. Deliberately EQUAL to [`LOG_TOP_PAD`], which is
+/// padding on the faded wrapper and therefore inside the faded region:
+/// at scroll-top the first row's edge lands exactly at the end of the
+/// ramp. Change one and change the other.
+pub const TRANSCRIPT_FADE_BAND_TOP: f32 = LOG_TOP_PAD;
+
+/// Transcript, bottom edge. Deliberately EQUAL to [`COMPOSER_CLEARANCE`],
+/// the list's trailing spacer: in Follow the newest row's baseline sits
+/// exactly one clearance above the viewport floor, i.e. exactly at the
+/// end of this ramp, so the resting transcript is fully opaque and only
+/// content scrolled UNDER the floating composer dissolves. Change one and
+/// change the other.
+///
+/// The stack is taller than the clearance while an attention panel or a
+/// connection panel stands; content behind that extra height is faded but
+/// not to zero. That is the same limitation the fixed-height spacer
+/// already has, not a new one.
+pub const TRANSCRIPT_FADE_BAND_BOTTOM: f32 = COMPOSER_CLEARANCE;
+
+// ---------------------------------------------------------------------------
+// Motion (Slice M). eave has exactly one animation — the streaming veil —
+// and this is its curve. There is no per-frame drive anywhere in the app
+// and nothing here schedules one.
+
+/// The veil dissolves as `1 − (1 − t)^EXP`: fast at the start, settling
+/// at the end, so a chunk reaches legibility early and the last 20 % of
+/// the fade is the part you do not notice. gpui's built-in set has no
+/// ease-out below quintic (`ease_out_quint` at exponent 5 snaps), and the
+/// exponent is comet's, chosen against the same problem on the same
+/// mechanism (`markdown/veil.rs`).
+pub const VEIL_EASE_EXPONENT: f32 = 1.6;
+
+/// [`VEIL_EASE_EXPONENT`] as the easing function `Animation::with_easing`
+/// wants. Before Slice M the veil ran on `Animation::new`'s default,
+/// which is `linear`.
+pub fn veil_ease(t: f32) -> f32 {
+    1.0 - (1.0 - t).powf(VEIL_EASE_EXPONENT)
+}
 
 #[cfg(test)]
 mod tests {

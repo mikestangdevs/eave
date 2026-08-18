@@ -23,8 +23,8 @@ use gpui::{
     actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent, Context,
     Corners, Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
-    Pixels, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextRun,
-    TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
+    Pixels, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
+    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowHandle, WindowOptions,
 };
 use gpui::Animation;
@@ -40,6 +40,7 @@ use eave_wire::{
 };
 
 use crate::display::{DisplayList, RowId};
+use crate::edge_fade::edge_faded;
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::theme;
 
@@ -1472,6 +1473,12 @@ struct Shell {
     /// Whether the friction log's path has been stated in the footer yet
     /// this run (Stage L).
     friction_path_stated: bool,
+    /// The rails' scroll offsets (Slice M). Held only so the scroll-edge
+    /// fades can read overflow at PAINT time — nothing else reads them,
+    /// and no scroll POSITION is authoritative here (spec 03: the UI
+    /// holds no authoritative state).
+    rail_scroll: ScrollHandle,
+    files_scroll: ScrollHandle,
 }
 
 /// The data dir this process is running against, recorded by [`run`] so
@@ -1787,6 +1794,7 @@ impl Shell {
                     .mr_2()
                     .rounded(px(theme::RADIUS_BUTTON))
                     .hover(|s| s.bg(theme::overlay()))
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sessions.update(cx, |s, cx| {
                             s.collapsed = !s.collapsed;
@@ -1834,6 +1842,7 @@ impl Shell {
                     .mr_2()
                     .rounded(px(theme::RADIUS_BUTTON))
                     .hover(|s| s.bg(theme::overlay()))
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.files.update(cx, |f, cx| {
                             f.collapsed = !f.collapsed;
@@ -1946,6 +1955,7 @@ impl Shell {
                     .rounded(px(theme::RADIUS_BUTTON))
                     .when(is_sel, |d| d.bg(theme::overlay_strong()))
                     .when(!is_sel, |d| d.hover(|s| s.bg(theme::overlay())))
+                    .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, _| {
                         let _ = this.commands.send(Command::Select(sid.clone()));
                     }))
@@ -2090,6 +2100,7 @@ impl Shell {
                                             .line_height(px(theme::SMALL_LINE))
                                             .text_color(theme::text_secondary())
                                             .hover(|s| s.bg(theme::overlay()))
+                                            .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 // An affordance acts on the
                                                 // row; it does not select it
@@ -2120,6 +2131,7 @@ impl Shell {
                                             .line_height(px(theme::SMALL_LINE))
                                             .text_color(theme::text_secondary())
                                             .hover(|s| s.bg(theme::overlay()))
+                                            .cursor_pointer()
                                             .on_click(move |_, _, cx| {
                                                 cx.stop_propagation();
                                                 open_in_system(std::path::Path::new(&wt_path));
@@ -2152,6 +2164,7 @@ impl Shell {
                                                 theme::text_secondary()
                                             })
                                             .hover(|s| s.bg(theme::overlay()))
+                                            .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
                                                 let _ = this.commands.send(
@@ -2180,6 +2193,23 @@ impl Shell {
                     .into_any_element()
             })
             .collect();
+        // Slice M (§3.1): an empty rail rendered literally nothing, so a
+        // first run and a rail that failed to load looked identical. One
+        // clause, the fact only — the action is the `+ new` button eight
+        // pixels above it, and restating a visible button is noise.
+        let rows: Vec<AnyElement> = if rows.is_empty() {
+            vec![div()
+                .debug_selector(|| "rail-empty".into())
+                .px(px(theme::SPACE_2))
+                .py(px(theme::SPACE_1))
+                .text_size(px(theme::SMALL_SIZE))
+                .line_height(px(theme::SMALL_LINE))
+                .text_color(theme::text_ghost())
+                .child("no sessions")
+                .into_any_element()]
+        } else {
+            rows
+        };
         // No surface of its own: rail rows sit directly on the glass
         // ground (comet's shell model, 2026-08-17). The content well
         // beside it is the differentiated card; painting the rail would
@@ -2221,25 +2251,40 @@ impl Shell {
                             .line_height(px(theme::SMALL_LINE))
                             .text_color(theme::text_secondary())
                             .hover(|s| s.bg(theme::overlay()))
+                            .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, _| {
                                 let _ = this.commands.send(Command::NewSession);
                             }))
                             .child("+ new"),
                     ),
             )
+            // Slice M: rows dissolve at the scroller's edges instead of
+            // ending on a hard cut. The rail paints no surface of its
+            // own, so there is nothing to cut against BUT the desktop
+            // showing through the glass — which is exactly the case a
+            // painted gradient cannot handle and `EdgeFade` can. Gated on
+            // overflow (the rail has no resting top pad), so a rail whose
+            // sessions all fit looks exactly as it did before.
             .child(
-                div()
-                    .id("rail-rows")
-                    .debug_selector(|| "rail-rows".into())
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .px(px(theme::SPACE_2))
-                    .pb(px(theme::SPACE_2))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACE_1))
-                    .children(rows),
+                edge_faded(
+                    theme::RAIL_FADE_BAND,
+                    true,
+                    true,
+                    div()
+                        .id("rail-rows")
+                        .debug_selector(|| "rail-rows".into())
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.rail_scroll)
+                        .px(px(theme::SPACE_2))
+                        .pb(px(theme::SPACE_2))
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme::SPACE_1))
+                        .children(rows),
+                )
+                .fade_overflow_y(&self.rail_scroll),
             )
             // Stage L: the aggregate resource fact, under the list it
             // aggregates and outside the scroller — a ceiling the
@@ -2386,16 +2431,24 @@ impl Shell {
                             .child(SharedString::from(n.to_string()))
                     })),
             )
+            // Slice M: same edge fade as the session rail, same reason.
             .child(
-                div()
-                    .id("files-rows")
-                    .debug_selector(|| "files-rows".into())
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .px(px(theme::SPACE_2))
-                    .pb(px(theme::SPACE_2))
-                    .child(body),
+                edge_faded(
+                    theme::RAIL_FADE_BAND,
+                    true,
+                    true,
+                    div()
+                        .id("files-rows")
+                        .debug_selector(|| "files-rows".into())
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.files_scroll)
+                        .px(px(theme::SPACE_2))
+                        .pb(px(theme::SPACE_2))
+                        .child(body),
+                )
+                .fade_overflow_y(&self.files_scroll),
             )
             .children(mode.map(|text| {
                 div()
@@ -2435,6 +2488,7 @@ impl Shell {
             .rounded(px(theme::RADIUS_BUTTON))
             .when(expanded, |d| d.bg(theme::overlay()))
             .when(!expanded, |d| d.hover(|s| s.bg(theme::overlay())))
+            .cursor_pointer()
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 if ev.modifiers().platform {
                     if status != FileStatus::Deleted {
@@ -2829,6 +2883,12 @@ impl Shell {
                     .text_color(theme::danger())
                     .id("attn-kill")
                     .debug_selector(|| "attn-kill".into())
+                    // Slice M (§2.2). Its resting fill is already a
+                    // danger wash, so the hover step is more of the same
+                    // pigment rather than the neutral overlay every
+                    // unfilled affordance uses.
+                    .hover(|s| s.bg(theme::danger_wash_hover()))
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, _| {
                         let _ = this.commands.send(Command::Kill);
                     }))
@@ -3185,6 +3245,12 @@ impl Shell {
                 let rid = rid.clone();
                 move || format!("{}-{rid}", if allow { "approve" } else { "deny" })
             })
+            // Slice M (§2.2). The neutral wash, not the button's own
+            // pigment: approve and deny are the two most consequential
+            // clicks in the app, and hover must say "the pointer is
+            // here" without ever reading as "this one is chosen".
+            .hover(|s| s.bg(theme::overlay()))
+            .cursor_pointer()
             .on_click(move |_, _, cx| {
                 let message = if allow {
                     String::new()
@@ -3299,8 +3365,27 @@ impl Shell {
                 let el: AnyElement = match veil {
                     Some(v) => block_el
                         .with_animation(
+                            // The id carries a generation counter for a
+                            // reason: `with_animation`'s clock is keyed by
+                            // the element-id PATH and replays from t=0 on
+                            // remount, so a veil whose id did not change
+                            // per burst would restart on every re-render.
                             ("veil", ((id.msg as u64) << 32) | (v.generation & 0xffff_ffff)),
-                            Animation::new(v.duration),
+                            // Slice M (§1.21): the curve, not the
+                            // multi-chunk rewrite. `Animation::new`
+                            // defaults to LINEAR, which put the fade's
+                            // slowest-reading stretch at the end, where
+                            // the text is already legible; an ease-out
+                            // moves it to where it is not noticed.
+                            //
+                            // This element is also the whole of eave's
+                            // reduced-motion story (§1.22):
+                            // `with_animation` honours `App::reduce_motion`
+                            // itself — a oneshot renders its END state and
+                            // schedules no frames, i.e. alpha 1.0, i.e.
+                            // text that simply appears. The flag it reads
+                            // is set in `bootstrap`.
+                            Animation::new(v.duration).with_easing(theme::veil_ease),
                             |mut el, t| {
                                 el.alpha = t;
                                 el
@@ -3407,6 +3492,29 @@ impl Render for Shell {
             .transcript
             .pending_approvals()
             .count();
+        // Slice M (§3.2): what an empty log actually means. Three cases,
+        // and only two of them are facts this shell can back.
+        //   - nothing subscribed -> "no session selected"
+        //   - subscribed, and the engine's own count says the journal is
+        //     empty (last_seq 0) -> "nothing sent yet"
+        //   - subscribed, journal NOT empty, rows not here yet -> the
+        //     replay is still in flight. That is a LOADING state, and
+        //     Slice M builds no loaders; "nothing sent yet" over a session
+        //     with 200 messages would be a lie for the length of a round
+        //     trip, so this says nothing at all, exactly as before.
+        let empty_note: Option<&'static str> = if !state.display.is_empty() {
+            None
+        } else if let Some(sid) = state.session_id.as_deref() {
+            self.sessions
+                .read(cx)
+                .sessions
+                .iter()
+                .find(|s| s.session_id == sid)
+                .filter(|s| s.last_seq == 0)
+                .map(|_| "nothing sent yet")
+        } else {
+            Some("no session selected")
+        };
 
         let transcript_el = list(list_state, move |ix, _window, cx| {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix))
@@ -3499,6 +3607,17 @@ impl Render for Shell {
                                 })
                                 .id("send")
                     .debug_selector(|| "send".into())
+                                // Slice M (§2.2). A filled control REPLACES its bg
+                                // rather than compositing a wash over it, so both
+                                // states have to name a hovered fill.
+                                .hover(move |s| {
+                                    s.bg(if has_draft {
+                                        theme::inverse_hover()
+                                    } else {
+                                        theme::overlay_strongest()
+                                    })
+                                })
+                                .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.send_current(cx);
                                 }))
@@ -3568,8 +3687,57 @@ impl Render for Shell {
                                     .flex_1()
                                     .min_h(px(0.))
                                     .relative()
-                                    .pt(px(theme::LOG_TOP_PAD))
-                                    .child(transcript_el)
+                                    // Slice M: the log dissolves into the
+                                    // well's edges instead of ending on a
+                                    // hard cut. LOG_TOP_PAD moved INSIDE
+                                    // the faded wrapper on purpose — it
+                                    // is the resting pad the top band is
+                                    // sized to (TRANSCRIPT_FADE_BAND_TOP),
+                                    // so scroll-top stays fully opaque and
+                                    // only content actually scrolling away
+                                    // fades. Not gated on scroll state:
+                                    // comet gated theirs and got a report
+                                    // of the top staying unfaded for one
+                                    // frame on every session switch. The
+                                    // floating chrome below is a SIBLING,
+                                    // outside the scope — the pill and the
+                                    // composer must not fade along with
+                                    // the content they occlude.
+                                    .child(
+                                        edge_faded(
+                                            theme::TRANSCRIPT_FADE_BAND_TOP,
+                                            true,
+                                            true,
+                                            div()
+                                                .size_full()
+                                                .pt(px(theme::LOG_TOP_PAD))
+                                                .child(transcript_el),
+                                        )
+                                        .band_top(theme::TRANSCRIPT_FADE_BAND_TOP)
+                                        .band_bottom(theme::TRANSCRIPT_FADE_BAND_BOTTOM),
+                                    )
+                                    // Slice M (§3.2): an overlay, so it is
+                                    // outside both the fade scope and the
+                                    // virtualized list and can never touch
+                                    // a row height. Held above the
+                                    // composer's clearance so it is never
+                                    // read through the frost.
+                                    .children(empty_note.map(|note| {
+                                        div()
+                                            .debug_selector(|| "transcript-empty".into())
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .right_0()
+                                            .bottom(px(theme::COMPOSER_CLEARANCE))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(px(theme::SMALL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(theme::text_ghost())
+                                            .child(note)
+                                    }))
                                     .when(show_affordance, |d| {
                                         d.child(
                                             div()
@@ -3595,6 +3763,15 @@ impl Render for Shell {
                                                         .text_color(theme::text_secondary())
                                                         .id("to-bottom")
                     .debug_selector(|| "to-bottom".into())
+                                                        // Slice M (§2.2). Same alpha,
+                                                        // lighter tint — the pill's job
+                                                        // is to occlude the log behind
+                                                        // it, and a thinner hover would
+                                                        // undo that.
+                                                        .hover(|s| {
+                                                            s.bg(theme::chrome_glass_hover())
+                                                        })
+                                                        .cursor_pointer()
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.transcript.update(cx, |t, cx| {
                                                                 t.scroll = ScrollMode::Follow;
@@ -3776,6 +3953,113 @@ struct Feed {
     cmd_tx: tokio_mpsc::UnboundedSender<Command>,
 }
 
+/// Whether the operator has asked for less motion (Slice M, §1.22).
+///
+/// `EAVE_REDUCE_MOTION` wins when set (`1`/`true` on, anything else off).
+/// It exists because the OS setting is not something a test — or a
+/// verification pass — can toggle, and a preference with no way to
+/// exercise its other branch is a preference nobody has ever seen work.
+///
+/// Otherwise macOS's own accessibility preference (System Settings →
+/// Accessibility → Display → Reduce motion), which lives in the
+/// `com.apple.universalaccess` domain. gpui reads this NOWHERE: at our
+/// pin, `App::reduce_motion` defaults to false and the only production
+/// caller of `set_reduce_motion` in the whole tree is Zed setting it from
+/// its own settings file. So honouring the system preference means eave
+/// reading it, or it is not honoured at all.
+///
+/// Read ONCE, at boot: `cfprefsd` caches per process, so a change made
+/// while eave is running takes effect on relaunch. Stated rather than
+/// papered over with a polling timer — a polling timer is exactly the
+/// per-frame machinery this slice does not build.
+fn reduce_motion_preference() -> bool {
+    if let Some(forced) = reduce_motion_override(std::env::var("EAVE_REDUCE_MOTION").ok().as_deref())
+    {
+        return forced;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_reduce_motion().unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// The env half of [`reduce_motion_preference`], split out as a pure
+/// function so both branches are tested without touching process env
+/// (same reason `resolve_friction_log` is pure).
+fn reduce_motion_override(var: Option<&str>) -> Option<bool> {
+    var.map(|v| matches!(v, "1" | "true"))
+}
+
+/// `CFPreferencesCopyAppValue("reduceMotion", "com.apple.universalaccess")`.
+///
+/// `None` means the key is absent or is not a boolean — which is the
+/// normal state of a machine where the operator has never touched the
+/// setting, not an error worth reporting.
+#[cfg(target_os = "macos")]
+fn macos_reduce_motion() -> Option<bool> {
+    use std::ffi::c_void;
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithBytes(
+            alloc: CFTypeRef,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CFTypeRef;
+        fn CFPreferencesCopyAppValue(key: CFTypeRef, application_id: CFTypeRef) -> CFTypeRef;
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    /// `kCFStringEncodingUTF8`.
+    const UTF8: u32 = 0x0800_0100;
+
+    // SAFETY: every pointer below is either null-checked before use or
+    // came from a Create/Copy call whose ownership we then release. No
+    // pointer outlives this function.
+    unsafe {
+        let mk = |s: &str| -> CFTypeRef {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                s.len() as isize,
+                UTF8,
+                0,
+            )
+        };
+        let key = mk("reduceMotion");
+        let domain = mk("com.apple.universalaccess");
+        if key.is_null() || domain.is_null() {
+            if !key.is_null() {
+                CFRelease(key);
+            }
+            if !domain.is_null() {
+                CFRelease(domain);
+            }
+            return None;
+        }
+        let value = CFPreferencesCopyAppValue(key, domain);
+        CFRelease(key);
+        CFRelease(domain);
+        if value.is_null() {
+            return None;
+        }
+        let out = (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
+        CFRelease(value);
+        out
+    }
+}
+
 /// Everything downstream of the feed — entities, elapsed ticker, pump,
 /// window, Shell — shared verbatim by `run()` and the harness tests:
 /// production and tests walk one spine (stage J).
@@ -3795,6 +4079,14 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         KeyBinding::new("cmd-shift-d", DenyOldest, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+
+    // Slice M (§1.22): honoured for the one animation eave has. gpui
+    // applies this inside `with_animation` itself — a oneshot renders its
+    // end state and schedules no frames — so the veil becomes "the text
+    // is simply there", which is the correct reduced form of a fade.
+    // Set here rather than in `run` so the harness boots the same wiring
+    // production does (Stage J).
+    cx.set_reduce_motion(reduce_motion_preference());
 
     let conn = cx.new(|_| ConnectionState {
         status: ConnEvent::Connecting,
@@ -4061,6 +4353,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     friction: None,
                     friction_gen: 0,
                     friction_path_stated: false,
+                    rail_scroll: ScrollHandle::new(),
+                    files_scroll: ScrollHandle::new(),
                 }
             });
             let handle = shell.read(cx).focus.clone();
@@ -4117,6 +4411,53 @@ mod harness;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slice M (§1.21). The veil's curve is an ease-OUT: it must reach
+    /// the endpoints exactly (a fade that never quite finishes leaves
+    /// permanently dimmed text) and be ahead of linear everywhere in
+    /// between, which is the whole difference from the default it
+    /// replaced.
+    #[test]
+    fn the_veil_curve_is_an_ease_out_that_still_lands_on_its_endpoints() {
+        assert_eq!(theme::veil_ease(0.0), 0.0);
+        assert_eq!(theme::veil_ease(1.0), 1.0);
+        let mut prev = 0.0;
+        for i in 1..=99 {
+            let t = i as f32 / 100.0;
+            let v = theme::veil_ease(t);
+            assert!(v > prev, "must be monotonic at t={t}");
+            assert!(v > t, "must lead linear at t={t} (got {v})");
+            assert!(v <= 1.0);
+            prev = v;
+        }
+    }
+
+    /// Slice M (§1.22). The override is what makes reduced motion
+    /// verifiable at all — the OS setting is not something a test run can
+    /// toggle. Anything that is not an explicit yes is a no, so a stray
+    /// `EAVE_REDUCE_MOTION=maybe` cannot silently disable the one
+    /// animation in the app.
+    #[test]
+    fn the_reduced_motion_override_only_answers_when_it_was_asked() {
+        assert_eq!(reduce_motion_override(None), None);
+        assert_eq!(reduce_motion_override(Some("1")), Some(true));
+        assert_eq!(reduce_motion_override(Some("true")), Some(true));
+        assert_eq!(reduce_motion_override(Some("0")), Some(false));
+        assert_eq!(reduce_motion_override(Some("")), Some(false));
+        assert_eq!(reduce_motion_override(Some("maybe")), Some(false));
+    }
+
+    /// The CoreFoundation read is the only unsafe block in the app, and
+    /// the failure it could have is not a wrong answer but an abort. This
+    /// exercises it against the running machine's real preference domain:
+    /// absent (`None`) is the normal state of a Mac whose owner has never
+    /// opened that settings pane, and is not a failure.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reading_the_system_reduced_motion_preference_does_not_abort() {
+        let seen = macos_reduce_motion();
+        assert!(matches!(seen, None | Some(true) | Some(false)));
+    }
 
     #[test]
     fn provider_identity_is_uniform_and_never_a_mark() {

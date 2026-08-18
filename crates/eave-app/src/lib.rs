@@ -3,6 +3,11 @@
 //! runs headless against the captured real-agent fixture; `ui` is the GPUI
 //! shell consuming it.
 
+/// The fork's `EdgeFade` scope, wrapped as an element (Slice M). Private:
+/// it is a render-path detail of `ui`, not part of the headless surface
+/// the acceptance runs use.
+mod edge_fade;
+
 pub mod display;
 pub mod fixture;
 pub mod markdown;

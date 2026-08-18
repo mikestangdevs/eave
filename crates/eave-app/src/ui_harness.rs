@@ -50,6 +50,13 @@ fn boot(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext) {
             },
         )
     });
+    // Slice M: `bootstrap` reads the MACHINE's reduced-motion preference,
+    // which a test must never inherit — the developer's accessibility
+    // setting would otherwise decide whether the veil animates, and the
+    // suite would behave differently on two Macs. Pinned to the
+    // full-motion path here; `reduce_motion_override` covers the other
+    // branch as a pure function.
+    cx.update(|cx| cx.set_reduce_motion(false));
     let vcx = VisualTestContext::from_window(window.into(), cx).into_mut();
     vcx.run_until_parked();
     (
@@ -1253,4 +1260,161 @@ fn the_notice_never_stands_on_top_of_the_question_it_points_at(cx: &mut TestAppC
         })
         .unwrap();
     assert!(notice_stands, "the notice itself still stands");
+}
+
+// ---------------------------------------------------------------------------
+// Slice M — polish pass one: empty states, and the invariant behind hover
+// and cursor coverage.
+
+/// An empty rail used to render literally nothing, which made "you have
+/// never started a session" and "the rail failed to load" the same
+/// picture. It states the fact now, and stops the moment there is a row
+/// to show instead.
+#[gpui::test]
+fn an_empty_rail_says_it_is_empty_instead_of_showing_bare_glass(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(Vec::new());
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "rail-empty"),
+        "an empty rail must state that it is empty"
+    );
+    // The affordance that answers it is still there — which is why the
+    // note itself does not restate it.
+    assert!(shown(vcx, "new-session"));
+
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-empty") && shown(vcx, "rail-aaaa1111"),
+        "one real session replaces the note, it does not sit above it"
+    );
+}
+
+/// An empty log is three different situations and the shell may only
+/// claim the two it can back. The third — a session whose journal the
+/// engine says is NOT empty, whose rows have not arrived yet — is a
+/// loading state, and stating "nothing sent yet" over a session with
+/// history would be a lie for the length of a round trip.
+#[gpui::test]
+fn an_empty_log_states_only_the_kind_of_empty_it_can_prove(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+
+    // Nothing subscribed at all.
+    assert!(
+        shown(vcx, "transcript-empty"),
+        "with no session selected the well must say so"
+    );
+
+    // Subscribed, and the engine's own count says the journal is empty.
+    let mut fresh = session("aaaa1111");
+    fresh.last_seq = 0;
+    h.plumbing.push_rail(vec![fresh]);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "transcript-empty"),
+        "a brand-new session states that nothing has been sent"
+    );
+
+    // Subscribed to a session the engine says HAS records, none of which
+    // have arrived. Nothing may be claimed here.
+    let mut loaded = session("bbbb2222");
+    loaded.last_seq = 41;
+    h.plumbing.push_rail(vec![loaded]);
+    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "bbbb2222".into() });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "transcript-empty"),
+        "a journal still in flight is a loading state, not an empty one — \
+         Slice M builds no loaders and must therefore say nothing"
+    );
+
+    // And once the rows land, the note is gone for the ordinary reason.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "bbbb2222".into(),
+        epoch: 1,
+        records: vec![user_record(41, "the history that was in flight")],
+    });
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "transcript-empty"));
+}
+
+/// The empty note is an OVERLAY, never a row. The virtualized list caches
+/// a measure per row, and a row whose height depends on anything but its
+/// own identity and content leaves a stale measure that moves the scroll
+/// anchor (`ui.rs`, `render_row`). An empty state rendered as a row would
+/// be exactly that kind of height, so this pins the item count instead:
+/// an empty log holds the trailing spacer and nothing else.
+#[gpui::test]
+fn the_empty_note_never_becomes_a_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    let items = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).list.item_count()
+        })
+        .unwrap();
+    assert_eq!(
+        items, 1,
+        "an empty log is the trailing under-glass spacer and nothing else"
+    );
+}
+
+/// Every clickable element states that it is clickable, and answers the
+/// pointer.
+///
+/// This is a structural check on the source rather than a rendered one,
+/// and deliberately so: gpui resolves `hover` and `cursor_pointer` inside
+/// its own style pass and exposes neither the computed style nor the
+/// painted scene to a test, so there is nothing to assert against a
+/// frame. What CAN be pinned is the property that actually decays — a
+/// button added later with a handler and no feedback. Before Slice M this
+/// count was 12 against 0.
+#[gpui::test]
+fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
+    let src = include_str!("ui.rs");
+    let clicks = src.matches(".on_click(").count();
+    let cursors = src.matches(".cursor_pointer()").count();
+    assert_eq!(
+        clicks, cursors,
+        "every .on_click site needs a .cursor_pointer — eave had 84 fewer \
+         cursor calls than comet and every one of them was the default arrow"
+    );
+
+    // Hover coverage. Five controls across four sites had a handler and no
+    // feedback of any kind; each site is checked by its own selector so a
+    // regression names the control it broke rather than a number.
+    for (selector, kind) in [
+        ("attn-kill", "danger_wash_hover"),
+        ("send", "inverse_hover"),
+        ("to-bottom", "chrome_glass_hover"),
+    ] {
+        let anchor = format!(r#"debug_selector(|| "{selector}".into())"#);
+        let at = src
+            .find(&anchor)
+            .unwrap_or_else(|| panic!("{selector} is no longer tagged"));
+        let window = &src[at..src.len().min(at + 900)];
+        assert!(
+            window.contains(".hover("),
+            "{selector} lost its hover feedback"
+        );
+        assert!(
+            window.contains(kind),
+            "{selector} should hover to {kind} — a filled control replaces \
+             its bg rather than compositing the neutral wash over it"
+        );
+    }
+    // approve / deny share one builder and one selector expression.
+    let at = src.find("fn decision_button(").expect("decision_button");
+    let window = &src[at..src.len().min(at + 2400)];
+    assert!(
+        window.contains(".hover("),
+        "approve and deny lost their hover feedback"
+    );
 }
