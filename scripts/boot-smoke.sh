@@ -19,8 +19,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SPEED="${1:-30}"
-FIXTURE="fixtures/real-claude-2026-08-16.tap.jsonl"
-[ -f "$FIXTURE" ] || { echo "boot-smoke: missing $FIXTURE" >&2; exit 1; }
+# Two fixtures, both replayed in both modes:
+#   real-claude   — a genuine capture; the pacing and markdown the
+#                   streaming/anchor work was tuned against.
+#   approvals     — SYNTHESISED (Slice K), and labelled so. There is no
+#                   real capture of an approval exchange through eave's
+#                   own wire yet, and fabricating records into the real
+#                   capture would destroy what makes it worth having.
+#                   Its job is the one thing the hermetic harness cannot
+#                   do: render the approval card through Metal, at real
+#                   glyph metrics, and prove the Pending→settled height
+#                   change never moves the scroll anchor.
+FIXTURES=(
+  "fixtures/real-claude-2026-08-16.tap.jsonl"
+  "fixtures/approvals-synthetic.tap.jsonl"
+)
+for f in "${FIXTURES[@]}"; do
+  [ -f "$f" ] || { echo "boot-smoke: missing $f" >&2; exit 1; }
+done
 
 # Never let a smoke run append to the real dogfood log.
 export EAVE_DOGFOOD_LOG="${EAVE_DOGFOOD_LOG:-${TMPDIR:-/tmp}/eave-boot-smoke.md}"
@@ -30,18 +46,20 @@ cargo build --workspace
 fail=0
 for mode in glass opaque; do
   if [ "$mode" = opaque ]; then export EAVE_VIBRANCY=0; else unset EAVE_VIBRANCY; fi
-  echo "── boot smoke: $mode ──"
-  out="$(EAVE_REPLAY="$FIXTURE" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
-         ./target/debug/eave 2>/dev/null | grep REPLAY_ASSERT || true)"
-  echo "${out:-<no assert line — the app did not boot>}"
-  case "$out" in
-    *PASS*) ;;
-    *) fail=1 ;;
-  esac
+  for fixture in "${FIXTURES[@]}"; do
+    echo "── boot smoke: $mode · $(basename "$fixture") ──"
+    out="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
+           ./target/debug/eave 2>/dev/null | grep REPLAY_ASSERT || true)"
+    echo "${out:-<no assert line — the app did not boot>}"
+    case "$out" in
+      *PASS*) ;;
+      *) fail=1 ;;
+    esac
+  done
 done
 
 if [ "$fail" -ne 0 ]; then
   echo "boot-smoke: FAILED" >&2
   exit 1
 fi
-echo "boot-smoke: both modes booted and held anchor"
+echo "boot-smoke: every fixture booted and held anchor in both modes"

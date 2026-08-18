@@ -116,6 +116,7 @@ fn journal_round_trips_records() {
     let written = vec![
         w.append(provider(SessionEvent::Init {
             session_id: "s1".into(),
+            permission_mode: Some("default".into()),
         }))
         .unwrap(),
         w.append(JournalEvent::UserSent { text: "hi".into() }).unwrap(),
@@ -354,6 +355,7 @@ fn crash_tail_repair_settles_open_turn_as_interrupted() {
     let mut w = JournalWriter::create(&path, &test_header("s1")).unwrap();
     w.append(provider(SessionEvent::Init {
         session_id: "s1".into(),
+        permission_mode: Some("default".into()),
     }))
     .unwrap();
     w.append(JournalEvent::UserSent {

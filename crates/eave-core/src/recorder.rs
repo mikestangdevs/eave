@@ -93,7 +93,7 @@ pub async fn record_session(
                         return Ok(outcome);
                     }
                     ev => {
-                        if let SessionEvent::Init { session_id } = &ev {
+                        if let SessionEvent::Init { session_id, .. } = &ev {
                             meta.session_id = session_id.clone();
                             meta.save(&session_dir)?;
                         }

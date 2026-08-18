@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use eave_wire::model::{Delivery, Row, ToolStatus, Transcript};
+use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
 
 use crate::markdown::{split_blocks, Block};
 
@@ -127,6 +127,37 @@ fn msg_content_hash(row: &Row) -> u64 {
             fnv1a_more(fnv1a_more(fnv1a(&[2, tag]), id.as_bytes()), name.as_bytes())
         }
         Row::Marker { text } => fnv1a_more(fnv1a(&[3]), text.as_bytes()),
+        // Slice K: the status is part of the content — an answered card
+        // must re-render, and a still-pending one must not.
+        Row::Approval {
+            request_id,
+            tool,
+            description,
+            path,
+            input_json,
+            status,
+        } => {
+            let tag: u8 = match status {
+                ApprovalStatus::Pending => 1,
+                ApprovalStatus::Approved => 2,
+                ApprovalStatus::Denied { .. } => 3,
+                ApprovalStatus::Withdrawn { .. } => 4,
+            };
+            let mut h = fnv1a(&[4, tag]);
+            for part in [
+                request_id.as_str(),
+                tool.as_str(),
+                description.as_str(),
+                path.as_deref().unwrap_or(""),
+                input_json.as_str(),
+            ] {
+                h = fnv1a_more(h, part.as_bytes());
+            }
+            if let ApprovalStatus::Denied { message } = status {
+                h = fnv1a_more(h, message.as_bytes());
+            }
+            h
+        }
     }
 }
 

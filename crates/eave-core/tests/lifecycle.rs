@@ -75,7 +75,7 @@ async fn normal_turn_streams_events_and_exits_cleanly() {
     // live 2026-08-15): the caller-chosen id round-trips through Init.
     assert!(matches!(
         &events[0],
-        SessionEvent::Init { session_id } if *session_id == cfg.session_id
+        SessionEvent::Init { session_id, .. } if *session_id == cfg.session_id
     ));
     assert_eq!(
         session.provider_session_id().as_deref(),

@@ -4,8 +4,17 @@
 //! Flag set follows the proven native path in waku
 //! (waku-core/src/driver/claude.rs, research: waku.md §2), including the
 //! caller-chosen `--session-id` so the resume cursor exists before the
-//! first turn. v0 permission posture is `acceptEdits`
-//! (spec 04 §Permissions — dev-loop only, blocked for any public build).
+//! first turn.
+//!
+//! Permission posture (Slice K): the CLI is spawned with
+//! `--permission-prompt-tool stdio` and **no** `--permission-mode`, which
+//! is the only combination that makes it ASK. Dropping the flag entirely
+//! does not produce a prompt — it produces a silent auto-deny
+//! (`system/permission_denied`, capture A, 2026-08-18); `--permission-mode
+//! acceptEdits` produces zero questions at all (capture H). Because the
+//! flag is undocumented in `--help` for 2.1.226, the posture is VERIFIED
+//! from the CLI's own `init.permissionMode` rather than assumed, and a
+//! session that cannot prove it asks is refused (spec 04 §Permissions).
 
 use std::collections::VecDeque;
 use std::os::unix::process::ExitStatusExt;
@@ -22,7 +31,9 @@ use tokio::sync::{mpsc, watch};
 use crate::events::SessionEvent;
 use crate::proc::{self, ProcIdentity};
 use crate::process;
-use crate::session::{AgentSession, KillReport, SessionError, SessionWatch, SpawnConfig};
+use crate::session::{
+    AgentSession, ApprovalDecision, KillReport, SessionError, SessionWatch, SpawnConfig,
+};
 use crate::stream::ClaudeStream;
 use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
 
@@ -34,16 +45,26 @@ type ExitFacts = (Option<i32>, Option<i32>);
 struct Shared {
     stream: Mutex<ClaudeStream>,
     last_activity: Mutex<Instant>,
+    /// The CLI announced itself at least once. A process that dies without
+    /// this never got far enough to state its posture — Slice K's
+    /// flag-rejected case (spec 04 §Permissions).
+    saw_init: AtomicBool,
     /// Set at kill initiation; the reader drops all protocol input from then
     /// on — descendants holding inherited pipes may emit stale lines after
     /// the leader dies (spec 01 §Kill; research: bb.md pain points).
     kill_initiated: AtomicBool,
 }
 
+type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
+
 pub struct ClaudeCodeSession {
     identity: ProcIdentity,
     pgid: i32,
-    stdin: Option<ChildStdin>,
+    /// Shared because two writers exist (Slice K): the engine answering an
+    /// approval, and the reader task auto-refusing a dialog the moment one
+    /// arrives. Serialized by the mutex — a control frame can never
+    /// interleave with a user message mid-line.
+    stdin: SharedStdin,
     shared: Arc<Shared>,
     exit_rx: watch::Receiver<Option<ExitFacts>>,
     /// OS-fact flags for the attention monitor (spec 01 `failed`): stdout
@@ -70,8 +91,11 @@ impl ClaudeCodeSession {
                 "--verbose",
                 "--include-partial-messages",
                 "--replay-user-messages",
-                "--permission-mode",
-                "acceptEdits",
+                // Slice K: route permission questions to us on stdout
+                // instead of auto-denying them. Undocumented but accepted
+                // (2.1.226); its absence is caught below, never ignored.
+                "--permission-prompt-tool",
+                "stdio",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -122,13 +146,14 @@ impl ClaudeCodeSession {
             },
         };
 
-        let stdin = child.stdin.take();
+        let stdin: SharedStdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take()));
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
         let shared = Arc::new(Shared {
             stream: Mutex::new(ClaudeStream::new()),
             last_activity: Mutex::new(Instant::now()),
+            saw_init: AtomicBool::new(false),
             kill_initiated: AtomicBool::new(false),
         });
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
@@ -140,6 +165,7 @@ impl ClaudeCodeSession {
         let reader_shared = Arc::clone(&shared);
         let reader_tx = events_tx.clone();
         let reader_eof = Arc::clone(&stdout_eof);
+        let reader_stdin = Arc::clone(&stdin);
         let stdout_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -149,6 +175,24 @@ impl ClaudeCodeSession {
                 }
                 let events = reader_shared.stream.lock().unwrap().parse_line(&line);
                 for event in events {
+                    // Slice K amendment 1: the posture is verified, never
+                    // assumed. A CLI that reports a mode which does not ask
+                    // is refused here, at the first frame it sends.
+                    if let SessionEvent::Init { permission_mode, .. } = &event {
+                        reader_shared.saw_init.store(true, Ordering::SeqCst);
+                        if let Some(refusal) = posture_refusal(permission_mode.as_deref()) {
+                            let _ = reader_tx.send(event).await;
+                            let _ = reader_tx.send(refusal).await;
+                            continue;
+                        }
+                    }
+                    // Slice K amendment 2: a dialog eave cannot present is
+                    // answered with a stated refusal immediately — silence
+                    // would park the session on a question nobody can see.
+                    if let SessionEvent::DialogRefused { request_id, dialog } = &event {
+                        let frame = refusal_frame(request_id, dialog);
+                        write_line(&reader_stdin, &frame).await;
+                    }
                     // Receiver gone just means nobody is listening; keep
                     // draining so the child never blocks on a full pipe.
                     let _ = reader_tx.send(event).await;
@@ -181,6 +225,7 @@ impl ClaudeCodeSession {
         // Supervisor: reap the leader, drain both readers, then emit the
         // terminal Exited event and publish the exit facts.
         let super_exited = Arc::clone(&exited_flag);
+        let super_shared = Arc::clone(&shared);
         tokio::spawn(async move {
             let status = child.wait().await;
             // Set before draining the readers so a monitor tick between
@@ -196,6 +241,25 @@ impl ClaudeCodeSession {
                 let mut ring = ring.lock().unwrap();
                 String::from_utf8_lossy(ring.make_contiguous()).into_owned()
             };
+            // Slice K amendment 1, the flag-rejected case: a CLI that
+            // never announced itself and complained about the permission
+            // flag on stderr could not have asked us anything. State it as
+            // a refusal so the transcript says WHY, instead of leaving a
+            // bare non-zero exit for the operator to decode.
+            if !super_shared.saw_init.load(Ordering::SeqCst)
+                && stderr_tail.contains("permission-prompt-tool")
+            {
+                let _ = events_tx
+                    .send(SessionEvent::PostureRefused {
+                        mode: "unknown".into(),
+                        reason:
+                            "the agent CLI rejected --permission-prompt-tool, so eave cannot be \
+                             asked to approve anything; eave will not run a session that writes \
+                             without review"
+                                .into(),
+                    })
+                    .await;
+            }
             let _ = events_tx
                 .send(SessionEvent::Exited {
                     code: facts.0,
@@ -273,7 +337,6 @@ impl AgentSession for ClaudeCodeSession {
     }
 
     async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {
-        let stdin = self.stdin.as_mut().ok_or(SessionError::StdinClosed)?;
         let line = serde_json::json!({
             "type": "user",
             "message": {
@@ -281,11 +344,61 @@ impl AgentSession for ClaudeCodeSession {
                 "content": [{ "type": "text", "text": text }],
             },
         });
-        let mut payload = line.to_string();
-        payload.push('\n');
-        stdin.write_all(payload.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        write_frame(&self.stdin, &line.to_string()).await
+    }
+
+    fn pending_approvals(&self) -> usize {
+        self.shared.stream.lock().unwrap().pending_approvals()
+    }
+
+    /// Answer one permission question (Slice K). The frame names the same
+    /// `request_id` the CLI asked with; the CLI resumes the tool call on
+    /// `allow` and hands the operator's `message` to the model verbatim as
+    /// the tool result on `deny` (capture D, 2026-08-18).
+    ///
+    /// `Ok(false)` means the question was not open — already answered, or
+    /// withdrawn by the provider under the operator's click. That is a
+    /// race, not an error, and it must never reach the pipe: a stale
+    /// decision would be ignored by the CLI and journaled by us as if it
+    /// had landed.
+    async fn respond_to_approval(
+        &mut self,
+        request_id: &str,
+        decision: &ApprovalDecision,
+    ) -> Result<bool, SessionError> {
+        if !self
+            .shared
+            .stream
+            .lock()
+            .unwrap()
+            .approval_is_open(request_id)
+        {
+            return Ok(false);
+        }
+        let response = match decision {
+            ApprovalDecision::Allow => serde_json::json!({ "behavior": "allow" }),
+            ApprovalDecision::Deny { message } => serde_json::json!({
+                "behavior": "deny",
+                "message": message,
+            }),
+        };
+        let frame = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": response,
+            },
+        });
+        write_frame(&self.stdin, &frame.to_string()).await?;
+        // Only now is the question closed: a failed write leaves it open so
+        // the operator can try again rather than facing a dead card.
+        self.shared
+            .stream
+            .lock()
+            .unwrap()
+            .resolve_approval(request_id);
+        Ok(true)
     }
 
     async fn kill(&mut self) -> Result<KillReport, SessionError> {
@@ -342,4 +455,74 @@ impl AgentSession for ClaudeCodeSession {
             Err(SessionError::KillUnproven { remaining: stragglers })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Permission plumbing (Slice K)
+
+/// Modes that provably ASK. Everything else is refused, including a mode
+/// this build has never heard of and a CLI that named none at all: the
+/// question "does this posture review writes?" has no safe default, and a
+/// wrong guess here is unreviewed writes on someone's machine (spec 04
+/// §Permissions, amendment 1).
+///
+/// `default` is the mode you get by passing no `--permission-mode` at all,
+/// and it is the one the capture proves asks. `manual` is accepted on the
+/// command line and the CLI reports it back AS `default` (capture M), so it
+/// is listed for the day that stops being true.
+const ASKING_MODES: [&str; 2] = ["default", "manual"];
+
+fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
+    match mode {
+        Some(m) if ASKING_MODES.contains(&m) => None,
+        Some(m) => Some(SessionEvent::PostureRefused {
+            mode: m.to_string(),
+            reason: format!(
+                "the agent CLI is running in permission mode {m:?}, which never asks \
+                 before it writes; eave refuses to supervise a session it cannot review"
+            ),
+        }),
+        None => Some(SessionEvent::PostureRefused {
+            mode: "unstated".into(),
+            reason: "the agent CLI did not state a permission mode, so eave cannot prove it \
+                     will ask before it writes"
+                .into(),
+        }),
+    }
+}
+
+/// The stated refusal for a dialog request eave cannot present yet
+/// (amendment 2). Answered immediately by the reader task — the model is
+/// told plainly, and the turn continues instead of parking forever.
+fn refusal_frame(request_id: &str, kind: &str) -> String {
+    serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": format!(
+                "eave cannot present {kind} dialogs to the operator yet. Do not retry this \
+                 tool; ask in your reply text instead and the operator will answer there."
+            ),
+        },
+    })
+    .to_string()
+}
+
+/// Write one ndjson frame to the child's stdin under the shared lock.
+async fn write_frame(stdin: &SharedStdin, line: &str) -> Result<(), SessionError> {
+    let mut guard = stdin.lock().await;
+    let pipe = guard.as_mut().ok_or(SessionError::StdinClosed)?;
+    let mut payload = String::with_capacity(line.len() + 1);
+    payload.push_str(line);
+    payload.push('\n');
+    pipe.write_all(payload.as_bytes()).await?;
+    pipe.flush().await?;
+    Ok(())
+}
+
+/// Best-effort write from the reader task, which has no one to report to:
+/// a closed pipe means the child is already going away.
+async fn write_line(stdin: &SharedStdin, line: &str) {
+    let _ = write_frame(stdin, line).await;
 }

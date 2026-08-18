@@ -263,6 +263,25 @@ impl Client {
         .await
     }
 
+    /// Answer one open permission question (Slice K). `Ok(false)` = the
+    /// question was no longer open — already answered, or withdrawn by the
+    /// provider under the operator's click. A race, not an error.
+    pub async fn decide(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: eave_wire::Decision,
+    ) -> Result<bool, ClientError> {
+        Ok(self
+            .request::<eave_wire::DecideOk>(Request::Decide {
+                session_id: session_id.into(),
+                request_id: request_id.into(),
+                decision,
+            })
+            .await?
+            .answered)
+    }
+
     /// Watch the session set (spec 05 §Watch): yields `Sessions` snapshot
     /// frames — one immediately, one on every session-set/state change.
     /// Fold by replacement. Carries no transcript content, ever.

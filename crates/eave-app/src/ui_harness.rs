@@ -77,6 +77,8 @@ fn session(id: &str) -> SessionInfo {
         checkout_root: None,
         shared_with: Vec::new(),
         worktree: None,
+        pending_approvals: 0,
+        permission_mode: None,
     }
 }
 
@@ -759,4 +761,369 @@ fn cmd_clicking_a_changed_file_opens_it_without_launching_anything(cx: &mut Test
     );
     let opened = OPENED.with(|o| o.borrow().clone());
     assert_eq!(opened, vec![PathBuf::from("/tmp/eave-harness/repo/src/lib.rs")]);
+}
+
+// ---------------------------------------------------------------------------
+// Slice K — approvals.
+//
+// Text system: **Noop for every test in this section.** These assert what
+// the shell *emits* (the `Command` stream) and *whether* a card is on
+// screen at all — neither depends on glyph advances, and the elements
+// looked up here are containers whose presence is set by the fold, not by
+// how wide a word shapes. The one Slice K fact whose FIT could be lost to
+// layout is the rail's posture line, and that one is measured with real
+// metrics in `a_posture_that_never_asks_fits_the_rail_at_real_widths`
+// below (amendment 1: the decision is made per test, not once).
+
+/// A journalled permission question, exactly as the adapter produces one.
+fn approval_record(seq: u64, request_id: &str, tool: &str, path: &str) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ApprovalRequested {
+                request_id: request_id.into(),
+                tool: tool.into(),
+                display_name: tool.into(),
+                description: "writes a file".into(),
+                path: Some(path.into()),
+                input_json: format!("{{\"file_path\":\"{path}\",\"content\":\"hi\"}}"),
+                suggestions_json: None,
+            },
+        },
+    }
+}
+
+/// Put one open question on screen in session `aaaa1111`.
+fn ask(h: &Harness, vcx: &mut VisualTestContext, records: Vec<eave_core::journal::Record>) {
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records,
+    });
+    vcx.run_until_parked();
+}
+
+/// The question states what it is asking for, and approving emits exactly
+/// one decision naming the request the operator was looking at.
+#[gpui::test]
+fn approving_states_the_facts_and_answers_that_request(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    ask(&h, vcx, vec![approval_record(1, "req-1", "Write", "/repo/src/main.rs")]);
+    let _ = h.drain();
+
+    assert!(shown(vcx, "approval-req-1"), "the question must be on screen");
+    assert!(
+        shown(vcx, "approval-path-req-1"),
+        "the path it would touch is the fact that most needs stating"
+    );
+    assert!(
+        shown(vcx, "approval-input-req-1"),
+        "the full input is stated, not summarised away"
+    );
+
+    click(vcx, "approve-req-1");
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::Decide { request_id, allow: true, message }]
+                if request_id == "req-1" && message.is_empty()
+        ),
+        "approve must emit exactly one allow for this request, got {cmds:?}"
+    );
+}
+
+/// Denying carries the operator's words — and spends them, so the same
+/// sentence cannot later be sent again as a message.
+#[gpui::test]
+fn denying_carries_the_operators_reason_and_clears_the_composer(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    ask(&h, vcx, vec![approval_record(1, "req-1", "Bash", "/repo/out.txt")]);
+    vcx.simulate_input("commit first");
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    click(vcx, "deny-req-1");
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::Decide { request_id, allow: false, message }]
+                if request_id == "req-1" && message == "commit first"
+        ),
+        "deny must carry the reason verbatim, got {cmds:?}"
+    );
+    let draft = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).composer.read(cx).text.clone()
+        })
+        .unwrap();
+    assert!(
+        draft.is_empty(),
+        "the words were spent on the agent; leaving them would send them twice"
+    );
+
+    // And a plain deny with nothing typed is still a deny.
+    ask(&h, vcx, vec![approval_record(1, "req-2", "Bash", "/repo/out.txt")]);
+    let _ = h.drain();
+    click(vcx, "deny-req-2");
+    assert!(
+        matches!(
+            h.drain().as_slice(),
+            [Command::Decide { allow: false, message, .. }] if message.is_empty()
+        ),
+        "an empty reason is allowed; the engine states the default"
+    );
+}
+
+/// The keyboard answers the OLDEST open question, and it is the same
+/// command the buttons emit — one behavior with two doors.
+#[gpui::test(iterations = 8)]
+fn the_keyboard_answers_the_oldest_open_question(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    ask(
+        &h,
+        vcx,
+        vec![
+            approval_record(1, "req-old", "Write", "/repo/a.txt"),
+            approval_record(2, "req-new", "Bash", "/repo/b.txt"),
+        ],
+    );
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-a");
+    vcx.run_until_parked();
+    assert!(
+        matches!(
+            h.drain().as_slice(),
+            [Command::Decide { request_id, allow: true, .. }] if request_id == "req-old"
+        ),
+        "⇧⌘A must answer the question the operator has been looking at longest"
+    );
+
+    // With the oldest answered, the next keystroke moves to the next one.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![eave_core::journal::Record {
+            seq: 3,
+            ts_ms: 30,
+            event: eave_core::journal::JournalEvent::ApprovalDecided {
+                request_id: "req-old".into(),
+                allowed: true,
+                message: None,
+            },
+        }],
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-shift-d");
+    vcx.run_until_parked();
+    assert!(
+        matches!(
+            h.drain().as_slice(),
+            [Command::Decide { request_id, allow: false, .. }] if request_id == "req-new"
+        ),
+        "⇧⌘D must answer the next open question"
+    );
+}
+
+/// A question that has been answered or withdrawn is no longer askable:
+/// its buttons are gone, and nothing on screen invites a second click.
+#[gpui::test]
+fn a_settled_question_stops_offering_an_answer(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    ask(&h, vcx, vec![approval_record(1, "req-1", "Write", "/repo/a.txt")]);
+    assert!(shown(vcx, "approve-req-1") && shown(vcx, "deny-req-1"));
+
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![eave_core::journal::Record {
+            seq: 2,
+            ts_ms: 20,
+            event: eave_core::journal::JournalEvent::Provider {
+                event: eave_core::events::SessionEvent::ApprovalWithdrawn {
+                    request_id: "req-1".into(),
+                    reason: "the provider withdrew the request".into(),
+                },
+            },
+        }],
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    assert!(
+        shown(vcx, "approval-req-1"),
+        "the question stays in the log — it happened"
+    );
+    assert!(
+        !shown(vcx, "approve-req-1") && !shown(vcx, "deny-req-1"),
+        "but an unanswerable question must not still offer an answer"
+    );
+    assert!(
+        shown(vcx, "approval-status-req-1"),
+        "and it must say what became of it"
+    );
+}
+
+/// A BACKGROUND session waiting on the operator has to be visible in the
+/// rail without switching to it — and the rail may say the count, never
+/// the tool or the path (spec 05 §Watch).
+#[gpui::test]
+fn a_background_session_waiting_on_me_is_visible_in_the_rail(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut selected = session("aaaa1111");
+    selected.state = "running".into();
+    selected.live = true;
+    let mut background = session("bbbb2222");
+    background.state = "awaiting_approval".into();
+    background.live = true;
+    background.pending_approvals = 3;
+    h.plumbing.push_rail(vec![selected, background]);
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "badge-bbbb2222"),
+        "a background session parked on me must badge without being opened"
+    );
+    // The rail's own row states it; the transcript of that session is not
+    // subscribed and no card for it exists on screen.
+    assert!(!shown(vcx, "approval-req-1"));
+}
+
+/// Several sessions can be parked at once, and each states its own count.
+#[gpui::test]
+fn several_sessions_can_wait_on_me_at_once(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.state = "awaiting_approval".into();
+    a.live = true;
+    a.pending_approvals = 1;
+    let mut b = session("bbbb2222");
+    b.state = "awaiting_approval".into();
+    b.live = true;
+    b.pending_approvals = 2;
+    h.plumbing.push_rail(vec![a, b]);
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "badge-aaaa1111") && shown(vcx, "badge-bbbb2222"));
+    // Answering one is scoped to the session the operator is looking at:
+    // the shell only ever holds one transcript, so a decision can only
+    // name a request from it (proven by the absence of any other card).
+    assert!(!shown(vcx, "approval-req-1"));
+}
+
+// ---------------------------------------------------------------------------
+// Stated facts — REAL text system (Slice K's one fit-critical fact).
+
+/// Amendment 3's line is a WARNING, and a warning that clips is worse
+/// than none: "NEVER ASKS · bypassPermi…" reads as a mode name, not as an
+/// alarm. Measured with real font-kit metrics for the same reason as the
+/// worktree facts — synthetic advances would let a clipping line pass.
+#[gpui::test]
+fn the_posture_line_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut asks = session("aaaa1111");
+    asks.permission_mode = Some("default".into());
+    let mut never = session("bbbb2222");
+    never.permission_mode = Some("bypassPermissions".into());
+    h.plumbing.push_rail(vec![asks, never]);
+    vcx.run_until_parked();
+
+    // Same full-width room for both, so the room is layout-derived and
+    // text-independent (the composition this measurement relies on).
+    let room = vcx.debug_bounds("posture-aaaa1111").unwrap().size.width;
+    assert_eq!(
+        room,
+        vcx.debug_bounds("posture-bbbb2222").unwrap().size.width,
+        "posture lines must be full-width like every other rail fact"
+    );
+
+    for mode in ["default", "manual", "bypassPermissions", "acceptEdits", "dontAsk"] {
+        let text = posture_line(mode);
+        let w = real_text_width(&text, theme::SANS, theme::SMALL_SIZE);
+        assert!(
+            w <= room,
+            "the posture fact {text:?} shapes to {w:?} but the rail gives it {room:?}"
+        );
+    }
+}
+
+/// A send made while a question is open is queued by the CLI with no
+/// echo and no ack (capture N, 2026-08-18). The composer must say so —
+/// otherwise the send sits pending with no stated reason, which is the
+/// one thing spec 02's delivery contract must never do.
+#[gpui::test]
+fn the_composer_states_that_a_send_will_queue_behind_the_question(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(&h, vcx, vec![user_record(1, "go")]);
+    let hint_before = vcx.debug_bounds("composer-hint").map(|b| b.size.width);
+    assert!(hint_before.is_some(), "the composer always states its own key");
+
+    ask(
+        &h,
+        vcx,
+        vec![
+            user_record(1, "go"),
+            approval_record(2, "req-1", "Write", "/repo/a.txt"),
+        ],
+    );
+    let hint_after = vcx.debug_bounds("composer-hint").map(|b| b.size.width);
+    assert!(
+        hint_after != hint_before,
+        "with a question open the composer must say the send will queue, \
+         not repeat the same four words"
+    );
+}
+
+/// The floating notice is chrome above the composer; the question is a
+/// card in the log with the buttons on it. Rendering both put the notice
+/// ON TOP of the approve/deny it was pointing at (reported from the real
+/// renderer, 2026-08-18). While the question is on screen the card is the
+/// notice; the panel only stands in when it is not.
+///
+/// Text system: Noop. This asserts whether an element renders at all,
+/// which is decided by the fold, not by glyph advances.
+#[gpui::test]
+fn the_notice_never_stands_on_top_of_the_question_it_points_at(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(&h, vcx, vec![approval_record(1, "req-1", "Bash", "/repo/target")]);
+    h.plumbing.push_attn((
+        "aaaa1111".into(),
+        AttentionSnapshot::AwaitingApproval {
+            since_ms: 0,
+            pending: 1,
+            tool: "Bash".into(),
+        },
+    ));
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "approve-req-1") && shown(vcx, "deny-req-1"),
+        "the answer must stay reachable while the session waits"
+    );
+    assert!(
+        !shown(vcx, "attn-kill"),
+        "and waiting on a person is never a kill situation"
+    );
+
+    // With the same notice standing but no question on screen — the
+    // projection was reset, or attention outran the records — the panel
+    // is the only thing that can tell the operator, so it renders.
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "approval-req-1"),
+        "precondition: the question is gone from the log"
+    );
+    let notice_stands = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).sessions.read(cx).attention.is_some()
+        })
+        .unwrap();
+    assert!(notice_stands, "the notice itself still stands");
 }

@@ -25,6 +25,24 @@ pub enum Delivery {
     Undelivered,
 }
 
+/// Where one permission question stands (Slice K). Derived from the
+/// records, like everything else here: the request, the decision, and the
+/// withdrawal are all journaled, so a resubscribing client rebuilds the
+/// exact pending set by replay with no separate channel and nothing to go
+/// stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalStatus {
+    /// Open. The agent is parked on this and will wait forever.
+    Pending,
+    Approved,
+    /// The operator's words, handed to the model verbatim.
+    Denied { message: String },
+    /// Nobody answered and the question is gone — the provider withdrew
+    /// it, or the process ended under it. It can never be answered now,
+    /// and a card that pretends otherwise is a lie.
+    Withdrawn { reason: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolStatus {
     Running,
@@ -39,6 +57,18 @@ pub enum Row {
     /// snapshot or a turn end.
     Assistant { text: String, live: bool },
     Tool { id: String, name: String, status: ToolStatus },
+    /// The agent is asking to run one tool (Slice K). Every fact an
+    /// operator needs to decide is on the row: an approval given without
+    /// knowing what was approved is the failure the slice exists to
+    /// prevent.
+    Approval {
+        request_id: String,
+        tool: String,
+        description: String,
+        path: Option<String>,
+        input_json: String,
+        status: ApprovalStatus,
+    },
     /// Non-content markers rendered inline: session start, turn ends,
     /// interruptions, terminal outcome.
     Marker { text: String },
@@ -140,6 +170,20 @@ impl Transcript {
                     }
                 }
             }
+            JournalEvent::ApprovalDecided {
+                request_id,
+                allowed,
+                message,
+            } => self.set_approval_status(
+                request_id,
+                if *allowed {
+                    ApprovalStatus::Approved
+                } else {
+                    ApprovalStatus::Denied {
+                        message: message.clone().unwrap_or_default(),
+                    }
+                },
+            ),
             JournalEvent::ToolInterrupted { id } => {
                 self.set_tool_status(id, ToolStatus::Interrupted);
             }
@@ -155,7 +199,7 @@ impl Transcript {
 
     fn apply_provider(&mut self, event: &SessionEvent) {
         match event {
-            SessionEvent::Init { session_id } => self.push_row(Row::Marker {
+            SessionEvent::Init { session_id, .. } => self.push_row(Row::Marker {
                 text: format!("session started ({session_id})"),
             }),
             // Deltas and their snapshot pair with the *live* assistant row,
@@ -207,6 +251,36 @@ impl Transcript {
                     });
                 }
             }
+            SessionEvent::ApprovalRequested {
+                request_id,
+                tool,
+                description,
+                path,
+                input_json,
+                ..
+            } => self.push_row(Row::Approval {
+                request_id: request_id.clone(),
+                tool: tool.clone(),
+                description: description.clone(),
+                path: path.clone(),
+                input_json: input_json.clone(),
+                status: ApprovalStatus::Pending,
+            }),
+            SessionEvent::ApprovalWithdrawn { request_id, reason } => self.set_approval_status(
+                request_id,
+                ApprovalStatus::Withdrawn {
+                    reason: reason.clone(),
+                },
+            ),
+            SessionEvent::DialogRefused { dialog, .. } => self.push_row(Row::Marker {
+                text: format!(
+                    "the agent asked a {dialog} question; eave cannot present dialogs yet \
+                     and told it so"
+                ),
+            }),
+            SessionEvent::PostureRefused { mode, reason } => self.push_row(Row::Marker {
+                text: format!("refused to run in permission mode {mode}: {reason}"),
+            }),
             // Stage E consumes these from the journal; Stage C does not
             // render them (spec 01 §Attention clocks).
             SessionEvent::System { .. } => {}
@@ -230,6 +304,16 @@ impl Transcript {
                 }
                 Row::Tool { status, .. } if *status == ToolStatus::Running => {
                     *status = ToolStatus::Interrupted;
+                    true
+                }
+                // The process that asked is gone, so the question can
+                // never be answered — it is withdrawn, not still pending
+                // (Slice K). This is also what makes crash-tail repair
+                // need no synthetic closer for approvals.
+                Row::Approval { status, .. } if *status == ApprovalStatus::Pending => {
+                    *status = ApprovalStatus::Withdrawn {
+                        reason: "the session ended before anyone answered".into(),
+                    };
                     true
                 }
                 _ => false,
@@ -259,6 +343,37 @@ impl Transcript {
                 if *live {
                     *live = false;
                     self.touch(ix);
+                }
+            }
+        }
+    }
+
+    /// Open permission questions, oldest first (Slice K). The UI's pending
+    /// set — derived, never held separately.
+    pub fn pending_approvals(&self) -> impl Iterator<Item = &Row> {
+        self.rows.iter().filter(|r| {
+            matches!(
+                r,
+                Row::Approval {
+                    status: ApprovalStatus::Pending,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn set_approval_status(&mut self, request_id: &str, status: ApprovalStatus) {
+        for ix in 0..self.rows.len() {
+            if let Row::Approval {
+                request_id: rid,
+                status: s,
+                ..
+            } = &mut self.rows[ix]
+            {
+                if rid == request_id {
+                    *s = status;
+                    self.touch(ix);
+                    return;
                 }
             }
         }

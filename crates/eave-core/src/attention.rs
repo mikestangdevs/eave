@@ -38,6 +38,17 @@ pub enum WaitReason {
 
 /// The transient attention overlay on a live session. `Running` means "no
 /// notice" — it is broadcast so a prior notice provably clears.
+///
+/// Slice K note on why `AwaitingApproval` is a STATE and not another
+/// [`WaitReason`]: every `WaitReason` lives inside `Quiet`, and `Quiet`
+/// means "alive and ambiguous — here is a kill affordance". A session
+/// parked on a permission question is neither ambiguous nor a candidate
+/// for killing; the only thing wrong with it is that nobody has clicked
+/// yet. Filing it under `Quiet` would offer to kill a session that is
+/// working exactly as designed, which is the specific failure the slice
+/// was told to prevent. It is also immediate rather than clock-gated: the
+/// operator learns they are being waited on at once, not two minutes
+/// later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AttentionSnapshot {
@@ -53,6 +64,23 @@ pub enum AttentionSnapshot {
         zero_samples: u32,
         sampled_ms: u64,
     },
+    /// The session is parked on the operator: one or more permission
+    /// questions are open and the agent cannot proceed until a human
+    /// answers (Slice K). No clock runs in this state — not `QUIET_AFTER`,
+    /// not `TOOL_EXEC_AFTER` — and `unresponsive` is unreachable from it,
+    /// because a process waiting on a person legitimately burns no CPU
+    /// (the same reasoning that already exempts an in-flight API request).
+    /// The session waits indefinitely; eave never decides for the
+    /// operator.
+    AwaitingApproval {
+        since_ms: u64,
+        /// How many questions are open. The rail states the count; the
+        /// questions themselves live on the session's own transcript
+        /// stream (watch isolation invariant, spec 05 §Watch).
+        pending: u64,
+        /// The tool named by the oldest open question.
+        tool: String,
+    },
     /// Provable death from OS facts — immediate, no timer (spec 01). The
     /// journal's terminal truth still comes from the recorder; this is the
     /// surface overlay carrying the concrete cause.
@@ -65,6 +93,7 @@ impl AttentionSnapshot {
             AttentionSnapshot::Running => "running",
             AttentionSnapshot::Quiet { .. } => "quiet",
             AttentionSnapshot::Unresponsive { .. } => "unresponsive",
+            AttentionSnapshot::AwaitingApproval { .. } => "awaiting_approval",
             AttentionSnapshot::Failed { .. } => "failed",
         }
     }
@@ -137,6 +166,10 @@ pub struct Classifier {
     outstanding: Vec<(String, String, u64)>,
     /// `status: requesting` seen; cleared by any assistant output.
     api_since: Option<u64>,
+    /// Permission questions the operator has not answered, oldest first:
+    /// (request_id, tool, since_ms). While this is non-empty the session
+    /// is parked on a human and no clock runs (Slice K).
+    pending_approvals: Vec<(String, String, u64)>,
     last_activity_ms: u64,
     state: AttentionSnapshot,
     zero_streak: u32,
@@ -149,6 +182,7 @@ impl Classifier {
             turn_balance: 0,
             outstanding: Vec::new(),
             api_since: None,
+            pending_approvals: Vec::new(),
             last_activity_ms: now_ms,
             state: AttentionSnapshot::Running,
             zero_streak: 0,
@@ -167,6 +201,12 @@ impl Classifier {
     /// nothing wire-marked in flight, or already unresponsive (to notice
     /// recovery). Sampling a busy or tool-running session proves nothing.
     pub fn wants_cpu_sampling(&self) -> bool {
+        // Never while parked on the operator (Slice K): a process waiting
+        // on a person burns no CPU by design, so sampling it would prove
+        // nothing and could only mislead.
+        if !self.pending_approvals.is_empty() {
+            return false;
+        }
         matches!(
             &self.state,
             AttentionSnapshot::Quiet {
@@ -179,15 +219,55 @@ impl Classifier {
     /// Any byte/state-change from the CLI: reset the clock; a live notice
     /// clears back to running (spec 01 transition table). `Failed` is
     /// sticky — provable death is not undone by a stale descendant line.
+    ///
+    /// Slice K: while questions are open, activity does NOT clear the
+    /// notice — the agent chatting on does not mean the operator answered.
+    /// The parked state is owned by the pending set, and
+    /// [`Self::settle_approvals`] is the only thing that leaves it.
     fn activity(&mut self, now_ms: u64) -> Option<AttentionSnapshot> {
         self.last_activity_ms = now_ms;
         self.zero_streak = 0;
+        if !self.pending_approvals.is_empty() {
+            return None;
+        }
         match self.state {
             AttentionSnapshot::Quiet { .. } | AttentionSnapshot::Unresponsive { .. } => {
                 self.state = AttentionSnapshot::Running;
                 Some(self.state.clone())
             }
             _ => None,
+        }
+    }
+
+    /// Re-derive the parked state from the pending set. Entering is
+    /// immediate (the operator is being waited on the moment the question
+    /// lands); leaving restores `Running` and restarts the clocks from
+    /// now, so an approval that took an hour does not instantly trip
+    /// `QUIET_AFTER` on the way out.
+    fn settle_approvals(&mut self, now_ms: u64) -> Option<AttentionSnapshot> {
+        match self.pending_approvals.first() {
+            Some((_, tool, since_ms)) => {
+                let want = AttentionSnapshot::AwaitingApproval {
+                    since_ms: *since_ms,
+                    pending: self.pending_approvals.len() as u64,
+                    tool: tool.clone(),
+                };
+                if self.state == want {
+                    return None;
+                }
+                self.state = want;
+                Some(self.state.clone())
+            }
+            None => {
+                if matches!(self.state, AttentionSnapshot::AwaitingApproval { .. }) {
+                    self.last_activity_ms = now_ms;
+                    self.zero_streak = 0;
+                    self.state = AttentionSnapshot::Running;
+                    Some(self.state.clone())
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -208,7 +288,11 @@ impl Classifier {
                     self.turn_balance = (self.turn_balance - 1).max(-1);
                     self.outstanding.clear();
                     self.api_since = None;
-                    self.activity(now_ms)
+                    // A turn cannot end with a question still open; if the
+                    // provider says it did, believe the provider.
+                    self.pending_approvals.clear();
+                    self.activity(now_ms);
+                    self.settle_approvals(now_ms)
                 }
                 SessionEvent::ToolUseStarted { id, name } => {
                     self.outstanding.push((id.clone(), name.clone(), now_ms));
@@ -220,6 +304,29 @@ impl Classifier {
                 SessionEvent::ToolUseFinished { id } => {
                     self.outstanding.retain(|(tid, _, _)| tid != id);
                     self.activity(now_ms)
+                }
+                SessionEvent::ApprovalRequested {
+                    request_id, tool, ..
+                } => {
+                    self.api_since = None;
+                    self.activity(now_ms);
+                    if !self
+                        .pending_approvals
+                        .iter()
+                        .any(|(id, _, _)| id == request_id)
+                    {
+                        self.pending_approvals.push((
+                            request_id.clone(),
+                            tool.clone(),
+                            now_ms,
+                        ));
+                    }
+                    self.settle_approvals(now_ms)
+                }
+                SessionEvent::ApprovalWithdrawn { request_id, .. } => {
+                    self.pending_approvals.retain(|(id, _, _)| id != request_id);
+                    self.activity(now_ms);
+                    self.settle_approvals(now_ms)
                 }
                 SessionEvent::TextDelta { .. } | SessionEvent::AssistantText { .. } => {
                     self.api_since = None;
@@ -237,6 +344,11 @@ impl Classifier {
             },
             // Repair/terminal records only appear in replay, which the
             // monitor never classifies over; settle everything anyway.
+            JournalEvent::ApprovalDecided { request_id, .. } => {
+                self.pending_approvals.retain(|(id, _, _)| id != request_id);
+                self.activity(now_ms);
+                self.settle_approvals(now_ms)
+            }
             JournalEvent::ToolInterrupted { id } => {
                 self.outstanding.retain(|(tid, _, _)| tid != id);
                 None
@@ -245,6 +357,7 @@ impl Classifier {
                 self.turn_balance = 0;
                 self.outstanding.clear();
                 self.api_since = None;
+                self.pending_approvals.clear();
                 None
             }
         }
@@ -259,6 +372,13 @@ impl Classifier {
         // Idle between turns is NORMAL — the CLI lingers on stdin after
         // turn_completed (claude-stream-notes.md). No open turn, no clock.
         if self.turn_balance <= 0 {
+            return None;
+        }
+        // Slice K: a pending human approval holds BOTH clocks (spec 01
+        // §Attention clocks). This is the carve-out that keeps a session
+        // held across someone's lunch break from being reported as
+        // ambiguous and offered a kill.
+        if !self.pending_approvals.is_empty() {
             return None;
         }
         let desired: Option<WaitReason> = if let Some((_, name, since)) = self
@@ -596,6 +716,147 @@ mod tests {
             assert_eq!(c.on_cpu_sample(zero, t), None);
         }
         assert_eq!(c.snapshot().state_name(), "quiet");
+    }
+
+    fn approval_requested(id: &str, tool: &str) -> Record {
+        provider(SessionEvent::ApprovalRequested {
+            request_id: id.into(),
+            tool: tool.into(),
+            display_name: tool.into(),
+            description: "writes a file".into(),
+            path: Some("/repo/src/main.rs".into()),
+            input_json: r#"{"file_path":"/repo/src/main.rs"}"#.into(),
+            suggestions_json: None,
+        })
+    }
+
+    /// THE Slice K regression: a session held on a permission question for
+    /// an operator's lunch break must never be reported as ambiguous, and
+    /// must never be offered a kill. Held past `QUIET_AFTER` (2 min) AND
+    /// past `TOOL_EXEC_AFTER` (10 min) — an hour of it — with the tool
+    /// genuinely outstanding the whole time.
+    #[test]
+    fn a_pending_approval_holds_both_clocks_indefinitely() {
+        let mut c = Classifier::new(TH, 0);
+        delivered(&mut c, 0);
+        c.on_record(
+            &provider(SessionEvent::ToolUseStarted {
+                id: "toolu_1".into(),
+                name: "Write".into(),
+            }),
+            1_000,
+        );
+        // The question lands: parked immediately, not two minutes later.
+        match c.on_record(&approval_requested("req-1", "Write"), 1_100) {
+            Some(AttentionSnapshot::AwaitingApproval { pending: 1, ref tool, .. })
+                if tool == "Write" => {}
+            other => panic!("expected awaiting_approval at once, got {other:?}"),
+        }
+        // One hour of ticks: both thresholds are long past and neither
+        // fires. Nothing offers to kill this session.
+        for t in (2_000..3_600_000).step_by(10_000) {
+            assert_eq!(c.on_tick(t), None, "tick at {t}ms must not classify");
+            assert_eq!(c.snapshot().state_name(), "awaiting_approval");
+        }
+        // And `unresponsive` is unreachable: sampling is never armed, and
+        // even a forced run of zero samples cannot harden this state.
+        assert!(!c.wants_cpu_sampling());
+        for i in 0..(TH.cpu_samples * 4) {
+            assert_eq!(c.on_cpu_sample(true, 3_600_000 + u64::from(i) * 5_000), None);
+        }
+        assert_eq!(c.snapshot().state_name(), "awaiting_approval");
+    }
+
+    /// The agent keeps talking while it waits (it often does — "I need
+    /// your permission to write the file", capture A). Chatter is not an
+    /// answer: the notice must survive it.
+    #[test]
+    fn provider_chatter_does_not_clear_the_parked_notice() {
+        let mut c = Classifier::new(TH, 0);
+        delivered(&mut c, 0);
+        c.on_record(&approval_requested("req-1", "Write"), 1_000);
+        for t in (2_000..60_000).step_by(5_000) {
+            c.on_record(
+                &provider(SessionEvent::TextDelta { text: "waiting…".into() }),
+                t,
+            );
+            assert_eq!(c.snapshot().state_name(), "awaiting_approval");
+        }
+    }
+
+    /// Answering releases the session, and the clocks restart from the
+    /// decision — an approval that took an hour must not instantly trip
+    /// `QUIET_AFTER` on the way out.
+    #[test]
+    fn deciding_releases_the_session_and_restarts_the_clocks() {
+        let mut c = Classifier::new(TH, 0);
+        delivered(&mut c, 0);
+        c.on_record(&approval_requested("req-1", "Write"), 1_000);
+        let decided_at = 3_600_000;
+        assert_eq!(
+            c.on_record(
+                &rec(JournalEvent::ApprovalDecided {
+                    request_id: "req-1".into(),
+                    allowed: true,
+                    message: None,
+                }),
+                decided_at,
+            ),
+            Some(AttentionSnapshot::Running)
+        );
+        // Not instantly quiet despite an hour of wall clock behind it.
+        assert_eq!(c.on_tick(decided_at + TH.quiet_after_ms - 1), None);
+        assert!(matches!(
+            c.on_tick(decided_at + TH.quiet_after_ms),
+            Some(AttentionSnapshot::Quiet { .. })
+        ));
+    }
+
+    /// A withdrawal (the provider interrupted the turn) releases the
+    /// session the same way an answer does.
+    #[test]
+    fn a_withdrawn_request_releases_the_session() {
+        let mut c = Classifier::new(TH, 0);
+        delivered(&mut c, 0);
+        c.on_record(&approval_requested("req-1", "Bash"), 1_000);
+        assert_eq!(
+            c.on_record(
+                &provider(SessionEvent::ApprovalWithdrawn {
+                    request_id: "req-1".into(),
+                    reason: "the provider withdrew the request".into(),
+                }),
+                2_000,
+            ),
+            Some(AttentionSnapshot::Running)
+        );
+    }
+
+    /// Several questions can stand at once; the notice names the oldest
+    /// and counts them all, and only the last answer releases the session.
+    #[test]
+    fn the_notice_counts_every_open_question_and_names_the_oldest() {
+        let mut c = Classifier::new(TH, 0);
+        delivered(&mut c, 0);
+        c.on_record(&approval_requested("req-1", "Write"), 1_000);
+        match c.on_record(&approval_requested("req-2", "Bash"), 2_000) {
+            Some(AttentionSnapshot::AwaitingApproval { pending: 2, ref tool, since_ms })
+                if tool == "Write" && since_ms == 1_000 => {}
+            other => panic!("expected 2 pending named by the oldest, got {other:?}"),
+        }
+        // Answering the newer one leaves the session parked on the older.
+        match c.on_record(
+            &rec(JournalEvent::ApprovalDecided {
+                request_id: "req-2".into(),
+                allowed: false,
+                message: Some("no".into()),
+            }),
+            3_000,
+        ) {
+            Some(AttentionSnapshot::AwaitingApproval { pending: 1, ref tool, .. })
+                if tool == "Write" => {}
+            other => panic!("expected still parked on req-1, got {other:?}"),
+        }
+        assert_eq!(c.on_tick(3_600_000), None);
     }
 
     #[test]

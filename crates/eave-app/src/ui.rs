@@ -33,7 +33,7 @@ use gpui_platform::application;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use eave_engine::client::{Client, ClientError, EngineSpawn};
-use eave_wire::model::{Delivery, Row, ToolStatus, Transcript};
+use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
 use eave_wire::{
     AttentionSnapshot, ChangedFile, Cursor, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff,
     FileStatus, FilesSnapshot, GitState, SessionInfo, SubscriptionItem, WaitReason,
@@ -43,7 +43,13 @@ use crate::display::{DisplayList, RowId};
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::theme;
 
-actions!(eave, [Quit]);
+actions!(eave, [Quit, ApproveOldest, DenyOldest]);
+
+/// How much of a tool's input the approval card shows before it states
+/// that it is holding back (Slice K). A 4 KB `Write` must not push its own
+/// approve button off the screen; a truncated input that does not SAY it
+/// is truncated would be the same lie as any other half-stated fact.
+const APPROVAL_INPUT_CAP: usize = 1200;
 
 // ---------------------------------------------------------------------------
 // Client task ⇄ UI plumbing (unchanged seam from Stage C)
@@ -139,6 +145,15 @@ enum Command {
     /// which arms the affordance; the second click sends `force: true`
     /// (decision 2's two-step).
     RemoveWorktree { id: String, force: bool },
+    /// Answer one open permission question (Slice K). `message` is the
+    /// operator's own words on a deny — the provider hands them to the
+    /// model verbatim, so "denied, commit first" is a different
+    /// instruction from "denied".
+    Decide {
+        request_id: String,
+        allow: bool,
+        message: String,
+    },
 }
 
 #[derive(Default)]
@@ -422,6 +437,20 @@ async fn feed_loop(
                                 plumbing.push_wt((id, note));
                             });
                         }
+                        Some(Command::Decide { request_id, allow, message }) => {
+                            // Off-loop: answering must never block the
+                            // stream that carries the next question.
+                            let client = Arc::clone(&client);
+                            let sid = session_id.clone();
+                            tokio::spawn(async move {
+                                let decision = if allow {
+                                    eave_wire::Decision::Allow
+                                } else {
+                                    eave_wire::Decision::Deny { message }
+                                };
+                                let _ = client.decide(&sid, &request_id, decision).await;
+                            });
+                        }
                         Some(Command::Resubscribe) => {
                             cursor = None;
                             break StreamEnd::Switch;
@@ -496,6 +525,8 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         checkout_root: None,
         shared_with: Vec::new(),
         worktree: None,
+        pending_approvals: 0,
+        permission_mode: Some("default".into()),
     }]);
     // Same for the files rail (Slice B): the reading column must be
     // constrained on BOTH sides during asserts and captures.
@@ -879,16 +910,57 @@ fn provider_identity(provider: &str) -> (String, String) {
 fn state_color(state: &str) -> Hsla {
     match state {
         "running" => theme::live(),
-        "quiet" => theme::warning(),
+        // Slice K: the session is parked on the operator. Attention-worthy
+        // — it is the one state where the thing being waited on is you —
+        // but not a fault, so warning and never danger.
+        "quiet" | "awaiting_approval" => theme::warning(),
         "unresponsive" | "failed" => theme::danger(),
         _ => theme::text_ghost(),
     }
 }
 
 /// Attention badge: only the states the operator may need to act on get a
-/// word in the rail; everything else is just the neutral dot.
-fn state_badge(state: &str) -> Option<&str> {
-    matches!(state, "quiet" | "unresponsive" | "failed").then_some(state)
+/// word in the rail; everything else is just the neutral dot. The word is
+/// the state name except for `awaiting_approval`, which says what it means
+/// for the person reading it (Slice K) — a background session parked on a
+/// question has to read as "you are the blocker" without being opened.
+fn state_badge(state: &str) -> Option<&'static str> {
+    match state {
+        "quiet" => Some("quiet"),
+        "unresponsive" => Some("unresponsive"),
+        "failed" => Some("failed"),
+        "awaiting_approval" => Some("waiting on you"),
+        _ => None,
+    }
+}
+
+/// Take the operator's deny reason out of the composer and clear it
+/// (Slice K). eave has exactly one text field, so the composer IS the
+/// reason field — the card says so in as many words. Clearing it is the
+/// point: the words were spent on the agent, and leaving them behind
+/// would let the next Enter send the same sentence again as a message.
+fn take_deny_reason(composer: Option<&Entity<ComposerState>>, cx: &mut App) -> String {
+    let Some(composer) = composer else {
+        return String::new();
+    };
+    let text = composer.read(cx).text.trim().to_string();
+    if !text.is_empty() {
+        composer.update(cx, |c, cx| {
+            c.text.clear();
+            cx.notify();
+        });
+    }
+    text
+}
+
+/// The permission posture as a rail fact (Slice K amendment 3). A session
+/// running in a mode that never asks must not look like one that does —
+/// this is the line that makes the difference visible without opening it.
+fn posture_line(mode: &str) -> String {
+    match mode {
+        "default" | "manual" => format!("asks before it writes · {mode}"),
+        other => format!("NEVER ASKS · {other}"),
+    }
 }
 
 /// The shared-checkout fact (Slice I2): who else works in these files,
@@ -1006,6 +1078,15 @@ struct TranscriptState {
     ema_ms: f32,
     last_growth: Option<Instant>,
     assert_replay: Option<ReplayAssert>,
+    /// Slice K: the approval card's buttons live inside a virtualized row
+    /// built by a static fn with no `Context`, so they emit through a
+    /// clone of the shell's own command channel. Deliberately the SAME
+    /// channel the keyboard path uses — the two routes are one behavior,
+    /// which is what makes the harness's keyboard test meaningful.
+    commands: Option<tokio_mpsc::UnboundedSender<Command>>,
+    /// The composer, read at deny time for the operator's reason and
+    /// cleared once it has been spent (see [`Shell::deny_reason`]).
+    composer: Option<Entity<ComposerState>>,
 }
 
 impl TranscriptState {
@@ -1024,6 +1105,8 @@ impl TranscriptState {
             ema_ms: 200.0,
             last_growth: None,
             assert_replay: None,
+            commands: None,
+            composer: None,
         }
     }
 
@@ -1424,6 +1507,39 @@ impl Shell {
         .detach();
     }
 
+    /// The request id of the oldest open permission question, if any
+    /// (Slice K). Oldest, not newest: questions are answered in the order
+    /// the agent asked them, which is the order the cards read in.
+    fn oldest_pending_approval(&self, cx: &Context<Self>) -> Option<String> {
+        self.transcript
+            .read(cx)
+            .transcript
+            .pending_approvals()
+            .find_map(|row| match row {
+                Row::Approval { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+    }
+
+    /// Answer the oldest open question from the keyboard. Same channel,
+    /// same command as the buttons — one behavior with two doors.
+    fn decide_oldest(&mut self, allow: bool, cx: &mut Context<Self>) {
+        let Some(request_id) = self.oldest_pending_approval(cx) else {
+            return;
+        };
+        let message = if allow {
+            String::new()
+        } else {
+            let composer = self.composer.clone();
+            take_deny_reason(Some(&composer), cx)
+        };
+        let _ = self.commands.send(Command::Decide {
+            request_id,
+            allow,
+            message,
+        });
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         match ks.key.as_str() {
@@ -1640,7 +1756,19 @@ impl Shell {
                 let is_sel = selected.as_deref() == Some(info.session_id.as_str());
                 let (glyph, label) = provider_identity(&info.provider);
                 let dot = state_color(&info.state);
-                let badge = state_badge(&info.state).map(str::to_string);
+                // Slice K: the badge counts the open questions when there
+                // is more than one — "waiting on you (3)" is a different
+                // fact from "waiting on you".
+                let badge = state_badge(&info.state).map(|word| {
+                    if info.state == "awaiting_approval" && info.pending_approvals > 1 {
+                        format!("{word} ({})", info.pending_approvals)
+                    } else {
+                        word.to_string()
+                    }
+                });
+                let posture = info.permission_mode.as_deref().map(posture_line);
+                let posture_asks =
+                    matches!(info.permission_mode.as_deref(), Some("default") | Some("manual"));
                 let sid = info.session_id.clone();
                 // Slice I2 facts, stated as quiet meta lines. Sharing:
                 // sessions working in the same checkout (decision 1 —
@@ -1757,6 +1885,28 @@ impl Shell {
                             .text_color(theme::text_ghost())
                             .child(SharedString::from(short_cwd(&info.cwd, home.as_deref()))),
                     )
+                    // Slice K amendment 3: the posture the CLI reported at
+                    // init, stated as a rail fact. Full width and wrapping
+                    // for the same reason as the shares line — a posture
+                    // that clips to "NEVER AS…" is worse than none.
+                    .children(posture.map(|line| {
+                        div()
+                            .debug_selector(|| format!("posture-{}", info.session_id))
+                            .pl(px(meta_indent))
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .font_weight(if posture_asks {
+                                theme::WEIGHT_LABEL
+                            } else {
+                                theme::WEIGHT_STRONG
+                            })
+                            .text_color(if posture_asks {
+                                theme::text_ghost()
+                            } else {
+                                theme::danger()
+                            })
+                            .child(SharedString::from(line))
+                    }))
                     // Slice I2: shared-checkout fact, full row width — at
                     // rail width a fact must never lose to a button. It
                     // WRAPS rather than clips: the list grows with the
@@ -2373,6 +2523,15 @@ impl Shell {
         if self.transcript.read(cx).session_id.as_deref() != Some(attn_session.as_str()) {
             return None;
         }
+        // Is the question the notice is about already on screen, with its
+        // own buttons? (Slice K — see the `AwaitingApproval` arm below.)
+        let question_on_screen = self
+            .transcript
+            .read(cx)
+            .transcript
+            .pending_approvals()
+            .next()
+            .is_some();
         let now = eave_core::journal::now_ms();
         let panel = |ring: Hsla, wash: Hsla| {
             div()
@@ -2456,6 +2615,40 @@ impl Shell {
                     fmt_elapsed(sampled_ms)
                 ))
                 .child(self.kill_affordance(cx, "it will never be killed automatically")),
+            // Slice K: when the question itself is on screen, the card
+            // says everything this panel would — and says it better,
+            // because it carries the buttons. The panel is floating
+            // chrome above the composer, so rendering both put a notice
+            // ON TOP of the approve/deny it was pointing at (found by eye
+            // in the real renderer, 2026-08-18). The notice therefore
+            // only stands in when the question is NOT on screen: the
+            // projection was reset, or the attention frame outran the
+            // records that carry the question.
+            AttentionSnapshot::AwaitingApproval { .. } if question_on_screen => return None,
+            AttentionSnapshot::AwaitingApproval {
+                since_ms,
+                pending,
+                tool,
+            } => panel(theme::warning_ring(), theme::warning_plate_strong_glass())
+                .child(label(
+                    theme::warning(),
+                    format!(
+                        "waiting on you for {}",
+                        fmt_elapsed(now.saturating_sub(since_ms))
+                    ),
+                    true,
+                ))
+                .child(if pending > 1 {
+                    format!(
+                        "{pending} permission requests are open; the oldest is {tool}. \
+                         The session waits until you answer — nothing times out."
+                    )
+                } else {
+                    format!(
+                        "{tool} is waiting for your approval below. The session waits \
+                         until you answer — nothing times out."
+                    )
+                }),
             AttentionSnapshot::Failed { since_ms, cause } => {
                 panel(theme::danger_ring(), theme::danger_plate_glass())
                     .child(label(
@@ -2607,6 +2800,20 @@ impl Shell {
                     )
                     .into_any_element()
             }
+            // Slice K: the question itself. Every fact an operator needs
+            // to decide is on the card — tool, what it does, which path,
+            // and the full input — because approving without knowing what
+            // you approved is the failure this slice exists to prevent.
+            Row::Approval {
+                request_id,
+                tool,
+                description,
+                path,
+                input_json,
+                status,
+            } => Self::render_approval(
+                state, request_id, tool, description, path, input_json, status,
+            ),
             Row::Marker { text } => div()
                 .py(px(theme::SPACE_3))
                 .flex()
@@ -2645,6 +2852,211 @@ impl Shell {
             }
         };
         Self::column(inner).into_any_element()
+    }
+
+    /// One permission question, pending or settled (Slice K).
+    ///
+    /// Deliberately NOT a `cx.listener` closure per button: this is a
+    /// static row builder like every other row, so the click has to reach
+    /// the shell through the same window-level dispatch the rest of the
+    /// transcript uses. The buttons emit into the shared command channel
+    /// directly — the same channel the keyboard path uses, so both routes
+    /// are provably one behavior.
+    fn render_approval(
+        state: &TranscriptState,
+        request_id: &str,
+        tool: &str,
+        description: &str,
+        path: &Option<String>,
+        input_json: &str,
+        status: &ApprovalStatus,
+    ) -> AnyElement {
+        let pending = matches!(status, ApprovalStatus::Pending);
+        let rid = request_id.to_string();
+        let (ring, plate) = if pending {
+            (theme::warning_ring(), theme::warning_plate_strong_glass())
+        } else {
+            (theme::border(), theme::overlay())
+        };
+        let line = |color: Hsla, text: String| {
+            div()
+                .text_size(px(theme::SMALL_SIZE))
+                .line_height(px(theme::SMALL_LINE))
+                .text_color(color)
+                .child(SharedString::from(text))
+        };
+        let mono = |text: String| {
+            div()
+                .font_family(theme::MONO)
+                .text_size(px(theme::CODE_SIZE))
+                .line_height(px(theme::CODE_LINE))
+                .text_color(theme::code_block_text())
+                .child(SharedString::from(text))
+        };
+        let mut card = div()
+            .my(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_PANEL))
+            .border_1()
+            .border_color(ring)
+            .bg(plate)
+            .px(px(theme::SPACE_3))
+            .py(px(theme::SPACE_2))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .debug_selector({
+                let rid = rid.clone();
+                move || format!("approval-{rid}")
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .font_weight(theme::WEIGHT_STRONG)
+                            .text_color(if pending {
+                                theme::warning()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(SharedString::from(if pending {
+                                format!("{tool} — needs your approval")
+                            } else {
+                                format!("{tool}")
+                            })),
+                    )
+                    .child(
+                        div()
+                            .debug_selector({
+                                let rid = rid.clone();
+                                move || format!("approval-status-{rid}")
+                            })
+                            .text_size(px(theme::SMALL_SIZE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(match status {
+                                ApprovalStatus::Pending => "waiting".to_string(),
+                                ApprovalStatus::Approved => "approved".to_string(),
+                                ApprovalStatus::Denied { message } => {
+                                    if message.is_empty() {
+                                        "denied".to_string()
+                                    } else {
+                                        format!("denied: {message}")
+                                    }
+                                }
+                                ApprovalStatus::Withdrawn { reason } => {
+                                    format!("withdrawn: {reason}")
+                                }
+                            })),
+                    ),
+            );
+        if !description.is_empty() {
+            card = card.child(line(theme::text(), description.to_string()));
+        }
+        if let Some(p) = path {
+            card = card.child(
+                mono(p.clone()).debug_selector({
+                    let rid = rid.clone();
+                    move || format!("approval-path-{rid}")
+                }),
+            );
+        }
+        // The full input, stated. Truncation is stated too — a silently
+        // shortened input is the same lie as a silently shortened fact
+        // anywhere else in this app.
+        let (shown, omitted) = if input_json.chars().count() > APPROVAL_INPUT_CAP {
+            let head: String = input_json.chars().take(APPROVAL_INPUT_CAP).collect();
+            let rest = input_json.chars().count() - APPROVAL_INPUT_CAP;
+            (head, rest)
+        } else {
+            (input_json.to_string(), 0)
+        };
+        card = card.child(
+            div()
+                .mt_1()
+                .rounded(px(theme::RADIUS_CODE))
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::inset())
+                .px(px(theme::SPACE_2))
+                .py(px(theme::SPACE_1))
+                .debug_selector({
+                    let rid = rid.clone();
+                    move || format!("approval-input-{rid}")
+                })
+                .child(mono(shown)),
+        );
+        if omitted > 0 {
+            card = card.child(line(
+                theme::text_tertiary(),
+                format!("… and {omitted} more characters of input"),
+            ));
+        }
+        if pending {
+            card = card
+                .child(
+                    div()
+                        .pt_1()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(Self::decision_button(state, &rid, true, "approve", theme::live()))
+                        .child(Self::decision_button(state, &rid, false, "deny", theme::danger())),
+                )
+                .child(line(
+                    theme::text_tertiary(),
+                    "⇧⌘A approve · ⇧⌘D deny · whatever is in the composer is sent as the \
+                     deny reason"
+                        .to_string(),
+                ));
+        }
+        Self::column(card).into_any_element()
+    }
+
+    fn decision_button(
+        state: &TranscriptState,
+        rid: &str,
+        allow: bool,
+        word: &str,
+        color: Hsla,
+    ) -> gpui::Stateful<gpui::Div> {
+        let rid = rid.to_string();
+        let id: SharedString = format!("{}-{rid}", if allow { "approve" } else { "deny" }).into();
+        let tx = state.commands.clone();
+        let composer = state.composer.clone();
+        div()
+            .px(px(theme::SPACE_3))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .border_1()
+            .border_color(color)
+            .text_size(px(theme::DETAIL_SIZE))
+            .font_weight(theme::WEIGHT_LABEL)
+            .text_color(color)
+            .child(SharedString::from(word.to_string()))
+            .id(id)
+            .debug_selector({
+                let rid = rid.clone();
+                move || format!("{}-{rid}", if allow { "approve" } else { "deny" })
+            })
+            .on_click(move |_, _, cx| {
+                let message = if allow {
+                    String::new()
+                } else {
+                    take_deny_reason(composer.as_ref(), cx)
+                };
+                if let Some(tx) = &tx {
+                    let _ = tx.send(Command::Decide {
+                        request_id: rid.clone(),
+                        allow,
+                        message,
+                    });
+                }
+            })
     }
 
     fn render_block(
@@ -2847,6 +3259,12 @@ impl Render for Shell {
         let files_collapsed = self.files.read(cx).collapsed;
         let composer_text = self.composer.read(cx).text.clone();
         let has_draft = !composer_text.is_empty();
+        let pending_here = self
+            .transcript
+            .read(cx)
+            .transcript
+            .pending_approvals()
+            .count();
 
         let transcript_el = list(list_state, move |ix, _window, cx| {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix))
@@ -2894,9 +3312,28 @@ impl Render for Shell {
                         .items_center()
                         .child(
                             div()
+                                .debug_selector(|| "composer-hint".into())
                                 .text_size(px(theme::MICRO_SIZE))
-                                .text_color(theme::text_ghost())
-                                .child("return to send"),
+                                .text_color(if pending_here > 0 {
+                                    theme::warning()
+                                } else {
+                                    theme::text_ghost()
+                                })
+                                // Slice K, capture N (2026-08-18): the CLI
+                                // swallows a user message sent while a
+                                // permission is pending — no echo, no ack,
+                                // nothing until the decision lands. Under
+                                // eave's order-paired delivery contract
+                                // that would show as a send stuck pending
+                                // with no stated reason, so the composer
+                                // says the reason.
+                                .child(SharedString::from(if pending_here > 0 {
+                                    "return to send — queued behind the approval above until \
+                                     you answer"
+                                        .to_string()
+                                } else {
+                                    "return to send".to_string()
+                                })),
                         )
                         .child(div().flex_1())
                         .child(
@@ -2943,6 +3380,14 @@ impl Render for Shell {
             .line_height(px(theme::BODY_LINE))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            // Slice K: answering is a real action with a real binding, not
+            // a character the composer happens not to want.
+            .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| {
+                this.decide_oldest(true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DenyOldest, _, cx| {
+                this.decide_oldest(false, cx)
+            }))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             .child(self.titlebar(cx))
             .child(
@@ -3197,7 +3642,13 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     } = feed;
     let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
 
-    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        // Slice K: answering is a first-class act, so it gets real
+        // bindings rather than living only inside the key handler.
+        KeyBinding::new("cmd-shift-a", ApproveOldest, None),
+        KeyBinding::new("cmd-shift-d", DenyOldest, None),
+    ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
 
     let conn = cx.new(|_| ConnectionState {
@@ -3432,6 +3883,15 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         |window, cx| {
             let shell = cx.new(|cx| {
                 let composer = cx.new(|_| ComposerState { text: String::new() });
+                // Slice K: the approval card's buttons are built by a
+                // static row fn with no `Context`, so give the transcript
+                // state the two handles they need — the shell's own
+                // command channel and the composer they read the deny
+                // reason from.
+                transcript.update(cx, |t, _| {
+                    t.commands = Some(cmd_tx.clone());
+                    t.composer = Some(composer.clone());
+                });
                 cx.observe(&conn, |_, _, cx| cx.notify()).detach();
                 cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
                 cx.observe(&files, |_, _, cx| cx.notify()).detach();

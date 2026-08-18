@@ -79,6 +79,19 @@ impl SessionWatch {
     }
 }
 
+/// The operator's answer to one permission question (Slice K). There are
+/// exactly two — eave never auto-approves, never auto-denies, and never
+/// times out into either; a session waits indefinitely on a human, the
+/// same principle as never auto-killing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Allow,
+    /// The message reaches the model verbatim as the tool result, so
+    /// "denied — commit first" is a genuinely different instruction from
+    /// "denied" (capture D, 2026-08-18).
+    Deny { message: String },
+}
+
 /// What a verified kill established (spec 01 §Kill & verify).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillReport {
@@ -127,6 +140,19 @@ pub trait AgentSession: Send {
 
     /// Send one user message into the running session.
     async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError>;
+
+    /// Permission questions this session is parked on right now (Slice K).
+    fn pending_approvals(&self) -> usize;
+
+    /// Answer one permission question. `Ok(false)` = the question was not
+    /// open (already answered, or withdrawn under the operator's click) —
+    /// a race, stated as a fact, never an error and never journaled as if
+    /// it had landed.
+    async fn respond_to_approval(
+        &mut self,
+        request_id: &str,
+        decision: &ApprovalDecision,
+    ) -> Result<bool, SessionError>;
 
     /// Kill with proof of exit: group SIGTERM → grace → group SIGKILL →
     /// group probe under the identity guard → one bounded straggler scan.

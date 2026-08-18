@@ -23,13 +23,14 @@ use eave_core::journal::{self, now_ms, Header, JournalEvent, JournalWriter, Reco
 use eave_core::proc::{self, PidState, ProcIdentity};
 use eave_core::process;
 use eave_core::recorder::{record_session, send_and_journal};
-use eave_core::session::{AgentSession, SessionWatch, SpawnConfig};
+use eave_core::session::{AgentSession, ApprovalDecision, SessionWatch, SpawnConfig};
 use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, ChangedFile, Cursor, DiffOk, FileStatus, FilesSnapshot, HelloOk, IsolateOk,
-    KillOk, ListOk, OpenOk, RemoveWorktreeOk, Request, RequestEnvelope, ResponseBody,
-    ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, UnsubscribeOk, PROTO_VERSION,
+    socket_path, ChangedFile, Cursor, DecideOk, Decision, DiffOk, FileStatus, FilesSnapshot,
+    HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, Request, RequestEnvelope,
+    ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, UnsubscribeOk,
+    PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -75,6 +76,14 @@ impl EngineConfig {
         let mut agent_env = Vec::new();
         if let Ok(mode) = std::env::var("EAVE_FAKE_MODE") {
             agent_env.push(("FAKE_MODE".to_string(), mode));
+        }
+        // Slice K: the posture the fake agent will announce, so the
+        // acceptance tests can drive the refusal paths through the real
+        // spawn/verify path rather than around it.
+        for key in ["FAKE_PERMISSION_MODE", "FAKE_APPROVAL_TOOL", "FAKE_APPROVAL_PATH"] {
+            if let Ok(v) = std::env::var(format!("EAVE_{key}")) {
+                agent_env.push((key.to_string(), v));
+            }
         }
         let default_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let worktrees_root = std::env::var_os("EAVE_WORKTREES_DIR")
@@ -171,12 +180,30 @@ pub struct SessionHandle {
     /// `None` until the probe lands; equality across sessions is the
     /// shared-checkout collision fact.
     checkout: StdMutex<Option<crate::git::CheckoutProbe>>,
+    /// Permission questions the live agent is parked on, oldest first, and
+    /// the posture it reported at `init` (Slice K). Both are ephemeral
+    /// per-process facts — the durable truth is the journal, which carries
+    /// every request and every decision — but the rail needs them as a
+    /// count and a mode name without subscribing to the transcript.
+    approvals: StdMutex<ApprovalState>,
     /// The session's eave-created worktree, if any (Slice I2): identity
     /// from `worktree.json` in the session dir (durable — crash
     /// re-detection starts from it and verifies against `git worktree
     /// list`, never engine memory); presence and dirty count stamped by
     /// scans.
     worktree: StdMutex<Option<WorktreeState>>,
+}
+
+/// Live permission facts for one session (Slice K). Identity and counts
+/// only — the tool names and paths live in the journal and travel on the
+/// session's own subscribe stream, never on watch (spec 05 §Watch).
+#[derive(Debug, Default)]
+struct ApprovalState {
+    /// Open request ids, oldest first.
+    pending: Vec<String>,
+    /// What the CLI said its permission mode was at `init`. `None` until
+    /// a process has announced itself.
+    mode: Option<String>,
 }
 
 /// Live view of a session's worktree facts (Slice I2).
@@ -256,6 +283,11 @@ impl SessionHandle {
                 .map(|c| c.root.display().to_string()),
             // Cross-session by definition; the engine's list() fills it.
             shared_with: Vec::new(),
+            pending_approvals: {
+                let a = self.approvals.lock().unwrap();
+                a.pending.len() as u64
+            },
+            permission_mode: self.approvals.lock().unwrap().mode.clone(),
             worktree: self.worktree.lock().unwrap().as_ref().map(|w| {
                 eave_wire::WorktreeInfo {
                     base: w.base.display().to_string(),
@@ -487,6 +519,7 @@ impl Engine {
                 files_gate: TokioMutex::new(()),
                 fs_watch: StdMutex::new(FsWatchCtl::default()),
                 checkout: StdMutex::new(None),
+                approvals: StdMutex::new(ApprovalState::default()),
                 worktree: StdMutex::new(None),
             })
         };
@@ -527,6 +560,7 @@ impl Engine {
                 let _ = meta.save(&dir);
             }
         }
+        let last_mode = last_permission_mode(&loaded.records);
         let (bcast, _) = broadcast::channel(BROADCAST_CAP);
         let (files_tx, _) = broadcast::channel(FILES_CAP);
         // The worktree identity claim loads from disk; presence and
@@ -561,6 +595,12 @@ impl Engine {
             files_gate: TokioMutex::new(()),
             fs_watch: StdMutex::new(FsWatchCtl::default()),
             checkout: StdMutex::new(None),
+            // The last posture this session ran under is history: read it
+            // back off the log so a cold rail states it before any respawn.
+            approvals: StdMutex::new(ApprovalState {
+                pending: Vec::new(),
+                mode: last_mode,
+            }),
             worktree: StdMutex::new(worktree),
         }))
     }
@@ -665,6 +705,23 @@ impl Engine {
                             event: eave_core::events::SessionEvent::TurnCompleted { .. }
                         }
                 );
+                // Slice K: the rail's approval facts, kept from the same
+                // records the transcript folds — one truth, two readers.
+                // A change here is a state change a watcher can see, so it
+                // pokes watch (a count, never a tool name or a path).
+                if track_approvals(&tap_handle, &rec) {
+                    tap_handle.poke_watch();
+                }
+                // Amendment 1: a CLI that cannot prove it will ask does not
+                // get to keep running. Killed here rather than left alive
+                // in a posture nobody reviewed — the transcript already
+                // carries the stated reason.
+                if let JournalEvent::Provider {
+                    event: eave_core::events::SessionEvent::PostureRefused { .. },
+                } = &rec.event
+                {
+                    tokio::spawn(refuse_posture(Arc::clone(&tap_handle)));
+                }
                 tap_handle.shared.lock().unwrap().records.push(rec.clone());
                 let _ = tap_handle.bcast.send(Fanout::Record(rec));
                 if turn_boundary && !tap_handle.watcher_active() {
@@ -713,12 +770,68 @@ impl Engine {
                 // governs now. Broadcast the clear so a live notice drops.
                 s.attention = None;
             }
+            // The process that asked the questions is gone; nothing can be
+            // answered now (Slice K). The mode it ran under stays — that is
+            // history the rail keeps stating.
+            done_handle.approvals.lock().unwrap().pending.clear();
             let _ = done_handle.bcast.send(Fanout::Attention(AttentionSnapshot::Running));
             done_handle.poke_watch();
             *done_handle.live.lock().await = None;
         });
 
         Ok(Live { session, extra_tx })
+    }
+
+    /// Answer one open permission question (Slice K). Serialized on the
+    /// same `live` lock as sends and kills, so a decision can never
+    /// interleave with a user message mid-line on the child's stdin.
+    ///
+    /// Order is deliberate: the decision is written to the pipe FIRST and
+    /// journaled only once that write succeeded. The record means "this
+    /// answer reached the agent" — which is the fact an audit needs — so a
+    /// failed write must leave no record claiming otherwise, and leaves
+    /// the question open for the operator to try again.
+    async fn decide(
+        self: &Arc<Self>,
+        id: &str,
+        request_id: &str,
+        decision: Decision,
+    ) -> Result<DecideOk, String> {
+        let handle = self.session(id)?;
+        let mut live = handle.live.lock().await;
+        let l = live
+            .as_mut()
+            .ok_or("session is not live — nothing is waiting on an answer")?;
+        let core = match &decision {
+            Decision::Allow => ApprovalDecision::Allow,
+            Decision::Deny { message } => ApprovalDecision::Deny {
+                message: if message.trim().is_empty() {
+                    "The operator denied this action in eave.".to_string()
+                } else {
+                    message.clone()
+                },
+            },
+        };
+        let answered = l
+            .session
+            .respond_to_approval(request_id, &core)
+            .await
+            .map_err(|e| format!("could not answer the agent: {e}"))?;
+        if answered {
+            let (allowed, message) = match &core {
+                ApprovalDecision::Allow => (true, None),
+                ApprovalDecision::Deny { message } => (false, Some(message.clone())),
+            };
+            l.extra_tx
+                .send(JournalEvent::ApprovalDecided {
+                    request_id: request_id.to_string(),
+                    allowed,
+                    message,
+                })
+                .await
+                .map_err(|_| "recorder gone".to_string())?;
+        }
+        Ok(DecideOk { answered })
     }
 
     async fn kill(self: &Arc<Self>, id: &str) -> Result<KillOk, String> {
@@ -956,6 +1069,18 @@ impl Engine {
 /// roots are equal work in the SAME files. Sessions with an unknown root
 /// (probe not landed / non-canonicalizable) share with nobody — stated
 /// as absence, never guessed.
+/// The permission posture of the most recent process segment in a log
+/// (Slice K). History, not a guess: it is whatever the CLI itself stated
+/// at `init` the last time this session ran.
+fn last_permission_mode(records: &[Record]) -> Option<String> {
+    records.iter().rev().find_map(|r| match &r.event {
+        JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::Init { permission_mode, .. },
+        } => permission_mode.clone(),
+        _ => None,
+    })
+}
+
 fn fill_sharing(infos: &mut [SessionInfo]) {
     let mut by_root: HashMap<String, Vec<String>> = HashMap::new();
     for s in infos.iter() {
@@ -979,6 +1104,63 @@ fn fill_sharing(infos: &mut [SessionInfo]) {
 
 /// Probe the session cwd's canonical checkout root (Slice I2) and stamp
 /// it; watchers re-snapshot when the fact lands or changes.
+/// Fold one record into the session's live approval facts (Slice K).
+/// Returns whether anything a watcher can see changed.
+fn track_approvals(handle: &Arc<SessionHandle>, rec: &Record) -> bool {
+    use eave_core::events::SessionEvent as E;
+    let mut a = handle.approvals.lock().unwrap();
+    match &rec.event {
+        JournalEvent::Provider { event } => match event {
+            E::Init { permission_mode, .. } => {
+                let changed = a.mode != *permission_mode;
+                a.mode = permission_mode.clone();
+                changed
+            }
+            E::ApprovalRequested { request_id, .. } => {
+                if a.pending.iter().any(|id| id == request_id) {
+                    return false;
+                }
+                a.pending.push(request_id.clone());
+                true
+            }
+            E::ApprovalWithdrawn { request_id, .. } => {
+                let before = a.pending.len();
+                a.pending.retain(|id| id != request_id);
+                a.pending.len() != before
+            }
+            // A turn cannot end with a question still open; if the
+            // provider says it did, believe the provider.
+            E::TurnCompleted { .. } => {
+                let had = !a.pending.is_empty();
+                a.pending.clear();
+                had
+            }
+            _ => false,
+        },
+        JournalEvent::ApprovalDecided { request_id, .. } => {
+            let before = a.pending.len();
+            a.pending.retain(|id| id != request_id);
+            a.pending.len() != before
+        }
+        JournalEvent::Closed { .. } => {
+            let had = !a.pending.is_empty();
+            a.pending.clear();
+            had
+        }
+        _ => false,
+    }
+}
+
+/// Amendment 1's enforcement: end a session whose CLI announced a posture
+/// eave will not supervise. The kill ladder is the normal one — proof of
+/// exit, never a signal fired and hoped over (spec 01 §Kill).
+async fn refuse_posture(handle: Arc<SessionHandle>) {
+    let mut live = handle.live.lock().await;
+    if let Some(l) = live.as_mut() {
+        let _ = l.session.kill().await;
+    }
+}
+
 async fn probe_checkout(handle: Arc<SessionHandle>) {
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
     let probe = crate::git::checkout_root(&cwd).await;
@@ -1282,6 +1464,14 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 });
                 continue;
             }
+            Request::Decide {
+                session_id,
+                request_id,
+                decision,
+            } => match engine.decide(&session_id, &request_id, decision).await {
+                Ok(ok) => ok_value(&ok),
+                Err(message) => ResponseBody::Err { message },
+            },
             Request::Unsubscribe { id: target } => {
                 // Stop the named stream and release what it held (the
                 // files stream's watcher refcount drops via guard drop).

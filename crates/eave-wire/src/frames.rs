@@ -133,6 +133,32 @@ pub enum Request {
     /// eave never deletes dirty work without the operator meaning it).
     /// Clean removal also prunes and deletes the `eave/` branch.
     RemoveWorktree { session_id: String, force: bool },
+    /// Answer one open permission question (Slice K). The agent is parked
+    /// until this arrives and there is no other way out — eave never
+    /// auto-approves, never auto-denies, and never times out into either.
+    /// Reply [`DecideOk`]; an id that is no longer open is a stated fact
+    /// (`answered: false`), not an error: the provider may have withdrawn
+    /// the question under the operator's click.
+    Decide {
+        session_id: String,
+        request_id: String,
+        #[serde(flatten)]
+        decision: Decision,
+    },
+}
+
+/// The two answers, and only two (Slice K). `Deny` carries the operator's
+/// own words, which the provider hands to the model verbatim as the tool
+/// result — "denied, commit first" is a different instruction from
+/// "denied" (capture D, 2026-08-18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "behavior", rename_all = "snake_case")]
+pub enum Decision {
+    Allow,
+    Deny {
+        #[serde(default)]
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +230,14 @@ pub enum SubscriptionItem {
     },
 }
 
+/// Unary reply to [`Request::Decide`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideOk {
+    /// The decision reached the agent. `false` = the question was no
+    /// longer open (already answered, or withdrawn under the click).
+    pub answered: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelloOk {
     pub proto: u32,
@@ -242,6 +276,22 @@ pub struct SessionInfo {
     /// them automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
+    /// Open permission questions right now (Slice K). A COUNT, deliberately
+    /// — the watch channel may say that a session is waiting on the
+    /// operator and how many times, and may never say which tool or which
+    /// path. Those are transcript content and travel only on that
+    /// session's own `subscribe` stream (isolation invariant, §Watch).
+    /// This is what makes a BACKGROUND session's pending approval visible
+    /// in the rail without switching to it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_approvals: u64,
+    /// The permission posture the agent CLI reported at `init` (Slice K):
+    /// the mode it says it is actually running in, not the one eave asked
+    /// for. `None` before the first spawn, or for a session recorded by an
+    /// engine predating Slice K. The rail states it, because a session in
+    /// a mode that never asks must not look like one that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 /// A session's eave-created worktree, as last observed (Slice I2).
@@ -589,6 +639,8 @@ mod tests {
                         present: true,
                         dirty_files: Some(3),
                     }),
+                    pending_approvals: 2,
+                    permission_mode: Some("default".into()),
                 }],
             }),
         };

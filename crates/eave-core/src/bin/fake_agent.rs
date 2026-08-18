@@ -59,8 +59,23 @@ fn session_id() -> String {
     argv_session().0.unwrap_or_else(|| "fake-session-1".into())
 }
 
+/// The posture the CLI announces (Slice K). The real CLI states this in
+/// its `init` frame and eave refuses any session that cannot prove it
+/// asks, so the fake states it too — `FAKE_PERMISSION_MODE` is how the
+/// tests drive the refusal paths (`acceptEdits` = a mode that never asks,
+/// `none` = a CLI that says nothing at all).
 fn emit_init() {
-    emit(json!({ "type": "system", "subtype": "init", "session_id": session_id() }));
+    let mode = std::env::var("FAKE_PERMISSION_MODE").unwrap_or_else(|_| "default".into());
+    if mode == "none" {
+        emit(json!({ "type": "system", "subtype": "init", "session_id": session_id() }));
+    } else {
+        emit(json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": session_id(),
+            "permissionMode": mode,
+        }));
+    }
 }
 
 fn emit_text(text: &str) {
@@ -352,6 +367,126 @@ fn main() {
             );
             emit_result();
             std::thread::sleep(Duration::from_millis(100));
+        }
+        // ---- Slice K: the permission channel -----------------------
+        // Ask once, then do exactly what the operator said. The request
+        // shape mirrors the real capture (docs/research/
+        // approvals-capture-2026-08-18/capC-ppt.jsonl) including the
+        // envelope-level request_id and the nested `request` object.
+        "approval-cycle" | "approval-hang" => {
+            let hang = mode == "approval-hang";
+            emit_init();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            let tool = std::env::var("FAKE_APPROVAL_TOOL").unwrap_or_else(|_| "Write".into());
+            let path = std::env::var("FAKE_APPROVAL_PATH")
+                .unwrap_or_else(|_| "/tmp/eave-fake/note.txt".into());
+            let rid = std::env::var("FAKE_APPROVAL_ID").unwrap_or_else(|_| "req-1".into());
+            emit(json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": "toolu_k1", "name": tool },
+                },
+            }));
+            emit(json!({
+                "type": "control_request",
+                "request_id": rid,
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": tool,
+                    "display_name": tool,
+                    "input": { "file_path": path, "content": "hi" },
+                    "description": "note.txt",
+                    "permission_suggestions": [
+                        { "type": "setMode", "mode": "acceptEdits", "destination": "session" }
+                    ],
+                    "blocked_path": path,
+                    "tool_use_id": "toolu_k1",
+                },
+            }));
+            if hang {
+                // Nobody will ever be told the answer: the deterministic
+                // shape for the clock-hold and withdrawal tests.
+                hang_forever();
+            }
+            // Wait for the decision, ignoring anything else on stdin.
+            loop {
+                let mut l = String::new();
+                match std::io::stdin().read_line(&mut l) {
+                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(_) => {}
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) else {
+                    continue;
+                };
+                if v.get("type").and_then(|t| t.as_str()) != Some("control_response") {
+                    continue;
+                }
+                let resp = &v["response"]["response"];
+                let allowed = resp.get("behavior").and_then(|b| b.as_str()) == Some("allow");
+                let message = resp
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                emit(json!({
+                    "type": "user",
+                    "message": { "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_k1",
+                        "content": if allowed {
+                            format!("DECISION:allow wrote {path}")
+                        } else {
+                            format!("DECISION:deny {message}")
+                        },
+                        "is_error": !allowed,
+                    }]},
+                }));
+                emit_text(if allowed { "did the thing" } else { "stood down" });
+                emit_result();
+                std::thread::sleep(Duration::from_millis(100));
+                return;
+            }
+        }
+        // A dialog request eave cannot present. The adapter must answer it
+        // with a stated refusal on its own (amendment 2); this mode proves
+        // the answer arrives by reporting what it received.
+        "dialog-request" => {
+            emit_init();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            emit(json!({
+                "type": "control_request",
+                "request_id": "dlg-1",
+                "request": { "subtype": "request_user_dialog", "kind": "ask_user_question" },
+            }));
+            loop {
+                let mut l = String::new();
+                match std::io::stdin().read_line(&mut l) {
+                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(_) => {}
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) else {
+                    continue;
+                };
+                if v.get("type").and_then(|t| t.as_str()) != Some("control_response") {
+                    continue;
+                }
+                let sub = v["response"]["subtype"].as_str().unwrap_or("");
+                let err = v["response"]["error"].as_str().unwrap_or("");
+                emit_text(&format!("DIALOG_ANSWER:{sub}:{err}"));
+                emit_result();
+                std::thread::sleep(Duration::from_millis(100));
+                return;
+            }
+        }
+        // The undocumented flag is gone: die exactly as the real CLI does
+        // for an unknown option, before announcing anything.
+        "reject-permission-flag" => {
+            eprintln!("error: unknown option '--permission-prompt-tool'");
+            std::process::exit(1);
         }
         "env-report" => {
             emit_init();

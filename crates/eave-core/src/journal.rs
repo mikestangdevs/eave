@@ -80,6 +80,19 @@ pub enum JournalEvent {
     /// sequential in v0). Absent confirmation in a terminal journal =
     /// undelivered — the UI must not render the message as sent.
     UserDelivered {},
+    /// The operator's answer to one `ApprovalRequested` (Slice K), written
+    /// at the moment it provably reached the agent. This is the audit
+    /// trail that makes "eave never auto-approves" checkable after the
+    /// fact rather than merely asserted: every allowed tool call in a
+    /// journal has a human decision recorded against it, by request id.
+    /// `message` is the operator's own words on a deny — the provider
+    /// hands them to the model verbatim, so they are part of the history.
+    ApprovalDecided {
+        request_id: String,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// Synthetic closer: a tool that was outstanding when the session ended
     /// without a terminal event. Outcome unknown — never invented.
     ToolInterrupted { id: String },
@@ -471,11 +484,17 @@ fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<Repai
                 }
                 SessionEvent::UserEcho { .. }
                 | SessionEvent::TextDelta { .. }
-                | SessionEvent::AssistantText { .. } => turn_open = true,
+                | SessionEvent::AssistantText { .. }
+                // A permission question only exists mid-turn (Slice K).
+                | SessionEvent::ApprovalRequested { .. } => turn_open = true,
                 SessionEvent::TurnCompleted { .. } => turn_open = false,
                 _ => {}
             },
             JournalEvent::UserSent { .. } | JournalEvent::UserDelivered {} => turn_open = true,
+            // A pending approval needs no synthetic closer: the `Closed`
+            // record below settles it in the shared fold (spec 05
+            // §Engine semantics), exactly as it settles a pending send.
+            JournalEvent::ApprovalDecided { .. } => {}
             JournalEvent::ToolInterrupted { id } => {
                 in_flight.remove(id);
             }
