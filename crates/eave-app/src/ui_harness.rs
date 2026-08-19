@@ -1950,6 +1950,138 @@ fn a_window_with_nothing_in_flight_never_starts_the_pulse_clock(cx: &mut TestApp
     );
 }
 
+// ---------------------------------------------------------------------------
+// Slice N4 — the idle floor, asserted instead of sampled
+
+/// How many times the ROOT is told to re-render, counted from here on.
+///
+/// The shell observes its five state entities and notifies itself whenever
+/// any of them changes, so a notification on the shell IS "this window has
+/// to be drawn again" — which is the quantity a CPU sampler is a proxy for.
+/// Counting it directly is what makes the answer survive a loaded machine:
+/// a percentage measured at load 361 measures the load.
+fn watch_redraws(h: &Harness, vcx: &mut VisualTestContext) -> Redraws {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shell = vcx.read_window(&h.window, |shell, _| shell.clone()).unwrap();
+    let sub = {
+        let count = Arc::clone(&count);
+        vcx.update(move |_, cx| {
+            cx.observe(&shell, move |_, _| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        })
+    };
+    Redraws { count, _sub: sub }
+}
+
+struct Redraws {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    _sub: gpui::Subscription,
+}
+
+impl Redraws {
+    fn get(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// **A settled window is told to re-render zero times.** This is the idle
+/// floor, and it is the number every future performance claim is read
+/// against.
+///
+/// It was chased twice with a CPU sampler and answered differently both
+/// times (11-15% of a core in N1, 0.00-0.53% in N2, same machine, same
+/// binaries) because a percentage sampled on a machine at load 361 measures
+/// the machine. This measures the thing itself, on the deterministic
+/// scheduler, where the answer cannot move.
+///
+/// Ten seconds crosses the one-second reporting ticker ten times, and that
+/// ticker is the only timer alive on a settled window: it wakes, reads two
+/// entities, finds no standing notice and no open turn, and notifies
+/// nothing. Everything else in the spine is edge-driven — the pump waits on
+/// a channel, the five observes wait on their entities, the pulse clock is
+/// not constructed at all, and the motion tail asks for nothing because
+/// nothing claimed it. If this ever reads non-zero, eave has started
+/// redrawing itself for free and the report that says otherwise is stale.
+#[gpui::test]
+fn a_settled_window_is_never_told_to_re_render(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    // Boot's entrance (N2) is legitimately mid-flight, and a window with a
+    // tween running is not the state under test — it is the state the tween
+    // is *supposed* to cost. Settle it first. `drive` panics rather than
+    // spinning if it never settles, so "the entrance never ends" fails here
+    // as loudly as "the idle window redraws" fails below.
+    drive(&h, vcx, Duration::from_millis(16));
+
+    let redraws = watch_redraws(&h, vcx);
+    for _ in 0..10 {
+        vcx.executor().advance_clock(Duration::from_secs(1));
+        vcx.run_until_parked();
+    }
+
+    assert_eq!(
+        redraws.get(),
+        0,
+        "a window with nothing selected, nothing streaming and no notice \
+         standing redrew itself while the operator was away from the desk"
+    );
+    assert!(
+        !clock_running(vcx),
+        "ten seconds of idling constructed the pulse clock"
+    );
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0,
+        "and it asked for a frame on the way out"
+    );
+}
+
+/// The one thing on a settled window that never stops on its own, and the
+/// rate it runs at.
+///
+/// A standing attention notice ("quiet for 30s") has to keep its elapsed
+/// text moving, so the reporting ticker notifies the rail once a second for
+/// as long as the notice stands — which can be hours, since nothing clears
+/// a notice but the session changing state. That is the whole of eave's
+/// unbounded idle cost, and this pins its rate.
+///
+/// The expected count is a literal. Deriving it from the ticker's own
+/// `Duration::from_secs(1)` would make this pass at any rate, including the
+/// 30 Hz the pulse clock runs at — which is exactly the mistake N1 shipped
+/// and mutation-testing caught.
+#[gpui::test]
+fn a_standing_notice_redraws_once_a_second_and_not_faster(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    h.plumbing.push_attn((
+        "aaaa1111".into(),
+        AttentionSnapshot::Quiet {
+            since_ms: 0,
+            reason: WaitReason::Idle,
+        },
+    ));
+    vcx.run_until_parked();
+
+    let redraws = watch_redraws(&h, vcx);
+    for _ in 0..10 {
+        vcx.executor().advance_clock(Duration::from_secs(1));
+        vcx.run_until_parked();
+    }
+
+    assert_eq!(
+        redraws.get(),
+        10,
+        "a standing notice must cost ONE redraw a second — no more (a \
+         faster clock is a regression) and no fewer (a notice whose \
+         elapsed text has stopped moving is lying about how long it has \
+         been standing)"
+    );
+}
+
 /// The lease, end to end through the real shell: a running session takes
 /// one, and the session settling lets the clock park itself. Nobody stops
 /// the clock — it stops when the last lease lapses, and if this test ever
