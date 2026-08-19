@@ -424,6 +424,17 @@ impl MenuItem {
 /// whole on the frame the arrow key lands. Same shape as the send
 /// button's arming (Slice M), same reason, and correct here — a keyboard
 /// highlight that eased in would lag behind a held arrow key.
+///
+/// **If you add a leading icon here, colour the `svg` itself.** The
+/// `.text_color()` below cascades to the label because a div pushes its
+/// text style onto the window's text stack for its children
+/// (`div.rs`, `with_text_style`). An `svg` does NOT read that stack:
+/// `Svg::paint` guards on `style.text.color` from its *own* computed
+/// style, which is `Style::default()` refined only by the element's own
+/// base style — so an uncoloured glyph silently paints nothing, at the
+/// right size, in the right slot, and every bounds-based assertion still
+/// passes. Slice P3 shipped six sites that way and 254 tests agreed with
+/// it; see `docs/reports/stage-p3-icons.md`.
 pub fn menu_row(
     ix: usize,
     item: &MenuItem,
