@@ -1,9 +1,14 @@
-//! The frame drive (Slice N1) and the tweens it drives (Slice N2).
+//! The frame drive (Slice N1), the tweens it drives (Slice N2), and the
+//! loaders that ride its clock (Slice N3).
 //!
-//! N1 built this as machinery with no consumers, behind a blanket
-//! `dead_code` allow. N2 is the first consumer and took the allow off; what
-//! is still unreached now carries a *named* allow with the inventory item
-//! that will reach it, so the compiler keeps the rest of the module honest.
+//! N1 built this as machinery with no consumers at all, behind a blanket
+//! `#![allow(dead_code)]`. N2 was the first consumer and took the allow
+//! off; N3 is the first consumer of the *clock* half. What is still
+//! unreached carries a **named** allow saying which inventory item will
+//! reach it, so the compiler keeps every other line of the module honest —
+//! which was the point of the exercise: under the blanket, a wrong API
+//! shape was invisible, because the only callers were tests written by the
+//! same pass that wrote the code.
 //!
 //! Everything that moves needs a per-frame source, and gpui offers exactly
 //! one out of the box: `with_animation`, which requests a redraw every
@@ -170,14 +175,17 @@ impl CubicBezier {
 
 /// CSS `cubic-bezier(0.16, 1, 0.3, 1)` — the signature entrance curve:
 /// almost all of the distance in the first third, then a long settle.
+#[allow(dead_code)] // inventory §1.3 (fade-in) is its first consumer.
 pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
 /// CSS `ease-out` — size transitions.
 #[allow(dead_code)] // inventory §1.8 (200 ms pane/rail size transitions) is its caller; unbuilt.
 pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
 /// CSS `ease` — quick fades, menu/dialog pops.
+#[allow(dead_code)] // inventory §1.5 / §1.6 (menu, dialog) are its first consumers.
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 /// CSS `cubic-bezier(0.22, 1, 0.36, 1)` — reorder glides.
-#[allow(dead_code)] // inventory §1.9 (drag-reorder glide) is its caller; unbuilt.
+#[allow(dead_code)] // inventory §1.17 (260 ms FLIP reorder) is its caller,
+                    // §1.9 (drag-reorder glide) the second; both unbuilt.
 pub const EASE_RESORT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
 /// CSS `ease-in-out` — scroll glides (the browser smooth-scroll shape:
 /// gentle start, cruise, gentle landing).
@@ -186,6 +194,7 @@ pub const EASE_IN_OUT: CubicBezier = CubicBezier::new(0.42, 0.0, 0.58, 1.0);
 /// Tailwind's default transition curve — CSS `cubic-bezier(0.4, 0, 0.2, 1)`.
 /// Every `transition-colors` hover wash in a Tailwind UI rides this unless
 /// it is overridden, which is why the hover fade below carries it.
+#[allow(dead_code)] // reached only through HOVER_FADE, itself unreached.
 pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
 
 // ---------------------------------------------------------------------------
@@ -249,6 +258,12 @@ impl MotionSpec {
     /// knob does not appear here on purpose: it stretches the wall-clock
     /// span, and the delta arriving here is already normalised over it, so
     /// a scaled run traces exactly the same curve more slowly.
+    // Unreached in production (the tests drive it). N3's loaders read the
+    // curve directly for a repeating wave; `progress` is the oneshot half,
+    // and the entrances (§1.3) are what will run on it. eave's one shipped
+    // oneshot, the veil, still runs `theme::veil_ease` — migrating it is a
+    // visual change to a shipped animation (N1 caveat 8).
+    #[allow(dead_code)]
     pub fn progress(&self, raw_delta: f32) -> f32 {
         let total = (self.delay_ms + self.duration_ms) as f32;
         if total <= 0.0 || self.duration_ms == 0 {
@@ -279,6 +294,7 @@ impl MotionSpec {
 /// Loader periods and entrance timings are design decisions belonging to the
 /// slice that renders them; only the machinery lands in N1, and the hover
 /// fade is the one entry whose value is a CSS default rather than a taste.
+#[allow(dead_code)] // inventory §1.13 — every hover wash still snaps.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
 
 /// The standard entrance (inventory §1.3): 500 ms over [`EASE_OUT_EXPO`],
@@ -361,7 +377,7 @@ impl Global for PulseClock {}
 /// "does this state of the shell cost anything at rest" — a `false` means no
 /// timer is pending anywhere in the window.
 #[cfg(test)]
-pub fn clock_is_running(cx: &App) -> bool {
+pub fn clock_running(cx: &App) -> bool {
     cx.has_global::<PulseClock>() && cx.global::<PulseClock>().running
 }
 
@@ -418,9 +434,9 @@ pub fn pulse_now(view: EntityId, cx: &mut App) -> Option<Instant> {
 /// apart read the same phase; that is the whole reason this exists rather
 /// than each loader timing itself.
 ///
-/// Still unconsumed after N2 — the loaders (inventory §1.14, §1.15) are what
-/// the phase lock is for, and neither is built.
-#[allow(dead_code)] // see above: §1.14 / §1.15 are its callers.
+/// Slice N3 is the caller that pays for the phase lock: every working
+/// indicator in the window reads its phase from here on the same frame
+/// (inventory §1.14, §1.15).
 pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
     let Some(now) = pulse_now(view, cx) else {
         return 0.0;
@@ -492,6 +508,14 @@ thread_local! {
 /// window and renders on one thread, so neither is a live problem — but
 /// both are properties of the `thread_local`, not accidents to be relied
 /// on if that changes.
+// Unreached, and worth saying why rather than deleting: N3 is the first
+// consumer slice and it does not need the tail at all. Everything it drives
+// is REPEATING, and a repeating consumer is driven by the clock's own
+// `cx.notify` — the tail exists for hand-driven ONESHOTS, which arrive with
+// the entrances (§1.3). Until then `take_active()` at the end of
+// `Shell::render` always answers false, which is exactly the invariant N1
+// wanted: nothing mid-flight schedules nothing.
+#[allow(dead_code)]
 pub fn mark_active() {
     MOTION_ACTIVE.with(|f| f.set(true));
 }
@@ -1024,7 +1048,7 @@ mod tests {
     }
 
     fn running(cx: &TestAppContext) -> bool {
-        cx.update(|cx| clock_is_running(cx))
+        cx.update(|cx| clock_running(cx))
     }
 
     /// The invariant the whole design exists to hold. A window whose views

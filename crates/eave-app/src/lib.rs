@@ -14,6 +14,11 @@ mod edge_fade;
 /// runs use.
 mod motion;
 
+/// The loaders (Slice N3): the working indicator and the skeletons — the
+/// first consumer of `motion`. Private for the same reason: it renders,
+/// and the headless acceptance runs do not.
+mod loaders;
+
 pub mod display;
 pub mod fixture;
 pub mod markdown;

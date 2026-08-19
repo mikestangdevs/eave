@@ -569,6 +569,59 @@ pub const STATE_DOT: f32 = 6.0;
 pub const TOOL_DOT: f32 = 5.0;
 
 // ---------------------------------------------------------------------------
+// Loaders (Slice N3) — the working indicator and the skeletons.
+//
+// These are the design values N1 deliberately left out of its catalog
+// (`motion.rs` caveat 7: loader periods are a decision about how eave
+// FEELS, not machinery), so they live here with every other design value.
+// The curve they ride is `motion::EASE_IN_OUT` and the spec assembled
+// from these numbers is `loaders::WORK_PULSE` — the shapes themselves are
+// in `loaders.rs`, because an element is not a design value.
+
+/// One period for every working indicator in the window. The pulse clock
+/// runs them all off one epoch, so a rail dot and the transcript trailer
+/// visibly share a clock rather than wobbling against each other; that
+/// only reads as deliberate if they also share a period.
+///
+/// 1.2 s is a taste decision, and the taste is: slow enough that a 6 px
+/// dot in peripheral vision reads as breathing rather than blinking, fast
+/// enough that any glance longer than half a period catches movement. At
+/// the clock's 33 ms tick that is ~36 frames a period.
+pub const WORK_PULSE_MS: u64 = 1200;
+
+/// What a cell fades DOWN to, as a fraction of its full color. Not zero:
+/// a working indicator whose cells reach invisible flickers, and the dot
+/// forms are replacing STATE dots — a state dot that disappears twice a
+/// second is stating something false about the session.
+pub const WORK_CELL_REST: f32 = 0.28;
+
+/// Gap between the four cells of a dot-slot indicator. The cells are
+/// sized from the slot around this, so the indicator is exactly as big as
+/// the dot it replaces ([`STATE_DOT`] or [`TOOL_DOT`]) — the whole point
+/// of a fixed slot is that a load-state flip moves nothing.
+pub const WORK_DOT_GAP: f32 = HAIRLINE;
+
+/// The in-flow bar form: cells and their geometry. Used where a caret
+/// used to sit and in the transcript trailer, so the cell is sized to
+/// read at body scale without becoming a progress bar.
+pub const WORK_BAR_CELLS: usize = 4;
+pub const WORK_BAR_CELL: f32 = 3.0;
+pub const WORK_BAR_GAP: f32 = SPACE_HALF;
+
+/// Skeleton rows for a load state. The slot height is [`DETAIL_LINE`] —
+/// the line height of the stated-fact text a skeleton stands in for at
+/// both of its sites — and the bar pulses INSIDE that slot, so the
+/// skeleton occupies the same rhythm the arriving content will.
+pub const SKELETON_ROW_H: f32 = DETAIL_LINE;
+pub const SKELETON_BAR_H: f32 = SPACE_2;
+pub const SKELETON_ROWS: usize = 5;
+/// Bar widths as a fraction of the container, cycled down the rows.
+/// Arbitrary but fixed: skeleton bars of equal width read as a progress
+/// meter, and a meter would be a claim about how far along the load is —
+/// which eave does not know.
+pub const SKELETON_WIDTHS: [f32; 5] = [0.72, 0.46, 0.88, 0.34, 0.61];
+
+// ---------------------------------------------------------------------------
 // Session rail (Slice A) — comet's shell model (directive 2026-08-17):
 // the rails paint NO surface of their own. Their rows sit directly on
 // the glass ground, and the CONTENT WELL between them is the

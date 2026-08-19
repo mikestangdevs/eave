@@ -41,6 +41,7 @@ use eave_wire::{
 
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
+use crate::loaders;
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::motion::{self, HoverFade as _};
 use crate::theme;
@@ -751,7 +752,7 @@ fn count_labels(adds: Option<u64>, dels: Option<u64>) -> Option<(String, String)
 /// shape is a stated fact — binary, symlink, submodule, rename, error,
 /// truncation all render as words; only add/remove lines get pigment
 /// (the washes), because add/remove IS state and nothing else here is.
-fn diff_pane(f: &ChangedFile, fetch: &DiffFetch) -> AnyElement {
+fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyElement {
     let fact = |text: String| {
         div()
             .text_size(px(theme::DETAIL_SIZE))
@@ -765,7 +766,16 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch) -> AnyElement {
         children.push(fact(format!("renamed from {orig}")));
     }
     match fetch {
-        DiffFetch::Loading => children.push(fact("…".into())),
+        // Slice N3: the diff is on its way. Skeleton lines in the pane's
+        // own line rhythm, so the arriving hunks land where the skeleton
+        // already was.
+        DiffFetch::Loading => {
+            children.push(
+                loaders::skeleton(theme::SKELETON_ROWS, phase)
+                    .debug_selector(|| "diff-skeleton".into())
+                    .into_any_element(),
+            )
+        }
         DiffFetch::Failed(message) => children.push(fact(format!("diff unavailable: {message}"))),
         DiffFetch::Ready(diff) => match &diff.kind {
             DiffKind::Binary => children.push(fact("binary file — no text diff".into())),
@@ -1159,6 +1169,22 @@ struct TranscriptState {
     /// The composer, read at deny time for the operator's reason and
     /// cleared once it has been spent (see [`Shell::deny_reason`]).
     composer: Option<Entity<ComposerState>>,
+    /// Slice N3 — the live-turn clock behind the working trailer.
+    ///
+    /// A signed BALANCE, never a bool. The recorder's two input channels
+    /// are unordered relative to each other, so a fast CLI's
+    /// `TurnCompleted` can be journaled BEFORE the `UserDelivered` that
+    /// opened its turn (progress.md trap; `attention::Classifier`'s
+    /// `turn_balance` is the engine-side twin of this field, and a bool
+    /// there was a ~40% flake). Floored at −1 so the pair nets to closed
+    /// in either arrival order — the failure a bool buys here is a
+    /// phantom turn whose trailer never goes away.
+    turn_balance: i32,
+    /// When the operator asked, in journal ms: the `UserSent` timestamp.
+    /// From the journal rather than from when this process happened to
+    /// attach, so a session opened mid-turn reports the turn's real age
+    /// and not the age of the subscription.
+    turn_started_ms: Option<u64>,
 }
 
 impl TranscriptState {
@@ -1179,7 +1205,18 @@ impl TranscriptState {
             assert_replay: None,
             commands: None,
             composer: None,
+            turn_balance: 0,
+            turn_started_ms: None,
         }
+    }
+
+    /// Is a turn in flight right now? (Slice N3.) The engine's own
+    /// `SessionInfo.state` cannot answer this: the real CLI **lingers**
+    /// after `turn_completed` waiting for more stdin, so it still reads
+    /// `running` between turns (progress.md). The turn boundary on the
+    /// wire is `TurnCompleted`, which is what the balance counts.
+    fn in_turn(&self) -> bool {
+        self.turn_balance > 0
     }
 
     fn live_len(&self) -> Option<(u32, usize)> {
@@ -1197,6 +1234,28 @@ impl TranscriptState {
         let user_rows_before = self.transcript.rows.len();
         if self.transcript.apply(epoch, records).is_err() {
             return Err(());
+        }
+        // Slice N3: the live-turn clock, folded from the same batch. After
+        // the apply, so a batch rejected for a sequence gap never moves it.
+        for rec in records {
+            match &rec.event {
+                eave_core::journal::JournalEvent::UserSent { .. } => {
+                    self.turn_started_ms = Some(rec.ts_ms);
+                }
+                eave_core::journal::JournalEvent::UserDelivered {} => {
+                    self.turn_balance = (self.turn_balance + 1).min(8);
+                }
+                // A segment ended: whatever was open died with the process.
+                eave_core::journal::JournalEvent::Closed { .. } => {
+                    self.turn_balance = 0;
+                }
+                eave_core::journal::JournalEvent::Provider {
+                    event: eave_core::events::SessionEvent::TurnCompleted { .. },
+                } => {
+                    self.turn_balance = (self.turn_balance - 1).max(-1);
+                }
+                _ => {}
+            }
         }
         let ops = self.display.update(&self.transcript);
         // List item count is always display rows + 1: the trailing
@@ -1334,6 +1393,11 @@ impl TranscriptState {
         self.display.update(&self.transcript);
         self.list.reset(self.display.len() + 1);
         self.veil = None;
+        // Slice N3: the turn clock is a projection like everything else
+        // here — a replay re-derives it, and a switch must not carry the
+        // old session's open turn into the new one's trailer.
+        self.turn_balance = 0;
+        self.turn_started_ms = None;
     }
 }
 
@@ -1924,7 +1988,7 @@ impl Shell {
     /// The highlight is a projection of the feed task's actual
     /// subscription (`TranscriptState::session_id`); clicking only
     /// *requests* a switch.
-    fn rail(&self, cx: &Context<Self>) -> AnyElement {
+    fn rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
         let mut sessions = self.sessions.read(cx).sessions.clone();
         sessions.sort_by(|a, b| b.created_ts_ms.cmp(&a.created_ts_ms));
         let selected = self.transcript.read(cx).session_id.clone();
@@ -2032,7 +2096,20 @@ impl Shell {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(div().size(px(theme::STATE_DOT)).flex_none().rounded_full().bg(dot))
+                            .child(
+                                // Slice N3: a running session's dot works;
+                                // every other state keeps the solid dot it
+                                // has always had. `quiet`/`failed`/`done`
+                                // are states, not activity — a pulsing
+                                // danger dot would say "still going" over
+                                // a session that is provably dead.
+                                loaders::work_dot(
+                                    theme::STATE_DOT,
+                                    dot,
+                                    phase.filter(|_| info.state == "running"),
+                                )
+                                .flex_none(),
+                            )
                             .child(
                                 div()
                                     .size(px(theme::PROVIDER_CHIP))
@@ -2389,7 +2466,7 @@ impl Shell {
     /// all render as plain words, never as an error or an empty void.
     /// Session-tagged like the attention overlay: data from a deselected
     /// session never renders.
-    fn files_rail(&self, cx: &Context<Self>) -> AnyElement {
+    fn files_rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
         let selected = self.transcript.read(cx).session_id.clone();
         let held = self.files.read(cx).snapshot.clone();
         // Some(None) = engine refused; Some(Some) = snapshot; None = no
@@ -2418,7 +2495,20 @@ impl Shell {
                 .into_any_element()
         };
         let (count_label, body): (Option<String>, AnyElement) = match &current {
-            None => (None, fact("…")),
+            // Slice N3: the snapshot has not arrived yet. The single
+            // character `…` was the same picture whether it was seconds
+            // away or never coming; skeleton rows at least say a LIST is
+            // what is coming, in the rhythm it will arrive in.
+            None => (
+                None,
+                div()
+                    .px(px(theme::SPACE_2))
+                    .child(
+                        loaders::skeleton(theme::SKELETON_ROWS, phase)
+                            .debug_selector(|| "files-skeleton".into()),
+                    )
+                    .into_any_element(),
+            ),
             Some(None) => (None, fact("file status unavailable — engine predates it")),
             Some(Some(snap)) => match &snap.state {
                 GitState::NotARepo => (None, fact("not a git repository")),
@@ -2441,7 +2531,7 @@ impl Shell {
                         rows.push(self.file_row(f, expanded, cx));
                         if expanded {
                             if let Some((_, fetch)) = &diff_slot {
-                                rows.push(diff_pane(f, fetch));
+                                rows.push(diff_pane(f, fetch, phase));
                             }
                         }
                     }
@@ -2806,6 +2896,112 @@ impl Shell {
         )
     }
 
+    /// Is anything in this window mid-flight this frame? (Slice N3.)
+    ///
+    /// The ONE place that decides whether the pulse clock gets a lease,
+    /// and therefore whether the window schedules any work at all. Every
+    /// arm names the render site it answers for, because a gate that
+    /// drifts from its sites fails in one of two directions: under-eager
+    /// freezes an indicator mid-wave, over-eager leaves a 30 fps timer
+    /// running over a still picture. Over-eager is the safe side and this
+    /// is deliberately a superset — a site that draws nothing costs a
+    /// timer, a site that draws a frozen loader is a bug report.
+    fn work_in_flight(&self, cx: &Context<Self>) -> bool {
+        // The rail's state dots.
+        if self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .any(|s| s.state == "running")
+        {
+            return true;
+        }
+        let selected = self.transcript.read(cx).session_id.clone();
+        let files = self.files.read(cx);
+        // The files rail: a selected session whose snapshot has not
+        // arrived (the skeleton rows).
+        if !files.collapsed && selected.is_some() {
+            let arrived = matches!(&files.snapshot, Some((sid, _)) if Some(sid.as_str()) == selected.as_deref());
+            if !arrived {
+                return true;
+            }
+        }
+        // The diff pane's own load.
+        if matches!(&files.diff, Some(d) if matches!(d.fetch, DiffFetch::Loading)) {
+            return true;
+        }
+        let state = self.transcript.read(cx);
+        // The working trailer.
+        if state.in_turn() {
+            return true;
+        }
+        // A running tool row, or a live message with nothing in it yet.
+        // Reverse order: both live at the tail of the log, so the scan
+        // that finds something exits at once and only a settled log is
+        // walked in full.
+        state.transcript.rows.iter().rev().any(|r| match r {
+            Row::Tool { status, .. } => matches!(status, ToolStatus::Running),
+            Row::Assistant { live, .. } => *live,
+            _ => false,
+        })
+    }
+
+    /// The working trailer (Slice N3, inventory §3.6): what a healthy
+    /// running turn looks like.
+    ///
+    /// Until this slice eave had **no in-flow indicator for one at all**.
+    /// A turn that was working and a turn that was wedged rendered
+    /// identically, and an elapsed time only appeared once the engine had
+    /// already escalated the session to `quiet` — which is to say, only
+    /// after something had gone wrong.
+    ///
+    /// It sits in the floating chrome stack, in the same slot the
+    /// attention notice uses, and only when that notice is absent. Two
+    /// consequences, both intended: the operator reads one sentence in
+    /// one place and one voice ("working for 12s" → "quiet for 30s"),
+    /// and — because the stack is a SIBLING of the virtualized list,
+    /// anchored to the bottom of the well — the trailer can never
+    /// participate in a row's cached height or move the composer.
+    ///
+    /// No flavour word. comet rotates a 20-word vocabulary here every 7 s
+    /// (Thinking, Pondering, Scheming…); eave's register is instrument,
+    /// so the trailer states the fact and the elapsed time and nothing
+    /// else (report §7.1 on the two voices).
+    fn work_trailer(&self, phase: Option<f32>, cx: &Context<Self>) -> Option<AnyElement> {
+        let state = self.transcript.read(cx);
+        if !state.in_turn() {
+            return None;
+        }
+        // No `UserSent` seen means no honest clock to report; the
+        // indicator alone still states that something is running. Never
+        // invent a start time from when this process attached.
+        let elapsed = state
+            .turn_started_ms
+            .map(|started| fmt_elapsed(eave_core::journal::now_ms().saturating_sub(started)));
+        Some(
+            Self::column(
+                div()
+                    .debug_selector(|| "work-trailer".into())
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .pb(px(theme::SPACE_2))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(loaders::work_bar(theme::live(), phase))
+                    .child(SharedString::from(match elapsed {
+                        Some(e) => format!("working for {e}"),
+                        None => "working".to_string(),
+                    })),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// The attention notice (spec 01 §States): `quiet` escalates subtle →
     /// prominent and reports elapsed steadily; `unresponsive` and `failed`
     /// are prominent panels with the evidence/cause and a kill affordance.
@@ -3019,7 +3215,7 @@ impl Shell {
     /// Every row wraps its content in the shared reading column; vertical
     /// rhythm lives on the row (turn gap before a directive, block gap
     /// after prose) so virtualization owns all spacing.
-    fn render_row(state: &TranscriptState, ix: usize) -> AnyElement {
+    fn render_row(state: &TranscriptState, ix: usize, phase: Option<f32>) -> AnyElement {
         let Some(row) = state.display.row(ix).copied() else {
             // The one index past the content is the under-glass spacer
             // (Stage H): it holds Follow's newest row above the floating
@@ -3096,7 +3292,13 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().size(px(theme::TOOL_DOT)).rounded_full().bg(dot))
+                    .child(loaders::work_dot(
+                        theme::TOOL_DOT,
+                        dot,
+                        // Only while it is actually running: `done` and
+                        // `interrupted` are settled facts.
+                        phase.filter(|_| matches!(status, ToolStatus::Running)),
+                    ))
                     .child(
                         div()
                             .font_family(theme::MONO)
@@ -3149,12 +3351,20 @@ impl Shell {
                 .into_any_element(),
             Row::Assistant { text: msg_text, live } => {
                 let Some(block) = state.display.block(id) else {
-                    // Placeholder row of an empty live message.
+                    // Placeholder row of an empty live message. Slice N3
+                    // replaced the static `▌` here: a caret that never
+                    // moves is the same picture whether the agent is
+                    // mid-thought or wedged. The slot is pinned to ONE
+                    // body line so the row's cached height cannot depend
+                    // on the phase — the indicator only ever changes
+                    // opacity inside it.
                     return Self::column(
                         div()
                             .pt(px(theme::MSG_TOP_GAP))
-                            .text_color(theme::live())
-                            .child("▌"),
+                            .h(px(theme::BODY_LINE))
+                            .flex()
+                            .items_center()
+                            .child(loaders::work_bar(theme::live(), phase)),
                     )
                     .into_any_element();
                 };
@@ -3606,6 +3816,15 @@ impl Render for Shell {
 
         // Before the immutable reads below: this one takes a pulse lease.
         let caret_lit = self.caret_lit(cx);
+        // Slice N3: ONE ask for the whole window, here in the root
+        // render pass. The shell decides once whether anything is
+        // mid-flight, takes one lease on the pulse clock for it, and
+        // hands the same phase to every indicator — which is what keeps
+        // them phase-locked (N1 §1), and what keeps a window with nothing
+        // in flight from constructing the clock at all.
+        let working = self.work_in_flight(cx);
+        let view = cx.entity_id();
+        let pulse = loaders::pulse(working, view, cx);
 
         let transcript_entity = self.transcript.clone();
         let state = self.transcript.read(cx);
@@ -3648,7 +3867,7 @@ impl Render for Shell {
         };
 
         let transcript_el = list(list_state, move |ix, _window, cx| {
-            transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix))
+            transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
         })
         .size_full();
 
@@ -3790,6 +4009,16 @@ impl Render for Shell {
         ))
         .flex_none();
 
+        // Slice N3: the healthy-turn half of the attention slot. The
+        // notice owns the slot whenever it has anything to say, so the
+        // two are mutually exclusive by construction and never stack.
+        let notice = self.attention_notice(cx);
+        let trailer = if notice.is_none() {
+            self.work_trailer(pulse, cx)
+        } else {
+            None
+        };
+
         // Opaque window by default, custom titlebar — locked decision
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
         // Under `EAVE_VIBRANCY=1` this root bg is the glass ground.
@@ -3820,7 +4049,7 @@ impl Render for Shell {
                     .min_h(px(0.))
                     .flex()
                     .flex_row()
-                    .when(!rail_collapsed, |d| d.child(self.rail(cx)))
+                    .when(!rail_collapsed, |d| d.child(self.rail(cx, pulse)))
                     .child(
                         // The content well: an inset rounded card floating
                         // over the glass ground (comet's shell model) — the
@@ -3985,13 +4214,14 @@ impl Render for Shell {
                                             .flex()
                                             .flex_col()
                                             .children(self.conn_panel(cx))
-                                            .children(self.attention_notice(cx))
+                                            .children(notice)
+                                            .children(trailer)
                                             .child(composer),
                                     ),
                             )
                             .child(self.footer(cx)),
                     )
-                    .when(!files_collapsed, |d| d.child(self.files_rail(cx))),
+                    .when(!files_collapsed, |d| d.child(self.files_rail(cx, pulse))),
             );
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
@@ -4345,12 +4575,22 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     // moves. Costs one entity read per second when idle.
     {
         let sessions = sessions.clone();
+        let transcript = transcript.clone();
         cx.spawn(async move |cx| loop {
             cx.background_executor()
                 .timer(Duration::from_secs(1))
                 .await;
             if sessions.read_with(cx, |s, _| s.notice_standing()) {
                 sessions.update(cx, |_, cx| cx.notify());
+            }
+            // Slice N3: the working trailer's elapsed has to move too,
+            // and it must NOT lean on the pulse clock for it. Under
+            // reduced motion no lease is ever taken and no pulse timer
+            // exists, so a trailer driven only by the loader would freeze
+            // its clock for exactly the people who asked for less motion.
+            // This second is the trailer's only guaranteed heartbeat.
+            if transcript.read_with(cx, |t, _| t.in_turn()) {
+                transcript.update(cx, |_, cx| cx.notify());
             }
         })
         .detach();

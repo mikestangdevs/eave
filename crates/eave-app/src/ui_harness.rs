@@ -1724,14 +1724,14 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     drive(&h, vcx, Duration::from_millis(10));
     assert!(
-        !vcx.update(|_, cx| motion::clock_is_running(cx)),
+        !vcx.update(|_, cx| motion::clock_running(cx)),
         "an idle shell with an empty composer had the pulse clock running"
     );
 
     vcx.simulate_keystrokes("h i");
     vcx.run_until_parked();
     assert!(
-        vcx.update(|_, cx| motion::clock_is_running(cx)),
+        vcx.update(|_, cx| motion::clock_running(cx)),
         "a draft did not put the caret on the clock"
     );
 
@@ -1742,7 +1742,7 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
     vcx.executor().advance_clock(Duration::from_secs(1));
     vcx.run_until_parked();
     assert!(
-        !vcx.update(|_, cx| motion::clock_is_running(cx)),
+        !vcx.update(|_, cx| motion::clock_running(cx)),
         "the clock kept ticking after the draft was sent"
     );
     assert_eq!(h.window.update(vcx, |_, window, cx| window.simulate_next_frame(cx)).unwrap(), 0);
@@ -1886,5 +1886,341 @@ fn a_glyph_swap_would_move_the_text_which_is_why_the_blink_recolours(
         "if these were the same width a glyph swap would be a legitimate \
          way to blink; they are not, so the blink recolours a run and the \
          string never changes (`Shell::render`, the has_draft branch)"
+    );
+}
+
+// Slice N3 — the loaders.
+//
+// Two things are asserted here and they are different in kind. The first
+// three tests are about COST: N1's whole design is "a window with nothing
+// mid-flight schedules nothing at all", and N3 is the first slice that
+// could break it, because it is the first slice that ever asks. The rest
+// are about the trailer, whose one structural risk is that it lives near
+// the tail of a virtualized list — so the test that matters is the one
+// proving it is not IN the list.
+//
+// `motion::clock_running` is the instrument for the first group: the tick
+// task's own liveness, not a proxy for it.
+
+/// The confirmation that the `UserSent` above reached the agent.
+fn delivered_record(seq: u64) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::UserDelivered {},
+    }
+}
+
+/// The turn boundary as it arrives on the wire. NOT `Closed` — the real
+/// CLI lingers after this waiting for more stdin (progress.md), which is
+/// exactly why the trailer cannot key off the session's state.
+fn turn_completed_record(seq: u64) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::TurnCompleted {
+                subtype: "success".into(),
+                is_error: false,
+            },
+        },
+    }
+}
+
+fn clock_running(vcx: &mut VisualTestContext) -> bool {
+    vcx.update(|_, cx| motion::clock_running(cx))
+}
+
+/// N1's invariant, now that something in the tree actually asks. A shell
+/// with nothing in flight must not merely park the clock — it must never
+/// construct it, so the window schedules no work of any kind.
+#[gpui::test]
+fn a_window_with_nothing_in_flight_never_starts_the_pulse_clock(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // A session the engine is NOT running, and no selected transcript.
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert!(!clock_running(vcx), "an idle shell leased the pulse clock");
+
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    assert!(
+        !clock_running(vcx),
+        "a second of wall clock started a drive with nothing in flight"
+    );
+}
+
+/// The lease, end to end through the real shell: a running session takes
+/// one, and the session settling lets the clock park itself. Nobody stops
+/// the clock — it stops when the last lease lapses, and if this test ever
+/// has to be relaxed the design changed, not the test.
+#[gpui::test]
+fn a_running_session_leases_the_clock_and_a_settled_one_lets_it_park(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut running = session("aaaa1111");
+    running.state = "running".into();
+    h.plumbing.push_rail(vec![running.clone()]);
+    vcx.run_until_parked();
+    assert!(
+        clock_running(vcx),
+        "a running session's dot did not take a lease"
+    );
+
+    let mut settled = running;
+    settled.state = "done".into();
+    h.plumbing.push_rail(vec![settled]);
+    vcx.run_until_parked();
+    // Well past both the 33 ms tick and the 300 ms lease. The assertion
+    // is that it stopped, not that it stopped promptly.
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    assert!(
+        !clock_running(vcx),
+        "the clock kept ticking over a settled session"
+    );
+}
+
+/// Reduced motion is honoured before the lease, not after it: a machine
+/// whose owner asked for less motion runs no timer at all, however much
+/// work is in flight. The picture it gets is the resting one — the solid
+/// dots eave drew before this slice — never a loader frozen mid-wave.
+#[gpui::test]
+fn reduced_motion_starts_no_clock_however_much_is_in_flight(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    vcx.update(|_, cx| cx.set_reduce_motion(true));
+    let mut running = session("aaaa1111");
+    running.state = "running".into();
+    h.plumbing.push_rail(vec![running]);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    assert!(
+        !clock_running(vcx),
+        "reduced motion still started the pulse clock"
+    );
+    // The FACT survives the preference — only the motion goes.
+    assert!(
+        shown(vcx, "work-trailer"),
+        "reduced motion removed the working trailer instead of its motion"
+    );
+}
+
+/// The gap this slice exists to close: eave had no in-flow indicator for
+/// a healthy running turn at all, and no elapsed time until the engine
+/// had already escalated the session to `quiet`.
+#[gpui::test]
+fn a_live_turn_gets_a_trailer_and_the_turn_ending_takes_it_away(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+    assert!(
+        shown(vcx, "work-trailer"),
+        "a turn in flight must say so in the log"
+    );
+
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![turn_completed_record(3)],
+    });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "work-trailer"),
+        "the trailer outlived the turn it was reporting"
+    );
+}
+
+/// The delivery pair is netted, not flagged. The recorder's two input
+/// channels are unordered relative to each other, so a fast CLI's
+/// `TurnCompleted` can be journaled BEFORE the `UserDelivered` that
+/// opened its turn — the engine-side classifier had a ~40% flake from a
+/// bool here, and the symptom on this side would be a phantom trailer
+/// that never goes away.
+#[gpui::test]
+fn the_turn_clock_nets_the_delivery_pair_in_either_order(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(
+        &h,
+        vcx,
+        vec![
+            user_record(1, "go"),
+            turn_completed_record(2),
+            delivered_record(3),
+        ],
+    );
+    assert!(
+        !shown(vcx, "work-trailer"),
+        "a completion that arrived before its own delivery left a phantom turn open"
+    );
+}
+
+/// **The structural assertion the trailer exists to survive.** It sits
+/// near the tail of a bottom-anchored virtualized list, which is exactly
+/// where a new row would shove every other row up by its own height. It
+/// is not a row: it lives in the floating chrome stack, a sibling of the
+/// list. So the trailer appearing and disappearing must move nothing.
+///
+/// The instrument is an approval card's button, because it is the one
+/// thing rendered INSIDE a list row that carries a selector — its bounds
+/// are a direct readout of the list's layout.
+///
+/// **This assertion is mutation-checked, and it needed to be.** The
+/// harness runs on the Noop text system, where every glyph has the same
+/// synthetic advance, so no `debug_bounds` assertion can catch a width
+/// change — only a change in box structure (Slice N2 lost a test to
+/// exactly that). This one survives because it is a *differential* y
+/// comparison: a constant-but-wrong advance moves both samples equally.
+/// Proved rather than argued — making the list's tail spacer take 20 px
+/// while a turn is open fails it with `y: 497px` vs `y: 517px`.
+///
+/// If this ever goes red on a tree where the trailer is provably still
+/// chrome, suspect the approve/deny buttons before the trailer: their
+/// hover wash is Slice N2's `hover_fade`, and they are the only N2 surface
+/// inside a transcript row. It is a `bg` plus a listener and participates
+/// in no layout — N2's replay assert ran 24/24 with every fade live to say
+/// so — but it is the only other thing in here that could move.
+#[gpui::test]
+fn the_trailer_never_participates_in_a_row_height(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(
+        &h,
+        vcx,
+        vec![
+            user_record(1, "go"),
+            delivered_record(2),
+            approval_record(3, "req-1", "Write", "/repo/src/main.rs"),
+        ],
+    );
+    assert!(shown(vcx, "work-trailer"), "the turn is open");
+    let before = vcx
+        .debug_bounds("approve-req-1")
+        .expect("the approval row must be on screen to measure it");
+
+    // End the turn: the trailer goes, and `TurnCompleted` adds no row of
+    // its own when it is not an error, so the list content is unchanged.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![turn_completed_record(4)],
+    });
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "work-trailer"));
+    let after = vcx
+        .debug_bounds("approve-req-1")
+        .expect("the approval row must still be on screen");
+    assert_eq!(
+        before, after,
+        "the trailer leaving moved a row — it is participating in the list's layout"
+    );
+}
+
+/// One slot, one sentence. The attention notice owns the space above the
+/// composer whenever it has anything to say, so "working for 12s" and
+/// "quiet for 30s" are read in the same place in the same voice, and
+/// never stacked on top of each other.
+#[gpui::test]
+fn an_attention_notice_owns_the_slot_and_the_trailer_stands_down(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+    assert!(shown(vcx, "work-trailer"));
+
+    h.plumbing.push_attn((
+        "aaaa1111".into(),
+        AttentionSnapshot::Quiet {
+            since_ms: 0,
+            reason: WaitReason::Idle,
+        },
+    ));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "work-trailer"),
+        "the trailer stacked underneath the quiet notice"
+    );
+    // And it stood down because the notice took the slot, not because the
+    // turn ended — the turn is still open.
+    let open = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).in_turn()
+        })
+        .unwrap();
+    assert!(open, "the turn should still be open under a quiet notice");
+}
+
+/// The files rail's not-yet-arrived state used to be the single character
+/// `…`, which says nothing about whether a list is coming.
+#[gpui::test]
+fn a_files_rail_with_no_snapshot_yet_shows_skeleton_rows(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "files-skeleton"),
+        "a session whose file list has not arrived must say a list is coming"
+    );
+
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "files-skeleton"),
+        "the skeleton outlived the snapshot it was standing in for"
+    );
+}
+
+/// Same for the diff pane: a click opens it into a load state, and the
+/// load state is now shaped like the diff that is coming.
+#[gpui::test]
+fn a_diff_that_has_not_arrived_shows_skeleton_rows(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(3),
+                dels: Some(1),
+                orig_path: None,
+                untracked: false,
+            }],
+            omitted: 0,
+            watching: true,
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "diff-skeleton"), "nothing is loading yet");
+
+    click(vcx, "file-src/lib.rs");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "diff-skeleton"),
+        "an open pane waiting on its diff must state that it is waiting"
+    );
+
+    h.plumbing.push_diff((
+        "aaaa1111".into(),
+        "src/lib.rs".into(),
+        Ok(FileDiff {
+            path: "src/lib.rs".into(),
+            kind: DiffKind::Binary,
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "diff-skeleton"),
+        "the skeleton outlived the diff it was standing in for"
     );
 }
