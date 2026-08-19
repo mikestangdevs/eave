@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One boot smoke per render mode (Stage J step 4).
+# One boot smoke per fixture (Stage J step 4; the render-mode loop went
+# away with the opaque build on 2026-08-19).
 #
 # This is all that is left of the scripted-drive rig. Clicking is no
 # longer scripted at all: every interaction the old rig drove through the
@@ -19,7 +20,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SPEED="${1:-30}"
-# Two fixtures, both replayed in both modes:
+# Two fixtures:
 #   real-claude   — a genuine capture; the pacing and markdown the
 #                   streaming/anchor work was tuned against.
 #   approvals     — SYNTHESISED (Slice K), and labelled so. There is no
@@ -43,23 +44,25 @@ export EAVE_DOGFOOD_LOG="${EAVE_DOGFOOD_LOG:-${TMPDIR:-/tmp}/eave-boot-smoke.md}
 
 cargo build --workspace
 
+# One render mode. Until 2026-08-19 this looped glass and opaque, because
+# eave shipped both; the opaque build was deleted by ruling ("i never want
+# it") and with it the ×2 convention every report before N3 quotes. Glass is
+# the only look, so a single pass per fixture IS full coverage now — if you
+# find yourself re-adding a mode loop, the design changed.
 fail=0
-for mode in glass opaque; do
-  if [ "$mode" = opaque ]; then export EAVE_VIBRANCY=0; else unset EAVE_VIBRANCY; fi
-  for fixture in "${FIXTURES[@]}"; do
-    echo "── boot smoke: $mode · $(basename "$fixture") ──"
-    out="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
-           ./target/debug/eave 2>/dev/null | grep REPLAY_ASSERT || true)"
-    echo "${out:-<no assert line — the app did not boot>}"
-    case "$out" in
-      *PASS*) ;;
-      *) fail=1 ;;
-    esac
-  done
+for fixture in "${FIXTURES[@]}"; do
+  echo "── boot smoke: $(basename "$fixture") ──"
+  out="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
+         ./target/debug/eave 2>/dev/null | grep REPLAY_ASSERT || true)"
+  echo "${out:-<no assert line — the app did not boot>}"
+  case "$out" in
+    *PASS*) ;;
+    *) fail=1 ;;
+  esac
 done
 
 if [ "$fail" -ne 0 ]; then
   echo "boot-smoke: FAILED" >&2
   exit 1
 fi
-echo "boot-smoke: every fixture booted and held anchor in both modes"
+echo "boot-smoke: every fixture booted and held anchor"

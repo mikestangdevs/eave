@@ -7,18 +7,20 @@
 //! nothing performs or decorates. Palette and type scale derive from
 //! waku's (solid dark surfaces, `.SystemUIFont` prose, white-alpha
 //! hairlines) — the closest reference that works on our upstream gpui
-//! pin and locked opaque window (spec 03 §No-fork consequences).
+//! pin. (That "locked opaque window" premise is long gone: the fork pin
+//! reversed 2026-08-17 and brought the blur with it, and the opaque build
+//! was deleted 2026-08-19. The waku lineage of the TYPE and hairlines
+//! stands; the surfaces are all washes now.)
 
-use std::sync::OnceLock;
 
 use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
-// The glass ground (default since the 2026-08-17 ruling; `EAVE_VIBRANCY=0`
-// keeps the opaque ladder as the tested fallback). The default flips the
-// window to Blurred and every surface token below to its glass variant;
-// nothing outside theme.rs branches on it except the window-background
-// option itself.
+// The glass ground — ruled by the user 2026-08-17, and since 2026-08-19
+// the ONLY ground: the opaque build was deleted outright ("i never want
+// it"), along with the `EAVE_VIBRANCY` switch that selected it. There is no
+// fallback and no second render mode. The window opens Blurred
+// unconditionally and every surface token below is a wash.
 //
 // The retune, not the flag, is the substance. Every element paints over
 // the one root canvas, and in-window compositing is plain alpha (the blur
@@ -47,27 +49,19 @@ use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 //     keeps the pre-blended opaque plate: any alpha there ghosts the
 //     log through it, and no blur will save it.
 
-/// True (the default): Blurred window + the glass ladder — the shipped
-/// look per the 2026-08-17 ruling (comet's glass shell is the reference;
-/// the opaque build read as flat gray). `EAVE_VIBRANCY=0` forces the old
-/// opaque ladder — an escape hatch and the second tested mode, no longer
-/// a pending spike. Read once; the window cannot change appearance
-/// mid-run anyway.
-pub fn vibrancy() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("EAVE_VIBRANCY").map(|v| v != "0").unwrap_or(true))
-}
 
-// The glass variants (private so both modes stay unit-testable in one
-// process — the public fns branch on the env flag).
+// The wash primitives. Private, and still worth keeping separate from the
+// public tokens above: they are the values the elevation tests compose
+// directly, so a rung can be checked without going through its semantic
+// name. (They were private because the public fns used to branch on an env
+// flag; that flag is gone, the separation earned its keep anyway.)
 
 /// Glass ground: α 0.80 (0xCC), source `#0A0A0A` — near-black so the
 /// blurred desktop's hue carries the surface (comet parity; see above).
 fn glass_canvas() -> Hsla {
     rgba(0x0a0a0acc).into()
 }
-/// The content well's darkening wash (glass variant of
-/// [`content_plate`]) — private so it stays unit-testable in both modes.
+/// The content well's darkening wash, behind [`content_plate`].
 fn wash_content() -> Hsla {
     hsla(0.0, 0.0, 0.0, 0.25)
 }
@@ -102,32 +96,19 @@ fn wash_danger_plate() -> Hsla {
 }
 
 // ---------------------------------------------------------------------------
-// Surfaces (glass by default — the 2026-08-17 ruling; `EAVE_VIBRANCY=0`
-// is the opaque fallback)
+// Surfaces — all washes over the glass ground (see above)
 
 /// Window ground; the transcript sits directly on it.
 pub fn canvas() -> Hsla {
-    if vibrancy() {
-        glass_canvas()
-    } else {
-        rgb(0x1a1a1a).into()
-    }
+    glass_canvas()
 }
 /// Raised blocks: user directive blocks, pills, cards.
 pub fn raised() -> Hsla {
-    if vibrancy() {
-        wash_raised()
-    } else {
-        rgb(0x232323).into()
-    }
+    wash_raised()
 }
 /// L2 chrome plate: in-flow cards above the log (rail, composer, panels).
 pub fn panel() -> Hsla {
-    if vibrancy() {
-        wash_panel()
-    } else {
-        rgb(0x282828).into()
-    }
+    wash_panel()
 }
 /// The composer card plate — L2 chrome, same rung as [`panel`].
 pub fn composer() -> Hsla {
@@ -152,7 +133,7 @@ pub fn composer() -> Hsla {
 // cue), while body text keeps >8:1 and ghost text ~2:1 against it —
 // the same ratios the opaque plates gave. At 0.80 the breath drops
 // under ±6/255 (imperceptible); below ~0.6 ghost-tier text fogs out.
-// These tints are EAVE_VIBRANCY-independent: in-app blur samples the
+// These tints never depended on the window mode: in-app blur samples the
 // scene, window vibrancy handles what's behind the window.
 
 /// Backdrop-blur radius for L2 floating chrome (comet's composer class
@@ -198,20 +179,12 @@ pub fn danger_plate_glass() -> Hsla {
 /// sit on the bare frost around it. Opaque fallback: the plain canvas —
 /// the hairline card outline alone carries the seam.
 pub fn content_plate() -> Hsla {
-    if vibrancy() {
-        wash_content()
-    } else {
-        canvas()
-    }
+    wash_content()
 }
 
 /// Sunken panels: code blocks.
 pub fn inset() -> Hsla {
-    if vibrancy() {
-        wash_inset()
-    } else {
-        rgb(0x151515).into()
-    }
+    wash_inset()
 }
 
 /// The resting end of a hover wash on an unfilled control (Slice N2) —
@@ -265,14 +238,18 @@ pub fn overlay_strongest() -> Hsla {
 // `canvas`/`raised`/`composer`/`panel`/`inset` below are the semantic
 // names for these rungs; `border`/`border_strong`/`edge_modal` are the
 // hairline ladder.
+//
+// **Those hexes are REFERENCE VALUES, not a code path** (2026-08-19). eave
+// shipped an opaque build alongside the glass one until then, and the
+// washes were tuned so that each rung composites to its hex over the glass
+// ground — that is where these numbers come from and why each wash has the
+// alpha it has. The opaque build is gone by ruling: glass is the only look,
+// `EAVE_VIBRANCY` no longer exists, and there is no fallback. The hexes stay
+// because deleting them would delete the derivation of every alpha below.
 
 /// L3 surface — reserved; no modal exists yet.
 pub fn surface_modal() -> Hsla {
-    if vibrancy() {
-        wash_modal()
-    } else {
-        rgb(0x2e2e2e).into()
-    }
+    wash_modal()
 }
 /// L3 hairline — reserved with it.
 pub fn edge_modal() -> Hsla {
@@ -382,25 +359,13 @@ pub fn danger_wash_hover() -> Hsla {
 /// read raised, not sunken. Keep in sync with `panel()` and the wash
 /// alphas above.
 pub fn warning_plate() -> Hsla {
-    if vibrancy() {
-        wash_warning_plate()
-    } else {
-        rgb(0x312f2b).into()
-    }
+    wash_warning_plate()
 }
 pub fn warning_plate_strong() -> Hsla {
-    if vibrancy() {
-        wash_warning_plate_strong()
-    } else {
-        rgb(0x3e3930).into()
-    }
+    wash_warning_plate_strong()
 }
 pub fn danger_plate() -> Hsla {
-    if vibrancy() {
-        wash_danger_plate()
-    } else {
-        rgb(0x332c2c).into()
-    }
+    wash_danger_plate()
 }
 
 /// Diff line fills (Slice B2) — the only place state pigment tints a
@@ -414,18 +379,10 @@ pub fn danger_plate() -> Hsla {
 /// for; pre-composite instead of hoping).
 const DIFF_WASH_ALPHA: f32 = 0.10;
 pub fn diff_add_bg() -> Hsla {
-    if vibrancy() {
-        success().opacity(DIFF_WASH_ALPHA)
-    } else {
-        rgb(0x212c25).into()
-    }
+    success().opacity(DIFF_WASH_ALPHA)
 }
 pub fn diff_del_bg() -> Hsla {
-    if vibrancy() {
-        danger().opacity(DIFF_WASH_ALPHA)
-    } else {
-        rgb(0x2e2322).into()
-    }
+    danger().opacity(DIFF_WASH_ALPHA)
 }
 
 // ---------------------------------------------------------------------------

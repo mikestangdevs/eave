@@ -4021,7 +4021,7 @@ impl Render for Shell {
 
         // Opaque window by default, custom titlebar — locked decision
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
-        // Under `EAVE_VIBRANCY=1` this root bg is the glass ground.
+        // This root bg is the glass ground.
         let root = div()
             .size_full()
             .flex()
@@ -4757,13 +4757,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
-            // Opaque is the shipped path; `EAVE_VIBRANCY=1` is the
-            // vibrancy spike (theme.rs owns the glass retune).
-            window_background: if theme::vibrancy() {
-                WindowBackgroundAppearance::Blurred
-            } else {
-                WindowBackgroundAppearance::Opaque
-            },
+            // Glass is the only look (ruled 2026-08-17, opaque path deleted
+            // 2026-08-19). theme.rs owns the tints this blur sits under.
+            window_background: WindowBackgroundAppearance::Blurred,
             titlebar: Some(TitlebarOptions {
                 title: Some("eave".into()),
                 appears_transparent: true,
