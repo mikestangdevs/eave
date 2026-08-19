@@ -68,3 +68,9 @@ libc = "0.2"
 gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
     "test-support",
 ] }
+# Slice P3: the icon-parse test uses the SAME parser gpui uses at runtime,
+# pinned to the version the fork's workspace pins (see the fork's root
+# Cargo.toml). A substring check for `viewBox=` would pass on a file whose
+# path data is malformed; this will not. Same version => cargo unifies it
+# with gpui's copy, so it costs no extra compile.
+usvg = { version = "0.46.0", default-features = false }

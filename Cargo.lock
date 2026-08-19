@@ -1389,6 +1389,7 @@ dependencies = [
  "libc",
  "serde_json",
  "tokio",
+ "usvg",
 ]
 
 [[package]]
