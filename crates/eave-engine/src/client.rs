@@ -21,6 +21,7 @@ use tokio::net::{unix::OwnedWriteHalf, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
 use eave_core::proc::ProcIdentity;
+use eave_core::session::AgentConfig;
 use eave_wire::{
     socket_path, BusyReport, Cursor, HelloOk, KillOk, ListOk, OpenOk, Request, RequestEnvelope,
     ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, ENGINE_BUSY_EXIT,
@@ -233,13 +234,37 @@ impl Client {
         Ok(self.request::<ListOk>(Request::List).await?.sessions)
     }
 
+    /// Open with the engine's default agent. Unchanged signature on
+    /// purpose: every existing caller (including the app) keeps working,
+    /// and per-session config is opt-in through [`open_with_agent`].
     pub async fn open(
         &self,
         session_id: Option<String>,
         cwd: Option<String>,
     ) -> Result<SessionInfo, ClientError> {
+        self.open_with_agent(session_id, cwd, None).await
+    }
+
+    /// Open with a stated agent config (Slice P2) — which binary, which
+    /// model, which extra flags, carried by the session rather than the
+    /// engine.
+    ///
+    /// The engine refuses a provider whose permission posture it has not
+    /// proven, and refuses re-opening an existing session under a different
+    /// config; both come back as `ClientError` with the reason, because a
+    /// silently substituted model is worse than a failed open.
+    pub async fn open_with_agent(
+        &self,
+        session_id: Option<String>,
+        cwd: Option<String>,
+        agent: Option<AgentConfig>,
+    ) -> Result<SessionInfo, ClientError> {
         Ok(self
-            .request::<OpenOk>(Request::Open { session_id, cwd })
+            .request::<OpenOk>(Request::Open {
+                session_id,
+                cwd,
+                agent,
+            })
             .await?
             .info)
     }

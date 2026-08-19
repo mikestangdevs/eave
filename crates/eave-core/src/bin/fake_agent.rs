@@ -488,6 +488,17 @@ fn main() {
             eprintln!("error: unknown option '--permission-prompt-tool'");
             std::process::exit(1);
         }
+        // Slice P2: echo the argv eave actually spawned us with, so a
+        // process test can prove that a session's configured model and
+        // flags reached the child — and in what order — rather than
+        // asserting on the SpawnConfig struct the engine built, which
+        // would test the engine against itself.
+        "argv-report" => {
+            emit_init();
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            emit_text(&args.join(" "));
+            emit_result();
+        }
         "env-report" => {
             emit_init();
             let leaked: Vec<String> = std::env::vars()

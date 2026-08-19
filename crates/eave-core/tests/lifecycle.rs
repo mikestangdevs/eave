@@ -333,3 +333,83 @@ async fn claude_real_smoke() {
     assert!(session.provider_session_id().is_some());
     session.kill().await.unwrap();
 }
+
+/// Slice P2, directive item 4: a session whose config was set at open must
+/// still `--resume` against the REAL claude CLI — the one thing the fake
+/// agent cannot prove, because it accepts whatever argv it is handed.
+///
+/// Two spawns over one provider session id: the first names it
+/// (`--session-id`) with an explicit `--model`, the second resumes it
+/// (`--resume`) with the same model, and the second must see the first
+/// turn's content. If `--model` and `--resume` were mutually exclusive in
+/// the CLI, or if the model changed the resume cursor's meaning, this is
+/// where it would show.
+///
+/// `cargo test -p eave-core --test lifecycle -- --ignored real_claude_resume_with_model`
+#[tokio::test]
+#[ignore]
+async fn real_claude_resume_with_model() {
+    let id = uuid::Uuid::new_v4().to_string();
+    let model = std::env::var("EAVE_TEST_MODEL").unwrap_or_else(|_| "haiku".into());
+
+    let mut first = SpawnConfig::new("claude", std::env::temp_dir(), id.clone());
+    first.model = Some(model.clone());
+    let (mut session, mut rx) = ClaudeCodeSession::spawn(&first).expect("spawn 1");
+    session
+        .send_user_message("Remember the word pineapple. Reply with just: ok")
+        .await
+        .expect("send 1");
+    let init_mode = wait_turn(&mut rx).await;
+    assert!(
+        init_mode.is_some(),
+        "real claude never stated a permission mode on spawn 1 — posture unverifiable"
+    );
+    drop(session);
+
+    // Second spawn: same id, same model, resuming.
+    let mut second = SpawnConfig::new("claude", std::env::temp_dir(), id.clone());
+    second.model = Some(model.clone());
+    second.resume = true;
+    let (mut session, mut rx) = ClaudeCodeSession::spawn(&second).expect("spawn 2 (--resume)");
+    session
+        .send_user_message("What word did I ask you to remember? Reply with just that word.")
+        .await
+        .expect("send 2");
+
+    let mut said = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(180), async {
+        while let Some(event) = rx.recv().await {
+            if let SessionEvent::AssistantText { text, .. } = &event {
+                said.push_str(text);
+            }
+            if matches!(event, SessionEvent::TurnCompleted { .. }) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        said.to_lowercase().contains("pineapple"),
+        "--resume with an explicit --model lost the session's history; it said: {said:?}"
+    );
+}
+
+/// Drain one turn and report the permission mode the CLI announced.
+async fn wait_turn(rx: &mut tokio::sync::mpsc::Receiver<SessionEvent>) -> Option<String> {
+    let mut mode = None;
+    let _ = tokio::time::timeout(Duration::from_secs(180), async {
+        while let Some(event) = rx.recv().await {
+            if let SessionEvent::Init {
+                permission_mode, ..
+            } = &event
+            {
+                mode = permission_mode.clone();
+            }
+            if matches!(event, SessionEvent::TurnCompleted { .. }) {
+                break;
+            }
+        }
+    })
+    .await;
+    mode
+}

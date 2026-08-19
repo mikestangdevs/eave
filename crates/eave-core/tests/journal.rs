@@ -34,6 +34,7 @@ fn test_header(session_id: &str) -> Header {
         provider: "fake-agent".into(),
         cwd: "/tmp".into(),
         created_ts_ms: journal::now_ms(),
+            agent: Default::default(),
     }
 }
 
@@ -862,4 +863,78 @@ async fn real_claude_journal_and_cold_resume() {
     .unwrap();
     session2.kill().await.unwrap();
     assert!(recalled, "resumed session failed to recall the codeword");
+}
+
+// ---------------------------------------------------------------------------
+// Slice P2 — the persistence half of per-session agent config
+
+/// A journal written before per-session config existed must still load,
+/// and must read as "the engine's defaults" — which is exactly what those
+/// sessions ran under.
+///
+/// This is why `FORMAT_VERSION` did NOT move for the new header field:
+/// `load` refuses any version but its own, so a bump would have made every
+/// existing journal on every dogfooding machine unreadable. The field is
+/// `#[serde(default)]` instead, and this test is what pins that choice.
+#[test]
+fn a_header_written_before_agent_config_still_loads() {
+    let dir = scratch();
+    let path = dir.join("journal.jsonl");
+    // Byte-for-byte the header shape a pre-P2 build wrote.
+    let old = r#"{"format_version":1,"session_id":"s1","provider":"claude-code","cwd":"/tmp","created_ts_ms":7}"#;
+    std::fs::write(&path, format!("{old}\n")).unwrap();
+
+    let loaded = eave_core::journal::load(&path).expect("an old journal must still load");
+    assert_eq!(loaded.header.session_id, "s1");
+    assert_eq!(loaded.header.provider, "claude-code");
+    assert_eq!(
+        loaded.header.agent,
+        eave_core::session::AgentConfig::default(),
+        "an absent config must read as the engine's defaults"
+    );
+}
+
+/// And a session that configured nothing must write a header that an OLDER
+/// build could still read — no new key at all, thanks to
+/// `skip_serializing_if`.
+#[test]
+fn an_unconfigured_header_writes_no_agent_key() {
+    let header = Header {
+        format_version: FORMAT_VERSION,
+        session_id: "s1".into(),
+        provider: "claude-code".into(),
+        cwd: "/tmp".into(),
+        created_ts_ms: 7,
+        agent: Default::default(),
+    };
+    let raw = serde_json::to_string(&header).expect("serialize");
+    assert!(
+        !raw.contains("agent"),
+        "an unconfigured session must write the old header shape: {raw}"
+    );
+}
+
+/// A configured session's header round-trips through the file, which is
+/// what makes the config survive a restart at all.
+#[test]
+fn a_configured_header_round_trips_through_the_journal() {
+    let dir = scratch();
+    let path = dir.join("journal.jsonl");
+    let agent = eave_core::session::AgentConfig {
+        provider: Some("claude-code".into()),
+        program: None,
+        model: Some("opus-4-2".into()),
+        extra_args: vec!["--foo".into()],
+    };
+    let header = Header {
+        format_version: FORMAT_VERSION,
+        session_id: "s1".into(),
+        provider: "claude-code".into(),
+        cwd: "/tmp".into(),
+        created_ts_ms: 7,
+        agent: agent.clone(),
+    };
+    JournalWriter::create(&path, &header).expect("create");
+    let loaded = eave_core::journal::load(&path).expect("load");
+    assert_eq!(loaded.header.agent, agent);
 }

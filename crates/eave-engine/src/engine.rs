@@ -23,7 +23,10 @@ use eave_core::journal::{self, now_ms, Header, JournalEvent, JournalWriter, Reco
 use eave_core::proc::{self, PidState, ProcIdentity};
 use eave_core::process;
 use eave_core::recorder::{record_session, send_and_journal};
-use eave_core::session::{AgentSession, ApprovalDecision, SessionWatch, SpawnConfig};
+use eave_core::session::{
+    conflicts_with_eave_flags, posture_is_verified, AgentConfig, AgentSession, ApprovalDecision,
+    SessionWatch, SpawnConfig, POSTURE_VERIFIED_PROVIDERS,
+};
 use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
@@ -275,6 +278,12 @@ impl SessionHandle {
         SessionInfo {
             session_id: self.session_id.clone(),
             provider: s.header.provider.clone(),
+            // Slice P2. A configured model is a fact ABOUT the session, in
+            // the same class as `provider` and `cwd` — not transcript
+            // content — so it is allowed on the watch channel by the
+            // isolation invariant (spec 05 §Watch). `None` = the CLI's own
+            // default, which eave neither knows nor invents.
+            model: s.header.agent.model.clone(),
             cwd: s.header.cwd.clone(),
             created_ts_ms: s.header.created_ts_ms,
             state,
@@ -456,22 +465,110 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Resolve a session's agent config against the engine's defaults and
+    /// **refuse anything whose permission posture is not proven** (Slice P2).
+    ///
+    /// This is the gate the whole slice exists to place. Per-session config
+    /// means a caller can name any provider and any binary; Slice K's proof
+    /// that the agent asks before it writes is Claude-specific and lives in
+    /// `claude.rs`. Spawning an unverified provider would reintroduce the v0
+    /// auto-accept blocker by the side door — a session writing to disk with
+    /// nothing able to review it — so an unrecognised provider is refused
+    /// with the reason, never spawned on the assumption it behaves like
+    /// Claude. Fail-closed, exactly like `ASKING_MODES`.
+    /// A session's agent config is fixed at open. Re-opening with a
+    /// DIFFERENT one is refused rather than silently ignored: the caller
+    /// asked for a model and would otherwise get another, which is the kind
+    /// of quiet substitution this codebase states instead of doing.
+    /// Re-opening with the same config, or with none, is fine.
+    fn reject_config_change(
+        have: &AgentConfig,
+        want: Option<&AgentConfig>,
+    ) -> Result<(), String> {
+        match want {
+            Some(w) if w != have => Err(format!(
+                "session already exists with a different agent config (has {have:?}, asked for \
+                 {w:?}) — a session's agent is fixed when it is opened, because its journal and \
+                 its provider-side resume cursor were created under it"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn resolve_agent(&self, want: &AgentConfig) -> Result<AgentConfig, String> {
+        // The gate applies to a provider named IN CONFIG — the surface this
+        // slice opens. A session that names none inherits the engine's own
+        // `EAVE_AGENT`, which is the operator's deliberate launch-time
+        // choice and predates this slice (I1 caveat 9); gating that too
+        // would refuse every test harness and would be a different slice's
+        // decision to make.
+        //
+        // Neither path skips Slice K's REAL proof, which is per-spawn and at
+        // runtime: the CLI's own `init.permissionMode` is checked against
+        // `ASKING_MODES` on every single spawn, and a session that cannot
+        // prove it asks is refused there regardless of how it was
+        // configured. This static check is the earlier, coarser one — it
+        // refuses a provider eave has no adapter for at all, before a
+        // process exists.
+        let Some(provider) = want.provider.clone() else {
+            return Ok(AgentConfig {
+                provider: None,
+                program: want.program.clone(),
+                model: want.model.clone(),
+                extra_args: want.extra_args.clone(),
+            });
+        };
+        if !posture_is_verified(&provider) {
+            return Err(format!(
+                "provider {provider:?} has no verified permission posture — eave only knows how \
+                 to make {:?} ask before it writes, and refuses to run an agent whose writes it \
+                 cannot review. Slice K established the proof and it is provider-specific.",
+                POSTURE_VERIFIED_PROVIDERS.join(", ")
+            ));
+        }
+        if let Some(bad) = want
+            .extra_args
+            .iter()
+            .find(|a| conflicts_with_eave_flags(a))
+        {
+            return Err(format!(
+                "agent flag {bad:?} may not be set per session — it would override the permission \
+                 posture or the resume cursor that eave depends on"
+            ));
+        }
+        Ok(AgentConfig {
+            provider: Some(provider),
+            program: want.program.clone(),
+            model: want.model.clone(),
+            extra_args: want.extra_args.clone(),
+        })
+    }
+
     fn open_or_load(
         self: &Arc<Self>,
         session_id: Option<String>,
         cwd: Option<String>,
+        agent: Option<AgentConfig>,
     ) -> Result<Arc<SessionHandle>, String> {
         let id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Validate BEFORE touching the registry or the disk: a refused
+        // config must leave no session behind.
+        let agent = agent.map(|a| self.resolve_agent(&a)).transpose()?;
         // Hold the registry lock across the whole open: two concurrent
         // opens of one id must never build two handles over one journal.
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(h) = sessions.get(&id) {
+            Self::reject_config_change(&h.shared.lock().unwrap().header.agent, agent.as_ref())?;
             return Ok(Arc::clone(h));
         }
         let dir = self.store.session_dir(&id);
         let journal_path = Store::journal_path(&dir);
         let handle = if journal_path.exists() {
-            self.load_from_disk(&id)?
+            let h = self.load_from_disk(&id)?;
+            // The journal's own config wins — that is what "survives a
+            // restart" means. A caller asking for a different one is told.
+            Self::reject_config_change(&h.shared.lock().unwrap().header.agent, agent.as_ref())?;
+            h
         } else {
             // The real claude CLI rejects `--session-id` values that are
             // not UUIDs, so a named id against it dies at first spawn —
@@ -496,9 +593,17 @@ impl Engine {
             let header = Header {
                 format_version: FORMAT_VERSION,
                 session_id: id.clone(),
-                provider: self.cfg.provider.clone(),
+                // The resolved config's provider, so `header.provider` and
+                // `header.agent.provider` can never disagree about what
+                // this session runs.
+                provider: agent
+                    .as_ref()
+                    .and_then(|a| a.provider.clone())
+                    .unwrap_or_else(|| self.cfg.provider.clone()),
                 cwd: cwd.unwrap_or_else(|| self.cfg.default_cwd.display().to_string()),
                 created_ts_ms: now_ms(),
+                // Slice P2: written once, here, before anything spawns.
+                agent: agent.clone().unwrap_or_default(),
             };
             JournalWriter::create(&journal_path, &header)
                 .map_err(|e| format!("create journal: {e}"))?;
@@ -674,13 +779,41 @@ impl Engine {
 
         // A provider ran before ⇒ continue it (`--resume`); otherwise name
         // the fresh id (`--session-id`) — spec 02 §Resume contract.
-        let mut cfg = SpawnConfig::new(
-            &self.cfg.agent_program,
-            PathBuf::from(&header.cwd),
-            handle.session_id.clone(),
-        );
+        // Slice P2: the SESSION's config decides what spawns, not the
+        // engine's environment — which is what makes it survive a restart
+        // and govern a `--resume`. The engine's values fill only the gaps.
+        // Re-checked here rather than trusted from the header: a journal is
+        // a file on disk and could have been written by another build, and
+        // this is the last point before a process is created.
+        let agent = &header.agent;
+        // Re-checked at the last point before a process exists, and only for
+        // a provider the SESSION named: a journal is a file on disk and
+        // could have been written by another build. An unconfigured session
+        // runs the engine's default, exactly as it did before this slice.
+        if let Some(provider) = agent.provider.as_deref() {
+            if !posture_is_verified(provider) {
+                return Err(format!(
+                    "refusing to spawn session {} : provider {provider:?} has no verified \
+                     permission posture (Slice K's proof is Claude-specific)",
+                    handle.session_id
+                ));
+            }
+        }
+        let program: PathBuf = agent
+            .program
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.cfg.agent_program.clone());
+        let mut cfg = SpawnConfig::new(program, PathBuf::from(&header.cwd), handle.session_id.clone());
         cfg.resume = resume;
         cfg.extra_env = self.cfg.agent_env.clone();
+        cfg.model = agent.model.clone();
+        cfg.extra_args = agent
+            .extra_args
+            .iter()
+            .filter(|a| !conflicts_with_eave_flags(a))
+            .cloned()
+            .collect();
         let (session, events) =
             ClaudeCodeSession::spawn(&cfg).map_err(|e| format!("spawn agent: {e}"))?;
 
@@ -1448,7 +1581,11 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 engine: engine.identity,
             }),
             Request::List => ok_value(&engine.list()),
-            Request::Open { session_id, cwd } => match engine.open_or_load(session_id, cwd) {
+            Request::Open {
+                session_id,
+                cwd,
+                agent,
+            } => match engine.open_or_load(session_id, cwd, agent) {
                 Ok(h) => ok_value(&OpenOk { info: h.info() }),
                 Err(message) => ResponseBody::Err { message },
             },

@@ -32,6 +32,7 @@
 use serde::{Deserialize, Serialize};
 
 use eave_core::journal::{Header, Record};
+use eave_core::session::AgentConfig;
 use eave_core::proc::ProcIdentity;
 
 pub use eave_core::attention::{AttentionSnapshot, WaitReason};
@@ -67,6 +68,19 @@ pub enum Request {
     Open {
         session_id: Option<String>,
         cwd: Option<String>,
+        /// What agent this session should run (Slice P2). `None` = the
+        /// engine's defaults, which is what every caller predating this
+        /// field sends and why it is `#[serde(default)]`: an older client's
+        /// `open` frame still parses, and behaves exactly as it did.
+        ///
+        /// Fixed at open. Re-opening an existing session with a DIFFERENT
+        /// config is an error, not a silent substitution — the journal and
+        /// the provider-side resume cursor were created under the original.
+        /// A provider with no verified permission posture is refused here
+        /// (Slice K's proof is Claude-specific); see
+        /// `eave_core::session::posture_is_verified`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentConfig>,
     },
     /// Stream a session's record log. Replays per the cursor contract, then
     /// follows live. Items keep flowing on this request's id until the
@@ -248,6 +262,18 @@ pub struct HelloOk {
 pub struct SessionInfo {
     pub session_id: String,
     pub provider: String,
+    /// The model this session is configured to run (Slice P2), verbatim as
+    /// it will be passed to the CLI. `None` = the provider's own default,
+    /// or a session recorded by an engine predating per-session config —
+    /// never a guessed name.
+    ///
+    /// A fact ABOUT the session, like `provider` and `cwd`, so the watch
+    /// channel may carry it: the isolation invariant bars transcript
+    /// CONTENT, and which model was configured is not content. That is what
+    /// lets a rail state every session's model without subscribing to any
+    /// of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub cwd: String,
     pub created_ts_ms: u64,
     /// Current state name (spec 01 §States; "new" before any spawn).
@@ -638,6 +664,7 @@ mod tests {
                 sessions: vec![SessionInfo {
                     session_id: "s1".into(),
                     provider: "claude-code".into(),
+                    model: None,
                     cwd: "/tmp".into(),
                     created_ts_ms: 1,
                     state: "running".into(),
@@ -829,5 +856,81 @@ mod tests {
         let line = serde_json::to_string(&req).unwrap();
         let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back.request, Request::List);
+    }
+
+    // -----------------------------------------------------------------
+    // Slice P2 — the compatibility contract for per-session agent config
+
+    /// An `open` frame from a client that predates per-session config must
+    /// still parse. This is the whole reason the field is
+    /// `#[serde(default)]` rather than a proto bump: a running app and a
+    /// newer engine (or the reverse) meet across this frame.
+    #[test]
+    fn an_open_frame_without_agent_config_still_parses() {
+        // `#[serde(tag = "method", content = "params")]` — the shape a
+        // real pre-P2 client puts on the socket.
+        let old = r#"{"method":"open","params":{"session_id":"s1","cwd":null}}"#;
+        let req: Request = serde_json::from_str(old).expect("old open frame must parse");
+        match req {
+            Request::Open {
+                session_id,
+                cwd,
+                agent,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("s1"));
+                assert_eq!(cwd, None);
+                assert_eq!(agent, None, "absent config must mean the engine's default");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// And the reverse direction: a frame carrying no config must SERIALIZE
+    /// exactly as it did before, so an older engine sees a byte-identical
+    /// request rather than an unknown key.
+    #[test]
+    fn an_open_without_config_serializes_with_no_agent_key() {
+        let req = Request::Open {
+            session_id: Some("s1".into()),
+            cwd: None,
+            agent: None,
+        };
+        let raw = serde_json::to_string(&req).expect("serialize");
+        assert!(
+            !raw.contains("agent"),
+            "an unconfigured open must not mention agent: {raw}"
+        );
+    }
+
+    /// A `SessionInfo` from an engine predating the field parses, and reads
+    /// as "no model configured" — never as a guessed default.
+    #[test]
+    fn a_session_info_without_a_model_parses_as_unconfigured() {
+        let old = r#"{
+            "session_id":"s1","provider":"claude-code","cwd":"/tmp",
+            "created_ts_ms":1,"state":"new","live":false,"epoch":7,"last_seq":0
+        }"#;
+        let info: SessionInfo = serde_json::from_str(old).expect("old SessionInfo must parse");
+        assert_eq!(info.model, None);
+        assert_eq!(info.provider, "claude-code");
+    }
+
+    /// The config a session states is carried whole across the wire — the
+    /// fields exist so a picker can read back exactly what it set.
+    #[test]
+    fn an_agent_config_round_trips_across_the_wire() {
+        let req = Request::Open {
+            session_id: Some("s1".into()),
+            cwd: None,
+            agent: Some(AgentConfig {
+                provider: Some("claude-code".into()),
+                program: None,
+                model: Some("opus-4-2".into()),
+                extra_args: vec!["--foo".into()],
+            }),
+        };
+        let raw = serde_json::to_string(&req).expect("serialize");
+        let back: Request = serde_json::from_str(&raw).expect("round trip");
+        assert_eq!(back, req);
     }
 }

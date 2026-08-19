@@ -106,6 +106,18 @@ impl ClaudeCodeSession {
         } else {
             cmd.args(["--session-id", &cfg.session_id]);
         }
+        // Slice P2: the session's own model and flags, after eave's. Absent
+        // model = no `--model` at all, which is not the same as an empty
+        // one. `extra_args` is verbatim and last, and has already been
+        // filtered of anything that would undo the posture above
+        // (`session::conflicts_with_eave_flags`) at the engine boundary —
+        // this is a spawn, not a policy point.
+        if let Some(model) = &cfg.model {
+            cmd.args(["--model", model]);
+        }
+        for arg in &cfg.extra_args {
+            cmd.arg(arg);
+        }
         let eave_vars: Vec<String> = std::env::vars()
             .map(|(k, _)| k)
             .filter(|k| k.starts_with("EAVE_"))

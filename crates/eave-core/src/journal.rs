@@ -36,6 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::session::AgentConfig;
 use crate::events::SessionEvent;
 
 pub const FORMAT_VERSION: u32 = 1;
@@ -50,6 +51,28 @@ pub struct Header {
     pub provider: String,
     pub cwd: String,
     pub created_ts_ms: u64,
+    /// What agent this session runs (Slice P2) — chosen at open, written
+    /// here once, and read back on every load, which is what makes it
+    /// survive a restart and govern a `--resume` rather than the engine's
+    /// current environment doing so.
+    ///
+    /// It lives in the HEADER, not in `meta.json`, because it is a fact
+    /// about the session's identity that must not drift: the journal is
+    /// append-only and the header is written before anything spawns, so
+    /// the config a turn ran under is recoverable from history. `meta` is
+    /// the mutable file and gets rewritten on every state change.
+    ///
+    /// **`format_version` did NOT move for this.** `load` refuses any
+    /// version but its own, so a bump would make every existing journal
+    /// unreadable; the field is `#[serde(default)]` instead, so an old
+    /// header reads as `AgentConfig::default()` — "use the engine's
+    /// defaults", which is exactly what those sessions did.
+    #[serde(default, skip_serializing_if = "is_default_agent")]
+    pub agent: AgentConfig,
+}
+
+fn is_default_agent(a: &AgentConfig) -> bool {
+    a == &AgentConfig::default()
 }
 
 /// One journal line after the header.
