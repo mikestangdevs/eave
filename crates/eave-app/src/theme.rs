@@ -631,6 +631,90 @@ pub const COMPOSER_CLEARANCE: f32 = 116.0;
 pub const RADIUS_PILL: f32 = 13.0;
 
 // ---------------------------------------------------------------------------
+// The overlay layer (Slice P1) — popovers, menus, context menus. The L3
+// rung, one step above the floating chrome the composer and the ↓-bottom
+// pill sit on.
+//
+// **These tints carry no backdrop blur, and that is the slice's one
+// deliberate visual gap.** Every other floating surface in eave frosts
+// what is behind it (`BLUR_CHROME`, 16) and can therefore afford a
+// see-through α 0.72. A menu cannot yet: its entrance fades opacity
+// 0.3→1, and a backdrop blur does NOT fade with the element painting over
+// it, so a frosted menu would flash a full-strength blur for the whole
+// 140 ms while the tint was still arriving. Resolving that is a visual
+// question for the first consumer, not machinery, so P1 ships the surface
+// unfrosted and states the number the follow-up needs.
+//
+// Without the blur, alpha has to carry the occlusion on its own. The
+// derivation, in the same terms as the chrome rung: body text behind an
+// α 0.72 surface ghosts through at ~24% of its own contrast, which is
+// plainly legible as a second layer of words under the menu's own. At
+// α 0.92 it lands at ~7% — the alpha of `border()`, which is this
+// design's own floor for "an edge you can just make out". So 0.92 is not
+// a taste, it is the point where unblurred bleed drops to the faintest
+// thing the palette already draws on purpose. **When the blur lands, this
+// comes back down to `CHROME_GLASS_ALPHA`** — do not keep both.
+const MENU_GLASS_ALPHA: f32 = 0.92;
+
+/// Backdrop-blur radius for the L3 overlay rung — reserved, unused.
+/// The value `BLUR_CHROME`'s comment has always named for "menus/modals";
+/// see the alpha note above for why nothing paints it yet.
+pub const BLUR_MENU: f32 = 44.0;
+
+/// L3 glass: the popover surface. One luminance step above
+/// [`chrome_glass`]'s `#141414` and below its hovered `#232323`, so a
+/// hovered menu row — which composites [`overlay`] ON TOP of this — still
+/// resolves as lighter than the surface carrying it.
+pub fn menu_glass() -> Hsla {
+    let c: Hsla = rgb(0x1e1e1e).into();
+    c.opacity(MENU_GLASS_ALPHA)
+}
+
+/// The popover's rounding. Between `RADIUS_BUTTON` (7) and
+/// `RADIUS_PANEL` (10): a menu is a small floating card, not a pane.
+pub const RADIUS_MENU: f32 = 8.0;
+/// A menu row's rounding — the wash is inset from the surface edge, so
+/// it needs its own smaller radius (the standard concentric rule:
+/// `RADIUS_MENU` − `MENU_ROW_INSET`, landing on the 4 px grid's half).
+pub const RADIUS_MENU_ROW: f32 = 5.0;
+
+/// Narrowest a menu goes. Under this a two-word label plus a trailing
+/// state reads as two columns rather than one row.
+pub const MENU_MIN_W: f32 = 176.0;
+/// Widest. Past this a menu stops being a list of choices and starts
+/// being a pane; a long label wraps inside the row instead.
+pub const MENU_MAX_W: f32 = 320.0;
+/// Vertical pad inside the surface, above the first row and below the
+/// last.
+pub const MENU_PAD_Y: f32 = SPACE_1;
+/// Horizontal inset of a row's wash from the surface edge — what makes
+/// the hover wash read as a pill inside the card rather than a full-bleed
+/// band across it.
+pub const MENU_ROW_INSET: f32 = SPACE_1;
+/// A row's height. Matches neither the send button (26 is coincidence)
+/// nor a transcript line: it is `LABEL_LINE` (16) plus `SPACE_1` above
+/// and below, so the wash clears the glyphs by one grid unit.
+pub const MENU_ROW_H: f32 = LABEL_LINE + SPACE_1 * 2.0;
+/// Horizontal pad inside a row's wash.
+pub const MENU_ROW_PAD_X: f32 = SPACE_2;
+/// Minimum gap between a row's label and its trailing state, so the two
+/// never close up on a long label.
+pub const MENU_ROW_GAP: f32 = SPACE_3;
+
+/// Gap between the anchor point and the menu's edge.
+pub const MENU_ANCHOR_GAP: f32 = SPACE_1;
+/// How close a menu may come to the window edge before it is pushed back
+/// in. `anchored()` does the pushing; this is the margin it keeps.
+pub const MENU_SCREEN_MARGIN: f32 = SPACE_2;
+
+/// Disabled treatment (polish-inventory §2.6): comet's ported web recipe
+/// is `disabled:opacity-35` plus no pointer events, and this is the 0.35.
+/// It is deliberately NOT a text tier — a disabled control dims *whole*,
+/// glyph and wash and trailing state together, which is what says "this
+/// control is off" rather than "this text is less important".
+pub const DISABLED_OPACITY: f32 = 0.35;
+
+// ---------------------------------------------------------------------------
 // Scroll-edge fades (Slice M) — the fork's per-primitive `EdgeFade`, the
 // only mechanism that dissolves content over glass (a painted overlay
 // cannot fade anything out when what is behind it is the desktop). See
