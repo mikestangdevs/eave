@@ -2510,3 +2510,391 @@ fn the_collapse_toggles_still_toggle_after_the_glyph_swap(cx: &mut TestAppContex
     vcx.run_until_parked();
     assert!(shown(vcx, "new-session"), "the rail did not come back");
 }
+
+// Slice P1 — the overlay layer
+//
+// The layer has no product consumer by directive, so everything below
+// drives it through the demo trigger `ui` mounts behind
+// `overlay::demo_enabled()`. What is being proven is not the demo: it is
+// that a floating surface can occlude, dismiss, navigate and *leave*
+// without any of it costing a frame once it has settled.
+//
+// The pure half of the machine — the state transitions, both tweens and
+// the highlight arithmetic — is asserted without a window at all, in
+// `overlay`'s own test module. These are the parts that need one: paint
+// order, hit-testing, and the frame drive.
+
+/// Boot with the demo trigger mounted. The gate is thread-local, and
+/// `#[gpui::test]` gives each test its own thread, so this cannot leak
+/// into a test that did not ask for it.
+fn boot_with_overlay(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext) {
+    overlay::enable_demo_for_test();
+    boot(cx)
+}
+
+/// Do these two boxes share any pixels? Used to prove a fixture is
+/// actually testing occlusion rather than clicking empty space next to
+/// the thing it thinks it is covering.
+fn overlaps(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
+    a.origin.x < b.origin.x + b.size.width
+        && b.origin.x < a.origin.x + a.size.width
+        && a.origin.y < b.origin.y + b.size.height
+        && b.origin.y < a.origin.y + a.size.height
+}
+
+/// Boot, fill the rail, open the menu, and settle it. Returns the menu's
+/// bounds — every occlusion assertion needs them.
+fn open_menu(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext, Bounds<Pixels>) {
+    let (mut h, vcx) = boot_with_overlay(cx);
+    h.plumbing.push_rail(vec![
+        session("aaaa1111"),
+        session("bbbb2222"),
+        session("cccc3333"),
+        session("dddd4444"),
+    ]);
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    click(vcx, "overlay-demo");
+    vcx.run_until_parked();
+    // Let the 140 ms entrance land, so nothing below is asserting against
+    // a surface that is still arriving.
+    drive(&h, vcx, Duration::from_millis(16));
+    let bounds = vcx
+        .debug_bounds("overlay-menu")
+        .expect("the menu did not render");
+    (h, vcx, bounds)
+}
+
+/// The gate holds: the shipped shell has no trigger and no layer. This is
+/// the assertion that lets the other 244 tests keep their numbers — the
+/// demo compiles into the binary, and it must be invisible until asked
+/// for.
+#[gpui::test]
+fn the_overlay_layer_is_absent_from_the_shell_that_ships(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "overlay-demo"), "the demo trigger shipped");
+    assert!(!shown(vcx, "overlay-menu"), "the overlay layer shipped");
+}
+
+/// The first popover eave has ever had: it opens, it paints over the
+/// shell, and a click anywhere else takes it away.
+#[gpui::test]
+fn a_menu_opens_over_the_shell_and_a_click_outside_takes_it_away(cx: &mut TestAppContext) {
+    let (h, vcx, menu) = open_menu(cx);
+    assert!(shown(vcx, "menu-row-0") && shown(vcx, "menu-row-2"));
+
+    // Somewhere clear of the menu, still inside the window.
+    let outside = point(
+        menu.origin.x + menu.size.width + px(120.),
+        menu.origin.y + menu.size.height + px(120.),
+    );
+    assert!(!menu.contains(&outside));
+    vcx.simulate_click(outside, Modifiers::none());
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(!shown(vcx, "overlay-menu"), "the menu outlived its dismissal");
+}
+
+#[gpui::test]
+fn escape_takes_the_menu_away(cx: &mut TestAppContext) {
+    let (h, vcx, _) = open_menu(cx);
+    vcx.simulate_keystrokes("escape");
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(!shown(vcx, "overlay-menu"));
+}
+
+/// **The click-through bug, asserted before it can be written.** A rail
+/// row lies under the menu; clicking the menu row on top of it must fire
+/// the menu row and must not select the session.
+#[gpui::test]
+fn a_menu_row_takes_the_click_the_row_beneath_it_would_have(cx: &mut TestAppContext) {
+    let (mut h, vcx, menu) = open_menu(cx);
+    let rail = vcx
+        .debug_bounds("rail-aaaa1111")
+        .expect("the rail row did not render");
+    assert!(
+        overlaps(menu, rail),
+        "the fixture proves nothing unless the menu actually covers a live \
+         affordance — menu {menu:?} rail {rail:?}"
+    );
+
+    click(vcx, "menu-row-0");
+    vcx.run_until_parked();
+    let chosen = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).demo.chosen.clone())
+        .unwrap();
+    assert_eq!(chosen.as_deref(), Some("Reveal in Finder"));
+    assert!(
+        h.drain().is_empty(),
+        "the click fell through the menu and reached the rail"
+    );
+}
+
+/// The other half, and the one that is easy to get wrong: dismissing by
+/// clicking outside must not ALSO activate whatever was outside. The
+/// full-window catcher behind the menu is what stops it, and this is the
+/// only thing that proves the catcher occludes rather than merely
+/// listening.
+#[gpui::test]
+fn dismissing_by_clicking_away_does_not_also_hit_what_was_there(cx: &mut TestAppContext) {
+    let (mut h, vcx, menu) = open_menu(cx);
+    // A rail row the menu does NOT cover: the click has to be a real
+    // click on a real affordance, or the test is about empty space.
+    let row = ["rail-dddd4444", "rail-cccc3333", "rail-bbbb2222"]
+        .into_iter()
+        .find_map(|sel| {
+            vcx.debug_bounds(sel)
+                .filter(|b| !overlaps(menu, *b))
+                .map(|b| (sel, b))
+        })
+        .expect("no rail row sits clear of the menu — fixture needs more rows");
+    let (_, bounds) = row;
+
+    vcx.simulate_click(bounds.center(), Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "the dismissing click also selected the session underneath it"
+    );
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(!shown(vcx, "overlay-menu"), "the click did not dismiss");
+
+    // ...and now that the menu is gone, the same click works normally.
+    vcx.simulate_click(bounds.center(), Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(_)]),
+        "the catcher outlived the menu and swallowed a real click"
+    );
+}
+
+/// Keyboard navigation skips the disabled row, and return fires the
+/// highlighted one. Three rows, the third disabled: down three times must
+/// wrap to the first rather than land on the third.
+#[gpui::test]
+fn the_arrows_skip_the_disabled_row_and_return_chooses(cx: &mut TestAppContext) {
+    let (h, vcx, _) = open_menu(cx);
+    let hl = |vcx: &mut VisualTestContext, h: &Harness| {
+        vcx.read_window(&h.window, |shell, cx| {
+            shell.read(cx).demo.menu.highlighted()
+        })
+        .unwrap()
+    };
+    vcx.simulate_keystrokes("down");
+    assert_eq!(hl(vcx, &h), Some(0));
+    vcx.simulate_keystrokes("down");
+    assert_eq!(hl(vcx, &h), Some(1));
+    vcx.simulate_keystrokes("down");
+    assert_eq!(hl(vcx, &h), Some(0), "the cursor stopped on the disabled row");
+
+    vcx.simulate_keystrokes("down enter");
+    let (chosen, mounted) = vcx
+        .read_window(&h.window, |shell, cx| {
+            let s = shell.read(cx);
+            (s.demo.chosen.clone(), s.demo.menu.is_mounted())
+        })
+        .unwrap();
+    assert_eq!(chosen.as_deref(), Some("Copy session id"));
+    assert!(mounted, "choosing must play the exit, not vanish");
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(!shown(vcx, "overlay-menu"));
+}
+
+/// A disabled row is dimmed, takes no click, and is still there — it
+/// occupies its slot and swallows the click rather than letting it reach
+/// the shell behind the menu.
+#[gpui::test]
+fn a_disabled_row_is_present_and_inert(cx: &mut TestAppContext) {
+    let (mut h, vcx, _) = open_menu(cx);
+    assert!(shown(vcx, "menu-row-2"), "a disabled row still renders");
+    click(vcx, "menu-row-2");
+    vcx.run_until_parked();
+    let (chosen, open) = vcx
+        .read_window(&h.window, |shell, cx| {
+            let s = shell.read(cx);
+            (s.demo.chosen.clone(), s.demo.menu.is_open())
+        })
+        .unwrap();
+    assert_eq!(chosen, None, "a disabled row fired");
+    assert!(open, "a disabled row dismissed the menu it sits in");
+    assert!(h.drain().is_empty(), "the click fell through to the shell");
+}
+
+/// An open menu owns the keyboard. A character typed at it must not land
+/// in a draft the user cannot see behind the surface.
+#[gpui::test]
+fn an_open_menu_swallows_typing(cx: &mut TestAppContext) {
+    let (h, vcx, _) = open_menu(cx);
+    let draft = |vcx: &mut VisualTestContext, h: &Harness| {
+        vcx.read_window(&h.window, |shell, cx| {
+            shell.read(cx).composer.read(cx).text.clone()
+        })
+        .unwrap()
+    };
+    vcx.simulate_input("hello");
+    assert_eq!(draft(vcx, &h), "", "typing reached the composer through the menu");
+    vcx.simulate_keystrokes("escape");
+    drive(&h, vcx, Duration::from_millis(16));
+    vcx.simulate_input("hello");
+    assert_eq!(draft(vcx, &h), "hello", "the composer never got the keyboard back");
+}
+
+/// The constraint that decides where the layer mounts: **an overlay must
+/// never participate in a cached row height.** eave's transcript is a
+/// virtualized list, and a surface that changes any layout is a surface
+/// that can change one of those. Root-mounted and absolute, it changes
+/// nothing — measured, not argued.
+#[gpui::test]
+fn the_overlay_moves_nothing_it_floats_over(cx: &mut TestAppContext) {
+    let (h, vcx) = boot_with_overlay(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+
+    let probes = [
+        "rail-aaaa1111",
+        "rail-bbbb2222",
+        "rail-rows",
+        // `composer-hint`, not `composer-text`: the text element only
+        // renders once there is a draft, and a probe that is absent
+        // proves nothing (it was absent before AND after).
+        "composer-hint",
+        "send",
+        "rail-toggle",
+    ];
+    let before: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
+    assert!(
+        before.iter().all(|b| b.is_some()),
+        "a probe never rendered, so it proves nothing: {before:?}"
+    );
+
+    click(vcx, "overlay-demo");
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(shown(vcx, "overlay-menu"), "the menu must be up for this to mean anything");
+
+    let after: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
+    assert_eq!(before, after, "the overlay moved the shell underneath it");
+}
+
+/// N1's invariant, carried into the first hand-driven oneshot in the app:
+/// a menu costs frames while it is arriving and while it is leaving, and
+/// **nothing at all** in between or afterwards.
+///
+/// The `drive` calls are the assertion — each one panics rather than
+/// spinning if the window never stops asking, which is the exact failure
+/// mode of a tween driven by a mounted `with_animation`.
+#[gpui::test]
+fn a_menu_costs_frames_only_while_it_moves(cx: &mut TestAppContext) {
+    let (h, vcx) = boot_with_overlay(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+
+    click(vcx, "overlay-demo");
+    vcx.run_until_parked();
+    let entering = drive(&h, vcx, Duration::from_millis(16));
+    assert!(entering > 0, "the entrance never asked for a frame");
+
+    // Settled and open: the surface is up, and it is free.
+    assert!(shown(vcx, "overlay-menu"));
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0,
+        "an open, settled menu is still asking for frames"
+    );
+    assert!(
+        !clock_running(vcx),
+        "the overlay leased the pulse clock — it rides the tail, not the clock"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    let leaving = drive(&h, vcx, Duration::from_millis(16));
+    assert!(leaving > 0, "the exit never asked for a frame");
+    assert!(!shown(vcx, "overlay-menu"));
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0,
+        "the window kept asking for frames after the menu was gone"
+    );
+    assert!(!clock_running(vcx));
+}
+
+/// The exit's whole reason to exist: the surface stays mounted, painted
+/// and **occluding** while it plays, but stops taking input the instant
+/// it is dismissed. A click during those 100 ms must do nothing at all —
+/// not fire a menu row, and not reach what the menu was covering.
+#[gpui::test]
+fn the_surface_stays_up_and_dead_through_its_exit(cx: &mut TestAppContext) {
+    let (mut h, vcx, menu) = open_menu(cx);
+    let rail = vcx.debug_bounds("rail-aaaa1111").expect("no rail row");
+    assert!(overlaps(menu, rail), "the fixture must cover a live affordance");
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "overlay-menu"),
+        "the surface vanished instead of playing its exit"
+    );
+
+    // Mid-exit: click straight through where the menu is.
+    click(vcx, "menu-row-0");
+    vcx.run_until_parked();
+    let chosen = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).demo.chosen.clone())
+        .unwrap();
+    assert_eq!(chosen, None, "a row fired during the exit");
+    assert!(
+        h.drain().is_empty(),
+        "a click during the exit fell through to the rail underneath"
+    );
+
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(!shown(vcx, "overlay-menu"), "the reap never came");
+}
+
+/// Reduced motion: the menu is simply there, and then simply gone. No
+/// entrance, no exit, and — the part that matters — **no window of time
+/// where an invisible surface is still occluding the shell**, which is
+/// what a reduced-motion path that skipped only the tween would leave
+/// behind.
+#[gpui::test]
+fn reduced_motion_gets_a_menu_with_no_travel_at_all(cx: &mut TestAppContext) {
+    let (h, vcx) = boot_with_overlay(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    vcx.update(|_, cx| cx.set_reduce_motion(true));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    click(vcx, "overlay-demo");
+    vcx.run_until_parked();
+    // No clock advanced, no frames driven: it is already fully there.
+    assert!(shown(vcx, "overlay-menu"), "the menu waited for a frame it will never get");
+    let opacity = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell
+                .read(cx)
+                .demo
+                .menu
+                .motion_at(cx.background_executor().now(), true)
+        })
+        .unwrap();
+    assert_eq!(opacity, Some((1.0, 0.0)), "reduced motion drew a part-way menu");
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "overlay-menu"),
+        "a dismissed menu stayed mounted with no exit to play — an \
+         invisible surface still occluding the shell"
+    );
+}

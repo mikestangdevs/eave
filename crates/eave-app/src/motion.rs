@@ -180,8 +180,9 @@ pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
 /// CSS `ease-out` — size transitions.
 #[allow(dead_code)] // inventory §1.8 (200 ms pane/rail size transitions) is its caller; unbuilt.
 pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
-/// CSS `ease` — quick fades, menu/dialog pops.
-#[allow(dead_code)] // inventory §1.5 / §1.6 (menu, dialog) are its first consumers.
+/// CSS `ease` — quick fades, menu/dialog pops. The catalog's busiest
+/// curve: [`FADE_QUICK`], [`DIALOG_IN`], and both halves of the menu pair
+/// below ride it.
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 /// CSS `cubic-bezier(0.22, 1, 0.36, 1)` — reorder glides.
 #[allow(dead_code)] // inventory §1.17 (260 ms FLIP reorder) is its caller,
@@ -320,6 +321,41 @@ pub const ENTRANCE_RISE: f32 = 4.0;
 /// How far [`DIALOG_IN`] rises, in px — half of [`ENTRANCE_RISE`], the
 /// standing-in-for-scale value.
 pub const DIALOG_RISE: f32 = 2.0;
+
+/// The popover entrance (inventory §1.5): 140 ms over [`EASE`].
+///
+/// Faster than every other entrance in the catalog, and that is the
+/// point — a menu is a *response to a click that already happened*, so
+/// any perceptible delay reads as the app being slow rather than as the
+/// menu arriving. It also starts from [`MENU_OPACITY_FROM`] rather than
+/// from nothing, which is the same argument from the other side: at
+/// 140 ms a fade from zero never resolves into a shape, it just flickers.
+pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
+
+/// The popover exit (inventory §1.5): 100 ms, **deliberately shorter than
+/// [`MENU_IN`]** — comet's stated rule, "exits should get out of the way".
+/// A dismissal is an instruction that has already been given; the only
+/// job left is to not snap.
+///
+/// This one is not driven the way every other tween in this module is.
+/// The exit's `t` is computed from the popup's own closing instant, held
+/// in its state machine (`crate::overlay::Popup`), and NOT from the fade
+/// store — because an exit is the one tween that plays while its element
+/// is on its way out, so a store entry keyed by "was this read last
+/// frame" is exactly the wrong instrument for it. See the scar in
+/// [`MotionSpec`]'s trailing note: a replay mid-exit is a full-opacity
+/// flash, and the whole reason `Popup` exists is to make that
+/// unrepresentable.
+pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE);
+
+/// Where [`MENU_IN`]'s opacity starts (and where [`MENU_OUT`] would end
+/// if it ended anywhere but zero — it does not; see `overlay`).
+pub const MENU_OPACITY_FROM: f32 = 0.3;
+
+/// How far a menu rises over [`MENU_IN`], in px — the same 2 px
+/// standing-in-for-scale value as [`DIALOG_RISE`], because it is standing
+/// in for the same absent transform.
+pub const MENU_RISE: f32 = 2.0;
 
 /// Caret blink half-period (inventory §1.20): 500 ms solid, 500 ms hidden —
 /// the standard textarea cadence. Not a [`MotionSpec`]: a blink is a step
@@ -508,14 +544,14 @@ thread_local! {
 /// window and renders on one thread, so neither is a live problem — but
 /// both are properties of the `thread_local`, not accidents to be relied
 /// on if that changes.
-// Unreached, and worth saying why rather than deleting: N3 is the first
-// consumer slice and it does not need the tail at all. Everything it drives
-// is REPEATING, and a repeating consumer is driven by the clock's own
-// `cx.notify` — the tail exists for hand-driven ONESHOTS, which arrive with
-// the entrances (§1.3). Until then `take_active()` at the end of
-// `Shell::render` always answers false, which is exactly the invariant N1
-// wanted: nothing mid-flight schedules nothing.
-#[allow(dead_code)]
+// Slice P1 is the first caller, and it took three slices to arrive because
+// of what the tail is FOR. N3's loaders are all REPEATING, and a repeating
+// consumer is driven by the clock's own `cx.notify`; N2's fades are driven
+// by the store, which the root asks about once in its own tail. The tail
+// proper exists for hand-driven ONESHOTS — a tween whose whole clock is one
+// instant a caller is holding — and the popover exit is exactly that: it
+// cannot use the store, because the store's liveness rule is "was this read
+// last frame" and an exit plays while its element is leaving.
 pub fn mark_active() {
     MOTION_ACTIVE.with(|f| f.set(true));
 }

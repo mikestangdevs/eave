@@ -24,6 +24,12 @@ mod loaders;
 /// modules — the headless acceptance runs never draw.
 mod icons;
 
+/// The overlay layer (Slice P1): the anchored popover surface, the
+/// `Popup` state machine and the menu-row primitive. Private for the same
+/// reason as `loaders` and `motion` — it renders, and it has no product
+/// consumer yet at all.
+mod overlay;
+
 pub mod display;
 pub mod fixture;
 pub mod markdown;

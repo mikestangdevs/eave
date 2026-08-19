@@ -23,7 +23,8 @@ use gpui::{
     actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent, Context,
     Corners, Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
-    Pixels, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
+    MouseDownEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString,
+    StrikethroughStyle, StyledText,
     TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowHandle, WindowOptions,
 };
@@ -45,6 +46,7 @@ use crate::icons;
 use crate::loaders;
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::motion::{self, HoverFade as _};
+use crate::overlay::{self, MenuItem, Popup};
 use crate::theme;
 
 actions!(eave, [Quit, ApproveOldest, DenyOldest]);
@@ -1552,6 +1554,25 @@ fn thread_cpu_time() -> Duration {
 // ---------------------------------------------------------------------------
 // Shell
 
+/// Slice P1's demo state, and the whole of the overlay layer's presence
+/// in the product: nothing else in eave opens a popup.
+///
+/// It hangs off the shell rather than living in the overlay module because
+/// that is what a real consumer will do — a popup belongs to whatever owns
+/// the affordance that opened it, and building the demo any other way
+/// would have proved the machinery works in a shape no consumer can copy.
+/// Inert unless [`overlay::demo_enabled`]; see there for the gate.
+#[derive(Default)]
+struct DemoOverlay {
+    /// `T` is the anchor point the menu was opened at, in window
+    /// coordinates — the smallest thing a popup can need to remember, and
+    /// enough to prove the parameter is carried through the exit.
+    menu: Popup<Point<Pixels>>,
+    /// The last row chosen. Nothing reads it but the tests; it exists so
+    /// that "the row fired" is an observable fact rather than an absence.
+    chosen: Option<SharedString>,
+}
+
 struct Shell {
     focus: FocusHandle,
     conn: Entity<ConnectionState>,
@@ -1575,6 +1596,8 @@ struct Shell {
     /// holds no authoritative state).
     rail_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
+    /// Slice P1 — see [`DemoOverlay`]. No product consumer.
+    demo: DemoOverlay,
 }
 
 /// The data dir this process is running against, recorded by [`run`] so
@@ -1769,6 +1792,38 @@ impl Shell {
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // Slice P1: an open overlay owns the keyboard, and it owns ALL of
+        // it — escape dismisses, the arrows move the highlight, return
+        // chooses, and every other key is swallowed rather than falling
+        // through to the composer. A menu you can type past is not a menu,
+        // and the alternative (letting unhandled keys through) means a
+        // stray character lands in a draft the user cannot see behind the
+        // surface. Both dismissals stay reachable, so this traps nobody.
+        //
+        // Ahead of the caret-anchor reset below on purpose: navigating a
+        // menu is not "the typist is still in the composer", and re-anchoring
+        // the blink from here would make an arrow key look like a keystroke.
+        if self.demo.menu.is_open() {
+            match ks.key.as_str() {
+                "escape" => self.close_demo_menu(cx),
+                "down" => {
+                    self.demo.menu.highlight_next();
+                    cx.notify();
+                }
+                "up" => {
+                    self.demo.menu.highlight_prev();
+                    cx.notify();
+                }
+                "enter" => match self.demo.menu.highlighted() {
+                    Some(ix) => self.choose_demo(ix, cx),
+                    // Return with nothing highlighted dismisses rather
+                    // than firing the first row: the user has not chosen.
+                    None => self.close_demo_menu(cx),
+                },
+                _ => {}
+            }
+            return;
+        }
         // §1.20: ANY key resets the blink anchor, not just the ones that
         // change the text. Backspacing to empty, a rejected ⌘-chord, an
         // arrow key — they are all "the typist is still here", and a caret
@@ -3760,6 +3815,127 @@ impl Shell {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Slice P1's demo trigger — the overlay layer's only caller.
+//
+// The layer has no product consumer by directive, so this is what proves
+// it: a button that is not rendered at all unless `EAVE_OVERLAY_DEMO` is
+// set, opening a three-row menu that exercises every branch of the
+// primitive (a plain row, a row with trailing state, a disabled row). The
+// tests turn the same gate on directly.
+
+impl Shell {
+    /// The demo menu's rows. Rebuilt per render rather than stored: a menu
+    /// states facts that were true when it was drawn, and a consumer that
+    /// cached them would show a stale list after the state moved under it.
+    fn demo_items() -> Vec<MenuItem> {
+        vec![
+            MenuItem::new("Reveal in Finder"),
+            MenuItem::new("Copy session id").trailing("⌘C"),
+            // The disabled row is not decoration: it is the only way to
+            // prove the highlight skips it and that it takes no click.
+            MenuItem::new("Delete worktree").disabled(),
+        ]
+    }
+
+    fn open_demo_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let enabled = Self::demo_items().iter().map(|i| i.enabled).collect();
+        self.demo.menu.open(at, enabled, now);
+        cx.notify();
+    }
+
+    /// Dismiss: start the exit, and schedule the reap that will drop it.
+    ///
+    /// The reap is scheduled here, by the caller, rather than inside
+    /// `begin_close` — a state machine that spawns tasks is a state machine
+    /// that cannot be unit-tested without an executor, and `Popup` is
+    /// deliberately pure. `begin_close` answering `false` under reduced
+    /// motion is what keeps a timer from being spawned for an exit that
+    /// never plays.
+    fn close_demo_menu(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.demo.menu.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.demo.menu.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn choose_demo(&mut self, ix: usize, cx: &mut Context<Self>) {
+        // Re-checked here as well as in the row: a disabled row drops its
+        // click handler, but the KEYBOARD path reaches this by index, and
+        // an index is only as safe as whoever computed it.
+        if let Some(item) = Self::demo_items().get(ix).filter(|i| i.enabled) {
+            self.demo.chosen = Some(item.label.clone());
+        }
+        self.close_demo_menu(cx);
+    }
+
+    /// The trigger. **Absolutely positioned**, so that even with the gate
+    /// on it cannot move a single pixel of the real shell — which is what
+    /// lets the other 244 tests run with it compiled in.
+    fn demo_trigger(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("overlay-demo")
+            .debug_selector(|| "overlay-demo".into())
+            .absolute()
+            .top(px(theme::TITLEBAR_H))
+            .left(px(theme::PLATE_MARGIN))
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .border_1()
+            .border_color(theme::border_strong())
+            .text_size(px(theme::LABEL_SIZE))
+            .line_height(px(theme::LABEL_LINE))
+            .text_color(theme::text_secondary())
+            .hover_fade("overlay-demo", theme::wash_rest(), theme::overlay())
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                // Anchored at the pointer, one grid unit below it — the
+                // context-menu idiom, and the one anchor that needs no
+                // element bounds. A menu hung off a button's own box wants
+                // `anchored()`'s local position mode instead; both are one
+                // call, and which is right is the consumer's decision.
+                let at = window.mouse_position();
+                this.open_demo_menu(point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)), cx);
+            }))
+            .child("overlay demo")
+    }
+
+    fn demo_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let anchor = *self.demo.menu.data()?;
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let live = self.demo.menu.is_open();
+        let highlighted = self.demo.menu.highlighted();
+        let rows = Self::demo_items()
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                overlay::menu_row(
+                    ix,
+                    item,
+                    highlighted == Some(ix),
+                    live,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.choose_demo(ix, cx)),
+                )
+            })
+            .collect();
+        overlay::menu_layer(
+            &self.demo.menu,
+            anchor,
+            now,
+            reduced,
+            rows,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_demo_menu(cx)),
+        )
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Slice N2: open the frame FIRST, before anything below reads a
@@ -4057,6 +4233,12 @@ impl Render for Shell {
             None
         };
 
+        // Slice P1: built before the chain rather than inside a `.when`,
+        // so neither closure has to capture `self` and `cx` alongside the
+        // element being built. Both are `None` in the shipped app.
+        let demo_trigger = overlay::demo_enabled().then(|| self.demo_trigger(cx));
+        let demo_layer = self.demo_layer(cx);
+
         // Opaque window by default, custom titlebar — locked decision
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
         // This root bg is the glass ground.
@@ -4270,7 +4452,13 @@ impl Render for Shell {
                             .child(self.footer(cx)),
                     )
                     .when(!files_collapsed, |d| d.child(self.files_rail(cx, pulse))),
-            );
+            )
+            // Slice P1: the overlay layer mounts at the ROOT and nowhere
+            // else — `deferred` fixes paint order, but layout stays where
+            // it is written, and the transcript is a virtualized list that
+            // caches row heights. See `overlay::menu_layer`.
+            .children(demo_trigger)
+            .children(demo_layer);
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
         // claims this frame during the pass above; the root asks once, here,
@@ -4841,6 +5029,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                 Shell {
                     focus: cx.focus_handle(),
+                    demo: DemoOverlay::default(),
                     conn: conn.clone(),
                     sessions: sessions.clone(),
                     files: files.clone(),
@@ -4864,6 +5053,15 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             });
             let handle = shell.read(cx).focus.clone();
             window.focus(&handle, cx);
+            // Slice P1: `EAVE_OVERLAY_DEMO=open` opens the menu on the
+            // first frame, so the surface can be looked at rather than
+            // only asserted. A fixed anchor rather than the pointer's,
+            // because there is no pointer yet.
+            if overlay::demo_opens_at_boot() {
+                shell.update(cx, |s, cx| {
+                    s.open_demo_menu(point(px(240.), px(180.)), cx)
+                });
+            }
             shell
         },
     )
