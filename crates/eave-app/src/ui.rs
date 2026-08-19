@@ -42,7 +42,7 @@ use eave_wire::{
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
 use crate::markdown::{inline_runs, Block, InlineRun};
-use crate::motion;
+use crate::motion::{self, HoverFade as _};
 use crate::theme;
 
 actions!(eave, [Quit, ApproveOldest, DenyOldest]);
@@ -1339,6 +1339,12 @@ impl TranscriptState {
 
 struct ComposerState {
     text: String,
+    /// When the caret last went solid (inventory §1.20). Every keystroke
+    /// resets it, which is what keeps a typing burst from blinking: the
+    /// cadence is solid through its first half-period, so the caret only
+    /// starts flashing once the typist has stopped. `None` until the first
+    /// keystroke — a caret nobody has typed at has nothing to blink about.
+    caret_anchor: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,6 +1680,13 @@ impl Shell {
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // §1.20: ANY key resets the blink anchor, not just the ones that
+        // change the text. Backspacing to empty, a rejected ⌘-chord, an
+        // arrow key — they are all "the typist is still here", and a caret
+        // that blinked through them would be flashing at someone who is
+        // actively using the composer.
+        let struck = cx.background_executor().now();
+        self.composer.update(cx, |c, _| c.caret_anchor = Some(struck));
         match ks.key.as_str() {
             "enter" => self.send_current(cx),
             "backspace" => {
@@ -1712,6 +1725,42 @@ impl Shell {
                 }
             }
         }
+    }
+
+    /// Is the composer caret drawn this frame? (inventory §1.20 — 500 ms
+    /// half-period, solid through the first half so a typing burst never
+    /// blinks.)
+    ///
+    /// **Only a draft blinks, and that is a divergence worth reading.** A
+    /// blink is the one tween in this slice that never settles, so its
+    /// consumer holds a pulse lease for as long as it is on screen — and
+    /// eave's caret is on screen always, which would mean a window that
+    /// redraws 30 times a second forever. That directly contradicts the
+    /// invariant N1 was built around and asserts twice: *a window with
+    /// nothing mid-flight schedules nothing at all.* Gating on a draft keeps
+    /// the invariant reachable — an idle eave still schedules nothing — and
+    /// keeps the blink where it means something, marking the insertion point
+    /// in real text rather than decorating a placeholder. Measured cost of
+    /// the ungated version is in `docs/reports/stage-n2-hover.md` §5; if the
+    /// user wants it always, delete the `has_draft` early return and nothing
+    /// else changes.
+    fn caret_lit(&self, cx: &mut Context<Self>) -> bool {
+        let (has_draft, anchor) = {
+            let c = self.composer.read(cx);
+            (!c.text.is_empty(), c.caret_anchor)
+        };
+        if !has_draft {
+            return true;
+        }
+        // The lease is the whole reason this call is `&mut`: it is what
+        // keeps the clock ticking, and dropping it is what parks the clock.
+        let view = cx.entity_id();
+        let (Some(now), Some(anchor)) = (motion::pulse_now(view, cx), anchor) else {
+            // Reduced motion, or a draft that arrived without a keystroke
+            // (a paste through the fixture path). Solid.
+            return true;
+        };
+        motion::caret_visible(now.saturating_duration_since(anchor))
     }
 
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1794,7 +1843,7 @@ impl Shell {
                     .p(px(theme::SPACE_1))
                     .mr_2()
                     .rounded(px(theme::RADIUS_BUTTON))
-                    .hover(|s| s.bg(theme::overlay()))
+                    .hover_fade("rail-toggle", theme::wash_rest(), theme::overlay())
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sessions.update(cx, |s, cx| {
@@ -1842,7 +1891,7 @@ impl Shell {
                     .p(px(theme::SPACE_1))
                     .mr_2()
                     .rounded(px(theme::RADIUS_BUTTON))
-                    .hover(|s| s.bg(theme::overlay()))
+                    .hover_fade("files-toggle", theme::wash_rest(), theme::overlay())
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.files.update(cx, |f, cx| {
@@ -1954,8 +2003,22 @@ impl Shell {
                     .px(px(theme::SPACE_2))
                     .py(px(theme::SPACE_2))
                     .rounded(px(theme::RADIUS_BUTTON))
-                    .when(is_sel, |d| d.bg(theme::overlay_strong()))
-                    .when(!is_sel, |d| d.hover(|s| s.bg(theme::overlay())))
+                    // A newly-arrived row fades in (§1.4). Opacity only, and
+                    // opacity never participates in layout — the rail's
+                    // structure is untouched.
+                    .opacity(motion::entrance_t(
+                        &format!("in:rail-{}", info.session_id),
+                        motion::FADE_QUICK,
+                    ))
+                    // The selected row keeps its standing fill and takes no
+                    // hover step (Slice M): stated as rest == hovered rather
+                    // than by dropping the fade, so a selection flip under a
+                    // stationary pointer cannot strand a half-faded entry.
+                    .hover_fade(
+                        format!("rail-{}", info.session_id),
+                        if is_sel { theme::overlay_strong() } else { theme::wash_rest() },
+                        if is_sel { theme::overlay_strong() } else { theme::overlay() },
+                    )
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, _| {
                         let _ = this.commands.send(Command::Select(sid.clone()));
@@ -2100,7 +2163,11 @@ impl Shell {
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
                                             .text_color(theme::text_secondary())
-                                            .hover(|s| s.bg(theme::overlay()))
+                                            .hover_fade(
+                                                format!("iso-{}", info.session_id),
+                                                theme::wash_rest(),
+                                                theme::overlay(),
+                                            )
                                             .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 // An affordance acts on the
@@ -2131,7 +2198,11 @@ impl Shell {
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
                                             .text_color(theme::text_secondary())
-                                            .hover(|s| s.bg(theme::overlay()))
+                                            .hover_fade(
+                                                format!("wto-{}", info.session_id),
+                                                theme::wash_rest(),
+                                                theme::overlay(),
+                                            )
                                             .cursor_pointer()
                                             .on_click(move |_, _, cx| {
                                                 cx.stop_propagation();
@@ -2164,7 +2235,11 @@ impl Shell {
                                             } else {
                                                 theme::text_secondary()
                                             })
-                                            .hover(|s| s.bg(theme::overlay()))
+                                            .hover_fade(
+                                                format!("wtd-{}", info.session_id),
+                                                theme::wash_rest(),
+                                                theme::overlay(),
+                                            )
                                             .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
@@ -2242,7 +2317,7 @@ impl Shell {
                     .child(
                         div()
                             .id("new-session")
-                    .debug_selector(|| "new-session".into())
+                            .debug_selector(|| "new-session".into())
                             .px(px(theme::SPACE_2))
                             .py(px(theme::SPACE_1))
                             .rounded(px(theme::RADIUS_BUTTON))
@@ -2251,7 +2326,7 @@ impl Shell {
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .text_color(theme::text_secondary())
-                            .hover(|s| s.bg(theme::overlay()))
+                            .hover_fade("new-session", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, _| {
                                 let _ = this.commands.send(Command::NewSession);
@@ -2487,8 +2562,20 @@ impl Shell {
             .px(px(theme::SPACE_2))
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
-            .when(expanded, |d| d.bg(theme::overlay()))
-            .when(!expanded, |d| d.hover(|s| s.bg(theme::overlay())))
+            // §1.4: a file that has just appeared in the rail fades in.
+            // The path is the key, so a snapshot replaced by an FS event
+            // does not re-fade rows that were already there.
+            .opacity(motion::entrance_t(
+                &format!("in:file-{}", f.path),
+                motion::FADE_QUICK,
+            ))
+            // An expanded row already rests at the wash, so its hover step
+            // is the same colour — rest == hovered, no flicker on expand.
+            .hover_fade(
+                format!("file-{}", f.path),
+                if expanded { theme::overlay() } else { theme::wash_rest() },
+                theme::overlay(),
+            )
             .cursor_pointer()
             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                 if ev.modifiers().platform {
@@ -2669,6 +2756,10 @@ impl Shell {
 
     /// Loud connection states get a real panel above the composer with the
     /// full actionable message; the footer only carries the short fact.
+    ///
+    /// It mounts and unmounts on a state change, which is exactly the shape
+    /// gpui's element-id-keyed animation clock replays on — so its §1.3
+    /// entrance is hand-driven from a keyed store (`motion::entrance_t`).
     fn conn_panel(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let message = match &self.conn.read(cx).status {
             ConnEvent::Busy { holder_pid } => match holder_pid {
@@ -2680,6 +2771,7 @@ impl Shell {
             ConnEvent::Failed { message } => message.clone(),
             _ => return None,
         };
+        let t = motion::entrance_t("in:conn-panel", motion::FADE_IN);
         Some(
             Self::column(frost(
                 theme::RADIUS_PANEL,
@@ -2704,6 +2796,12 @@ impl Shell {
                     .child(message),
             ))
             .pb(px(theme::SPACE_2))
+            .opacity(t)
+            // §1.3's rise, as a RELATIVE inset: taffy resolves relative
+            // insets after layout, so this slides the panel the way a CSS
+            // transform would and the composer below it never moves.
+            .relative()
+            .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
             .into_any_element(),
         )
     }
@@ -2713,6 +2811,11 @@ impl Shell {
     /// are prominent panels with the evidence/cause and a kill affordance.
     /// Nothing here ever auto-dismisses or auto-kills — notices persist
     /// until the engine reclassifies or the user acts.
+    ///
+    /// Like [`conn_panel`](Self::conn_panel) it carries a hand-driven §1.3
+    /// entrance. The key is the SESSION's, not a constant: a notice that
+    /// moves from one session to another is a different notice arriving,
+    /// and it should enter rather than cross-fade in place.
     fn attention_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let (attn_session, attention) = self.sessions.read(cx).attention.clone()?;
         // A notice belongs to one session; never render it over another
@@ -2857,9 +2960,13 @@ impl Shell {
                     .child(self.kill_affordance(cx, "clean up the process when you're ready"))
             }
         };
+        let t = motion::entrance_t(&format!("in:notice-{attn_session}"), motion::FADE_IN);
         Some(
             Self::column(frost(theme::RADIUS_PANEL, inner))
                 .pb(px(theme::SPACE_2))
+                .opacity(t)
+                .relative()
+                .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
                 .into_any_element(),
         )
     }
@@ -2878,7 +2985,6 @@ impl Shell {
                     .rounded(px(theme::RADIUS_BUTTON))
                     .border_1()
                     .border_color(theme::danger_ring())
-                    .bg(theme::danger_wash_strong())
                     .text_size(px(theme::DETAIL_SIZE))
                     .font_weight(theme::WEIGHT_LABEL)
                     .text_color(theme::danger())
@@ -2887,8 +2993,14 @@ impl Shell {
                     // Slice M (§2.2). Its resting fill is already a
                     // danger wash, so the hover step is more of the same
                     // pigment rather than the neutral overlay every
-                    // unfilled affordance uses.
-                    .hover(|s| s.bg(theme::danger_wash_hover()))
+                    // unfilled affordance uses. Both ends are opaque
+                    // pigment here, so this is the one site where the
+                    // blend is an ordinary sRGB interpolation.
+                    .hover_fade(
+                        "attn-kill",
+                        theme::danger_wash_strong(),
+                        theme::danger_wash_hover(),
+                    )
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, _| {
                         let _ = this.commands.send(Command::Kill);
@@ -3241,7 +3353,7 @@ impl Shell {
             .font_weight(theme::WEIGHT_LABEL)
             .text_color(color)
             .child(SharedString::from(word.to_string()))
-            .id(id)
+            .id(id.clone())
             .debug_selector({
                 let rid = rid.clone();
                 move || format!("{}-{rid}", if allow { "approve" } else { "deny" })
@@ -3250,7 +3362,13 @@ impl Shell {
             // pigment: approve and deny are the two most consequential
             // clicks in the app, and hover must say "the pointer is
             // here" without ever reading as "this one is chosen".
-            .hover(|s| s.bg(theme::overlay()))
+            //
+            // The only two hover fades in the app that live INSIDE the
+            // virtualized list, so their reads land in prepaint rather
+            // than in the root render — which is the whole reason the
+            // store's staleness rule carries a frame of grace
+            // (`motion::Fades::begin`).
+            .hover_fade(id.to_string(), theme::wash_rest(), theme::overlay())
             .cursor_pointer()
             .on_click(move |_, _, cx| {
                 let message = if allow {
@@ -3403,6 +3521,15 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Slice N2: open the frame FIRST, before anything below reads a
+        // hover wash or an entrance. `begin_frame` is where stale entries
+        // are pruned, and a read that beat the prune would see a dead
+        // element's entry and skip its own entrance (motion.rs).
+        //
+        // Time comes from the executor, never `Instant::now()` — N1's rule,
+        // and what lets the harness drive every tween off the fake clock.
+        motion::begin_frame(cx.background_executor().now(), cx.reduce_motion());
+
         // Perf probe: measure inter-frame time while force-scrolling the
         // 10k transcript top to bottom (spec 04 §Acceptance).
         if let Some(perf) = &mut self.perf {
@@ -3477,6 +3604,9 @@ impl Render for Shell {
             }
         }
 
+        // Before the immutable reads below: this one takes a pulse lease.
+        let caret_lit = self.caret_lit(cx);
+
         let transcript_entity = self.transcript.clone();
         let state = self.transcript.read(cx);
         let list_state = state.list.clone();
@@ -3541,7 +3671,39 @@ impl Render for Shell {
                         .line_height(px(theme::COMPOSER_LINE))
                         .text_color(theme::text())
                         .child(if has_draft {
-                            div().child(format!("{composer_text}▏")).into_any_element()
+                            // The blink is a COLOUR-ONLY run split, never a
+                            // glyph swap and never a sibling element. The
+                            // caret has to stay inside the text so it wraps
+                            // with it, and cosmic-text's `Attrs::compatible`
+                            // ignores colour — so the two runs shape as one
+                            // contiguous string and the layout is byte-
+                            // identical whether the caret is lit or not.
+                            // (Same property the streaming veil relies on;
+                            // `VeiledBlock::text_runs`.)
+                            let caret = "▏";
+                            let font = gpui::font(theme::SANS);
+                            let run = |len: usize, color: Hsla| TextRun {
+                                len,
+                                font: font.clone(),
+                                color,
+                                background_color: None,
+                                underline: None::<UnderlineStyle>,
+                                strikethrough: None::<StrikethroughStyle>,
+                            };
+                            let runs = vec![
+                                run(composer_text.len(), theme::text()),
+                                run(
+                                    caret.len(),
+                                    theme::text().opacity(if caret_lit { 1.0 } else { 0.0 }),
+                                ),
+                            ];
+                            div()
+                                .debug_selector(|| "composer-text".into())
+                                .child(
+                                    StyledText::new(format!("{composer_text}{caret}"))
+                                        .with_runs(runs),
+                                )
+                                .into_any_element()
                         } else {
                             div()
                                 .flex()
@@ -3594,11 +3756,6 @@ impl Render for Shell {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(if has_draft {
-                                    theme::inverse()
-                                } else {
-                                    theme::overlay_strong()
-                                })
                                 .text_size(px(theme::SEND_GLYPH_SIZE))
                                 .font_weight(theme::WEIGHT_STRONG)
                                 .text_color(if has_draft {
@@ -3607,17 +3764,22 @@ impl Render for Shell {
                                     theme::text_ghost()
                                 })
                                 .id("send")
-                    .debug_selector(|| "send".into())
+                                .debug_selector(|| "send".into())
                                 // Slice M (§2.2). A filled control REPLACES its bg
                                 // rather than compositing a wash over it, so both
                                 // states have to name a hovered fill.
-                                .hover(move |s| {
-                                    s.bg(if has_draft {
-                                        theme::inverse_hover()
-                                    } else {
-                                        theme::overlay_strongest()
-                                    })
-                                })
+                                //
+                                // Arming the button (first character typed) swaps
+                                // BOTH ends of the fade under a pointer that may
+                                // be sitting on it. That is a step, not a tween —
+                                // the fade interpolates between whatever the two
+                                // ends are this frame, so the armed colour arrives
+                                // at once and only the hover progress is smooth.
+                                .hover_fade(
+                                    "send",
+                                    if has_draft { theme::inverse() } else { theme::overlay_strong() },
+                                    if has_draft { theme::inverse_hover() } else { theme::overlay_strongest() },
+                                )
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.send_current(cx);
@@ -3724,6 +3886,16 @@ impl Render for Shell {
                                     // composer's clearance so it is never
                                     // read through the frost.
                                     .children(empty_note.map(|note| {
+                                        // §1.3. The entrance rides an INNER
+                                        // div: the note's own box is
+                                        // absolute (it is an overlay pinned
+                                        // above the composer's clearance)
+                                        // and `relative()` would destroy
+                                        // that positioning outright.
+                                        let t = motion::entrance_t(
+                                            "in:empty-note",
+                                            motion::FADE_IN,
+                                        );
                                         div()
                                             .debug_selector(|| "transcript-empty".into())
                                             .absolute()
@@ -3737,15 +3909,32 @@ impl Render for Shell {
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
                                             .text_color(theme::text_ghost())
-                                            .child(note)
+                                            .child(
+                                                div()
+                                                    .opacity(t)
+                                                    .relative()
+                                                    .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
+                                                    .child(note),
+                                            )
                                     }))
                                     .when(show_affordance, |d| {
+                                        // §1.6, 180 ms. comet approximates a
+                                        // `scale 0.96→1` with fade + a 2 px
+                                        // rise because gpui divs have no
+                                        // scale transform at the pinned rev.
+                                        // The rise rides the ABSOLUTE inset
+                                        // here rather than a relative one —
+                                        // an absolutely positioned box moves
+                                        // nothing else by definition.
+                                        let t =
+                                            motion::entrance_t("in:to-bottom", motion::DIALOG_IN);
                                         d.child(
                                             div()
                                                 .absolute()
-                                                .bottom(px(
-                                                    theme::COMPOSER_CLEARANCE + theme::SPACE_3
-                                                ))
+                                                .opacity(t)
+                                                .bottom(px(theme::COMPOSER_CLEARANCE
+                                                    + theme::SPACE_3
+                                                    - motion::DIALOG_RISE * (1.0 - t)))
                                                 .left_0()
                                                 .right_0()
                                                 .flex()
@@ -3758,20 +3947,21 @@ impl Render for Shell {
                                                         .rounded_full()
                                                         .border_1()
                                                         .border_color(theme::border_strong())
-                                                        .bg(theme::chrome_glass())
                                                         .shadow(theme::shadow_panel())
                                                         .text_size(px(theme::LABEL_SIZE))
                                                         .text_color(theme::text_secondary())
                                                         .id("to-bottom")
-                    .debug_selector(|| "to-bottom".into())
+                                                        .debug_selector(|| "to-bottom".into())
                                                         // Slice M (§2.2). Same alpha,
                                                         // lighter tint — the pill's job
                                                         // is to occlude the log behind
                                                         // it, and a thinner hover would
                                                         // undo that.
-                                                        .hover(|s| {
-                                                            s.bg(theme::chrome_glass_hover())
-                                                        })
+                                                        .hover_fade(
+                                                            "to-bottom",
+                                                            theme::chrome_glass(),
+                                                            theme::chrome_glass_hover(),
+                                                        )
                                                         .cursor_pointer()
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.transcript.update(cx, |t, cx| {
@@ -3812,6 +4002,16 @@ impl Render for Shell {
         // `with_animation`, but `request_animation_frame` is the raw call
         // underneath it and honours nothing on its own — gpui's own doc
         // comment says to check the flag here.
+        //
+        // Slice N2 is the first thing to claim it, and it claims from HERE
+        // rather than from the thirteen elements themselves: a hover read
+        // inside the virtualized list happens in prepaint, after this tail
+        // has already run, so an element that raised its own claim would
+        // miss its frame (N1's `mark_active` doc comment). One ask, from
+        // the root render, over the whole store.
+        if motion::fades_active() {
+            motion::mark_active();
+        }
         if motion::take_active() && !cx.reduce_motion() {
             window.request_animation_frame();
         }
@@ -4333,7 +4533,10 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         },
         |window, cx| {
             let shell = cx.new(|cx| {
-                let composer = cx.new(|_| ComposerState { text: String::new() });
+                let composer = cx.new(|_| ComposerState {
+                    text: String::new(),
+                    caret_anchor: None,
+                });
                 // Slice K: the approval card's buttons are built by a
                 // static row fn with no `Context`, so give the transcript
                 // state the two handles they need — the shell's own

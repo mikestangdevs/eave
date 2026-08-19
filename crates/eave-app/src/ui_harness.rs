@@ -57,7 +57,19 @@ fn boot(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext) {
     // full-motion path here; `reduce_motion_override` covers the other
     // branch as a pure function.
     cx.update(|cx| cx.set_reduce_motion(false));
+    // ...and clear the fade store with it. `bootstrap` opens the window and
+    // draws its first frame before the line above lands, so any entrance on
+    // that frame recorded itself as already-arrived under the machine's real
+    // preference — on a Mac with reduce-motion on (this one), every entrance
+    // in the suite would silently be a no-op. Production never hits this:
+    // the flag is read once at bootstrap and never changes.
+    motion::reset_for_test();
     let vcx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    // And force one draw through it, because `run_until_parked` only draws a
+    // dirty window and `bootstrap`'s own first frame is now behind us. Every
+    // test therefore boots with the empty-log note mid-entrance — a test
+    // that counts frames has to let that land first (`drive`).
+    vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
     (
         Harness {
@@ -1387,10 +1399,22 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
          cursor calls than comet and every one of them was the default arrow"
     );
 
-    // Hover coverage. Five controls across four sites had a handler and no
-    // feedback of any kind; each site is checked by its own selector so a
-    // regression names the control it broke rather than a number.
-    for (selector, kind) in [
+    // Hover coverage, all thirteen controls. Before Slice M five of them
+    // had a click handler and no feedback of any kind; Slice N2 replaced
+    // every `.hover(|s| s.bg(..))` — which snaps by construction, because
+    // gpui applies the whole style on the frame the pointer enters — with
+    // `.hover_fade(key, rest, hovered)`, which blends over HOVER_FADE.
+    //
+    // Each control is checked by its own selector so a regression names the
+    // one it broke. The colour is checked too, because the interesting way
+    // to break this is not to delete the fade but to give a filled control
+    // the neutral wash: a control with its own `bg` REPLACES it rather than
+    // compositing over it, so `overlay()` on the send button would paint a
+    // near-black square instead of a lighter fill.
+    for (selector, wash) in [
+        ("rail-toggle", "wash_rest"),
+        ("files-toggle", "wash_rest"),
+        ("new-session", "wash_rest"),
         ("attn-kill", "danger_wash_hover"),
         ("send", "inverse_hover"),
         ("to-bottom", "chrome_glass_hover"),
@@ -1399,23 +1423,53 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         let at = src
             .find(&anchor)
             .unwrap_or_else(|| panic!("{selector} is no longer tagged"));
-        let window = &src[at..src.len().min(at + 900)];
+        // Wide enough to clear the rationale comments that sit between a
+        // selector and its wash; a fade that genuinely moved elsewhere in
+        // the tree would take its selector with it.
+        let window = &src[at..src.len().min(at + 1600)];
         assert!(
-            window.contains(".hover("),
-            "{selector} lost its hover feedback"
+            window.contains(".hover_fade("),
+            "{selector} lost its hover feedback (or went back to a snapping .hover)"
         );
         assert!(
-            window.contains(kind),
-            "{selector} should hover to {kind} — a filled control replaces \
+            window.contains(wash),
+            "{selector} should hover to {wash} — a filled control replaces \
              its bg rather than compositing the neutral wash over it"
+        );
+    }
+    // The five built from a formatted selector, checked at their builder.
+    for (builder, what) in [
+        (r#"format!("rail-{}", info.session_id)"#, "the session row"),
+        (r#"format!("iso-{}", info.session_id)"#, "isolate"),
+        (r#"format!("wto-{}", info.session_id)"#, "worktree open"),
+        (r#"format!("wtd-{}", info.session_id)"#, "worktree delete"),
+        (r#"format!("file-{}", f.path)"#, "the file row"),
+    ] {
+        let at = src
+            .find(&format!("debug_selector(|| {builder})"))
+            .unwrap_or_else(|| panic!("{what} is no longer tagged"));
+        let window = &src[at..src.len().min(at + 1400)];
+        assert!(
+            window.contains(".hover_fade("),
+            "{what} lost its hover feedback"
         );
     }
     // approve / deny share one builder and one selector expression.
     let at = src.find("fn decision_button(").expect("decision_button");
     let window = &src[at..src.len().min(at + 2400)];
     assert!(
-        window.contains(".hover("),
+        window.contains(".hover_fade("),
         "approve and deny lost their hover feedback"
+    );
+
+    // And nothing anywhere may go back to the snapping form. This is the
+    // assertion that actually holds the line: the per-selector checks above
+    // pass just as well if someone adds a `.hover()` BESIDE a fade.
+    assert_eq!(
+        src.matches(".hover(").count(),
+        0,
+        "a snapping `.hover(|s| ..)` came back — every interactive wash \
+         rides motion::HOVER_FADE now (inventory §1.13)"
     );
 }
 
@@ -1435,6 +1489,9 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
 #[gpui::test]
 fn an_idle_shell_asks_for_no_frames_and_a_claim_buys_exactly_one(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    // Slice N2 gave the shell something to do at boot: the empty-log note
+    // enters. Let it land — "idle" means settled, not freshly opened.
+    drive(&h, vcx, Duration::from_millis(10));
 
     let pending = h
         .window
@@ -1477,6 +1534,9 @@ fn an_idle_shell_asks_for_no_frames_and_a_claim_buys_exactly_one(cx: &mut TestAp
 #[gpui::test]
 fn reduced_motion_stops_the_tail_from_asking_for_frames(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    // Land the boot entrance under full motion first, so what is measured
+    // below is the claim and not a frame the note had already asked for.
+    drive(&h, vcx, Duration::from_millis(10));
     vcx.update(|_, cx| cx.set_reduce_motion(true));
 
     motion::mark_active();
@@ -1492,5 +1552,339 @@ fn reduced_motion_stops_the_tail_from_asking_for_frames(cx: &mut TestAppContext)
     assert_eq!(
         asked, 0,
         "reduced motion still scheduled a frame for a hand-driven tween"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice N2 — hover fades and entrances, through the real shell
+
+/// One simulated display frame: deliver the frame the window asked for, let
+/// the clock move, and let it draw. Returns whether it wanted one at all.
+///
+/// This is the honest instrument in a test: there is no platform frame loop,
+/// so what `simulate_next_frame` returns IS the number of frames the window
+/// would have been handed.
+fn tick(h: &Harness, vcx: &mut VisualTestContext, step: Duration) -> bool {
+    let asked = h
+        .window
+        .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    if asked == 0 {
+        return false;
+    }
+    vcx.executor().advance_clock(step);
+    vcx.run_until_parked();
+    true
+}
+
+/// Drive until the window stops asking, and report how many frames it wanted.
+/// Panics rather than spinning if it never settles — a tween that asks
+/// forever is the exact failure mode N1 exists to prevent, and it should
+/// fail as a test rather than as a hung suite.
+#[track_caller]
+fn drive(h: &Harness, vcx: &mut VisualTestContext, step: Duration) -> usize {
+    let mut frames = 0;
+    while tick(h, vcx, step) {
+        frames += 1;
+        assert!(
+            frames < 400,
+            "the window asked for 400 frames without settling — something \
+             is claiming the tail unconditionally"
+        );
+    }
+    frames
+}
+
+/// A hover wash takes time, and then it stops costing anything.
+///
+/// Both halves matter and they fail in opposite directions. A wash that
+/// settles in one frame is the snapping `.hover()` this slice replaced. A
+/// wash that never settles pins the window at the display rate — comet
+/// measured that shape at 36% CPU, and it is what the whole frame-drive
+/// design exists to avoid.
+///
+/// The frame count is a literal, not a value derived from `HOVER_FADE`:
+/// deriving it would make the test pass for any duration, including zero
+/// (the N1 trap — see `progress.md` §Traps). At a 10 ms step a 150 ms wash
+/// claims the tail on the draws at 0, 10 … 140 ms and declines at 150.
+#[gpui::test]
+fn a_hover_wash_takes_time_and_then_stops_asking_for_frames(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // Let the boot entrance land first — an entering shell is legitimately
+    // mid-flight and would otherwise be counted here.
+    drive(&h, vcx, Duration::from_millis(10));
+
+    let bounds = vcx
+        .debug_bounds("new-session")
+        .expect("+ new did not render");
+    vcx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+    vcx.run_until_parked();
+
+    let frames = drive(&h, vcx, Duration::from_millis(10));
+    assert!(
+        (13..=17).contains(&frames),
+        "the wash into `+ new` ran for {frames} frames at 10 ms each; a \
+         150 ms fade is ~15, a snap is 0–1, and a runaway is the cap"
+    );
+
+    // Leaving is a fade too, not a cut.
+    vcx.simulate_mouse_move(point(px(2.), px(2.)), None, Modifiers::none());
+    vcx.run_until_parked();
+    let back = drive(&h, vcx, Duration::from_millis(10));
+    assert!(
+        (13..=17).contains(&back),
+        "the wash out of `+ new` ran for {back} frames — a leave should \
+         fade, not cut"
+    );
+
+    // And having landed, the shell is idle again.
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0,
+        "a settled hover left a standing frame request behind"
+    );
+}
+
+/// Reduced motion is honoured at the tail, so a hover under it costs
+/// nothing at all — not a shorter fade, no frames.
+///
+/// This is the assertion that would catch the easy mistake: honouring the
+/// preference in the *store* (fades snap) while still claiming the tail,
+/// which looks correct and quietly pumps frames for a tween nobody sees.
+#[gpui::test]
+fn a_hover_under_reduced_motion_asks_for_no_frames_at_all(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    drive(&h, vcx, Duration::from_millis(10));
+    vcx.update(|_, cx| cx.set_reduce_motion(true));
+
+    let bounds = vcx
+        .debug_bounds("new-session")
+        .expect("+ new did not render");
+    vcx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        drive(&h, vcx, Duration::from_millis(10)),
+        0,
+        "reduced motion still scheduled frames for a hover wash"
+    );
+}
+
+/// The empty-log note enters, and having entered it stays put.
+///
+/// The second half is the remount hazard (inventory §1.3): gpui keys
+/// `with_animation`'s start time by the element-id path, so an element that
+/// misses a frame replays. eave hand-drives instead, and this pins the
+/// consequence through the real shell — nothing re-enters just because the
+/// window drew again.
+#[gpui::test]
+fn the_empty_note_enters_once_and_does_not_replay_on_later_frames(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(
+        shown(vcx, "transcript-empty"),
+        "no session is selected, so the note should be on screen"
+    );
+
+    // 500 ms at a 10 ms step ≈ 50 frames. Literal, as above.
+    let frames = drive(&h, vcx, Duration::from_millis(10));
+    assert!(
+        (45..=55).contains(&frames),
+        "the note's entrance ran for {frames} frames at 10 ms each; FADE_IN \
+         is 500 ms, so ~50"
+    );
+
+    // Now make the shell draw again, repeatedly, for a reason that has
+    // nothing to do with the note.
+    for _ in 0..5 {
+        h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+        vcx.run_until_parked();
+        assert_eq!(
+            h.window
+                .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+                .unwrap(),
+            0,
+            "a redraw replayed an entrance that had already arrived"
+        );
+    }
+}
+
+/// The caret's drive, which is the one tween in the slice that never
+/// settles — so it is the one that could quietly cost forever.
+///
+/// **An empty composer takes no lease.** That is a deliberate gate, not an
+/// oversight: eave's caret is on screen always, and a caret that blinked
+/// always would mean a window redrawing 30 times a second for the life of
+/// the process, which is precisely the invariant N1 was built to hold — *a
+/// window with nothing mid-flight schedules nothing at all*. See
+/// `Shell::caret_lit`.
+#[gpui::test]
+fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    drive(&h, vcx, Duration::from_millis(10));
+    assert!(
+        !vcx.update(|_, cx| motion::clock_is_running(cx)),
+        "an idle shell with an empty composer had the pulse clock running"
+    );
+
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|_, cx| motion::clock_is_running(cx)),
+        "a draft did not put the caret on the clock"
+    );
+
+    // Sending empties the composer; the lease lapses and the clock parks.
+    // PULSE_LEASE is 300 ms, so a second of clock is comfortably past it.
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|_, cx| motion::clock_is_running(cx)),
+        "the clock kept ticking after the draft was sent"
+    );
+    assert_eq!(h.window.update(vcx, |_, window, cx| window.simulate_next_frame(cx)).unwrap(), 0);
+}
+
+/// §1.3's rise is a RELATIVE inset, and this is what that buys: the panel
+/// slides 4 px into place and **nothing around it moves**.
+///
+/// The mistake this rules out is doing the rise with a margin or a padding,
+/// which reads identically on the element itself and shoves every sibling
+/// below it — here, the composer — down and back up over half a second.
+/// taffy resolves relative insets after layout, exactly as a CSS transform
+/// does, and that is the only reason the entrance is safe to put on an
+/// in-flow panel at all.
+///
+/// Both halves are needed. The second assertion is what stops the first
+/// from passing vacuously: if the rise had silently become a no-op, the
+/// composer would also never move, and the test would be green for the
+/// wrong reason.
+#[gpui::test]
+fn an_entrance_that_rises_moves_itself_and_nothing_else(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    drive(&h, vcx, Duration::from_millis(10));
+
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_attn((
+        "aaaa1111".into(),
+        AttentionSnapshot::Unresponsive {
+            since_ms: 0,
+            zero_samples: 5,
+            sampled_ms: 5_000,
+        },
+    ));
+    vcx.run_until_parked();
+
+    // The notice is on screen and its entrance has just begun.
+    let rising = vcx
+        .debug_bounds("attn-kill")
+        .expect("the unresponsive notice did not render");
+    let send_rising = vcx.debug_bounds("send").expect("send did not render");
+
+    // Let the entrance land.
+    let frames = drive(&h, vcx, Duration::from_millis(10));
+    assert!(
+        frames > 1,
+        "the notice arrived without an entrance at all — this test would \
+         then prove nothing"
+    );
+    let landed = vcx.debug_bounds("attn-kill").unwrap();
+    let send_landed = vcx.debug_bounds("send").unwrap();
+
+    assert_eq!(
+        send_rising, send_landed,
+        "the composer moved while the panel above it rose — the rise is \
+         being applied as layout, not as a relative inset"
+    );
+    let travelled = (rising.origin.y - landed.origin.y).abs();
+    assert!(
+        travelled > px(1.),
+        "the panel itself did not move ({travelled:?}); the rise is a no-op \
+         and the assertion above is vacuous"
+    );
+}
+
+/// The caret blinks without moving the composer.
+///
+/// **Read the scope before trusting this.** The harness runs on the Noop
+/// text system, where every glyph has the same synthetic advance — so this
+/// test cannot see a *width* change, and a caret that blinked by swapping
+/// its glyph for a blank would pass it. What it does catch is the other
+/// wrong implementation, and the more tempting one: lifting the caret out
+/// into a sibling element, which changes the box structure and therefore
+/// the layout whatever the glyph metrics are. The width half is
+/// `a_glyph_swap_would_move_the_text_which_is_why_the_blink_recolours`
+/// below, at real font-kit metrics; between them the two cover it, and
+/// neither does alone.
+///
+/// The draft is long enough to wrap, because a single short line would be
+/// pinned by `COMPOSER_MIN_H`.
+#[gpui::test]
+fn the_caret_blink_never_moves_a_pixel_of_the_composer(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    drive(&h, vcx, Duration::from_millis(10));
+
+    vcx.simulate_input(
+        "the quick brown fox jumps over the lazy dog and then keeps going \
+         well past the width of the composer so that the text has to wrap",
+    );
+    vcx.run_until_parked();
+
+    let text = vcx
+        .debug_bounds("composer-text")
+        .expect("the draft did not render");
+    let send = vcx.debug_bounds("send").unwrap();
+    assert!(
+        text.size.height > px(theme::COMPOSER_LINE),
+        "precondition: the draft was meant to wrap, and it did not"
+    );
+
+    // Walk a full blink cycle in 100 ms steps. 500 ms is the half-period, so
+    // this crosses both edges — lit, dark, lit again.
+    for step in 1..=12 {
+        vcx.executor().advance_clock(Duration::from_millis(100));
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.debug_bounds("composer-text").unwrap(),
+            text,
+            "at {} ms into the blink the composer's text box moved",
+            step * 100
+        );
+        assert_eq!(
+            vcx.debug_bounds("send").unwrap(),
+            send,
+            "at {} ms into the blink the send button moved",
+            step * 100
+        );
+    }
+}
+
+/// Why the blink recolours a run instead of swapping the glyph, measured
+/// rather than asserted: at real metrics the caret and a blank are
+/// **different widths**, so a swap would reflow the draft under the typist's
+/// hands twice a second.
+///
+/// This is the half the harness cannot see — its Noop text system gives
+/// every glyph the same advance (Stage J, amendment 1: synthetic advances
+/// make a metrics test pass vacuously, which is the exact failure that
+/// amendment exists to prevent).
+#[gpui::test]
+fn a_glyph_swap_would_move_the_text_which_is_why_the_blink_recolours(
+    _cx: &mut TestAppContext,
+) {
+    let caret = real_text_width("▏", theme::SANS, theme::BODY_SIZE);
+    let blank = real_text_width(" ", theme::SANS, theme::BODY_SIZE);
+    assert!(
+        caret > px(0.),
+        "the caret glyph shaped to nothing — wrong family or size"
+    );
+    assert_ne!(
+        caret, blank,
+        "if these were the same width a glyph swap would be a legitimate \
+         way to blink; they are not, so the blink recolours a run and the \
+         string never changes (`Shell::render`, the has_draft branch)"
     );
 }

@@ -1,6 +1,9 @@
-//! Slice N1 — the frame drive. Machinery only: nothing in eave consumes any
-//! of this yet, by directive, which is why the module carries a blanket
-//! `dead_code` allow. The first consumer slice takes it off.
+//! The frame drive (Slice N1) and the tweens it drives (Slice N2).
+//!
+//! N1 built this as machinery with no consumers, behind a blanket
+//! `dead_code` allow. N2 is the first consumer and took the allow off; what
+//! is still unreached now carries a *named* allow with the inventory item
+//! that will reach it, so the compiler keeps the rest of the module honest.
 //!
 //! Everything that moves needs a per-frame source, and gpui offers exactly
 //! one out of the box: `with_animation`, which requests a redraw every
@@ -31,13 +34,13 @@
 //! below are *asserted* rather than argued: the test scheduler's fake clock
 //! drives them. (comet reads wall time here and keeps a separate pure core
 //! to stay testable; one time source is simpler and strictly stronger.)
-#![allow(dead_code)]
 
-use std::cell::Cell;
+
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use gpui::{Animation, App, EntityId, Global};
+use gpui::{App, EntityId, Global, Hsla, Rgba, StatefulInteractiveElement, Styled, Window};
 
 // ---------------------------------------------------------------------------
 // The measurement knob
@@ -163,24 +166,22 @@ impl CubicBezier {
         // below is the regression.
         self.sample_y(self.solve_t_for_x(x)).clamp(0.0, 1.0)
     }
-
-    /// This curve as a gpui easing closure.
-    pub fn easing(self) -> impl Fn(f32) -> f32 + 'static {
-        move |x| self.eval(x)
-    }
 }
 
 /// CSS `cubic-bezier(0.16, 1, 0.3, 1)` — the signature entrance curve:
 /// almost all of the distance in the first third, then a long settle.
 pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
 /// CSS `ease-out` — size transitions.
+#[allow(dead_code)] // inventory §1.8 (200 ms pane/rail size transitions) is its caller; unbuilt.
 pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
 /// CSS `ease` — quick fades, menu/dialog pops.
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 /// CSS `cubic-bezier(0.22, 1, 0.36, 1)` — reorder glides.
+#[allow(dead_code)] // inventory §1.9 (drag-reorder glide) is its caller; unbuilt.
 pub const EASE_RESORT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
 /// CSS `ease-in-out` — scroll glides (the browser smooth-scroll shape:
 /// gentle start, cruise, gentle landing).
+#[allow(dead_code)] // inventory §1.12 (smooth scroll-to-row) is its caller; unbuilt.
 pub const EASE_IN_OUT: CubicBezier = CubicBezier::new(0.42, 0.0, 0.58, 1.0);
 /// Tailwind's default transition curve — CSS `cubic-bezier(0.4, 0, 0.2, 1)`.
 /// Every `transition-colors` hover wash in a Tailwind UI rides this unless
@@ -212,6 +213,12 @@ impl MotionSpec {
         }
     }
 
+    /// Unreached in production: the only spec in the catalog that wants a
+    /// delay is comet's boot splash (inventory §1.7), and eave has no
+    /// splash. The delay path through [`progress`](Self::progress) is live
+    /// and tested regardless, because the fade store runs every spec
+    /// through it.
+    #[allow(dead_code)] // §1.7 is its caller; unbuilt.
     pub const fn with_delay(mut self, delay_ms: u64) -> Self {
         self.delay_ms = delay_ms;
         self
@@ -252,12 +259,19 @@ impl MotionSpec {
         self.curve.eval(t.clamp(0.0, 1.0))
     }
 
-    /// A oneshot gpui [`Animation`] for this spec, delay folded in and the
-    /// measurement knob applied. The one gpui-facing method on the type.
-    pub fn animation(&self) -> Animation {
-        let spec = *self;
-        Animation::new(spec.scaled_total()).with_easing(move |d| spec.progress(d))
-    }
+    // There WAS a `fn animation(&self) -> gpui::Animation` here, N1's one
+    // gpui-facing method, and N2 deleted it unused. That is a finding, not
+    // tidying: gpui's `Animation` is only reachable through
+    // `with_animation`, which keys its start time by the element-id *path*
+    // and therefore replays whenever an element misses a frame — and every
+    // tween this slice landed is on exactly that path (eave's floating
+    // chrome mounts and unmounts on state changes; the ↓-bottom pill is the
+    // clearest case). So all five are hand-driven off the fade store below,
+    // and the door to gpui's animator was never opened. `progress` is the
+    // shape that survived contact: it is pure, and it is what the store
+    // calls. If the streaming veil ever migrates onto this catalog (§1.21),
+    // put the method back then — with the remount question answered for
+    // that site rather than assumed.
 }
 
 /// CSS `transition-colors`: 150 ms over [`EASE_TAILWIND`] — the temporal
@@ -266,6 +280,50 @@ impl MotionSpec {
 /// slice that renders them; only the machinery lands in N1, and the hover
 /// fade is the one entry whose value is a CSS default rather than a taste.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
+
+/// The standard entrance (inventory §1.3): 500 ms over [`EASE_OUT_EXPO`],
+/// opacity 0→1 with a 4 px rise. The rise is applied as a relative-position
+/// inset, never as a margin — taffy resolves relative insets *after* layout,
+/// so the element slides the way a CSS transform would and its siblings
+/// never move. See [`ENTRANCE_RISE`].
+pub const FADE_IN: MotionSpec = MotionSpec::new(500, EASE_OUT_EXPO);
+
+/// Opacity-only, 150 ms (inventory §1.4) — a row that has just arrived in a
+/// rail. No rise: a list of rows sliding independently reads as noise, and
+/// the arrival is the only fact being stated.
+pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE);
+
+/// 180 ms (inventory §1.6) — the ↓-bottom pill. comet's `dialog-in`
+/// approximates a `scale 0.96→1` with fade + a 2 px rise, because gpui divs
+/// have no scale transform at the pinned rev; eave inherits both the
+/// approximation and the reason.
+pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
+
+/// How far [`FADE_IN`] rises, in px.
+pub const ENTRANCE_RISE: f32 = 4.0;
+/// How far [`DIALOG_IN`] rises, in px — half of [`ENTRANCE_RISE`], the
+/// standing-in-for-scale value.
+pub const DIALOG_RISE: f32 = 2.0;
+
+/// Caret blink half-period (inventory §1.20): 500 ms solid, 500 ms hidden —
+/// the standard textarea cadence. Not a [`MotionSpec`]: a blink is a step
+/// function, so there is no curve to ease and no progress to interpolate,
+/// and dressing it as a tween would only invite someone to ease it.
+pub const CARET_HALF_PERIOD: Duration = Duration::from_millis(500);
+
+/// Is the caret drawn, `elapsed` after the anchor?
+///
+/// **Solid through the first half-period**, which is the whole point of the
+/// anchor: each keystroke resets it, so a typing burst never blinks — the
+/// caret only starts flashing once the typist has stopped for half a second.
+/// The scale knob applies, so a capture can slow the cadence down.
+pub fn caret_visible(elapsed: Duration) -> bool {
+    let half = CARET_HALF_PERIOD.mul_f32(motion_scale());
+    if half.is_zero() {
+        return true;
+    }
+    (elapsed.as_nanos() / half.as_nanos()) % 2 == 0
+}
 
 // ---------------------------------------------------------------------------
 // The pulse clock
@@ -299,6 +357,14 @@ struct PulseClock {
 
 impl Global for PulseClock {}
 
+/// Is the shared clock ticking? Test-only, and the honest instrument for
+/// "does this state of the shell cost anything at rest" — a `false` means no
+/// timer is pending anywhere in the window.
+#[cfg(test)]
+pub fn clock_is_running(cx: &App) -> bool {
+    cx.has_global::<PulseClock>() && cx.global::<PulseClock>().running
+}
+
 /// The clock, created on first use. Deliberately not `default_global`: the
 /// epoch has to come from the executor's clock, and a `Default` impl has no
 /// way to reach it.
@@ -313,19 +379,27 @@ fn clock_mut(cx: &mut App, now: Instant) -> &mut PulseClock {
     cx.global_mut::<PulseClock>()
 }
 
-/// Current phase `[0,1)` of a repeating spec, plus a lease that keeps `view`
-/// re-rendering at [`PULSE_TICK`] for as long as it keeps asking. Call it
-/// from the consumer's render; stop calling it and the lease lapses.
+/// Renew `view`'s tick lease and hand back the clock's `now`. Call it from
+/// the consumer's render; stop calling it and the lease lapses, and with the
+/// last lease gone the clock parks.
 ///
-/// Reduced motion returns a static 0 and touches nothing — no lease, no
-/// global, no timer. That is the whole of item 4: the clock itself is the
-/// place the preference is honoured, so no consumer can forget to.
-pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
+/// `None` under reduced motion — and nothing is touched on that path: no
+/// lease, no global, no timer. That is where the preference is honoured, so
+/// no consumer can forget to; a `None` means "render your resting state".
+///
+/// **Slice N2 split this out of [`pulse_delta`], because the first real
+/// consumer could not use `pulse_delta` at all.** The clock's phase is a
+/// function of the *shared epoch* — that is the property that keeps N
+/// loaders in step — but the caret's cadence has to restart from its own
+/// anchor on every keystroke, and there is no epoch-relative phase that can
+/// express "restart now". What that consumer needs from the clock is the two
+/// things underneath the phase: a lease, and a time. So those are what this
+/// returns, and `pulse_delta` is a thin epoch-relative wrapper over it.
+pub fn pulse_now(view: EntityId, cx: &mut App) -> Option<Instant> {
     if cx.reduce_motion() {
-        return 0.0;
+        return None;
     }
     let now = cx.background_executor().now();
-    let period = spec.scaled_total().as_secs_f32();
     let start = {
         let clock = clock_mut(cx, now);
         clock.leases.insert(view, now + PULSE_LEASE);
@@ -336,6 +410,22 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
     if start {
         spawn_ticker(cx);
     }
+    Some(now)
+}
+
+/// Current phase `[0,1)` of a repeating spec, measured from the shared
+/// epoch, plus the lease [`pulse_now`] takes. Two consumers mounted a second
+/// apart read the same phase; that is the whole reason this exists rather
+/// than each loader timing itself.
+///
+/// Still unconsumed after N2 — the loaders (inventory §1.14, §1.15) are what
+/// the phase lock is for, and neither is built.
+#[allow(dead_code)] // see above: §1.14 / §1.15 are its callers.
+pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
+    let Some(now) = pulse_now(view, cx) else {
+        return 0.0;
+    };
+    let period = spec.scaled_total().as_secs_f32();
     if period <= 0.0 {
         return 0.0;
     }
@@ -416,10 +506,330 @@ pub fn take_active() -> bool {
     MOTION_ACTIVE.with(|f| f.replace(false))
 }
 
+// ---------------------------------------------------------------------------
+// The fade store — hover washes (§1.13) and entrances (§1.3, §1.4, §1.6)
+
+/// Linear interpolation, the one arithmetic both fades share.
+fn lerp(from: f32, to: f32, t: f32) -> f32 {
+    from + (to - from) * t
+}
+
+/// One keyed tween: `origin → target` over `spec`, started at `started`.
+///
+/// A hover entry is created by a pointer event and re-anchored **at its
+/// current value** whenever the pointer flips direction mid-flight, so a
+/// reversal is continuous instead of a jump back to the far end. An entrance
+/// entry is created by its first render and never flips.
+#[derive(Debug, Clone, Copy)]
+struct FadeEntry {
+    origin: f32,
+    target: f32,
+    started: Instant,
+    spec: MotionSpec,
+    /// Frame counter at the last read — the liveness stamp. An element that
+    /// unmounts mid-hover never gets its leave event, so nothing but "it
+    /// stopped being read" says the entry is dead.
+    seen: u64,
+}
+
+impl FadeEntry {
+    fn value(&self, now: Instant) -> f32 {
+        let span = self.spec.scaled_total();
+        let elapsed = now.saturating_duration_since(self.started);
+        if span.is_zero() || elapsed >= span {
+            return self.target;
+        }
+        let raw = elapsed.as_secs_f32() / span.as_secs_f32();
+        lerp(self.origin, self.target, self.spec.progress(raw))
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        self.origin == self.target
+            || now.saturating_duration_since(self.started) >= self.spec.scaled_total()
+    }
+}
+
+/// Per-key fade progress. The pure core: every method takes `now`
+/// explicitly, so the whole thing is unit-testable with no window and no
+/// clock. The thread-local wrappers below are what the shell calls.
+#[derive(Default)]
+struct Fades {
+    entries: HashMap<String, FadeEntry>,
+    /// Renders of the root view, not display frames — see [`begin_frame`].
+    frame: u64,
+    /// The instant every read in this frame answers at. `None` before the
+    /// first render.
+    now: Option<Instant>,
+    /// The window's reduced-motion preference, read once per frame. Held
+    /// here rather than passed to every entrance site because a site that
+    /// forgot it would animate on a machine whose owner asked for less
+    /// motion, and there is no way to notice that on a machine where the
+    /// preference is off.
+    reduced: bool,
+}
+
+impl Fades {
+    /// Open a frame: advance the counter, stamp the instant every read in
+    /// this frame will use, and **prune first, before anything reads**.
+    ///
+    /// Two things are dropped here. An entry unread through the whole
+    /// previous frame belongs to an element that is gone — that is the only
+    /// signal there is, because an element that unmounts under the pointer
+    /// never sends its leave event. And a hover entry that has settled back
+    /// to rest is indistinguishable from an absent one, so it goes too and
+    /// the map stays the size of what is actually on screen.
+    ///
+    /// The counter advances **once per render, not once per display frame**,
+    /// which is what makes the staleness rule safe: a window that renders
+    /// nothing for ten seconds does not age anything, so a settled entrance
+    /// cannot be pruned by idleness and replay when the window next wakes.
+    fn begin(&mut self, now: Instant, reduced: bool) {
+        self.frame += 1;
+        self.now = Some(now);
+        self.reduced = reduced;
+        let frame = self.frame;
+        self.entries.retain(|_, e| {
+            // One frame of grace, not zero: the approve/deny buttons live
+            // inside the virtualized list, whose rows are built during
+            // prepaint — after the root render has returned — so their reads
+            // land one frame later than everything else's.
+            if e.seen + 1 < frame {
+                return false;
+            }
+            !(e.target == 0.0 && e.settled(now))
+        });
+    }
+
+    /// The instant this frame answers at.
+    fn now(&self) -> Option<Instant> {
+        self.now
+    }
+
+    /// The pointer entered (`hovered`) or left the element behind `key`.
+    /// Reduced motion snaps to the endpoint rather than declining to record
+    /// it: the wash still has to appear, it just must not take time.
+    fn set(&mut self, key: &str, hovered: bool, reduced: bool, now: Instant) {
+        let target = if hovered { 1.0 } else { 0.0 };
+        let Some(current) = self
+            .entries
+            .get(key)
+            .map(|e| e.value(now))
+            .or(if hovered { Some(0.0) } else { None })
+        else {
+            // A leave for an element that was never hovered — a stale entry
+            // pruned mid-flight will do this. Nothing to fade back from.
+            return;
+        };
+        let seen = self.frame;
+        self.entries.insert(
+            key.to_string(),
+            FadeEntry {
+                origin: if reduced { target } else { current },
+                target,
+                started: now,
+                spec: HOVER_FADE,
+                seen,
+            },
+        );
+    }
+
+    /// Hover progress (0..1) for `key`; stamps liveness. An absent key is at
+    /// rest, which is the correct answer for anything never hovered.
+    fn hover(&mut self, key: &str, now: Instant) -> f32 {
+        let frame = self.frame;
+        let reduced = self.reduced;
+        match self.entries.get_mut(key) {
+            Some(e) => {
+                e.seen = frame;
+                if reduced { e.target } else { e.value(now) }
+            }
+            None => 0.0,
+        }
+    }
+
+    /// Entrance progress (0..1) for `key`, starting the tween on the first
+    /// read and stamping liveness on every read after it.
+    ///
+    /// **This is the remount fix.** gpui keys `with_animation`'s start time
+    /// by the element-id *path*, so an element that vanishes for one frame —
+    /// or whose ancestors' ids shift — silently replays its entrance from
+    /// zero. eave's floating chrome stack mounts and unmounts on state
+    /// changes, which is exactly that shape. Keying the clock here instead
+    /// means the tween is a function of the caller's own key and of whether
+    /// the shell drew it last frame, and nothing else.
+    fn entrance(&mut self, key: &str, spec: MotionSpec, now: Instant) -> f32 {
+        let frame = self.frame;
+        let reduced = self.reduced;
+        if let Some(e) = self.entries.get_mut(key) {
+            e.seen = frame;
+            return if reduced { e.target } else { e.value(now) };
+        }
+        let entry = FadeEntry {
+            origin: if reduced { 1.0 } else { 0.0 },
+            target: 1.0,
+            started: now,
+            spec,
+            seen: frame,
+        };
+        let value = entry.value(now);
+        self.entries.insert(key.to_string(), entry);
+        value
+    }
+
+    /// Is anything still mid-flight? The root render's tail asks once and
+    /// turns a `true` into a claim on the next frame.
+    fn active(&self, now: Instant) -> bool {
+        // Reduced motion is answered per FRAME rather than per entry: the
+        // preference the window holds right now is the one that counts, so
+        // a store full of half-run tweens still asks for nothing the moment
+        // it is set. (The tail checks the flag too — this is the store
+        // holding its own end, not a duplicate of that check.)
+        !self.reduced && self.entries.values().any(|e| !e.settled(now))
+    }
+}
+
+thread_local! {
+    /// Render-thread only, one window only — the same `thread_local`
+    /// argument as [`MOTION_ACTIVE`], and for the same reason: the free
+    /// element builders reach this without an `App` in hand.
+    static FADES: RefCell<Fades> = RefCell::new(Fades::default());
+}
+
+/// Open the frame. **Call this first in the root view's `render`**, once per
+/// render, before anything reads a fade — the prune runs here, so a read
+/// that beats it would see a dead entry and skip its own entrance.
+pub fn begin_frame(now: Instant, reduced: bool) {
+    FADES.with(|f| f.borrow_mut().begin(now, reduced));
+}
+
+/// Hover progress (0..1) for `key` this frame; 0 before the first
+/// [`begin_frame`].
+pub fn hover_t(key: &str) -> f32 {
+    FADES.with(|f| {
+        let mut fades = f.borrow_mut();
+        match fades.now() {
+            Some(now) => fades.hover(key, now),
+            None => 0.0,
+        }
+    })
+}
+
+/// Entrance progress (0..1) for `key` this frame; 1 (i.e. fully arrived,
+/// no animation) before the first [`begin_frame`].
+pub fn entrance_t(key: &str, spec: MotionSpec) -> f32 {
+    FADES.with(|f| {
+        let mut fades = f.borrow_mut();
+        match fades.now() {
+            Some(now) => fades.entrance(key, spec, now),
+            None => 1.0,
+        }
+    })
+}
+
+/// An `.on_hover` listener driving `key`'s fade — pair it with a
+/// [`hover_blend`] read of the same key on the same element.
+///
+/// `window.refresh()` rather than `request_animation_frame`: this runs in
+/// event dispatch, and `request_animation_frame` resolves the *current view*
+/// and is draw-phase-only. `refresh` marks the window dirty; the root render
+/// then re-evaluates the blend and its tail keeps frames coming for as long
+/// as the fade is mid-flight.
+pub fn hover_listener(key: impl Into<String>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    let key = key.into();
+    move |hovered, window, cx| {
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        FADES.with(|f| f.borrow_mut().set(&key, *hovered, reduced, now));
+        window.refresh();
+    }
+}
+
+/// Empty the store. Test-only, and there is exactly one caller: the UI
+/// harness, which pins the reduced-motion preference to full motion *after*
+/// `bootstrap` has already opened the window and drawn its first frame. Any
+/// entrance on that frame recorded itself as already-arrived under the
+/// machine's real preference, and would then never play. Production cannot
+/// reach this — `reduce_motion_preference()` is read once at bootstrap and
+/// the flag never changes again for the life of the process.
+#[cfg(test)]
+pub fn reset_for_test() {
+    FADES.with(|f| *f.borrow_mut() = Fades::default());
+}
+
+/// Frame-drive hook: true while any fade is mid-flight. Call it once, from
+/// the root render's tail, and turn a `true` into [`mark_active`].
+pub fn fades_active() -> bool {
+    FADES.with(|f| {
+        let fades = f.borrow();
+        fades.now().is_some_and(|now| fades.active(now))
+    })
+}
+
+/// Blend two colours the way a browser transitions them: component
+/// interpolation in sRGB with **premultiplied alpha**.
+///
+/// The premultiplication is the whole point. eave's washes fade in from
+/// fully transparent, and a transparent colour still carries *some* RGB —
+/// `transparent_black` carries black. Interpolating the components straight
+/// drags the midpoint through that black, so a light wash appearing over a
+/// dark surface flashes grey on its way in. Premultiplying weights each
+/// endpoint's colour by its own alpha, so a zero-alpha endpoint contributes
+/// nothing but its transparency and the wash simply brightens.
+pub fn mix(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return from;
+    }
+    if t >= 1.0 {
+        return to;
+    }
+    let (f, g) = (Rgba::from(from), Rgba::from(to));
+    let a = lerp(f.a, g.a, t);
+    if a <= f32::EPSILON {
+        // Both ends (effectively) transparent: there is no colour to carry,
+        // and dividing by `a` here would be a division by zero.
+        return Hsla::from(Rgba { a: 0.0, ..g });
+    }
+    Hsla::from(Rgba {
+        r: lerp(f.r * f.a, g.r * g.a, t) / a,
+        g: lerp(f.g * f.a, g.g * g.a, t) / a,
+        b: lerp(f.b * f.a, g.b * g.a, t) / a,
+        a,
+    })
+}
+
+/// The standard hover blend: `rest → hovered` at `key`'s current progress.
+pub fn hover_blend(key: &str, rest: Hsla, hovered: Hsla) -> Hsla {
+    mix(rest, hovered, hover_t(key))
+}
+
+/// `.hover_fade(key, rest, hovered)` — the replacement for gpui's
+/// `.hover(|s| s.bg(..))`, which snaps by construction because the style
+/// applies whole on the frame the pointer enters.
+///
+/// It exists as one call because the blend and the listener are useless
+/// apart: a blend with no listener never moves, and a listener with no blend
+/// pumps frames for a colour nobody reads. Splitting them across a call site
+/// is the one way to get this wrong, so there is no way to write it.
+pub trait HoverFade: Sized {
+    fn hover_fade(self, key: impl Into<String>, rest: Hsla, hovered: Hsla) -> Self;
+}
+
+impl<E> HoverFade for E
+where
+    E: Styled + StatefulInteractiveElement,
+{
+    fn hover_fade(self, key: impl Into<String>, rest: Hsla, hovered: Hsla) -> Self {
+        let key = key.into();
+        self.bg(hover_blend(&key, rest, hovered))
+            .on_hover(hover_listener(key))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Context, IntoElement, Render, TestAppContext, Window, div};
+    use gpui::{Context, IntoElement, Render, TestAppContext, Window, div, hsla};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -614,7 +1024,7 @@ mod tests {
     }
 
     fn running(cx: &TestAppContext) -> bool {
-        cx.update(|cx| cx.has_global::<PulseClock>() && cx.global::<PulseClock>().running)
+        cx.update(|cx| clock_is_running(cx))
     }
 
     /// The invariant the whole design exists to hold. A window whose views
@@ -803,5 +1213,442 @@ mod tests {
             a.abs_diff(10) <= 1,
             "ten ticks' worth of clock produced {a} redraws"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The fade store (Slice N2)
+
+    /// A frame, as the store sees one: open it, and hand back the instant.
+    fn frame(fades: &mut Fades, at: Instant, reduced: bool) -> Instant {
+        fades.begin(at, reduced);
+        at
+    }
+
+    const KEY: &str = "some-button";
+
+    /// The property that makes a fade feel like a fade rather than a
+    /// toggle: flick the pointer off an element halfway through its wash
+    /// and the wash falls **from where it was**, not from full.
+    ///
+    /// The mutation this is really guarding against is the easy one —
+    /// re-anchoring at `target` instead of at the current value, which
+    /// looks right on a slow pass and flashes on a fast one.
+    #[test]
+    fn a_hover_that_reverses_mid_flight_re_anchors_at_its_current_value() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        f.set(KEY, true, false, t0);
+
+        // Halfway through the 150 ms wash.
+        let mid = t0 + Duration::from_millis(75);
+        frame(&mut f, mid, false);
+        let rising = f.hover(KEY, mid);
+        assert!(
+            (0.05..=0.95).contains(&rising),
+            "half a HOVER_FADE in, the wash was at {rising} — that is an \
+             endpoint, not a mid-flight value"
+        );
+
+        // The pointer leaves at exactly that moment.
+        f.set(KEY, false, false, mid);
+        let falling = f.hover(KEY, mid);
+        assert!(
+            (falling - rising).abs() < 1e-4,
+            "the reversal jumped from {rising} to {falling} instead of \
+             continuing from where it was"
+        );
+
+        let later = mid + Duration::from_millis(40);
+        frame(&mut f, later, false);
+        assert!(
+            f.hover(KEY, later) < falling,
+            "the reversed fade did not fall"
+        );
+
+        let rest = mid + Duration::from_millis(200);
+        frame(&mut f, rest, false);
+        assert_eq!(f.hover(KEY, rest), 0.0, "the wash never reached rest");
+    }
+
+    /// An element that unmounts while the pointer is inside it never sends
+    /// a leave event — there is nothing to send it. So the only signal the
+    /// entry is dead is that the shell stopped reading it, and pruning on
+    /// that signal is the whole reason the store carries a frame counter.
+    ///
+    /// Without this, a rail row hovered and then filtered out of the
+    /// snapshot leaves a wash entry behind, and the next row to reuse that
+    /// key inherits it.
+    #[test]
+    fn an_element_that_unmounts_mid_hover_is_pruned_because_its_leave_never_comes() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        f.set(KEY, true, false, t0);
+        let settled = t0 + Duration::from_millis(200);
+        frame(&mut f, settled, false);
+        assert_eq!(f.hover(KEY, settled), 1.0);
+
+        // The shell renders twice more and never draws it again.
+        let a = settled + Duration::from_millis(8);
+        frame(&mut f, a, false);
+        assert!(
+            f.entries.contains_key(KEY),
+            "one frame of grace is required — the approve/deny buttons are \
+             read in prepaint, a frame behind everything else"
+        );
+        let b = a + Duration::from_millis(8);
+        frame(&mut f, b, false);
+        assert!(
+            f.entries.is_empty(),
+            "a hover entry outlived the element it belongs to"
+        );
+    }
+
+    /// The two settled states are not the same state. A hover that has
+    /// fallen back to rest is indistinguishable from an element that was
+    /// never hovered, so it goes. A settled *entrance* is the record that
+    /// says "this already arrived" — drop that and the element replays its
+    /// entrance on the very next frame, forever.
+    #[test]
+    fn a_settled_entrance_is_kept_and_a_hover_settled_at_rest_is_dropped() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        f.set(KEY, true, false, t0);
+        f.entrance("in:panel", FADE_IN, t0);
+
+        // Both run to completion, then the pointer leaves and both are read
+        // again on every frame after that.
+        let done = t0 + Duration::from_millis(600);
+        frame(&mut f, done, false);
+        f.hover(KEY, done);
+        f.entrance("in:panel", FADE_IN, done);
+        f.set(KEY, false, false, done);
+
+        let rested = done + Duration::from_millis(200);
+        frame(&mut f, rested, false);
+        f.hover(KEY, rested);
+        f.entrance("in:panel", FADE_IN, rested);
+        let after = rested + Duration::from_millis(8);
+        frame(&mut f, after, false);
+
+        assert!(
+            !f.entries.contains_key(KEY),
+            "a hover back at rest is steady state and should not be stored"
+        );
+        assert!(
+            f.entries.contains_key("in:panel"),
+            "the arrived record was dropped — the panel will replay its \
+             entrance on the next frame"
+        );
+        assert_eq!(f.entrance("in:panel", FADE_IN, after), 1.0);
+    }
+
+    /// The remount rule, stated in both directions.
+    ///
+    /// This is what eave has instead of gpui's `with_animation`, whose
+    /// start time is keyed by the element-id *path* and replays whenever an
+    /// element misses a frame or its ancestors' ids shift. Here the replay
+    /// is a function of one thing only: did the shell draw this key last
+    /// render.
+    #[test]
+    fn an_entrance_replays_when_the_shell_stops_drawing_it_and_not_before() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        assert_eq!(f.entrance("in:pill", DIALOG_IN, t0), 0.0, "it should start at zero");
+
+        let arrived = t0 + Duration::from_millis(300);
+        frame(&mut f, arrived, false);
+        assert_eq!(f.entrance("in:pill", DIALOG_IN, arrived), 1.0);
+
+        // Still drawn, many frames later: no replay.
+        let mut at = arrived;
+        for _ in 0..10 {
+            at += Duration::from_millis(8);
+            frame(&mut f, at, false);
+            assert_eq!(
+                f.entrance("in:pill", DIALOG_IN, at),
+                1.0,
+                "a mounted entrance replayed"
+            );
+        }
+
+        // The pill's condition goes false; the shell renders twice without
+        // it, then it comes back.
+        at += Duration::from_millis(8);
+        frame(&mut f, at, false);
+        at += Duration::from_millis(8);
+        frame(&mut f, at, false);
+        assert_eq!(
+            f.entrance("in:pill", DIALOG_IN, at),
+            0.0,
+            "the pill came back and did not re-enter"
+        );
+    }
+
+    /// The staleness rule counts **renders, not display frames** — and that
+    /// distinction is load-bearing, not pedantry.
+    ///
+    /// eave's window schedules nothing while nothing is mid-flight (N1), so
+    /// a settled shell can go minutes between renders. If the counter
+    /// advanced with wall time, every one of those gaps would age the
+    /// arrived-records out and the whole floating chrome stack would
+    /// re-enter the moment anything woke the window.
+    #[test]
+    fn an_idle_window_never_ages_an_entrance_into_a_replay() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        f.entrance("in:panel", FADE_IN, t0);
+        let arrived = t0 + Duration::from_secs(1);
+        frame(&mut f, arrived, false);
+        assert_eq!(f.entrance("in:panel", FADE_IN, arrived), 1.0);
+
+        // An hour of nothing happening: one render at the end of it.
+        let woken = arrived + Duration::from_secs(3600);
+        frame(&mut f, woken, false);
+        assert_eq!(
+            f.entrance("in:panel", FADE_IN, woken),
+            1.0,
+            "an idle hour replayed an entrance that had already arrived"
+        );
+    }
+
+    /// Reduced motion does not mean "no wash" — it means "no time". Both
+    /// kinds land on their endpoint immediately, and nothing is left
+    /// mid-flight for the tail to request a frame for.
+    #[test]
+    fn reduced_motion_puts_both_kinds_straight_on_their_endpoint() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, true);
+        f.set(KEY, true, true, t0);
+        assert_eq!(f.hover(KEY, t0), 1.0, "the hover wash did not appear");
+        assert_eq!(
+            f.entrance("in:panel", FADE_IN, t0),
+            1.0,
+            "the panel did not arrive"
+        );
+        assert!(!f.active(t0), "reduced motion left something mid-flight");
+    }
+
+    /// The frame-drive hook. `active` is what the root render's tail turns
+    /// into a claim, so a store that answered `true` at rest would pin the
+    /// window at the display rate forever — the exact failure N1 exists to
+    /// avoid — and one that answered `false` mid-flight would freeze every
+    /// fade on its first frame.
+    #[test]
+    fn the_store_asks_for_frames_only_while_something_is_mid_flight() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        assert!(!f.active(t0), "an empty store asked for a frame");
+
+        f.set(KEY, true, false, t0);
+        assert!(f.active(t0), "a wash that just started asked for nothing");
+
+        let mid = t0 + Duration::from_millis(75);
+        frame(&mut f, mid, false);
+        f.hover(KEY, mid);
+        assert!(f.active(mid), "the wash stopped asking mid-flight");
+
+        // 150 ms is HOVER_FADE's whole span; a literal, not a value derived
+        // from the constant under test.
+        let done = t0 + Duration::from_millis(150);
+        frame(&mut f, done, false);
+        f.hover(KEY, done);
+        assert!(!f.active(done), "a landed wash kept asking for frames");
+    }
+
+    /// Premultiplied alpha, which is the difference between a wash that
+    /// brightens in and one that smears through grey on the way.
+    ///
+    /// `wash_rest` is transparent BLACK — a real colour at zero alpha. Blend
+    /// the components straight and the midpoint carries half that black;
+    /// premultiply and a zero-alpha end contributes nothing but its
+    /// transparency, so the hue is the target's the whole way and only the
+    /// alpha ramps. The naive value is computed here rather than described,
+    /// so the assertion fails if someone "simplifies" `mix`.
+    #[test]
+    fn a_wash_fading_in_from_transparent_never_passes_through_grey() {
+        let from: Hsla = gpui::transparent_black();
+        let to: Hsla = hsla(220.0 / 360.0, 0.10, 0.90, 0.05);
+        let target = Rgba::from(to);
+
+        for t in [0.05f32, 0.25, 0.5, 0.75, 0.95] {
+            let got = Rgba::from(mix(from, to, t));
+            assert!(
+                (got.r - target.r).abs() < 1e-3
+                    && (got.g - target.g).abs() < 1e-3
+                    && (got.b - target.b).abs() < 1e-3,
+                "at t={t} the wash's colour was ({}, {}, {}), not the \
+                 target's ({}, {}, {})",
+                got.r,
+                got.g,
+                got.b,
+                target.r,
+                target.g,
+                target.b,
+            );
+            assert!(
+                (got.a - target.a * t).abs() < 1e-3,
+                "at t={t} the alpha was {} rather than the ramp",
+                got.a
+            );
+            // What straight component interpolation would have produced,
+            // and by exactly how much it would have been too dark.
+            let naive = target.r * t;
+            assert!(
+                got.r - naive - target.r * (1.0 - t) < 1e-3,
+                "at t={t} the blend ({}) is not the premultiplied value; \
+                 straight interpolation would give {naive}",
+                got.r
+            );
+            assert!(
+                got.r > naive,
+                "at t={t} the blend ({}) is no brighter than the naive one \
+                 ({naive}) — mix is not premultiplying",
+                got.r
+            );
+        }
+
+        // Both ends transparent: no colour to carry, and no divide by zero.
+        let ghost = mix(gpui::transparent_black(), gpui::transparent_black(), 0.5);
+        assert_eq!(Rgba::from(ghost).a, 0.0);
+    }
+
+    /// Two opaque pigments still blend the ordinary way — the `attn-kill`
+    /// button's case, where both ends are a danger wash.
+    #[test]
+    fn a_blend_between_two_opaque_colours_lands_on_both_ends_and_midway() {
+        let from: Hsla = hsla(0.0, 0.0, 0.2, 1.0);
+        let to: Hsla = hsla(0.0, 0.0, 0.8, 1.0);
+        assert_eq!(mix(from, to, 0.0), from);
+        assert_eq!(mix(from, to, 1.0), to);
+        assert_eq!(mix(from, to, -5.0), from, "t below 0 was extrapolated");
+        assert_eq!(mix(from, to, 5.0), to, "t above 1 was extrapolated");
+        let mid = Rgba::from(mix(from, to, 0.5));
+        let (a, b) = (Rgba::from(from), Rgba::from(to));
+        assert!((mid.r - (a.r + b.r) / 2.0).abs() < 1e-3);
+    }
+
+    /// §1.20's whole point: the caret is **solid** through its first half-
+    /// period. A keystroke resets the anchor, so a typing burst holds the
+    /// caret lit and it only starts flashing once the typist stops.
+    ///
+    /// The expectations are literal milliseconds on purpose — deriving them
+    /// from `CARET_HALF_PERIOD` would make the test pass for any cadence,
+    /// including one so fast it strobes (N1's trap, `progress.md` §Traps).
+    #[test]
+    fn the_caret_is_solid_through_its_first_half_period() {
+        assert!(caret_visible(Duration::ZERO), "the caret was dark on reset");
+        assert!(caret_visible(Duration::from_millis(1)));
+        assert!(caret_visible(Duration::from_millis(499)));
+        assert!(!caret_visible(Duration::from_millis(500)));
+        assert!(!caret_visible(Duration::from_millis(999)));
+        assert!(caret_visible(Duration::from_millis(1000)));
+        assert!(!caret_visible(Duration::from_millis(1500)));
+
+        // A burst of keystrokes 100 ms apart never lets `elapsed` reach the
+        // half-period, so the caret is lit at every one of them.
+        for keystroke in 0..12 {
+            assert!(
+                caret_visible(Duration::from_millis(100 * keystroke % 500)),
+                "a typing burst blinked"
+            );
+        }
+    }
+
+    /// Every wash in the shell, swept end to end: **no hover fade ever gets
+    /// darker than where it started.**
+    ///
+    /// This is the assertion standing in for a screenshot. "The wash flashes
+    /// on its way in" is a perceptual claim, but it has an exact mechanical
+    /// signature — a midpoint whose composited luminance dips below the
+    /// resting one — and that is checkable. It is also the one thing
+    /// premultiplied alpha exists to prevent, and the one thing that would
+    /// be invisible on this machine, where the OS reduced-motion preference
+    /// is on and every fade is a snap unless it is deliberately overridden.
+    ///
+    /// The pairs are the real ones from `theme`, in the same order as the
+    /// thirteen controls in `ui`, so a token retuned to a darker hover step
+    /// fails here rather than in someone's eye a week later.
+    #[test]
+    fn no_hover_wash_in_the_shell_ever_darkens_on_its_way_in() {
+        use crate::theme;
+        // (name, resting fill, hovered fill) — an unfilled control rests at
+        // `wash_rest`, which is transparent black; a filled one rests at its
+        // own pigment.
+        let pairs: [(&str, Hsla, Hsla); 6] = [
+            ("unfilled controls (9 of them)", theme::wash_rest(), theme::overlay()),
+            ("the selected rail row", theme::overlay_strong(), theme::overlay_strong()),
+            ("an expanded file row", theme::overlay(), theme::overlay()),
+            ("attn-kill", theme::danger_wash_strong(), theme::danger_wash_hover()),
+            ("send, armed", theme::inverse(), theme::inverse_hover()),
+            ("send, unarmed", theme::overlay_strong(), theme::overlay_strongest()),
+        ];
+        // Composite over eave's dark ground and report luminance. The
+        // ground is the literal `#1A1A1A` of `canvas()`'s opaque branch
+        // rather than `canvas()` itself, and deliberately: in glass mode
+        // every surface token is a translucent WASH whose own rgb is 0, and
+        // compositing over an rgb-zero ground makes the assertion vacuous —
+        // nothing can be darker than black. A fixed dark ground is what the
+        // washes actually land on in either render mode, and it is the only
+        // ground on which "this got darker" means anything.
+        const GROUND: f32 = 0x1a as f32 / 255.0;
+        let over = |c: Hsla| {
+            let c = Rgba::from(c);
+            let mix1 = |f: f32| f * c.a + GROUND * (1.0 - c.a);
+            0.2126 * mix1(c.r) + 0.7152 * mix1(c.g) + 0.0722 * mix1(c.b)
+        };
+        for (what, rest, hovered) in pairs
+            .into_iter()
+            .chain([("the ↓-bottom pill", theme::chrome_glass(), theme::chrome_glass_hover())])
+        {
+            let floor = over(rest).min(over(hovered));
+            for i in 0..=100 {
+                let t = i as f32 / 100.0;
+                let lum = over(mix(rest, hovered, t));
+                assert!(
+                    lum >= floor - 1e-4,
+                    "{what}: at t={t} the wash sits at luminance {lum}, below \
+                     both of its own endpoints ({floor}) — it darkens on the \
+                     way through, which is exactly what premultiplied alpha \
+                     is here to prevent"
+                );
+            }
+        }
+    }
+
+    /// The lease `pulse_delta` is built on, checked directly: it is what a
+    /// consumer with its own anchor (the caret) reaches for, and the reason
+    /// it exists is that such a consumer cannot use an epoch-relative phase.
+    #[gpui::test]
+    fn the_pulse_lease_hands_back_a_time_and_declines_under_reduced_motion(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _, _) = Ticker::new(false);
+        let window = cx.add_window(|_, _| view);
+        let id = window.root(cx).unwrap().entity_id();
+
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            assert!(
+                pulse_now(id, cx).is_none(),
+                "reduced motion still took a lease"
+            );
+            assert!(
+                !cx.has_global::<PulseClock>(),
+                "reduced motion constructed the clock"
+            );
+
+            cx.set_reduce_motion(false);
+            let a = pulse_now(id, cx).expect("a lease and a time");
+            let b = pulse_now(id, cx).expect("a lease and a time");
+            assert_eq!(a, b, "two reads in one frame saw different times");
+            assert!(cx.has_global::<PulseClock>());
+        });
     }
 }

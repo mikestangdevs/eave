@@ -214,6 +214,21 @@ pub fn inset() -> Hsla {
     }
 }
 
+/// The resting end of a hover wash on an unfilled control (Slice N2) —
+/// what such a control actually paints today, which is nothing: black at
+/// zero alpha.
+///
+/// It is named rather than written as `transparent_black()` at thirteen
+/// call sites because it is the *reason the blend is premultiplied*. This
+/// colour carries black. Interpolate the components of `wash_rest → overlay`
+/// straight and the midpoint is a half-alpha grey, so a light wash appearing
+/// over a dark surface flashes dark on its way in; premultiplying weights
+/// each end by its own alpha, so a zero-alpha end contributes nothing but
+/// its transparency (`motion::mix`).
+pub fn wash_rest() -> Hsla {
+    gpui::transparent_black()
+}
+
 /// Hover/selection wash composited over any surface (waku's idiom: no
 /// per-surface hover tokens, just a white wash).
 pub fn overlay() -> Hsla {
