@@ -87,6 +87,7 @@ fn session(id: &str) -> SessionInfo {
     SessionInfo {
         session_id: id.into(),
         provider: "claude-code".into(),
+        model: None,
         cwd: "/tmp/eave-harness".into(),
         created_ts_ms: 1,
         state: "idle".into(),

@@ -10,8 +10,81 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::proc::ProcIdentity;
+
+/// What agent a SESSION runs, as opposed to what agent the engine
+/// defaults to (Slice P2). Carried on the session, persisted in its
+/// journal header at open, and therefore the same across a restart and a
+/// `--resume` — the engine's own `EAVE_AGENT` default only fills the gaps.
+///
+/// Every field is optional and every absent field means "the engine's
+/// default", so a session opened before this existed reads back as
+/// `AgentConfig::default()` and behaves exactly as it did. That is the
+/// whole compatibility story: no format version moved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Provider family — decides which adapter spawns it and, critically,
+    /// **which permission posture proof applies**. `None` = the engine's
+    /// configured provider. See [`posture_is_verified`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The CLI binary. `None` = the engine's `agent_program`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// Passed verbatim as `--model`. `None` = whatever the CLI defaults to;
+    /// eave does not invent a model name, and does not validate this one —
+    /// an unknown model is the CLI's error to state, not eave's to guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Extra CLI flags, verbatim and in order, appended after eave's own.
+    /// Deliberately unvalidated and deliberately LAST — see the refusal in
+    /// [`conflicts_with_eave_flags`], which is the one thing that is not
+    /// allowed through: a flag that would undo eave's permission posture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+}
+
+/// The ONLY provider whose permission posture eave has actually proven.
+///
+/// Slice K established what makes the Claude CLI ask before it writes —
+/// `--permission-prompt-tool stdio` with no `--permission-mode`, verified
+/// against the CLI's own `init.permissionMode` rather than assumed — and
+/// every part of that proof is Claude-specific and lives in `claude.rs`.
+/// It transfers to no other CLI.
+pub const POSTURE_VERIFIED_PROVIDERS: [&str; 1] = ["claude-code"];
+
+/// Is this provider's permission posture proven? **Fail-closed by
+/// construction**, exactly like Slice K's `ASKING_MODES`: an unrecognised
+/// provider is refused, never spawned on the assumption that it behaves
+/// like Claude.
+///
+/// This is the door Slice K closed, and the reason it is guarded here
+/// rather than at the UI: per-session config makes it possible to name any
+/// binary you like, and spawning an unverified one would reintroduce the
+/// v0 auto-accept blocker by the side door — a session writing to disk
+/// with nothing able to review it.
+pub fn posture_is_verified(provider: &str) -> bool {
+    POSTURE_VERIFIED_PROVIDERS.contains(&provider)
+}
+
+/// Flags a caller may not smuggle through [`AgentConfig::extra_args`],
+/// because they would undo the posture proof rather than extend it.
+///
+/// `--permission-mode` is the whole of Slice K's finding: supplying ANY
+/// value for it stops the CLI asking (capture H — `acceptEdits` produces
+/// zero questions), and `--permission-prompt-tool` is the flag that routes
+/// questions to eave in the first place. Re-specifying either from config
+/// would let a session opt itself out of review while still reporting a
+/// verified provider.
+pub fn conflicts_with_eave_flags(arg: &str) -> bool {
+    let head = arg.split('=').next().unwrap_or(arg);
+    matches!(
+        head,
+        "--permission-mode" | "--permission-prompt-tool" | "--session-id" | "--resume"
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -27,6 +100,14 @@ pub struct SpawnConfig {
     /// Extra environment for the child. The inherited environment is always
     /// sanitized of `EAVE_*` first (spec 01 §Spawn; research: bb.md §1).
     pub extra_env: Vec<(String, String)>,
+    /// Resolved from the session's [`AgentConfig`] (Slice P2), not from the
+    /// engine. `None` = do not pass `--model` at all, which is not the same
+    /// as passing an empty one.
+    pub model: Option<String>,
+    /// Resolved from the session's [`AgentConfig`], appended after eave's
+    /// own flags. Already filtered by [`conflicts_with_eave_flags`] at the
+    /// engine boundary — the adapter trusts this list.
+    pub extra_args: Vec<String>,
 }
 
 impl SpawnConfig {
@@ -37,6 +118,8 @@ impl SpawnConfig {
             session_id,
             resume: false,
             extra_env: Vec::new(),
+            model: None,
+            extra_args: Vec::new(),
         }
     }
 }

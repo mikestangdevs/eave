@@ -519,6 +519,7 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
     plumbing.push_rail(vec![SessionInfo {
         session_id: sid.clone(),
         provider: "replay".into(),
+        model: None,
         cwd: path.display().to_string(),
         created_ts_ms: 0,
         state: "running".into(),
