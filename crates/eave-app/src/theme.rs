@@ -645,8 +645,17 @@ pub const TRANSCRIPT_FADE_BAND_BOTTOM: f32 = COMPOSER_CLEARANCE;
 
 // ---------------------------------------------------------------------------
 // Motion (Slice M). eave has exactly one animation — the streaming veil —
-// and this is its curve. There is no per-frame drive anywhere in the app
-// and nothing here schedules one.
+// and this is its curve.
+//
+// Slice N1 built the frame drive, and it does NOT live here: the shared
+// pulse clock, the cubic-bezier catalog and the render tail are in
+// `motion.rs`. The split is deliberate — this file owns appearance
+// (colour, spacing, radius), `motion` owns timing and curves. The veil is
+// the one straggler on the wrong side of that line: it predates the
+// catalog, and its hand-rolled power curve is a near-match for a real
+// `cubic-bezier` that `motion` can express exactly. Migrating it is a
+// visual change to a shipped animation, so it belongs to a consumer
+// slice, not to the slice that built the machinery.
 
 /// The veil dissolves as `1 − (1 − t)^EXP`: fast at the start, settling
 /// at the end, so a chunk reaches legibility early and the last 20 % of

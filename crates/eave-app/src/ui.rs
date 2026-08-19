@@ -42,6 +42,7 @@ use eave_wire::{
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
 use crate::markdown::{inline_runs, Block, InlineRun};
+use crate::motion;
 use crate::theme;
 
 actions!(eave, [Quit, ApproveOldest, DenyOldest]);
@@ -3630,7 +3631,7 @@ impl Render for Shell {
         // Opaque window by default, custom titlebar — locked decision
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
         // Under `EAVE_VIBRANCY=1` this root bg is the glass ground.
-        div()
+        let root = div()
             .size_full()
             .flex()
             .flex_col()
@@ -3801,7 +3802,20 @@ impl Render for Shell {
                             .child(self.footer(cx)),
                     )
                     .when(!files_collapsed, |d| d.child(self.files_rail(cx))),
-            )
+            );
+
+        // Slice N1: the motion tail. Anything hand-driven that is mid-flight
+        // claims this frame during the pass above; the root asks once, here,
+        // and schedules exactly one more frame. Nothing mid-flight -> nothing
+        // scheduled, which is the entire point of the shape (motion.rs).
+        // Reduced motion never schedules: gpui honours the flag inside
+        // `with_animation`, but `request_animation_frame` is the raw call
+        // underneath it and honours nothing on its own — gpui's own doc
+        // comment says to check the flag here.
+        if motion::take_active() && !cx.reduce_motion() {
+            window.request_animation_frame();
+        }
+        root
     }
 }
 

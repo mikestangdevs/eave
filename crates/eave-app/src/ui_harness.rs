@@ -1418,3 +1418,79 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         "approve and deny lost their hover feedback"
     );
 }
+
+/// Slice N1: the render tail, wired through the real shell.
+///
+/// The first half is the invariant — a shell with nothing mid-flight
+/// leaves no frame request behind, so an idle window costs nothing. The
+/// second half is the wiring: a claim reaches the root's tail and buys
+/// exactly ONE more frame, not a standing subscription. That distinction
+/// is the whole difference between this and the naive shape comet
+/// measured at 36% CPU; a claim that bought a permanent drive would look
+/// identical until you profiled it.
+///
+/// `simulate_next_frame` is the honest instrument here: tests have no
+/// platform frame loop, so the count it returns IS the number of frames
+/// the window asked for and would otherwise be handed.
+#[gpui::test]
+fn an_idle_shell_asks_for_no_frames_and_a_claim_buys_exactly_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+
+    let pending = h
+        .window
+        .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    assert_eq!(
+        pending, 0,
+        "an idle shell scheduled {pending} frame(s) with nothing mid-flight"
+    );
+
+    // Something declares itself mid-flight, then the shell renders.
+    motion::mark_active();
+    h.window
+        .update(vcx, |_, _, cx| cx.notify())
+        .unwrap();
+    vcx.run_until_parked();
+
+    let asked = h
+        .window
+        .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    assert_eq!(asked, 1, "the tail did not carry the claim to the window");
+    vcx.run_until_parked();
+
+    // The claim was consumed by that tail: the drive stops on its own
+    // unless whatever is moving asks again.
+    let after = h
+        .window
+        .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    assert_eq!(after, 0, "one claim bought a standing subscription");
+}
+
+/// Reduced motion stops at the tail too. gpui honours the flag inside
+/// `with_animation`, but `request_animation_frame` is the raw call
+/// underneath it and honours nothing on its own — so a hand-driven tween
+/// would keep pumping frames on a machine whose owner asked for less
+/// motion. This is the assertion that the tail checks the flag; the clock
+/// half is covered in `motion`.
+#[gpui::test]
+fn reduced_motion_stops_the_tail_from_asking_for_frames(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    vcx.update(|_, cx| cx.set_reduce_motion(true));
+
+    motion::mark_active();
+    h.window
+        .update(vcx, |_, _, cx| cx.notify())
+        .unwrap();
+    vcx.run_until_parked();
+
+    let asked = h
+        .window
+        .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    assert_eq!(
+        asked, 0,
+        "reduced motion still scheduled a frame for a hand-driven tween"
+    );
+}

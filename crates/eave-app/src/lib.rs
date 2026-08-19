@@ -8,6 +8,12 @@
 /// the acceptance runs use.
 mod edge_fade;
 
+/// The frame drive (Slice N1): the shared pulse clock, the motion catalog
+/// and the render tail. Private for the same reason `edge_fade` is — it is
+/// render-path machinery, not part of the headless surface the acceptance
+/// runs use.
+mod motion;
+
 pub mod display;
 pub mod fixture;
 pub mod markdown;
