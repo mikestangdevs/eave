@@ -152,6 +152,20 @@ async fn an_open_question_and_an_in_flight_tool_are_separate_counts() {
          ever reads 0, the counts have come apart and nothing may assume \
          a parked session shows a tool in flight"
     );
+
+    // Reap. `approval-hang` parks forever by design, and nothing in this
+    // crate kills a child on drop — every other test here either runs the
+    // agent to exit or kills it explicitly. This one asserted and returned,
+    // which orphaned exactly one hung fake-agent per `cargo test` run,
+    // reparented to init, in a codebase whose entire subject is
+    // child-process lifecycle. Kill is the file's convention and it is
+    // provable, so assert that too rather than firing and hoping.
+    let report = session.kill().await.expect("kill must be provable");
+    assert!(!process::group_alive(session.identity().pid));
+    assert!(
+        report.stragglers_killed.is_empty(),
+        "the parked agent should have no descendants to strand"
+    );
 }
 
 #[tokio::test]
