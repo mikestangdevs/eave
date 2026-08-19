@@ -41,6 +41,7 @@ use eave_wire::{
 
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
+use crate::icons;
 use crate::loaders;
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::motion::{self, HoverFade as _};
@@ -733,6 +734,29 @@ enum DiffFetch {
     /// diff must not be a per-frame deep copy.
     Ready(Arc<FileDiff>),
     Failed(String),
+}
+
+/// The glyph for a file's git status (Slice P3).
+///
+/// This mapping replaces `FileStatus::glyph()`'s one-letter vocabulary at
+/// the render site only — the wire type keeps its letters, because they
+/// are git's own names for these states and the engine has no business
+/// knowing what the shell draws.
+///
+/// **The set is deliberately primitive.** These render into a 12 px box:
+/// anything with interior detail (a page outline, a pencil) is mush at
+/// that size, so each status gets the simplest mark that cannot be
+/// confused with the others at a glance — and `Modified` gets a RING
+/// rather than a disc because eave already spends filled discs on session
+/// and tool state.
+fn status_icon(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => icons::STATUS_ADDED,
+        FileStatus::Modified => icons::STATUS_MODIFIED,
+        FileStatus::Deleted => icons::STATUS_DELETED,
+        FileStatus::Renamed => icons::STATUS_RENAMED,
+        FileStatus::Conflicted => icons::STATUS_CONFLICTED,
+    }
 }
 
 /// Right-aligned count labels for one changed file; `None` when the
@@ -1899,8 +1923,11 @@ impl Shell {
             .window_control_area(WindowControlArea::Drag)
             .child(div().w(px(theme::TRAFFIC_CLEARANCE)).h_full().flex_none())
             .child(
-                // Rail collapse toggle: a self-drawn sidebar pictogram
-                // (bordered rect + one vertical hairline), monochrome.
+                // Rail collapse toggle. Slice P3 replaced the hand-drawn
+                // pictogram (a bordered rect with a hairline `div` at the
+                // third) with the drawn glyph it was imitating. Same mark,
+                // to within half a pixel — see `theme::ICON_TOGGLE` for why
+                // the BOX is larger — and one element instead of three.
                 div()
                     .id("rail-toggle")
                     .debug_selector(|| "rail-toggle".into())
@@ -1915,21 +1942,15 @@ impl Shell {
                             cx.notify();
                         });
                     }))
-                    .child(
-                        div()
-                            .w(px(theme::RAIL_TOGGLE_W))
-                            .h(px(theme::RAIL_TOGGLE_H))
-                            .rounded(px(theme::RADIUS_GLYPH))
-                            .border_1()
-                            .border_color(theme::text_tertiary())
-                            .child(
-                                div()
-                                    .w(px(theme::HAIRLINE))
-                                    .h_full()
-                                    .ml(px(theme::RAIL_TOGGLE_W / 3.0))
-                                    .bg(theme::text_tertiary()),
-                            ),
-                    ),
+                    .child(icons::tagged_icon(
+                        icons::PANEL_LEFT,
+                        theme::ICON_TOGGLE,
+                        // The pigment the hand-drawn version painted its
+                        // border with. Named here, not inherited — gpui
+                        // does not cascade colour into an SVG.
+                        theme::text_tertiary(),
+                        "rail-toggle-glyph",
+                    )),
             )
             .child(
                 div()
@@ -1947,8 +1968,8 @@ impl Shell {
             }))
             .child(div().flex_1())
             .child(
-                // Files-rail collapse toggle: the sidebar pictogram
-                // mirrored (hairline on the right third).
+                // Files-rail collapse toggle: the same glyph mirrored
+                // (divider on the right third). Slice P3, as above.
                 div()
                     .id("files-toggle")
                     .debug_selector(|| "files-toggle".into())
@@ -1963,21 +1984,12 @@ impl Shell {
                             cx.notify();
                         });
                     }))
-                    .child(
-                        div()
-                            .w(px(theme::RAIL_TOGGLE_W))
-                            .h(px(theme::RAIL_TOGGLE_H))
-                            .rounded(px(theme::RADIUS_GLYPH))
-                            .border_1()
-                            .border_color(theme::text_tertiary())
-                            .child(
-                                div()
-                                    .w(px(theme::HAIRLINE))
-                                    .h_full()
-                                    .ml(px(theme::RAIL_TOGGLE_W * 2.0 / 3.0))
-                                    .bg(theme::text_tertiary()),
-                            ),
-                    ),
+                    .child(icons::tagged_icon(
+                        icons::PANEL_RIGHT,
+                        theme::ICON_TOGGLE,
+                        theme::text_tertiary(),
+                        "files-toggle-glyph",
+                    )),
             )
     }
 
@@ -2408,7 +2420,17 @@ impl Shell {
                             .on_click(cx.listener(|this, _, _, _| {
                                 let _ = this.commands.send(Command::NewSession);
                             }))
-                            .child("+ new"),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .child(icons::tagged_icon(
+                                icons::PLUS,
+                                theme::ICON_INLINE,
+                                theme::text_secondary(),
+                                "new-session-glyph",
+                            ))
+                            .child("new"),
                     ),
             )
             // Slice M: rows dissolve at the scroller's edges instead of
@@ -2683,14 +2705,22 @@ impl Shell {
             .items_center()
             .gap_2()
             .child(
+                // Slice P3: the slot keeps its width so paths stay aligned
+                // exactly where the letter left them; only its contents
+                // changed. See `status_icon` for what the letters became.
                 div()
                     .w(px(theme::FILE_STATUS_W))
+                    .h(px(theme::SMALL_LINE))
                     .flex_none()
-                    .font_family(theme::MONO)
-                    .text_size(px(theme::MICRO_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
-                    .text_color(theme::text_tertiary())
-                    .child(f.status.glyph()),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icons::tagged_icon(
+                        status_icon(f.status),
+                        theme::ICON_STATUS,
+                        theme::text_tertiary(),
+                        format!("file-status-{}", f.path),
+                    )),
             )
             .child(
                 div()
@@ -3975,13 +4005,11 @@ impl Render for Shell {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_size(px(theme::SEND_GLYPH_SIZE))
-                                .font_weight(theme::WEIGHT_STRONG)
-                                .text_color(if has_draft {
-                                    theme::on_inverse()
-                                } else {
-                                    theme::text_ghost()
-                                })
+                                // Slice P3: no text_size/font_weight/text_color
+                                // — the child is a glyph, an SVG takes its size
+                                // from its own box, and gpui does NOT cascade
+                                // text colour into one (see `icons::icon`). The
+                                // arm colour is handed to the glyph directly.
                                 .id("send")
                                 .debug_selector(|| "send".into())
                                 // Slice M (§2.2). A filled control REPLACES its bg
@@ -4003,7 +4031,16 @@ impl Render for Shell {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.send_current(cx);
                                 }))
-                                .child("↑"),
+                                .child(icons::tagged_icon(
+                                    icons::ARROW_UP,
+                                    theme::ICON_SEND,
+                                    if has_draft {
+                                        theme::on_inverse()
+                                    } else {
+                                        theme::text_ghost()
+                                    },
+                                    "send-glyph",
+                                )),
                         ),
                 ),
         ))
@@ -4200,7 +4237,17 @@ impl Render for Shell {
                                                                 cx.notify();
                                                             });
                                                         }))
-                                                        .child("↓ bottom"),
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(theme::SPACE_1))
+                                                        .child(icons::tagged_icon(
+                                                            icons::ARROW_DOWN,
+                                                            theme::ICON_INLINE,
+                                                            theme::text_secondary(),
+                                                            "to-bottom-glyph",
+                                                        ))
+                                                        .child("bottom"),
                                                 )),
                                         )
                                     })
@@ -4350,7 +4397,11 @@ pub fn run(data_dir: PathBuf) -> ! {
     });
     let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
 
-    application().run(move |cx: &mut App| {
+    // Slice P3: the one place an `Application` is built, so the one place
+    // the icon set can be registered. `bootstrap` cannot do it — assets are
+    // an `Application`-level concern and gpui exposes no `App` setter — which
+    // is why the harness renders every glyph as empty coverage (icons.rs).
+    application().with_assets(icons::Icons).run(move |cx: &mut App| {
         let queues = Arc::new(Queues::default());
         let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();

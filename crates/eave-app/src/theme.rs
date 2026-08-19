@@ -494,8 +494,6 @@ pub const TITLE_SIZE: f32 = 13.0;
 /// events read as instrument facts, not prose.
 pub const TOOL_NAME_SIZE: f32 = 12.0;
 pub const TOOL_NAME_LINE: f32 = 16.0;
-/// The send button glyph.
-pub const SEND_GLYPH_SIZE: f32 = 13.0;
 /// Composer input line (slightly airier than body so the caret row
 /// doesn't feel cramped inside the card).
 pub const COMPOSER_LINE: f32 = 22.0;
@@ -569,6 +567,34 @@ pub const STATE_DOT: f32 = 6.0;
 pub const TOOL_DOT: f32 = 5.0;
 
 // ---------------------------------------------------------------------------
+// Icons (Slice P3) — the box a glyph is drawn into.
+//
+// A gpui SVG is rendered INTO its box and tinted with the inherited text
+// colour, so these are the only numbers that decide how heavy the set
+// looks. They are not free-floating: each one is paired with a
+// `stroke-width` in the drawing, and `icons::tests` asserts the product
+// lands in the set's 1.0-1.2 px band. Change one of these and that test
+// tells you which file needs redrawing.
+
+/// The composer's send arrow, inside the 26 px round button.
+pub const ICON_SEND: f32 = 14.0;
+/// Glyphs that sit inline beside a text label: `+ new`, `↓ bottom`.
+/// Smaller than the label's box on purpose — a glyph matched to the cap
+/// height of the text beside it reads as part of the same line.
+pub const ICON_INLINE: f32 = 12.0;
+/// Both rail collapse toggles in the titlebar. Larger than the 16 px the
+/// hand-drawn pictogram occupied, because the drawing carries its own
+/// padding: the panel rect spans 18 of 24 units, so a 20 px box puts it at
+/// 15 x 11.7 px — within half a pixel of the 16 x 12 rect it replaces. The
+/// visible mark is what should match, not the box around it.
+pub const ICON_TOGGLE: f32 = 20.0;
+/// The file status glyph. Exactly [`FILE_STATUS_W`], so the slot is
+/// unchanged and paths stay aligned where the letter left them. The air
+/// is inside the drawing: every status mark spans at most 12 of the 24
+/// grid units, so it reads no larger than the letter it replaces.
+pub const ICON_STATUS: f32 = 12.0;
+
+// ---------------------------------------------------------------------------
 // Loaders (Slice N3) — the working indicator and the skeletons.
 //
 // These are the design values N1 deliberately left out of its catalog
@@ -639,10 +665,9 @@ pub const PLATE_MARGIN: f32 = SPACE_3;
 /// self-drawn set for every provider (Slice A directive).
 pub const PROVIDER_CHIP: f32 = 18.0;
 pub const RADIUS_CHIP: f32 = 5.0;
-/// The rail collapse toggle's self-drawn sidebar pictogram (titlebar).
-pub const RAIL_TOGGLE_W: f32 = 16.0;
-pub const RAIL_TOGGLE_H: f32 = 12.0;
-pub const RADIUS_GLYPH: f32 = 3.0;
+// Slice P3 deleted RAIL_TOGGLE_W/H and RADIUS_GLYPH with the hand-drawn
+// sidebar pictogram they described. The toggles are `icons::PANEL_LEFT`
+// and `PANEL_RIGHT` now, sized by `ICON_TOGGLE` above.
 
 // ---------------------------------------------------------------------------
 // Files rail (Slice B) — rows on the bare glass ground, mirroring the

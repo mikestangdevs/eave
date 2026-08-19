@@ -2224,3 +2224,156 @@ fn a_diff_that_has_not_arrived_shows_skeleton_rows(cx: &mut TestAppContext) {
         "the skeleton outlived the diff it was standing in for"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Slice P3 — the icon pipeline.
+//
+// **What these tests can and cannot prove.** `TestAppContext` hardcodes
+// `Arc::new(())` as its asset source (gpui `app/test_context.rs`), the `()`
+// impl answers `Ok(None)` to everything, and `App` exposes no setter — so
+// no test in this file can make an icon resolve. Every glyph here renders
+// as empty coverage. That is not a gap this slice can close: assets are an
+// `Application`-level concern and the harness never builds one.
+//
+// So these assert the half that IS observable and that a swap can break:
+// the SLOT (an SVG lays out from its own box, whether or not the bytes
+// arrive) and the HITBOX (replacing a clickable div's child is exactly how
+// you break its click target). Whether the drawing is right is a question
+// for a capture, and it is answered in the report.
+
+/// Every swapped site draws a glyph in the box its token names.
+///
+/// Non-vacuous by construction: each expected size is a DIFFERENT number,
+/// so a copy-paste that pointed two sites at one token would fail here.
+#[gpui::test]
+fn every_swapped_control_draws_its_glyph_in_the_box_its_token_names(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(3),
+                dels: Some(1),
+                orig_path: None,
+                untracked: false,
+            }],
+            omitted: 0,
+            watching: true,
+        }),
+    ));
+    vcx.run_until_parked();
+
+    for (selector, expected) in [
+        ("send-glyph", theme::ICON_SEND),
+        ("new-session-glyph", theme::ICON_INLINE),
+        ("rail-toggle-glyph", theme::ICON_TOGGLE),
+        ("files-toggle-glyph", theme::ICON_TOGGLE),
+        ("file-status-src/lib.rs", theme::ICON_STATUS),
+    ] {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} did not render"));
+        assert_eq!(
+            (b.size.width, b.size.height),
+            (px(expected), px(expected)),
+            "{selector} is not the square its token names",
+        );
+    }
+}
+
+/// The status slot is status-independent, which is the whole reason it is
+/// a fixed slot: five statuses used to be five one-letter strings and are
+/// now five different drawings, and neither may move the path beside it.
+#[gpui::test]
+fn the_status_glyph_never_moves_the_path_beside_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    let file = |path: &str, status| ChangedFile {
+        path: path.into(),
+        status,
+        adds: Some(1),
+        dels: Some(1),
+        orig_path: None,
+        untracked: false,
+    };
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![
+                file("a.rs", FileStatus::Added),
+                file("b.rs", FileStatus::Modified),
+                file("c.rs", FileStatus::Deleted),
+                file("d.rs", FileStatus::Renamed),
+                file("e.rs", FileStatus::Conflicted),
+            ],
+            omitted: 0,
+            watching: true,
+        }),
+    ));
+    vcx.run_until_parked();
+
+    // Measure the GLYPH boxes, not the rows. A row is full-width, so its
+    // bounds would be identical whatever the status drew inside it — an
+    // assertion on rows would pass for a variable-width glyph and prove
+    // nothing. Each glyph carries its own selector for exactly this reason.
+    //
+    // Literal selectors because `debug_bounds` wants `&'static str`.
+    let glyphs = [
+        "file-status-a.rs",
+        "file-status-b.rs",
+        "file-status-c.rs",
+        "file-status-d.rs",
+        "file-status-e.rs",
+    ];
+    let boxes: Vec<_> = glyphs
+        .iter()
+        .map(|sel| {
+            vcx.debug_bounds(sel)
+                .unwrap_or_else(|| panic!("{sel} did not render"))
+        })
+        .collect();
+    let first = boxes[0];
+    for (b, name) in boxes.iter().zip(glyphs) {
+        assert_eq!(b.size.width, first.size.width, "{name} glyph width");
+        assert_eq!(b.size.height, first.size.height, "{name} glyph height");
+        assert_eq!(b.origin.x, first.origin.x, "{name} glyph x");
+    }
+    // ...and the slot really is the fixed one, not just five glyphs that
+    // happen to agree: the box is the token's, inside the rail's slot.
+    assert_eq!(first.size.width, px(theme::ICON_STATUS));
+    assert!(theme::ICON_STATUS <= theme::FILE_STATUS_W);
+}
+
+/// Both toggles still toggle. Replacing the child of a clickable `div` is
+/// the standard way to break its click target — the icon is inside the
+/// hitbox, not the other way round, and this is what says so.
+#[gpui::test]
+fn the_collapse_toggles_still_toggle_after_the_glyph_swap(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    assert!(shown(vcx, "new-session"), "the session rail starts open");
+
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "new-session"),
+        "clicking the rail toggle did not collapse the rail — the glyph \
+         swap broke the hitbox"
+    );
+
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "new-session"), "the rail did not come back");
+}

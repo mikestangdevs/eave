@@ -19,6 +19,11 @@ mod motion;
 /// and the headless acceptance runs do not.
 mod loaders;
 
+/// The icon pipeline (Slice P3): the embedded glyph set and the
+/// `AssetSource` that serves it. Private like the other render-path
+/// modules — the headless acceptance runs never draw.
+mod icons;
+
 pub mod display;
 pub mod fixture;
 pub mod markdown;
