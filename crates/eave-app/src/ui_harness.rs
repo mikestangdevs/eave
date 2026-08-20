@@ -5489,7 +5489,8 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
     let (mut h, vcx) = boot(cx);
     // A live engine: this is the case where elapsed time is the ONLY
     // evidence available, which is the case the patience exists for.
-    h.plumbing.push_conn(ConnEvent::Connected { engine_pid: 4242 });
+    h.plumbing
+        .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     // No `push_files`. That absence is the whole test.
 
@@ -5603,7 +5604,8 @@ fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
     cx: &mut TestAppContext,
 ) {
     let (h, vcx) = boot(cx);
-    h.plumbing.push_conn(ConnEvent::Connected { engine_pid: 4242 });
+    h.plumbing
+        .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     assert!(shown(vcx, "files-skeleton"), "nothing was ever waiting");
     assert!(clock_running(vcx), "nothing was ever moving");
@@ -5661,7 +5663,8 @@ fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
 #[gpui::test]
 fn trying_again_re_asks_and_restarts_the_rails_patience(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    h.plumbing.push_conn(ConnEvent::Connected { engine_pid: 4242 });
+    h.plumbing
+        .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     steps_until_parked(vcx, 300, "never gave up");
     assert!(shown(vcx, "files-retry"), "nothing to click");

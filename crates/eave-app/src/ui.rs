@@ -1050,8 +1050,7 @@ struct FilesState {
 /// is unsubscribed, nothing is killed, no session is touched (progress.md
 /// §Known failures: no timer ever kills), and a snapshot arriving at 21 s
 /// renders exactly as one arriving at 2 s does.
-const FILES_PATIENCE: Duration =
-    Duration::from_secs(2 * eave_engine::git::GIT_TIMEOUT.as_secs());
+const FILES_PATIENCE: Duration = Duration::from_secs(2 * eave_engine::git::GIT_TIMEOUT.as_secs());
 
 /// What the files rail knows about the selected session's file list, on
 /// this frame (Slice AH).
@@ -4218,7 +4217,17 @@ impl Shell {
                     .rounded(px(theme::RADIUS_CHIP))
                     .text_size(px(theme::DETAIL_SIZE))
                     .line_height(px(theme::DETAIL_LINE))
-                    .text_color(theme::text_secondary())
+                    // `text()`, not `text_secondary()`, and the reason is
+                    // this session's other slice: a quiet tier UNDER a
+                    // wash is the defect Slice AG exists to fix
+                    // (`text_secondary` over `overlay` is 3.81:1, and
+                    // this element's rest state fades up to exactly that
+                    // wash on hover). The full tier is 7.00:1 over the
+                    // same ground, and it is also the right weight for
+                    // the one thing on this surface you can act on —
+                    // `scope_segment` reaches for the same tier for the
+                    // same reason.
+                    .text_color(theme::text())
                     .hover_fade("files-retry", theme::wash_rest(), theme::overlay())
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {

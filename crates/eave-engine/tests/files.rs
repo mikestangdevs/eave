@@ -1279,9 +1279,12 @@ async fn every_files_subscription_answers_at_both_scopes_and_every_cwd() {
                 .unwrap_or_else(|e| panic!("files {id} {scope:?}: {e}"));
             // `wait_for_snapshot` panics past its own deadline, which is
             // the assertion: no frame is the failure.
-            let snap =
-                wait_for_snapshot(&mut rx, &format!("first frame for {id} at {scope:?}"), |_| true)
-                    .await;
+            let snap = wait_for_snapshot(
+                &mut rx,
+                &format!("first frame for {id} at {scope:?}"),
+                |_| true,
+            )
+            .await;
             // ...and the frame has to SAY something. An empty list under a
             // basis nobody could measure would render as "no changes",
             // which is the confusion Slice AA exists to prevent — so a
@@ -1314,6 +1317,10 @@ async fn every_files_subscription_answers_at_both_scopes_and_every_cwd() {
         snap.basis
     );
 
-    assert_eq!(c.list().await.expect("list").len(), 3, "the engine survived");
+    assert_eq!(
+        c.list().await.expect("list").len(),
+        3,
+        "the engine survived"
+    );
     drop(engine);
 }
