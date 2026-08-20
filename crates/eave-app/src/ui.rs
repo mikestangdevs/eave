@@ -1585,6 +1585,12 @@ const ROW_ACTION_HIT: f32 = 24.0;
 /// the session instead of acting on it.
 const ROW_ACTION_GLYPH: f32 = 13.0;
 
+/// The launcher model picker's chevron. Smaller than [`ROW_ACTION_GLYPH`]
+/// because it sits *beside a label* rather than standing alone as an
+/// affordance: at the label's 12.5 px it reads as a second word, and the
+/// job of a disclosure chevron is to be noticed without being read.
+const MODEL_CHEVRON: f32 = 11.0;
+
 fn row_action(key: String, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
     let selector = key.clone();
     let glyph_selector = format!("{key}-glyph");
@@ -6449,7 +6455,26 @@ impl Shell {
                                             cx,
                                         );
                                     }))
-                                    .child(format!("{model}  ⌄")),
+                                    // The chevron is the ICON, not the
+                                    // character `⌄` (U+2304). That codepoint
+                                    // sits low in its em box, so it rendered
+                                    // visibly below the label's optical
+                                    // centre — a flex row with `items_center`
+                                    // centres the glyph on the line box
+                                    // instead of trusting a font's metrics
+                                    // for a character almost no face is
+                                    // designed to set beside text.
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_1))
+                                    .child(model.to_string())
+                                    .child(icons::tagged_icon(
+                                        icons::ALT_ARROW_DOWN,
+                                        MODEL_CHEVRON,
+                                        theme::text_secondary_on_wash(),
+                                        "launcher-model-chevron",
+                                    )),
                             )
                             .child(
                                 div()
