@@ -2390,7 +2390,7 @@ impl Shell {
                 div()
                     .id(SharedString::from(format!("rail-{}", info.session_id)))
                     .debug_selector(|| format!("rail-{}", info.session_id))
-                    .px(px(theme::SPACE_2))
+                    .px(px(theme::RAIL_CARD_BLEED))
                     .py(px(theme::SPACE_2))
                     .rounded(px(theme::RADIUS_BUTTON))
                     // A newly-arrived row fades in (§1.4). Opacity only, and
@@ -2678,13 +2678,16 @@ impl Shell {
         // pixels above it, and restating a visible button is noise.
         let rows: Vec<AnyElement> = if rows.is_empty() {
             vec![div()
-                .debug_selector(|| "rail-empty".into())
-                .px(px(theme::SPACE_2))
+                .px(px(theme::RAIL_GUTTER))
                 .py(px(theme::SPACE_1))
-                .text_size(px(theme::SMALL_SIZE))
-                .line_height(px(theme::SMALL_LINE))
-                .text_color(theme::text_ghost())
-                .child("no sessions")
+                .child(
+                    div()
+                        .debug_selector(|| "rail-empty".into())
+                        .text_size(px(theme::SMALL_SIZE))
+                        .line_height(px(theme::SMALL_LINE))
+                        .text_color(theme::text_ghost())
+                        .child("no sessions"),
+                )
                 .into_any_element()]
         } else {
             rows
@@ -2702,7 +2705,7 @@ impl Shell {
             .flex_col()
             .child(
                 div()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pt(px(theme::SPACE_3))
                     .pb(px(theme::SPACE_2))
                     .flex()
@@ -2714,6 +2717,7 @@ impl Shell {
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
+                            .debug_selector(|| "rail-title".into())
                             .text_color(theme::text_tertiary())
                             .child("sessions"),
                     )
@@ -2766,7 +2770,7 @@ impl Shell {
                         .min_h(px(0.))
                         .overflow_y_scroll()
                         .track_scroll(&self.rail_scroll)
-                        .px(px(theme::SPACE_2))
+                        .pr(px(theme::RAIL_CARD_BLEED))
                         .pb(px(theme::SPACE_2))
                         .flex()
                         .flex_col()
@@ -2781,16 +2785,23 @@ impl Shell {
             // surprise. Absent entirely when nothing live reports memory.
             .children(resource.map(|(line, over)| {
                 div()
-                    .debug_selector(|| "rail-resource".into())
                     .flex_none()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pb(px(theme::SPACE_3))
                     .pt(px(theme::SPACE_1))
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
-                    .font_weight(if over { theme::WEIGHT_LABEL } else { theme::WEIGHT_BODY })
-                    .text_color(if over { theme::warning() } else { theme::text_ghost() })
-                    .child(SharedString::from(line))
+                    .child(
+                        div()
+                            .debug_selector(|| "rail-resource".into())
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .font_weight(if over {
+                                theme::WEIGHT_LABEL
+                            } else {
+                                theme::WEIGHT_BODY
+                            })
+                            .text_color(if over { theme::warning() } else { theme::text_ghost() })
+                            .child(SharedString::from(line)),
+                    )
             }))
             .into_any_element()
     }
@@ -2909,7 +2920,7 @@ impl Shell {
             .flex_col()
             .child(
                 div()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pt(px(theme::SPACE_3))
                     .pb(px(theme::SPACE_2))
                     .flex()
@@ -2921,11 +2932,13 @@ impl Shell {
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
+                            .debug_selector(|| "files-title".into())
                             .text_color(theme::text_tertiary())
                             .child("changes"),
                     )
                     .children(count_label.map(|n| {
                         div()
+                            .debug_selector(|| "files-count".into())
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_family(theme::MONO)
@@ -2946,7 +2959,7 @@ impl Shell {
                         .min_h(px(0.))
                         .overflow_y_scroll()
                         .track_scroll(&self.files_scroll)
-                        .px(px(theme::SPACE_2))
+                        .pr(px(theme::RAIL_CARD_BLEED))
                         .pb(px(theme::SPACE_2))
                         .child(body),
                 )
@@ -2954,14 +2967,17 @@ impl Shell {
             )
             .children(mode.map(|text| {
                 div()
-                    .debug_selector(|| "files-mode".into())
                     .flex_none()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pb(px(theme::SPACE_2))
-                    .text_size(px(theme::DETAIL_SIZE))
-                    .line_height(px(theme::DETAIL_LINE))
-                    .text_color(theme::text_ghost())
-                    .child(text)
+                    .child(
+                        div()
+                            .debug_selector(|| "files-mode".into())
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::DETAIL_LINE))
+                            .text_color(theme::text_ghost())
+                            .child(text),
+                    )
             }))
             .into_any_element()
     }
@@ -2985,7 +3001,7 @@ impl Shell {
         div()
             .id(SharedString::from(format!("file-{}", f.path)))
             .debug_selector(|| format!("file-{}", f.path))
-            .px(px(theme::SPACE_2))
+            .px(px(theme::RAIL_CARD_BLEED))
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
             // §1.4: a file that has just appeared in the rail fades in.

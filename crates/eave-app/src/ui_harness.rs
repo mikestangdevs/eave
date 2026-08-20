@@ -826,6 +826,114 @@ fn an_unknown_tool_states_no_detail(cx: &mut TestAppContext) {
     );
 }
 
+/// A rail has ONE left edge.
+///
+/// It had four. Every value was a legal `SPACE_*` and the scale was applied
+/// everywhere — which is the point: **a spacing scale tells you the SIZE of
+/// a gap and says nothing about which edge things line up on.** The header
+/// label sat at 24, a row's card at 20, the empty state at 28 and the
+/// footer at 24, with the row card overhanging the `+ new` button by 4 px.
+/// Both rails had it, identically, because one was copied from the other.
+///
+/// The assertions compare MEASURED edges against each other and never
+/// against `RAIL_GUTTER`. A test that computed its expectation from the
+/// constant it is testing would pass for any value of that constant, which
+/// is the trap §Traps already names.
+#[gpui::test]
+fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // `live` with reported memory, because the footer's resource line is
+    // absent entirely when nothing live reports any — and that line is one
+    // of the two edges under test.
+    let mut only = session("aaaa1111");
+    only.live = true;
+    only.rss_bytes = Some(64 * 1024 * 1024);
+    h.plumbing.push_rail(vec![only]);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(1),
+                dels: Some(0),
+                orig_path: None,
+                untracked: false,
+            }],
+            omitted: 0,
+            watching: true,
+        }),
+    ));
+    vcx.run_until_parked();
+
+    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .origin
+            .x
+    };
+    let right = |vcx: &mut VisualTestContext, sel: &'static str| {
+        let b = vcx
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"));
+        b.origin.x + b.size.width
+    };
+
+    // Header label and footer fact are both text directly on the rail, so
+    // they share the gutter.
+    assert_eq!(
+        x(vcx, "rail-title"),
+        x(vcx, "rail-resource"),
+        "the sessions rail's header and footer start on different edges"
+    );
+    // The header's trailing control and a row's card share their RIGHT
+    // edge — this is the 4 px overhang, asserted.
+    assert_eq!(
+        right(vcx, "new-session"),
+        right(vcx, "rail-aaaa1111"),
+        "the row card and the + new button end on different edges"
+    );
+
+    // The files rail is the same rule, and had the same drift.
+    assert_eq!(
+        x(vcx, "files-title"),
+        x(vcx, "files-mode"),
+        "the files rail's header and mode line start on different edges"
+    );
+    // The files header's trailing slot holds a count, not a control — but
+    // it is still the trailing element, so the rule is the same one.
+    // (`files-toggle` is the TITLEBAR's collapse control and lives outside
+    // the rail entirely; asserting against it was measuring two different
+    // columns.)
+    assert_eq!(
+        right(vcx, "files-count"),
+        right(vcx, "file-src/lib.rs"),
+        "the file row and the rail's trailing count end on different edges"
+    );
+}
+
+/// ...and the empty state is on it too, which is the one that read as a
+/// typo rather than as drift: "no sessions" was indented PAST the header it
+/// sits under.
+#[gpui::test]
+fn the_empty_state_starts_on_the_gutter(cx: &mut TestAppContext) {
+    let (_h, vcx) = boot(cx);
+    vcx.run_until_parked();
+    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .origin
+            .x
+    };
+    assert_eq!(
+        x(vcx, "rail-empty"),
+        x(vcx, "rail-title"),
+        "the empty state is indented past the header it sits under"
+    );
+}
+
 /// Clicking a row only *requests* a switch — the rail's highlight is a
 /// projection of the feed's actual subscription. And once the feed has
 /// moved on, frames still in flight from the session that just left must
