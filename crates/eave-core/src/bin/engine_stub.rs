@@ -87,6 +87,7 @@ async fn main() {
         session_id: session_id.clone(),
         state: "running".into(),
         child: Some(session.identity()),
+        title: None,
     };
     meta.save(&dir).expect("save meta");
 

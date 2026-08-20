@@ -92,13 +92,17 @@ pub async fn record_session(
                         tap_send(rec);
                         meta.state = outcome.state_name().into();
                         meta.child = None;
-                        meta.save(&session_dir)?;
+                        // Stage AB: this task holds a `Meta` snapshot taken
+                        // at spawn, so a rename that landed mid-turn is not
+                        // in it. Preserve the on-disk title rather than
+                        // writing back a stale one.
+                        meta.save_keeping_title(&session_dir)?;
                         return Ok(outcome);
                     }
                     ev => {
                         if let SessionEvent::Init { session_id, .. } = &ev {
                             meta.session_id = session_id.clone();
-                            meta.save(&session_dir)?;
+                            meta.save_keeping_title(&session_dir)?;
                         }
                         let terminal = matches!(ev, SessionEvent::TurnCompleted { .. });
                         let rec = writer.append(JournalEvent::Provider { event: ev })?;

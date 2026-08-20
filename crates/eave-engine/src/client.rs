@@ -427,6 +427,25 @@ impl Client {
             .info)
     }
 
+    /// Name a session, or clear its name with `None` (Stage AB).
+    ///
+    /// Returns the session as the engine now holds it, so the caller reads
+    /// back the NORMALIZED title — trimmed, folded to one line, capped —
+    /// rather than assuming the string it sent is the one that landed.
+    pub async fn rename(
+        &self,
+        session_id: &str,
+        title: Option<&str>,
+    ) -> Result<SessionInfo, ClientError> {
+        Ok(self
+            .request::<eave_wire::RenameOk>(Request::Rename {
+                session_id: session_id.into(),
+                title: title.map(str::to_string),
+            })
+            .await?
+            .info)
+    }
+
     /// Delete a session's eave worktree (Slice I2). `removed: false` is
     /// the engine's refusal restating freshly-measured dirty facts —
     /// re-send with `force: true` only when the operator confirmed

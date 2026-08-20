@@ -46,6 +46,7 @@ fn test_meta(session_id: &str) -> Meta {
         session_id: session_id.into(),
         state: "running".into(),
         child: None,
+        title: None,
     }
 }
 

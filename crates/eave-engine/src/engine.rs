@@ -30,11 +30,11 @@ use eave_core::session::{
     conflicts_with_eave_flags, posture_is_verified, AgentConfig, AgentSession, ApprovalDecision,
     SessionWatch, SpawnConfig, POSTURE_VERIFIED_PROVIDERS,
 };
-use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
+use eave_core::store::{normalize_title, EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
     socket_path, ChangedFile, Cursor, DecideOk, Decision, DiffBasis, DiffOk, FileScope, FileStatus,
-    FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, Request,
+    FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, RenameOk, Request,
     RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem,
     UnsubscribeOk, PROTO_VERSION,
 };
@@ -147,6 +147,29 @@ struct Shared {
     /// task; `None` when no process is attached. Transient — never
     /// journaled.
     attention: Option<AttentionSnapshot>,
+    /// The operator's name for this session (Stage AB), mirroring
+    /// `meta.json`. Never derived from `records` — see
+    /// [`eave_wire::SessionInfo::title`].
+    title: Option<String>,
+    /// When [`Shared::reported_state`] last changed (Stage AB). `None`
+    /// until it moves; the rail falls back to `created_ts_ms`.
+    last_activity_ms: Option<u64>,
+}
+
+impl Shared {
+    /// The state name a watcher reads — the attention overlay while a
+    /// process is attached, the journal's terminal truth otherwise. Split
+    /// out of `info()` because [`SessionHandle::settle_state`] has to
+    /// compare it before and after a mutation, and two copies of this rule
+    /// would eventually disagree about what "the state" is.
+    fn reported_state(&self) -> String {
+        match (&self.attention, self.live) {
+            (Some(a), true) if !matches!(a, AttentionSnapshot::Running) => {
+                a.state_name().to_string()
+            }
+            _ => self.state.clone(),
+        }
+    }
 }
 
 /// What the per-session broadcast fans out: seq'd journal records, plus
@@ -335,14 +358,15 @@ impl SessionHandle {
         // While live, the attention overlay is the reported state
         // (spec 01 §States: quiet/unresponsive/failed are what the badge
         // shows); terminal names still come from the journal's truth.
-        let state = match (&s.attention, s.live) {
-            (Some(a), true) if !matches!(a, AttentionSnapshot::Running) => {
-                a.state_name().to_string()
-            }
-            _ => s.state.clone(),
-        };
+        let state = s.reported_state();
         SessionInfo {
             session_id: self.session_id.clone(),
+            // Stage AB. Read straight from the operator-set field — there
+            // is deliberately no fallback that reaches into `s.records`.
+            // The rail would love a title derived from the first prompt;
+            // the isolation invariant (spec 05 §Watch) forbids it, and
+            // `watch.rs` proves the forbidding on raw bytes.
+            title: s.title.clone(),
             provider: s.header.provider.clone(),
             // Slice P2. A configured model is a fact ABOUT the session, in
             // the same class as `provider` and `cwd` — not transcript
@@ -352,6 +376,7 @@ impl SessionHandle {
             model: s.header.agent.model.clone(),
             cwd: s.header.cwd.clone(),
             created_ts_ms: s.header.created_ts_ms,
+            last_activity_ms: s.last_activity_ms,
             state,
             live: s.live,
             epoch: s.epoch,
@@ -455,9 +480,32 @@ impl SessionHandle {
     /// broadcast for live ones. Attention is part of the reported state
     /// name, so watchers are poked too.
     fn set_attention(&self, snap: AttentionSnapshot) {
-        self.shared.lock().unwrap().attention = Some(snap.clone());
+        {
+            let mut s = self.shared.lock().unwrap();
+            let was = s.reported_state();
+            s.attention = Some(snap.clone());
+            Self::settle_state(&mut s, &was);
+        }
         let _ = self.bcast.send(Fanout::Attention(snap));
         self.poke_watch();
+    }
+
+    /// Stamp `last_activity_ms` iff the state name a watcher reads actually
+    /// moved (Stage AB). Called under `shared`'s lock by every mutation
+    /// that could move it, with the name taken *before* the mutation.
+    ///
+    /// The equality check is the whole design, not an optimization. The
+    /// attention monitor re-publishes its snapshot on evidence updates as
+    /// well as on transitions, so an unconditional stamp here would tick
+    /// the clock on the monitor's cadence — and a timestamp that advances
+    /// while a session streams is a report of that session's transcript
+    /// activity, on the one channel that may not carry it. Stamping only
+    /// on a change makes the field a strictly redundant encoding of
+    /// something `state` already told every watcher.
+    fn settle_state(s: &mut Shared, was: &str) {
+        if s.reported_state() != was {
+            s.last_activity_ms = Some(now_ms());
+        }
     }
 
     /// Something a watcher can see changed (session appeared, process
@@ -692,6 +740,8 @@ impl Engine {
                 session_id: id.clone(),
                 state: "new".into(),
                 child: None,
+                // Stage AB: nobody has named it yet, and eave will not.
+                title: None,
             };
             meta.save(&dir).map_err(|e| format!("save meta: {e}"))?;
             let (bcast, _) = broadcast::channel(BROADCAST_CAP);
@@ -707,6 +757,13 @@ impl Engine {
                     live: false,
                     pid: None,
                     attention: None,
+                    // Stage AB: unnamed, and no state has moved yet — the
+                    // rail sorts this one on `created_ts_ms`. Seeding the
+                    // stamp with `now` here would be a lie of the useful
+                    // kind (it happens to equal creation today) that stops
+                    // being true the moment creation and open diverge.
+                    title: None,
+                    last_activity_ms: None,
                 }),
                 bcast,
                 live: TokioMutex::new(None),
@@ -753,13 +810,23 @@ impl Engine {
             })
             .unwrap_or_else(|| "new".into());
         // Keep meta in step with what repair concluded.
+        let mut title = None;
         if let Ok(mut meta) = Meta::load(&dir) {
+            // Stage AB: the operator's name for this session is durable —
+            // it is read back here and nowhere else. A meta that fails to
+            // load leaves the session unnamed rather than guessing one.
+            title = meta.title.clone();
             if meta.state != state || meta.child.is_some() {
                 meta.state = state.clone();
                 meta.child = None;
                 let _ = meta.save(&dir);
             }
         }
+        // Stage AB: the last time this session's state provably moved is
+        // the `Closed` that ended its last process segment — durable, and
+        // therefore identical before and after an engine restart. Nothing
+        // ever ran ⇒ `None`, and the rail falls back to creation order.
+        let last_activity_ms = last_state_change_ms(&loaded.records);
         let last_mode = last_permission_mode(&loaded.records);
         let (bcast, _) = broadcast::channel(BROADCAST_CAP);
         let (files_tx, _) = broadcast::channel(FILES_CAP);
@@ -784,6 +851,8 @@ impl Engine {
                 live: false,
                 pid: None,
                 attention: None,
+                title,
+                last_activity_ms,
             }),
             bcast,
             live: TokioMutex::new(None),
@@ -915,22 +984,27 @@ impl Engine {
         let (session, events) =
             ClaudeCodeSession::spawn(&cfg).map_err(|e| format!("spawn agent: {e}"))?;
 
-        let meta = Meta {
+        let mut meta = Meta {
             format_version: META_FORMAT_VERSION,
             provider: header.provider.clone(),
             cwd: header.cwd.clone(),
             session_id: handle.session_id.clone(),
             state: "running".into(),
             child: Some(session.identity()),
+            // Stage AB: overwritten by `save_keeping_title` from what is
+            // on disk — `rename` is the only writer of this field.
+            title: None,
         };
-        meta.save(&handle.dir)
+        meta.save_keeping_title(&handle.dir)
             .map_err(|e| format!("save meta: {e}"))?;
 
         {
             let mut s = handle.shared.lock().unwrap();
+            let was = s.reported_state();
             s.live = true;
             s.pid = Some(session.identity().pid);
             s.state = "running".into();
+            SessionHandle::settle_state(&mut s, &was);
         }
         handle.poke_watch();
 
@@ -1012,12 +1086,14 @@ impl Engine {
             };
             {
                 let mut s = done_handle.shared.lock().unwrap();
+                let was = s.reported_state();
                 s.live = false;
                 s.pid = None;
                 s.state = state;
                 // The overlay is per-process; the journal's terminal truth
                 // governs now. Broadcast the clear so a live notice drops.
                 s.attention = None;
+                SessionHandle::settle_state(&mut s, &was);
             }
             // The process that asked the questions is gone; nothing can be
             // answered now (Slice K). The mode it ran under stays — that is
@@ -1305,6 +1381,38 @@ impl Engine {
         ListOk { sessions: infos }
     }
 
+    /// Name a session, or clear its name with `None` (Stage AB).
+    ///
+    /// The **only** writer of `Meta::title`, in either direction. Every
+    /// other meta write goes through `save_keeping_title` and preserves
+    /// whatever this wrote; that single-writer rule is what keeps a rename
+    /// from being erased by the next state transition.
+    ///
+    /// Allowed in every state, including while live. There is nothing to
+    /// serialize against — the title touches no process, no journal and no
+    /// provider-side cursor — so refusing during a turn would be ceremony
+    /// with no fact behind it.
+    fn rename(&self, id: &str, title: Option<String>) -> Result<SessionInfo, String> {
+        let handle = self.session(id)?;
+        let title = title.as_deref().and_then(normalize_title);
+        let mut meta = Meta::load(&handle.dir).map_err(|e| {
+            format!(
+                "cannot rename {id}: its meta.json is unreadable ({e}) — refusing to \
+                 write a reconstructed one over it"
+            )
+        })?;
+        meta.title = title.clone();
+        meta.save(&handle.dir)
+            .map_err(|e| format!("save meta: {e}"))?;
+        handle.shared.lock().unwrap().title = title;
+        // A rail row's label changed — watchers re-snapshot. Deliberately
+        // NOT a `settle_state` stamp: naming a session is not the session
+        // doing anything, and sorting the rail by "most recently renamed"
+        // would be a lie about which agent is working.
+        handle.poke_watch();
+        self.info_with_sharing(id)
+    }
+
     /// One session's info with the cross-session sharing fact filled —
     /// what unary replies about a single session return.
     fn info_with_sharing(&self, id: &str) -> Result<SessionInfo, String> {
@@ -1370,6 +1478,24 @@ fn last_permission_mode(records: &[Record]) -> Option<String> {
         } => permission_mode.clone(),
         _ => None,
     })
+}
+
+/// When a loaded session's state last provably moved (Stage AB): the
+/// `Closed` that ended its most recent process segment.
+///
+/// Only `Closed` counts, and that is the point. Every other record is
+/// transcript — reading a `UserSent`'s or a tool result's timestamp would
+/// make `last_activity_ms` a measure of how much the agent said, which is
+/// the fact `watch` is not allowed to carry. `Closed` is a state change and
+/// nothing else, and `journal::load` guarantees one exists for any segment
+/// that ever ran (crash-tail repair appends the interrupted closer), so
+/// `None` here means genuinely nothing has ever run.
+fn last_state_change_ms(records: &[Record]) -> Option<u64> {
+    records
+        .iter()
+        .rev()
+        .find(|r| matches!(r.event, JournalEvent::Closed { .. }))
+        .map(|r| r.ts_ms)
 }
 
 fn fill_sharing(infos: &mut [SessionInfo]) {
@@ -1782,6 +1908,12 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 });
                 continue;
             }
+            // Stage AB. Unary and on the connection loop: it is two small
+            // file operations, unlike `isolate`, which shells out to git.
+            Request::Rename { session_id, title } => match engine.rename(&session_id, title) {
+                Ok(info) => ok_value(&RenameOk { info }),
+                Err(message) => ResponseBody::Err { message },
+            },
             Request::Decide {
                 session_id,
                 request_id,

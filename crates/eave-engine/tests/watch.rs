@@ -255,6 +255,243 @@ async fn watch_channel_never_carries_transcript_content() {
     drop(engine);
 }
 
+/// Stage AB, and the reason the rail's title is not the one the build
+/// directive asked for.
+///
+/// The obvious title is the session's first prompt, capped. It cannot
+/// exist: the canary above plants its marker at the HEAD of that prompt,
+/// so a leading-words title does not merely bend the isolation invariant
+/// (spec 05 §Watch), it fails `watch_channel_never_carries_transcript_content`
+/// by name. The feature was degraded to an operator-set name instead, and
+/// this test is what stops it being quietly un-degraded: it asserts the
+/// engine looks at the journal for a title exactly never.
+///
+/// Positive control is the same one the canary uses — the words provably
+/// cross `subscribe` — so "no title" here is a rule being kept, not a
+/// session that never had any content to mine.
+#[tokio::test]
+async fn the_engine_never_mines_a_title_out_of_the_transcript() {
+    const CANARY: &str = "TITLE_CANARY_91b4";
+    let dir = scratch();
+    let engine = EngineProc::spawn(&dir, "linger");
+
+    let c = Client::connect(&dir).await.expect("connect client");
+    c.open(Some("s1".into()), None).await.expect("open");
+    // Delivery is deliberately not asserted here: `UserSent` is journaled
+    // BEFORE the pipe write (spec 02 §Delivery state), so the record this
+    // test is about exists either way — and the delivered flag is a known
+    // flaky signal on a loaded machine.
+    c.send("s1", &format!("{CANARY} rename the rail rows"))
+        .await
+        .expect("send");
+
+    // Positive control: the prompt IS on this session's own stream.
+    let mut t = Transcript::new();
+    let mut rx = c.subscribe("s1", None).await.expect("subscribe");
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < end, "canary never arrived on subscribe");
+        drain_records(&mut rx, &mut t, 1, Duration::from_secs(15)).await;
+        if t.rows
+            .iter()
+            .any(|r| matches!(r, Row::User { text, .. } if text.contains(CANARY)))
+        {
+            break;
+        }
+    }
+
+    // The session set says nothing about it — not the first word, not a
+    // capped prefix, nothing.
+    let mut watch = c.watch().await.expect("watch");
+    let end = Instant::now() + Duration::from_secs(15);
+    let mut checked = 0usize;
+    while Instant::now() < end && checked < 3 {
+        let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await
+        else {
+            break;
+        };
+        let SubscriptionItem::Sessions { sessions } = item else {
+            panic!("watch carried a non-sessions frame");
+        };
+        let s1 = sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .expect("s1 in snapshot");
+        assert_eq!(
+            s1.title, None,
+            "the engine derived a title from the transcript — that is the \
+             one thing this field may never be"
+        );
+        // Belt and braces at the byte level: no fragment of the prompt,
+        // however short, may have reached the snapshot by any route.
+        let json = serde_json::to_string(&sessions).unwrap();
+        assert!(!json.contains(CANARY), "{json}");
+        assert!(!json.contains("rename the rail"), "{json}");
+        checked += 1;
+    }
+    assert!(checked > 0, "watch produced no snapshot to check");
+
+    drop(engine);
+}
+
+/// Stage AB: a title the OPERATOR set is a session fact, so it does what
+/// every other session fact does — rides `watch`, survives the meta
+/// rewrites a turn performs, and survives an engine restart.
+///
+/// The turn is the part worth having a test for. `meta.json` is rewritten
+/// wholesale at spawn and again at `init`, from a snapshot taken before
+/// the rename; without `Meta::save_keeping_title` the name vanishes the
+/// first time you talk to the session you just named.
+#[tokio::test]
+async fn an_operator_title_is_a_durable_session_fact() {
+    let dir = scratch();
+    let mut engine1 = EngineProc::spawn(&dir, "linger");
+
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open s1");
+
+    // Normalization is the engine's, and the reply states what landed.
+    let info = c
+        .rename("s1", Some("  the   rail\nslice  "))
+        .await
+        .expect("rename");
+    assert_eq!(info.title.as_deref(), Some("the rail slice"));
+
+    // The cap is the engine's too — a paste does not become a session fact.
+    let long = "x".repeat(500);
+    let info = c.rename("s1", Some(&long)).await.expect("rename long");
+    assert_eq!(
+        info.title.as_deref().map(|t| t.chars().count()),
+        Some(eave_core::store::TITLE_MAX_CHARS)
+    );
+    let info = c
+        .rename("s1", Some("the rail slice"))
+        .await
+        .expect("rename back");
+    assert_eq!(info.title.as_deref(), Some("the rail slice"));
+
+    // A turn rewrites meta twice. The name must still be there after it.
+    // What matters is that a spawn happened, not that the byte landed.
+    c.send("s1", "go").await.expect("send");
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < end, "session never went live");
+        let listed = c.list().await.expect("list");
+        let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+        assert_eq!(
+            s1.title.as_deref(),
+            Some("the rail slice"),
+            "a turn erased the name the operator gave the session"
+        );
+        if s1.live {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    c.kill("s1").await.expect("kill");
+    engine1.sigkill();
+
+    // Durable: a fresh engine reads it back off disk.
+    let engine2 = EngineProc::spawn(&dir, "linger");
+    let c2 = Client::connect(&dir).await.expect("connect 2");
+    let mut watch = c2.watch().await.expect("watch");
+    let item = tokio::time::timeout(Duration::from_secs(10), watch.recv())
+        .await
+        .expect("snapshot in time")
+        .expect("watch open");
+    let SubscriptionItem::Sessions { sessions } = item else {
+        panic!("watch must open with a snapshot");
+    };
+    let s1 = sessions.iter().find(|s| s.session_id == "s1").unwrap();
+    assert_eq!(s1.title.as_deref(), Some("the rail slice"));
+
+    // And clearing is the same method, not a second one.
+    let info = c2.rename("s1", None).await.expect("clear");
+    assert_eq!(info.title, None);
+    // So is a title made only of whitespace: that is not a title.
+    let info = c2.rename("s1", Some("   ")).await.expect("blank");
+    assert_eq!(info.title, None);
+
+    drop(engine2);
+}
+
+/// Stage AB: `last_activity_ms` is stamped by state changes and by nothing
+/// else — which is what keeps it inside the isolation invariant instead of
+/// beside it.
+///
+/// A timestamp that advanced per record would let any watcher read the
+/// *rate* of any session's transcript off the watch channel: not content
+/// sent, but content inferred, which the invariant is equally about. So
+/// the second half of this test is the load-bearing half — the stamp holds
+/// perfectly still across a stretch of heavy streaming, because the state
+/// name held still.
+#[tokio::test]
+async fn activity_is_stamped_by_state_changes_and_nothing_else() {
+    let dir = scratch();
+    let engine = EngineProc::spawn(&dir, "slow-stream");
+
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open s1");
+
+    // Nothing has happened, so nothing is claimed. Not a zero — a zero
+    // would sort every never-started session to 1970.
+    let listed = c.list().await.expect("list");
+    let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+    assert_eq!(s1.last_activity_ms, None);
+    let created = s1.created_ts_ms;
+
+    // new → running is a state change, and it stamps.
+    c.send("s1", "go").await.expect("send");
+    let end = Instant::now() + Duration::from_secs(15);
+    let stamped = loop {
+        assert!(Instant::now() < end, "session never went live");
+        let listed = c.list().await.expect("list");
+        let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+        if let Some(ms) = s1.last_activity_ms {
+            assert!(ms >= created, "{ms} < {created}");
+            break ms;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    // Now the session streams hard with its state name unchanged. The
+    // stamp must not move a millisecond.
+    let before = c.list().await.expect("list");
+    let state_before = before
+        .iter()
+        .find(|s| s.session_id == "s1")
+        .unwrap()
+        .state
+        .clone();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let after = c.list().await.expect("list");
+    let s1 = after.iter().find(|s| s.session_id == "s1").unwrap();
+    if s1.state == state_before {
+        assert_eq!(
+            s1.last_activity_ms,
+            Some(stamped),
+            "the activity stamp moved while the state did not — that makes \
+             the watch channel a report of transcript throughput"
+        );
+    }
+
+    // A terminal transition IS a state change, so it does stamp.
+    c.kill("s1").await.expect("kill");
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < end, "kill never settled");
+        let listed = c.list().await.expect("list");
+        let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+        if !s1.live && s1.last_activity_ms > Some(stamped) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    drop(engine);
+}
+
 /// Selection switch mid-stream (Slice A): drop the s1 subscription while
 /// its turn is still streaming, subscribe s2 cursorless — s2 replays from
 /// seq 1 behind a Reset, contains only s2 content, and s1's turn is
