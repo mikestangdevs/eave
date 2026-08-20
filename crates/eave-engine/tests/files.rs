@@ -1229,3 +1229,98 @@ async fn snapshot_tree_never_touches_the_real_index() {
         "the throwaway index leaked into the captured tree: {listing:?}"
     );
 }
+
+/// **Slice AH — the engine's half of the eternal skeleton.**
+///
+/// The UI's rail draws skeleton rows until a `files` frame arrives, and
+/// before this slice that wait was unbounded: an unanswered subscription
+/// held a 30 fps pulse lease for the life of the process. The right place
+/// to fix that is wherever the answer can be made to exist, so the first
+/// question was whether the engine can legitimately stay silent — a
+/// timeout in the UI invents a fact, an answer from the engine states
+/// one.
+///
+/// This is that question asked directly, across the cross product of the
+/// two scopes and the three cwds a session can have. `non_git_and_broken_
+/// cwds_are_stated_facts` covers the working-tree scope's half; the
+/// turn scope's half was never asked, and it is the interesting one,
+/// because the turn cache starts EMPTY (`files_turn: None`) and is filled
+/// only while somebody is subscribed at that scope. A subscriber that
+/// arrived before the first turn, on a session that has never run, is
+/// exactly the client the rail opens on boot.
+///
+/// Every cell must produce a frame. If one ever does not, the fix belongs
+/// here and not in the shell.
+#[tokio::test]
+async fn every_files_subscription_answers_at_both_scopes_and_every_cwd() {
+    let dir = scratch();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+
+    let a_repo = repo();
+    let not_a_repo = scratch();
+    let cases: [(&str, String); 3] = [
+        ("repo", a_repo.display().to_string()),
+        ("plain", not_a_repo.display().to_string()),
+        // Never created. The engine has to answer about a directory that
+        // is not there, which is where a naive scan would simply hang or
+        // panic instead of speaking.
+        ("gone", "/tmp/eave-wire-tests/ah-vanished-cwd".into()),
+    ];
+
+    for (id, cwd) in &cases {
+        c.open(Some((*id).into()), Some(cwd.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("open {id}: {e}"));
+        for scope in [FileScope::WorkingTree, FileScope::LatestTurn] {
+            let (_sub, mut rx) = c
+                .files_with_id_scoped(id, scope)
+                .await
+                .unwrap_or_else(|e| panic!("files {id} {scope:?}: {e}"));
+            // `wait_for_snapshot` panics past its own deadline, which is
+            // the assertion: no frame is the failure.
+            let snap = wait_for_snapshot(
+                &mut rx,
+                &format!("first frame for {id} at {scope:?}"),
+                |_| true,
+            )
+            .await;
+            // ...and the frame has to SAY something. An empty list under a
+            // basis nobody could measure would render as "no changes",
+            // which is the confusion Slice AA exists to prevent — so a
+            // silent zero counts as no answer for this test's purposes.
+            let stated = match (&snap.state, &snap.basis) {
+                (GitState::NotARepo, _) => true,
+                (GitState::Error { message }, _) => !message.is_empty(),
+                (_, DiffBasis::Unavailable { reason }) => !reason.is_empty(),
+                (GitState::Ok, _) => true,
+            };
+            assert!(
+                stated,
+                "{id} at {scope:?} answered with a snapshot that states \
+                 nothing: {snap:?}"
+            );
+        }
+    }
+
+    // The turn scope on a session that has never run is the boot case, and
+    // its answer is words rather than an empty list.
+    let (_sub, mut rx) = c
+        .files_with_id_scoped("repo", FileScope::LatestTurn)
+        .await
+        .expect("files repo latest-turn");
+    let snap = wait_for_snapshot(&mut rx, "turn basis before any turn", |_| true).await;
+    assert!(
+        matches!(&snap.basis, DiffBasis::Unavailable { reason } if reason.contains("turn")),
+        "a turn scope with no turn behind it must say so, not report an \
+         empty change list: {:?}",
+        snap.basis
+    );
+
+    assert_eq!(
+        c.list().await.expect("list").len(),
+        3,
+        "the engine survived"
+    );
+    drop(engine);
+}
