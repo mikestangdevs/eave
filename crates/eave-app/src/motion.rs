@@ -1676,7 +1676,7 @@ mod tests {
                 theme::danger_wash_strong(),
                 theme::danger_wash_hover(),
             ),
-            ("send, armed", theme::inverse(), theme::inverse_hover()),
+            ("send, armed", theme::accent(), theme::accent_hover()),
             (
                 "send, unarmed",
                 theme::overlay_strong(),

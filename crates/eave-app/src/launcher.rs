@@ -184,6 +184,11 @@ pub fn tile(
         .h(px(theme::TILE_H))
         .rounded(px(theme::RADIUS_TILE))
         .border_1()
+        // Slice AL tried the accent here and put it back. A chosen tile is
+        // a SELECTION — where you are, not where you are acting — and the
+        // accent's rule (see `theme::accent`) does not care that this
+        // particular selection happens to be short-lived. The rim stays
+        // neutral and the tile's own wash carries the state.
         .border_color(if selected {
             theme::border_strong()
         } else {
@@ -202,8 +207,8 @@ pub fn tile(
         .child(icons::icon(p.mark, theme::ICON_MARK_LG, mark_color))
         .child(
             div()
-                .text_size(px(theme::LABEL_SIZE))
-                .line_height(px(theme::LABEL_LINE))
+                .text_size(px(theme::DETAIL_SIZE))
+                .line_height(px(theme::DETAIL_LINE))
                 .text_color(if live {
                     theme::text()
                 } else {

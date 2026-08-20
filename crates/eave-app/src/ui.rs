@@ -5352,8 +5352,8 @@ impl Shell {
                     .bg(theme::raised())
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_2))
-                    .text_size(px(theme::USER_SIZE))
-                    .line_height(px(theme::USER_LINE))
+                    .text_size(px(theme::BODY_SIZE))
+                    .line_height(px(theme::BODY_LINE))
                     .text_color(theme::text())
                     .when(matches!(delivery, Delivery::Pending), |d| d.opacity(0.65))
                     .child(SharedString::from(text.clone()));
@@ -5986,7 +5986,7 @@ impl Shell {
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::CHECKBOX))
                             .font_weight(theme::WEIGHT_STRONG)
-                            .text_color(theme::on_inverse())
+                            .text_color(theme::on_solid())
                             .child("✓"),
                     )
                 })
@@ -6741,8 +6741,8 @@ impl Shell {
                             .child(
                                 div()
                                     .debug_selector(|| "launcher-title".into())
-                                    .text_size(px(theme::LAUNCHER_TITLE_SIZE))
-                                    .line_height(px(theme::LAUNCHER_TITLE_LINE))
+                                    .text_size(px(theme::DISPLAY_SIZE))
+                                    .line_height(px(theme::DISPLAY_LINE))
                                     .font_weight(theme::WEIGHT_STRONG)
                                     .text_color(theme::text())
                                     .child("Start a session"),
@@ -6849,11 +6849,11 @@ impl Shell {
                                     .px(px(theme::SPACE_4))
                                     .py(px(theme::SPACE_1))
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    .bg(theme::inverse())
+                                    .bg(theme::solid())
                                     .text_size(px(theme::LABEL_SIZE))
                                     .line_height(px(theme::LABEL_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(theme::on_inverse())
+                                    .text_color(theme::on_solid())
                                     .cursor_pointer()
                                     .on_click(
                                         cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx)),
@@ -7054,11 +7054,11 @@ impl Shell {
                                             .debug_selector(|| "empty-key".into())
                                             .px(px(theme::SPACE_2))
                                             .rounded(px(theme::RADIUS_BUTTON))
-                                            .bg(theme::inverse())
+                                            .bg(theme::solid())
                                             .text_size(px(theme::LABEL_SIZE))
                                             .line_height(px(theme::LABEL_LINE))
                                             .font_weight(theme::WEIGHT_LABEL)
-                                            .text_color(theme::on_inverse())
+                                            .text_color(theme::on_solid())
                                             .child(RETURN_KEY),
                                     )
                                     .child(
@@ -7499,15 +7499,24 @@ impl Render for Shell {
                                 // the fade interpolates between whatever the two
                                 // ends are this frame, so the armed colour arrives
                                 // at once and only the hover progress is smooth.
+                                //
+                                // Slice AL: the ARMED fill is the accent, not
+                                // `solid`. The accent marks where you are acting,
+                                // not where you are — an armed send button is the
+                                // most literal case of that rule in the app, and
+                                // it arms together with the composer's rim and
+                                // caret, which are the same colour on purpose.
+                                // Unarmed it stays neutral, because a button with
+                                // nothing to send is not an action.
                                 .hover_fade(
                                     "send",
                                     if has_draft {
-                                        theme::inverse()
+                                        theme::accent()
                                     } else {
                                         theme::overlay_strong()
                                     },
                                     if has_draft {
-                                        theme::inverse_hover()
+                                        theme::accent_hover()
                                     } else {
                                         theme::overlay_strongest()
                                     },
@@ -7520,7 +7529,7 @@ impl Render for Shell {
                                     icons::ARROW_UP,
                                     theme::ICON_SM,
                                     if has_draft {
-                                        theme::on_inverse()
+                                        theme::on_solid()
                                     } else {
                                         theme::text_secondary()
                                     },
