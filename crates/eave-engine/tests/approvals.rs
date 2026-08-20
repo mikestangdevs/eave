@@ -235,9 +235,9 @@ async fn an_approval_asks_waits_and_then_acts_on_the_answer() {
     // auto-approves" checkable rather than merely asserted.
     let decided = t.rows.iter().any(|r| matches!(r, Row::Approval { status: ApprovalStatus::Approved, .. }));
     assert!(decided);
-    let journal = std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap();
+    let journal = journal_awaiting(&dir, "\"kind\":\"approval_decided\"").await;
     assert!(
-        journal.contains("\"kind\":\"approval_decided\"") && journal.contains("\"allowed\":true"),
+        journal.contains("\"allowed\":true"),
         "the decision must be durable history"
     );
 }
@@ -280,8 +280,45 @@ async fn a_denial_hands_the_operators_words_to_the_agent() {
         }
         other => panic!("expected a denial, got {other:?}"),
     }
-    let journal = std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap();
+    let journal = journal_awaiting(&dir, "commit first, then ask again").await;
     assert!(journal.contains("commit first, then ask again"));
+}
+
+/// Read a session's journal, waiting for `needle` to reach the FILE.
+///
+/// The journal is write-behind: records live in memory and hit the OS on a
+/// ~120 ms coalesce tick (`journal.rs`). The wire tap runs ahead of that, so
+/// a test that saw a fact on the wire and then read the file can read it
+/// before the fact is there — which on a loaded machine is ordinary, not
+/// exotic. This is the same rule §Traps already states for crash-tail
+/// repair; it applies to every file read, not only those after a kill.
+async fn journal_awaiting(dir: &std::path::Path, needle: &str) -> String {
+    let path = dir.join("sessions/s1/journal.jsonl");
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for {needle:?} to reach {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Read a session's journal once the write-behind window has provably
+/// passed, for assertions about what is NOT there.
+///
+/// An absence asserted immediately is the worse bug of the two: it passes
+/// whether or not the record was going to arrive, so the test cannot fail
+/// for the reason it exists. Waiting past the coalesce tick is what gives
+/// the negative any force.
+async fn journal_settled(dir: &std::path::Path) -> String {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap_or_default()
 }
 
 /// THE Slice K clock test (directive: "the riskiest hour"). A session held
@@ -368,7 +405,7 @@ async fn a_question_left_open_settles_when_the_process_goes() {
         Ok(answered) => assert!(!answered, "a dead session cannot have been answered"),
         Err(_) => {} // "session is not live" — equally stated
     }
-    let journal = std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap();
+    let journal = journal_settled(&dir).await;
     assert!(
         !journal.contains("approval_decided"),
         "no decision ever reached the agent, so none may be recorded"

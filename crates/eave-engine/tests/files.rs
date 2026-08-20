@@ -490,12 +490,25 @@ async fn fs_events_refresh_without_turn_boundaries() {
 
     // No send, no turn — the write alone must surface.
     std::fs::write(repo.join("base.txt"), "one\nLIVE\ntwo\n").unwrap();
-    let snap = wait_for_snapshot(&mut rx, "event-driven snapshot", |s| !s.files.is_empty()).await;
+    // The predicate carries `watching` for a reason, and dropping it makes
+    // this test flaky under load rather than wrong: `engine.rs` states that
+    // the frames between subscribing and the watcher's startup scan may
+    // legitimately say `watching = false`, and that "that scan's own frame
+    // corrects it". If the write lands before the startup scan — which a
+    // loaded machine makes ordinary — then the startup scan's own frame is
+    // already non-empty, a bare `!files.is_empty()` selects THAT frame, and
+    // the assertion below fails against a flag the engine never promised on
+    // it.
+    //
+    // So the predicate must select the frame that PROVES the claim, not
+    // merely one consistent with it. Timing out here still means the real
+    // failure — no watcher-driven refresh ever arrived.
+    let snap = wait_for_snapshot(&mut rx, "watcher-driven snapshot", |s| {
+        !s.files.is_empty() && s.watching
+    })
+    .await;
     assert_eq!(snap.files[0].path, "base.txt");
     assert_eq!(snap.files[0].status, FileStatus::Modified);
-    // The mode is a stated fact on the wire: a watcher covered this
-    // refresh, and the snapshot says so.
-    assert!(snap.watching, "watcher snapshots must state watching=true");
 
     drop(engine);
 }
