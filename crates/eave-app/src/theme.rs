@@ -552,10 +552,10 @@ pub fn solid() -> Hsla {
 /// **A bright fill takes a DARK label, and that is the whole trick this
 /// slice turns on.** comet's `on_accent` is near-white because its accent is
 /// indigo-500, a dark fill. eave's pigments all sit at l .65–.83, so the
-/// legible ink on them is this one, and it clears by a lot: 5.76:1 on
-/// [`danger`], 5.66:1 on [`live`], 6.95:1 on [`accent`], 8.63:1 on
-/// [`success`], 9.14:1 on [`warning`]. One token rather than an `on_accent`
-/// with the same hex — two names for one colour is the criterion that
+/// legible ink on them is this one, and it clears by a lot: 6.68:1 on
+/// [`danger`], 6.17:1 on [`live`], 6.77:1 on [`accent`], 9.96:1 on
+/// [`success`], 11.21:1 on [`warning`]. One token rather than an `on_accent`
+/// with the same value — two names for one colour is the criterion that
 /// retired `text_ghost`.
 pub fn on_solid() -> Hsla {
     grey(0x0e)
@@ -592,16 +592,16 @@ pub fn solid_hover() -> Hsla {
 ///
 /// **Above its floor**, which is the constraint that fixed the *step*: as
 /// the selection bar it lands on the rail's bare ground (see the leading
-/// strip in `ui.rs`), where it measures 4.39:1 against a 3:1 floor. Over the
-/// row's wash it would have been 3.04:1 — fit, not clearance — and that is
-/// why the bar has a strip of its own.
+/// strip in `ui.rs`), where it measures **3.93:1** against a 3:1 floor. Over
+/// the row's own wash it would have been **2.70:1** — under the floor
+/// outright — and that is why the bar has a strip of its own.
 ///
 /// Text on an accent fill is [`on_solid`], not a token of its own. comet's
 /// `on_accent` is near-white because comet's accent fill is indigo-500, a
 /// DARK plate; eave's accent is a light one, so its label goes the other
-/// way. White on violet-400 is 2.45:1; `on_solid` on it is 6.95:1. The
-/// PATTERN is the port — a saturated fill is usable without desaturating it
-/// as long as its ink is named — not the token's value.
+/// way. White on violet-400 is **2.85:1**; `on_solid` on it is **6.77:1**.
+/// The PATTERN is the port — a saturated fill is usable without desaturating
+/// it as long as its ink is named — not the token's value.
 pub fn accent() -> Hsla {
     oklch(0.702, 0.183, 293.541)
 }
@@ -649,9 +649,9 @@ pub fn warning() -> Hsla {
 }
 /// **red-400.** Was `#e2726a`.
 ///
-/// This is the token the whole slice turns on, so the number is worth
-/// stating: as a *mark* on the rail's bare strip it goes 3.64:1 → **3.88:1**
-/// here, and as a chip fill under [`on_solid`] 5.76:1 → **6.14:1**. It got
+/// This is the token the whole slice turns on, so the numbers are worth
+/// stating: as a *mark* on the rail's bare strip it goes 3.65:1 → **3.88:1**
+/// here, and as a chip fill under [`on_solid`] 6.30:1 → **6.68:1**. It got
 /// louder AND more legible, in the same move that was previously thought to
 /// require desaturating it to `#f3c3bf`.
 pub fn danger() -> Hsla {
@@ -666,8 +666,9 @@ pub fn danger() -> Hsla {
 // "the saturated pigments reach the screen as roughly one 6 px dot": the
 // four pigments were on screen in three roles, and two of them were
 // invisible by construction. The call sites now draw `warning()` and
-// `danger()` at full strength, which is 4.47:1 on the same plate, and
-// `every_pigment_clears_the_surface_it_lands_on` holds them there.
+// `danger()` at full strength — 7.04:1 and 4.76:1 on the plates they
+// outline — and `every_pigment_clears_the_surface_it_lands_on` holds them
+// there.
 /// The kill button's resting fill (`attn-kill`).
 pub fn danger_wash_strong() -> Hsla {
     danger().opacity(0.14)
@@ -1092,16 +1093,16 @@ pub const RAIL_CARD_BLEED: f32 = SPACE_3;
 ///
 /// **It exists because a pigment cannot live on the selection wash.** Before
 /// this slice the state dot sat inside the card, so on the row you were
-/// looking at it composited over `overlay_strong` — 82.5/255 at the bright
-/// end of the backdrop sweep — where `danger()` measures **2.52:1** and
-/// `live()` **2.47:1**, both under the 3:1 a mark owes its surface. The two
+/// looking at it composited over the selection wash — 82.9/255 at the bright
+/// end of the backdrop sweep — where `danger()` measures **2.51:1** and
+/// `live()` **2.46:1**, both under the 3:1 a mark owes its surface. The two
 /// available answers were to lighten the pigments into the pale register the
 /// operator had already rejected, or to move the mark off the wash. This is
 /// the second one, and it is the [`STATE_DELTA_FLOOR`] lesson applied to
 /// pigment: *above what, and does anything paint it?*
 ///
-/// On the bare ground the same marks read 3.64:1 and 3.58:1 with no pigment
-/// touched.
+/// On the bare ground the same marks read **3.88:1** and **3.58:1**, and
+/// neither pigment was touched to get there.
 ///
 /// The width is [`STATE_DOT`] + `SPACE_2` — **exactly what the dot and its
 /// gap cost inside the card** — so promoting the dot out of the card moves
@@ -1360,14 +1361,16 @@ pub const STATE_DELTA_FLOOR: f32 = 8.0;
 /// against the adjacent surface.
 ///
 /// That distinction is the entire unlock for the stuck question this slice
-/// inherited. `danger()` measures 3.65:1 on the bare ground and 2.52:1 on a
+/// inherited. `danger()` measured 3.65:1 on the bare ground and 2.52:1 on a
 /// selected rail row, and the previous slice's answer was to desaturate it
 /// to `#f3c3bf`, a pale pink. The arithmetic behind that answer is real and
-/// unavoidable *for text*: solving red for 4.5:1 on a surface of 82.5/255
-/// requires a relative luminance of **0.56**, and no colour with a red hue
-/// reaches 0.56 without being a pink — WCAG's luminance is 72% green, so a
-/// red pays for its hue twice. Every red that clears 4.5:1 there is a pink;
-/// this is not taste and no amount of hue-hunting escapes it.
+/// unavoidable *for text*: solving red for 4.5:1 on the selected row's
+/// surface requires a relative luminance of **0.563**, and no colour with a
+/// red hue reaches 0.563 without being a pink — WCAG's luminance is 72 %
+/// green, so a red pays for its hue twice. `#f3c3bf`, the pale pink the
+/// previous slice proposed, sits at 0.618; Tailwind red-400 sits at 0.314.
+/// Every red that clears 4.5:1 there is a pink; this is not taste and no
+/// amount of hue-hunting escapes it.
 ///
 /// At 3:1 the requirement drops to **0.36**, and at 3:1 *against the bare
 /// ground* (the surface the rail's leading strip actually paints) it drops
@@ -2371,7 +2374,7 @@ mod tests {
             // --- the rail's leading strip, on the BARE frost. This strip
             //     exists because of these five rows: inside the card, on a
             //     selected row's `overlay_strong`, `live` reads 2.47:1 and
-            //     `danger` 2.52:1.
+            //     `danger` 2.75:1.
             ("rail state mark, running", live(), bare()),
             ("rail state mark, quiet or awaiting you", warning(), bare()),
             ("rail state mark, unresponsive or failed", danger(), bare()),
@@ -2536,7 +2539,7 @@ mod tests {
                 // Slice AL: the loud half of the posture line ("NEVER
                 // ASKS") and of the worktree line ("worktree missing").
                 // Both were drawn in `danger()`/`warning()` inside the
-                // card, at 2.52:1 and 4.00:1.
+                // card, at 2.75:1 and 4.28:1 against a 4.5 floor.
                 "rail posture and worktree lines, loud",
                 text(),
                 TEXT_CONTRAST_FLOOR,

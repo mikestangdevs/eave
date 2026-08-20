@@ -4555,13 +4555,14 @@ fn a_rail_row_says_its_name_louder_than_its_facts(cx: &mut TestAppContext) {
 /// Slice AL. Selection reads as an accent bar on the row's leading edge,
 /// and the bar is OUTSIDE the washed card on purpose.
 ///
-/// That is not decoration. Inside the card, on a selected row's
-/// `overlay_strong` over the brightest ground in the sweep, `danger()`
-/// measures 2.52:1 and `live()` 2.47:1 against the 3:1 a non-text mark owes
-/// its surface — so the row's state dot was under the floor exactly where an
-/// operator looks. The strip puts both marks on the bare frost (3.64:1 and
-/// 3.58:1) with no pigment desaturated, and the selection bar is what the
-/// strip is otherwise for.
+/// That is not decoration. Inside the card, over the selected row's wash at
+/// the brightest ground in the sweep, `danger()` measures **2.75:1** and
+/// `live()` **2.54:1** against the 3:1 a non-text mark owes its surface — so
+/// the row's state dot was under the floor exactly where an operator looks,
+/// and it stays under it with the ported pigments, because the surface was
+/// what was wrong. The strip puts both marks on the bare frost (3.88:1 and
+/// 3.58:1) with nothing desaturated, and the selection bar is what the strip
+/// is otherwise for.
 ///
 /// `debug_bounds` is the instrument, not a screenshot: the harness cannot
 /// paint, and this asserts geometry and presence, which layout decides.

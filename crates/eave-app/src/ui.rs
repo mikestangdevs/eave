@@ -1355,14 +1355,14 @@ fn state_color(state: &str) -> Hsla {
 
 /// A word carried BY a pigment rather than drawn IN it (Slice AL).
 ///
-/// The stuck question this answers: `danger()` measures **2.52:1** as text
-/// on a selected rail row and **4.47:1** on an attention plate, both under
-/// the 4.5 a glyph owes its surface — and solving a red for 4.5:1 at those
-/// surfaces produces a pale pink, because WCAG's luminance is 72 % green so
-/// a red pays for its hue twice. A *fill* owes 3:1, and the label on a
-/// bright fill is `theme::on_solid()`, which clears **5.76:1** on `danger`,
-/// 5.66 on `live`, 8.63 on `success` and 9.14 on `warning`. So the pigment
-/// stops being the ink and becomes the plate, at full saturation.
+/// The stuck question this answers: `danger()` measures **2.51:1** as text
+/// on a selected rail row — under the 4.5 a glyph owes its surface — and
+/// solving a red for 4.5:1 there produces a pale pink, because WCAG's
+/// luminance is 72 % green so a red pays for its hue twice. A *fill* owes
+/// 3:1, and the label on a bright fill is `theme::on_solid()`, which clears
+/// **6.68:1** on `danger`, 6.17 on `live`, 9.96 on `success` and 11.21 on
+/// `warning`. So the pigment stops being the ink and becomes the plate, at
+/// full saturation.
 ///
 /// A chip's own FILL is deliberately not held to the 3:1 mark floor: the
 /// fact is in the label, and a label at 5.8:1 identifies the chip without
@@ -3437,13 +3437,13 @@ impl Shell {
                     .items_stretch()
                     // Slice AL — the leading strip. The row used to be one
                     // box: the wash, the state dot and the text all inside
-                    // it. That put the dot on `overlay_strong` whenever its
-                    // row was selected, where `danger()` reads **2.52:1**
-                    // and `live()` **2.47:1** against the 3:1 a mark owes
-                    // its surface. Splitting the row moves both marks onto
-                    // the bare frost (3.64:1 and 3.58:1) with no pigment
-                    // touched, and gives the selection bar the one place in
-                    // the rail where a saturated colour can live.
+                    // it. That put the dot on the selection wash whenever
+                    // its row was selected, where `danger()` reads
+                    // **2.75:1** and `live()` **2.54:1** against the 3:1 a
+                    // mark owes its surface. Splitting the row moves both
+                    // onto the bare frost (3.88:1 and 3.58:1) with no
+                    // pigment touched, and gives the selection bar the one
+                    // place in the rail where a saturated colour can live.
                     //
                     // `RAIL_STRIP_W` is exactly what the dot and its gap
                     // used to cost inside the card, so nothing to the right
@@ -3637,9 +3637,9 @@ impl Shell {
                             // Slice AL: the badge is a CHIP now, not a word
                             // in the state's colour. "failed" drawn in
                             // `danger()` on the row you are looking at was
-                            // **2.52:1** — the app's loudest fact, illegible
+                            // **2.51:1** — the app's loudest fact, illegible
                             // exactly where it mattered. As a fill carrying
-                            // `on_solid()` it is 5.76:1 and the red stayed
+                            // `on_solid()` it is 6.68:1 and the red stayed
                             // red.
                             .children(badge.map(|word| {
                                 pigment_chip(dot, word)
@@ -3683,10 +3683,11 @@ impl Shell {
                             .line_height(px(theme::MICRO_LINE))
                             // Slice AL: "NEVER ASKS" used to be drawn in
                             // `danger()`, inside the card, where a selected
-                            // row's wash puts it at 2.52:1 — the app's
-                            // loudest fact at its least legible. Weight and
-                            // case carry it now; the row's state mark in the
-                            // strip is where this row's pigment lives.
+                            // row's wash puts it at 2.75:1 against a 4.5
+                            // floor — the app's loudest fact at its least
+                            // legible. Weight and case carry it now; the
+                            // row's state mark out in the strip is where
+                            // this row's pigment lives.
                             .font_weight(if posture_asks {
                                 theme::WEIGHT_LABEL
                             } else {
@@ -3885,7 +3886,7 @@ impl Shell {
                     // Slice AL: the note used to be drawn IN the pigment —
                     // `warning()` for the armed confirmation, `danger()` for
                     // the engine's refusal — inside the card, where a
-                    // selected row's wash takes `danger()` to 2.52:1. The
+                    // selected row's wash takes `danger()` to 2.75:1. The
                     // pigment moved to the note's leading rule, which is a
                     // non-text mark and clears 3:1, and the sentence itself
                     // takes the ink the rest of the card uses.
@@ -4527,10 +4528,12 @@ impl Shell {
                     ),
             )
             // Slice AL: `+12` and `−3` were `success()` and `danger()` as
-            // INK, on a row a hover wash can reach — 4.42:1 and **2.95:1**
-            // against a 4.5 floor. They are the files rail's whole signal,
-            // so they became chips rather than going grey: the pigment is
-            // the plate and `on_solid()` is the digit.
+            // INK, on a row a hover wash can reach — 4.41:1 and **2.95:1**
+            // against a 4.5 floor, and 4.67:1 / 3.13:1 with the ported
+            // pigments, so the red still does not make it. They are the
+            // files rail's whole signal, so they became chips rather than
+            // going grey: the pigment is the plate and `on_solid()` is the
+            // digit.
             .child(match counts {
                 Some((adds, dels)) => div()
                     .flex_none()
@@ -4749,9 +4752,9 @@ impl Shell {
                     .rounded(px(theme::RADIUS_PANEL))
                     .border_1()
                     // Slice AL: the ring was `danger().opacity(0.22)`,
-                    // which composites to **1.4:1** against the plate it
+                    // which composites to **1.38:1** against the plate it
                     // outlines — a red rim nobody could see. At full
-                    // strength it is 4.47:1, and it is now most of the
+                    // strength it is 4.76:1, and it is now most of the
                     // pigment this panel spends.
                     .border_color(theme::danger())
                     .bg(theme::danger_plate_glass())
@@ -4764,8 +4767,11 @@ impl Shell {
                     .child(
                         // A panel heading takes the NAME rank, and its ink
                         // is neutral: `danger()` as a glyph on this plate is
-                        // 4.47:1, under the floor by 0.03. The pigment is in
-                        // the rim and the dot, where 3:1 applies.
+                        // 4.76:1 — over the floor, but by 0.26 where the
+                        // measured token→pixel skew costs 0.35, so it is an
+                        // arithmetic claim rather than one about what a
+                        // person sees. The pigment is in the rim and the
+                        // dot, where 3:1 applies and it clears by 1.76.
                         div()
                             .flex()
                             .flex_row()
@@ -5018,12 +5024,13 @@ impl Shell {
                 .text_color(theme::text_secondary())
         };
         // Slice AL: the heading was drawn IN the state pigment, which
-        // measures 4.47:1 on `danger_plate_glass` and 4.00:1 on a wash —
-        // both under the floor a glyph owes. The dot beside it is a mark and
-        // owes 3:1, which the same pigment clears at 4.47:1, so the pigment
-        // stayed exactly where it could be seen and the words took the NAME
-        // rank in primary ink. A panel heading that was the same size as its
-        // own body text was the other half of the problem.
+        // clears its floor by 0.26 on `danger_plate_glass` and not at all on
+        // a state wash — under, or inside, the 0.35 the measured
+        // token→pixel skew costs. The dot beside it is a mark and owes 3:1,
+        // which the same pigment clears by 1.76, so the pigment stayed
+        // exactly where it could be seen and the words took the NAME rank in
+        // primary ink. A panel heading that was the same size as its own
+        // body text was the other half of the problem.
         let label = |dot: Hsla, text: String, strong: bool| {
             div()
                 .flex()
@@ -5174,9 +5181,9 @@ impl Shell {
                     .line_height(px(theme::DETAIL_LINE))
                     .font_weight(theme::WEIGHT_LABEL)
                     // Slice AL: the word was `danger()` over a danger wash
-                    // over the plate — 3.9:1, and the rim beside it was
-                    // 1.4:1. The rim is full pigment now and carries the
-                    // button; the word is primary ink on top of it.
+                    // over the plate — **3.33:1** — and the rim beside it
+                    // was 1.38:1. The rim is full pigment now and carries
+                    // the button; the word is primary ink on top of it.
                     .text_color(theme::text())
                     .id("attn-kill")
                     .debug_selector(|| "attn-kill".into())
@@ -5259,10 +5266,10 @@ impl Shell {
                 match delivery {
                     // The acceptance-critical distinction: journaled but
                     // never reached the agent (spec 02 §Delivery state).
-                    // Slice AL: `danger()` as ink on the content well is
-                    // 4.52:1 — fit, not clearance, and under the 0.35 the
+                    // Slice AL: `danger()` as ink on the content well was
+                    // 4.54:1 — fit, not clearance, and inside the 0.35 the
                     // token→pixel skew costs. The pigment moved to a leading
-                    // rule, where 3:1 applies and it reads 4.52:1 with 1.5
+                    // rule, where 3:1 applies and it reads 4.82:1 with 1.8
                     // to spare.
                     Delivery::Undelivered => wrap
                         .child(
@@ -5392,7 +5399,7 @@ impl Shell {
                             .child(SharedString::from(d))
                     }))
                     // Slice AL: a failed tool's word is a chip. It was
-                    // `danger()` ink on the content well at 4.52:1 — fit
+                    // `danger()` ink on the content well at 4.54:1 — fit
                     // rather than clearance — and "failed" is the one word
                     // in the transcript an operator scans for.
                     .child(if *is_error {
@@ -5616,9 +5623,8 @@ impl Shell {
                     .gap_2()
                     .child(
                         // Slice AL: an approval card's heading is a NAME,
-                        // and its ink is neutral — `warning()` on this card
-                        // is 4.0:1 once a wash reaches it. The card's ring
-                        // carries the pigment.
+                        // and its ink is neutral. The card's ring carries
+                        // the pigment, at 7.04:1 on the plate it outlines.
                         div()
                             .text_size(px(theme::NAME_SIZE))
                             .line_height(px(theme::NAME_LINE))
@@ -5748,11 +5754,11 @@ impl Shell {
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
             .border_1()
-            // Slice AL: the rim is the pigment (a mark, 3:1 — `live()` and
-            // `danger()` read 4.44:1 on the well) and the word is primary
-            // ink. Drawn IN the pigment, "deny" was 4.52:1 and "approve"
-            // 4.44:1: the two most consequential clicks in the app, both
-            // under the floor.
+            // Slice AL: the rim is the pigment (a mark, 3:1 — `live()`
+            // reads 4.45:1 on the well and `danger()` 4.82:1) and the word
+            // is primary ink. Drawn IN the pigment, "approve" was 4.45:1 and
+            // "deny" 4.54:1: the two most consequential clicks in the app,
+            // both inside the clearance the instrument's own error costs.
             .border_color(color)
             .text_size(px(theme::DETAIL_SIZE))
             .line_height(px(theme::DETAIL_LINE))
@@ -6934,8 +6940,10 @@ impl Render for Shell {
                                 // Slice AL: the caret is the accent. It is
                                 // a mark rather than a word, it is the one
                                 // element on screen that is always eave's
-                                // and never the agent's, and it reads 6.76:1
-                                // on the composer's glass.
+                                // and never the agent's, and it reads 6.05:1
+                                // on the composer's glass. (comet keeps a
+                                // dedicated `caret` token for the same
+                                // reason; eave spends its accent.)
                                 .child(div().text_color(theme::accent()).child("▏"))
                                 .child(
                                     div()
