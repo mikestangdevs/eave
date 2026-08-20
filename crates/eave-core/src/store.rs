@@ -166,6 +166,23 @@ pub struct Meta {
     /// reads back as unnamed. `format_version` did not move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The operator filed this session away (Stage AC). One bit, and it
+    /// means exactly one thing: **the default rail listing does not draw
+    /// it.** Nothing else changes — the session still loads, still
+    /// replays, still answers `subscribe`, and can still be sent to.
+    ///
+    /// It lives here, beside [`title`](Meta::title), for the identical
+    /// reason: it is a mutable operator opinion, and the journal is the
+    /// session's immutable history. **Archiving must never touch the
+    /// journal** — an archive that rewrote history would be a delete
+    /// wearing a softer word, and the whole value of the bit is that it
+    /// is reversible by flipping it back.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if`, so a pre-Stage-AC
+    /// meta reads back unarchived and an unarchived session writes no
+    /// key at all. `format_version` did not move.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// The longest operator title eave will hold, in **characters** — a cap in
@@ -215,20 +232,26 @@ impl Meta {
         fs::rename(&tmp, Store::meta_path(session_dir))
     }
 
-    /// Save, keeping whatever [`title`](Meta::title) is on disk (Stage AB).
+    /// Save, keeping whatever the OPERATOR set is on disk — the
+    /// [`title`](Meta::title) (Stage AB) and the
+    /// [`archived`](Meta::archived) bit (Stage AC).
     ///
-    /// `meta.json` has two writers with different concerns: the state
-    /// machine (state, child, resume cursor) rewrites it on every
-    /// transition, and a rename writes exactly one field. Because every
-    /// save rewrites the whole file, either writer erases the other's work
-    /// unless one rule holds — **`rename` is the only writer of `title`,
-    /// and every other writer preserves it.** This is that rule.
+    /// `meta.json` has two classes of writer with different concerns: the
+    /// state machine (state, child, resume cursor) rewrites it on every
+    /// transition from a snapshot taken at spawn, and the operator methods
+    /// each write exactly one field. Because every save rewrites the whole
+    /// file, either class erases the other's work unless one rule holds —
+    /// **each operator field has exactly one writer, and every other
+    /// writer preserves it.** This is that rule.
     ///
     /// Without it the bug is quiet and specific: name a session, send it a
-    /// message, and the spawn's meta write drops the name you just gave it.
-    pub fn save_keeping_title(&mut self, session_dir: &Path) -> io::Result<()> {
+    /// message, and the spawn's meta write drops the name you just gave
+    /// it. Stage AC widened the rule rather than adding a second one,
+    /// because the second one is the one somebody forgets to call.
+    pub fn save_keeping_operator_fields(&mut self, session_dir: &Path) -> io::Result<()> {
         if let Ok(on_disk) = Self::load(session_dir) {
             self.title = on_disk.title;
+            self.archived = on_disk.archived;
         }
         self.save(session_dir)
     }
@@ -286,13 +309,122 @@ mod tests {
 
     /// Stage AB: a meta written before titles existed reads back unnamed,
     /// and an unnamed session writes no `title` key at all.
+    ///
+    /// Stage AC extends the same claim to `archived`: an engine predating
+    /// the bit wrote no key, and reading one back as `true` by accident
+    /// would hide a session the operator never filed away.
     #[test]
     fn meta_without_a_title_still_loads_and_stays_silent() {
         let line = r#"{"format_version":1,"provider":"claude-code","cwd":"/tmp",
             "session_id":"s1","state":"new","child":null}"#;
         let meta: Meta = serde_json::from_str(line).unwrap();
         assert_eq!(meta.title, None);
+        assert!(
+            !meta.archived,
+            "a meta predating the archive bit must read back VISIBLE — the \
+             other default silently hides every session an old engine wrote"
+        );
         let back = serde_json::to_string(&meta).unwrap();
         assert!(!back.contains("title"), "{back}");
+        assert!(!back.contains("archived"), "{back}");
+    }
+
+    /// A private scratch directory. `eave-core` carries no `tempfile`
+    /// dependency, and a unit test is not the place to add one — pid plus
+    /// a counter is unique within a run and across concurrent runs.
+    fn scratch() -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("eave-store-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn meta_for(dir: &Path) -> Meta {
+        let m = Meta {
+            format_version: META_FORMAT_VERSION,
+            provider: "claude-code".into(),
+            cwd: "/tmp".into(),
+            session_id: "s1".into(),
+            state: "new".into(),
+            child: None,
+            title: None,
+            archived: false,
+        };
+        m.save(dir).expect("save");
+        m
+    }
+
+    /// Stage AC's half of the single-writer rule, in the shape the bug
+    /// actually takes: the state machine rebuilds a whole `Meta` from a
+    /// spawn-time snapshot, so both operator fields are `None`/`false` in
+    /// the struct it is about to write.
+    ///
+    /// Both fields must survive that write. A version of this that kept
+    /// only the title would archive-then-send and quietly un-archive.
+    #[test]
+    fn a_state_write_keeps_both_of_the_operators_fields() {
+        let dir = scratch();
+        let dir = dir.as_path();
+        let mut meta = meta_for(dir);
+
+        // The operator's two writes, each touching exactly one field.
+        meta.title = normalize_title("chase the flake");
+        meta.save(dir).expect("rename");
+        let mut meta = Meta::load(dir).expect("load");
+        meta.archived = true;
+        meta.save(dir).expect("archive");
+
+        // Now the state machine, from its own snapshot — which knows
+        // nothing about either.
+        let mut spawn_snapshot = Meta {
+            format_version: META_FORMAT_VERSION,
+            provider: "claude-code".into(),
+            cwd: "/tmp".into(),
+            session_id: "s1".into(),
+            state: "running".into(),
+            child: None,
+            title: None,
+            archived: false,
+        };
+        spawn_snapshot
+            .save_keeping_operator_fields(dir)
+            .expect("state write");
+
+        let after = Meta::load(dir).expect("reload");
+        assert_eq!(after.state, "running", "the state write did not land");
+        assert_eq!(
+            after.title.as_deref(),
+            Some("chase the flake"),
+            "a turn erased the name the operator gave the session"
+        );
+        assert!(
+            after.archived,
+            "a turn un-archived the session — the archive bit has one \
+             writer and the state machine is not it"
+        );
+    }
+
+    /// The bit is durable across a reload, and reversible: flipping it
+    /// back is the same field, not a second one that can disagree.
+    #[test]
+    fn archiving_is_one_bit_and_it_flips_both_ways() {
+        let dir = scratch();
+        let dir = dir.as_path();
+        let mut meta = meta_for(dir);
+        assert!(!meta.archived, "a fresh session is not archived");
+
+        meta.archived = true;
+        meta.save(dir).expect("archive");
+        assert!(Meta::load(dir).expect("load").archived);
+
+        meta.archived = false;
+        meta.save(dir).expect("unarchive");
+        assert!(!Meta::load(dir).expect("load").archived);
+        let raw = std::fs::read_to_string(Store::meta_path(dir)).expect("read");
+        assert!(
+            !raw.contains("archived"),
+            "an unarchived session left the key behind: {raw}"
+        );
     }
 }

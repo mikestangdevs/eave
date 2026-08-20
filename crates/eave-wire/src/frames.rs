@@ -204,6 +204,32 @@ pub enum Request {
         /// that normalizes to empty — a title of spaces is not a title.
         title: Option<String>,
     },
+    /// File a session away, or bring it back (Stage AC).
+    ///
+    /// **One bit, and the journal is never touched.** Archiving means
+    /// exactly one thing — the default rail listing does not draw this
+    /// session — and it is stored beside the title in `meta.json`, so it
+    /// survives a restart and can be flipped back. Nothing else changes:
+    /// an archived session still loads, still replays, still answers
+    /// `subscribe`, and can still be sent to. eave deletes nothing here;
+    /// destruction is `remove_worktree`'s business and its own two-step.
+    ///
+    /// Setting and clearing are the same verb for the same reason
+    /// [`Request::Rename`] takes an `Option`: two methods for one bit is
+    /// two things that can disagree about which is authoritative.
+    ///
+    /// Allowed in every state, including while live. There is nothing to
+    /// serialize against, and the engine deliberately does not refuse a
+    /// running session — the operator may legitimately file away a
+    /// session they have stopped watching. What must never happen is a
+    /// session parked on a permission question disappearing where nobody
+    /// can answer it, and that is a LISTING rule, kept by the client that
+    /// draws the list, not by refusing the bit.
+    Archive {
+        session_id: String,
+        /// `true` files it away; `false` brings it back.
+        archived: bool,
+    },
     /// Answer one open permission question (Slice K). The agent is parked
     /// until this arrives and there is no other way out — eave never
     /// auto-approves, never auto-denies, and never times out into either.
@@ -341,6 +367,23 @@ pub struct SessionInfo {
     /// chose may cross, the words the agent was given may not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The operator filed this session away (Stage AC). A fact ABOUT the
+    /// session — an opinion the operator typed, in the same class as
+    /// `title` — so the isolation invariant (§Watch) lets it cross: it
+    /// says nothing about what any agent was asked to do.
+    ///
+    /// **The engine reports archived sessions like any other.** Filtering
+    /// is the client's job, and that is deliberate: a listing that simply
+    /// omitted them would leave the bit unreachable from the surface that
+    /// set it, so un-archiving would need a second listing mode to exist
+    /// at all. It also keeps the failure mode benign — a client that has
+    /// never heard of this field renders exactly the list it always did.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if`, so an engine predating
+    /// the field puts no key on the wire and a client predating it ignores
+    /// one that is there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
     pub provider: String,
     /// The model this session is configured to run (Slice P2), verbatim as
     /// it will be passed to the CLI. `None` = the provider's own default,
@@ -729,6 +772,15 @@ pub struct RenameOk {
     pub info: SessionInfo,
 }
 
+/// Reply to [`Request::Archive`] (Stage AC). Carries the whole
+/// [`SessionInfo`] for the same reason [`RenameOk`] does: the caller reads
+/// the bit back off the session as the engine now holds it, rather than
+/// assuming the value it sent is the one that landed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveOk {
+    pub info: SessionInfo,
+}
+
 /// Reply to [`Request::RemoveWorktree`] (Slice I2). `removed: false` is
 /// a refusal with its facts: the counts the operator must confirm
 /// against (`force: true` re-sends meaning it). The counts are measured
@@ -838,6 +890,7 @@ mod tests {
                 sessions: vec![SessionInfo {
                     session_id: "s1".into(),
                     title: Some("ship the rail".into()),
+                    archived: false,
                     provider: "claude-code".into(),
                     model: None,
                     cwd: "/tmp".into(),
@@ -865,6 +918,45 @@ mod tests {
         assert!(line.contains("\"sessions\""), "{line}");
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back, resp);
+    }
+
+    /// Stage AC: one method, one bit, both directions — and a frame that
+    /// an engine predating the field parses unchanged.
+    #[test]
+    fn archive_round_trips_in_both_directions() {
+        for archived in [true, false] {
+            let req = RequestEnvelope {
+                id: 12,
+                request: Request::Archive {
+                    session_id: "s1".into(),
+                    archived,
+                },
+            };
+            let line = serde_json::to_string(&req).unwrap();
+            assert!(line.contains("\"method\":\"archive\""), "{line}");
+            assert!(
+                line.contains(&format!("\"archived\":{archived}")),
+                "the bit has to be ON the frame in both directions: {line}"
+            );
+            let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, req);
+        }
+    }
+
+    /// A `SessionInfo` from an engine that has never heard of the archive
+    /// bit must read back VISIBLE. The other default hides every session
+    /// an older engine reports, which is the worst possible failure for a
+    /// field whose whole meaning is "do not draw this".
+    #[test]
+    fn a_session_from_an_older_engine_is_never_archived() {
+        let line = r#"{"session_id":"s1","provider":"claude-code","cwd":"/tmp",
+            "created_ts_ms":1,"state":"idle","live":false,"epoch":1,"last_seq":0}"#;
+        let info: SessionInfo = serde_json::from_str(line).unwrap();
+        assert!(!info.archived);
+        // And an unarchived session puts no key on the wire at all, so a
+        // client predating the field sees the bytes it always saw.
+        let back = serde_json::to_string(&info).unwrap();
+        assert!(!back.contains("archived"), "{back}");
     }
 
     #[test]

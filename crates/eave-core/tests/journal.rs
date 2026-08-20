@@ -47,6 +47,7 @@ fn test_meta(session_id: &str) -> Meta {
         state: "running".into(),
         child: None,
         title: None,
+        archived: false,
     }
 }
 
