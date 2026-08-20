@@ -1292,6 +1292,13 @@ async fn every_files_subscription_answers_at_both_scopes_and_every_cwd() {
             let stated = match (&snap.state, &snap.basis) {
                 (GitState::NotARepo, _) => true,
                 (GitState::Error { message }, _) => !message.is_empty(),
+                // Slice AJ's variant, reached here by INTEGRATION rather
+                // than by either branch: AH wrote this match and AJ added
+                // the variant, so neither suite could have caught it alone.
+                // "git did not answer" is itself an answer, and `stated()`
+                // is non-empty by construction — which is exactly why the
+                // wording moved into the wire type.
+                (GitState::Unanswered { .. }, _) => !snap.state.stated().is_empty(),
                 (_, DiffBasis::Unavailable { reason }) => !reason.is_empty(),
                 (GitState::Ok, _) => true,
             };
