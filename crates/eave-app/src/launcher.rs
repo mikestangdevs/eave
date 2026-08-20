@@ -121,6 +121,19 @@ pub const PROVIDERS: &[Provider] = &[
         id: "hermes",
         name: "Hermes",
         mark: icons::HERMES_MARK,
+        // Empty until the tile is live, which
+        // `tests::only_a_startable_provider_offers_models` enforces and
+        // which this slice deliberately did not break.
+        //
+        // Slice AW established what belongs here when it IS live, and it
+        // is exactly one entry: `hermes acp` takes no `--model` flag at
+        // all — ACP carries the model as protocol — and the list a live
+        // Hermes offers is whatever providers that machine holds
+        // credentials for (177 entries on the development machine, every
+        // one of them machine-specific). So `&[MODEL_DEFAULT]`, the "send
+        // no model, let the CLI decide" entry, is the only selection eave
+        // could honour, and it goes in with the line that makes the tile
+        // live rather than before it.
         models: &[],
     },
     Provider {
