@@ -745,9 +745,24 @@ async fn feed_loop(
                             cursor = None;
                             break StreamEnd::Switch;
                         }
-                        // Only reachable from the launcher, which has its
-                        // own loop above — a session is selected here, so
-                        // there is nothing to launch into.
+                        // DROPPED — and Slice AI checked, because this arm
+                        // is where `EAVE_LAUNCH_AT_BOOT` went to die.
+                        //
+                        // **Do not service it here.** The launcher is on
+                        // screen only while nothing is selected, so the
+                        // only `Launch` that can reach this arm is the
+                        // SECOND press of the start button: the first one
+                        // opened a session and brought the loop back here,
+                        // and the second is still queued behind it.
+                        // Opening on it would make a double-click on
+                        // `Start` two sessions.
+                        //
+                        // What was broken was the other direction — a
+                        // caller that wants a session while one is selected
+                        // has to ask for the launcher first, and the boot
+                        // hook did not. It does now
+                        // (`Shell::launch_at_boot`); `+ new` is the way in,
+                        // and it is the arm directly above.
                         Some(Command::Launch { .. }) => {}
                         None => break StreamEnd::Quit, // UI gone
                     },
@@ -3738,9 +3753,7 @@ impl Shell {
                             .text_color(theme::text_secondary())
                             .hover_fade("new-session", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, _| {
-                                let _ = this.commands.send(Command::NewSession);
-                            }))
+                            .on_click(cx.listener(|this, _, _, _| this.new_session()))
                             .flex()
                             .flex_row()
                             .items_center()
@@ -5995,6 +6008,48 @@ impl Shell {
         cx.notify();
     }
 
+    /// `+ new`: **deselect, and land on the launcher** (Slice Q2 — it no
+    /// longer opens anything).
+    ///
+    /// A named method rather than a closure body because the rail's button
+    /// is no longer its only caller: [`Shell::launch_at_boot`] takes the
+    /// same route, and "the same route" has to be literally the same call
+    /// or it is a claim nobody checks.
+    ///
+    /// Nothing here touches UI state, deliberately. Whether the launcher is
+    /// up is the connection loop's `at_launcher`, projected back as
+    /// `FeedEvent::NoSession` — a shell that raised the launcher on its own
+    /// would be holding state the engine has not agreed to, which is the
+    /// one thing the projection rule forbids.
+    fn new_session(&self) {
+        let _ = self.commands.send(Command::NewSession);
+    }
+
+    /// What `EAVE_LAUNCH_AT_BOOT=1` presses, **in the order a person
+    /// presses it: `+ new` first, then start.**
+    ///
+    /// SLICE AI, and the `+ new` is the whole slice. The hook used to send
+    /// `Command::Launch` alone, and `Launch` is serviced by exactly ONE of
+    /// the connection loop's two branches — the rest loop, which only runs
+    /// while no session is selected. The session branch drops it (see
+    /// there; the drop is right). So the moment the data dir had any
+    /// history the hook boot-selected that session, sent a `Launch` nobody
+    /// was listening for, and **silently did nothing** — from Q2 onwards,
+    /// through two independent rediscoveries.
+    /// `scripts/q2-launch-proof.sh` never caught it because every case it
+    /// ran started from an empty engine.
+    ///
+    /// `+ new` is not a shortcut around the UI; it is the UI. The commands
+    /// channel preserves order, so `NewSession` puts the loop back in the
+    /// rest branch before `Launch` is read out behind it. Against an EMPTY
+    /// engine the extra `NewSession` lands on the rest loop's "already
+    /// here" arm and costs nothing — which is why the proof's `launched`
+    /// case still wants exactly one session rather than two.
+    fn launch_at_boot(&mut self, cx: &mut Context<Self>) {
+        self.new_session();
+        self.launch(cx);
+    }
+
     /// The model menu's overlay layer. Separate from `demo_layer` and
     /// mounted beside it: two popups, two independent state machines, and
     /// no shared "which menu is open" global to get out of step.
@@ -7050,6 +7105,17 @@ fn macos_reduce_motion() -> Option<bool> {
     }
 }
 
+/// Was `EAVE_LAUNCH_AT_BOOT=1` asked for? (Q2's rig hook — see the call
+/// site in [`bootstrap`], and [`Shell::launch_at_boot`] for what it does.)
+///
+/// Split out from the hook so the environment read is the ONLY untested
+/// part of it. It must stay a bare read: the harness boots this same
+/// `bootstrap`, and an env var is process-wide, so a test that set it would
+/// press start in every other test running beside it.
+fn launch_at_boot_requested() -> bool {
+    std::env::var("EAVE_LAUNCH_AT_BOOT").is_ok_and(|v| v == "1")
+}
+
 /// Everything downstream of the feed — entities, elapsed ticker, pump,
 /// window, Shell — shared verbatim by `run()` and the harness tests:
 /// production and tests walk one spine (stage J).
@@ -7449,11 +7515,12 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 // `Command::Launch` reaching a real `open_with_agent` is
                 // exercised by no test in the suite. Same shape and same
                 // reason as P1's `EAVE_OVERLAY_DEMO`.
-                if std::env::var("EAVE_LAUNCH_AT_BOOT")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                {
-                    shell.update(cx, |s, cx| s.launch(cx));
+                //
+                // Slice AI: what it presses lives in `Shell::launch_at_boot`,
+                // so the sequence is testable by the harness even though the
+                // environment read is not.
+                if launch_at_boot_requested() {
+                    shell.update(cx, |s, cx| s.launch_at_boot(cx));
                 }
                 shell
             },

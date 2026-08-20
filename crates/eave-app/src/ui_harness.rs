@@ -5479,3 +5479,124 @@ async fn the_changes_rail_offers_a_remedy_only_when_there_is_one(cx: &mut TestAp
         );
     }
 }
+
+// SLICE AI — the launcher's reach.
+//
+// `EAVE_LAUNCH_AT_BOOT=1` worked against an empty engine and silently did
+// nothing against a non-empty one, because `Command::Launch` is serviced by
+// one of the connection loop's two branches. These tests pin the UI half of
+// the fix — that the hook takes the same route a person takes, and that the
+// route exists. The connection loop itself is unreachable from this harness
+// (it is replaced by plumbing), so the half that proves a session actually
+// lands on disk is `scripts/q2-launch-proof.sh`'s `again` case.
+// ---------------------------------------------------------------------------
+
+/// **`+ new` asks for the launcher, and had no test for pressing it.**
+///
+/// The control was asserted to exist, to be right-aligned and to rest at
+/// `wash_rest`; what it *does* was covered by nothing. It is also the only
+/// way back to the launcher once a session is selected, which is what makes
+/// it load-bearing rather than a convenience — Slice AI's fix rides on it.
+#[gpui::test]
+fn pressing_new_session_asks_for_the_launcher(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // A session on screen, so the launcher is NOT already up. This is the
+    // state in which `+ new` is the only route to it.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "launcher"), "the launcher was already up");
+    let _ = h.drain();
+
+    click(vcx, "new-session");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert_eq!(cmds.len(), 1, "`+ new` emitted {cmds:?}");
+    assert!(
+        matches!(cmds[0], Command::NewSession),
+        "`+ new` emitted {:?} rather than asking for the launcher",
+        cmds[0],
+    );
+
+    // ...and it does NOT raise the launcher by itself. The UI is a pure
+    // projection: the launcher arrives when the engine agrees it should.
+    assert!(
+        !shown(vcx, "launcher"),
+        "the shell raised a launcher the engine had not agreed to",
+    );
+    h.plumbing.push_feed(FeedEvent::NoSession { error: None });
+    vcx.run_until_parked();
+    assert!(shown(vcx, "launcher"), "the launcher never arrived");
+}
+
+/// **The boot hook reaches the launcher before it presses start.**
+///
+/// This is the regression test for the defect: with a session selected the
+/// launcher is not on screen, and a bare `Command::Launch` is read out by a
+/// branch that drops it. The hook must therefore emit `NewSession` FIRST —
+/// the same command `+ new` sends, in the same order a person presses them.
+///
+/// Order is the whole assertion. Two commands in the other order would still
+/// be two commands, and would still do nothing.
+#[gpui::test]
+fn the_boot_hook_reaches_the_launcher_before_it_presses_start(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "launcher"),
+        "a non-empty engine still rested at the launcher — this test proves \
+         nothing unless the launcher is out of reach to begin with",
+    );
+    let _ = h.drain();
+
+    h.window
+        .update(vcx, |shell, _, cx| shell.launch_at_boot(cx))
+        .unwrap();
+    vcx.run_until_parked();
+
+    let cmds = h.drain();
+    assert_eq!(cmds.len(), 2, "the boot hook emitted {cmds:?}");
+    assert!(
+        matches!(cmds[0], Command::NewSession),
+        "the boot hook pressed start before it asked for the launcher: {cmds:?}",
+    );
+    assert!(
+        matches!(cmds[1], Command::Launch { .. }),
+        "the boot hook asked for the launcher and never pressed start: {cmds:?}",
+    );
+}
+
+/// The same hook against an EMPTY engine still presses start exactly once.
+///
+/// The fix adds a `NewSession` the rest state does not need; the rest loop
+/// answers it with "already here". What must not happen is the extra step
+/// turning into an extra session — `q2-launch-proof.sh`'s `launched` case
+/// wants one journal, not two, and this is that claim at the command level.
+#[gpui::test]
+fn the_boot_hook_presses_start_once_against_an_empty_engine(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    assert!(
+        shown(vcx, "launcher"),
+        "an empty engine did not rest at the launcher",
+    );
+    let _ = h.drain();
+
+    h.window
+        .update(vcx, |shell, _, cx| shell.launch_at_boot(cx))
+        .unwrap();
+    vcx.run_until_parked();
+
+    let cmds = h.drain();
+    let starts = cmds
+        .iter()
+        .filter(|c| matches!(c, Command::Launch { .. }))
+        .count();
+    assert_eq!(
+        starts, 1,
+        "the boot hook pressed start {starts} times: {cmds:?}"
+    );
+}
