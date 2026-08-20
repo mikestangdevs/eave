@@ -33,6 +33,7 @@ use gpui::AnimationExt as _;
 use gpui_platform::application;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use eave_core::session::AgentConfig;
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
 use eave_wire::{
@@ -46,6 +47,7 @@ use crate::icons;
 use crate::loaders;
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::motion::{self, HoverFade as _};
+use crate::launcher::{self, PROVIDERS};
 use crate::overlay::{self, MenuItem, Popup};
 use crate::theme;
 
@@ -78,6 +80,14 @@ enum ConnEvent {
 #[derive(Debug)]
 enum FeedEvent {
     Session { id: String },
+    /// Nothing is selected and nothing will be opened for you — the
+    /// launcher's state (Slice Q2). Distinct from "the selected session's
+    /// journal is empty": this says there is no session at all.
+    ///
+    /// `error` carries the engine's own words when a launch was refused —
+    /// the posture gate's message, verbatim. Silence there would be the
+    /// worst of both: a button that does nothing and says nothing.
+    NoSession { error: Option<String> },
     Reset {
         id: String,
     },
@@ -136,8 +146,21 @@ enum Command {
     /// Rail row click: subscribe this session instead (cursorless — the
     /// UI holds no projection for it; full replay, never merge).
     Select(String),
-    /// Rail "+ new": open a fresh session and select it.
+    /// Rail "+ new": go to the launcher (Slice Q2). This used to open a
+    /// session immediately with the engine's defaults; it now deselects
+    /// and lets you choose an agent, which is the whole point of having a
+    /// rest state.
     NewSession,
+    /// Launcher "start session" (Slice Q2): open with a stated agent and
+    /// select it. The engine refuses a provider whose posture it has not
+    /// proven, so a wrong `provider` here produces a stated error rather
+    /// than an unreviewed child process.
+    Launch {
+        provider: String,
+        /// `None` = pass no `--model` at all, which is not the same as
+        /// passing an empty one (`AgentConfig::model`).
+        model: Option<String>,
+    },
     /// Files-rail row click (B2): fetch one file's diff. Unary and
     /// re-issued on every fresh snapshot while the row stays expanded —
     /// the files channel is the invalidation signal.
@@ -242,6 +265,12 @@ async fn feed_loop(
     let mut attempt: u32 = 0;
     let mut cursor: Option<Cursor> = None;
     let mut selected: Option<String> = None;
+    // Slice Q2. Set by `+ new`, cleared by anything that picks a session.
+    // Without it, the "degrade to the most recent session" rule below
+    // would bounce you straight back out of the launcher — asking for a
+    // new session and being handed the old one is the bug this flag
+    // exists to prevent, not a corner case.
+    let mut at_launcher = false;
     'conn: loop {
         plumbing.push_conn(if attempt == 0 {
             ConnEvent::Connecting
@@ -289,23 +318,97 @@ async fn feed_loop(
         'session: loop {
             // Validate the held selection against the engine's set; a
             // vanished session (fresh data dir, changed disk) degrades to
-            // the most recent session, or a fresh one on an empty engine.
+            // the most recent session.
             let sessions = match client.list().await {
                 Ok(s) => s,
                 Err(_) => continue 'conn,
             };
-            let session_id = match selected
-                .clone()
-                .filter(|id| sessions.iter().any(|s| &s.session_id == id))
-            {
-                Some(id) => id,
-                None => match sessions.iter().max_by_key(|s| s.created_ts_ms) {
-                    Some(s) => s.session_id.clone(),
-                    None => match client.open(None, None).await {
-                        Ok(info) => info.session_id,
-                        Err(_) => continue 'conn,
-                    },
-                },
+            // Slice Q2 REMOVED the last arm of this: an empty engine used
+            // to be met with `client.open(None, None)` right here, which
+            // is why eave had no rest state to design. A session is now
+            // opened only by `Command::Launch` — i.e. only because someone
+            // asked for one, under a stated agent.
+            let session_id = if at_launcher {
+                None
+            } else {
+                selected
+                    .clone()
+                    .filter(|id| sessions.iter().any(|s| &s.session_id == id))
+                    .or_else(|| {
+                        sessions
+                            .iter()
+                            .max_by_key(|s| s.created_ts_ms)
+                            .map(|s| s.session_id.clone())
+                    })
+            };
+            let Some(session_id) = session_id else {
+                // The launcher. No subscription exists, so this is a much
+                // smaller select! than the one below — but the rail's
+                // watch stream is a 'conn-level thing and keeps flowing,
+                // which is what lets the session list stay live behind a
+                // launcher that is showing because you pressed `+ new`.
+                selected = None;
+                cursor = None;
+                plumbing.push_feed(FeedEvent::NoSession { error: None });
+                loop {
+                    tokio::select! {
+                        item = watch_rx.recv() => match item {
+                            Some(SubscriptionItem::Sessions { sessions }) => {
+                                plumbing.push_rail(sessions);
+                            }
+                            Some(_) => {}
+                            None => continue 'conn,
+                        },
+                        cmd = commands.recv() => match cmd {
+                            Some(Command::Launch { provider, model }) => {
+                                let agent = AgentConfig {
+                                    provider: Some(provider),
+                                    model,
+                                    ..AgentConfig::default()
+                                };
+                                match client.open_with_agent(None, None, Some(agent)).await {
+                                    Ok(info) => {
+                                        at_launcher = false;
+                                        selected = Some(info.session_id);
+                                        continue 'session;
+                                    }
+                                    // A refusal here is the engine's
+                                    // posture gate doing its job, and the
+                                    // connection is fine — state its words
+                                    // on the launcher rather than tearing
+                                    // the connection down.
+                                    Err(ClientError::Engine(msg)) => {
+                                        plumbing.push_feed(FeedEvent::NoSession {
+                                            error: Some(msg),
+                                        });
+                                    }
+                                    Err(_) => continue 'conn,
+                                }
+                            }
+                            Some(Command::Select(id)) => {
+                                at_launcher = false;
+                                selected = Some(id);
+                                continue 'session;
+                            }
+                            // Already here.
+                            Some(Command::NewSession) => {}
+                            Some(Command::Isolate(id)) => {
+                                let _ = client.isolate(&id).await;
+                            }
+                            Some(Command::RemoveWorktree { id, force }) => {
+                                let _ = client.remove_worktree(&id, force).await;
+                            }
+                            // Everything else needs a selected session and
+                            // there is not one: dropped, never queued. A
+                            // send that arrives at the launcher has no
+                            // session to be addressed to, and holding it
+                            // to replay into whatever opens next would be
+                            // worse than losing it.
+                            Some(_) => {}
+                            None => return, // UI gone
+                        },
+                    }
+                }
             };
             // The cursor belongs to one session's log: a switch always
             // subscribes cursorless (full replay — the UI holds no
@@ -468,14 +571,19 @@ async fn feed_loop(
                                 break StreamEnd::Switch;
                             }
                         }
-                        Some(Command::NewSession) => match client.open(None, None).await {
-                            Ok(info) => {
-                                selected = Some(info.session_id);
-                                cursor = None;
-                                break StreamEnd::Switch;
-                            }
-                            Err(_) => break StreamEnd::Conn,
-                        },
+                        // Slice Q2: `+ new` no longer opens anything. It
+                        // drops the selection and lands on the launcher,
+                        // where the agent gets chosen before a process
+                        // exists.
+                        Some(Command::NewSession) => {
+                            at_launcher = true;
+                            cursor = None;
+                            break StreamEnd::Switch;
+                        }
+                        // Only reachable from the launcher, which has its
+                        // own loop above — a session is selected here, so
+                        // there is nothing to launch into.
+                        Some(Command::Launch { .. }) => {}
                         None => break StreamEnd::Quit, // UI gone
                     },
                 }
@@ -1177,6 +1285,11 @@ struct ReplayAssert {
 
 struct TranscriptState {
     session_id: Option<String>,
+    /// Slice Q2: the engine's own words when a launch was refused. Lives
+    /// here rather than on `Shell` because it is cleared by the same feed
+    /// event that clears the session — the two facts arrive together and
+    /// must never disagree.
+    launch_error: Option<String>,
     transcript: Transcript,
     display: DisplayList,
     list: ListState,
@@ -1222,6 +1335,7 @@ impl TranscriptState {
         list.set_follow_mode(gpui::FollowMode::Tail);
         Self {
             session_id: None,
+            launch_error: None,
             transcript: Transcript::new(),
             display: DisplayList::new(),
             list,
@@ -1598,6 +1712,34 @@ struct Shell {
     files_scroll: ScrollHandle,
     /// Slice P1 — see [`DemoOverlay`]. No product consumer.
     demo: DemoOverlay,
+    /// Slice Q2 — the launcher's own state. Held on the shell rather than
+    /// in `TranscriptState` because it is a *choice in progress*, not a
+    /// fact about a session: it survives the feed events that clear the
+    /// transcript, so pressing `+ new` twice does not reset the agent you
+    /// were half-way through picking.
+    launcher: LauncherUi,
+}
+
+/// Slice Q2. The provider strip's selection and the model menu.
+struct LauncherUi {
+    /// Index into [`launcher::PROVIDERS`].
+    provider: usize,
+    /// The model menu — P1's `Popup`, anchored at the picker button. `T`
+    /// is the anchor point in window coordinates.
+    models: Popup<Point<Pixels>>,
+    /// The chosen `--model`. **`None` means pass no flag at all**, which
+    /// is `launcher::MODEL_DEFAULT` and is not the same as an empty one.
+    model: Option<&'static str>,
+}
+
+impl Default for LauncherUi {
+    fn default() -> Self {
+        Self {
+            provider: launcher::default_provider(),
+            models: Popup::default(),
+            model: None,
+        }
+    }
 }
 
 /// The data dir this process is running against, recorded by [`run`] so
@@ -1803,6 +1945,25 @@ impl Shell {
         // Ahead of the caret-anchor reset below on purpose: navigating a
         // menu is not "the typist is still in the composer", and re-anchoring
         // the blink from here would make an arrow key look like a keystroke.
+        if self.launcher.models.is_open() {
+            match ks.key.as_str() {
+                "escape" => self.close_model_menu(cx),
+                "down" => {
+                    self.launcher.models.highlight_next();
+                    cx.notify();
+                }
+                "up" => {
+                    self.launcher.models.highlight_prev();
+                    cx.notify();
+                }
+                "enter" => match self.launcher.models.highlighted() {
+                    Some(ix) => self.choose_model(ix, cx),
+                    None => self.close_model_menu(cx),
+                },
+                _ => {}
+            }
+            return;
+        }
         if self.demo.menu.is_open() {
             match ks.key.as_str() {
                 "escape" => self.close_demo_menu(cx),
@@ -3936,6 +4097,301 @@ impl Shell {
     }
 }
 
+/// Slice Q2 — the launcher.
+impl Shell {
+    fn provider(&self) -> &'static launcher::Provider {
+        &PROVIDERS[self.launcher.provider]
+    }
+
+    /// The model menu's rows, rebuilt per render for the same reason the
+    /// demo's are: a menu states what was true when it was drawn.
+    ///
+    /// The current choice carries a trailing check rather than a highlight
+    /// — highlight is the KEYBOARD's cursor and means "this is where you
+    /// are", which is a different fact from "this is what is set".
+    fn model_items(&self) -> Vec<MenuItem> {
+        let current = self.launcher.model;
+        self.provider()
+            .models
+            .iter()
+            .map(|m| {
+                let is_current = match current {
+                    Some(c) => c == *m,
+                    None => *m == launcher::MODEL_DEFAULT,
+                };
+                let row = MenuItem::new(*m);
+                if is_current {
+                    row.trailing("✓")
+                } else {
+                    row
+                }
+            })
+            .collect()
+    }
+
+    fn open_model_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let enabled = self.model_items().iter().map(|i| i.enabled).collect();
+        self.launcher.models.open(at, enabled, now);
+        cx.notify();
+    }
+
+    /// Dismiss: start the exit, schedule the reap. Same division as the
+    /// demo's — `Popup` stays pure, the caller owns the timer, and
+    /// `begin_close` answering `false` under reduced motion is what keeps
+    /// a timer from being spawned for an exit that never plays.
+    fn close_model_menu(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.launcher.models.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.launcher.models.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn choose_model(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.provider().models.get(ix) {
+            // The first entry means "send no --model flag", which is a
+            // different thing from sending the string "CLI default".
+            self.launcher.model = if *m == launcher::MODEL_DEFAULT {
+                None
+            } else {
+                Some(*m)
+            };
+        }
+        self.close_model_menu(cx);
+    }
+
+    /// Pick a provider tile.
+    ///
+    /// **Clears the model.** A model alias belongs to one CLI's vocabulary
+    /// — carrying `opus` across to another provider would send a flag that
+    /// vendor has never heard of, and eave does not validate models
+    /// (P2 caveat 5), so the CLI would be the one to complain.
+    fn pick_provider(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.launcher.provider != ix {
+            self.launcher.provider = ix;
+            self.launcher.model = None;
+        }
+        cx.notify();
+    }
+
+    fn launch(&mut self, cx: &mut Context<Self>) {
+        let p = self.provider();
+        let _ = self.commands.send(Command::Launch {
+            provider: p.id.to_string(),
+            model: self.launcher.model.map(str::to_string),
+        });
+        cx.notify();
+    }
+
+    /// The model menu's overlay layer. Separate from `demo_layer` and
+    /// mounted beside it: two popups, two independent state machines, and
+    /// no shared "which menu is open" global to get out of step.
+    fn launcher_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let anchor = *self.launcher.models.data()?;
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let live = self.launcher.models.is_open();
+        let highlighted = self.launcher.models.highlighted();
+        let rows = self
+            .model_items()
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                overlay::menu_row(
+                    ix,
+                    item,
+                    highlighted == Some(ix),
+                    live,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.choose_model(ix, cx)),
+                )
+            })
+            .collect();
+        overlay::menu_layer(
+            &self.launcher.models,
+            anchor,
+            now,
+            reduced,
+            rows,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_model_menu(cx)),
+        )
+    }
+
+    /// The launcher itself: what eave looks like when nothing is running.
+    ///
+    /// Positioned exactly where Slice M's "no session selected" ghost text
+    /// was — an absolute overlay above the composer's clearance, outside
+    /// the edge-fade scope and outside the virtualized list, so it can
+    /// never participate in a row height.
+    fn launcher_view(&self, error: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+        let cwd = std::env::current_dir()
+            .map(|p| tilde(&p))
+            .unwrap_or_else(|_| "the current directory".into());
+        let selected = self.launcher.provider;
+        let p = self.provider();
+        let model = self.launcher.model.unwrap_or(launcher::MODEL_DEFAULT);
+        // The entrance rides an INNER div: this box is absolute, and
+        // `relative()` on it would destroy that positioning outright (the
+        // scar Slice M's note left).
+        let t = motion::entrance_t("in:launcher", motion::FADE_IN);
+
+        div()
+            .debug_selector(|| "launcher".into())
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            // Not `COMPOSER_CLEARANCE` — the composer is not mounted while
+            // this is up (see the render chain), so reserving its height
+            // would push the launcher off centre by half a composer.
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .opacity(t)
+                    .relative()
+                    .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
+                    .w_full()
+                    .max_w(px(theme::LAUNCHER_MAX_W))
+                    .px(px(theme::GUTTER))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(theme::LAUNCHER_GAP))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .debug_selector(|| "launcher-title".into())
+                                    .text_size(px(theme::LAUNCHER_TITLE_SIZE))
+                                    .line_height(px(theme::LAUNCHER_TITLE_LINE))
+                                    .font_weight(theme::WEIGHT_STRONG)
+                                    .text_color(theme::text())
+                                    .child("Start a session"),
+                            )
+                            .child(
+                                // Where it will run, stated before it runs
+                                // rather than discovered afterwards. The
+                                // cwd is the single most consequential
+                                // fact about a coding agent's session.
+                                div()
+                                    .debug_selector(|| "launcher-cwd".into())
+                                    .text_size(px(theme::SMALL_SIZE))
+                                    .line_height(px(theme::SMALL_LINE))
+                                    .text_color(theme::text_tertiary())
+                                    .child(format!("in {cwd}")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "provider-strip".into())
+                            // Capped at three tiles wide so six providers
+                            // wrap 3+3 rather than however many happen to
+                            // fit. Six across does not fit the transcript
+                            // column at eave's default window size with
+                            // both rails open, and the first build's 4+2
+                            // read as an accident — which is what an
+                            // uncapped `flex_wrap` always eventually does.
+                            .max_w(px(theme::STRIP_MAX_W))
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .justify_center()
+                            .gap(px(theme::TILE_GAP))
+                            .children(PROVIDERS.iter().enumerate().map(|(ix, provider)| {
+                                launcher::tile(
+                                    ix,
+                                    provider,
+                                    ix == selected,
+                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.pick_provider(ix, cx)
+                                    }),
+                                )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACE_2))
+                            // The model picker. A button that opens P1's
+                            // menu — the launcher is the overlay layer's
+                            // first product consumer.
+                            .child(
+                                div()
+                                    .id("launcher-model")
+                                    .debug_selector(|| "launcher-model".into())
+                                    .px(px(theme::SPACE_3))
+                                    .py(px(theme::SPACE_1))
+                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .text_size(px(theme::LABEL_SIZE))
+                                    .line_height(px(theme::LABEL_LINE))
+                                    .text_color(theme::text_secondary())
+                                    .hover_fade(
+                                        "launcher-model",
+                                        theme::wash_rest(),
+                                        theme::overlay(),
+                                    )
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, window, cx| {
+                                            let at = window.mouse_position();
+                                            this.open_model_menu(
+                                                point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
+                                                cx,
+                                            );
+                                        },
+                                    ))
+                                    .child(format!("{model}  ⌄")),
+                            )
+                            .child(
+                                div()
+                                    .id("launcher-start")
+                                    .debug_selector(|| "launcher-start".into())
+                                    .px(px(theme::SPACE_4))
+                                    .py(px(theme::SPACE_1))
+                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .bg(theme::inverse())
+                                    .text_size(px(theme::LABEL_SIZE))
+                                    .line_height(px(theme::LABEL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(theme::on_inverse())
+                                    .cursor_pointer()
+                                    .on_click(
+                                        cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx)),
+                                    )
+                                    .child(format!("Start {}", p.name)),
+                            ),
+                    )
+                    // The engine's own words on a refusal. Not a toast and
+                    // not a log line: the screen that asked is the screen
+                    // that answers.
+                    .children(error.map(|e| {
+                        div()
+                            .debug_selector(|| "launcher-error".into())
+                            .max_w(px(theme::LAUNCHER_MAX_W))
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::danger())
+                            .child(e.to_string())
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Slice N2: open the frame FIRST, before anything below reads a
@@ -4059,6 +4515,14 @@ impl Render for Shell {
         //     Slice M builds no loaders; "nothing sent yet" over a session
         //     with 200 messages would be a lie for the length of a round
         //     trip, so this says nothing at all, exactly as before.
+        // Slice Q2 took the third case away from this note and gave it to
+        // the launcher: "no session selected" was a sentence where a
+        // screen belonged. The other two are unchanged, and the one that
+        // says nothing still says nothing — a replay in flight over a
+        // 200-message journal must not be captioned "nothing sent yet" for
+        // the length of a round trip.
+        let show_launcher = state.session_id.is_none();
+        let launch_error = state.launch_error.clone();
         let empty_note: Option<&'static str> = if !state.display.is_empty() {
             None
         } else if let Some(sid) = state.session_id.as_deref() {
@@ -4070,7 +4534,7 @@ impl Render for Shell {
                 .filter(|s| s.last_seq == 0)
                 .map(|_| "nothing sent yet")
         } else {
-            Some("no session selected")
+            None
         };
 
         let transcript_el = list(list_state, move |ix, _window, cx| {
@@ -4238,6 +4702,11 @@ impl Render for Shell {
         // element being built. Both are `None` in the shipped app.
         let demo_trigger = overlay::demo_enabled().then(|| self.demo_trigger(cx));
         let demo_layer = self.demo_layer(cx);
+        // Slice Q2, built here for the same reason: the launcher and its
+        // model menu both need `self` and `cx`, and the element chain
+        // below has neither to spare.
+        let launcher_el = show_launcher.then(|| self.launcher_view(launch_error.as_deref(), cx));
+        let launcher_menu = self.launcher_menu_layer(cx);
 
         // Opaque window by default, custom titlebar — locked decision
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
@@ -4366,6 +4835,12 @@ impl Render for Shell {
                                                     .child(note),
                                             )
                                     }))
+                                    // Slice Q2 — the launcher, in exactly
+                                    // the slot the note it replaced used:
+                                    // an overlay outside both the fade
+                                    // scope and the virtualized list, so
+                                    // it can never touch a row height.
+                                    .children(launcher_el)
                                     .when(show_affordance, |d| {
                                         // §1.6, 180 ms. comet approximates a
                                         // `scale 0.96→1` with fade + a 2 px
@@ -4446,7 +4921,18 @@ impl Render for Shell {
                                             .children(self.conn_panel(cx))
                                             .children(notice)
                                             .children(trailer)
-                                            .child(composer),
+                                            // Slice Q2: no session, no
+                                            // composer. A draft typed at
+                                            // the launcher has nothing to
+                                            // be addressed to — the rest
+                                            // loop drops a `Send` because
+                                            // holding it to replay into
+                                            // whatever opens next would be
+                                            // worse — so an input that
+                                            // silently eats what you type
+                                            // is the one thing this must
+                                            // not be.
+                                            .children((!show_launcher).then_some(composer)),
                                     ),
                             )
                             .child(self.footer(cx)),
@@ -4458,7 +4944,11 @@ impl Render for Shell {
             // it is written, and the transcript is a virtualized list that
             // caches row heights. See `overlay::menu_layer`.
             .children(demo_trigger)
-            .children(demo_layer);
+            .children(demo_layer)
+            // After `demo_layer` so that if both are ever mounted at once
+            // the launcher's menu is on top — the launcher is the product
+            // surface and the demo is a test fixture.
+            .children(launcher_menu);
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
         // claims this frame during the pass above; the root asks once, here,
@@ -4952,6 +5442,19 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                     }
                                     state.session_id = Some(id)
                                 }
+                                // Slice Q2. `reset()` as well as clearing
+                                // the id: the launcher renders over the
+                                // transcript column, and rows left behind
+                                // it would be a dead session's content
+                                // sitting under a live launcher.
+                                FeedEvent::NoSession { error } => {
+                                    if state.session_id.is_some() {
+                                        switched = true;
+                                    }
+                                    state.session_id = None;
+                                    state.reset();
+                                    state.launch_error = error;
+                                }
                                 // Frames tagged with another session are
                                 // stragglers from a dropped subscription
                                 // — discard, never apply (no bleed).
@@ -5030,6 +5533,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 Shell {
                     focus: cx.focus_handle(),
                     demo: DemoOverlay::default(),
+                    launcher: LauncherUi::default(),
                     conn: conn.clone(),
                     sessions: sessions.clone(),
                     files: files.clone(),
@@ -5061,6 +5565,20 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 shell.update(cx, |s, cx| {
                     s.open_demo_menu(point(px(240.), px(180.)), cx)
                 });
+            }
+            // Slice Q2: `EAVE_LAUNCH_AT_BOOT=1` presses the launcher's own
+            // start button on the first frame.
+            //
+            // This exists because the launcher's HALF that a capture can
+            // prove is the half that does nothing: a shot shows eave
+            // resting instead of auto-opening, and cannot show a click
+            // producing a session. The harness cannot cover it either —
+            // it replaces the connection loop with plumbing, so
+            // `Command::Launch` reaching a real `open_with_agent` is
+            // exercised by no test in the suite. Same shape and same
+            // reason as P1's `EAVE_OVERLAY_DEMO`.
+            if std::env::var("EAVE_LAUNCH_AT_BOOT").map(|v| v == "1").unwrap_or(false) {
+                shell.update(cx, |s, cx| s.launch(cx));
             }
             shell
         },

@@ -26,6 +26,12 @@ mod loaders;
 /// modules — the headless acceptance runs never draw.
 mod icons;
 
+/// The launcher (Slice Q2): eave's rest state — the provider strip, the
+/// table of agents eave knows how to name, and the gate-backed answer to
+/// which of them can actually be started. Private for the same reason as
+/// its neighbours: it renders.
+mod launcher;
+
 /// The overlay layer (Slice P1): the anchored popover surface, the
 /// `Popup` state machine and the menu-row primitive. Private for the same
 /// reason as `loaders` and `motion` — it renders, and it has no product

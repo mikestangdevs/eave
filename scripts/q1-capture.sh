@@ -20,7 +20,12 @@ OUT="${1:-$ROOT/docs-shots}"
 mkdir -p "$OUT"
 
 BIN="$ROOT/target/debug/eave"
-[ -x "$BIN" ] || { echo "no binary at $BIN — build first" >&2; exit 1; }
+# BUILD, do not merely check. `cargo test` builds test binaries and leaves
+# `target/debug/eave` alone, so a capture that only checked for the file
+# would happily photograph the last build — which is exactly how Q2's
+# first shot showed a layout that had already been fixed.
+cargo build --quiet
+[ -x "$BIN" ] || { echo "no binary at $BIN" >&2; exit 1; }
 
 FIXTURE="$ROOT/fixtures/real-claude-2026-08-16.tap.jsonl"
 [ -f "$FIXTURE" ] || { echo "missing $FIXTURE" >&2; exit 1; }
