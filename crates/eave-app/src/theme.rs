@@ -219,21 +219,34 @@ pub fn wash_rest() -> Hsla {
     gpui::transparent_black()
 }
 
-/// Hover/selection wash composited over any surface (waku's idiom: no
-/// per-surface hover tokens, just a white wash).
+/// The three state rungs are ONE LADDER, and the floor between them is the
+/// same [`STATE_DELTA_FLOOR`] that separates each from its ground. Slice U
+/// pinned each wash against the ground and stopped there, so `overlay` and
+/// `overlay_strong` were left **2/255 apart** — a hovered row and the
+/// selected row were the same colour to the eye, and the test that was
+/// supposed to catch exactly that could not see it, because it only ever
+/// compared a wash to what was underneath it.
+///
+/// `adjacent_states_are_a_step_apart` is the missing assertion.
+///
+/// Hover wash on an unfilled control: the first rung off the ground.
 pub fn overlay() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.08)
 }
+/// The standing fill of a SELECTED thing — one full step above [`overlay`],
+/// so that "the row under my cursor" and "the row I am in" are never the
+/// same colour. Was `0.09`.
 pub fn overlay_strong() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.09)
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.14)
 }
 /// One step above [`overlay_strong`], for an element whose RESTING fill
 /// is already `overlay_strong` — the unarmed send button. A hover wash
 /// that composites over a surface is the app's idiom, but an element
 /// with its own `bg` replaces rather than composites, so the few filled
-/// controls need their hovered fill named outright (Slice M).
+/// controls need their hovered fill named outright (Slice M). Was `0.14`,
+/// which is now what the rung below it carries.
 pub fn overlay_strongest() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.14)
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.20)
 }
 
 // ---------------------------------------------------------------------------
@@ -793,12 +806,26 @@ const MENU_GLASS_ALPHA: f32 = 0.92;
 /// see the alpha note above for why nothing paints it yet.
 pub const BLUR_MENU: f32 = 44.0;
 
-/// L3 glass: the popover surface. One luminance step above
-/// [`chrome_glass`]'s `#141414` and below its hovered `#232323`, so a
-/// hovered menu row — which composites [`overlay`] ON TOP of this — still
-/// resolves as lighter than the surface carrying it.
+/// L3 glass: the popover surface. Must resolve LIGHTER than the chrome it
+/// floats on, on every backdrop — asserted by
+/// `a_popover_clears_the_chrome_it_floats_on`.
+///
+/// **Was `#1e1e1e`, and the reasoning that picked it compared hexes while
+/// the two surfaces carry different alphas.** `#1e1e1e` is indeed a step
+/// above `chrome_glass`'s `#141414` as a *tint*; it is not a step above it
+/// as a *surface*, because chrome admits 28% of the backdrop and a menu
+/// admits 8%. So chrome climbs with the desktop and the menu barely moves,
+/// and the gap closes: **+12.3/255 over a black desktop, +2.0 at 200, and
+/// −0.8 at white** — a popover that goes fractionally darker than the
+/// surface carrying it, i.e. an edgeless rectangle.
+///
+/// The alpha is not the lever. [`MENU_GLASS_ALPHA`]'s 0.92 is derived from
+/// unblurred text bleed and is load-bearing; and the gap scales as
+/// `α · (tint − chrome)`, so alpha only multiplies a difference that was
+/// already going to zero. The tint is the lever. `#282828` puts the worst
+/// case — a white desktop — at **+8.4/255** and the best at +21.5.
 pub fn menu_glass() -> Hsla {
-    let c: Hsla = rgb(0x1e1e1e).into();
+    let c: Hsla = rgb(0x282828).into();
     c.opacity(MENU_GLASS_ALPHA)
 }
 
@@ -1115,6 +1142,118 @@ mod tests {
         }
     }
 
+    /// A popover is lighter than the chrome it floats on. On every backdrop.
+    ///
+    /// `every_rung_is_a_step_you_can_see` and
+    /// `glass_ladder_never_inverts_on_any_backdrop` both measure
+    /// `wash_raised`/`wash_panel`/`wash_modal` — and **`wash_panel` and
+    /// `wash_modal` have no call site in the app.** The elevation ladder
+    /// those two tests guard is not the ladder eave paints. What it paints
+    /// is `canvas -> content_plate -> raised` in the reading column and
+    /// `chrome_glass -> menu_glass` in the floating chrome, and until this
+    /// test the second pair was constrained by nothing at all.
+    ///
+    /// It failed on the shipped tint at the bright end of the sweep by
+    /// -0.8/255 — an inversion, not a tight step.
+    #[test]
+    fn a_popover_clears_the_chrome_it_floats_on() {
+        for g in grounds() {
+            let chrome = over(chrome_glass(), g);
+            let menu = over(menu_glass(), chrome);
+            let d = units(menu) - units(chrome);
+            assert!(
+                d >= SURFACE_STEP_FLOOR,
+                "a popover is {d:+.1}/255 against its chrome on ground \
+                 {:.1}, floor {SURFACE_STEP_FLOOR}",
+                units(g)
+            );
+        }
+    }
+
+    /// The wash a hovered menu row composites ON TOP of the popover has to
+    /// clear the popover too — the surface moved, so the thing measured
+    /// against it is re-measured rather than assumed to have come along.
+    #[test]
+    fn a_hovered_menu_row_clears_its_popover() {
+        for g in grounds() {
+            let menu = over(menu_glass(), over(chrome_glass(), g));
+            let row = over(overlay(), menu);
+            let d = units(row) - units(menu);
+            assert!(
+                d >= STATE_DELTA_FLOOR,
+                "a hovered menu row moves {d:.1}/255 on ground {:.1}, floor \
+                 {STATE_DELTA_FLOOR}",
+                units(g)
+            );
+        }
+    }
+
+    /// Floating chrome is always readable — by its fill, or by its rim.
+    ///
+    /// `chrome_glass` is `#141414` at α 0.72, so 28% of the desktop bleeds
+    /// through and the surface TRACKS the backdrop: +8.6/255 above the
+    /// frost over a black desktop, **exactly 0.0/255 at desktop ≈60**, and
+    /// 28/255 below it over white. The tint sits inside the ground's own
+    /// range (8→59), so no alpha closes that crossing — only moving the
+    /// tint out of the range would, and both directions were rejected:
+    /// near-black reverses the polarity the reference app has, and
+    /// `#444444` is the light-gray slab the 2026-08-17 retune already threw
+    /// out. Ruling (2026-08-20): **leave the fill and let the rim carry it**
+    /// — the same ruling `a_sunken_plate_is_read_from_its_rim` records for
+    /// `inset`.
+    ///
+    /// The two are complementary, and that is the whole reason this holds.
+    /// Neither part clears the floor everywhere on its own:
+    ///
+    /// | | dark desktop | crossover (~60) | white desktop |
+    /// | --- | --- | --- | --- |
+    /// | fill | +8.6 | **0.0** | -28.1 |
+    /// | rim | +29 | +29 | **+5.4** |
+    ///
+    /// Where the fill vanishes the rim is at its strongest, and where the
+    /// rim washes out the fill has opened to 22/255 of separation. So the
+    /// assertion is on the surface, not on either part: at every backdrop
+    /// SOMETHING clears the floor. Asserting the rim alone fails at ground
+    /// 51.0, and asserting the fill alone fails at the crossover — this
+    /// test was written both of those ways first.
+    ///
+    /// Blur helps as well: floating chrome frosts what is behind it, and a
+    /// frosted region reads as a surface at any luminance. It is not
+    /// measurable here, so it is a bonus and never the argument.
+    #[test]
+    fn floating_chrome_is_always_carried_by_something() {
+        let mut worst = (f32::MAX, 0.0f32, 0.0f32, 0.0f32);
+        for g in grounds() {
+            let chrome = over(chrome_glass(), g);
+            let rim = over(border_strong(), chrome);
+            let fill_d = (units(chrome) - units(g)).abs();
+            let rim_d = (units(rim) - units(g)).abs();
+            let carried = fill_d.max(rim_d);
+            if carried < worst.0 {
+                worst = (carried, units(g), fill_d, rim_d);
+            }
+            assert!(
+                carried >= SURFACE_STEP_FLOOR,
+                "floating chrome is invisible on ground {:.1}: fill {fill_d:.1}/255, \
+                 rim {rim_d:.1}/255, floor {SURFACE_STEP_FLOOR}",
+                units(g)
+            );
+        }
+        // Clearance, not fit: the worst backdrop in the sweep must not be
+        // sitting ON the floor. Quoted rather than derived from the floor,
+        // so raising SURFACE_STEP_FLOOR cannot make this pass by moving the
+        // bar it is measured against.
+        assert!(
+            worst.0 >= 8.0,
+            "the worst backdrop leaves chrome at only {:.1}/255 (ground {:.1}, \
+             fill {:.1}, rim {:.1}) — that is the floor, not clearance",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3
+        );
+    }
+
     /// A sunken plate carries no fill, so its rim must carry it alone.
     #[test]
     fn a_sunken_plate_is_read_from_its_rim() {
@@ -1146,6 +1285,44 @@ mod tests {
                 assert!(
                     d >= STATE_DELTA_FLOOR,
                     "{name} moves {d:.1}/255 on ground {:.1}, floor {STATE_DELTA_FLOOR}",
+                    units(g)
+                );
+            }
+        }
+    }
+
+    /// ...and it is one you can tell apart from the OTHER state.
+    ///
+    /// `a_state_change_is_one_you_can_find` measures every wash against the
+    /// ground it sits on and never against its neighbour, so a ladder whose
+    /// rungs all cleared the ground by 13/255 and each other by 2/255 passed
+    /// it clean. That is what shipped: `overlay` at α 0.08 and
+    /// `overlay_strong` at α 0.09 put the hovered row and the SELECTED row
+    /// **2.0/255 apart** — the rail's two most important states, drawn the
+    /// same colour, in the one place a person looks to answer "which session
+    /// am I in?".
+    ///
+    /// The floor is the same one, because the question is the same one: a
+    /// state change the eye can find. Measured on the bright end of the
+    /// sweep, which is the hard end — a white wash over a light ground has
+    /// the least room to move.
+    #[test]
+    fn adjacent_states_are_a_step_apart() {
+        for g in grounds() {
+            let ladder = [
+                ("rest", units(g)),
+                ("overlay", units(over(overlay(), g))),
+                ("overlay_strong", units(over(overlay_strong(), g))),
+                ("overlay_strongest", units(over(overlay_strongest(), g))),
+            ];
+            for w in ladder.windows(2) {
+                let (lo_name, lo) = w[0];
+                let (hi_name, hi) = w[1];
+                assert!(
+                    hi - lo >= STATE_DELTA_FLOOR,
+                    "{lo_name}->{hi_name} is {:.1}/255 on ground {:.1}, floor \
+                     {STATE_DELTA_FLOOR}",
+                    hi - lo,
                     units(g)
                 );
             }
