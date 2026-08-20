@@ -1157,10 +1157,10 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                             match op {
                                 DiffOp::Add => styled
                                     .bg(theme::diff_add_bg())
-                                    .text_color(theme::text_secondary()),
+                                    .text_color(theme::text_secondary_on_wash()),
                                 DiffOp::Del => styled
                                     .bg(theme::diff_del_bg())
-                                    .text_color(theme::text_secondary()),
+                                    .text_color(theme::text_secondary_on_wash()),
                                 DiffOp::Ctx => styled.text_color(theme::text_tertiary()),
                             }
                             .into_any_element(),
@@ -1259,7 +1259,7 @@ fn state_color(state: &str) -> Hsla {
         // but not a fault, so warning and never danger.
         "quiet" | "awaiting_approval" => theme::warning(),
         "unresponsive" | "failed" => theme::danger(),
-        _ => theme::text_tertiary(),
+        _ => theme::text_secondary(),
     }
 }
 
@@ -3050,7 +3050,7 @@ impl Shell {
                         // The pigment the hand-drawn version painted its
                         // border with. Named here, not inherited — gpui
                         // does not cascade colour into an SVG.
-                        theme::text_tertiary(),
+                        theme::text_secondary(),
                         "rail-toggle-glyph",
                     )),
             )
@@ -3089,7 +3089,7 @@ impl Shell {
                     .child(icons::tagged_icon(
                         icons::SIDEBAR_MINIMALISTIC,
                         theme::ICON_TOGGLE,
-                        theme::text_tertiary(),
+                        theme::text_secondary(),
                         "files-toggle-glyph",
                     )),
             )
@@ -3281,7 +3281,7 @@ impl Shell {
                                     .justify_center()
                                     .font_family(theme::MONO)
                                     .text_size(px(theme::MICRO_SIZE))
-                                    .text_color(theme::text_secondary())
+                                    .text_color(theme::text_secondary_on_wash())
                                     .child(SharedString::from(glyph)),
                             )
                             .child(match editing_here {
@@ -3358,7 +3358,7 @@ impl Shell {
                                     .text_color(if is_sel {
                                         theme::text()
                                     } else {
-                                        theme::text_secondary()
+                                        theme::text_secondary_on_wash()
                                     })
                                     .child(SharedString::from(label))
                                     .into_any_element(),
@@ -3381,7 +3381,7 @@ impl Shell {
                             .truncate()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(theme::text_secondary())
                             .child(SharedString::from(rail_meta_line(&info, home.as_deref()))),
                     )
                     // Stage AC: an archived row that is on screen says so,
@@ -3396,7 +3396,7 @@ impl Shell {
                             .truncate()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(theme::text_secondary())
                             .child(SharedString::from(line))
                     }))
                     // Slice K amendment 3: the posture the CLI reported at
@@ -3415,7 +3415,7 @@ impl Shell {
                                 theme::WEIGHT_STRONG
                             })
                             .text_color(if posture_asks {
-                                theme::text_tertiary()
+                                theme::text_secondary()
                             } else {
                                 theme::danger()
                             })
@@ -3434,7 +3434,7 @@ impl Shell {
                             .pl(px(meta_indent))
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(theme::text_secondary())
                             .child(SharedString::from(line))
                     }))
                     // Slice I2: worktree fact line, also full width.
@@ -3446,7 +3446,7 @@ impl Shell {
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
                             .text_color(if wt_present {
-                                theme::text_tertiary()
+                                theme::text_secondary()
                             } else {
                                 theme::warning()
                             })
@@ -3492,7 +3492,7 @@ impl Shell {
                                             .border_color(theme::border())
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
+                                            .text_color(theme::text())
                                             .hover_fade(
                                                 format!("ren-{}", info.session_id),
                                                 theme::wash_rest(),
@@ -3519,7 +3519,7 @@ impl Shell {
                                             .border_color(theme::border())
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
+                                            .text_color(theme::text())
                                             .hover_fade(
                                                 format!("arc-{}", info.session_id),
                                                 theme::wash_rest(),
@@ -3559,7 +3559,7 @@ impl Shell {
                                             .border_color(theme::border())
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
+                                            .text_color(theme::text())
                                             .hover_fade(
                                                 format!("iso-{}", info.session_id),
                                                 theme::wash_rest(),
@@ -3594,7 +3594,7 @@ impl Shell {
                                             .border_color(theme::border())
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
+                                            .text_color(theme::text())
                                             .hover_fade(
                                                 format!("wto-{}", info.session_id),
                                                 theme::wash_rest(),
@@ -3630,7 +3630,7 @@ impl Shell {
                                             .text_color(if armed {
                                                 theme::danger()
                                             } else {
-                                                theme::text_secondary()
+                                                theme::text()
                                             })
                                             .hover_fade(
                                                 format!("wtd-{}", info.session_id),
@@ -3731,7 +3731,7 @@ impl Shell {
                             .border_color(theme::border())
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_secondary())
+                            .text_color(theme::text_secondary_on_wash())
                             .hover_fade("new-session", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, _| {
@@ -3744,7 +3744,7 @@ impl Shell {
                             .child(icons::tagged_icon(
                                 icons::PEN_NEW_SQUARE,
                                 theme::ICON_SM,
-                                theme::text_secondary(),
+                                theme::text_secondary_on_wash(),
                                 "new-session-glyph",
                             ))
                             .child("new"),
@@ -3773,7 +3773,7 @@ impl Shell {
                             .border_color(theme::border())
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(theme::text_secondary())
                             .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -4151,7 +4151,7 @@ impl Shell {
                     .child(icons::tagged_icon(
                         status_icon(f.status),
                         theme::ICON_STATUS,
-                        theme::text_tertiary(),
+                        theme::text_secondary(),
                         format!("file-status-{}", f.path),
                     )),
             )
@@ -4169,14 +4169,14 @@ impl Shell {
                             div()
                                 .min_w(px(0.))
                                 .truncate()
-                                .text_color(theme::text_tertiary())
+                                .text_color(theme::text_secondary())
                                 .child(SharedString::from(dir)),
                         )
                     })
                     .child(
                         div()
                             .flex_none()
-                            .text_color(theme::text_secondary())
+                            .text_color(theme::text_secondary_on_wash())
                             .child(SharedString::from(base)),
                     ),
             )
@@ -4206,7 +4206,7 @@ impl Shell {
                     .font_family(theme::MONO)
                     .text_size(px(theme::SMALL_SIZE))
                     .line_height(px(theme::SMALL_LINE))
-                    .text_color(theme::text_tertiary())
+                    .text_color(theme::text_secondary())
                     .child("—")
                     .into_any_element(),
             })
@@ -4307,7 +4307,7 @@ impl Shell {
             .when(is_sel, |d| {
                 d.font_weight(theme::WEIGHT_LABEL).text_color(theme::text())
             })
-            .when(!is_sel, |d| d.text_color(theme::text_tertiary()))
+            .when(!is_sel, |d| d.text_color(theme::text_secondary()))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.set_files_scope(scope, cx)))
             .child(label)
@@ -5840,7 +5840,7 @@ impl Shell {
             .border_color(theme::border_strong())
             .text_size(px(theme::LABEL_SIZE))
             .line_height(px(theme::LABEL_LINE))
-            .text_color(theme::text_secondary())
+            .text_color(theme::text_secondary_on_wash())
             .hover_fade("overlay-demo", theme::wash_rest(), theme::overlay())
             .cursor_pointer()
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -6126,7 +6126,7 @@ impl Shell {
                                     .border_color(theme::border())
                                     .text_size(px(theme::LABEL_SIZE))
                                     .line_height(px(theme::LABEL_LINE))
-                                    .text_color(theme::text_secondary())
+                                    .text_color(theme::text_secondary_on_wash())
                                     .hover_fade(
                                         "launcher-model",
                                         theme::wash_rest(),
@@ -6473,7 +6473,7 @@ impl Render for Shell {
                                     if has_draft {
                                         theme::on_inverse()
                                     } else {
-                                        theme::text_tertiary()
+                                        theme::text_secondary()
                                     },
                                     "send-glyph",
                                 )),
