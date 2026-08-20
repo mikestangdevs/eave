@@ -642,6 +642,113 @@ fn user_record(seq: u64, text: &str) -> eave_core::journal::Record {
     }
 }
 
+fn tool_started(seq: u64, id: &str, name: &str, input: &str) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseStarted {
+                id: id.into(),
+                name: name.into(),
+                input: input.into(),
+            },
+        },
+    }
+}
+
+fn tool_finished(seq: u64, id: &str, result: &str, is_error: bool) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseFinished {
+                id: id.into(),
+                result: result.into(),
+                is_error,
+            },
+        },
+    }
+}
+
+/// A tool row states what it was asked to do.
+///
+/// Before this slice the transcript rendered `Bash  done`: the parser kept
+/// a `tool_result`'s id and threw away its `content`, and kept a `tool_use`'s
+/// id and name and threw away its `input`. An agent could run the whole test
+/// suite and eave would show you two words, neither of them the command.
+#[gpui::test]
+fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(
+            1,
+            "toolu_1",
+            "Bash",
+            r#"{"command":"cargo test --workspace"}"#,
+        )],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-detail").is_some(),
+        "a running tool row states no command"
+    );
+
+    // ...and a failure states why, in place.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_finished(2, "toolu_1", "error: 3 tests failed", true)],
+    });
+    vcx.run_until_parked();
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).transcript.rows.clone()
+        })
+        .unwrap();
+    let tool = rows
+        .iter()
+        .find_map(|r| match r {
+            eave_wire::model::Row::Tool {
+                input,
+                result,
+                is_error,
+                ..
+            } => Some((input.clone(), result.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("a tool row");
+    assert!(tool.0.contains("cargo test --workspace"), "input dropped");
+    assert_eq!(tool.1, "error: 3 tests failed", "result dropped");
+    assert!(tool.2, "the provider's error flag dropped");
+    assert!(
+        vcx.debug_bounds("tool-detail").is_some(),
+        "the command stopped being stated once the tool finished"
+    );
+}
+
+/// A tool eave has no summary key for states its name and nothing else,
+/// rather than inventing a detail from an arbitrary input field.
+#[gpui::test]
+fn an_unknown_tool_states_no_detail(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(1, "toolu_1", "SomeMcpTool", r#"{"opaque":1}"#)],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-detail").is_none(),
+        "a detail was invented for a tool with no known summary key"
+    );
+}
+
 /// Clicking a row only *requests* a switch — the rail's highlight is a
 /// projection of the feed's actual subscription. And once the feed has
 /// moved on, frames still in flight from the session that just left must

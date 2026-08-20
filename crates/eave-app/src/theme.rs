@@ -800,6 +800,18 @@ pub const MENU_SCREEN_MARGIN: f32 = SPACE_2;
 /// It is deliberately NOT a text tier — a disabled control dims *whole*,
 /// glyph and wash and trailing state together, which is what says "this
 /// control is off" rather than "this text is less important".
+/// How many lines of a FAILED tool's reply the transcript states before it
+/// says how many more there are.
+///
+/// Chosen, not derived, and deliberately small: this block lives inside a
+/// virtualized list, so its height is a row height, and a row whose height
+/// grows with an agent's verbosity is how a transcript stops being able to
+/// promise anything about scrolling. Six lines is enough for a compiler
+/// error's first message or a failed assertion; anything longer is a thing
+/// to open, not a thing to glance at. comet caps its equivalent at 24 and
+/// pays for it with a fold and a measured height, which is the next slice.
+pub const TOOL_ERROR_MAX_LINES: usize = 6;
+
 pub const DISABLED_OPACITY: f32 = 0.35;
 
 // ---------------------------------------------------------------------------

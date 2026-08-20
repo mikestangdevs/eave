@@ -502,7 +502,7 @@ fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<Repai
                     in_flight.insert(id.clone());
                     turn_open = true;
                 }
-                SessionEvent::ToolUseFinished { id } => {
+                SessionEvent::ToolUseFinished { id, .. } => {
                     in_flight.remove(id);
                 }
                 SessionEvent::UserEcho { .. }

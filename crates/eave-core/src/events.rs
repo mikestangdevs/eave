@@ -3,6 +3,49 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The most of one tool payload eave will record, in bytes.
+///
+/// A cap is not optional here. Tool results are the largest thing eave has
+/// ever written per record — a build log or a `Read` of a big file arrives
+/// whole — and the journal is append-only and **replays in full on cold
+/// start** (spec 02), so an uncapped payload makes startup grow with the
+/// agent's verbosity rather than with the conversation's length. comet
+/// reached a 917 KB chat document that was 85% tool text before they capped
+/// theirs.
+///
+/// 8 KiB is **chosen, not derived**: it is comfortably more than any tool
+/// call in the capture corpus and small enough that a thousand of them are
+/// megabytes rather than gigabytes. Measure a real session before moving it.
+pub const TOOL_PAYLOAD_CAP: usize = 8 * 1024;
+
+/// Bound a tool payload, stating what was removed.
+///
+/// The elision is in the MIDDLE on purpose: a command is at the start of its
+/// input and a test run's verdict is at the end of its output, so tail
+/// truncation throws away the half that answers "did it work".
+pub fn cap_payload(s: &str) -> String {
+    if s.len() <= TOOL_PAYLOAD_CAP {
+        return s.to_string();
+    }
+    // Halve the budget either side, then walk back to a char boundary so the
+    // result is never split mid-codepoint.
+    let half = TOOL_PAYLOAD_CAP / 2;
+    let mut head = half;
+    while head > 0 && !s.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = s.len() - half;
+    while tail < s.len() && !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n… {} bytes elided …\n{}",
+        &s[..head],
+        s.len() - head - (s.len() - tail),
+        &s[tail..]
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -22,9 +65,30 @@ pub enum SessionEvent {
     /// A complete assistant text block (the post-stream snapshot message).
     AssistantText { text: String },
     /// A tool call became outstanding. Emitted once per tool id.
-    ToolUseStarted { id: String, name: String },
+    ///
+    /// `input` is the provider's own `input` object re-serialised compactly
+    /// and bounded by [`TOOL_PAYLOAD_CAP`]. It is `#[serde(default)]` because
+    /// every journal written before this field existed lacks it: those
+    /// records still load, and their rows state the tool without stating
+    /// what it was asked to do, which is exactly what they knew.
+    ToolUseStarted {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: String,
+    },
     /// A previously outstanding tool call resolved.
-    ToolUseFinished { id: String },
+    ///
+    /// `result` is the provider's `tool_result.content`, flattened to text
+    /// and bounded the same way; `is_error` is the provider's own flag, not
+    /// an inference from the text.
+    ToolUseFinished {
+        id: String,
+        #[serde(default)]
+        result: String,
+        #[serde(default)]
+        is_error: bool,
+    },
     /// The CLI echoed a user message back (`--replay-user-messages`).
     UserEcho { text: String },
     /// Provider-terminal turn event (`result` line).
@@ -97,4 +161,75 @@ pub enum SessionEvent {
         signal: Option<i32>,
         stderr_tail: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cap elides the MIDDLE and states the byte count.
+    ///
+    /// Tail truncation is the obvious implementation and the wrong one: a
+    /// command is at the start of its input and a test run's verdict is at
+    /// the end of its output, so cutting the tail throws away the half that
+    /// answers "did it work".
+    #[test]
+    fn a_capped_payload_keeps_both_ends_and_says_what_it_dropped() {
+        let short = "cargo test";
+        assert_eq!(cap_payload(short), short, "under the cap, untouched");
+
+        let long: String = std::iter::repeat_n('x', TOOL_PAYLOAD_CAP * 3).collect();
+        let capped = cap_payload(&long);
+        assert!(capped.len() < long.len());
+        assert!(
+            capped.contains("bytes elided"),
+            "an elision that does not state itself is a lie: {capped:.80}"
+        );
+        // Both ends survived.
+        assert!(capped.starts_with('x') && capped.ends_with('x'));
+    }
+
+    /// A multi-byte codepoint must never be split by the cap.
+    #[test]
+    fn the_cap_never_splits_a_character() {
+        // Every char is 4 bytes, so a byte-halving cut lands mid-codepoint
+        // unless it walks back to a boundary.
+        let long: String = std::iter::repeat_n('🙂', TOOL_PAYLOAD_CAP).collect();
+        let capped = cap_payload(&long);
+        assert!(capped.contains("bytes elided"));
+        // The assertion is that this is reachable at all: an invalid split
+        // would have panicked on the slice inside `cap_payload`.
+        assert!(capped.chars().filter(|c| *c == '🙂').count() > 0);
+    }
+
+    /// A journal written before the payload fields existed still loads, and
+    /// says what it knew: the tool ran, and nothing about what it was asked.
+    ///
+    /// This is the whole back-compat contract of the slice. eave replays its
+    /// journal in full on cold start (spec 02), so a format change that
+    /// cannot read yesterday's file is a format change that loses history.
+    #[test]
+    fn a_journal_written_before_this_slice_still_loads() {
+        let old = r#"{"kind":"tool_use_started","id":"toolu_1","name":"Bash"}"#;
+        let ev: SessionEvent = serde_json::from_str(old).expect("old record must load");
+        assert_eq!(
+            ev,
+            SessionEvent::ToolUseStarted {
+                id: "toolu_1".into(),
+                name: "Bash".into(),
+                input: String::new(),
+            }
+        );
+
+        let old = r#"{"kind":"tool_use_finished","id":"toolu_1"}"#;
+        let ev: SessionEvent = serde_json::from_str(old).expect("old record must load");
+        assert_eq!(
+            ev,
+            SessionEvent::ToolUseFinished {
+                id: "toolu_1".into(),
+                result: String::new(),
+                is_error: false,
+            }
+        );
+    }
 }

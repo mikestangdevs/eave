@@ -294,14 +294,14 @@ impl Classifier {
                     self.activity(now_ms);
                     self.settle_approvals(now_ms)
                 }
-                SessionEvent::ToolUseStarted { id, name } => {
+                SessionEvent::ToolUseStarted { id, name, .. } => {
                     self.outstanding.push((id.clone(), name.clone(), now_ms));
                     // A tool call is response output: any pending request
                     // has been answered.
                     self.api_since = None;
                     self.activity(now_ms)
                 }
-                SessionEvent::ToolUseFinished { id } => {
+                SessionEvent::ToolUseFinished { id, .. } => {
                     self.outstanding.retain(|(tid, _, _)| tid != id);
                     self.activity(now_ms)
                 }
@@ -623,6 +623,7 @@ mod tests {
             &provider(SessionEvent::ToolUseStarted {
                 id: "t1".into(),
                 name: "Bash".into(),
+                input: String::new(),
             }),
             1_000,
         );
@@ -640,7 +641,14 @@ mod tests {
         }
         // Tool resolves → running again; quiet clock restarts from there.
         assert_eq!(
-            c.on_record(&provider(SessionEvent::ToolUseFinished { id: "t1".into() }), 700_000),
+            c.on_record(
+                &provider(SessionEvent::ToolUseFinished {
+                    id: "t1".into(),
+                    result: String::new(),
+                    is_error: false,
+                }),
+                700_000
+            ),
             Some(AttentionSnapshot::Running)
         );
         assert_eq!(c.on_tick(700_000 + TH.quiet_after_ms - 1), None);
@@ -743,6 +751,7 @@ mod tests {
             &provider(SessionEvent::ToolUseStarted {
                 id: "toolu_1".into(),
                 name: "Write".into(),
+                input: String::new(),
             }),
             1_000,
         );

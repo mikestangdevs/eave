@@ -3579,16 +3579,47 @@ impl Shell {
                     _ => wrap.into_any_element(),
                 }
             }
-            Row::Tool { id: _, name, status } => {
+            Row::Tool {
+                id: _,
+                name,
+                status,
+                input,
+                result,
+                is_error,
+            } => {
                 let (label, dot) = match status {
                     ToolStatus::Running => ("running…", theme::live()),
+                    ToolStatus::Finished if *is_error => ("failed", theme::danger()),
                     ToolStatus::Finished => ("done", theme::text_ghost()),
                     ToolStatus::Interrupted => ("interrupted", theme::danger()),
                 };
-                div()
-                    .pt(px(theme::SPACE_2))
-                    .pb(px(theme::SPACE_1))
-                    .pl(px(theme::TOOL_INDENT))
+                // What the tool was ASKED to do. Until this slice a row was
+                // the tool's name and a status word, so an agent running
+                // `cargo test --workspace` rendered "Bash  done" — the one
+                // fact an operator is watching for was the one eave threw
+                // away (`stream.rs` kept the id and dropped the input).
+                let detail = eave_wire::model::tool_detail(name, input);
+                // A failed tool states why. A successful one does not: its
+                // output is usually long, usually uninteresting, and always
+                // a row height inside a virtualized list.
+                let failure = (*is_error && !result.trim().is_empty()).then(|| {
+                    let total = result.lines().count();
+                    let mut text = result
+                        .lines()
+                        .take(theme::TOOL_ERROR_MAX_LINES)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if total > theme::TOOL_ERROR_MAX_LINES {
+                        // State the remainder rather than trailing off, the
+                        // way the diff pane states its own cap.
+                        text.push_str(&format!(
+                            "\n… {} more lines",
+                            total - theme::TOOL_ERROR_MAX_LINES
+                        ));
+                    }
+                    text
+                });
+                let head = div()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3609,13 +3640,53 @@ impl Shell {
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(name.clone())),
                     )
+                    .children(detail.map(|d| {
+                        div()
+                            .debug_selector(|| "tool-detail".into())
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::TOOL_NAME_SIZE))
+                            .line_height(px(theme::TOOL_NAME_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(d))
+                    }))
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(if *is_error {
+                                theme::danger()
+                            } else {
+                                theme::text_tertiary()
+                            })
                             .child(label),
-                    )
+                    );
+                div()
+                    .pt(px(theme::SPACE_2))
+                    .pb(px(theme::SPACE_1))
+                    .pl(px(theme::TOOL_INDENT))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACE_1))
+                    .child(head)
+                    .children(failure.map(|f| {
+                        div()
+                            .ml(px(theme::TOOL_INDENT))
+                            .rounded(px(theme::RADIUS_CODE))
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::inset())
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(f))
+                    }))
                     .into_any_element()
             }
             // Slice K: the question itself. Every fact an operator needs

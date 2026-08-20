@@ -266,6 +266,15 @@ impl ClaudeStream {
                                 if self.outstanding.remove(id) {
                                     out.push(SessionEvent::ToolUseFinished {
                                         id: id.to_string(),
+                                        result: tool_result_text(block),
+                                        // The provider's own flag. Never
+                                        // inferred from the text: "error"
+                                        // appears in plenty of successful
+                                        // output.
+                                        is_error: block
+                                            .get("is_error")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false),
                                     });
                                 }
                             }
@@ -300,11 +309,43 @@ impl ClaudeStream {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                // Re-serialised compactly rather than kept verbatim: the
+                // provider's whitespace is not a fact about the tool call,
+                // and a compact form is what the cap is measured against.
+                // A missing `input` is an empty string, not `"null"` — the
+                // row then states the tool and nothing more, which is
+                // accurate.
+                input: block
+                    .get("input")
+                    .filter(|v| !v.is_null())
+                    .map(|v| crate::events::cap_payload(&v.to_string()))
+                    .unwrap_or_default(),
             })
         } else {
             None
         }
     }
+}
+
+/// Flatten a `tool_result` block's content to text, bounded.
+///
+/// The provider sends either a bare string (what every call in the
+/// 2026-08-18 capture corpus does) or the API's array-of-blocks form. Both
+/// are real; the array form keeps only its `text` blocks, joined by
+/// newlines, because an image in a tool result has no text to state and a
+/// row that rendered `[object]` would be worse than one that renders
+/// nothing.
+fn tool_result_text(block: &Value) -> String {
+    let raw = match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    crate::events::cap_payload(&raw)
 }
 
 fn malformed(line: &str, error: String) -> SessionEvent {
