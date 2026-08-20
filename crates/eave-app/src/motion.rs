@@ -1667,8 +1667,8 @@ mod tests {
             ),
             (
                 "the selected rail row",
-                theme::overlay_strong(),
-                theme::overlay_strong(),
+                theme::accent_wash(),
+                theme::accent_wash(),
             ),
             ("an expanded file row", theme::overlay(), theme::overlay()),
             (
@@ -1676,7 +1676,7 @@ mod tests {
                 theme::danger_wash_strong(),
                 theme::danger_wash_hover(),
             ),
-            ("send, armed", theme::inverse(), theme::inverse_hover()),
+            ("send, armed", theme::solid(), theme::solid_hover()),
             (
                 "send, unarmed",
                 theme::overlay_strong(),

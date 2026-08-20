@@ -184,8 +184,12 @@ pub fn tile(
         .h(px(theme::TILE_H))
         .rounded(px(theme::RADIUS_TILE))
         .border_1()
+        // Slice AL: the chosen tile takes the accent rim. Selection reads
+        // the same way here as it does in the rail — a saturated violet on a
+        // bare edge — instead of a slightly-stronger grey hairline that was
+        // 0.14 of white away from the unselected one.
         .border_color(if selected {
-            theme::border_strong()
+            theme::accent()
         } else {
             theme::border()
         })
@@ -202,8 +206,8 @@ pub fn tile(
         .child(icons::icon(p.mark, theme::ICON_MARK_LG, mark_color))
         .child(
             div()
-                .text_size(px(theme::LABEL_SIZE))
-                .line_height(px(theme::LABEL_LINE))
+                .text_size(px(theme::DETAIL_SIZE))
+                .line_height(px(theme::DETAIL_LINE))
                 .text_color(if live {
                     theme::text()
                 } else {

@@ -377,7 +377,7 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     let (widest, _) = resource_line(&fleet, Some(512 * GB)).unwrap();
     assert_eq!(widest, "30 agents · 120.0 GB of 512.0 GB");
     for line in [widest, "2 agents · 0.5 GB of 32.0 GB".to_string()] {
-        let w = real_text_width(&line, ".SystemUIFont", theme::SMALL_SIZE);
+        let w = real_text_width(&line, ".SystemUIFont", theme::MICRO_SIZE);
         assert!(
             w <= room,
             "the resource fact {line:?} needs {w:?} but the rail gives \
@@ -429,7 +429,7 @@ fn every_worktree_fact_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContex
     }
     for state in ["quiet", "unresponsive", "failed"] {
         let word = state_badge(state).unwrap();
-        let w = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
+        let w = real_text_width(word, theme::SANS, theme::MICRO_SIZE);
         assert!(w <= room, "badge {word:?} needs {w:?}, room is {room:?}");
     }
 }
@@ -463,13 +463,13 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
         "dddd4444".to_string(),
     ]);
     assert!(
-        real_text_width(&three, theme::SANS, theme::SMALL_SIZE) > room,
+        real_text_width(&three, theme::SANS, theme::MICRO_SIZE) > room,
         "three sharers should overflow one line — if this ever stops being \
          true the wrap below is untested, not unnecessary"
     );
     let confirm = "2 uncommitted files, 0 unmerged commits \u{2014} delete again to mean it";
     assert!(
-        real_text_width(confirm, theme::SANS, theme::SMALL_SIZE) > room,
+        real_text_width(confirm, theme::SANS, theme::MICRO_SIZE) > room,
         "the armed confirmation does not fit on one line"
     );
 
@@ -1948,7 +1948,7 @@ fn the_posture_line_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContext) 
         "dontAsk",
     ] {
         let text = posture_line(mode);
-        let w = real_text_width(&text, theme::SANS, theme::SMALL_SIZE);
+        let w = real_text_width(&text, theme::SANS, theme::MICRO_SIZE);
         assert!(
             w <= room,
             "the posture fact {text:?} shapes to {w:?} but the rail gives it {room:?}"
@@ -2231,7 +2231,7 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         ("files-toggle", "wash_rest"),
         ("new-session", "wash_rest"),
         ("attn-kill", "danger_wash_hover"),
-        ("send", "inverse_hover"),
+        ("send", "solid_hover"),
         ("to-bottom", "chrome_glass_hover"),
     ] {
         let anchor = format!(r#"debug_selector(|| "{selector}".into())"#);
@@ -2252,18 +2252,36 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
              its bg rather than compositing the neutral wash over it"
         );
     }
-    // Built from a formatted selector, checked at their builder.
-    for (builder, what) in [
-        (r#"format!("rail-{}", info.session_id)"#, "the session row"),
-        (r#"format!("file-{}", f.path)"#, "the file row"),
+    // The two rows whose selector is built from a runtime id are checked by
+    // their hover KEY rather than by proximity to their `debug_selector`.
+    //
+    // **That is stronger than the window search above, and Slice AL is why
+    // it had to be.** The session row was split into a bare leading strip
+    // (selection bar + state mark) and a washed card, so the element that
+    // paints the fade is no longer the element that carries the selector —
+    // and the 1400-character window said "the session row lost its hover
+    // feedback" when nothing of the sort had happened. Proximity in a source
+    // file is not a property. The KEY is: Stage AK's action strip reveals
+    // itself from `motion::hover_t("rail-{sid}")`, so a fade registered
+    // under that exact key is the thing the row's behaviour depends on, no
+    // matter which div paints it.
+    for (key, what) in [
+        (
+            r#".hover_fade(
+                                format!("rail-{}", info.session_id),"#,
+            "the session row",
+        ),
+        (
+            r#".hover_fade(
+                format!("file-{}", f.path),"#,
+            "the file row",
+        ),
     ] {
-        let at = src
-            .find(&format!("debug_selector(|| {builder})"))
-            .unwrap_or_else(|| panic!("{what} is no longer tagged"));
-        let window = &src[at..src.len().min(at + 1400)];
         assert!(
-            window.contains(".hover_fade("),
-            "{what} lost its hover feedback"
+            src.contains(key),
+            "{what} lost the hover fade keyed to its own id — Stage AK's \
+             action strip reads that key, so the fade and the reveal come \
+             apart if it moves"
         );
     }
     // Stage AK: the five rail affordances are built by one constructor, so
@@ -4295,7 +4313,7 @@ fn a_long_title_clips_itself_before_it_crowds_the_badge(cx: &mut TestAppContext)
     // rounding between the shaper and the laid-out box, never for a
     // smaller gap.
     let word = "waiting on you (3)";
-    let need = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
+    let need = real_text_width(word, theme::SANS, theme::MICRO_SIZE);
     assert!(
         badge.size.width >= need - px(1.),
         "the badge got {:?} for a word needing {need:?} — the title took \
@@ -4489,6 +4507,109 @@ fn rail_with_selected(h: &Harness, vcx: &mut VisualTestContext, infos: Vec<Sessi
     h.plumbing.push_rail(infos);
     h.plumbing.push_feed(FeedEvent::Session { id: id.into() });
     vcx.run_until_parked();
+}
+
+/// Slice AL. The rail's hierarchy, measured on the RENDERED boxes rather
+/// than asserted about the constants — a rank that never reaches an element
+/// is a rank that does not exist.
+///
+/// Before this slice a session's name was `DETAIL_SIZE` = 12.0 and the facts
+/// under it `SMALL_SIZE` = 11.0: a 1.09x "hierarchy" on the app's primary
+/// navigation surface, which is why the rail read as one grey block. The
+/// name now takes `NAME_SIZE` and the facts `MICRO_SIZE`.
+///
+/// The 1.3x here is deliberately looser than the 1.45x the two ranks give
+/// (24 px against 15 with the label's hairlines counted), so the test states
+/// "there is a hierarchy you can see" rather than re-deriving the two
+/// constants it is testing — which would pass no matter what they became.
+#[gpui::test]
+fn a_rail_row_says_its_name_louder_than_its_facts(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut only = session("aaaa1111");
+    only.title = Some("the refactor".into());
+    only.permission_mode = Some("default".into());
+    h.plumbing.push_rail(vec![only]);
+    vcx.run_until_parked();
+
+    let h_of = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .size
+            .height
+    };
+    // Both boxes are `.truncate()`d single lines, which is what makes their
+    // laid-out heights comparable: this harness runs a Noop text system by
+    // default, so a WRAPPING fact lays out at whatever advance the stub
+    // returns and its height stops meaning anything. (The posture line does
+    // exactly that — 30 px here for a string that shapes to 152 px of a
+    // 186 px box under real metrics.)
+    let name = h_of(vcx, "label-aaaa1111");
+    let quiet = h_of(vcx, "cwd-aaaa1111");
+    assert!(
+        name >= quiet * 1.3,
+        "the session name lays out {name:?} against the fact under it at \
+         {quiet:?} — that is not a hierarchy, it is a rounding difference"
+    );
+}
+
+/// Slice AL. Selection reads as an accent bar on the row's leading edge,
+/// and the bar is OUTSIDE the washed card on purpose.
+///
+/// That is not decoration. Inside the card, on a selected row's
+/// `overlay_strong` over the brightest ground in the sweep, `danger()`
+/// measures 2.52:1 and `live()` 2.47:1 against the 3:1 a non-text mark owes
+/// its surface — so the row's state dot was under the floor exactly where an
+/// operator looks. The strip puts both marks on the bare frost (3.64:1 and
+/// 3.58:1) with no pigment desaturated, and the selection bar is what the
+/// strip is otherwise for.
+///
+/// `debug_bounds` is the instrument, not a screenshot: the harness cannot
+/// paint, and this asserts geometry and presence, which layout decides.
+#[gpui::test]
+fn selection_is_a_bar_on_the_leading_edge_outside_the_wash(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+
+    let bar = vcx
+        .debug_bounds("sel-bar-aaaa1111")
+        .expect("the selected row draws a selection bar");
+    assert!(
+        vcx.debug_bounds("sel-bar-bbbb2222").is_none(),
+        "an unselected row is drawing a selection bar — then the bar states \
+         nothing"
+    );
+
+    let row = vcx.debug_bounds("rail-aaaa1111").expect("the row renders");
+    let card = vcx
+        .debug_bounds("rail-card-aaaa1111")
+        .expect("the row's washed card renders");
+
+    // The bar is on the row's own leading edge...
+    assert_eq!(
+        bar.origin.x, row.origin.x,
+        "the selection bar is inset from the row's leading edge"
+    );
+    // ...and entirely clear of the card that carries the wash. Clearance,
+    // not adjacency: sharing an edge would put the bar's outer pixels on the
+    // wash, which is the surface it cannot clear.
+    assert!(
+        bar.origin.x + bar.size.width <= card.origin.x - px(theme::SELECTION_BAR_W),
+        "the selection bar ends at {:?} and the washed card starts at {:?} — \
+         the bar has to sit on the bare frost, not on the wash",
+        bar.origin.x + bar.size.width,
+        card.origin.x
+    );
+    // And it is a bar, not a block: shorter than the row it marks.
+    assert!(
+        bar.size.height < row.size.height,
+        "the selection bar is the full height of its row — that is a border \
+         on a card the bar is deliberately outside of"
+    );
 }
 
 /// The slice's first half. `rename` has been complete on the wire since

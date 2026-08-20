@@ -458,8 +458,8 @@ pub fn menu_row(
         .flex_row()
         .items_center()
         .gap(px(theme::MENU_ROW_GAP))
-        .text_size(px(theme::LABEL_SIZE))
-        .line_height(px(theme::LABEL_LINE))
+        .text_size(px(theme::DETAIL_SIZE))
+        .line_height(px(theme::DETAIL_LINE))
         .text_color(if item.enabled {
             theme::text()
         } else {

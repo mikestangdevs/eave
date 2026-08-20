@@ -1226,7 +1226,7 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                         div()
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_tertiary())
                             .truncate()
                             .child(SharedString::from(hunk.header.clone()))
@@ -1240,8 +1240,8 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                         let styled = div()
                             .px(px(theme::SPACE_1))
                             .font_family(theme::MONO)
-                            .text_size(px(theme::DIFF_SIZE))
-                            .line_height(px(theme::DIFF_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .child(SharedString::from(text));
                         children.push(
                             match op {
@@ -1351,6 +1351,35 @@ fn state_color(state: &str) -> Hsla {
         "unresponsive" | "failed" => theme::danger(),
         _ => theme::text_secondary(),
     }
+}
+
+/// A word carried BY a pigment rather than drawn IN it (Slice AL).
+///
+/// The stuck question this answers: `danger()` measures **2.52:1** as text
+/// on a selected rail row and **4.47:1** on an attention plate, both under
+/// the 4.5 a glyph owes its surface — and solving a red for 4.5:1 at those
+/// surfaces produces a pale pink, because WCAG's luminance is 72 % green so
+/// a red pays for its hue twice. A *fill* owes 3:1, and the label on a
+/// bright fill is `theme::on_solid()`, which clears **5.76:1** on `danger`,
+/// 5.66 on `live`, 8.63 on `success` and 9.14 on `warning`. So the pigment
+/// stops being the ink and becomes the plate, at full saturation.
+///
+/// A chip's own FILL is deliberately not held to the 3:1 mark floor: the
+/// fact is in the label, and a label at 5.8:1 identifies the chip without
+/// help from its edge. `every_pigment_clears_the_surface_it_lands_on` states
+/// that carve-out in as many words rather than leaving the chips out
+/// silently.
+fn pigment_chip(pigment: Hsla, word: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(theme::SPACE_1))
+        .rounded(px(theme::RADIUS_CHIP))
+        .bg(pigment)
+        .text_size(px(theme::MICRO_SIZE))
+        .line_height(px(theme::MICRO_LINE))
+        .font_weight(theme::WEIGHT_LABEL)
+        .text_color(theme::on_solid())
+        .child(word.into())
 }
 
 /// Attention badge: only the states the operator may need to act on get a
@@ -3217,8 +3246,13 @@ impl Shell {
                     )),
             )
             .child(
+                // Slice AL: the wordmark was `TITLE_SIZE` = 13.0 — SMALLER
+                // than the 13.5 body text underneath it. A titlebar that
+                // whispers under its own document is not a taste question.
+                // It is a name, so it takes the name rank.
                 div()
-                    .text_size(px(theme::TITLE_SIZE))
+                    .text_size(px(theme::NAME_SIZE))
+                    .line_height(px(theme::NAME_LINE))
                     .font_weight(theme::WEIGHT_LABEL)
                     .text_color(theme::text_secondary())
                     .child("eave"),
@@ -3226,7 +3260,8 @@ impl Shell {
             .children(short.map(|s| {
                 div()
                     .ml_2()
-                    .text_size(px(theme::SMALL_SIZE))
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
                     .text_color(theme::text_tertiary())
                     .child(s)
             }))
@@ -3292,9 +3327,11 @@ impl Shell {
             .into_iter()
             .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
             .collect();
-        // The meta line aligns under the provider label: dot + gap +
-        // chip + gap.
-        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
+        // The meta line aligns under the session's name: chip + gap. The
+        // state dot used to be part of this sum; it now lives in the row's
+        // leading strip, which is exactly `RAIL_STRIP_W` = dot + gap wide,
+        // so every meta line still starts on the same x it always did.
+        let meta_indent = theme::PROVIDER_CHIP + theme::SPACE_2;
         let rows: Vec<AnyElement> = sessions
             .into_iter()
             .map(|info| {
@@ -3378,9 +3415,6 @@ impl Shell {
                     // In-flow children are unaffected, so this changes no
                     // measurement — which the row-height test relies on.
                     .relative()
-                    .px(px(theme::RAIL_CARD_BLEED))
-                    .py(px(theme::SPACE_2))
-                    .rounded(px(theme::RADIUS_BUTTON))
                     // A newly-arrived row fades in (§1.4). Opacity only, and
                     // opacity never participates in layout — the rail's
                     // structure is untouched.
@@ -3388,15 +3422,6 @@ impl Shell {
                         &format!("in:rail-{}", info.session_id),
                         motion::FADE_QUICK,
                     ))
-                    // The selected row keeps its standing fill and takes no
-                    // hover step (Slice M): stated as rest == hovered rather
-                    // than by dropping the fade, so a selection flip under a
-                    // stationary pointer cannot strand a half-faded entry.
-                    .hover_fade(
-                        format!("rail-{}", info.session_id),
-                        if is_sel { theme::overlay_strong() } else { theme::wash_rest() },
-                        if is_sel { theme::overlay_strong() } else { theme::overlay() },
-                    )
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         // Stage AC: selecting anything closes an open
@@ -3408,29 +3433,109 @@ impl Shell {
                         let _ = this.commands.send(Command::Select(sid.clone()));
                     }))
                     .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACE_1))
+                    .flex_row()
+                    .items_stretch()
+                    // Slice AL — the leading strip. The row used to be one
+                    // box: the wash, the state dot and the text all inside
+                    // it. That put the dot on `overlay_strong` whenever its
+                    // row was selected, where `danger()` reads **2.52:1**
+                    // and `live()` **2.47:1** against the 3:1 a mark owes
+                    // its surface. Splitting the row moves both marks onto
+                    // the bare frost (3.64:1 and 3.58:1) with no pigment
+                    // touched, and gives the selection bar the one place in
+                    // the rail where a saturated colour can live.
+                    //
+                    // `RAIL_STRIP_W` is exactly what the dot and its gap
+                    // used to cost inside the card, so nothing to the right
+                    // of it moved by a pixel.
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                // Slice N3: a running session's dot works;
-                                // every other state keeps the solid dot it
-                                // has always had. `quiet`/`failed`/`done`
-                                // are states, not activity — a pulsing
-                                // danger dot would say "still going" over
-                                // a session that is provably dead.
-                                loaders::work_dot(
-                                    theme::STATE_DOT,
-                                    dot,
-                                    phase.filter(|_| info.state == "running"),
+                            .flex_none()
+                            .w(px(theme::RAIL_STRIP_W))
+                            .relative()
+                            .when(is_sel, |d| {
+                                d.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            format!("sel-bar-{}", info.session_id)
+                                        })
+                                        .absolute()
+                                        .left_0()
+                                        .top(px(theme::SELECTION_BAR_INSET))
+                                        .bottom(px(theme::SELECTION_BAR_INSET))
+                                        .w(px(theme::SELECTION_BAR_W))
+                                        .rounded(px(theme::RADIUS_SELECTION_BAR))
+                                        .bg(theme::accent()),
                                 )
-                                .flex_none(),
-                            )
+                            })
                             .child(
+                                // Aligned to the label's own slot rather
+                                // than centred in the row: a row is three
+                                // or four lines deep and a mark floating
+                                // beside its middle reads as unattached.
+                                div()
+                                    .mt(px(theme::SPACE_2))
+                                    .h(px(theme::RAIL_LABEL_SLOT_H))
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .child(
+                                        // Slice N3: a running session's dot
+                                        // works; every other state keeps the
+                                        // solid dot it has always had.
+                                        // `quiet`/`failed`/`done` are states,
+                                        // not activity — a pulsing danger dot
+                                        // would say "still going" over a
+                                        // session that is provably dead.
+                                        loaders::work_dot(
+                                            theme::STATE_DOT,
+                                            dot,
+                                            phase.filter(|_| info.state == "running"),
+                                        )
+                                        .flex_none(),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("rail-card-{}", info.session_id)))
+                            .debug_selector(|| format!("rail-card-{}", info.session_id))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .px(px(theme::RAIL_CARD_BLEED))
+                            .py(px(theme::SPACE_2))
+                            .rounded(px(theme::RADIUS_BUTTON))
+                            // The selected row keeps its standing fill and
+                            // takes no hover step (Slice M): stated as
+                            // rest == hovered rather than by dropping the
+                            // fade, so a selection flip under a stationary
+                            // pointer cannot strand a half-faded entry.
+                            //
+                            // The KEY is still `rail-{sid}` even though the
+                            // element moved, because Stage AK's action strip
+                            // reads that key's hover progress.
+                            // Slice AL: the selected row's standing fill is
+                            // the ACCENT at α .24, not the neutral wash.
+                            // comet carries selection as a saturated colour
+                            // at a third of an alpha and never as grey; the
+                            // alpha is solved rather than copied, because
+                            // `STATE_DELTA_FLOOR` makes eave's ladder the
+                            // stricter of the two.
+                            .hover_fade(
+                                format!("rail-{}", info.session_id),
+                                if is_sel { theme::accent_wash() } else { theme::wash_rest() },
+                                if is_sel { theme::accent_wash() } else { theme::overlay() },
+                            )
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
                                 div()
                                     .size(px(theme::PROVIDER_CHIP))
                                     .flex_none()
@@ -3463,8 +3568,8 @@ impl Shell {
                                     .border_1()
                                     .border_color(theme::border_strong())
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
+                                    .text_size(px(theme::NAME_SIZE))
+                                    .line_height(px(theme::NAME_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
                                     .text_color(theme::text())
                                     // Clicking inside the field is not a
@@ -3513,8 +3618,13 @@ impl Shell {
                                     .border_1()
                                     .border_color(gpui::transparent_black())
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
+                                    // Slice AL: a session's name takes the
+                                    // NAME rank. It was `DETAIL_SIZE` = 12.0
+                                    // over `SMALL_SIZE` = 11.0 metadata —
+                                    // one pixel of hierarchy on the app's
+                                    // primary navigation surface.
+                                    .text_size(px(theme::NAME_SIZE))
+                                    .line_height(px(theme::NAME_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
                                     .text_color(if is_sel {
                                         theme::text()
@@ -3524,15 +3634,16 @@ impl Shell {
                                     .child(SharedString::from(label))
                                     .into_any_element(),
                             })
+                            // Slice AL: the badge is a CHIP now, not a word
+                            // in the state's colour. "failed" drawn in
+                            // `danger()` on the row you are looking at was
+                            // **2.52:1** — the app's loudest fact, illegible
+                            // exactly where it mattered. As a fill carrying
+                            // `on_solid()` it is 5.76:1 and the red stayed
+                            // red.
                             .children(badge.map(|word| {
-                                div()
+                                pigment_chip(dot, word)
                                     .debug_selector(|| format!("badge-{}", info.session_id))
-                                    .flex_none()
-                                    .text_size(px(theme::SMALL_SIZE))
-                                    .line_height(px(theme::SMALL_LINE))
-                                    .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(dot)
-                                    .child(SharedString::from(word))
                             })),
                     )
                     .child(
@@ -3540,8 +3651,8 @@ impl Shell {
                             .debug_selector(|| format!("cwd-{}", info.session_id))
                             .pl(px(meta_indent))
                             .truncate()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(rail_meta_line(&info, home.as_deref()))),
                     )
@@ -3555,8 +3666,8 @@ impl Shell {
                             .debug_selector(|| format!("archived-{}", info.session_id))
                             .pl(px(meta_indent))
                             .truncate()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(line))
                     }))
@@ -3568,8 +3679,14 @@ impl Shell {
                         div()
                             .debug_selector(|| format!("posture-{}", info.session_id))
                             .pl(px(meta_indent))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            // Slice AL: "NEVER ASKS" used to be drawn in
+                            // `danger()`, inside the card, where a selected
+                            // row's wash puts it at 2.52:1 — the app's
+                            // loudest fact at its least legible. Weight and
+                            // case carry it now; the row's state mark in the
+                            // strip is where this row's pigment lives.
                             .font_weight(if posture_asks {
                                 theme::WEIGHT_LABEL
                             } else {
@@ -3578,7 +3695,7 @@ impl Shell {
                             .text_color(if posture_asks {
                                 theme::text_secondary()
                             } else {
-                                theme::danger()
+                                theme::text()
                             })
                             .child(SharedString::from(line))
                     }))
@@ -3593,8 +3710,8 @@ impl Shell {
                         div()
                             .debug_selector(|| format!("shares-{}", info.session_id))
                             .pl(px(meta_indent))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(line))
                     }))
@@ -3606,10 +3723,13 @@ impl Shell {
                             .truncate()
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
+                            // Same ruling as the posture line: a fact
+                            // inside the washed card is neutral ink, because
+                            // `warning()` reads 4.00:1 there.
                             .text_color(if wt_present {
                                 theme::text_secondary()
                             } else {
-                                theme::warning()
+                                theme::text()
                             })
                             .child(SharedString::from(line))
                     }))
@@ -3761,15 +3881,39 @@ impl Shell {
                     })
                     // A standing worktree note: the armed confirmation's
                     // restated counts, or the engine's stated refusal.
+                    //
+                    // Slice AL: the note used to be drawn IN the pigment —
+                    // `warning()` for the armed confirmation, `danger()` for
+                    // the engine's refusal — inside the card, where a
+                    // selected row's wash takes `danger()` to 2.52:1. The
+                    // pigment moved to the note's leading rule, which is a
+                    // non-text mark and clears 3:1, and the sentence itself
+                    // takes the ink the rest of the card uses.
                     .children(note_line.map(|(line, color)| {
                         div()
                             .debug_selector(|| format!("wt-note-{}", info.session_id))
                             .pl(px(meta_indent))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(color)
-                            .child(SharedString::from(line))
-                    }))
+                            .flex()
+                            .flex_row()
+                            .gap(px(theme::SPACE_2))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(theme::QUOTE_BAR_W))
+                                    .rounded(px(theme::QUOTE_BAR_W / 2.0))
+                                    .bg(color),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
+                                    .text_color(theme::text_secondary_on_wash())
+                                    .child(SharedString::from(line)),
+                            )
+                    })),
+                    )
                     .into_any_element()
             })
             .collect();
@@ -3784,8 +3928,8 @@ impl Shell {
                 .child(
                     div()
                         .debug_selector(|| "rail-empty".into())
-                        .text_size(px(theme::SMALL_SIZE))
-                        .line_height(px(theme::SMALL_LINE))
+                        .text_size(px(theme::MICRO_SIZE))
+                        .line_height(px(theme::MICRO_LINE))
                         .text_color(theme::text_tertiary())
                         // Stage AC: "no sessions" over a rail whose
                         // sessions are all filed away is an empty state
@@ -3819,13 +3963,19 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .child(
+                        // Slice AL: the section rank. UPPERCASE and
+                        // WEIGHT_LABEL carry it, because gpui's `TextStyle`
+                        // has no letter-spacing field on this pin and the
+                        // only way to fake tracking is to interleave thin
+                        // spaces into the string — which breaks truncation,
+                        // measurement and copy-out.
                         div()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::SECTION_SIZE))
+                            .line_height(px(theme::SECTION_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
                             .debug_selector(|| "rail-title".into())
                             .text_color(theme::text_tertiary())
-                            .child("sessions"),
+                            .child("SESSIONS"),
                     )
                     .child(
                         div()
@@ -3836,8 +3986,8 @@ impl Shell {
                             .rounded(px(theme::RADIUS_BUTTON))
                             .border_1()
                             .border_color(theme::border())
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_secondary_on_wash())
                             .hover_fade("new-session", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
@@ -3876,8 +4026,8 @@ impl Shell {
                             .rounded(px(theme::RADIUS_BUTTON))
                             .border_1()
                             .border_color(theme::border())
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_secondary())
                             .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
@@ -3934,8 +4084,8 @@ impl Shell {
                     .child(
                         div()
                             .debug_selector(|| "rail-resource".into())
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .font_weight(if over {
                                 theme::WEIGHT_LABEL
                             } else {
@@ -4142,18 +4292,18 @@ impl Shell {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::SECTION_SIZE))
+                            .line_height(px(theme::SECTION_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
                             .debug_selector(|| "files-title".into())
                             .text_color(theme::text_tertiary())
-                            .child("changes"),
+                            .child("CHANGES"),
                     )
                     .children(count_label.map(|n| {
                         div()
                             .debug_selector(|| "files-count".into())
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .font_family(theme::MONO)
                             .text_color(theme::text_tertiary())
                             .child(SharedString::from(n.to_string()))
@@ -4339,7 +4489,7 @@ impl Shell {
                 // changed. See `status_icon` for what the letters became.
                 div()
                     .w(px(theme::FILE_STATUS_W))
-                    .h(px(theme::SMALL_LINE))
+                    .h(px(theme::MICRO_LINE))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -4376,6 +4526,11 @@ impl Shell {
                             .child(SharedString::from(base)),
                     ),
             )
+            // Slice AL: `+12` and `−3` were `success()` and `danger()` as
+            // INK, on a row a hover wash can reach — 4.42:1 and **2.95:1**
+            // against a 4.5 floor. They are the files rail's whole signal,
+            // so they became chips rather than going grey: the pigment is
+            // the plate and `on_solid()` is the digit.
             .child(match counts {
                 Some((adds, dels)) => div()
                     .flex_none()
@@ -4383,25 +4538,15 @@ impl Shell {
                     .flex_row()
                     .gap_1()
                     .font_family(theme::MONO)
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
-                    .child(
-                        div()
-                            .text_color(theme::success())
-                            .child(SharedString::from(adds)),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme::danger())
-                            .child(SharedString::from(dels)),
-                    )
+                    .child(pigment_chip(theme::success(), adds).font_family(theme::MONO))
+                    .child(pigment_chip(theme::danger(), dels).font_family(theme::MONO))
                     .into_any_element(),
                 // Unknowable (binary / oversized): one honest dash.
                 None => div()
                     .flex_none()
                     .font_family(theme::MONO)
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
                     .text_color(theme::text_secondary())
                     .child("—")
                     .into_any_element(),
@@ -4488,8 +4633,8 @@ impl Shell {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(theme::SMALL_SIZE))
-            .line_height(px(theme::SMALL_LINE))
+            .text_size(px(theme::MICRO_SIZE))
+            .line_height(px(theme::MICRO_LINE))
             // One wash, two roles: the selected segment RESTS at
             // `overlay()`, the other rests invisible and fades up to it.
             // So hovering an unselected segment previews exactly what
@@ -4557,8 +4702,8 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
                     .text_color(theme::text_tertiary())
                     .child(
                         div()
@@ -4603,7 +4748,12 @@ impl Shell {
                     .w_full()
                     .rounded(px(theme::RADIUS_PANEL))
                     .border_1()
-                    .border_color(theme::danger_ring())
+                    // Slice AL: the ring was `danger().opacity(0.22)`,
+                    // which composites to **1.4:1** against the plate it
+                    // outlines — a red rim nobody could see. At full
+                    // strength it is 4.47:1, and it is now most of the
+                    // pigment this panel spends.
+                    .border_color(theme::danger())
                     .bg(theme::danger_plate_glass())
                     .shadow(theme::shadow_panel())
                     .px(px(theme::SPACE_3))
@@ -4612,10 +4762,30 @@ impl Shell {
                     .line_height(px(theme::DETAIL_LINE))
                     .text_color(theme::text_secondary())
                     .child(
+                        // A panel heading takes the NAME rank, and its ink
+                        // is neutral: `danger()` as a glyph on this plate is
+                        // 4.47:1, under the floor by 0.03. The pigment is in
+                        // the rim and the dot, where 3:1 applies.
                         div()
-                            .font_weight(theme::WEIGHT_LABEL)
-                            .text_color(theme::danger())
-                            .child("engine unavailable"),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .size(px(theme::STATE_DOT))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(theme::danger()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::NAME_SIZE))
+                                    .line_height(px(theme::NAME_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(theme::text())
+                                    .child("engine unavailable"),
+                            ),
                     )
                     .child(message),
             ))
@@ -4790,8 +4960,8 @@ impl Shell {
                     .items_center()
                     .gap_2()
                     .pb(px(theme::SPACE_2))
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
                     .text_color(theme::text_tertiary())
                     .child(loaders::work_bar(theme::live(), phase))
                     .child(SharedString::from(match elapsed {
@@ -4847,21 +5017,36 @@ impl Shell {
                 .line_height(px(theme::DETAIL_LINE))
                 .text_color(theme::text_secondary())
         };
+        // Slice AL: the heading was drawn IN the state pigment, which
+        // measures 4.47:1 on `danger_plate_glass` and 4.00:1 on a wash —
+        // both under the floor a glyph owes. The dot beside it is a mark and
+        // owes 3:1, which the same pigment clears at 4.47:1, so the pigment
+        // stayed exactly where it could be seen and the words took the NAME
+        // rank in primary ink. A panel heading that was the same size as its
+        // own body text was the other half of the problem.
         let label = |dot: Hsla, text: String, strong: bool| {
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().size(px(theme::STATE_DOT)).rounded_full().bg(dot))
                 .child(
                     div()
+                        .size(px(theme::STATE_DOT))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(dot),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::NAME_SIZE))
+                        .line_height(px(theme::NAME_LINE))
                         .font_weight(if strong {
                             theme::WEIGHT_STRONG
                         } else {
                             theme::WEIGHT_LABEL
                         })
-                        .text_color(dot)
+                        .text_color(theme::text())
                         .child(text),
                 )
         };
@@ -4882,7 +5067,7 @@ impl Shell {
                 };
                 let prominent = held >= PROMINENT_AFTER_MS;
                 panel(
-                    theme::warning_ring(),
+                    theme::warning(),
                     if prominent {
                         theme::warning_plate_strong_glass()
                     } else {
@@ -4900,7 +5085,7 @@ impl Shell {
                 since_ms,
                 zero_samples,
                 sampled_ms,
-            } => panel(theme::danger_ring(), theme::danger_plate_glass())
+            } => panel(theme::danger(), theme::danger_plate_glass())
                 .child(label(
                     theme::danger(),
                     format!(
@@ -4929,7 +5114,7 @@ impl Shell {
                 since_ms,
                 pending,
                 tool,
-            } => panel(theme::warning_ring(), theme::warning_plate_strong_glass())
+            } => panel(theme::warning(), theme::warning_plate_strong_glass())
                 .child(label(
                     theme::warning(),
                     format!(
@@ -4950,7 +5135,7 @@ impl Shell {
                     )
                 }),
             AttentionSnapshot::Failed { since_ms, cause } => {
-                panel(theme::danger_ring(), theme::danger_plate_glass())
+                panel(theme::danger(), theme::danger_plate_glass())
                     .child(label(
                         theme::danger(),
                         format!("failed {} ago", fmt_elapsed(now.saturating_sub(since_ms))),
@@ -4984,10 +5169,15 @@ impl Shell {
                     .py(px(theme::SPACE_1))
                     .rounded(px(theme::RADIUS_BUTTON))
                     .border_1()
-                    .border_color(theme::danger_ring())
+                    .border_color(theme::danger())
                     .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
                     .font_weight(theme::WEIGHT_LABEL)
-                    .text_color(theme::danger())
+                    // Slice AL: the word was `danger()` over a danger wash
+                    // over the plate — 3.9:1, and the rim beside it was
+                    // 1.4:1. The rim is full pigment now and carries the
+                    // button; the word is primary ink on top of it.
+                    .text_color(theme::text())
                     .id("attn-kill")
                     .debug_selector(|| "attn-kill".into())
                     // Slice M (§2.2). Its resting fill is already a
@@ -5009,7 +5199,7 @@ impl Shell {
             )
             .child(
                 div()
-                    .text_size(px(theme::SMALL_SIZE))
+                    .text_size(px(theme::MICRO_SIZE))
                     .text_color(theme::text_tertiary())
                     .child(SharedString::from(note.to_string())),
             )
@@ -5054,8 +5244,8 @@ impl Shell {
                     .bg(theme::raised())
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_2))
-                    .text_size(px(theme::USER_SIZE))
-                    .line_height(px(theme::USER_LINE))
+                    .text_size(px(theme::BODY_SIZE))
+                    .line_height(px(theme::BODY_LINE))
                     .text_color(theme::text())
                     .when(matches!(delivery, Delivery::Pending), |d| d.opacity(0.65))
                     .child(SharedString::from(text.clone()));
@@ -5069,14 +5259,33 @@ impl Shell {
                 match delivery {
                     // The acceptance-critical distinction: journaled but
                     // never reached the agent (spec 02 §Delivery state).
+                    // Slice AL: `danger()` as ink on the content well is
+                    // 4.52:1 — fit, not clearance, and under the 0.35 the
+                    // token→pixel skew costs. The pigment moved to a leading
+                    // rule, where 3:1 applies and it reads 4.52:1 with 1.5
+                    // to spare.
                     Delivery::Undelivered => wrap
                         .child(
                             div()
-                                .text_size(px(theme::SMALL_SIZE))
-                                .line_height(px(theme::SMALL_LINE))
-                                .font_weight(theme::WEIGHT_LABEL)
-                                .text_color(theme::danger())
-                                .child("not delivered — the agent never saw this message"),
+                                .flex()
+                                .flex_row()
+                                .items_stretch()
+                                .gap(px(theme::SPACE_2))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(theme::QUOTE_BAR_W))
+                                        .rounded(px(theme::QUOTE_BAR_W / 2.0))
+                                        .bg(theme::danger()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(theme::MICRO_SIZE))
+                                        .line_height(px(theme::MICRO_LINE))
+                                        .font_weight(theme::WEIGHT_LABEL)
+                                        .text_color(theme::text_secondary())
+                                        .child("not delivered — the agent never saw this message"),
+                                ),
                         )
                         .into_any_element(),
                     _ => wrap.into_any_element(),
@@ -5164,8 +5373,8 @@ impl Shell {
                     .child(
                         div()
                             .font_family(theme::MONO)
-                            .text_size(px(theme::TOOL_NAME_SIZE))
-                            .line_height(px(theme::TOOL_NAME_LINE))
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::DETAIL_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(name.clone())),
@@ -5177,23 +5386,26 @@ impl Shell {
                             .min_w(px(0.))
                             .overflow_hidden()
                             .font_family(theme::MONO)
-                            .text_size(px(theme::TOOL_NAME_SIZE))
-                            .line_height(px(theme::TOOL_NAME_LINE))
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::DETAIL_LINE))
                             .text_color(theme::text_tertiary())
                             .child(SharedString::from(d))
                     }))
-                    .child(
+                    // Slice AL: a failed tool's word is a chip. It was
+                    // `danger()` ink on the content well at 4.52:1 — fit
+                    // rather than clearance — and "failed" is the one word
+                    // in the transcript an operator scans for.
+                    .child(if *is_error {
+                        pigment_chip(theme::danger(), label).into_any_element()
+                    } else {
                         div()
                             .flex_none()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(if *is_error {
-                                theme::danger()
-                            } else {
-                                theme::text_tertiary()
-                            })
-                            .child(label),
-                    );
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(label)
+                            .into_any_element()
+                    });
                 div()
                     .debug_selector(|| "tool-row".into())
                     .pt(px(theme::SPACE_2))
@@ -5248,7 +5460,7 @@ impl Shell {
                                         div()
                                             .font_family(theme::MONO)
                                             .text_size(px(theme::DETAIL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
+                                            .line_height(px(theme::MICRO_LINE))
                                             .text_color(theme::text_secondary())
                                             .child(SharedString::from(body)),
                                     )
@@ -5265,7 +5477,7 @@ impl Shell {
                             .py(px(theme::SPACE_1))
                             .font_family(theme::MONO)
                             .text_size(px(theme::DETAIL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(f))
                     }))
@@ -5303,8 +5515,8 @@ impl Shell {
                         .border_1()
                         .border_color(theme::border())
                         .bg(theme::overlay())
-                        .text_size(px(theme::SMALL_SIZE))
-                        .line_height(px(theme::SMALL_LINE))
+                        .text_size(px(theme::MICRO_SIZE))
+                        .line_height(px(theme::MICRO_LINE))
                         .text_color(theme::text_tertiary())
                         .child(SharedString::from(text.clone())),
                 )
@@ -5362,14 +5574,14 @@ impl Shell {
         let pending = matches!(status, ApprovalStatus::Pending);
         let rid = request_id.to_string();
         let (ring, plate) = if pending {
-            (theme::warning_ring(), theme::warning_plate_strong_glass())
+            (theme::warning(), theme::warning_plate_strong_glass())
         } else {
             (theme::border(), theme::overlay())
         };
         let line = |color: Hsla, text: String| {
             div()
-                .text_size(px(theme::SMALL_SIZE))
-                .line_height(px(theme::SMALL_LINE))
+                .text_size(px(theme::MICRO_SIZE))
+                .line_height(px(theme::MICRO_LINE))
                 .text_color(color)
                 .child(SharedString::from(text))
         };
@@ -5403,11 +5615,16 @@ impl Shell {
                     .items_center()
                     .gap_2()
                     .child(
+                        // Slice AL: an approval card's heading is a NAME,
+                        // and its ink is neutral — `warning()` on this card
+                        // is 4.0:1 once a wash reaches it. The card's ring
+                        // carries the pigment.
                         div()
-                            .text_size(px(theme::DETAIL_SIZE))
+                            .text_size(px(theme::NAME_SIZE))
+                            .line_height(px(theme::NAME_LINE))
                             .font_weight(theme::WEIGHT_STRONG)
                             .text_color(if pending {
-                                theme::warning()
+                                theme::text()
                             } else {
                                 theme::text_secondary()
                             })
@@ -5423,7 +5640,7 @@ impl Shell {
                                 let rid = rid.clone();
                                 move || format!("approval-status-{rid}")
                             })
-                            .text_size(px(theme::SMALL_SIZE))
+                            .text_size(px(theme::MICRO_SIZE))
                             .text_color(theme::text_tertiary())
                             .child(SharedString::from(match status {
                                 ApprovalStatus::Pending => "waiting".to_string(),
@@ -5531,10 +5748,16 @@ impl Shell {
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
             .border_1()
+            // Slice AL: the rim is the pigment (a mark, 3:1 — `live()` and
+            // `danger()` read 4.44:1 on the well) and the word is primary
+            // ink. Drawn IN the pigment, "deny" was 4.52:1 and "approve"
+            // 4.44:1: the two most consequential clicks in the app, both
+            // under the floor.
             .border_color(color)
             .text_size(px(theme::DETAIL_SIZE))
+            .line_height(px(theme::DETAIL_LINE))
             .font_weight(theme::WEIGHT_LABEL)
-            .text_color(color)
+            .text_color(theme::text())
             .child(SharedString::from(word.to_string()))
             .id(id.clone())
             .debug_selector({
@@ -5575,8 +5798,8 @@ impl Shell {
     fn capped_note(text: String) -> gpui::Div {
         div()
             .pt(px(theme::SPACE_1))
-            .text_size(px(theme::SMALL_SIZE))
-            .line_height(px(theme::SMALL_LINE))
+            .text_size(px(theme::MICRO_SIZE))
+            .line_height(px(theme::MICRO_LINE))
             .text_color(theme::text_tertiary())
             .child(SharedString::from(text))
             .debug_selector(|| "md-capped".into())
@@ -5614,7 +5837,7 @@ impl Shell {
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::CHECKBOX))
                             .font_weight(theme::WEIGHT_STRONG)
-                            .text_color(theme::on_inverse())
+                            .text_color(theme::on_solid())
                             .child("✓"),
                     )
                 })
@@ -6105,8 +6328,8 @@ impl Shell {
             .rounded(px(theme::RADIUS_BUTTON))
             .border_1()
             .border_color(theme::border_strong())
-            .text_size(px(theme::LABEL_SIZE))
-            .line_height(px(theme::LABEL_LINE))
+            .text_size(px(theme::DETAIL_SIZE))
+            .line_height(px(theme::DETAIL_LINE))
             .text_color(theme::text_secondary_on_wash())
             .hover_fade("overlay-demo", theme::wash_rest(), theme::overlay())
             .cursor_pointer()
@@ -6369,8 +6592,8 @@ impl Shell {
                             .child(
                                 div()
                                     .debug_selector(|| "launcher-title".into())
-                                    .text_size(px(theme::LAUNCHER_TITLE_SIZE))
-                                    .line_height(px(theme::LAUNCHER_TITLE_LINE))
+                                    .text_size(px(theme::DISPLAY_SIZE))
+                                    .line_height(px(theme::DISPLAY_LINE))
                                     .font_weight(theme::WEIGHT_STRONG)
                                     .text_color(theme::text())
                                     .child("Start a session"),
@@ -6382,8 +6605,8 @@ impl Shell {
                                 // fact about a coding agent's session.
                                 div()
                                     .debug_selector(|| "launcher-cwd".into())
-                                    .text_size(px(theme::SMALL_SIZE))
-                                    .line_height(px(theme::SMALL_LINE))
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
                                     .text_color(theme::text_tertiary())
                                     .child(format!("in {cwd}")),
                             ),
@@ -6433,8 +6656,8 @@ impl Shell {
                                     .rounded(px(theme::RADIUS_BUTTON))
                                     .border_1()
                                     .border_color(theme::border())
-                                    .text_size(px(theme::LABEL_SIZE))
-                                    .line_height(px(theme::LABEL_LINE))
+                                    .text_size(px(theme::DETAIL_SIZE))
+                                    .line_height(px(theme::DETAIL_LINE))
                                     .text_color(theme::text_secondary_on_wash())
                                     .hover_fade(
                                         "launcher-model",
@@ -6458,11 +6681,11 @@ impl Shell {
                                     .px(px(theme::SPACE_4))
                                     .py(px(theme::SPACE_1))
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    .bg(theme::inverse())
-                                    .text_size(px(theme::LABEL_SIZE))
-                                    .line_height(px(theme::LABEL_LINE))
+                                    .bg(theme::solid())
+                                    .text_size(px(theme::DETAIL_SIZE))
+                                    .line_height(px(theme::DETAIL_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(theme::on_inverse())
+                                    .text_color(theme::on_solid())
                                     .cursor_pointer()
                                     .on_click(
                                         cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx)),
@@ -6477,10 +6700,24 @@ impl Shell {
                         div()
                             .debug_selector(|| "launcher-error".into())
                             .max_w(px(theme::LAUNCHER_MAX_W))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::danger())
-                            .child(e.to_string())
+                            .flex()
+                            .flex_row()
+                            .items_stretch()
+                            .gap(px(theme::SPACE_2))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(theme::QUOTE_BAR_W))
+                                    .rounded(px(theme::QUOTE_BAR_W / 2.0))
+                                    .bg(theme::danger()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
+                                    .text_color(theme::text_secondary())
+                                    .child(e.to_string()),
+                            )
                     })),
             )
             .into_any_element()
@@ -6680,7 +6917,7 @@ impl Render for Shell {
                                 run(composer_text.len(), theme::text()),
                                 run(
                                     caret.len(),
-                                    theme::text().opacity(if caret_lit { 1.0 } else { 0.0 }),
+                                    theme::accent().opacity(if caret_lit { 1.0 } else { 0.0 }),
                                 ),
                             ];
                             div()
@@ -6694,7 +6931,12 @@ impl Render for Shell {
                             div()
                                 .flex()
                                 .flex_row()
-                                .child(div().text_color(theme::text()).child("▏"))
+                                // Slice AL: the caret is the accent. It is
+                                // a mark rather than a word, it is the one
+                                // element on screen that is always eave's
+                                // and never the agent's, and it reads 6.76:1
+                                // on the composer's glass.
+                                .child(div().text_color(theme::accent()).child("▏"))
                                 .child(
                                     div()
                                         .text_color(theme::text_tertiary())
@@ -6762,12 +7004,12 @@ impl Render for Shell {
                                 .hover_fade(
                                     "send",
                                     if has_draft {
-                                        theme::inverse()
+                                        theme::solid()
                                     } else {
                                         theme::overlay_strong()
                                     },
                                     if has_draft {
-                                        theme::inverse_hover()
+                                        theme::solid_hover()
                                     } else {
                                         theme::overlay_strongest()
                                     },
@@ -6780,7 +7022,7 @@ impl Render for Shell {
                                     icons::ARROW_UP,
                                     theme::ICON_SM,
                                     if has_draft {
-                                        theme::on_inverse()
+                                        theme::on_solid()
                                     } else {
                                         theme::text_secondary()
                                     },
@@ -6922,8 +7164,8 @@ impl Render for Shell {
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_size(px(theme::SMALL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
                                             .text_color(theme::text_tertiary())
                                             .child(
                                                 div()
@@ -6970,7 +7212,7 @@ impl Render for Shell {
                                                         .border_1()
                                                         .border_color(theme::border_strong())
                                                         .shadow(theme::shadow_panel())
-                                                        .text_size(px(theme::LABEL_SIZE))
+                                                        .text_size(px(theme::DETAIL_SIZE))
                                                         .text_color(theme::text_secondary())
                                                         .id("to-bottom")
                                                         .debug_selector(|| "to-bottom".into())
