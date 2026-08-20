@@ -1474,6 +1474,53 @@ fn archived_line(info: &SessionInfo, show_archived: bool) -> Option<String> {
     })
 }
 
+/// One affordance on a rail row: a hit target, an icon, and nothing else.
+///
+/// The size is stated here rather than in `theme` on purpose, and it is the
+/// one thing in this slice I would move later: `theme.rs` is being reworked
+/// by a concurrent slice and a new constant there would have been a
+/// guaranteed conflict for a value only this call site reads.
+///
+/// 24 px, not the 16 px of the glyph. A 16 px hit target is below every
+/// platform's pointer guidance and these sit inside a 224 px row where a
+/// miss means selecting the session instead of archiving it — the two
+/// outcomes are not close enough for a tight target to be acceptable.
+const ROW_ACTION_HIT: f32 = 24.0;
+
+/// The glyph inside that target. Smaller than `ICON_SM`, and the gap
+/// between the two numbers is the point: these sit in the row's corner
+/// beside text, where a 16 px mark reads as a button and a 13 px one reads
+/// as a hint. The TARGET does not shrink with it — a 13 px hit box would be
+/// well under every platform's pointer guidance, and a miss here selects
+/// the session instead of acting on it.
+const ROW_ACTION_GLYPH: f32 = 13.0;
+
+fn row_action(key: String, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+    let selector = key.clone();
+    let glyph_selector = format!("{key}-glyph");
+    div()
+        .id(SharedString::from(key.clone()))
+        .debug_selector(move || selector.clone())
+        .flex_none()
+        .w(px(ROW_ACTION_HIT))
+        .h(px(ROW_ACTION_HIT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_BUTTON))
+        // Its own wash, keyed to itself: the strip is already riding the
+        // ROW's hover for opacity, and a control that cannot say which of
+        // five is under the pointer is worse than five labelled boxes.
+        .hover_fade(key, theme::wash_rest(), theme::overlay())
+        .cursor_pointer()
+        .child(icons::tagged_icon(
+            glyph,
+            ROW_ACTION_GLYPH,
+            theme::text_secondary(),
+            glyph_selector,
+        ))
+}
+
 /// The rail's archived toggle, stated as a fact plus the action (Stage AC).
 ///
 /// The count is of archived sessions, not of hidden rows, and the wording
@@ -3201,11 +3248,6 @@ impl Shell {
                 let sid_arc = info.session_id.clone();
                 // Stage AC: the row's own facts about being filed away.
                 let archived_word = archived_line(&info, show_archived);
-                let archive_verb = if info.archived {
-                    "unarchive"
-                } else {
-                    "archive"
-                };
                 let archive_to = !info.archived;
                 // The rename field replaces the label IN PLACE, on this
                 // row only. A rail that re-folds while the field is open
@@ -3217,6 +3259,10 @@ impl Shell {
                 div()
                     .id(SharedString::from(format!("rail-{}", info.session_id)))
                     .debug_selector(|| format!("rail-{}", info.session_id))
+                    // The positioning context for Stage AK's action strip.
+                    // In-flow children are unaffected, so this changes no
+                    // measurement — which the row-height test relies on.
+                    .relative()
                     .px(px(theme::RAIL_CARD_BLEED))
                     .py(px(theme::SPACE_2))
                     .rounded(px(theme::RADIUS_BUTTON))
@@ -3463,109 +3509,97 @@ impl Shell {
                     // hover-revealed children need per-row state the
                     // rail deliberately does not keep. The selected row is
                     // the row you are managing.
+                    // Stage AK — the affordances are ICONS, revealed on
+                    // hover, floating over the row's right edge.
+                    //
+                    // They were five bordered text buttons on a line of
+                    // their own, and that line cost every row ~20 px whether
+                    // or not anyone wanted to manage that session. Stage AC
+                    // said so in its own comment and accepted it, because
+                    // "hover-revealed children need per-row state the rail
+                    // deliberately does not keep".
+                    //
+                    // They do not. `motion::hover_t` is keyed, public, and
+                    // the row ALREADY registers `rail-{sid}` for its own
+                    // wash — so the row's hover progress is a value to read,
+                    // not state to invent. Opacity rides the existing
+                    // listener's frame lease, so the idle floor is untouched
+                    // and no new lease exists to leak.
+                    //
+                    // `.absolute()` is the other half: an overlay strip
+                    // costs NO height, so removing the old line makes every
+                    // row shorter and the wrap that R1's fixed-height bug
+                    // taught us to fear cannot happen — there is nothing
+                    // left to wrap.
+                    //
+                    // Mounted only once hover has begun rather than always
+                    // at opacity 0. An invisible control that still takes
+                    // clicks is a trap, and the row's right edge is
+                    // somewhere a person may reasonably click to SELECT.
+                    // `hover_t` is exactly 0 when the pointer is elsewhere,
+                    // so this gate costs one frame at the start of a fade
+                    // and removes the misfire entirely.
                     .when(can_isolate || show_wt_buttons || is_sel, |d| {
-                        d.child(
-                            div()
-                                .pl(px(meta_indent))
-                                .flex()
-                                .flex_row()
-                                // WRAPS. Five affordances cannot fit
-                                // 160 px of row, and R1 already found what
-                                // a non-wrapping fixed row does with
-                                // content it cannot hold: it draws the
-                                // overflow on top of its neighbour.
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(theme::SPACE_2))
-                                .when(is_sel, |d| {
-                                    d.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "ren-{}",
-                                                info.session_id
-                                            )))
-                                            .debug_selector(|| format!("ren-{}", info.session_id))
-                                            .flex_none()
-                                            .px(px(theme::SPACE_2))
-                                            .rounded(px(theme::RADIUS_BUTTON))
-                                            .border_1()
-                                            .border_color(theme::border())
-                                            .text_size(px(theme::SMALL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
-                                            .hover_fade(
+                        let reveal = motion::hover_t(&format!("rail-{}", info.session_id));
+                        d.when(reveal > 0.0, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    // The row's top-right CORNER, not its
+                                    // vertical middle: centred, the strip
+                                    // floats beside the id/path line and
+                                    // reads as part of the row's content.
+                                    // Pinned to the corner it reads as
+                                    // chrome, which is what it is.
+                                    .top(px(theme::SPACE_1))
+                                    .right(px(theme::SPACE_1))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_1))
+                                    .opacity(reveal)
+                                    .when(is_sel, |d| {
+                                        d.child(
+                                            row_action(
                                                 format!("ren-{}", info.session_id),
-                                                theme::wash_rest(),
-                                                theme::overlay(),
+                                                icons::PEN,
                                             )
-                                            .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
                                                 this.begin_rename(sid_ren.clone(), cx);
-                                            }))
-                                            .child("rename"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "arc-{}",
-                                                info.session_id
-                                            )))
-                                            .debug_selector(|| format!("arc-{}", info.session_id))
-                                            .flex_none()
-                                            .px(px(theme::SPACE_2))
-                                            .rounded(px(theme::RADIUS_BUTTON))
-                                            .border_1()
-                                            .border_color(theme::border())
-                                            .text_size(px(theme::SMALL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
-                                            .hover_fade(
+                                            })),
+                                        )
+                                        .child(
+                                            row_action(
                                                 format!("arc-{}", info.session_id),
-                                                theme::wash_rest(),
-                                                theme::overlay(),
+                                                if archive_to {
+                                                    icons::ARCHIVE_MINIMALISTIC
+                                                } else {
+                                                    icons::ARCHIVE_UP_MINIMALISTIC
+                                                },
                                             )
-                                            .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
-                                                // Deliberately NOT a
-                                                // two-step like `delete`.
-                                                // Nothing is destroyed —
-                                                // the same button, one
-                                                // click, brings it back —
-                                                // so a confirmation here
-                                                // would be ceremony with
-                                                // no fact behind it.
+                                                // Deliberately NOT a two-step
+                                                // like `delete`. Nothing is
+                                                // destroyed — the same button,
+                                                // one click, brings it back —
+                                                // so a confirmation here would
+                                                // be ceremony with no fact
+                                                // behind it.
                                                 let _ = this.commands.send(Command::SetArchived {
                                                     id: sid_arc.clone(),
                                                     archived: archive_to,
                                                 });
-                                            }))
-                                            .child(archive_verb),
-                                    )
-                                })
-                                .when(can_isolate, |d| {
-                                    d.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "iso-{}",
-                                                info.session_id
-                                            )))
-                                            .debug_selector(|| format!("iso-{}", info.session_id))
-                                            .flex_none()
-                                            .px(px(theme::SPACE_2))
-                                            .rounded(px(theme::RADIUS_BUTTON))
-                                            .border_1()
-                                            .border_color(theme::border())
-                                            .text_size(px(theme::SMALL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
-                                            .hover_fade(
+                                            })),
+                                        )
+                                    })
+                                    .when(can_isolate, |d| {
+                                        d.child(
+                                            row_action(
                                                 format!("iso-{}", info.session_id),
-                                                theme::wash_rest(),
-                                                theme::overlay(),
+                                                icons::GIT_BRANCH,
                                             )
-                                            .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 // An affordance acts on the
                                                 // row; it does not select it
@@ -3575,69 +3609,27 @@ impl Shell {
                                                 let _ = this
                                                     .commands
                                                     .send(Command::Isolate(sid_iso.clone()));
-                                            }))
-                                            .child("isolate"),
-                                    )
-                                })
-                                .when(show_wt_buttons && wt_present, |d| {
-                                    d.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "wto-{}",
-                                                info.session_id
-                                            )))
-                                            .debug_selector(|| format!("wto-{}", info.session_id))
-                                            .flex_none()
-                                            .px(px(theme::SPACE_2))
-                                            .rounded(px(theme::RADIUS_BUTTON))
-                                            .border_1()
-                                            .border_color(theme::border())
-                                            .text_size(px(theme::SMALL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
-                                            .hover_fade(
+                                            })),
+                                        )
+                                    })
+                                    .when(show_wt_buttons && wt_present, |d| {
+                                        d.child(
+                                            row_action(
                                                 format!("wto-{}", info.session_id),
-                                                theme::wash_rest(),
-                                                theme::overlay(),
+                                                icons::FOLDER,
                                             )
-                                            .cursor_pointer()
                                             .on_click(move |_, _, cx| {
                                                 cx.stop_propagation();
                                                 open_in_system(std::path::Path::new(&wt_path));
-                                            })
-                                            .child("open"),
-                                    )
-                                })
-                                .when(show_wt_buttons, |d| {
-                                    d.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "wtd-{}",
-                                                info.session_id
-                                            )))
-                                            .debug_selector(|| format!("wtd-{}", info.session_id))
-                                            .flex_none()
-                                            .px(px(theme::SPACE_2))
-                                            .rounded(px(theme::RADIUS_BUTTON))
-                                            .border_1()
-                                            .border_color(if armed {
-                                                theme::danger()
-                                            } else {
-                                                theme::border()
-                                            })
-                                            .text_size(px(theme::SMALL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(if armed {
-                                                theme::danger()
-                                            } else {
-                                                theme::text_secondary()
-                                            })
-                                            .hover_fade(
+                                            }),
+                                        )
+                                    })
+                                    .when(show_wt_buttons, |d| {
+                                        d.child(
+                                            row_action(
                                                 format!("wtd-{}", info.session_id),
-                                                theme::wash_rest(),
-                                                theme::overlay(),
+                                                icons::TRASH_BIN_MINIMALISTIC,
                                             )
-                                            .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
                                                 let _ = this.commands.send(
@@ -3646,11 +3638,11 @@ impl Shell {
                                                         force: armed,
                                                     },
                                                 );
-                                            }))
-                                            .child("delete"),
-                                    )
-                                }),
-                        )
+                                            })),
+                                        )
+                                    }),
+                            )
+                        })
                     })
                     // A standing worktree note: the armed confirmation's
                     // restated counts, or the engine's stated refusal.
