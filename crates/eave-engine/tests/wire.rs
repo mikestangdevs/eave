@@ -582,12 +582,41 @@ async fn send_after_terminal_outcome_resumes_same_provider_session() {
     drop(engine);
 }
 
-/// Strict delta-folding (Stage D; spec 03 §Streaming commit): the fake
-/// emits a text delta every 50 ms; the wire must carry at most one
-/// delta-only Events frame per ~120 ms window, each folding several
-/// records — not one frame per record.
+/// Strict delta-folding (Stage D; spec 03 §Streaming commit): the wire
+/// must carry at most one delta-only Events frame per ~120 ms window,
+/// each folding several records — not one frame per record.
+///
+/// **What this test may not measure.** Its first version timed frame
+/// ARRIVALS with `Instant::now()` in the reading loop and required
+/// consecutive delta frames to be ≥90 ms apart with nearly every frame
+/// folding ≥2 records. Both numbers describe things the engine does not
+/// control:
+///
+/// - An arrival timestamp is when this task was *scheduled to read*, not
+///   when the engine sent. On a loaded box the reader stalls, frames
+///   queue in the channel, and two are then dequeued microseconds apart:
+///   measured "58 ms", "32 ms", engine entirely innocent. 25 failures in
+///   48 runs at load ~300 on 2026-08-20, every one of them this.
+/// - "nearly every frame folds ≥2" is the fake agent's 50 ms sleep
+///   divided by the 120 ms window. When load stretches those sleeps past
+///   120 ms, `engine.rs` says the leading edge of a burst after quiet
+///   **flashes through immediately** — so one record per frame is the
+///   documented, correct answer, and the old assertion called it a bug.
+///
+/// So both claims are made from the engine's own record timestamps, which
+/// no amount of client-side scheduling can move:
+///
+/// 1. **The budget.** Frames cannot outpace one per window, however fast
+///    the deltas arrive. Asserted in aggregate over the measured span —
+///    the same 120 ms, not a looser one.
+/// 2. **Non-vacuity.** More records than frames, so folding provably
+///    happened; without it claim 1 passes on a stream too slow to fold.
 #[tokio::test]
 async fn deltas_fold_into_120ms_frames() {
+    /// The window under test (spec 03 §Streaming commit,
+    /// `engine.rs::COALESCE`). Used as the contract, never as a knob.
+    const COALESCE_MS: u64 = 120;
+
     let dir = scratch();
     let engine = EngineProc::spawn(&dir, "slow-stream");
 
@@ -596,13 +625,14 @@ async fn deltas_fold_into_120ms_frames() {
     assert!(c.send("s1", "go").await.expect("send"));
     let mut rx = c.subscribe("s1", None).await.expect("subscribe");
 
-    // Collect ~2s of steady streaming with arrival timestamps.
+    // (records, first ts_ms, last ts_ms, all_deltas) — every timestamp
+    // here was stamped by the engine when the record was appended.
     let mut t = Transcript::new();
-    let mut frames: Vec<(Instant, usize, bool)> = Vec::new(); // (arrival, records, all_deltas)
-    let end = Instant::now() + Duration::from_secs(4);
+    let mut frames: Vec<(usize, u64, u64, bool)> = Vec::new();
+    let end = Instant::now() + Duration::from_secs(8);
     while frames.len() < 12 {
         assert!(Instant::now() < end, "not enough frames: {}", frames.len());
-        let item = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let item = tokio::time::timeout(Duration::from_secs(4), rx.recv())
             .await
             .expect("frame in time")
             .expect("stream open");
@@ -621,37 +651,50 @@ async fn deltas_fold_into_120ms_frames() {
                         }
                     )
                 });
-                frames.push((Instant::now(), records.len(), all_deltas));
+                frames.push((
+                    records.len(),
+                    records.first().unwrap().ts_ms,
+                    records.last().unwrap().ts_ms,
+                    all_deltas,
+                ));
             }
         }
     }
     drop(rx);
 
-    // Steady state: skip the leading edge (replay + turn start), measure
-    // consecutive delta-only frames.
-    let steady: Vec<&(Instant, usize, bool)> = frames.iter().skip(3).filter(|f| f.2).collect();
+    // Steady state: skip the leading edge (replay + turn start), keep the
+    // delta-only frames.
+    let steady: Vec<&(usize, u64, u64, bool)> = frames.iter().skip(3).filter(|f| f.3).collect();
     assert!(
         steady.len() >= 6,
         "expected a steady delta stream, got {}",
         steady.len()
     );
-    let mut folded = 0;
-    for pair in steady.windows(2) {
-        let gap = pair[1].0.duration_since(pair[0].0);
-        assert!(
-            gap >= Duration::from_millis(90),
-            "delta frames only {gap:?} apart — coalesce window not enforced"
-        );
-        if pair[1].1 >= 2 {
-            folded += 1;
-        }
-    }
-    // 50 ms cadence into 120 ms windows: nearly every frame folds ≥2
-    // records (allow one scheduler hiccup).
+
+    // Claim 1: the budget. `span` runs between engine record stamps, and
+    // the emissions that bracket it sit outside it — the window that
+    // produced the first frame opened before its first record was
+    // stamped, and the last frame was sent after its last record was.
+    // That is two windows the span cannot see, so the count is allowed
+    // `span / COALESCE + 2`. One frame per record would need far more:
+    // at the fake's cadence the same span would carry ~2.4x this many.
+    let span_ms = steady.last().unwrap().2 - steady.first().unwrap().1;
+    let ceiling = (span_ms / COALESCE_MS) + 2;
     assert!(
-        folded + 1 >= steady.len() - 1,
-        "frames are not folding deltas: {:?}",
-        steady.iter().map(|f| f.1).collect::<Vec<_>>()
+        steady.len() as u64 <= ceiling,
+        "{} delta frames across {span_ms} ms — more than one per {COALESCE_MS} ms window \
+         (ceiling {ceiling}); counts {:?}",
+        steady.len(),
+        steady.iter().map(|f| f.0).collect::<Vec<_>>()
+    );
+
+    // Claim 2: non-vacuity. A stream too slow to fold would satisfy claim
+    // 1 without the coalescer existing at all.
+    let total: usize = steady.iter().map(|f| f.0).sum();
+    assert!(
+        total > steady.len(),
+        "no frame folded anything, so nothing here tested folding: {:?}",
+        steady.iter().map(|f| f.0).collect::<Vec<_>>()
     );
 
     drop(engine);
