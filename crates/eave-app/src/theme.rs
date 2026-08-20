@@ -567,6 +567,39 @@ pub const ICON_TOGGLE: f32 = 20.0;
 pub const ICON_STATUS: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
+// The launcher (Slice Q2) — eave's rest state.
+//
+// A tile is deliberately WIDER than it is tall and deliberately large: it
+// is the only thing on an otherwise empty screen, and the reference apps'
+// rest states are confident rather than apologetic. The three stacked
+// lines inside it (mark, name, availability) are what makes a tile read as
+// an object rather than a button with a picture on it.
+
+/// One provider tile. 112 x 96 fits six across `LAUNCHER_MAX_W` with
+/// `SPACE_3` gutters and still leaves the strip centred in a 720 px
+/// content column.
+pub const TILE_W: f32 = 112.0;
+pub const TILE_H: f32 = 96.0;
+/// Tile corner. Larger than `RADIUS_CHIP` and smaller than
+/// `RADIUS_COMPOSER`: a tile is a card, not a chip and not a panel.
+pub const RADIUS_TILE: f32 = 10.0;
+/// The gap between tiles, and between the launcher's stacked sections.
+pub const TILE_GAP: f32 = SPACE_3;
+/// The strip's cap: exactly three tiles and two gaps. Six providers
+/// therefore wrap 3+3, which reads as a considered grid; the same six left
+/// to fill the available width wrap 4+2, which reads as a bug.
+pub const STRIP_MAX_W: f32 = TILE_W * 3.0 + TILE_GAP * 2.0;
+pub const LAUNCHER_GAP: f32 = SPACE_6;
+/// The launcher's column. Narrower than `CONTENT_MAX_W` so the strip does
+/// not run the full width of a wide window — a rest state that spans
+/// everything reads as a dashboard, not an invitation.
+pub const LAUNCHER_MAX_W: f32 = 700.0;
+/// The launcher's headline. The largest type in the app, and the only
+/// place eave says its own name.
+pub const LAUNCHER_TITLE_SIZE: f32 = 20.0;
+pub const LAUNCHER_TITLE_LINE: f32 = 26.0;
+
+// ---------------------------------------------------------------------------
 // Provider marks (Slice Q1) — a vendor's own logo, not a glyph.
 //
 // Marks are fills, not strokes, so no weight band applies and these are

@@ -1314,10 +1314,16 @@ fn an_empty_rail_says_it_is_empty_instead_of_showing_bare_glass(cx: &mut TestApp
 fn an_empty_log_states_only_the_kind_of_empty_it_can_prove(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
 
-    // Nothing subscribed at all.
+    // Nothing subscribed at all. Slice Q2 took this case off the note and
+    // gave it to the launcher — "no session selected" was a sentence where
+    // a screen belonged — so the note must be ABSENT here, not present.
     assert!(
-        shown(vcx, "transcript-empty"),
-        "with no session selected the well must say so"
+        shown(vcx, "launcher"),
+        "with no session selected the launcher is the rest state"
+    );
+    assert!(
+        !shown(vcx, "transcript-empty"),
+        "the note and the launcher must never be on screen together"
     );
 
     // Subscribed, and the engine's own count says the journal is empty.
@@ -1683,9 +1689,18 @@ fn a_hover_under_reduced_motion_asks_for_no_frames_at_all(cx: &mut TestAppContex
 #[gpui::test]
 fn the_empty_note_enters_once_and_does_not_replay_on_later_frames(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    // Q2: a bare boot is the LAUNCHER now, so the note has to be summoned
+    // by its own case — a selected session whose journal the engine says
+    // is empty.
+    let mut fresh = session("aaaa1111");
+    fresh.last_seq = 0;
+    h.plumbing.push_rail(vec![fresh]);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    vcx.run_until_parked();
     assert!(
         shown(vcx, "transcript-empty"),
-        "no session is selected, so the note should be on screen"
+        "a selected session with an empty journal should show the note"
     );
 
     // 500 ms at a 10 ms step ≈ 50 frames. Literal, as above.
@@ -1826,6 +1841,11 @@ fn an_entrance_that_rises_moves_itself_and_nothing_else(cx: &mut TestAppContext)
 #[gpui::test]
 fn the_caret_blink_never_moves_a_pixel_of_the_composer(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    // Q2: the composer is not mounted at the launcher — a draft typed with
+    // no session has nothing to be addressed to — so this needs a session
+    // before there is a composer to measure.
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(10));
 
     vcx.simulate_input(
@@ -2752,6 +2772,9 @@ fn the_overlay_moves_nothing_it_floats_over(cx: &mut TestAppContext) {
     let (h, vcx) = boot_with_overlay(cx);
     h.plumbing
         .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    // Q2: `composer-hint` is one of the probes below, and the composer is
+    // only mounted once a session is selected.
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
 
@@ -2896,5 +2919,283 @@ fn reduced_motion_gets_a_menu_with_no_travel_at_all(cx: &mut TestAppContext) {
         !shown(vcx, "overlay-menu"),
         "a dismissed menu stayed mounted with no exit to play — an \
          invisible surface still occluding the shell"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice Q2 — the launcher.
+//
+// The tests worth having here are the ones that catch a launcher becoming
+// a mock-up: a tile that claims to work when the engine would refuse it, a
+// button that emits nothing, a model choice that does not reach the
+// command, or a rest state that quietly costs frames forever.
+
+/// The rest state exists, and it is the launcher rather than a sentence.
+///
+/// Before Q2 this could not be tested at all — `ui.rs`'s connection loop
+/// opened a session by itself on an empty engine, so "no session" was a
+/// frame or two at boot and nothing a person would ever see.
+#[gpui::test]
+fn a_bare_boot_lands_on_the_launcher(cx: &mut TestAppContext) {
+    let (_h, vcx) = boot(cx);
+    assert!(shown(vcx, "launcher"), "boot with no session shows nothing");
+    assert!(shown(vcx, "launcher-title"));
+    assert!(shown(vcx, "provider-strip"));
+    assert!(shown(vcx, "launcher-start"));
+    // Where it will run, stated before it runs.
+    assert!(shown(vcx, "launcher-cwd"));
+    for ix in 0..crate::launcher::PROVIDERS.len() {
+        assert!(
+            vcx.debug_bounds(Box::leak(format!("provider-tile-{ix}").into_boxed_str()))
+                .is_some(),
+            "tile {ix} did not render",
+        );
+    }
+}
+
+/// The launcher is an OVERLAY, never a row — the same rule the empty note
+/// and the P1 surface hold to. A virtualized list caches a measure per
+/// row, and a row whose height depends on anything but its own identity
+/// leaves a stale measure that moves the scroll anchor.
+#[gpui::test]
+fn the_launcher_never_becomes_a_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(shown(vcx, "launcher"));
+    let items = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).list.item_count()
+        })
+        .unwrap();
+    assert_eq!(items, 1, "the launcher took a row in the virtualized list");
+}
+
+/// A session arriving replaces the launcher, and the two are never on
+/// screen together.
+#[gpui::test]
+fn a_session_replaces_the_launcher(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(shown(vcx, "launcher"));
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "launcher"), "the launcher outlived its session");
+
+    // ...and going back to the launcher clears the transcript with it: a
+    // dead session's rows sitting under a live launcher would be the
+    // nastiest version of this bug, because it looks like it works.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "something to leave behind")],
+    });
+    vcx.run_until_parked();
+    h.plumbing.push_feed(FeedEvent::NoSession { error: None });
+    vcx.run_until_parked();
+    assert!(shown(vcx, "launcher"));
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).display.len()
+        })
+        .unwrap();
+    assert_eq!(rows, 0, "the previous session's rows survived the launcher");
+}
+
+/// **The strip cannot claim more than the engine will accept.**
+///
+/// A live tile takes the click; a dead one does not — no handler at all,
+/// so the selection does not move. This is the launcher's whole honesty
+/// property: `launcher::is_live` reads
+/// `eave_core::session::POSTURE_VERIFIED_PROVIDERS`, the same constant the
+/// engine refuses on, so a tile that looks clickable is one that starts.
+#[gpui::test]
+fn a_provider_with_no_adapter_takes_no_click(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let picked = |vcx: &mut VisualTestContext| {
+        vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.provider)
+            .unwrap()
+    };
+    let live: Vec<usize> = crate::launcher::PROVIDERS
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| crate::launcher::is_live(p))
+        .map(|(ix, _)| ix)
+        .collect();
+    let dead: Vec<usize> = (0..crate::launcher::PROVIDERS.len())
+        .filter(|ix| !live.contains(ix))
+        .collect();
+    assert!(!dead.is_empty(), "nothing to prove if every tile is live");
+
+    let before = picked(vcx);
+    for ix in dead {
+        click(vcx, Box::leak(format!("provider-tile-{ix}").into_boxed_str()));
+        vcx.run_until_parked();
+        assert_eq!(
+            picked(vcx),
+            before,
+            "clicking tile {ix} moved the selection, but eave cannot start it",
+        );
+    }
+}
+
+/// Start emits the command, carrying the chosen provider and — by default
+/// — **no model at all**, which is not the same as an empty one.
+#[gpui::test]
+fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert_eq!(cmds.len(), 1, "start emitted {} commands", cmds.len());
+    match &cmds[0] {
+        Command::Launch { provider, model } => {
+            assert_eq!(provider, "claude-code");
+            assert_eq!(*model, None, "eave invented a model nobody chose");
+        }
+        other => panic!("start emitted {other:?}"),
+    }
+}
+
+/// The launcher is the overlay layer's first product consumer: the model
+/// picker is a real P1 popup, and what it chooses reaches the command.
+#[gpui::test]
+fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    click(vcx, "launcher-model");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "overlay-menu"), "the model menu never opened");
+
+    // Row 1 — row 0 is the CLI's own default, which is the state we are
+    // trying to move away from.
+    click(vcx, "menu-row-1");
+    vcx.run_until_parked();
+    // The exit has to PLAY before the next click can land. P1's surface
+    // stays mounted and occluding for the whole 100 ms exit, so a click on
+    // "start" during it hits the catcher and does nothing — which is the
+    // designed behaviour, and which cost this test a run to remember.
+    drive(&h, vcx, Duration::from_millis(16));
+    let chosen = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
+        .unwrap();
+    assert_eq!(chosen, Some("opus"));
+
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+    match &h.drain()[0] {
+        Command::Launch { model, .. } => assert_eq!(model.as_deref(), Some("opus")),
+        other => panic!("start emitted {other:?}"),
+    }
+}
+
+/// **A model alias belongs to one CLI's vocabulary.** Switching provider
+/// clears it rather than carrying `opus` to a vendor that has never heard
+/// of it — eave does not validate models (P2 caveat 5), so the flag would
+/// travel all the way to a child process before anything complained.
+///
+/// Skipped rather than faked if a second provider is ever live: the test
+/// needs two live tiles, and inventing one would defeat the honesty this
+/// whole slice is built on.
+#[gpui::test]
+fn switching_provider_clears_a_model_it_would_not_understand(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    click(vcx, "launcher-model");
+    vcx.run_until_parked();
+    click(vcx, "menu-row-1");
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
+            .unwrap(),
+        Some("opus"),
+    );
+
+    // No second live provider exists today, so drive the state directly —
+    // the clearing rule lives in `pick_provider`, and this reaches it the
+    // same way a click would.
+    h.window
+        .update(vcx, |shell, _, cx| shell.pick_provider(1, cx))
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
+            .unwrap(),
+        None,
+        "a model alias survived a provider switch",
+    );
+}
+
+/// The engine's refusal is stated on the screen that asked for it.
+#[gpui::test]
+fn a_refused_launch_states_the_engines_own_words(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(!shown(vcx, "launcher-error"));
+    h.plumbing.push_feed(FeedEvent::NoSession {
+        error: Some("provider \"codex\" is not posture-verified".into()),
+    });
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "launcher-error"),
+        "a refused launch said nothing at all",
+    );
+}
+
+/// N4's floor, applied to the rest state: **a launcher sitting there costs
+/// nothing.** This is the one that would catch the launcher becoming a
+/// window pinned at the display rate for the life of every idle eave.
+#[gpui::test]
+fn a_settled_launcher_asks_for_no_frames(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let entering = drive(&h, vcx, Duration::from_millis(16));
+    assert!(entering > 0, "the launcher's entrance never asked for a frame");
+    assert!(shown(vcx, "launcher"));
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0,
+        "a settled launcher is still asking for frames",
+    );
+    assert!(
+        !clock_running(vcx),
+        "the launcher leased the pulse clock — nothing here repeats",
+    );
+}
+
+/// Escape closes the model menu and leaves the launcher standing. The menu
+/// owns the whole keyboard while it is open (P1), and the thing it must
+/// not do is take the launcher down with it.
+#[gpui::test]
+fn escape_closes_the_model_menu_and_not_the_launcher(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    click(vcx, "launcher-model");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "overlay-menu"));
+    vcx.simulate_keystrokes("escape");
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(!shown(vcx, "overlay-menu"), "escape did not dismiss the menu");
+    assert!(shown(vcx, "launcher"), "escape took the launcher with it");
+}
+
+/// **No session, no composer.** The rest loop drops a `Send` — holding it
+/// to replay into whatever session opens next would be worse than losing
+/// it — so an input box that silently eats what you type is the one thing
+/// the launcher must not put on screen.
+///
+/// This is a defect the first build of Q2 shipped: the launcher rendered
+/// over a live "Message eave…" field, and only a window capture showed it.
+#[gpui::test]
+fn the_launcher_shows_no_composer_to_type_into(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(shown(vcx, "launcher"));
+    assert!(
+        !shown(vcx, "composer-hint"),
+        "the launcher offered a composer with no session to send to",
+    );
+
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "launcher"));
+    assert!(
+        shown(vcx, "composer-hint"),
+        "the composer did not come back with the session",
     );
 }
