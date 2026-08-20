@@ -6,7 +6,14 @@
      CFBundleIdentifier is load-bearing and effectively permanent: macOS keys
      preferences, Keychain items, TCC grants (accessibility, screen capture)
      and notarization records off it. Changing it later orphans every one of
-     those on machines that already ran an older build. -->
+     those on machines that already ran an older build.
+
+     `sh.eave.app` — chosen 2026-08-20 against the eave.sh domain, product
+     first rather than org first, matching the convention comet uses for
+     zeron.sh. The earlier placeholder was com.summitpoint.eave, reversed
+     from the address on the repo; nothing ever shipped under it and the
+     LaunchServices registrations and prefs plist that this project's own
+     launch testing created were removed before the change. -->
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
@@ -18,7 +25,7 @@
     <key>CFBundleIconFile</key>
     <string>eave.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>com.summitpoint.eave</string>
+    <string>sh.eave.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
