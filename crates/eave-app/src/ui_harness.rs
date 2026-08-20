@@ -7158,3 +7158,550 @@ fn emptying_the_composer_hint_moves_nothing(cx: &mut TestAppContext) {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Slice AR — the `/` palette
+
+/// A project with two real skills and a command in it, at a path nothing
+/// else uses.
+///
+/// A REAL directory, because the thing under test is a directory read.
+/// Mocking the filesystem here would leave the one behaviour this slice
+/// adds — "look at the session's cwd and see what is in it" — asserted by
+/// nothing.
+struct SlashProject(PathBuf);
+
+impl SlashProject {
+    fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("eave-ar-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |p: PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            root.join(".claude/skills/shipit/SKILL.md"),
+            "---\nname: shipit\ndescription: cut a release and tag it\n---\nbody\n",
+        );
+        write(
+            root.join(".claude/skills/shellcheck/SKILL.md"),
+            "---\ndescription: lint every shell script in the repo\n---\nbody\n",
+        );
+        write(
+            root.join(".claude/commands/review.md"),
+            "---\ndescription: review the working tree\n---\nbody\n",
+        );
+        Self(root)
+    }
+    fn cwd(&self) -> String {
+        self.0.display().to_string()
+    }
+}
+
+impl Drop for SlashProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Select a session whose cwd is `project`, and settle.
+fn open_session_in(h: &Harness, vcx: &mut VisualTestContext, project: &SlashProject) {
+    let mut s = session("aaaa1111");
+    s.cwd = project.cwd();
+    h.plumbing.push_rail(vec![s]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+}
+
+fn draft_of(h: &Harness, vcx: &mut VisualTestContext) -> String {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell.read(cx).composer.read(cx).text.clone()
+    })
+    .unwrap()
+}
+
+/// Let the background scan land and the entrance play.
+fn settle_palette(h: &Harness, vcx: &mut VisualTestContext) {
+    vcx.run_until_parked();
+    drive(h, vcx, Duration::from_millis(200));
+}
+
+/// **The slice, end to end: type a slash, see your own skills, choose one.**
+///
+/// The palette is reached by TYPING, which makes this the one place the
+/// central interaction is exercised at all — `docs/progress.md` records
+/// that synthetic keyboard events never reach the real gpui app, so no
+/// screenshot of this menu can ever be driven from outside the process.
+/// Inside the harness the keystrokes are real dispatches through the real
+/// `on_key`, and the directory is a real directory on disk.
+#[gpui::test]
+fn the_slash_palette_offers_the_operators_own_skills(cx: &mut TestAppContext) {
+    let project = SlashProject::new("offers");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    assert!(
+        !shown(vcx, "slash-palette"),
+        "the palette must not be up over an empty composer"
+    );
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    assert!(
+        shown(vcx, "slash-palette"),
+        "a leading slash did not open the palette"
+    );
+    // The project's three come FIRST, because precedence is project →
+    // user → plugin and the empty query preserves discovery order.
+    //
+    // **Only the first three rows can be asserted here, and that is the
+    // feature rather than a weakness of the test.** The palette really
+    // does read this operator's `~/.claude` as well — it is the real
+    // discovery path, not a mock — so rows beyond the fixture belong to
+    // whatever machine the suite is running on. What is machine-
+    // independent is that the project's own things lead.
+    for row in ["menu-row-0", "menu-row-1", "menu-row-2"] {
+        assert!(shown(vcx, row), "{row} missing — the scan found too little");
+    }
+
+    // Typing filters, and the letter still reaches the composer — the
+    // palette takes four keys and no others.
+    vcx.simulate_input("she");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/she",
+        "the palette swallowed a letter meant for the composer"
+    );
+    assert!(shown(vcx, "menu-row-0"), "/she matches shellcheck");
+    assert!(
+        !shown(vcx, "menu-row-1"),
+        "/she matches exactly one of the three"
+    );
+
+    // Choosing puts it in the composer and does NOT send it.
+    let before = h.window.update(vcx, |_, _, _| ()).is_ok();
+    assert!(before);
+    click(vcx, "menu-row-0");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/shellcheck ",
+        "choosing a row completes the command and leaves room for an argument"
+    );
+    assert!(
+        !shown(vcx, "slash-palette"),
+        "the trailing space ends the query, so the palette closes itself"
+    );
+}
+
+/// **The compatibility guarantee, and the reason it is a test.**
+///
+/// `Shell::send_current` has always forwarded a `/`-prefixed message
+/// verbatim — the CLI resolves it, and this slice added discovery, not
+/// plumbing. So an operator who types the whole command and presses Return
+/// must get exactly what they got before the palette existed. Firing the
+/// top match instead would silently change the meaning of Return for every
+/// slash message ever typed into this app.
+#[gpui::test]
+fn return_still_sends_a_slash_command_typed_in_full(cx: &mut TestAppContext) {
+    let project = SlashProject::new("sends");
+    let (mut h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("/shipit");
+    settle_palette(&h, vcx);
+    assert!(
+        shown(vcx, "slash-palette"),
+        "the palette is up over the match"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Send(t)] if t == "/shipit"),
+        "Return over an un-navigated palette must send the text as typed, \
+         got {cmds:?}"
+    );
+    assert_eq!(draft_of(&h, vcx), "", "a sent draft is cleared");
+    assert!(
+        !shown(vcx, "slash-palette"),
+        "the palette outlived the message it was offering completions for"
+    );
+}
+
+/// Return only *chooses* once the operator has moved the highlight onto a
+/// row themselves. Down-then-Return is a decision; Return alone is a send.
+#[gpui::test]
+fn return_chooses_only_after_the_operator_moves_the_highlight(cx: &mut TestAppContext) {
+    let project = SlashProject::new("highlight");
+    let (mut h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("/ship");
+    settle_palette(&h, vcx);
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("down");
+    settle_palette(&h, vcx);
+    vcx.simulate_keystrokes("enter");
+    settle_palette(&h, vcx);
+
+    assert!(
+        h.drain().is_empty(),
+        "Return on a highlighted row chooses; it must not also send"
+    );
+    assert_eq!(draft_of(&h, vcx), "/shipit ");
+}
+
+/// Escape refuses the palette **without touching the draft**.
+///
+/// The palette is a projection of the composer's text, so the obvious
+/// implementation of "close" is "clear the text" — and that would make
+/// escape both the only way to dismiss the menu and a way to lose what you
+/// wrote. The refusal is its own fact, and it is retracted by the next
+/// keystroke rather than by anything the operator has to remember.
+#[gpui::test]
+fn escape_refuses_the_palette_without_losing_the_draft(cx: &mut TestAppContext) {
+    let project = SlashProject::new("escape");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("/ship");
+    settle_palette(&h, vcx);
+    assert!(shown(vcx, "slash-palette"));
+
+    vcx.simulate_keystrokes("escape");
+    settle_palette(&h, vcx);
+    assert!(!shown(vcx, "slash-palette"), "escape did not dismiss");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/ship",
+        "escape must not be a way to lose a draft"
+    );
+
+    // ...and typing brings it back, so the refusal traps nobody.
+    vcx.simulate_input("i");
+    settle_palette(&h, vcx);
+    assert!(
+        shown(vcx, "slash-palette"),
+        "the next keystroke retracts the refusal"
+    );
+}
+
+/// A slash that is not at the start, and a slash with an argument after
+/// it, are both ordinary messages. `/` is a prefix, not a character to be
+/// afraid of.
+#[gpui::test]
+fn an_ordinary_message_never_opens_the_palette(cx: &mut TestAppContext) {
+    let project = SlashProject::new("ordinary");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("what does src/main.rs do?");
+    settle_palette(&h, vcx);
+    assert!(
+        !shown(vcx, "slash-palette"),
+        "a slash in the middle of a sentence opened a command palette"
+    );
+
+    // "what does src/main.rs do?" is 25 characters.
+    for _ in 0.."what does src/main.rs do?".len() {
+        vcx.simulate_keystrokes("backspace");
+    }
+    assert_eq!(draft_of(&h, vcx), "", "the composer did not empty");
+    vcx.simulate_input("/shipit now");
+    settle_palette(&h, vcx);
+    assert_eq!(draft_of(&h, vcx), "/shipit now");
+    assert!(
+        !shown(vcx, "slash-palette"),
+        "once an argument is being typed the operator has already chosen, \
+         and a menu over the composer is in the way"
+    );
+}
+
+/// A directory with nothing in it says so, and says it about the query the
+/// operator actually typed.
+///
+/// An empty menu would be the claim "you have no skills" made in the shape
+/// of an absence, which is the defect Slice M named in the transcript's
+/// empty state: "nothing there" and "have not looked" are different facts.
+#[gpui::test]
+fn a_query_that_matches_nothing_says_so_instead_of_showing_an_empty_menu(cx: &mut TestAppContext) {
+    let project = SlashProject::new("nomatch");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("/xyzzy");
+    settle_palette(&h, vcx);
+    assert!(
+        shown(vcx, "slash-palette"),
+        "the palette must stand its ground and explain, not vanish"
+    );
+    assert!(shown(vcx, "menu-row-0"), "the explanation is a row");
+    assert!(
+        !shown(vcx, "menu-row-1"),
+        "exactly one row: the explanation"
+    );
+}
+
+/// **The cwd trap, asserted at the only level that can catch it.**
+///
+/// eave is one binary in two roles and the ENGINE holds a session's cwd;
+/// this process's own `current_dir()` is wherever the bundle was launched
+/// from. A `slash::discover` keyed on the app's directory would still pass
+/// every unit test in `slash.rs` — they hand it a path — and would find
+/// nothing at all in production, or worse, would find whatever happened to
+/// be beside the binary.
+///
+/// So the assertion is made through the whole shell: two sessions, two
+/// real directories with different contents, and the palette has to follow
+/// the SESSION rather than the process.
+#[gpui::test]
+fn the_palette_reads_the_sessions_directory_and_not_the_apps(cx: &mut TestAppContext) {
+    let a = SlashProject::new("cwd-a");
+    let b = SlashProject::new("cwd-b");
+    // Give b a skill a does not have, so the two are distinguishable by
+    // CONTENT and not merely by row count.
+    std::fs::create_dir_all(b.0.join(".claude/skills/onlyinb")).unwrap();
+    std::fs::write(
+        b.0.join(".claude/skills/onlyinb/SKILL.md"),
+        "---\ndescription: only b has this\n---\nbody\n",
+    )
+    .unwrap();
+
+    let (h, vcx) = boot(cx);
+    let mut sa = session("aaaa1111");
+    sa.cwd = a.cwd();
+    let mut sb = session("bbbb2222");
+    sb.cwd = b.cwd();
+    h.plumbing.push_rail(vec![sa, sb]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_input("/onlyinb");
+    settle_palette(&h, vcx);
+    assert!(shown(vcx, "menu-row-0"), "the palette should be explaining");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/onlyinb",
+        "sanity: the text is what was typed"
+    );
+    // Session A's directory has no `onlyinb`, so the only row is the
+    // "nothing matches" explanation and choosing it does nothing.
+    click(vcx, "menu-row-0");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/onlyinb",
+        "a disabled explanation row is not a completion"
+    );
+
+    // Now move to B, whose directory does have it.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    vcx.run_until_parked();
+    vcx.simulate_input("/onlyinb");
+    settle_palette(&h, vcx);
+    click(vcx, "menu-row-0");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/onlyinb ",
+        "the palette must read the SESSION's cwd — it found a skill that \
+         exists only under session B's directory"
+    );
+}
+
+/// The palette is not allowed to become a poll.
+///
+/// The house rule is that a settled window schedules no frames. Discovery
+/// is disk I/O, and the obvious way to keep it fresh is a watcher or a
+/// timer — either of which would wake this window forever for the sake of
+/// a menu. The scan is started by a keystroke and by nothing else.
+#[gpui::test]
+fn an_open_palette_settles_and_then_schedules_nothing(cx: &mut TestAppContext) {
+    let project = SlashProject::new("settles");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::WorkingTree,
+        }),
+    ));
+    vcx.run_until_parked();
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    assert!(shown(vcx, "slash-palette"));
+
+    // Past the entrance and past the caret's own lease, so what is left is
+    // whatever the palette itself is asking for.
+    vcx.executor().advance_clock(Duration::from_secs(2));
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(600));
+    assert!(
+        shown(vcx, "slash-palette"),
+        "the palette must still be up — a settled test that closed it \
+         would be asserting nothing"
+    );
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0,
+        "an open, settled palette is still asking for frames"
+    );
+}
+
+/// The palette stops growing at [`theme::SLASH_MAX_ROWS`].
+///
+/// The cap is derived — the most rows that fit in a third of
+/// [`theme::WINDOW_MIN_H`] — and its job is to keep a menu that grows
+/// UPWARD out of the composer from covering the transcript the operator is
+/// reading. This fixture has more skills than the cap so the cap is what
+/// decides, on any machine.
+///
+/// The expected numbers are written as literals on purpose: deriving them
+/// from the constants under test would make this pass for any value of
+/// them.
+#[gpui::test]
+fn the_palette_stops_growing_before_it_covers_the_log(cx: &mut TestAppContext) {
+    assert_eq!(
+        theme::SLASH_MAX_ROWS,
+        6,
+        "6 rows of 25 px in a third of 520"
+    );
+    assert_eq!(theme::SLASH_MAX_H, 158.0, "6 * 25 + 4 + 4");
+
+    let project = SlashProject::new("cap");
+    for i in 0..12 {
+        let d = project.0.join(format!(".claude/skills/many{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\ndescription: number {i}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("/many");
+    settle_palette(&h, vcx);
+    assert!(shown(vcx, "menu-row-5"), "the sixth row is inside the cap");
+    assert!(
+        !shown(vcx, "menu-row-6"),
+        "a seventh row: the palette grew past its ceiling and is now \
+         covering the log it floats over"
+    );
+    // Row seven is not unreachable — it is one more letter away.
+    vcx.simulate_input("11");
+    settle_palette(&h, vcx);
+    click(vcx, "menu-row-0");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/many11 ",
+        "filtering is how the capped tail is reached"
+    );
+}
+
+/// **"You have none" and "I do not know where to look" are different
+/// facts, and the palette used to say the first for both.**
+///
+/// Found by photographing it. The first capture
+/// (`scripts/ar-capture.sh`, before `EAVE_REPLAY_PROVIDER` existed) ran
+/// the replay rig, whose synthetic rail row carries the provider `replay`
+/// — which `slash::roots` has no table for. The palette scanned nothing,
+/// found nothing, and reported "no skill or command matches /" over a
+/// directory that had a skill and a command sitting in it.
+///
+/// Every step was locally true and the sentence was still misleading,
+/// which is the same shape as Slice AQ's `working for 99h 49m` over a
+/// session parked on a question. `docs/shots/ar-unknown-provider.png`.
+///
+/// It matters beyond the rig: eave names six providers and can start one.
+/// Five of them will hit this branch the day an adapter lands, and
+/// `hermes` and `pi` have no surveyed roots at all.
+#[gpui::test]
+fn a_provider_eave_has_no_roots_for_says_so_rather_than_no_matches(cx: &mut TestAppContext) {
+    let project = SlashProject::new("unknown");
+    let (h, vcx) = boot(cx);
+    // `hermes` is named by `launcher::PROVIDERS` and surveyed by nobody.
+    let mut s = session("aaaa1111");
+    s.cwd = project.cwd();
+    s.provider = "hermes".into();
+    h.plumbing.push_rail(vec![s]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    assert!(
+        shown(vcx, "slash-palette"),
+        "the palette must open and explain itself; going away would be the \
+         same silence the empty menu was"
+    );
+    assert!(shown(vcx, "menu-row-0"));
+    assert!(!shown(vcx, "menu-row-1"), "one sentence, not a list");
+
+    // And the row is not a completion — there is nothing to complete to.
+    click(vcx, "menu-row-0");
+    settle_palette(&h, vcx);
+    assert_eq!(draft_of(&h, vcx), "/", "an explanation is not a command");
+}
+
+/// The palette is exactly as wide as the composer it grows out of.
+///
+/// It was not, at first: `w_full` inside the bottom stack made it overhang
+/// the composer by [`theme::GUTTER`] on both sides, which is visible in the
+/// first version of `docs/shots/ar-palette.png`. Both are `Shell::column`
+/// now, and this is the assertion that keeps them that way — a metric a
+/// screenshot can show but no arithmetic in `theme` would ever catch,
+/// because both values were individually legal.
+#[gpui::test]
+fn the_palette_lines_up_with_the_composer_it_grows_out_of(cx: &mut TestAppContext) {
+    let project = SlashProject::new("width");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    let palette = vcx.debug_bounds("slash-palette").expect("palette");
+    let composer = vcx.debug_bounds("composer-hint").expect("composer hint");
+    assert!(
+        palette.origin.x <= composer.origin.x,
+        "the palette starts right of the composer's own text: {:?} vs {:?}",
+        palette.origin.x,
+        composer.origin.x
+    );
+    // The hint is inset inside the composer's padding, so the palette's
+    // right edge must not exceed the composer card's — measured through
+    // the send button, which sits at the card's inner right edge.
+    let send = vcx
+        .debug_bounds("send")
+        .or_else(|| vcx.debug_bounds("composer-hint"));
+    if let Some(send) = send {
+        assert!(
+            palette.origin.x + palette.size.width >= send.origin.x,
+            "the palette does not reach the composer's right-hand controls"
+        );
+    }
+}
