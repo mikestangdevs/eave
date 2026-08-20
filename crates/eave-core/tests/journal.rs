@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use eave_core::claude::ClaudeCodeSession;
 use eave_core::events::SessionEvent;
 use eave_core::journal::{
     self, classify_exit, Header, JournalEvent, JournalWriter, Outcome, FORMAT_VERSION,
@@ -18,6 +17,9 @@ use eave_core::session::{AgentSession, SpawnConfig};
 use eave_core::store::{EngineLock, Meta, Store, META_FORMAT_VERSION};
 use eave_core::stream::ClaudeStream;
 use tokio::sync::mpsc;
+
+mod support;
+use support::spawn_agent;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -438,7 +440,7 @@ async fn exit_143_is_recorded_as_killed_not_crashed() {
         sid.clone(),
     );
     cfg.extra_env.push(("FAKE_MODE".into(), "term-143".into()));
-    let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    let (mut session, events) = spawn_agent(&cfg).unwrap();
 
     let (extra_tx, extra_rx) = mpsc::channel(1);
     drop(extra_tx);
@@ -504,7 +506,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
     );
     cfg.extra_env
         .push(("FAKE_MODE".into(), "stdin-closed".into()));
-    let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    let (mut session, events) = spawn_agent(&cfg).unwrap();
     let (extra_tx, extra_rx) = mpsc::channel(8);
     let rec = tokio::spawn(record_session(
         events,
@@ -516,7 +518,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
     ));
     wait_for_file(&jpath, |c| c.contains("init")).await;
 
-    let refusal = send_and_journal(&mut session, &extra_tx, "into the void")
+    let refusal = send_and_journal(&mut *session, &extra_tx, "into the void")
         .await
         .unwrap();
     // The reason is now kept, so this asserts the failure AND that the
@@ -524,6 +526,14 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
     // is what made this class of failure unreadable everywhere else.
     let why = refusal.expect("pipe write to a closed stdin must fail");
     assert!(!why.is_empty(), "a refused write must state a reason");
+    // The live half of the distinction `a_send_into_a_dead_agent_says_so`
+    // makes: this agent IS alive and IS refusing, so the reason must not
+    // blame a dead process. Without this control that test could pass
+    // against code that called every failed write a dead session.
+    assert!(
+        !why.contains("already gone"),
+        "the agent is alive and refusing; the reason must not call it gone: {why}"
+    );
     drop(extra_tx);
     session.kill().await.expect("kill must be provable");
     rec.await.unwrap().unwrap();
@@ -555,7 +565,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
     );
     cfg2.extra_env
         .push(("FAKE_MODE".into(), "tool-cycle".into()));
-    let (mut session2, events2) = ClaudeCodeSession::spawn(&cfg2).unwrap();
+    let (mut session2, events2) = spawn_agent(&cfg2).unwrap();
     let (extra_tx2, extra_rx2) = mpsc::channel(8);
     let rec2 = tokio::spawn(record_session(
         events2,
@@ -566,7 +576,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         None,
     ));
     assert!(
-        send_and_journal(&mut session2, &extra_tx2, "hello there")
+        send_and_journal(&mut *session2, &extra_tx2, "hello there")
             .await
             .unwrap()
             .is_none(),
@@ -582,6 +592,66 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         .unwrap()
         .undelivered_user_sends()
         .is_empty());
+}
+
+/// `delivered = false` covers two different worlds and used to say the
+/// same six words about both.
+///
+/// A live agent refusing a write is a fact about the agent — the bool
+/// exists for that (spec 02 §Delivery state). An agent that was already
+/// dead when we wrote is not refusing anything; it is a session that
+/// never started or has since exited, and "the agent did not accept your
+/// message" points the reader at the wrong process entirely. Both
+/// produced `io error: Broken pipe (os error 32)` and nothing else.
+///
+/// This is the dead half. `journaled_but_undelivered_send_is_distinct_from_sent`
+/// is the live half, and it asserts the reason does NOT say "gone" —
+/// together they are what makes either assertion mean anything.
+#[tokio::test]
+async fn a_send_into_a_dead_agent_says_so() {
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut cfg = SpawnConfig::new(
+        env!("CARGO_BIN_EXE_fake-agent"),
+        std::env::temp_dir(),
+        sid.clone(),
+    );
+    cfg.extra_env.push(("FAKE_MODE".into(), "crash".into()));
+    let (mut session, mut events) = spawn_agent(&cfg).unwrap();
+
+    // Wait for the exit rather than sleeping toward it: `Exited` is always
+    // the final event, so past it the process is provably gone and the
+    // write below cannot race it.
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while let Some(ev) = events.recv().await {
+            if matches!(ev, SessionEvent::Exited { .. }) {
+                return;
+            }
+        }
+        panic!("the agent never reported an exit");
+    })
+    .await
+    .expect("agent did not exit in time");
+    assert!(
+        !proc::identity_matches(&session.identity()),
+        "the specimen must really be gone before the write"
+    );
+
+    // The receiver is held, not dropped: a closed recorder is a different
+    // failure (`Err`), and this test is about the `Ok(Some(reason))` path.
+    let (extra_tx, _extra_rx) = mpsc::channel(8);
+    let why = send_and_journal(&mut *session, &extra_tx, "into a dead agent")
+        .await
+        .expect("a dead agent is not a recorder failure")
+        .expect("a write into a dead agent must not report delivery");
+
+    assert!(
+        why.contains("already gone"),
+        "the reason must name the dead process, not just the errno: {why}"
+    );
+    assert!(
+        why.contains(&session.identity().pid.to_string()),
+        "the reason must name WHICH process: {why}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +719,7 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
     cfg.resume = true;
     cfg.extra_env
         .push(("FAKE_MODE".into(), "resume-probe".into()));
-    let (mut session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    let (mut session, mut rx) = spawn_agent(&cfg).unwrap();
     // resume-probe answers the continuation message, like the real CLI —
     // cold resume is always user-initiated (spec 02: no auto-redispatch).
     session
@@ -872,7 +942,7 @@ async fn real_claude_journal_and_cold_resume() {
     let writer = JournalWriter::create(&jpath, &test_header(&sid)).unwrap();
 
     let cfg = SpawnConfig::new("claude", std::env::temp_dir(), sid.clone());
-    let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
+    let (mut session, events) = spawn_agent(&cfg).unwrap();
     let (extra_tx, extra_rx) = mpsc::channel(4);
     let rec = tokio::spawn(record_session(
         events,
@@ -915,7 +985,7 @@ async fn real_claude_journal_and_cold_resume() {
     let loaded = journal::load(&jpath).unwrap();
     let mut cfg2 = SpawnConfig::new("claude", std::env::temp_dir(), loaded.header.session_id);
     cfg2.resume = true;
-    let (mut session2, mut rx2) = ClaudeCodeSession::spawn(&cfg2).unwrap();
+    let (mut session2, mut rx2) = spawn_agent(&cfg2).unwrap();
     session2
         .send_user_message("What is the codeword? Reply with the codeword only.")
         .await
