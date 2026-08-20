@@ -8,6 +8,7 @@ pub mod attention;
 pub mod claude;
 pub mod events;
 pub mod journal;
+pub mod pi;
 pub mod proc;
 pub mod process;
 pub mod recorder;
