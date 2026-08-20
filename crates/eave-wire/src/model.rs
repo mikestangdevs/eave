@@ -519,7 +519,6 @@ impl std::error::Error for SeqGap {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// The inputs here are copied from the real capture corpus
     /// (`docs/research/approvals-capture-2026-08-18/`), not invented, because

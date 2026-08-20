@@ -147,7 +147,7 @@ fn msg_content_hash(row: &Row) -> u64 {
                 while end > 0 && !s.is_char_boundary(end) {
                     end -= 1;
                 }
-                fnv1a_more(fnv1a_more(h, &s.len().to_le_bytes()), s[..end].as_bytes())
+                fnv1a_more(fnv1a_more(h, &s.len().to_le_bytes()), &s.as_bytes()[..end])
             }
             bounded(bounded(h, input), result)
         }

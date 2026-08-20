@@ -883,7 +883,7 @@ fn an_unknown_tool_states_no_detail(cx: &mut TestAppContext) {
 /// is the trap §Traps already names.
 #[gpui::test]
 fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
-    let (mut h, vcx) = boot(cx);
+    let (h, vcx) = boot(cx);
     // `live` with reported memory, because the footer's resource line is
     // absent entirely when nothing live reports any — and that line is one
     // of the two edges under test.
