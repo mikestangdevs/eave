@@ -1668,23 +1668,6 @@ fn archived_line(info: &SessionInfo, show_archived: bool) -> Option<String> {
 /// outcomes are not close enough for a tight target to be acceptable.
 const ROW_ACTION_HIT: f32 = 24.0;
 
-/// Slice AO — the selected row's leading-edge accent bar: 3 px of the
-/// app's own pigment down the row's left edge.
-///
-/// A wash alone cannot say "this one" in a list of rows that are all the
-/// same shape — it is a 14 % lift in luminance across a whole rectangle,
-/// which the eye reads as a slightly different grey rather than as a mark.
-/// The bar is the mark. It is `absolute`, so it costs the row no height and
-/// no width and cannot participate in the hover-height invariant.
-///
-/// 3 px because 1 px reads as a hairline (the app already uses hairlines
-/// for seams, and a seam is not a selection) and 4 px at this row height
-/// starts to read as a second column. Its inset from the row's left edge is
-/// `SPACE_1`, which leaves `RAIL_CARD_BLEED - SPACE_1 - ROW_ACCENT_W` = 5 px
-/// of clearance before the dot — asserted, not assumed.
-const ROW_ACCENT_W: f32 = 3.0;
-const ROW_ACCENT_INSET: f32 = theme::SPACE_1;
-
 /// Slice AO — the ceiling on the marks group at the end of line two.
 ///
 /// Line two has `RAIL_W 248 − PLATE_MARGIN 12 − RAIL_CARD_BLEED 12 (the
@@ -1704,36 +1687,6 @@ const ROW_ACCENT_INSET: f32 = theme::SPACE_1;
 /// that a fact arriving longer than any of these degrades on its own line
 /// instead of taking the path with it.
 const ROW_MARKS_MAX: f32 = 70.0;
-
-/// How wide the corner strip is for a row offering `slots` affordances,
-/// plus the clearance the session name is owed beside it (Slice AO).
-///
-/// Stage AK's strip is `absolute`, which buys the height invariant and
-/// costs any layout guarantee about what is underneath it. AK's own test
-/// for that was pointed at `rail-title` — the rail's SESSIONS header, not
-/// the row's name — so it passed by a hundred pixels and never checked
-/// anything. Repointed at `label-{sid}` it fails immediately: a selected,
-/// dead, worktree'd row offers four 24 px targets, and four of them reach
-/// 21 px back into `claude code`.
-///
-/// That was true before this slice and is worse after it, because the name
-/// is bigger. The fix is to stop the two from sharing the space at all:
-/// line one reserves the strip's width, so the name truncates against the
-/// buttons instead of being drawn under them.
-///
-/// It is reserved from the row's AFFORDANCE SET, which does not depend on
-/// hover — so nothing moves when the pointer arrives — and not on
-/// selection either, because `rename` and `archive` are counted for every
-/// row on the grounds that any row can be selected. A reservation that
-/// appeared on click would reflow the name under the operator's pointer.
-fn row_strip_reserve(slots: usize) -> f32 {
-    let icons = slots as f32 * ROW_ACTION_HIT + (slots.saturating_sub(1)) as f32 * theme::SPACE_1;
-    // `right(SPACE_1)` measures from the row's padding box, so the strip
-    // already overhangs the content by `RAIL_CARD_BLEED − SPACE_1`; only
-    // the rest has to be reserved. Plus one gap, so this is clearance and
-    // not merely fit.
-    icons + theme::SPACE_1 - (theme::RAIL_CARD_BLEED - theme::SPACE_1) + theme::SPACE_2
-}
 
 /// The glyph inside that target. Smaller than `ICON_SM`, and the gap
 /// between the two numbers is the point: these sit in the row's corner
@@ -3441,7 +3394,7 @@ impl Shell {
             .collect();
         // The second line aligns under the session name: dot + gap +
         // chip + gap.
-        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
+        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::ICON_SM + theme::SPACE_2;
         let rows: Vec<AnyElement> = sessions
             .into_iter()
             .map(|info| {
@@ -3486,15 +3439,6 @@ impl Shell {
                     && !info.live
                     && info.worktree.is_none()
                     && !info.shared_with.is_empty();
-                // Every affordance this row can EVER offer — counted
-                // without reference to hover or selection, so the
-                // reservation below is a constant of the row.
-                let strip_slots = 2
-                    + usize::from(can_isolate)
-                    + match info.worktree.as_ref() {
-                        Some(w) if !info.live => 1 + usize::from(w.present),
-                        _ => 0,
-                    };
                 let wt_note = row_notes.get(&info.session_id).cloned();
                 let armed = matches!(wt_note, Some(RowNote::ConfirmDelete { .. }));
                 let wt = info.worktree.clone();
@@ -3600,32 +3544,12 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(theme::SPACE_1))
-                    // Slice AO: the accent bar. Absolute and inset from
-                    // both ends, so it is a mark on the row rather than a
-                    // border of it — and so it costs no height, which is
-                    // the invariant `hovering_a_row_does_not_move_it`
-                    // guards and which selection has no licence to break
-                    // either.
-                    .children(is_sel.then(|| {
-                        div()
-                            .debug_selector(|| format!("accent-{}", info.session_id))
-                            .absolute()
-                            .left(px(ROW_ACCENT_INSET))
-                            .top(px(theme::SPACE_2))
-                            .bottom(px(theme::SPACE_2))
-                            .w(px(ROW_ACCENT_W))
-                            .rounded(px(ROW_ACCENT_W / 2.0))
-                            .bg(theme::accent_bar())
-                    }))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            // Room for Stage AK's corner strip, so the name
-                            // never has to be read through it.
-                            .pr(px(row_strip_reserve(strip_slots)))
                             .child(
                                 // Slice N3: a running session's dot works;
                                 // every other state keeps the solid dot it
@@ -3655,22 +3579,32 @@ impl Shell {
                             // for a provider eave has no logo for, so a
                             // future adapter cannot produce an empty chip.
                             .child(match provider_mark(&info.provider) {
+                                // `ICON_SM`, not `ICON_MARK` (18) and
+                                // certainly not the launcher's
+                                // `ICON_MARK_LG` (28): a tile is 112 px
+                                // wide and its mark is the subject, a rail
+                                // row is 224 px wide and its mark is a
+                                // label for the name beside it. Every pixel
+                                // here is one the name does not get, and
+                                // the name is what a person reads the row
+                                // by. No new constant — 16 is a rank the
+                                // theme already has.
                                 Some(mark) => div()
-                                    .size(px(theme::PROVIDER_CHIP))
+                                    .size(px(theme::ICON_SM))
                                     .flex_none()
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .child(icons::tagged_icon(
                                         mark,
-                                        theme::ICON_MARK,
+                                        theme::ICON_SM,
                                         provider_mark_ink(&info.provider),
                                         format!("chip-{}", info.session_id),
                                     ))
                                     .into_any_element(),
                                 None => div()
                                     .debug_selector(|| format!("chip-{}", info.session_id))
-                                    .size(px(theme::PROVIDER_CHIP))
+                                    .size(px(theme::ICON_SM))
                                     .flex_none()
                                     .rounded(px(theme::RADIUS_CHIP))
                                     .border_1()
@@ -3707,8 +3641,8 @@ impl Shell {
                                     // name in place. Any other size and
                                     // opening rename would change the row's
                                     // height under the operator's pointer.
-                                    .text_size(px(14.0))
-                                    .line_height(px(20.0))
+                                    .text_size(px(13.0))
+                                    .line_height(px(19.0))
                                     .font_weight(theme::WEIGHT_STRONG)
                                     .text_color(theme::text())
                                     // Clicking inside the field is not a
@@ -3758,17 +3692,22 @@ impl Shell {
                                     .border_color(gpui::transparent_black())
                                     .rounded(px(theme::RADIUS_BUTTON))
                                     // Slice AO — the anchor of the row.
-                                    // 14 px, and deliberately NOT
-                                    // `NAME_SIZE` (16). Three channels
-                                    // separate this from the folder line —
-                                    // size, weight and ink — and stacking
-                                    // all three at full strength in a
-                                    // 248 px column reads as a shout
-                                    // rather than as an anchor; the
-                                    // operator's word for the 16 px
-                                    // version was "gigantic". Weight and
-                                    // ink carry it now and the size step is
-                                    // 14/12.5, just enough to rank.
+                                    // 13 px, and deliberately NOT
+                                    // `NAME_SIZE` (16), which is correct in
+                                    // a 560 px panel and "gigantic" (the
+                                    // operator's word) in a 248 px rail.
+                                    //
+                                    // Three channels separate this from the
+                                    // folder line — size, weight and ink —
+                                    // and all three at full strength read
+                                    // as a shout rather than as an anchor.
+                                    // Weight and ink do the work; the size
+                                    // step is 13 against 12.5, half a
+                                    // point, and it is enough. Every pixel
+                                    // the name does not spend on its own
+                                    // height is one more character of it on
+                                    // screen, which is the fact this row
+                                    // was actually failing at.
                                     //
                                     // Inline rather than a `ROW_NAME_SIZE`
                                     // constant: ten named sizes across four
@@ -3776,8 +3715,8 @@ impl Shell {
                                     // curing, and `NAME_SIZE` is still
                                     // correct where it is used — panel
                                     // headings, in a 560 px column.
-                                    .text_size(px(14.0))
-                                    .line_height(px(20.0))
+                                    .text_size(px(13.0))
+                                    .line_height(px(19.0))
                                     .font_weight(theme::WEIGHT_STRONG)
                                     // Slice AO: primary ink on every row,
                                     // not just the selected one. Selection
@@ -3930,6 +3869,39 @@ impl Shell {
                             d.child(
                                 div()
                                     .absolute()
+                                    // **Slice AO: what this strip covers,
+                                    // measured.** Stage AK's test for it
+                                    // was pointed at `rail-title` — the
+                                    // rail's SESSIONS header, not the row's
+                                    // name — so it cleared by a hundred
+                                    // pixels and could never fail.
+                                    // Repointed at `label-{sid}`: at two
+                                    // affordances the strip clears the name
+                                    // by 35 px, at three by 7, and at four
+                                    // (a selected, dead, worktree'd row) it
+                                    // reaches 21 px INTO it.
+                                    //
+                                    // Reserving the strip's width on line
+                                    // one fixes that and was tried; it costs
+                                    // the name 56–112 px of a 158 px line,
+                                    // and the photograph of it reads
+                                    // `clau…`. The operator's ruling on
+                                    // this row is that the name and the
+                                    // path come first, so the reservation
+                                    // is gone and the name renders in full
+                                    // at rest.
+                                    //
+                                    // What is left is a real invariant and
+                                    // is tested as one: the strip never
+                                    // reaches the START of the name, so the
+                                    // row stays identifiable while a person
+                                    // is reaching for the button that
+                                    // archives it. The absolute version —
+                                    // covering nothing — is not available
+                                    // at four 24 px targets on a 61 px row,
+                                    // and the fix for that is to offer
+                                    // fewer of them in the corner.
+                                    //
                                     // The row's top-right CORNER, not its
                                     // vertical middle: centred, the strip
                                     // floats beside the id/path line and

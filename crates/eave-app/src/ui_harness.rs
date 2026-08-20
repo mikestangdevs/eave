@@ -6187,14 +6187,25 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
     assert!(
         two_icons >= px(8.),
         "the name runs {ink:?} and the action strip leaves {two_icons:?} \
-         after it — the buttons are over the session's own name"
+         after it — rename and archive are on every row and must never be \
+         over the name they belong to"
     );
 
-    // And again at the WIDEST strip the rail can build: a selected, dead,
-    // worktree'd session shows pen, archive, open and delete — four 24 px
-    // targets and three gaps, twice the width of the case above. This is
-    // the case that was broken, and it is the half of the invariant that
-    // gets harder as the row gets shorter.
+    // And the WIDEST strip the rail can build: a selected, dead,
+    // worktree\'d session shows pen, archive, open and delete — four 24 px
+    // targets and three gaps, twice the width of the case above.
+    //
+    // **This one does overlap, and the assertion says so.** Four targets
+    // reach 21 px into `claude code`, and no arrangement of a 61 px row
+    // makes them not: reserving their width on line one was tried and it
+    // cuts the name to `clau…`, which is a worse row at rest than a
+    // partly-covered name is for the moment a pointer is on it.
+    //
+    // What must hold — and does — is that the strip never reaches the
+    // START of the name. A person reaching for `archive` has to be able to
+    // see which session they are archiving. 48 px is about six characters
+    // at this size, written as a literal rather than derived from the
+    // strip\'s own geometry.
     let mut wide = session("aaaa1111");
     wide.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
     rail_with_selected(&h, vcx, vec![wide], "aaaa1111");
@@ -6204,17 +6215,19 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
         "the four-affordance strip did not render, so this measures the \
          narrow case twice"
     );
-    let four_icons = clear(vcx);
+    let label = vcx.debug_bounds("label-aaaa1111").expect("the row\'s name");
+    let strip = vcx.debug_bounds("ren-aaaa1111").expect("the first action");
+    let visible = strip.origin.x - label.origin.x;
     assert!(
-        four_icons < two_icons,
-        "the four-icon strip is no wider than the two-icon one \
-         ({four_icons:?} vs {two_icons:?}) — this case is not testing what \
-         it claims to"
+        visible < ink,
+        "the four-icon strip clears the name entirely ({visible:?} of \
+         {ink:?}) — if that is now true, this test should be asserting the \
+         stronger invariant instead of this one"
     );
     assert!(
-        four_icons >= px(8.),
-        "at four affordances the strip leaves {four_icons:?} after the \
-         name; the row got shorter and the buttons closed on it"
+        visible >= px(48.),
+        "the widest strip leaves only {visible:?} of the name showing; a \
+         row you cannot identify is a row you archive by mistake"
     );
 }
 
@@ -6311,15 +6324,64 @@ fn nothing_on_the_row_competes_with_the_session_name(cx: &mut TestAppContext) {
     );
 }
 
-/// Selection is a MARK, not a slightly different grey.
+/// **The requirement this slice was actually failing, pinned.**
 ///
-/// `launcher.rs` has always done this properly — its selected provider tile
-/// takes `border_strong` over `overlay` against siblings with `border` over
-/// `wash_rest` — while the rail, the screen a person actually lives in,
-/// had a wash and nothing else. The bar is the rail's version, and it is
-/// `absolute` so that it can never be the thing that moves a row.
+/// Every test in this file passed while the photographed rail read
+/// `clau…`, `claude c…`, `chase the rai…`, `package…` — four names out of
+/// five truncated, most of them mid-word. The session name is the one
+/// thing on the row a person identifies the session by, and nothing was
+/// testing that it fit. A row that shows ten characters of a name is worse
+/// than the four-line row this slice replaced, which at least showed all
+/// of it.
+///
+/// Asserted against a literal character count and the ink the text system
+/// actually shapes — never against `RAIL_W` minus the constants the layout
+/// uses, which is the derived-expectation trap that has already cost this
+/// project a test that could not fail.
 #[gpui::test]
-fn the_selected_row_is_marked_on_its_leading_edge(cx: &mut TestAppContext) {
+fn a_realistically_named_session_shows_its_whole_name(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // Twenty characters, which is a name somebody types: it is the length
+    // of "chase the rail flake".
+    let name = "chase the rail flake";
+    assert_eq!(name.chars().count(), 20);
+    let mut named = session("aaaa1111");
+    named.title = Some(name.into());
+    // ...on the row carrying the most other freight it can: shared with
+    // two, so the marks group is on line two beside the folder.
+    named.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
+    rail_with_selected(&h, vcx, vec![named], "aaaa1111");
+
+    let label = vcx.debug_bounds("label-aaaa1111").expect("the row\'s name");
+    let ink = real_text_width(name, theme::SANS, 13.0);
+    assert!(
+        label.size.width >= ink,
+        "{name:?} shapes to {ink:?} and its slot is {:?} — the row would \
+         render it as an ellipsis, and a name nobody can read is the whole \
+         defect this slice was fixing",
+        label.size.width
+    );
+
+    // And the folder beside it, on the same row, at the same time.
+    let folder = vcx.debug_bounds("cwd-aaaa1111").expect("the folder");
+    assert!(
+        folder.size.width >= px(80.),
+        "the folder is {:?} wide on a named, shared row",
+        folder.size.width
+    );
+}
+
+/// Selection reads as a FILL and a RIM — `launcher.rs`\'s treatment for its
+/// provider tiles, which is the one place in this app that already did
+/// selection properly.
+///
+/// An accent bar down the row\'s leading edge was tried and photographed.
+/// The operator\'s ruling: *"no need for purple bar when selected"* — the
+/// fill and the rim carried it on their own. What this asserts now is that
+/// the rim is real and, more importantly, that it is laid out on EVERY row
+/// so selecting one cannot move the rest.
+#[gpui::test]
+fn selection_is_a_fill_and_a_rim_and_never_a_bar(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(
         &h,
@@ -6327,32 +6389,18 @@ fn the_selected_row_is_marked_on_its_leading_edge(cx: &mut TestAppContext) {
         vec![session("aaaa1111"), session("bbbb2222")],
         "aaaa1111",
     );
-
-    let bar = vcx.debug_bounds("accent-aaaa1111").expect("the accent bar");
     assert!(
-        vcx.debug_bounds("accent-bbbb2222").is_none(),
-        "an unselected row is wearing the selection mark"
+        !shown(vcx, "accent-aaaa1111"),
+        "the accent bar is back on the selected row"
     );
-
-    let row = vcx.debug_bounds("rail-aaaa1111").unwrap();
-    assert!(
-        bar.origin.x >= row.origin.x,
-        "the bar hangs off the row's left edge"
-    );
-    // Clearance from the row's first content, not merely "does not
-    // overlap": a bar touching the state dot reads as part of it.
-    let dot_x = row.origin.x + px(theme::RAIL_CARD_BLEED);
-    assert!(
-        bar.origin.x + bar.size.width <= dot_x - px(3.),
-        "the bar runs to {:?} and the row's content starts at {dot_x:?} — \
-         under 3px of clearance and the mark reads as a glyph",
-        bar.origin.x + bar.size.width
-    );
-    // It is a bar, not a block: taller than it is wide, by a lot.
-    assert!(
-        bar.size.height >= bar.size.width * 4.,
-        "the accent is {:?} — that is a swatch, not an edge mark",
-        bar.size
+    // The rim is a border on every row that only ever changes colour — a
+    // border that APPEARED on selection would move every row below it the
+    // moment the operator clicked. Proven by the size equality, which a
+    // 2 px border on one row and none on the other could not satisfy.
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").map(|r| r.size),
+        vcx.debug_bounds("rail-bbbb2222").map(|r| r.size),
+        "the selected row is a different size from its neighbour"
     );
 }
 
@@ -6361,8 +6409,8 @@ fn the_selected_row_is_marked_on_its_leading_edge(cx: &mut TestAppContext) {
 /// Stage AK proved the hover half and the rail depends on it: a virtualized
 /// list with cached row heights cannot have a row that resizes under the
 /// pointer. Slice AO added two things that could break the same invariant
-/// for a different reason — a rim that appears on selection, and a bar —
-/// so the selected/unselected pair is asserted to the pixel as well.
+/// for a different reason — a rim that appears on selection — so the
+/// selected/unselected pair is asserted to the pixel as well.
 #[gpui::test]
 fn selecting_a_row_does_not_move_it(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
