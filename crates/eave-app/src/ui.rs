@@ -2757,12 +2757,12 @@ struct SlashPalette {
     /// `T` is `()` — this palette's position is decided by flex layout, so
     /// unlike every other popup in the app it has no anchor to carry.
     popup: Popup<()>,
-    /// The scan, and what it was a scan OF. Keyed on `(provider, cwd)`
-    /// because both change what is on disk: a different session is a
-    /// different project root, and a different agent is a different set of
-    /// roots entirely (`slash::roots`).
+    /// What the palette is offering, and what it was built FROM. Keyed on
+    /// `(provider, cwd)` because both change what is on disk: a different
+    /// session is a different project root, and a different agent is a
+    /// different set of roots entirely (`slash::roots`).
     ///
-    /// `None` = never read for this pair. The palette shows [`READING`]
+    /// `None` = never built for this pair. The palette shows [`READING`]
     /// rather than an empty menu, because "no skills" and "have not looked
     /// yet" are different facts and only one of them is ever true here.
     cache: Option<SlashCache>,
@@ -2780,10 +2780,55 @@ struct SlashPalette {
     dismissed: bool,
 }
 
+/// Slice AR2. The palette's rows, and the two different sources they come
+/// from.
+///
+/// **The CLI decides which rows exist; the disk decides what they say.**
+/// `inventory` is the `slash_commands` array out of that session's own
+/// `system/init` frame — the CLI's own account of every `/name` it will
+/// accept — and `scanned` is the filesystem read Slice AR built. Neither
+/// can do the other's job: the frame carries no descriptions, and the scan
+/// cannot see the 47 commands bundled inside the `claude` executable.
 struct SlashCache {
     provider: String,
     cwd: String,
-    entries: Vec<SlashEntry>,
+    /// The inventory this offering was built against.
+    ///
+    /// `None` = the session has never announced one, and there are two
+    /// ways to get there: a session that has never been started, and one
+    /// whose replay has not yet reached its first `Init`. **Both fall back
+    /// to the scan**, which is the same palette Slice AR shipped — fewer
+    /// rows than the CLI has, and zero rows the CLI lacks.
+    ///
+    /// An announcement of ZERO names falls back too, and that is a
+    /// judgement rather than a reading. `slash_commands` is
+    /// `#[serde(default)]` on the wire, so an agent CLI that predates the
+    /// field and one that genuinely has no commands both arrive as an
+    /// empty list. Taking the empty list literally would blank the palette
+    /// for the first case, which is the more likely one; the scan is the
+    /// better answer for both.
+    inventory: Option<Vec<String>>,
+    /// The disk scan, kept verbatim so an inventory that lands later can
+    /// be described without reading the disk a second time.
+    scanned: Vec<SlashEntry>,
+    /// What the palette actually offers — [`SlashCache::rebuild`]'s output,
+    /// and the only list the rows are drawn from.
+    offered: Vec<SlashEntry>,
+}
+
+impl SlashCache {
+    /// Fold the two sources into the offering.
+    ///
+    /// Cheap on purpose (a hash map over ~21 scanned entries and one clone
+    /// per offered row), because it runs on the keystroke path rather than
+    /// behind a channel: the alternative is a subscription that has to be
+    /// woken when the inventory lands, and this is a menu.
+    fn rebuild(&mut self) {
+        self.offered = match self.inventory.as_deref() {
+            Some(names) if !names.is_empty() => slash::offer(names, &self.scanned),
+            _ => self.scanned.clone(),
+        };
+    }
 }
 
 /// What the palette says while the first scan of a directory is in flight.
@@ -2977,6 +3022,21 @@ impl Shell {
             .map(|s| (s.provider.clone(), s.cwd.clone()))
     }
 
+    /// Every `/name` the selected session's CLI said it would accept
+    /// (Slice AR2), or `None` when it has never said.
+    ///
+    /// **This is the app being TOLD, not the app finding out.** eave is one
+    /// binary in two roles and the ENGINE is the half that runs the agent
+    /// and reads its frames; the inventory reaches this process the way
+    /// every other transcript fact does — journaled by the engine, replayed
+    /// on `subscribe`, folded by `eave_wire::model::Transcript`. So it needs
+    /// no request type, no watch field and no cache invalidation: a session
+    /// that has ever run replays its own inventory on every later open,
+    /// with nothing live and nothing spawned.
+    fn slash_inventory(&self, cx: &Context<Self>) -> Option<Vec<String>> {
+        self.transcript.read(cx).transcript.inventory.clone()
+    }
+
     /// Is the palette actually on screen and taking input?
     ///
     /// **The projection, evaluated — and the only thing allowed to answer
@@ -3001,7 +3061,7 @@ impl Shell {
     /// first scan of this directory is still out.
     fn slash_matches(&self, query: &str) -> Option<Vec<&SlashEntry>> {
         let cache = self.slash.cache.as_ref()?;
-        Some(slash::filter(&cache.entries, query))
+        Some(slash::filter(&cache.offered, query))
     }
 
     /// Bring the palette into line with the composer's text.
@@ -3027,6 +3087,7 @@ impl Shell {
             return;
         };
 
+        let inventory = self.slash_inventory(cx);
         let fresh = self
             .slash
             .cache
@@ -3034,6 +3095,16 @@ impl Shell {
             .is_some_and(|c| c.provider == provider && c.cwd == cwd);
         if !fresh && !self.slash.loading {
             self.begin_slash_scan(provider, cwd, cx);
+        } else if let Some(cache) = self.slash.cache.as_mut() {
+            // The scan is keyed on the directory, but the INVENTORY arrives
+            // on the session's own stream and can land after it — a replay
+            // reaching its first `Init`, or a session being started for the
+            // first time. Re-fold rather than re-read: the disk has not
+            // changed, only what eave has been told about it.
+            if cache.inventory != inventory {
+                cache.inventory = inventory;
+                cache.rebuild();
+            }
         }
 
         // The row count the popup navigates over: the matches, or the one
@@ -3075,11 +3146,18 @@ impl Shell {
                 .await;
             let _ = view.update(cx, |shell, cx| {
                 shell.slash.loading = false;
-                shell.slash.cache = Some(SlashCache {
+                // Read the inventory HERE rather than passing it in: the
+                // scan is asynchronous, and a session's `Init` can replay
+                // while it is out.
+                let mut cache = SlashCache {
                     provider,
                     cwd,
-                    entries,
-                });
+                    inventory: shell.slash_inventory(cx),
+                    scanned: entries,
+                    offered: Vec::new(),
+                };
+                cache.rebuild();
+                shell.slash.cache = Some(cache);
                 // The row set only existed as `READING` until now, so the
                 // popup is navigating over one dead row. Re-point it at
                 // what actually arrived.
@@ -3186,9 +3264,18 @@ impl Shell {
         // Same distinction as [`READING`], and the same one Slice M drew
         // in the transcript's empty state. Absence of results has three
         // causes here and the operator can act on only one of them.
-        let unknown_provider = self
-            .slash_context(cx)
-            .is_some_and(|(p, cwd)| slash::roots(&p, Path::new(&cwd), &home_dir()).is_empty());
+        //
+        // Slice AR2 narrowed the condition. "eave does not know where this
+        // agent keeps its skills" is only true when eave has NEITHER a
+        // roots table for the provider NOR an inventory from it. Today only
+        // Claude produces an inventory, so nothing on this machine can hit
+        // the second half — but a provider that announced 68 names while
+        // being told eave did not know where its skills were would be the
+        // same wrong sentence, one adapter from now.
+        let unknown_provider = self.slash_inventory(cx).is_none_or(|i| i.is_empty())
+            && self
+                .slash_context(cx)
+                .is_some_and(|(p, cwd)| slash::roots(&p, Path::new(&cwd), &home_dir()).is_empty());
 
         let rows: Vec<AnyElement> = match self.slash_matches(query) {
             _ if unknown_provider => {
@@ -3230,8 +3317,8 @@ impl Shell {
                 .enumerate()
                 .map(|(ix, e)| {
                     let mut item = MenuItem::new(e.insertion());
-                    if let Some(d) = &e.description {
-                        item = item.detail(d.clone());
+                    if let Some(d) = e.description() {
+                        item = item.detail(d.to_string());
                     }
                     // The trailing slot says WHICH KIND, not which scope.
                     // Scope is already legible where it is ambiguous — a
@@ -3244,11 +3331,22 @@ impl Shell {
                     // declared the model may never reach for it, so the
                     // palette is the sole way in. That is exactly what a
                     // row in this menu is for.
-                    item = item.trailing(match (e.kind, e.operator_only) {
-                        (slash::Kind::Skill, true) => "skill · only here",
-                        (slash::Kind::Skill, false) => "skill",
-                        (slash::Kind::Command, true) => "command · only here",
-                        (slash::Kind::Command, false) => "command",
+                    //
+                    // Slice AR2 added the fourth case, and it is the one
+                    // the slice exists for. A row with no `kind` is a name
+                    // the CLI announced that no file under any root eave
+                    // scans backs — `/context`, `/compact`, `/dataviz`.
+                    // `find ~/.claude /opt/homebrew/lib/node_modules -name
+                    // dataviz` returns nothing while `/dataviz` is live in
+                    // the CLI: they are compiled into the executable. So
+                    // the row carries a name, no description, and the one
+                    // word that explains why there is no description.
+                    item = item.trailing(match (e.kind(), e.operator_only()) {
+                        (Some(slash::Kind::Skill), true) => "skill · only here",
+                        (Some(slash::Kind::Skill), false) => "skill",
+                        (Some(slash::Kind::Command), true) => "command · only here",
+                        (Some(slash::Kind::Command), false) => "command",
+                        (None, _) => "built in",
                     });
                     overlay::menu_row(
                         ix,

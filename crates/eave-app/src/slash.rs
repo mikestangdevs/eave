@@ -1,5 +1,6 @@
 //! Slice AR — the `/` palette's **discovery** half: what slash commands
 //! this operator actually has, and what each one does.
+//! Slice AR2 — and where that answer really comes from.
 //!
 //! `Shell::send_current` has always forwarded a `/`-prefixed message
 //! verbatim, so the CLI has always resolved these. What was missing was
@@ -8,6 +9,27 @@
 //! no `current_dir`, every path handed in. The half with the interesting
 //! behaviour is the half that has to be testable without a window
 //! (`overlay`'s ruling, taken again here).
+//!
+//! # Two sources, and only one of them is authoritative
+//!
+//! There are two functions here and they answer different questions.
+//!
+//! [`discover`] reads the disk. It is complete over things that have a
+//! file, which is exactly the set that has a **description**, and it has
+//! never offered a row the CLI did not have.
+//!
+//! [`offer`] decides what the palette shows, and it takes its NAMES from
+//! the CLI's own `system/init` frame instead. That frame is a complete
+//! inventory, it arrives before the model is invoked, and it is the
+//! definition of what that CLI will accept — so precedence, collisions and
+//! every future change to the naming convention are resolved inside the
+//! CLI and arrive here already settled, rather than being re-derived in
+//! eave and drifting from it. [`discover`]'s output is then matched to
+//! those names to supply the descriptions.
+//!
+//! The frame is why AR's precedence work still matters and is not merely
+//! preserved: when two files claim one name, its order is what decides
+//! which file's description gets attached to the CLI's single row.
 //!
 //! # The cwd trap, stated once
 //!
@@ -53,20 +75,31 @@
 //! resolution order and it is the order [`discover`] emits, so a caller
 //! that keeps the first of each name gets it for free.
 //!
-//! # What this can and cannot see (measured, 2026-08-20)
+//! # What each source can and cannot see (measured, 2026-08-20)
 //!
-//! On this machine the CLI reports **38 skills and 71 slash commands** in
-//! its `system/init` frame. Everything reachable from disk — project,
-//! user, and the plugin install paths — accounts for **18** of those 38.
-//! The other 20 (`dataviz`, `simplify`, `code-review`, `loop`, …) exist
-//! **nowhere on the filesystem**: they are bundled inside the `claude`
-//! executable. `find ~/.claude /opt/homebrew/lib/node_modules -name
-//! dataviz` returns nothing while `/dataviz` is live in the CLI.
+//! Spawning `claude` with eave's exact headless argv from `/tmp` and
+//! reading the first stdout line gives a `system/init` frame announcing
+//! **68 slash commands** and 37 skills. Everything reachable from disk —
+//! project, user, and the plugin install paths — accounts for **21** of
+//! those 68. The other 47 (`context`, `compact`, `dataviz`, `simplify`,
+//! `loop`, …) exist **nowhere on the filesystem**: they are bundled inside
+//! the `claude` executable. `find ~/.claude
+//! /opt/homebrew/lib/node_modules -name dataviz` returns nothing while
+//! `/dataviz` is live in the CLI.
 //!
-//! A filesystem scan therefore cannot be complete, and this one does not
-//! claim to be. It is complete over the things that have a `SKILL.md` or
-//! a `.md` to read — which is exactly the set that has a **description**,
-//! and a row with no description is not discovery. See the report.
+//! A filesystem scan therefore cannot be complete, and [`discover`] does
+//! not claim to be. It is complete over the things that have a `SKILL.md`
+//! or a `.md` to read — which is exactly the set that has a
+//! **description**. AR stopped there, on the ground that a row of bare
+//! names is not discovery. That is a good objection to the wrong question:
+//! it argues for showing those rows WITHOUT a description, not for hiding
+//! them, and an operator who types `/` and does not see `/context`
+//! concludes eave cannot do it.
+//!
+//! The frame is also **per session and cwd-sensitive**, which is why it
+//! rides the session's own stream: planting one command and one skill
+//! under a directory's `.claude/` took the same machine from 68 names to
+//! 71 in the same minute.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -107,11 +140,33 @@ pub enum Kind {
     Command,
 }
 
-/// One row's worth of fact.
+/// One row's worth of fact: a name, and whatever eave could find out
+/// about it.
+///
+/// **Slice AR2 split this in two, and the split is the slice.** The name
+/// and the facts now come from different places and only one of them is
+/// authoritative. A name is what the operator types and what the CLI will
+/// accept; [`Found`] is what a file on disk says about that name, and
+/// there is often no file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashEntry {
     /// What the operator types after the `/`, WITHOUT the slash.
     pub name: String,
+    /// What eave READ about this name, or `None` when it read nothing.
+    ///
+    /// `None` never comes out of [`discover`] — a scan only ever finds a
+    /// name by reading the file that carries it. It comes out of [`offer`],
+    /// for the names the CLI announced that no file eave scans backs: **46
+    /// of the 67 rows** the palette offers on this machine. Those are
+    /// bundled inside the `claude` executable, so there is nothing to read
+    /// and nothing to say, and the row states its name alone rather than
+    /// not existing.
+    pub found: Option<Found>,
+}
+
+/// What one file on disk declares about a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
     /// The frontmatter `description`, whitespace-collapsed and capped.
     /// `None` = the file had no frontmatter or no description key. Kept as
     /// an `Option` rather than an empty string so the row can be honest
@@ -137,6 +192,31 @@ impl SlashEntry {
     /// formatted at the call site.
     pub fn insertion(&self) -> String {
         format!("/{}", self.name)
+    }
+
+    /// What this command says it does, or `None` — either because no file
+    /// declared one or because eave never found a file at all. Both render
+    /// the same way (no second line) and neither is invented.
+    pub fn description(&self) -> Option<&str> {
+        self.found.as_ref()?.description.as_deref()
+    }
+
+    /// Skill or command, or `None` when eave has only the name.
+    pub fn kind(&self) -> Option<Kind> {
+        self.found.as_ref().map(|f| f.kind)
+    }
+
+    /// Which scope the description came from, or `None` when eave has only
+    /// the name.
+    pub fn origin(&self) -> Option<&Origin> {
+        self.found.as_ref().map(|f| &f.origin)
+    }
+
+    /// A file declared this operator-invoked only. `false` also covers "no
+    /// file said anything", which is the same rendering and the same
+    /// non-claim.
+    pub fn operator_only(&self) -> bool {
+        self.found.as_ref().is_some_and(|f| f.operator_only)
     }
 }
 
@@ -364,6 +444,84 @@ pub fn discover(provider: &str, session_cwd: &Path, home: &Path) -> Vec<SlashEnt
     out
 }
 
+// ---------------------------------------------------------------------------
+// Slice AR2 — the CLI's own inventory, described by the scan
+
+/// Names the palette refuses to offer even though the CLI announces them.
+///
+/// **Explicit, tiny, and every entry states its measurement.** The rule
+/// this list exists to obey is that a carve-out must be stated: the
+/// palette's whole claim is "this is what the CLI will accept", so every
+/// subtraction from that has to be defensible in one sentence with a
+/// measurement behind it, and a name nobody has measured stays on the
+/// menu.
+///
+/// - **`clear`** — verified inert in eave's `-p` mode. Sent through eave's
+///   exact argv on 2026-08-20 (and independently by Slice AR two days
+///   earlier), the CLI replies with `{"type":"result","subtype":"success",
+///   "is_error":false,"result":""}` and **no assistant turn at all**. The
+///   second measurement is worse than the first: it also emits
+///   `{"type":"conversation_reset","new_conversation_id":…}`, a top-level
+///   type `stream.rs` has no arm for and surfaces as `Unknown`. So `/clear`
+///   in eave does not merely do nothing visible — it silently forks the
+///   CLI's conversation out from under a journal that keeps appending to
+///   the old one. A palette row for it would offer a way to desynchronise
+///   the session.
+///
+/// Not on this list, deliberately: `/compact`, `/init`, `/reload-skills`
+/// and the rest of the destructive-sounding built-ins. They have not been
+/// measured, several cannot be measured without side effects, and guessing
+/// at them would put invented policy in a list whose entire value is that
+/// it contains none. `/context` and `/model` were measured and **work** —
+/// `/context` returned a 3129-character report through eave's own argv.
+const NEVER_OFFERED: &[&str] = &["clear"];
+
+/// What the palette offers: the CLI's own names, described by the scan.
+///
+/// **`inventory` is the source of truth for WHICH rows exist.** It is the
+/// `slash_commands` array out of the agent's `system/init` frame, which the
+/// CLI writes before the model is invoked and which is therefore, by
+/// definition, the set of names that CLI will accept. Precedence,
+/// collisions and every future change to the naming convention are settled
+/// inside the CLI and arrive here already resolved, instead of being
+/// re-derived in eave and drifting.
+///
+/// **`scanned` is the source of truth for WHAT A ROW SAYS.** The frame
+/// carries names and nothing else, so a description has to come from the
+/// file, matched by name. `scanned` arrives in [`discover`]'s precedence
+/// order (project → user → plugin) and the FIRST match wins — which is
+/// exactly what that ordering was built for: when two files claim one
+/// name, the CLI resolves the one eave describes.
+///
+/// Order is the frame's own, unedited. It is not alphabetical; it is
+/// registration order, and it puts the operator's own skills ahead of the
+/// bundled built-ins, which is a better default than anything eave would
+/// invent. It was byte-identical across four separate spawns from three
+/// different directories on 2026-08-20, so rows do not move between
+/// launches.
+///
+/// Duplicate names in `inventory` cannot happen — it is the CLI's resolved
+/// list — but a duplicate would produce a duplicate row rather than being
+/// silently dropped, because inventing a dedup rule for a case the CLI says
+/// is impossible is how eave would end up hiding a real row.
+pub fn offer(inventory: &[String], scanned: &[SlashEntry]) -> Vec<SlashEntry> {
+    let mut described: std::collections::HashMap<&str, &Found> =
+        std::collections::HashMap::with_capacity(scanned.len());
+    for e in scanned {
+        if let Some(found) = &e.found {
+            described.entry(e.name.as_str()).or_insert(found);
+        }
+    }
+    inventory
+        .iter()
+        .filter(|name| !NEVER_OFFERED.contains(&name.as_str()))
+        .map(|name| SlashEntry {
+            name: name.clone(),
+            found: described.get(name.as_str()).map(|f| (*f).clone()),
+        })
+        .collect()
+}
+
 /// Skills: a directory containing `SKILL.md`, at any depth.
 ///
 /// **The depth is not part of the name and the frontmatter `name` is not
@@ -436,10 +594,12 @@ fn scan_skills_depth(
             let front = Frontmatter::read(&skill_md);
             out.push(SlashEntry {
                 name: namespaced(namespace, &name),
-                description: front.description,
-                origin: origin.clone(),
-                kind: Kind::Skill,
-                operator_only: front.operator_only,
+                found: Some(Found {
+                    description: front.description,
+                    origin: origin.clone(),
+                    kind: Kind::Skill,
+                    operator_only: front.operator_only,
+                }),
             });
         } else {
             // A grouping directory — `skills/craft/` for a plugin,
@@ -490,10 +650,12 @@ fn scan_commands(
         let front = Frontmatter::read(&path);
         out.push(SlashEntry {
             name: namespaced(namespace, &format!("{prefix}{stem}")),
-            description: front.description,
-            origin: origin.clone(),
-            kind: Kind::Command,
-            operator_only: front.operator_only,
+            found: Some(Found {
+                description: front.description,
+                origin: origin.clone(),
+                kind: Kind::Command,
+                operator_only: front.operator_only,
+            }),
         });
     }
     for (name, path) in subdirs {
@@ -834,25 +996,34 @@ mod tests {
         td
     }
 
-    fn found(td: &TempTree) -> Vec<SlashEntry> {
+    fn scanned(td: &TempTree) -> Vec<SlashEntry> {
         discover(CLAUDE, &td.path().join("proj"), &td.path().join("home"))
+    }
+
+    /// A row whose only fact is its name — the shape [`offer`] produces
+    /// for a command bundled inside the agent's own binary.
+    fn named(name: &str) -> SlashEntry {
+        SlashEntry {
+            name: name.into(),
+            found: None,
+        }
     }
 
     #[test]
     fn a_project_skill_and_a_project_command_are_both_found_with_their_descriptions() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         let skill = all
             .iter()
-            .find(|e| e.name == "projskill" && e.origin == Origin::Project)
+            .find(|e| e.name == "projskill" && e.origin() == Some(&Origin::Project))
             .expect("project skill");
-        assert_eq!(skill.kind, Kind::Skill);
-        assert_eq!(skill.description.as_deref(), Some("a project skill"));
+        assert_eq!(skill.kind(), Some(Kind::Skill));
+        assert_eq!(skill.description(), Some("a project skill"));
 
         let cmd = all.iter().find(|e| e.name == "projcmd").expect("command");
-        assert_eq!(cmd.kind, Kind::Command);
-        assert_eq!(cmd.origin, Origin::Project);
-        assert_eq!(cmd.description.as_deref(), Some("a project command"));
+        assert_eq!(cmd.kind(), Some(Kind::Command));
+        assert_eq!(cmd.origin(), Some(&Origin::Project));
+        assert_eq!(cmd.description(), Some("a project command"));
     }
 
     /// Verified against the real CLI (2.1.226): a probe command at
@@ -861,9 +1032,9 @@ mod tests {
     #[test]
     fn a_command_in_a_subdirectory_namespaces_with_a_colon() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         let n = all.iter().find(|e| e.name == "sub:nested").expect("nested");
-        assert_eq!(n.description.as_deref(), Some("a nested command"));
+        assert_eq!(n.description(), Some("a nested command"));
     }
 
     /// The one that would have been guessed wrong. A skill directory named
@@ -872,7 +1043,7 @@ mod tests {
     #[test]
     fn a_skill_is_named_by_its_directory_not_by_its_frontmatter() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         assert!(
             all.iter().any(|e| e.name == "dirnamewins"),
             "the directory name is the command; got {:?}",
@@ -890,7 +1061,7 @@ mod tests {
     #[test]
     fn a_plugin_skill_takes_the_plugins_namespace_and_not_its_grouping_directory() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         let p = all
             .iter()
             .find(|e| e.name == "pack:packed")
@@ -900,8 +1071,8 @@ mod tests {
                     all.iter().map(|e| &e.name).collect::<Vec<_>>()
                 )
             });
-        assert_eq!(p.origin, Origin::Plugin("pack".into()));
-        assert_eq!(p.description.as_deref(), Some("a grouped plugin skill"));
+        assert_eq!(p.origin(), Some(&Origin::Plugin("pack".into())));
+        assert_eq!(p.description(), Some("a grouped plugin skill"));
         assert!(
             !all.iter().any(|e| e.name.contains("group")),
             "the grouping directory must not appear in any name"
@@ -911,24 +1082,24 @@ mod tests {
     #[test]
     fn project_outranks_user_for_the_same_name() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         let picked = filter(&all, "projskill");
         assert_eq!(
             picked.len(),
             1,
             "one /projskill reaches the CLI, so one row"
         );
-        assert_eq!(picked[0].origin, Origin::Project);
-        assert_eq!(picked[0].description.as_deref(), Some("a project skill"));
+        assert_eq!(picked[0].origin(), Some(&Origin::Project));
+        assert_eq!(picked[0].description(), Some("a project skill"));
     }
 
     #[test]
     fn a_folded_block_description_is_read_and_collapsed_to_one_line() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         let u = all.iter().find(|e| e.name == "userskill").expect("user");
         assert_eq!(
-            u.description.as_deref(),
+            u.description(),
             Some("a user skill whose description is a folded block")
         );
     }
@@ -951,7 +1122,7 @@ mod tests {
                 .join(".claude/plugins/marketplaces/mkt/plugins/uninstalled/skills/ghost/SKILL.md"),
             "---\ndescription: never installed\n---\nbody\n",
         );
-        let all = found(&td);
+        let all = scanned(&td);
         assert!(
             !all.iter().any(|e| e.name.contains("ghost")),
             "an uninstalled marketplace plugin must not reach the palette"
@@ -973,7 +1144,7 @@ mod tests {
     #[test]
     fn the_leaf_of_a_namespaced_name_is_reachable_without_typing_the_plugin() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         let hits = filter(&all, "packed");
         assert_eq!(
             hits.first().map(|e| e.name.as_str()),
@@ -984,22 +1155,7 @@ mod tests {
 
     #[test]
     fn a_prefix_match_outranks_a_match_in_the_middle() {
-        let entries = vec![
-            SlashEntry {
-                name: "unprojected".into(),
-                description: None,
-                origin: Origin::User,
-                kind: Kind::Command,
-                operator_only: false,
-            },
-            SlashEntry {
-                name: "proj".into(),
-                description: None,
-                origin: Origin::User,
-                kind: Kind::Command,
-                operator_only: false,
-            },
-        ];
+        let entries = vec![named("unprojected"), named("proj")];
         let hits = filter(&entries, "proj");
         assert_eq!(hits[0].name, "proj");
         assert_eq!(hits[1].name, "unprojected");
@@ -1008,21 +1164,15 @@ mod tests {
     #[test]
     fn an_empty_query_offers_everything_in_precedence_order() {
         let td = fixture();
-        let all = found(&td);
+        let all = scanned(&td);
         let hits = filter(&all, "");
         assert_eq!(hits.len(), all.len() - 1, "one duplicate name is merged");
-        assert_eq!(hits[0].origin, Origin::Project);
+        assert_eq!(hits[0].origin(), Some(&Origin::Project));
     }
 
     #[test]
     fn insertion_puts_the_slash_back() {
-        let e = SlashEntry {
-            name: "craft-skills:seams".into(),
-            description: None,
-            origin: Origin::Plugin("craft-skills".into()),
-            kind: Kind::Skill,
-            operator_only: false,
-        };
+        let e = named("craft-skills:seams");
         assert_eq!(e.insertion(), "/craft-skills:seams");
     }
 
@@ -1039,7 +1189,7 @@ mod tests {
             &format!("---\ndescription: {long}\n---\nbody\n"),
         );
         let all = discover(CLAUDE, &td.path().join("proj"), &td.path().join("home"));
-        let d = all[0].description.as_ref().unwrap();
+        let d = all[0].description().unwrap();
         assert!(
             d.chars().count() <= 161,
             "capped at 160 chars plus the ellipsis; got {}",
@@ -1059,7 +1209,7 @@ mod tests {
             &format!("---\ndescription: {}\n---\n", "—curly’quote—".repeat(40)),
         );
         let all = discover(CLAUDE, &td.path().join("proj"), &td.path().join("home"));
-        assert!(all[0].description.is_some());
+        assert!(all[0].description().is_some());
     }
 
     #[test]
@@ -1072,7 +1222,7 @@ mod tests {
         let all = discover(CLAUDE, &td.path().join("proj"), &td.path().join("home"));
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].name, "bare");
-        assert_eq!(all[0].description, None);
+        assert_eq!(all[0].description(), None);
     }
 
     /// An indented `description:` belongs to some nested mapping — a
@@ -1085,7 +1235,7 @@ mod tests {
             "---\nname: nested\ntools:\n  description: not this one\n---\nbody\n",
         );
         let all = discover(CLAUDE, &td.path().join("proj"), &td.path().join("home"));
-        assert_eq!(all[0].description, None);
+        assert_eq!(all[0].description(), None);
     }
 
     /// Codex's entire inventory lives in a HIDDEN directory
@@ -1241,11 +1391,11 @@ mod tests {
             "a directory with no SKILL.md anywhere under it is not a skill"
         );
         assert!(
-            all[0].operator_only,
+            all[0].operator_only(),
             "the author declared this operator-invoked only, which is \
              exactly the class a / palette exists for"
         );
-        assert!(all[0].description.is_some());
+        assert!(all[0].description().is_some());
     }
 
     /// A skill that says nothing about model invocation has not declared
@@ -1253,8 +1403,201 @@ mod tests {
     #[test]
     fn a_skill_that_does_not_mention_model_invocation_is_not_operator_only() {
         let td = fixture();
-        let all = found(&td);
-        assert!(all.iter().all(|e| !e.operator_only));
+        let all = scanned(&td);
+        assert!(all.iter().all(|e| !e.operator_only()));
+    }
+
+    // -- Slice AR2: the CLI's own inventory --------------------------
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// **The slice.** The palette lists what the FRAME lists — including
+    /// the names no file on disk backs — and the scan only describes them.
+    ///
+    /// The mix below is the shape of a real frame: a handful of things the
+    /// operator has files for, and rather more that are compiled into the
+    /// agent's own binary. On this machine that ratio is 21 to 46.
+    #[test]
+    fn the_palette_lists_what_the_cli_announces_and_the_scan_only_describes_it() {
+        let td = fixture();
+        let scan = scanned(&td);
+        let inventory = names(&[
+            "projskill",
+            "context",
+            "projcmd",
+            "compact",
+            "pack:packed",
+            "dataviz",
+        ]);
+        let offered = offer(&inventory, &scan);
+
+        assert_eq!(
+            offered.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            [
+                "projskill",
+                "context",
+                "projcmd",
+                "compact",
+                "pack:packed",
+                "dataviz"
+            ],
+            "every announced name is offered, in the frame's own order"
+        );
+
+        // A name with a file behind it keeps everything the scan read.
+        assert_eq!(offered[0].description(), Some("a project skill"));
+        assert_eq!(offered[0].kind(), Some(Kind::Skill));
+        assert_eq!(offered[0].origin(), Some(&Origin::Project));
+        assert_eq!(offered[4].description(), Some("a grouped plugin skill"));
+
+        // A name with none states its name and claims nothing else. This
+        // row is the whole point of AR2 and it is deliberately empty: eave
+        // does not know what `/context` does and will not invent a line.
+        assert_eq!(offered[1].name, "context");
+        assert_eq!(offered[1].description(), None);
+        assert_eq!(offered[1].kind(), None);
+        assert_eq!(offered[1].origin(), None);
+        assert!(!offered[1].operator_only());
+        assert_eq!(
+            offered[1].insertion(),
+            "/context",
+            "a row with no description is still a row that can be sent"
+        );
+    }
+
+    /// A file on disk the CLI does not announce is **not** offered.
+    ///
+    /// This is the half that makes the frame the source of truth rather
+    /// than a supplement, and it is the half that can cost a row: a skill
+    /// added since the session last started is on disk and not in the
+    /// frame, so it will not appear until that session runs again. The
+    /// trade is deliberate. The frame is the definition of what the CLI
+    /// will accept; a union with the scan would put eave back in the
+    /// business of predicting that, which is the business AR2 exists to
+    /// get it out of.
+    #[test]
+    fn a_file_the_cli_does_not_announce_is_not_offered() {
+        let td = fixture();
+        let scan = scanned(&td);
+        assert!(
+            scan.iter().any(|e| e.name == "projskill"),
+            "the fixture's project skill is on disk"
+        );
+        let offered = offer(&names(&["projcmd"]), &scan);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].name, "projcmd");
+    }
+
+    /// **Slice AR's precedence work is what attributes a description to
+    /// the right file**, and that is why it survives AR2 rather than being
+    /// replaced by it.
+    ///
+    /// The CLI resolves one `/projskill` and announces it once. Two files
+    /// claim that name — the project's and the user's — and only the
+    /// project's is the one the CLI will run, so only the project's
+    /// description may appear under it. Take the last match instead and
+    /// the palette describes a file the agent will never execute.
+    #[test]
+    fn precedence_decides_which_file_describes_one_announced_name() {
+        let td = fixture();
+        let scan = scanned(&td);
+        assert_eq!(
+            scan.iter().filter(|e| e.name == "projskill").count(),
+            2,
+            "the fixture plants the collision this rule exists for"
+        );
+        let offered = offer(&names(&["projskill"]), &scan);
+        assert_eq!(offered.len(), 1, "one announced name is one row");
+        assert_eq!(offered[0].description(), Some("a project skill"));
+        assert_eq!(offered[0].origin(), Some(&Origin::Project));
+    }
+
+    /// `/clear` is announced by the CLI, is accepted by the CLI, and does
+    /// nothing eave can survive — so it is the one name subtracted from
+    /// the frame's answer.
+    ///
+    /// Measured through eave's exact argv on 2026-08-20: the reply is a
+    /// `result` whose text is the empty string, with no assistant turn,
+    /// preceded by a `conversation_reset` frame that hands the CLI a new
+    /// conversation id while eave's journal keeps appending to the old
+    /// one. Offering it would offer a way to silently desynchronise a
+    /// session.
+    #[test]
+    fn clear_is_never_offered_however_the_cli_announces_it() {
+        let offered = offer(&names(&["context", "clear", "model"]), &[]);
+        assert_eq!(
+            offered.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["context", "model"],
+            "the deny-list removes exactly its own entry and nothing beside it"
+        );
+    }
+
+    /// **Every carve-out is stated, and the statement is machine-checked.**
+    ///
+    /// The palette's claim is "this is what your CLI will accept". Each
+    /// subtraction from that weakens the claim, so each one has to carry a
+    /// measurement in prose next to it — the same discipline
+    /// `the_roots_table_is_what_was_actually_surveyed` applies to the
+    /// roots. A future slice that quietly adds a name here fails this.
+    ///
+    /// The second half is the guard against creep: `/context` and `/model`
+    /// were both measured working in `-p` mode (a 3129-character context
+    /// report came back through eave's own argv), so neither may be
+    /// filtered on a hunch that built-ins are risky.
+    #[test]
+    fn every_denied_name_states_its_evidence_and_the_measured_ones_stay() {
+        let src = include_str!("slash.rs");
+        for name in NEVER_OFFERED {
+            // Assembled rather than written whole, so this test cannot
+            // satisfy itself with its own source.
+            let claim = format!("**`{name}`** —");
+            assert!(
+                src.lines()
+                    .filter(|l| l.trim_start().starts_with("///"))
+                    .any(|l| l.contains(&claim)),
+                "/{name} is refused with no stated reason; a carve-out from \
+                 the CLI's own inventory must say what was measured"
+            );
+        }
+        for verified in ["context", "model"] {
+            assert!(
+                !NEVER_OFFERED.contains(&verified),
+                "/{verified} was measured WORKING in headless mode and must \
+                 not be filtered"
+            );
+        }
+    }
+
+    /// An announced name that no file backs is not a hole in the row — it
+    /// is a row with one fact in it, and the renderer needs to be able to
+    /// tell that apart from a file that simply had no `description:` key.
+    ///
+    /// Both render without a second line; only one of them may claim a
+    /// kind or a scope.
+    #[test]
+    fn a_file_without_a_description_is_not_the_same_as_no_file() {
+        let td = TempTree::new("nodesc");
+        write(
+            &td.path().join("proj/.claude/commands/quiet.md"),
+            "just a body, no frontmatter at all\n",
+        );
+        let scan = discover(CLAUDE, &td.path().join("proj"), &td.path().join("home"));
+        let offered = offer(&names(&["quiet", "compact"]), &scan);
+
+        assert_eq!(offered[0].description(), None);
+        assert_eq!(
+            offered[0].kind(),
+            Some(Kind::Command),
+            "a file that said nothing was still READ, and eave knows what it is"
+        );
+        assert_eq!(offered[1].description(), None);
+        assert_eq!(
+            offered[1].kind(),
+            None,
+            "a name with no file behind it must not borrow the other's kind"
+        );
     }
 
     /// An INSTRUMENT, not an assertion: dump what [`discover`] finds for a
@@ -1268,8 +1611,15 @@ mod tests {
     /// anything — which costs nothing and is how every "the CLI addresses
     /// it THIS way" claim in this module was settled.
     ///
-    /// `EAVE_SLASH_DUMP_CWD=<dir> cargo test -p eave-app --lib
-    /// dump_real_inventory -- --ignored --nocapture`
+    /// Slice AR2 gave it the OTHER side of that diff: point
+    /// `EAVE_SLASH_DUMP_INIT` at a file holding one captured `system/init`
+    /// line and it runs the real [`offer`] against it and reports the
+    /// split — how many rows the CLI announces, how many the scan can
+    /// describe, and how many the scan finds that the CLI does not have
+    /// (which must be zero).
+    ///
+    /// `EAVE_SLASH_DUMP_CWD=<dir> EAVE_SLASH_DUMP_INIT=<init.json> cargo
+    /// test -p eave-app --lib dump_real_inventory -- --ignored --nocapture`
     #[test]
     #[ignore = "machine-dependent instrument; prints, asserts nothing"]
     fn dump_real_inventory() {
@@ -1289,9 +1639,52 @@ mod tests {
             println!(
                 "  /{}  [{:?} {}]  {}",
                 e.name,
-                e.kind,
-                e.origin.label(),
-                e.description.as_deref().unwrap_or("(no description)")
+                e.kind(),
+                e.origin().map_or("(no file)", Origin::label),
+                e.description().unwrap_or("(no description)")
+            );
+        }
+
+        let Ok(init_path) = std::env::var("EAVE_SLASH_DUMP_INIT") else {
+            println!("(set EAVE_SLASH_DUMP_INIT=<file with one system/init line> for the diff)");
+            return;
+        };
+        let text = std::fs::read_to_string(&init_path).expect("read the captured init line");
+        let line = text
+            .lines()
+            .find(|l| l.contains("\"subtype\":\"init\""))
+            .expect("a system/init line in that file");
+        let v: serde_json::Value = serde_json::from_str(line).expect("parse the init line");
+        let inventory: Vec<String> = v["slash_commands"]
+            .as_array()
+            .expect("slash_commands array")
+            .iter()
+            .filter_map(|c| c.as_str())
+            .map(str::to_string)
+            .collect();
+        let offered = offer(&inventory, &all);
+        let described = offered.iter().filter(|e| e.found.is_some()).count();
+        let names: std::collections::HashSet<&str> = inventory.iter().map(String::as_str).collect();
+        let false_offers: Vec<&str> = all
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|n| !names.contains(n))
+            .collect();
+        println!(
+            "the CLI announces {}; the palette offers {} ({} denied); \
+             the scan describes {} of them and finds {} the CLI does not have: {:?}",
+            inventory.len(),
+            offered.len(),
+            inventory.len() - offered.len(),
+            described,
+            false_offers.len(),
+            false_offers,
+        );
+        for e in &offered {
+            println!(
+                "  /{}  {}",
+                e.name,
+                e.description().unwrap_or("(name only — no file backs it)")
             );
         }
     }

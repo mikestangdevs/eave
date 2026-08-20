@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # Slice AR - photograph the `/` palette.
+# Slice AR2 - and the rows that come out of the CLI's own inventory.
+#
+# Run it as `scripts/ar-capture.sh ar2` for the AR2 shots. The only change
+# AR2 made is to the fixture's `init` record, which now carries the
+# `slash_commands` array the real CLI sends - which is what makes the shot
+# show `/context` and `/compact`, rows no filesystem scan can ever produce.
+# Not a fifth copy of these twenty lines of Quartz plumbing: AR's report
+# already counted four re-derivations of them and a fifth would be worse
+# than an edit.
 #
 # The palette's only door is the keyboard, and progress.md records that
 # synthetic keyboard events do not reach this gpui app at all (gpui derives
@@ -66,9 +75,10 @@ SK
 
 # A SETTLED journal - the palette is what this shot is about, so nothing
 # else in the window should be mid-flight competing with it.
-python3 - "$FIXTURE" "$SID" "$PROJ" <<'PY'
+BARE="$WORK/session-bare.tap.jsonl"
+python3 - "$FIXTURE" "$SID" "$PROJ" "$BARE" <<'PY'
 import json, sys
-path, sid, proj = sys.argv[1], sys.argv[2], sys.argv[3]
+path, sid, proj, bare = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 T0 = 1786890000000
 def frame(ts, item):
     return str(ts) + "\t" + json.dumps({"id": 100, "item": item})
@@ -82,16 +92,49 @@ def ev(seq, event):
 records = [
     ev(1, {"kind": "user_sent", "text": "What is left before this slice can ship?"}),
     ev(2, {"kind": "user_delivered"}),
+    # Slice AR2: the CLI announces its own complete command list in this
+    # frame, and the palette now takes its NAMES from here. The mix is the
+    # shape of a real one - the project's two, a real user skill, a real
+    # plugin skill, and the built-ins that exist in no file anywhere. And
+    # `clear`, which the CLI really does announce and the palette really
+    # does refuse (verified inert in -p mode), so the shot shows the
+    # carve-out by its absence.
     ev(3, {"kind": "provider", "event": {"kind": "init", "session_id": sid,
-                                         "permission_mode": "default"}}),
+                                         "permission_mode": "default",
+                                         "slash_commands": [
+                                             "ship-a-slice", "proof",
+                                             "context", "compact", "model",
+                                             "clear", "config", "doctor"]}}),
     ev(4, {"kind": "provider", "event": {"kind": "assistant_text", "text":
            "The suite is green and both gates are clean. What is left is the "
            "report, and one screenshot of the palette itself."}}),
 ]
-lines.append(frame(T0 + 200, {"type": "events", "session_id": sid,
-                              "epoch": 1, "records": records}))
-open(path, "w").write("\n".join(lines) + "\n")
-print("  fixture: " + str(len(lines)) + " frames -> " + path)
+# The init record plays at T0, WITH the reset, and the rest 200ms later.
+# Slice AR2 made that ordering load-bearing rather than cosmetic: the
+# palette takes its names from the inventory in that record, and
+# `EAVE_SLASH_DEMO` seeds the composer as soon as a session exists. Leaving
+# init in the later batch is a race the camera can lose, and losing it
+# photographs the fallback while claiming to photograph the feature.
+def emit(target, recs):
+    out = lines + [
+        frame(T0, {"type": "events", "session_id": sid,
+                   "epoch": 1, "records": recs[:3]}),
+        frame(T0 + 200, {"type": "events", "session_id": sid,
+                         "epoch": 1, "records": recs[3:]}),
+    ]
+    open(target, "w").write("\n".join(out) + "\n")
+    print("  fixture: " + str(len(out)) + " frames -> " + target)
+
+emit(path, records)
+# The unknown-provider shot needs a session whose CLI announced NOTHING.
+# With an inventory in the frame the palette has names to offer and the
+# "eave does not know where <provider> keeps its skills" sentence is no
+# longer true - which is correct behaviour and the wrong photograph.
+quiet = [dict(r) for r in records]
+quiet[2] = ev(3, {"kind": "provider", "event": {"kind": "init",
+                                                "session_id": sid,
+                                                "permission_mode": "default"}})
+emit(bare, quiet)
 PY
 
 shoot() {                                  # shoot <name> <env...>
@@ -160,6 +203,6 @@ shoot "$PREFIX-composer" EAVE_REPLAY="$FIXTURE" EAVE_REPLAY_SPEED=1 \
 # sentence: a provider eave has no roots table for. Worth photographing on
 # purpose, because "you have none" and "I do not know where to look" are
 # different facts and the palette used to say the first for both.
-shoot "$PREFIX-unknown-provider" EAVE_REPLAY="$FIXTURE" EAVE_REPLAY_SPEED=1 \
+shoot "$PREFIX-unknown-provider" EAVE_REPLAY="$BARE" EAVE_REPLAY_SPEED=1 \
       EAVE_REPLAY_CWD="$PROJ" EAVE_REPLAY_PROVIDER=hermes EAVE_SLASH_DEMO=1
 echo "done"

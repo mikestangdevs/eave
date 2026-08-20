@@ -59,6 +59,28 @@ pub enum SessionEvent {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
+        /// Every `/name` this CLI will accept, by the CLI's own account
+        /// (Slice AR2). The `system/init` frame carries a `slash_commands`
+        /// array and it arrives BEFORE the model is invoked, so this is a
+        /// complete inventory that costs no tokens to obtain.
+        ///
+        /// **Complete where a filesystem scan cannot be.** Measured
+        /// 2026-08-20 with eave's exact argv: the frame lists 68 names from
+        /// `/tmp`; everything reachable on disk accounts for 21 of them.
+        /// The rest (`/context`, `/dataviz`, `/compact`, …) are bundled
+        /// inside the `claude` executable and exist in no file.
+        ///
+        /// **Per session and cwd-sensitive**, which is why it rides the
+        /// session's own event rather than a global: planting one command
+        /// and one skill under a directory's `.claude/` took the same
+        /// machine from 68 to 71 in the same minute.
+        ///
+        /// Empty = the CLI said nothing (an older CLI, or a journal written
+        /// by an engine predating this field). Never a guess, and never
+        /// filled in from a scan — a reader that wants the disk's answer
+        /// has to ask the disk.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        slash_commands: Vec<String>,
     },
     /// Incremental assistant text (from partial-message stream events).
     TextDelta { text: String },

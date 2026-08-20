@@ -7225,6 +7225,47 @@ fn draft_of(h: &Harness, vcx: &mut VisualTestContext) -> String {
     .unwrap()
 }
 
+/// One `system/init` record, the way the engine journals it — the frame
+/// the agent CLI writes before the model is invoked, carrying its own
+/// complete list of the `/name`s it will accept (Slice AR2).
+fn init_record(seq: u64, slash_commands: &[&str]) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::Init {
+                session_id: "aaaa1111".into(),
+                permission_mode: Some("default".into()),
+                slash_commands: slash_commands.iter().map(|s| (*s).to_string()).collect(),
+            },
+        },
+    }
+}
+
+/// What the palette is offering right now, as `(name, description)`.
+///
+/// Read off the shell's own state rather than the rendered rows, because
+/// the fact under test is which rows exist and where each row's SECOND
+/// line came from — and a `debug_bounds` selector can only say that a row
+/// is on screen.
+fn offered(h: &Harness, vcx: &mut VisualTestContext) -> Vec<(String, Option<String>)> {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell
+            .read(cx)
+            .slash
+            .cache
+            .as_ref()
+            .map(|c| {
+                c.offered
+                    .iter()
+                    .map(|e| (e.name.clone(), e.description().map(str::to_string)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .unwrap()
+}
+
 /// Let the background scan land and the entrance play.
 fn settle_palette(h: &Harness, vcx: &mut VisualTestContext) {
     vcx.run_until_parked();
@@ -7704,4 +7745,203 @@ fn the_palette_lines_up_with_the_composer_it_grows_out_of(cx: &mut TestAppContex
             "the palette does not reach the composer's right-hand controls"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice AR2 — the inventory the CLI announces about itself
+
+/// **The slice, end to end.** A command that exists in no file on this
+/// machine is offered, is reachable, and completes.
+///
+/// `/context` is the case that matters: it is live in the real CLI, it is
+/// in the real `system/init` frame, and `find ~/.claude
+/// /opt/homebrew/lib/node_modules -name context` finds nothing. Slice AR's
+/// palette could not name it, so an operator who typed `/` and did not see
+/// it would conclude eave could not run it.
+///
+/// The same session's fixture skill is still described, from the same
+/// scan AR built — which is the other half of the rule: the frame decides
+/// WHICH rows exist, the disk decides what they SAY.
+#[gpui::test]
+fn the_palette_offers_a_command_the_cli_announced_that_no_file_backs(cx: &mut TestAppContext) {
+    let project = SlashProject::new("announced");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![init_record(1, &["shipit", "context"])],
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        offered(&h, vcx),
+        vec![
+            (
+                "shipit".to_string(),
+                Some("cut a release and tag it".into())
+            ),
+            ("context".to_string(), None),
+        ],
+        "the palette must offer exactly what the CLI announced, in the \
+         frame's order, describing only what it could read"
+    );
+
+    // And the row with no description is a real, selectable row.
+    vcx.simulate_input("cont");
+    settle_palette(&h, vcx);
+    click(vcx, "menu-row-0");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        draft_of(&h, vcx),
+        "/context ",
+        "a command with no file behind it still completes"
+    );
+}
+
+/// **The carve-out, end to end.** `/clear` is announced by the CLI and is
+/// still not offered.
+///
+/// Measured through eave's exact argv: it answers with an empty `result`,
+/// no assistant turn, and a `conversation_reset` frame that gives the CLI
+/// a new conversation id while eave's journal keeps appending to the old
+/// one. It is the only name subtracted from the CLI's own answer, and this
+/// is where that subtraction is visible.
+#[gpui::test]
+fn a_command_verified_inert_is_not_offered_even_though_the_cli_has_it(cx: &mut TestAppContext) {
+    let project = SlashProject::new("denied");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![init_record(1, &["clear", "context"])],
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_input("/clear");
+    settle_palette(&h, vcx);
+    assert!(
+        shown(vcx, "slash-palette"),
+        "the palette stays up and explains"
+    );
+    assert!(
+        offered(&h, vcx).iter().all(|(n, _)| n != "clear"),
+        "a command verified inert must never reach a row"
+    );
+    // The explanation row is not a completion: clicking it leaves the
+    // draft as typed, so Return still sends `/clear` to the CLI exactly as
+    // it always did. eave declines to ADVERTISE it; it does not block it.
+    click(vcx, "menu-row-0");
+    settle_palette(&h, vcx);
+    assert_eq!(draft_of(&h, vcx), "/clear");
+}
+
+/// Before a session has said what it has, the palette falls back to the
+/// scan — and offers **only** things it actually read.
+///
+/// There are two ways to be here and both are ordinary: a session that has
+/// never been started (there is no frame to have arrived) and one whose
+/// replay has not yet reached its first `Init`. The fallback is Slice AR's
+/// palette unchanged: fewer rows than the CLI has, and zero rows the CLI
+/// lacks.
+///
+/// **No row count is asserted, deliberately.** This test reads the real
+/// `~/.claude` on whatever machine the suite runs on — that is the real
+/// discovery path rather than a mock, and it is why the assertion is a
+/// property of every row instead of a total.
+#[gpui::test]
+fn a_session_that_has_announced_nothing_falls_back_to_the_scan(cx: &mut TestAppContext) {
+    let project = SlashProject::new("noinit");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    let rows = offered(&h, vcx);
+    assert!(
+        rows.iter().any(|(n, d)| n == "shipit" && d.is_some()),
+        "the fallback is still the scan, descriptions and all"
+    );
+    assert!(
+        rows.iter().all(|(_, d)| d.is_some()),
+        "with no inventory eave may offer only what it READ, and everything \
+         it reads has a file — a bare name here would be invented"
+    );
+}
+
+/// **The inventory belongs to the session, not to the app.**
+///
+/// The AR2 twin of `the_palette_reads_the_sessions_directory_and_not_the_apps`,
+/// and it guards the same trap from the other side. eave is one binary in
+/// two roles: the ENGINE runs the CLI and sees its `system/init` frame, and
+/// this process learns the inventory only by being told, on that session's
+/// own stream. An inventory cached per process — or read from whatever
+/// happened to arrive last — would pass every unit test in `slash.rs` and
+/// would show one session's commands under another.
+///
+/// Both sessions share a directory on purpose, so the ONLY thing that can
+/// distinguish their palettes is which session's stream the inventory came
+/// off. The disk-scan cache is keyed on `(provider, cwd)` and is therefore
+/// deliberately unchanged across the switch.
+#[gpui::test]
+fn the_inventory_follows_the_session_and_not_the_process(cx: &mut TestAppContext) {
+    let project = SlashProject::new("per-session");
+    let (h, vcx) = boot(cx);
+    let mut sa = session("aaaa1111");
+    sa.cwd = project.cwd();
+    let mut sb = session("bbbb2222");
+    sb.cwd = project.cwd();
+    h.plumbing.push_rail(vec![sa, sb]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![init_record(1, &["shipit"])],
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        offered(&h, vcx)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect::<Vec<_>>(),
+        ["shipit"],
+        "session A's CLI announced one command"
+    );
+
+    // Move to B, whose CLI announced a different one over the same
+    // directory.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "bbbb2222".into(),
+        epoch: 1,
+        records: vec![init_record(1, &["review", "compact"])],
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_input("/");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        offered(&h, vcx),
+        vec![
+            (
+                "review".to_string(),
+                Some("review the working tree".to_string())
+            ),
+            ("compact".to_string(), None),
+        ],
+        "the palette must follow the SESSION's own announcement"
+    );
 }

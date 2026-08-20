@@ -157,6 +157,30 @@ pub struct Transcript {
     pub cursor: Option<Cursor>,
     /// Terminal state name once a `Closed` record was applied.
     pub closed: Option<String>,
+    /// Every `/name` the agent CLI said it would accept, from the most
+    /// recent `Init` in this session's log (Slice AR2).
+    ///
+    /// **`None` and `Some(vec![])` are different facts and both happen.**
+    /// `None` = no `Init` has been replayed — a session that has never run,
+    /// or one whose replay has not reached its first frame. `Some(empty)` =
+    /// an `Init` that said nothing, which — because the field is
+    /// `#[serde(default)]` — covers both a CLI with no commands and a CLI
+    /// predating the field. This type keeps that distinction faithfully and
+    /// takes no view on it; what to DO about an empty announcement is a
+    /// policy, and it lives at the consumer (`SlashCache::rebuild` treats
+    /// it as no announcement and falls back to a filesystem scan).
+    ///
+    /// Derived by replay like every other field here, which is the whole
+    /// reason it needs no channel of its own: the `Init` record is in the
+    /// journal permanently, so a session that has ever run reports its
+    /// inventory again on every later open without spawning anything. What
+    /// that inventory describes is the LAST run — install a plugin and this
+    /// says so only after the session next starts.
+    ///
+    /// Last-wins rather than first: a resumed session writes a second
+    /// `Init`, and the newer one is the one describing the process that
+    /// just started.
+    pub inventory: Option<Vec<String>>,
     rev_counter: u64,
 }
 
@@ -267,9 +291,19 @@ impl Transcript {
 
     fn apply_provider(&mut self, event: &SessionEvent) {
         match event {
-            SessionEvent::Init { session_id, .. } => self.push_row(Row::Marker {
-                text: format!("session started ({session_id})"),
-            }),
+            SessionEvent::Init {
+                session_id,
+                slash_commands,
+                ..
+            } => {
+                // Slice AR2. Stamped even when empty: "this CLI announced
+                // nothing" is a fact a fallback must be able to see, and it
+                // is not the same fact as "nothing has run yet".
+                self.inventory = Some(slash_commands.clone());
+                self.push_row(Row::Marker {
+                    text: format!("session started ({session_id})"),
+                });
+            }
             // Deltas and their snapshot pair with the *live* assistant row,
             // which is not necessarily the last row — engine-side records
             // (UserSent/UserDelivered) interleave with provider events.
@@ -562,6 +596,58 @@ mod tests {
             ts_ms: 0,
             event,
         }
+    }
+
+    /// **Slice AR2.** The inventory is derived by replay like every other
+    /// fact here, and that is what saves it a channel of its own.
+    ///
+    /// The `Init` record is in the journal permanently, so a session that
+    /// has ever run reports its CLI's own command list on every later open
+    /// with nothing live and nothing spawned. A resumed session writes a
+    /// second `Init` and the newer one wins — it describes the process that
+    /// is actually running.
+    #[test]
+    fn the_inventory_is_replayed_and_the_latest_init_wins() {
+        let init = |names: &[&str]| JournalEvent::Provider {
+            event: SessionEvent::Init {
+                session_id: "s1".into(),
+                permission_mode: Some("default".into()),
+                slash_commands: names.iter().map(|n| (*n).to_string()).collect(),
+            },
+        };
+        let mut t = Transcript::new();
+        assert_eq!(
+            t.inventory, None,
+            "nothing has run, so nothing has been announced — and that is \
+             not the same fact as an empty announcement"
+        );
+
+        t.apply(1, &[rec(1, init(&["context", "model"]))]).unwrap();
+        assert_eq!(
+            t.inventory.as_deref(),
+            Some(["context".to_string(), "model".to_string()].as_slice())
+        );
+
+        // A second process segment: resumed, and its CLI now has one more.
+        t.apply(1, &[rec(2, init(&["context", "model", "dataviz"]))])
+            .unwrap();
+        assert_eq!(
+            t.inventory.as_ref().map(Vec::len),
+            Some(3),
+            "the newest Init describes the CLI that is running now"
+        );
+
+        // A CLI that announced nothing is a DIFFERENT fact from a session
+        // that has never run, and the projection keeps them apart. What to
+        // do about it is the palette's policy, not this type's.
+        t.apply(1, &[rec(3, init(&[]))]).unwrap();
+        assert_eq!(t.inventory.as_deref(), Some([].as_slice()));
+
+        // ...and a resubscribe drops it, because the replay that follows
+        // rebuilds it. A stale inventory surviving a reset would outlive
+        // the session it described.
+        t.reset();
+        assert_eq!(t.inventory, None);
     }
 
     #[test]
