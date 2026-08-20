@@ -13,7 +13,7 @@
 //! per burst. Frame pacing comes from the engine's strict 120 ms delta
 //! folding — no UI frame-pacing timer (spec 03 §Streaming commit).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1543,13 +1543,47 @@ impl TranscriptState {
 }
 
 struct ComposerState {
+    /// The live buffer: always the draft belonging to `key`.
     text: String,
+    /// Which session `text` belongs to; `""` is the launcher, which has no
+    /// composer mounted and therefore never accumulates one.
+    key: String,
+    /// Every OTHER session's unsent words, parked while it is not selected.
+    /// The entry for `key` lives in `text`, never here — one draft has one
+    /// home, so there is no pair to keep in step.
+    drafts: HashMap<String, String>,
     /// When the caret last went solid (inventory §1.20). Every keystroke
     /// resets it, which is what keeps a typing burst from blinking: the
     /// cadence is solid through its first half-period, so the caret only
     /// starts flashing once the typist has stopped. `None` until the first
     /// keystroke — a caret nobody has typed at has nothing to blink about.
     caret_anchor: Option<Instant>,
+}
+
+impl ComposerState {
+    /// Move the composer to another session, carrying each draft with the
+    /// session it was typed into.
+    ///
+    /// Before Slice S there was one buffer for every session, so a sentence
+    /// typed into A and left there was still in the field when B was
+    /// selected — and the next Return sent A's words to B. The buffer is
+    /// per-session now, and the switch is the only thing that moves it.
+    ///
+    /// An empty draft is removed rather than parked: absence and emptiness
+    /// are the same fact here, and storing both invites them to disagree.
+    fn switch_to(&mut self, key: String) {
+        if key == self.key {
+            return;
+        }
+        let outgoing = std::mem::take(&mut self.text);
+        if outgoing.is_empty() {
+            self.drafts.remove(&self.key);
+        } else {
+            self.drafts.insert(std::mem::take(&mut self.key), outgoing);
+        }
+        self.text = self.drafts.remove(&key).unwrap_or_default();
+        self.key = key;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,6 +2016,26 @@ impl Shell {
                     None => self.close_demo_menu(cx),
                 },
                 _ => {}
+            }
+            return;
+        }
+        // Slice Q2 unmounted the composer at the launcher (`show_launcher`
+        // below) but left this handler open, so keystrokes still landed in
+        // the buffer behind it — invisible, because the element is not
+        // rendered — and Return then dispatched a `Send` the rest loop
+        // drops, there being no session to address it to. The words
+        // surfaced later in whatever session opened first. Q2's own comment
+        // at the mount site says an input that silently eats what you type
+        // is the one thing this must not be; that is the half this closes.
+        //
+        // Ahead of the caret-anchor reset for the same reason as the
+        // overlay gates: nobody is typing in a composer that is not there.
+        if self.transcript.read(cx).session_id.is_none() {
+            // ⌘L survives. The friction log stamps the MOMENT, not a
+            // session, and it already states "no session" when there is
+            // none — the launcher is exactly where a dogfooder needs it.
+            if ks.key == "l" && ks.modifiers.platform {
+                self.friction_log(cx);
             }
             return;
         }
@@ -5488,6 +5542,40 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                 cx.notify();
                             }
                         });
+                        // ...and moves the composer's draft with it. This is
+                        // the ONLY writer of the composer's key: the swap
+                        // rides the same fact the rest of the switch does,
+                        // so a draft cannot end up parked under a session
+                        // the shell is no longer showing.
+                        //
+                        // The scroll mode rides it too. `reset()` clears the
+                        // transcript, the display, the list, the veil and the
+                        // turn clock and did NOT clear this, so a session you
+                        // switched into inherited the last one's mode: `Free`
+                        // (no follow while it streams, and a ↓-bottom pill
+                        // over a transcript already at its bottom) or a
+                        // `Pinned { msg }` whose id then resolved against a
+                        // transcript that never held it. Stage G caveat 2
+                        // recorded that as "not code; watched" — it is code.
+                        //
+                        // Deliberately NOT inside `reset()`: two of its three
+                        // callers are same-session replays (`FeedEvent::Reset`
+                        // and the out-of-sequence heal), and forcing Follow
+                        // there would yank a reader who had scrolled up back
+                        // to the tail every time the engine resubscribed. A
+                        // switch is the only moment the mode is stale.
+                        let moved = transcript.update(cx, |state, _| {
+                            state.scroll = ScrollMode::Follow;
+                            state.assert_scroll();
+                            let key = state.session_id.clone().unwrap_or_default();
+                            state.composer.clone().map(|c| (c, key))
+                        });
+                        if let Some((composer, key)) = moved {
+                            let _ = composer.update(cx, |c, cx| {
+                                c.switch_to(key);
+                                cx.notify();
+                            });
+                        }
                     }
                 }
             }
@@ -5514,6 +5602,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             let shell = cx.new(|cx| {
                 let composer = cx.new(|_| ComposerState {
                     text: String::new(),
+                    key: String::new(),
+                    drafts: HashMap::new(),
                     caret_anchor: None,
                 });
                 // Slice K: the approval card's buttons are built by a
