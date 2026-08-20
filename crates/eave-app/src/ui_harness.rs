@@ -5422,3 +5422,60 @@ fn a_quote_and_a_heading_render_their_markup_rather_than_showing_it(cx: &mut Tes
     );
     assert!(runs.iter().any(|r| r.style.bold && r.text == "why"));
 }
+
+// ---------------------------------------------------------------------------
+// Slice AJ — a timeout is not a git failure
+
+/// The remedy line appears exactly when there is something to do about it.
+///
+/// The sentence itself is pinned in `eave-wire`
+/// (`a_timeout_never_says_git_failed`); what can only be checked here is
+/// that the RAIL routes each state to the right rendering — because the
+/// defect was never in either layer's wording alone, it was the app adding
+/// a frame on top of the engine's.
+#[gpui::test]
+async fn the_changes_rail_offers_a_remedy_only_when_there_is_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+
+    let snap = |state: GitState| FilesSnapshot {
+        state,
+        files: vec![],
+        omitted: 0,
+        watching: true,
+        basis: DiffBasis::WorkingTree,
+    };
+    let unanswered = |gate: Option<&str>| GitState::Unanswered {
+        what: "status".into(),
+        secs: 10.0,
+        gate: gate.map(str::to_string),
+    };
+
+    for (name, state, want) in [
+        (
+            "blocked in a gated folder",
+            unanswered(Some("~/Desktop")),
+            true,
+        ),
+        ("blocked somewhere ordinary", unanswered(None), false),
+        (
+            "git itself refused",
+            GitState::Error {
+                message: "bad revision".into(),
+            },
+            false,
+        ),
+    ] {
+        h.plumbing
+            .push_files(("aaaa1111".into(), Some(snap(state))));
+        vcx.run_until_parked();
+        assert_eq!(
+            shown(vcx, "git-remedy"),
+            want,
+            "{name}: the remedy line should {} be on screen",
+            if want { "" } else { "not" }
+        );
+    }
+}

@@ -14,7 +14,7 @@
 //! ([`GitState::NotARepo`] / [`GitState::Error`]), never crashes.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -225,15 +225,7 @@ async fn run_env(
                 message: format!("git {}: {e}", args.first().unwrap_or(&"")),
             })
         }
-        Err(_elapsed) => {
-            return Err(GitState::Error {
-                message: format!(
-                    "git {} timed out after {}s",
-                    args.first().unwrap_or(&""),
-                    timeout.as_secs_f32()
-                ),
-            })
-        }
+        Err(_elapsed) => return Err(unanswered(args.first().unwrap_or(&""), cwd, timeout)),
     };
     if out.status.success() {
         return Ok(out.stdout);
@@ -720,11 +712,7 @@ pub async fn git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
 }
 
 fn stated(err: GitState) -> String {
-    match err {
-        GitState::Error { message } => message,
-        GitState::NotARepo => "not a git repository".into(),
-        GitState::Ok => "git gave no answer".into(),
-    }
+    err.stated()
 }
 
 /// `git worktree add -b <branch> <path>` from the base repo: a fresh
@@ -919,11 +907,7 @@ async fn tracked_kind(
 
 fn state_to_kind(state: GitState) -> DiffKind {
     DiffKind::Error {
-        message: match state {
-            GitState::Error { message } => message,
-            GitState::NotARepo => "not a git repository".into(),
-            GitState::Ok => "git gave no answer".into(),
-        },
+        message: state.stated(),
     }
 }
 
@@ -937,6 +921,66 @@ struct CappedOutput {
 /// Run one git command reading stdout only up to `cap` bytes — a huge
 /// diff must bound memory as well as time. Past the cap the child is
 /// killed and the head is returned marked truncated; exit status only
+/// The user directories macOS puts behind a Files-and-Folders grant.
+///
+/// Pure path logic, `home` passed in, so it is testable without touching a
+/// real `$HOME` — and so the table is readable as a list rather than buried
+/// in string surgery.
+///
+/// This list is deliberately short. It is the three directories a person
+/// actually keeps repositories in plus iCloud Drive, not an attempt to
+/// mirror TCC. A wrong `Some` here puts a misleading sentence in front of
+/// somebody, which is the exact failure this whole change exists to fix, so
+/// the bar for adding a row is that repositories really live there.
+fn gated_root(cwd: &Path, home: &Path) -> Option<String> {
+    const GATED: [&str; 4] = [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library/Mobile Documents",
+    ];
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    for name in GATED {
+        let root = home.join(name);
+        if cwd.starts_with(&root) {
+            return Some(if name == "Library/Mobile Documents" {
+                "iCloud Drive".to_string()
+            } else {
+                format!("~/{name}")
+            });
+        }
+    }
+    None
+}
+
+/// [`gated_root`] against the real home directory, and only on the platform
+/// where the claim is true. On any other OS these directories carry no such
+/// gate, and saying they do would be inventing a cause.
+fn permission_gate(cwd: &Path) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        gated_root(cwd, &home)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cwd;
+        None
+    }
+}
+
+/// The state a git call that never came back should report.
+///
+/// Never [`GitState::Error`]: the process was alive when the budget ran
+/// out, so git is not known to have failed at anything.
+fn unanswered(what: &str, cwd: &Path, timeout: Duration) -> GitState {
+    GitState::Unanswered {
+        what: what.to_string(),
+        secs: timeout.as_secs_f32(),
+        gate: permission_gate(cwd),
+    }
+}
+
 /// matters for complete reads.
 async fn run_capped(
     git: &Path,
@@ -963,13 +1007,7 @@ async fn run_capped(
             })
         }
     };
-    let timed_out = || GitState::Error {
-        message: format!(
-            "git {} timed out after {}s",
-            args.first().map(String::as_str).unwrap_or(""),
-            timeout.as_secs_f32()
-        ),
-    };
+    let timed_out = || unanswered(args.first().map(String::as_str).unwrap_or(""), cwd, timeout);
     let mut stdout = child.stdout.take().expect("stdout piped");
     let deadline = tokio::time::Instant::now() + timeout;
     let mut bytes = Vec::new();
@@ -1759,9 +1797,19 @@ mod tests {
         let started = std::time::Instant::now();
         let d = diff_with(&fake, &dir, Duration::from_millis(200), &file, None).await;
         assert!(started.elapsed() < Duration::from_secs(5));
+        // The diff pane collapses every state into `DiffKind::Error`, so
+        // the wording is all it has. Assert the negative as well: this is
+        // the surface that used to print `git failed: … timed out`, and a
+        // regression here is a sentence, not a type error.
         match d.kind {
-            DiffKind::Error { message } => assert!(message.contains("timed out"), "{message}"),
-            other => panic!("expected timeout error, got {other:?}"),
+            DiffKind::Error { message } => {
+                assert!(message.contains("did not answer"), "{message}");
+                assert!(
+                    !message.contains("git failed"),
+                    "git did not fail, it did not answer: {message}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
         }
     }
 
@@ -1777,11 +1825,100 @@ mod tests {
         let started = std::time::Instant::now();
         let snap = scan_with(&fake, &dir, Duration::from_millis(200)).await;
         assert!(started.elapsed() < Duration::from_secs(5));
+        // `Unanswered`, NOT `Error`: the fake git was alive and sleeping
+        // when the budget expired, so nothing failed. Distinguishing those
+        // two is the whole point of the variant.
+        assert!(!snap.state.stated().contains("git failed"));
         match snap.state {
-            GitState::Error { message } => {
-                assert!(message.contains("timed out"), "{message}")
+            GitState::Unanswered { what, secs, gate } => {
+                assert_eq!(what, "status");
+                assert!(secs > 0.0, "the budget is reported, got {secs}");
+                assert_eq!(gate, None, "a scratch dir is not a gated folder");
             }
-            other => panic!("expected timeout error, got {other:?}"),
+            other => panic!("a hanging git reported {other:?} instead of Unanswered"),
+        }
+    }
+
+    // --- Slice AJ — which folders macOS gates ------------------------------
+
+    /// The table is a whitelist and it behaves like one on both sides.
+    ///
+    /// A wrong `Some` here is the worse error: it puts "macOS gates this
+    /// folder" in front of somebody whose problem is something else, which
+    /// is the same class of mistake as the `git failed` message this whole
+    /// change exists to remove.
+    #[test]
+    fn only_the_gated_folders_are_called_gated() {
+        let home = std::path::Path::new("/Users/somebody");
+        for (path, want) in [
+            ("/Users/somebody/Desktop/eave", Some("~/Desktop")),
+            ("/Users/somebody/Documents/x/y", Some("~/Documents")),
+            ("/Users/somebody/Downloads", Some("~/Downloads")),
+            (
+                "/Users/somebody/Library/Mobile Documents/com~apple~CloudDocs/r",
+                Some("iCloud Drive"),
+            ),
+            ("/Users/somebody/code/eave", None),
+            ("/Users/somebody", None),
+            ("/tmp/eave", None),
+            ("/Users/somebody/Library/Caches", None),
+        ] {
+            assert_eq!(
+                super::gated_root(std::path::Path::new(path), home).as_deref(),
+                want,
+                "{path}"
+            );
+        }
+    }
+
+    /// A sibling whose name merely STARTS with a gated one is not gated.
+    ///
+    /// `starts_with` on `Path` compares whole components, so this holds —
+    /// but it holds by a property of the type rather than by anything
+    /// visible at the call site, and the naive string version of this
+    /// function would answer `Some` for all three.
+    #[test]
+    fn a_name_that_merely_starts_with_a_gated_one_is_not_gated() {
+        let home = std::path::Path::new("/Users/somebody");
+        for path in [
+            "/Users/somebody/Desktops/eave",
+            "/Users/somebody/Documents-old/eave",
+            "/Users/somebody/DownloadsArchive",
+        ] {
+            assert_eq!(
+                super::gated_root(std::path::Path::new(path), home),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    /// A timeout reports `Unanswered`, never `Error`. This is the engine
+    /// half of `a_timeout_never_says_git_failed`: that test proves the
+    /// SENTENCE is right, this one proves the engine hands over the state
+    /// that produces it.
+    #[tokio::test]
+    async fn a_git_call_that_never_returns_is_unanswered_not_an_error() {
+        let dir = std::env::temp_dir().join("aj-unanswered");
+        std::fs::create_dir_all(&dir).expect("scratch");
+        // `sleep` stands in for a git that is blocked rather than broken —
+        // a real pending permission grant blocks the syscall, so the
+        // process is alive and healthy when the budget expires, which is
+        // precisely the state that used to be reported as a git failure.
+        let err = super::run(
+            std::path::Path::new("/bin/sleep"),
+            &dir,
+            std::time::Duration::from_millis(120),
+            &["30"],
+        )
+        .await
+        .expect_err("must not succeed inside the budget");
+        match err {
+            eave_wire::GitState::Unanswered { what, secs, .. } => {
+                assert_eq!(what, "30", "the subcommand is carried through");
+                assert!(secs > 0.0, "the budget is reported, got {secs}");
+            }
+            other => panic!("a blocked call reported {other:?} instead of Unanswered"),
         }
     }
 }

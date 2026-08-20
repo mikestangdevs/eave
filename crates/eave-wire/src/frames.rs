@@ -595,9 +595,80 @@ pub enum GitState {
     /// The session cwd is not inside a git work tree. A fact to render,
     /// not a failure.
     NotARepo,
-    /// Git could not answer (timeout, missing binary, vanished cwd, …).
-    /// The message is shown verbatim; the previous snapshot is gone.
+    /// Git ran, answered, and said no — a bad revision, a corrupt index, a
+    /// vanished cwd. The message is git's own first stderr line and is
+    /// shown verbatim; the previous snapshot is gone.
     Error { message: String },
+    /// **Git did not answer.** The process was still running when the
+    /// budget expired, so nothing is known about the repo — and, crucially,
+    /// nothing is known to be *wrong with git*. Kept apart from
+    /// [`GitState::Error`] because collapsing the two is what produced
+    /// `git failed: git status timed out after 10s` on a machine where
+    /// `git status` takes 36 ms.
+    ///
+    /// `gate` is `Some(dir)` when the cwd sits inside a directory macOS
+    /// puts behind a Files-and-Folders grant. A *pending* grant blocks the
+    /// syscall rather than refusing it, so a timeout there is not a
+    /// symptom of anything being broken: it is the OS waiting for the
+    /// person to answer a dialog. A *refused* grant returns `EPERM`
+    /// immediately and arrives as [`GitState::Error`] instead, which is
+    /// why the hint belongs on this variant and only on this one.
+    Unanswered {
+        /// The subcommand that did not come back, e.g. `status`.
+        what: String,
+        secs: f32,
+        gate: Option<String>,
+    },
+}
+
+impl GitState {
+    /// The sentence to put in front of a person.
+    ///
+    /// It lives here, once, because the defect this replaces was **two call
+    /// sites each adding their own frame**: the engine wrote
+    /// `git status timed out after 10s` and the app wrapped it in
+    /// `git failed: …`, producing a sentence that blamed git twice on a
+    /// machine where `git status` took 36 ms. Neither half was willing to
+    /// own the wording, so both invented some.
+    ///
+    /// Callers render this verbatim and add nothing.
+    pub fn stated(&self) -> String {
+        match self {
+            GitState::Ok => "git gave no answer".into(),
+            GitState::NotARepo => "not a git repository".into(),
+            GitState::Error { message } => format!("git failed: {message}"),
+            GitState::Unanswered {
+                what,
+                secs,
+                gate: Some(dir),
+            } => format!("git {what} did not answer in {secs:.0}s — {dir} is a folder macOS gates"),
+            GitState::Unanswered {
+                what,
+                secs,
+                gate: None,
+            } => format!("git {what} did not answer in {secs:.0}s"),
+        }
+    }
+
+    /// What the person can DO about it, when there is anything.
+    ///
+    /// Separate from [`GitState::stated`] on this project's standing
+    /// pattern — state the fact, then offer the affordance — and phrased as
+    /// a condition rather than a diagnosis, because a timeout inside a
+    /// gated folder is *evidence* of a pending grant and not proof of one.
+    /// A git call can be slow in `~/Desktop` for ordinary reasons, and a
+    /// message that asserted the cause would be making the same mistake in
+    /// the other direction.
+    pub fn remedy(&self) -> Option<String> {
+        match self {
+            GitState::Unanswered { gate: Some(_), .. } => Some(
+                "If eave has not been granted access, approve the prompt — or add it \
+                 under System Settings › Privacy & Security › Files and Folders."
+                    .into(),
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1309,5 +1380,89 @@ mod tests {
         let raw = serde_json::to_string(&req).expect("serialize");
         let back: Request = serde_json::from_str(&raw).expect("round trip");
         assert_eq!(back, req);
+    }
+
+    // --- Slice AJ — a timeout is not a failure -----------------------------
+
+    /// The exact sentence a packaged eave put in front of a person on
+    /// 2026-08-20, on a machine where `git status` took 36 ms.
+    ///
+    /// Pinned as a literal rather than assembled from the parts, because
+    /// the whole defect was two layers each assembling a frame: a test that
+    /// built the expectation the same way the code does would have passed
+    /// throughout.
+    #[test]
+    fn a_timeout_never_says_git_failed() {
+        let unanswered = GitState::Unanswered {
+            what: "status".into(),
+            secs: 10.0,
+            gate: Some("~/Desktop".into()),
+        };
+        let said = unanswered.stated();
+        assert_ne!(said, "git failed: git status timed out after 10s");
+        assert!(
+            !said.contains("git failed"),
+            "git did not fail — it did not answer: {said:?}"
+        );
+        assert_eq!(
+            said,
+            "git status did not answer in 10s — ~/Desktop is a folder macOS gates"
+        );
+    }
+
+    /// Only git actually failing says git failed.
+    #[test]
+    fn a_real_git_error_still_says_git_failed() {
+        let err = GitState::Error {
+            message: "bad revision 'nope'".into(),
+        };
+        assert_eq!(err.stated(), "git failed: bad revision 'nope'");
+        assert_eq!(err.remedy(), None, "there is nothing a person can do here");
+    }
+
+    /// The remedy is offered exactly when there is one, and it does not
+    /// assert a cause it cannot know: a git call can be slow in a gated
+    /// folder for ordinary reasons.
+    #[test]
+    fn the_remedy_is_conditional_and_only_where_it_applies() {
+        let gated = GitState::Unanswered {
+            what: "status".into(),
+            secs: 10.0,
+            gate: Some("~/Desktop".into()),
+        };
+        let plain = GitState::Unanswered {
+            what: "status".into(),
+            secs: 10.0,
+            gate: None,
+        };
+        let r = gated.remedy().expect("a gated folder has a remedy");
+        assert!(
+            r.starts_with("If eave has not been granted access"),
+            "{r:?}"
+        );
+        assert!(r.contains("System Settings"), "{r:?}");
+        assert_eq!(plain.remedy(), None);
+        assert_eq!(
+            plain.stated(),
+            "git status did not answer in 10s",
+            "no gate, no speculation about one"
+        );
+    }
+
+    /// The new variant survives the wire. An engine that reports
+    /// `Unanswered` to an app that cannot parse it is worse than the bug
+    /// this replaces.
+    #[test]
+    fn unanswered_round_trips() {
+        for gate in [None, Some("iCloud Drive".to_string())] {
+            let st = GitState::Unanswered {
+                what: "diff".into(),
+                secs: 2.5,
+                gate,
+            };
+            let raw = serde_json::to_string(&st).expect("serialize");
+            let back: GitState = serde_json::from_str(&raw).expect("round trip");
+            assert_eq!(back, st);
+        }
     }
 }

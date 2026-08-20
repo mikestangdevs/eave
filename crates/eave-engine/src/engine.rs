@@ -2341,9 +2341,13 @@ async fn capture_turn_basis(handle: &Arc<SessionHandle>) {
             Err(eave_wire::GitState::NotARepo) => TurnBasis::Failed {
                 reason: "not a git repository — there is no tree to measure a turn against".into(),
             },
-            Err(eave_wire::GitState::Error { message }) => TurnBasis::Failed { reason: message },
-            Err(eave_wire::GitState::Ok) => TurnBasis::Failed {
-                reason: "git gave no answer when capturing the turn's base tree".into(),
+            // Every other state renders through `GitState::stated`, so a
+            // turn that could not find its base says the same thing the
+            // changes rail says about the same cause — including the
+            // gated-folder case, which is exactly when a first turn on a
+            // fresh install happens.
+            Err(state) => TurnBasis::Failed {
+                reason: state.stated(),
             },
         }
     };

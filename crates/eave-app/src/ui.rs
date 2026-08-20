@@ -1109,7 +1109,11 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
             DiffKind::Binary => children.push(fact("binary file — no text diff".into())),
             DiffKind::Symlink { target } => children.push(fact(format!("symlink → {target}"))),
             DiffKind::Submodule { detail } => children.push(fact(format!("submodule {detail}"))),
-            DiffKind::Error { message } => children.push(fact(format!("git failed: {message}"))),
+            // The engine stated this sentence in full (`GitState::stated`).
+            // The `git failed: ` that used to be prepended here was the
+            // second frame in the pair that produced
+            // `git failed: git status timed out after 10s`.
+            DiffKind::Error { message } => children.push(fact(message.clone())),
             DiffKind::Text { hunks, truncated } => {
                 if hunks.is_empty() && !*truncated {
                     children.push(fact("no line changes".into()));
@@ -3911,16 +3915,32 @@ impl Shell {
             })) => (None, fact(reason)),
             Some(Some(snap)) => match &snap.state {
                 GitState::NotARepo => (None, fact("not a git repository")),
-                GitState::Error { message } => (
-                    None,
-                    div()
-                        .px(px(theme::SPACE_2))
-                        .text_size(px(theme::DETAIL_SIZE))
-                        .line_height(px(theme::DETAIL_LINE))
-                        .text_color(theme::text_tertiary())
-                        .child(SharedString::from(format!("git failed: {message}")))
-                        .into_any_element(),
-                ),
+                // One arm for every state that has something to say, so a
+                // new `GitState` cannot reach the rail with the app
+                // inventing wording for it — which is how this surface
+                // ended up double-framing a timeout as a git failure.
+                state @ (GitState::Error { .. } | GitState::Unanswered { .. }) => {
+                    let said = state.stated();
+                    let remedy = state.remedy();
+                    (
+                        None,
+                        div()
+                            .px(px(theme::SPACE_2))
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::DETAIL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(said))
+                            .children(remedy.map(|r| {
+                                div()
+                                    .debug_selector(|| "git-remedy".into())
+                                    .child(SharedString::from(r))
+                            }))
+                            .into_any_element(),
+                    )
+                }
                 // An empty list under a basis we DO have is a real zero,
                 // and it says which zero it is: nothing uncommitted at
                 // all, or a turn that has not written anything yet.
