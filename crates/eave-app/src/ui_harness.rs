@@ -138,6 +138,61 @@ fn click_with(vcx: &mut VisualTestContext, selector: &'static str, modifiers: Mo
     vcx.simulate_click(c, modifiers);
 }
 
+/// Put the pointer on a rail row, so its hover-revealed affordances exist.
+///
+/// Stage AK made the row's five affordances icons that mount only while the
+/// row is hovered, which means **a test that clicks one has to hover first —
+/// exactly like a person.** Fifteen tests needed this line added, and that
+/// is the feature working rather than a tax: before it, every one of them
+/// was reaching a control no pointer had ever been near.
+///
+/// It drives time as well as moving the pointer. `hover_t` starts at 0 and
+/// rises, so a `run_until_parked` alone can leave the strip one frame short
+/// of existing — the loop settles when the target appears rather than
+/// guessing a duration.
+/// Move the pointer onto a rail row and let the fade run.
+///
+/// Asserts nothing about what appears, so it can be used to prove an
+/// affordance is **absent** as well as present — `hover_row` below is the
+/// asserting version and cannot answer a negative.
+#[track_caller]
+fn point_at_row(h: &Harness, vcx: &mut VisualTestContext, row: &'static str) {
+    let bounds = vcx
+        .debug_bounds(row)
+        .unwrap_or_else(|| panic!("row {row} did not render"));
+    vcx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+    vcx.run_until_parked();
+    drive(h, vcx, Duration::from_millis(240));
+}
+
+/// Put the pointer on a rail row, and wait for the affordance to exist.
+///
+/// Stage AK made the row's five affordances icons that mount only while the
+/// row is hovered, which means **a test that clicks one has to hover first —
+/// exactly like a person.** Seventeen call sites needed this line added, and
+/// that is the feature working rather than a tax: before it, every one of
+/// them was reaching a control no pointer had ever been near.
+///
+/// It drives time as well as moving the pointer. `hover_t` starts at 0 and
+/// rises, so a `run_until_parked` alone can leave the strip one frame short
+/// of existing — the loop settles when the target appears rather than
+/// guessing a duration.
+#[track_caller]
+fn hover_row(h: &Harness, vcx: &mut VisualTestContext, row: &'static str, reveals: &'static str) {
+    let bounds = vcx
+        .debug_bounds(row)
+        .unwrap_or_else(|| panic!("row {row} did not render"));
+    vcx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+    vcx.run_until_parked();
+    for _ in 0..30 {
+        if vcx.debug_bounds(reveals).is_some() {
+            return;
+        }
+        drive(h, vcx, Duration::from_millis(16));
+    }
+    panic!("hovering {row} never revealed {reveals}");
+}
+
 /// Is this element on screen at all?
 fn shown(vcx: &mut VisualTestContext, selector: &'static str) -> bool {
     vcx.debug_bounds(selector).is_some()
@@ -463,6 +518,11 @@ fn isolate_is_offered_only_while_it_is_still_possible(cx: &mut TestAppContext) {
         h.plumbing.push_rail(vec![info]);
         vcx.run_until_parked();
         assert!(shown(vcx, "rail-aaaa1111"), "row {id} should render");
+        // Stage AK: the affordance is hover-revealed, so "is it offered"
+        // is only answerable with the pointer on the row. `point_at_row`
+        // rather than `hover_row` precisely because half of this test's
+        // cases expect the answer NO.
+        point_at_row(h, vcx, "rail-aaaa1111");
         shown(vcx, "iso-aaaa1111")
     };
 
@@ -496,6 +556,7 @@ fn isolate_is_offered_only_while_it_is_still_possible(cx: &mut TestAppContext) {
     // And the offer, when taken, is exactly one stated intent.
     let _ = offered(ready, &h, vcx);
     let _ = h.drain();
+    hover_row(&h, vcx, "rail-aaaa1111", "iso-aaaa1111");
     click(vcx, "iso-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -518,6 +579,7 @@ fn an_affordance_click_acts_on_the_row_without_selecting_it(cx: &mut TestAppCont
     vcx.run_until_parked();
     let _ = h.drain();
 
+    hover_row(&h, vcx, "rail-aaaa1111", "iso-aaaa1111");
     click(vcx, "iso-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -532,6 +594,7 @@ fn an_affordance_click_acts_on_the_row_without_selecting_it(cx: &mut TestAppCont
     h.plumbing.push_rail(vec![orphan]);
     vcx.run_until_parked();
     let _ = h.drain();
+    hover_row(&h, vcx, "rail-aaaa1111", "wtd-aaaa1111");
     click(vcx, "wtd-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -563,6 +626,7 @@ fn deleting_a_worktree_takes_two_clicks_and_restates_fresh_counts(cx: &mut TestA
     let _ = h.drain();
 
     // First click never forces.
+    hover_row(&h, vcx, "rail-aaaa1111", "wtd-aaaa1111");
     click(vcx, "wtd-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -616,6 +680,7 @@ fn deleting_a_worktree_takes_two_clicks_and_restates_fresh_counts(cx: &mut TestA
 
     // Now the click means it.
     let _ = h.drain();
+    hover_row(&h, vcx, "rail-aaaa1111", "wtd-aaaa1111");
     click(vcx, "wtd-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -650,6 +715,7 @@ fn clearing_the_note_disarms_the_delete(cx: &mut TestAppContext) {
     );
 
     let _ = h.drain();
+    hover_row(&h, vcx, "rail-aaaa1111", "wtd-aaaa1111");
     click(vcx, "wtd-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -674,6 +740,7 @@ fn opening_a_worktree_states_the_path_without_launching_finder(cx: &mut TestAppC
     h.plumbing.push_rail(vec![info]);
     vcx.run_until_parked();
 
+    hover_row(&h, vcx, "rail-aaaa1111", "wto-aaaa1111");
     click(vcx, "wto-aaaa1111");
     let opened = OPENED.with(|o| o.borrow().clone());
     assert_eq!(
@@ -2115,11 +2182,36 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
     // pressed and takes an I-beam; `cursor_pointer` there would say
     // "button" over a text box.
     let cursors = src.matches(".cursor_pointer()").count() + src.matches(".cursor_text()").count();
+    // Stage AK: five rail affordances share one constructor, so they carry
+    // ONE `.cursor_pointer()` between them while still being five click
+    // sites. Counting `row_action(` closes that gap — but only because the
+    // line below proves the constructor really does set a cursor. Without
+    // that check this would be an exemption rather than an accounting.
+    assert!(
+        src.contains("fn row_action(") && {
+            let body = &src[src.find("fn row_action(").unwrap()..];
+            body[..body.find("\n}\n").unwrap()].contains(".cursor_pointer()")
+        },
+        "row_action stopped stating its cursor, and five click sites are \
+         counted through it"
+    );
+    // The helper's OWN cursor call is not a click site's — it stands in for
+    // its call sites, so it is removed from the direct count and each call
+    // site is credited instead. Computed, not hardcoded: a second cursor
+    // call inside the helper would otherwise silently buy an exemption.
+    let helper_body = {
+        let from = &src[src.find("fn row_action(").unwrap()..];
+        &from[..from.find("\n}\n").unwrap()]
+    };
+    let cursors_in_helper = helper_body.matches(".cursor_pointer()").count()
+        + helper_body.matches(".cursor_text()").count();
+    let via_helper = src.matches("row_action(").count() - 1; // minus the definition
     assert_eq!(
-        clicks, cursors,
-        "every .on_click site needs a .cursor_pointer or .cursor_text — \
-         eave had 84 fewer cursor calls than comet and every one of them \
-         was the default arrow"
+        clicks,
+        cursors - cursors_in_helper + via_helper,
+        "every .on_click site needs a .cursor_pointer or .cursor_text, \
+         directly or through row_action — eave had 84 fewer cursor calls \
+         than comet and every one of them was the default arrow"
     );
 
     // Hover coverage, all thirteen controls. Before Slice M five of them
@@ -2160,12 +2252,9 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
              its bg rather than compositing the neutral wash over it"
         );
     }
-    // The five built from a formatted selector, checked at their builder.
+    // Built from a formatted selector, checked at their builder.
     for (builder, what) in [
         (r#"format!("rail-{}", info.session_id)"#, "the session row"),
-        (r#"format!("iso-{}", info.session_id)"#, "isolate"),
-        (r#"format!("wto-{}", info.session_id)"#, "worktree open"),
-        (r#"format!("wtd-{}", info.session_id)"#, "worktree delete"),
         (r#"format!("file-{}", f.path)"#, "the file row"),
     ] {
         let at = src
@@ -2176,6 +2265,28 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
             window.contains(".hover_fade("),
             "{what} lost its hover feedback"
         );
+    }
+    // Stage AK: the five rail affordances are built by one constructor, so
+    // their feedback is checked THERE — which is stronger than the window
+    // search above, not weaker. A 1400-character proximity window is a
+    // heuristic that a long comment can defeat; "the only way to build one
+    // of these gives it a fade" is a property.
+    assert!(
+        helper_body.contains(".hover_fade("),
+        "row_action stopped giving its affordances hover feedback, and all \
+         five of them are built through it"
+    );
+    // ...and the five still exist to be built. Checked separately, because
+    // the assertion above would pass just as well if every call site had
+    // been deleted.
+    for key in [
+        r#"format!("ren-{}", info.session_id)"#,
+        r#"format!("arc-{}", info.session_id)"#,
+        r#"format!("iso-{}", info.session_id)"#,
+        r#"format!("wto-{}", info.session_id)"#,
+        r#"format!("wtd-{}", info.session_id)"#,
+    ] {
+        assert!(src.contains(key), "the affordance keyed {key} is gone");
     }
     // approve / deny share one builder and one selector expression.
     let at = src.find("fn decision_button(").expect("decision_button");
@@ -4400,6 +4511,7 @@ fn the_rail_renames_a_session_and_leaves_normalizing_to_the_engine(cx: &mut Test
         !shown(vcx, "rename-aaaa1111"),
         "a field nobody asked for is open"
     );
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.run_until_parked();
     assert!(
@@ -4446,6 +4558,7 @@ fn the_rename_field_is_seeded_and_escape_sends_nothing(cx: &mut TestAppContext) 
     named.title = Some("the old name".into());
     rail_with_selected(&h, vcx, vec![named], "aaaa1111");
 
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.run_until_parked();
     assert_eq!(
@@ -4477,6 +4590,7 @@ fn an_empty_rename_field_clears_the_name(cx: &mut TestAppContext) {
     named.title = Some("abc".into());
     rail_with_selected(&h, vcx, vec![named], "aaaa1111");
 
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.run_until_parked();
     for _ in 0..3 {
@@ -4494,6 +4608,7 @@ fn an_empty_rename_field_clears_the_name(cx: &mut TestAppContext) {
 
     // A field holding only spaces is not a name either, and it must not
     // reach the wire as one.
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.run_until_parked();
     for _ in 0..3 {
@@ -4527,6 +4642,7 @@ fn the_rename_field_owns_the_keyboard_and_the_composer_stays_empty(cx: &mut Test
         "no composer is mounted — then this test proves nothing"
     );
 
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.run_until_parked();
     let _ = h.drain();
@@ -4571,6 +4687,7 @@ fn opening_the_rename_field_moves_no_row(cx: &mut TestAppContext) {
     let y_b = vcx.debug_bounds("rail-bbbb2222").expect("row b").origin.y;
     let label = vcx.debug_bounds("label-aaaa1111").expect("label");
 
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.run_until_parked();
     let field = vcx.debug_bounds("rename-aaaa1111").expect("field");
@@ -4604,6 +4721,7 @@ fn selecting_another_row_closes_an_open_rename(cx: &mut TestAppContext) {
         vec![session("aaaa1111"), session("bbbb2222")],
         "aaaa1111",
     );
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.run_until_parked();
     assert!(shown(vcx, "rename-aaaa1111"));
@@ -4644,27 +4762,36 @@ fn every_affordance_on_a_selected_row_stays_inside_the_rail(cx: &mut TestAppCont
     rail_with_selected(&h, vcx, vec![owner], "aaaa1111");
 
     let rail = vcx.debug_bounds("rail-rows").expect("the rail scroller");
+    // Stage AK: hover-revealed, so nothing to measure until the pointer is
+    // on the row.
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     let buttons = [
-        ("ren-aaaa1111", "rename"),
-        ("arc-aaaa1111", "archive"),
-        ("wto-aaaa1111", "open"),
-        ("wtd-aaaa1111", "delete"),
+        "ren-aaaa1111",
+        "arc-aaaa1111",
+        "wto-aaaa1111",
+        "wtd-aaaa1111",
     ];
     let mut boxes = Vec::new();
-    for (selector, word) in buttons {
+    for selector in buttons {
         let b = vcx
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("{selector} did not render"));
-        // It kept its whole word. A button clipped to "arch…" states a
-        // different action from the one it performs.
-        let need = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
+        // It is a target a pointer can actually hit. This replaced a
+        // "did the label clip" check, which had nothing left to measure
+        // once the labels became glyphs — and it is the assertion the
+        // icons actually need, because the failure mode moved from "the
+        // word is cut off" to "the box is too small to press".
         assert!(
-            b.size.width >= need + px(theme::SPACE_2 * 2.0) - px(1.),
-            "{selector} got {:?} for \"{word}\" needing {need:?} plus its \
-             own padding — it is clipping its label",
-            b.size.width
+            b.size.width >= px(ROW_ACTION_HIT) - px(1.)
+                && b.size.height >= px(ROW_ACTION_HIT) - px(1.),
+            "{selector} is {:?} — smaller than the {ROW_ACTION_HIT}px hit \
+             target it is supposed to be, and a miss here selects the \
+             session instead of acting on it",
+            b.size
         );
-        // Inside the rail, on both edges.
+        // Inside the rail, on both edges. This matters MORE now than it
+        // did: the strip is absolutely positioned, so nothing about the
+        // layout stops it leaving the rail — only this.
         assert!(
             b.origin.x >= rail.origin.x,
             "{selector} starts left of the rail at {:?}",
@@ -4693,12 +4820,23 @@ fn every_affordance_on_a_selected_row_stays_inside_the_rail(cx: &mut TestAppCont
             } else {
                 a.origin.y - (b.origin.y + b.size.height)
             };
+            // 3px, written out. The strip lays out 4px between boxes and
+            // one pixel is allowed for rounding.
+            //
+            // Deliberately NOT `theme::SPACE_1 - 1.0`: the previous version
+            // of this line read `theme::SPACE_2 - 1.0`, which was the exact
+            // constant the layout used, so retuning the gap would have moved
+            // the bar with it and the test could never have failed. §7:
+            // never derive a test's expectation from the constant it is
+            // testing.
+            //
+            // The BOXES clear by 4px; the glyphs inside them clear by 12,
+            // because a 16px icon sits centred in a 24px target.
             assert!(
-                dx >= px(theme::SPACE_2 - 1.0) || dy >= px(0.),
+                dx >= px(3.0) || dy >= px(0.),
                 "{sa} and {sb} are {dx:?} apart horizontally and {dy:?} \
-                 vertically — the row lays out {:?} of gap and they are \
-                 drawing over each other",
-                px(theme::SPACE_2)
+                 vertically — the strip lays out 4px of gap and they are \
+                 drawing over each other"
             );
         }
     }
@@ -4724,6 +4862,7 @@ fn archiving_is_one_click_and_the_same_click_undoes_it(cx: &mut TestAppContext) 
     );
 
     let _ = h.drain();
+    hover_row(&h, vcx, "rail-aaaa1111", "arc-aaaa1111");
     click(vcx, "arc-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -4748,6 +4887,7 @@ fn archiving_is_one_click_and_the_same_click_undoes_it(cx: &mut TestAppContext) 
     );
 
     let _ = h.drain();
+    hover_row(&h, vcx, "rail-aaaa1111", "arc-aaaa1111");
     click(vcx, "arc-aaaa1111");
     let cmds = h.drain();
     assert!(
@@ -4939,6 +5079,7 @@ fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
          then nothing below is measuring the field"
     );
 
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
     click(vcx, "ren-aaaa1111");
     vcx.simulate_input("naming this one");
     let entering = drive(&h, vcx, Duration::from_millis(16));
@@ -5867,5 +6008,71 @@ fn trying_again_re_asks_and_restarts_the_rails_patience(cx: &mut TestAppContext)
     assert!(
         again > 100,
         "asking again bought only {again} steps of patience"
+    );
+}
+
+// Slice AK — the affordances are icons, revealed on hover
+
+/// **A hovered row is exactly as tall as an unhovered one.**
+///
+/// This is the invariant the whole design rests on, and the reason the strip
+/// is absolutely positioned rather than a flex child. The rail is a
+/// virtualized list with cached row heights: a row that grew when the
+/// pointer arrived would invalidate its own measurement mid-hover, shove
+/// every row below it, and — because the pointer is now over a different
+/// row — do it again. The old text strip could not hit this because it was
+/// always laid out; hover-revealing anything in flow would.
+///
+/// Asserted to the pixel. There is no tolerance to spend: either the strip
+/// participates in layout or it does not.
+#[gpui::test]
+fn hovering_a_row_does_not_move_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut owner = session("aaaa1111");
+    owner.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
+    rail_with_selected(&h, vcx, vec![owner], "aaaa1111");
+
+    let before = vcx.debug_bounds("rail-aaaa1111").expect("the row");
+    assert!(
+        vcx.debug_bounds("ren-aaaa1111").is_none(),
+        "the affordances are on screen before anything hovered the row"
+    );
+
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+    let after = vcx.debug_bounds("rail-aaaa1111").expect("the row");
+
+    assert_eq!(
+        before.size, after.size,
+        "the row changed size when the pointer arrived: {:?} -> {:?}",
+        before.size, after.size
+    );
+    assert_eq!(
+        before.origin, after.origin,
+        "the row moved when the pointer arrived: {:?} -> {:?}",
+        before.origin, after.origin
+    );
+}
+
+/// The strip sits over the row's right edge, not over its title.
+///
+/// Absolute positioning buys the height invariant above and costs this one:
+/// nothing in the layout stops the strip covering whatever is beneath it.
+/// The session's NAME is the one thing on the row that must stay readable
+/// while a person reaches for its buttons.
+#[gpui::test]
+fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+
+    // One row on screen, so the shared selector is unambiguous.
+    let title = vcx.debug_bounds("rail-title").expect("the row's title");
+    let first = vcx.debug_bounds("ren-aaaa1111").expect("the first action");
+    assert!(
+        first.origin.x >= title.origin.x + title.size.width,
+        "the action strip starts at {:?} and the title runs to {:?} — the \
+         buttons are drawn over the session's own name",
+        first.origin.x,
+        title.origin.x + title.size.width
     );
 }
