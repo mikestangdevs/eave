@@ -2539,7 +2539,7 @@ mod tests {
                 // Slice AL: the loud half of the posture line ("NEVER
                 // ASKS") and of the worktree line ("worktree missing").
                 // Both were drawn in `danger()`/`warning()` inside the
-                // card, at 2.75:1 and 4.28:1 against a 4.5 floor.
+                // card, at 2.75:1 and 3.97:1 against a 4.5 floor.
                 "rail posture and worktree lines, loud",
                 text(),
                 TEXT_CONTRAST_FLOOR,
