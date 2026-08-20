@@ -23,10 +23,11 @@ use gpui::Animation;
 use gpui::AnimationExt as _;
 use gpui::{
     actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent, Context,
-    Corners, Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
-    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
-    MouseDownEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString,
-    StrikethroughStyle, StyledText, TextRun, TitlebarOptions, UnderlineStyle, Window,
+    Corners, CursorStyle, DispatchPhase, Element, Entity, FocusHandle, Font, FontStyle, FontWeight,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, KeyBinding, KeyDownEvent,
+    LayoutId, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
+    StyledText, TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
 };
 use gpui_platform::application;
@@ -46,7 +47,7 @@ use crate::edge_fade::edge_faded;
 use crate::icons;
 use crate::launcher::{self, PROVIDERS};
 use crate::loaders;
-use crate::markdown::{inline_runs, Block, InlineRun};
+use crate::markdown::{self, inline_runs, Align, Block, InlineRun, Marker};
 use crate::motion::{self, HoverFade as _};
 use crate::overlay::{self, MenuItem, Popup};
 use crate::theme;
@@ -1646,6 +1647,31 @@ thread_local! {
     /// Every path the UI asked the system to open, in order (test-only).
     static OPENED: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Every URL the UI asked the system to open (test-only).
+    static OPENED_URLS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hand a markdown link to the default browser — **if it is a web link**.
+///
+/// The scheme check is repeated here even though `markdown::inline_runs`
+/// only ever attaches an href that already passed it. `open(1)` launches
+/// whatever has a registered handler, and the string arrives from an
+/// agent's output: the guard belongs at the syscall, not only at the
+/// parser, so that a future caller cannot route around it. A refused
+/// target opens nothing and is not recorded as opened.
+fn open_url(raw: &str) {
+    let Some(url) = markdown::web_url(raw) else {
+        return;
+    };
+    #[cfg(test)]
+    {
+        OPENED_URLS.with(|o| o.borrow_mut().push(url.clone()));
+    }
+    #[cfg(not(test))]
+    {
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+    }
 }
 
 fn fmt_elapsed(ms: u64) -> String {
@@ -2061,6 +2087,37 @@ struct VeiledBlock {
 }
 
 impl VeiledBlock {
+    /// A block with no veil: every character settled, full alpha. The
+    /// constructor every non-streaming inline surface uses — headings,
+    /// blockquotes, list items, table cells — so that all of them get
+    /// links, inline code and emphasis from one implementation.
+    fn plain(runs: Vec<InlineRun>, color: Hsla) -> Self {
+        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        let settled_chars = text.chars().count();
+        Self {
+            text: SharedString::from(text),
+            runs,
+            settled_chars,
+            alpha: 1.0,
+            color,
+            code_color: theme::code_text(),
+        }
+    }
+
+    /// Byte ranges of the flat text that carry an href, in order.
+    fn link_ranges(&self) -> Vec<(std::ops::Range<usize>, SharedString)> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for run in &self.runs {
+            let end = at + run.text.len();
+            if let Some(href) = &run.href {
+                out.push((at..end, SharedString::from(href.clone())));
+            }
+            at = end;
+        }
+        out
+    }
+
     fn text_runs(&self, base_font: &Font) -> Vec<TextRun> {
         let mut out = Vec::with_capacity(self.runs.len() + 1);
         let mut seen = 0usize;
@@ -2085,6 +2142,10 @@ impl VeiledBlock {
                 color: None,
                 wavy: false,
             });
+            let strikethrough = run.style.strike.then(|| StrikethroughStyle {
+                thickness: px(theme::HAIRLINE),
+                color: None,
+            });
             let len = run.text.len();
             let chars = run.text.chars().count();
             let make = |len: usize, alpha: f32| TextRun {
@@ -2093,7 +2154,7 @@ impl VeiledBlock {
                 color: color.opacity(alpha * color.a),
                 background_color: None,
                 underline,
-                strikethrough: None::<StrikethroughStyle>,
+                strikethrough,
             };
             if seen + chars <= self.settled_chars {
                 out.push(make(len, 1.0));
@@ -2122,7 +2183,183 @@ impl RenderOnce for VeiledBlock {
     fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let base_font = window.text_style().font();
         let runs = self.text_runs(&base_font);
-        StyledText::new(self.text).with_runs(runs)
+        let links = self.link_ranges();
+        let styled = StyledText::new(self.text).with_runs(runs);
+        if links.is_empty() {
+            // The common case pays nothing: no hitbox, no listeners, the
+            // same element the transcript has always drawn.
+            styled.into_any_element()
+        } else {
+            LinkText::new(styled, links).into_any_element()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clickable links inside a run of styled text
+
+/// [`StyledText`] plus hit-testing for the sub-ranges that are links.
+///
+/// gpui ships `InteractiveText`, and it is deliberately not used here. It
+/// carries a tooltip builder, a hover listener and cross-frame element
+/// state for the mouse-down index — machinery that needs an `ElementId`
+/// per block and a `window.refresh()` between the down and the up. What a
+/// transcript link needs is one hitbox and one mouse-up, and the veil's
+/// animated element is rebuilt from scratch every frame, so state that has
+/// to survive a frame is state that would have to be threaded through the
+/// display tree for nothing.
+///
+/// The mapping from pixels to a link is `TextLayout::index_for_position`,
+/// the same call `InteractiveText` makes, which is why a link that WRAPS
+/// across two lines is still one link: the hit test runs against the
+/// laid-out glyph, not against a rectangle somebody guessed.
+struct LinkText {
+    styled: StyledText,
+    layout: TextLayout,
+    links: Vec<(std::ops::Range<usize>, SharedString)>,
+}
+
+impl LinkText {
+    fn new(styled: StyledText, links: Vec<(std::ops::Range<usize>, SharedString)>) -> Self {
+        // The layout is an `Rc` shared with the element, so this clone
+        // reads what the real layout pass wrote.
+        let layout = styled.layout().clone();
+        Self {
+            styled,
+            layout,
+            links,
+        }
+    }
+
+    fn href_at(
+        links: &[(std::ops::Range<usize>, SharedString)],
+        ix: usize,
+    ) -> Option<&SharedString> {
+        links.iter().find(|(r, _)| r.contains(&ix)).map(|(_, h)| h)
+    }
+}
+
+impl IntoElement for LinkText {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for LinkText {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        Element::request_layout(&mut self.styled, None, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Hitbox {
+        Element::prepaint(
+            &mut self.styled,
+            None,
+            inspector_id,
+            bounds,
+            state,
+            window,
+            cx,
+        );
+        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request: &mut (),
+        hitbox: &mut Hitbox,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Element::paint(
+            &mut self.styled,
+            None,
+            inspector_id,
+            bounds,
+            request,
+            &mut (),
+            window,
+            cx,
+        );
+        let layout = self.layout.clone();
+        let links = std::mem::take(&mut self.links);
+        let over_link_now = layout
+            .index_for_position(window.mouse_position())
+            .ok()
+            .is_some_and(|ix| Self::href_at(&links, ix).is_some());
+        if over_link_now {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        {
+            let (layout, links, hitbox) = (layout.clone(), links.clone(), hitbox.clone());
+            window.on_mouse_event(move |ev: &MouseUpEvent, phase, window: &mut Window, _cx| {
+                if phase != DispatchPhase::Bubble
+                    || ev.button != MouseButton::Left
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                // `Ok` only: `index_for_position` answers `Err(nearest)` for
+                // a point that is inside the block but past the end of a
+                // line, and treating that as a hit would open a link from
+                // the empty margin beside it.
+                if let Ok(ix) = layout.index_for_position(ev.position) {
+                    if let Some(href) = Self::href_at(&links, ix) {
+                        open_url(href);
+                    }
+                }
+            });
+        }
+        {
+            // The cursor is decided at PAINT time, and a settled window
+            // paints on nothing (N4's idle floor) — so without this the
+            // pointer could sit on a link showing an arrow forever. One
+            // frame is bought only when the answer actually changes, which
+            // is at a link's edge, not per glyph.
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(
+                move |ev: &MouseMoveEvent, phase, window: &mut Window, _cx| {
+                    if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+                        return;
+                    }
+                    let now = layout
+                        .index_for_position(ev.position)
+                        .ok()
+                        .is_some_and(|ix| Self::href_at(&links, ix).is_some());
+                    if now != over_link_now {
+                        window.refresh();
+                    }
+                },
+            );
+        }
     }
 }
 
@@ -5065,6 +5302,246 @@ impl Shell {
             })
     }
 
+    /// A quiet trailer under a capped block, stating what it is holding
+    /// back. Every cap in this app states its own remainder; this is the
+    /// list's and the table's version of the fence's line.
+    fn capped_note(text: String) -> gpui::Div {
+        div()
+            .pt(px(theme::SPACE_1))
+            .text_size(px(theme::SMALL_SIZE))
+            .line_height(px(theme::SMALL_LINE))
+            .text_color(theme::text_tertiary())
+            .child(SharedString::from(text))
+            .debug_selector(|| "md-capped".into())
+    }
+
+    /// A bullet, an ordinal, or a checkbox — whatever this item's gutter
+    /// holds. Never a fixed-height row: the gutter is a fixed WIDTH beside
+    /// a column that wraps, which is the shape `overlay::menu_row` got
+    /// wrong (a fixed-height row whose label wrapped drew over its
+    /// neighbour, Slice R1).
+    fn list_marker(marker: Marker, depth: usize) -> AnyElement {
+        match marker {
+            Marker::Task(done) => div()
+                .w(px(theme::CHECKBOX))
+                .h(px(theme::CHECKBOX))
+                // Centred on the FIRST line of the item, not on the item:
+                // a three-line item must not float its box to the middle.
+                .mt(px((theme::BODY_LINE - theme::CHECKBOX) / 2.0))
+                .flex_shrink_0()
+                .rounded(px(theme::RADIUS_CHECKBOX))
+                .border_1()
+                .border_color(if done {
+                    theme::success()
+                } else {
+                    theme::border_strong()
+                })
+                .when(done, |d| d.bg(theme::success()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .when(done, |d| {
+                    d.child(
+                        div()
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::CHECKBOX))
+                            .font_weight(theme::WEIGHT_STRONG)
+                            .text_color(theme::on_inverse())
+                            .child("✓"),
+                    )
+                })
+                .debug_selector(move || format!("md-task-{}", if done { "done" } else { "open" }))
+                .into_any_element(),
+            other => {
+                let glyph = match other {
+                    // The bullet says which level it is on, so a nested
+                    // list reads as nested even where the indent is small.
+                    Marker::Bullet => match depth % 3 {
+                        0 => "•".to_string(),
+                        1 => "◦".to_string(),
+                        _ => "▪".to_string(),
+                    },
+                    Marker::Number(n) => format!("{n}."),
+                    Marker::Task(_) => unreachable!("handled above"),
+                };
+                div()
+                    .text_size(px(theme::BODY_SIZE))
+                    .line_height(px(theme::BODY_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(glyph))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// A list block: markers in their own gutter, nesting as indentation,
+    /// task boxes drawn rather than spelled `[ ]`.
+    fn render_list(text: &str) -> AnyElement {
+        let (items, more) = markdown::list_view(text, theme::LIST_MAX_ITEMS);
+        if items.is_empty() {
+            // Nothing parsed as an item (a list block that is only lazy
+            // continuation). State the source rather than nothing.
+            return div()
+                .text_size(px(theme::BODY_SIZE))
+                .line_height(px(theme::BODY_LINE))
+                .text_color(theme::text())
+                .child(VeiledBlock::plain(inline_runs(text), theme::text()))
+                .into_any_element();
+        }
+        let mut col = div().flex().flex_col().debug_selector(|| "md-list".into());
+        for (ix, item) in items.iter().enumerate() {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .pl(px(item.depth as f32 * theme::LIST_INDENT))
+                    .child(
+                        div()
+                            .w(px(theme::LIST_GUTTER_W))
+                            .flex_shrink_0()
+                            .flex()
+                            // An ordinal is read from its RIGHT edge — the
+                            // periods of "9." and "10." line up or the
+                            // column looks broken. A bullet and a checkbox
+                            // are read from their centres, and a capture of
+                            // a mixed list showed the two disagreeing by
+                            // eight pixels when everything was right-aligned.
+                            .map(|d| match item.marker {
+                                Marker::Number(_) => d.justify_end(),
+                                _ => d.justify_center(),
+                            })
+                            .child(Self::list_marker(item.marker, item.depth)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .pl(px(theme::LIST_MARKER_GAP))
+                            .text_size(px(theme::BODY_SIZE))
+                            .line_height(px(theme::BODY_LINE))
+                            .text_color(theme::text())
+                            .child(VeiledBlock::plain(inline_runs(&item.text), theme::text()))
+                            .debug_selector(move || format!("md-item-{ix}")),
+                    ),
+            );
+        }
+        if more > 0 {
+            col = col.child(Self::capped_note(format!("… {more} more items")));
+        }
+        col.into_any_element()
+    }
+
+    /// A pipe table, as columns.
+    ///
+    /// **The width decision, stated: it WRAPS.** The table never scrolls
+    /// and never widens the transcript. Columns take a zero flex basis and
+    /// a grow proportional to their longest cell, so the row is exactly the
+    /// content column wide whatever the table holds, and cell text wraps
+    /// inside its own column. `overflow_hidden` is a backstop rather than
+    /// the mechanism — verified by capture, gpui breaks even a single
+    /// unbreakable 120-character token at the column edge rather than
+    /// letting it overhang, so the clip is what catches a case that has not
+    /// been produced yet, not the everyday behaviour.
+    ///
+    /// The two alternatives were rejected for one reason each: a
+    /// horizontally scrolling row hides data behind a gesture with no
+    /// affordance, inside a list that already owns the vertical one; and
+    /// letting the row grow makes the WHOLE transcript scroll sideways, so
+    /// every paragraph in the session pays for one table.
+    fn render_table(text: &str) -> AnyElement {
+        let t = markdown::table_view(text, theme::TABLE_MAX_ROWS, theme::TABLE_CELL_MAX_CHARS);
+        if t.cols() == 0 {
+            return div().into_any_element();
+        }
+        let cell =
+            |ix: usize, body: &str, align: Align, strong: bool, color: Hsla, selector: String| {
+                div()
+                    .flex_basis(px(0.))
+                    .flex_grow(t.weights.get(ix).copied().unwrap_or(1.0))
+                    .min_w(px(0.))
+                    .px(px(theme::TABLE_CELL_PAD_X))
+                    .py(px(theme::TABLE_CELL_PAD_Y))
+                    .text_size(px(theme::BODY_SIZE))
+                    .line_height(px(theme::BODY_LINE))
+                    .text_color(color)
+                    .when(strong, |d| d.font_weight(theme::WEIGHT_STRONG))
+                    .map(|d| match align {
+                        Align::Left => d.text_left(),
+                        Align::Center => d.text_center(),
+                        Align::Right => d.text_right(),
+                    })
+                    .child(VeiledBlock::plain(inline_runs(body), color))
+                    .debug_selector(move || selector)
+            };
+
+        let mut table = div()
+            .my_1()
+            .w_full()
+            .rounded(px(theme::RADIUS_CODE))
+            .border_1()
+            .border_color(theme::border())
+            .overflow_hidden()
+            .debug_selector(|| "md-table".into());
+
+        if !t.head.is_empty() {
+            let mut head = div()
+                .flex()
+                .flex_row()
+                .items_stretch()
+                .bg(theme::overlay())
+                .border_b_1()
+                .border_color(theme::border_strong());
+            for (c, body) in t.head.iter().enumerate() {
+                head = head.child(cell(
+                    c,
+                    body,
+                    t.align[c],
+                    true,
+                    theme::text(),
+                    format!("md-head-{c}"),
+                ));
+            }
+            table = table.child(head);
+        }
+        for (r, row) in t.rows.iter().enumerate() {
+            let mut line = div()
+                .flex()
+                .flex_row()
+                .items_stretch()
+                .when(r > 0 || !t.head.is_empty(), |d| {
+                    d.border_t_1().border_color(theme::border())
+                });
+            for (c, body) in row.iter().enumerate() {
+                // Body cells carry the DATA, so they get the primary tier,
+                // not the quiet one: a table is not a caption. (The quiet
+                // tier would also have been the wrong call on the header's
+                // wash — `text_secondary` over `overlay()` is 3.81:1.)
+                line = line.child(cell(
+                    c,
+                    body,
+                    t.align[c],
+                    false,
+                    theme::text(),
+                    format!("md-cell-{r}-{c}"),
+                ));
+            }
+            table = table.child(line);
+        }
+        if t.more_rows > 0 {
+            table = table.child(
+                div()
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .px(px(theme::TABLE_CELL_PAD_X))
+                    .pb(px(theme::TABLE_CELL_PAD_Y))
+                    .child(Self::capped_note(format!("… {} more rows", t.more_rows))),
+            );
+        }
+        table.into_any_element()
+    }
+
     fn render_block(
         state: &TranscriptState,
         id: RowId,
@@ -5164,6 +5641,9 @@ impl Shell {
                     })
                     .into_any_element()
             }
+            // A heading is inline markdown too. Until Slice AD it was the
+            // one block rendered as a bare string, so `## The **why**`
+            // printed its own asterisks at 20 px.
             Block::Heading { level, text } => {
                 let (size, line, weight) = theme::heading(*level);
                 div()
@@ -5172,15 +5652,46 @@ impl Shell {
                     .line_height(line)
                     .text_color(theme::text())
                     .font_weight(weight)
-                    .child(SharedString::from(text.clone()))
+                    .child(VeiledBlock::plain(inline_runs(text), theme::text()))
                     .into_any_element()
             }
+            // A blockquote: a rule down the left, quieter ink. Parsed for
+            // the first time in Slice AD — before it, `> note` was a
+            // paragraph that began with a greater-than sign.
+            Block::Quote { text } => div()
+                .my_1()
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .w(px(theme::QUOTE_BAR_W))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(theme::border_strong()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .pl(px(theme::SPACE_3))
+                        .text_size(px(theme::BODY_SIZE))
+                        .line_height(px(theme::BODY_LINE))
+                        .text_color(theme::text_secondary())
+                        .child(VeiledBlock::plain(
+                            inline_runs(text),
+                            theme::text_secondary(),
+                        )),
+                )
+                .debug_selector(|| "md-quote".into())
+                .into_any_element(),
+            Block::List { text } => Self::render_list(text),
+            Block::Table { text } => Self::render_table(text),
             Block::Rule => div()
                 .my_1()
                 .h(px(theme::HAIRLINE))
                 .bg(theme::border())
                 .into_any_element(),
-            Block::List { text } | Block::Table { text } | Block::Paragraph { text } => {
+            Block::Paragraph { text } => {
                 let runs = inline_runs(text);
                 let flat: String = runs.iter().map(|r| r.text.as_str()).collect();
                 let total_chars = flat.chars().count();
@@ -5244,7 +5755,10 @@ impl Shell {
                         .into_any_element(),
                     None => block_el.into_any_element(),
                 };
-                div().child(el).into_any_element()
+                div()
+                    .child(el)
+                    .debug_selector(|| "md-para".into())
+                    .into_any_element()
             }
         }
     }
