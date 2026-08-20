@@ -241,3 +241,47 @@ extern "C" fn at_exit_check() {
         libc::_exit(101);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Provider-agnostic adoption (Slice AU)
+// ---------------------------------------------------------------------------
+
+/// Register an already-spawned agent with the leak guard and reap its
+/// process group when the returned guard drops.
+///
+/// The provider-agnostic twin of [`spawn_agent`], for adapters whose
+/// constructor is not `ClaudeCodeSession::spawn`. [`ReapedSession`] cannot
+/// serve them: it owns a concrete `ClaudeCodeSession`, and the session
+/// handle a caller wants to keep calling is the other adapter's own type.
+/// So this guard holds only the identity — which is all the reaper ever
+/// needed — and the caller keeps its session by value.
+///
+/// Every reason `support/mod.rs` exists applies unchanged: the child is
+/// `setsid`'d into its own group and is deliberately not killed on drop,
+/// so in tests this guard is the only thing between a panicking run and an
+/// orphan.
+#[must_use = "dropping this immediately reaps the agent you just spawned"]
+pub fn adopt(identity: ProcIdentity) -> Reaped {
+    arm_leak_guard();
+    remember(identity);
+    Reaped(identity)
+}
+
+/// Proves one agent's process group is gone when it drops — including
+/// during the unwind of a panicking test.
+pub struct Reaped(ProcIdentity);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Err(pgid) = reap_group_blocking(&self.0) {
+            // Loud, but not a panic: a panicking Drop during an unwind
+            // aborts the process and would replace the test's real
+            // failure with noise.
+            eprintln!(
+                "eave test harness: could not prove process group {pgid} gone; \
+                 pid {} may be orphaned",
+                self.0.pid
+            );
+        }
+    }
+}
