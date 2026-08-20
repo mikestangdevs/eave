@@ -227,10 +227,25 @@ fn real_text_system() -> Arc<gpui::TextSystem> {
 /// actually occupies. Hermetic: no window server, no compositor, no
 /// window — just font metrics, which is precisely what a fact must fit.
 fn real_text_width(text: &str, family: &str, size: f32) -> Pixels {
+    real_text_width_at(text, family, size, gpui::FontWeight::default())
+}
+
+/// [`real_text_width`], at a stated WEIGHT.
+///
+/// Slice AS: `real_text_width` shapes at the family's default weight, and a
+/// session name is drawn at [`theme::WEIGHT_STRONG`] — semibold is wider
+/// than regular, so every name measurement in this file that used the plain
+/// helper was optimistic about how much room a name needs. It matters
+/// most for the two tests that ask "does a realistic name FIT its slot",
+/// where being optimistic is the same as not asking.
+fn real_text_width_at(text: &str, family: &str, size: f32, weight: gpui::FontWeight) -> Pixels {
     let wts = gpui::WindowTextSystem::new(real_text_system());
     let run = TextRun {
         len: text.len(),
-        font: gpui::font(family),
+        font: gpui::Font {
+            weight,
+            ..gpui::font(family)
+        },
         color: gpui::black(),
         background_color: None,
         underline: None,
@@ -238,6 +253,36 @@ fn real_text_width(text: &str, family: &str, size: f32) -> Pixels {
     };
     wts.shape_line(SharedString::from(text.to_string()), px(size), &[run], None)
         .width
+}
+
+/// The width `text` occupies **as a session name** — the size and weight the
+/// rail row and a session tab both draw one at.
+///
+/// The 13.0 is a literal rather than [`theme::RAIL_NAME_SIZE`] (§7: never
+/// derive a test's expectation from the constant under test), and the guard
+/// is what makes moving that constant fail loudly here instead of sliding
+/// every name measurement in this file along with it.
+///
+/// It exists because three places described the same glyphs and all three
+/// disagreed: `ui.rs` drew `px(13.0)`, `theme::BODY_SIZE` had moved to 13.5
+/// underneath it, and `the_action_strip_does_not_cover_the_session_name`
+/// shaped **14.0 at the family's default weight** — so the one test asking
+/// "is the name covered" was measuring a font nothing renders.
+#[track_caller]
+fn real_name_width(text: &str) -> Pixels {
+    assert_eq!(
+        theme::RAIL_NAME_SIZE,
+        13.0,
+        "a session name is no longer 13 px, so every width measured through \
+         this helper is measuring the wrong font"
+    );
+    assert_eq!(
+        theme::WEIGHT_STRONG,
+        gpui::FontWeight::SEMIBOLD,
+        "a session name is no longer semibold; semibold is wider than \
+         regular and these are FIT assertions"
+    );
+    real_text_width_at(text, theme::SANS, 13.0, gpui::FontWeight::SEMIBOLD)
 }
 
 // ---------------------------------------------------------------------------
@@ -6545,7 +6590,9 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
 
     // An unnamed session falls back to the provider label, which is what
     // this row paints.
-    let ink = real_text_width("claude code", theme::SANS, 14.0);
+    // Slice AS: **14.0 was never the size this row draws**, and the default
+    // weight was never the weight. See `real_name_width`.
+    let ink = real_name_width("claude code");
     // What the row DRAWS is `min(ink, box)`: the label truncates, so a name
     // longer than its slot ends at the slot's edge with an ellipsis rather
     // than running on under the buttons.
@@ -6599,6 +6646,57 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
         visible >= px(48.),
         "the widest strip leaves only {visible:?} of the name showing; a \
          row you cannot identify is a row you archive by mistake"
+    );
+
+    // Slice AS: **and at a name somebody actually typed.** Everything above
+    // measures `claude code` (76.5 px), which is the SHORTEST realistic
+    // name the rail can draw — the provider fallback. Run the same two
+    // cases at a fifteen-character title and the picture changes:
+    //
+    // | name | affordances | clearance |
+    // | --- | --- | --- |
+    // | `claude code` | 2 (pen, archive) | **+37.5 px** |
+    // | `package the dmg` | 2 (pen, archive) | **+5.2 px** |
+    // | `claude code` | 4 | −18.5 px |
+    // | `package the dmg` | 4 | **−50.8 px** |
+    //
+    // So the strong invariant above — 8 px of daylight after the name — is
+    // held by the FIXTURE and not by the layout: at a realistic title the
+    // two affordances every row carries come within 5 px of the last glyph,
+    // and this test would not have noticed. The clearance is asserted as
+    // positive here rather than as ≥ 8, because a claim about a number the
+    // rail cannot currently make is a claim that fails on the next slice
+    // for the wrong reason. **This is a finding, not a fix**; the fix is
+    // fewer affordances in a 60 px corner (Stage AO's caveat 4, still
+    // open), and `docs/shots/as-rail-open.png` is the first photograph of
+    // it — the pen sits on the `m` of `dmg`.
+    let mut titled = session("aaaa1111");
+    titled.title = Some("package the dmg".into());
+    rail_with_selected(&h, vcx, vec![titled.clone()], "aaaa1111");
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+    let long_ink = real_name_width("package the dmg");
+    let two_at_a_real_title = clear(vcx);
+    assert!(
+        two_at_a_real_title > px(0.),
+        "`package the dmg` shapes to {long_ink:?} and the two affordances \
+         EVERY row carries leave {two_at_a_real_title:?} after it — rename \
+         and archive are on every row and must not be over the name they \
+         belong to"
+    );
+
+    // ...and the widest strip keeps its floor at that length too, which is
+    // the invariant that actually holds.
+    let mut titled_wide = titled;
+    titled_wide.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
+    rail_with_selected(&h, vcx, vec![titled_wide], "aaaa1111");
+    hover_row(&h, vcx, "rail-aaaa1111", "wtd-aaaa1111");
+    let label = vcx.debug_bounds("label-aaaa1111").expect("the row\'s name");
+    let strip = vcx.debug_bounds("ren-aaaa1111").expect("the first action");
+    let visible = strip.origin.x - label.origin.x;
+    assert!(
+        visible >= px(48.),
+        "at a real title the widest strip leaves only {visible:?} of the \
+         name showing"
     );
 }
 
@@ -6724,7 +6822,11 @@ fn a_realistically_named_session_shows_its_whole_name(cx: &mut TestAppContext) {
     rail_with_selected(&h, vcx, vec![named], "aaaa1111");
 
     let label = vcx.debug_bounds("label-aaaa1111").expect("the row\'s name");
-    let ink = real_text_width(name, theme::SANS, 13.0);
+    // Slice AS: at the weight the row DRAWS. This shaped at the family's
+    // default weight, and the name is `WEIGHT_STRONG` — semibold runs
+    // 118.5 px here against regular's 113.5, so the old measurement was
+    // asking whether a lighter font would fit than the one on screen.
+    let ink = real_name_width(name);
     assert!(
         label.size.width >= ink,
         "{name:?} shapes to {ink:?} and its slot is {:?} — the row would \
@@ -7155,6 +7257,567 @@ fn emptying_the_composer_hint_moves_nothing(cx: &mut TestAppContext) {
             (b.origin, b.size.height),
             "{name} moved or changed height when the hint appeared: \
              {a:?} -> {b:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slice AS — collapsing the rail must not cost you the other sessions.
+//
+// The titlebar's rail toggle removed the only way to reach another session:
+// one click on a control that reads as "give me more room" made eave
+// single-session until it was clicked again. The tab strip is the switcher
+// that survives the collapse.
+//
+// Everything below is a HARNESS measurement. No hover state and no
+// synthetic keystroke has ever been photographed in this app
+// (docs/progress.md §Instrument list), and the harness cannot paint an icon
+// at all (`TestAppContext` hardcodes `Arc::new(())` as its asset source) —
+// so nothing here is allowed to depend on a tab's provider mark being
+// visible. Every identity assertion goes through the NAME.
+
+/// **The slice, in one test.** Collapse the rail and you can still switch.
+///
+/// It is written as the walk a person takes: five sessions in the rail, one
+/// of them open, collapse the rail, and reach a different session. On
+/// `integration-4` the second half of this cannot be written at all —
+/// there is no element to click.
+#[gpui::test]
+fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let ids = ["aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555"];
+    rail_with_selected(
+        &h,
+        vcx,
+        ids.iter().map(|id| session(id)).collect(),
+        "aaaa1111",
+    );
+
+    // Open: rows, no tabs. The strip is not a second listing of the same
+    // sessions sitting beside the first.
+    assert!(shown(vcx, "rail-aaaa1111"), "the rail starts open");
+    assert!(
+        !shown(vcx, "session-tabs"),
+        "the strip is on screen with the rail open — two lists of the same \
+         sessions is not what the toggle is for"
+    );
+
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "rail-aaaa1111"), "the rail did not collapse");
+
+    // Collapsed: a tab for every session, in the rail's order.
+    for sel in [
+        "tab-aaaa1111",
+        "tab-bbbb2222",
+        "tab-cccc3333",
+        "tab-dddd4444",
+        "tab-eeee5555",
+    ] {
+        assert!(
+            shown(vcx, sel),
+            "{sel} is missing — collapsing the rail took that session out \
+             of reach, which is the whole defect"
+        );
+    }
+
+    // ...and it is not decoration: clicking one asks for that session.
+    let _ = h.drain();
+    click(vcx, "tab-dddd4444");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Select(id) if id == "dddd4444")),
+        "clicking a tab emitted {cmds:?} — a strip you cannot switch with \
+         is the dead end wearing a nicer shape"
+    );
+
+    // And the toggle still goes back.
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-aaaa1111"), "the rail did not come back");
+    assert!(
+        !shown(vcx, "session-tabs"),
+        "the strip outlived the collapse it exists for"
+    );
+}
+
+/// **The transcript does not move when the strip appears.**
+///
+/// This is the constraint the placement was chosen to satisfy rather than
+/// to trade against: the strip lives in the titlebar, which is
+/// `h(TITLEBAR_H)` and `flex_none`, so nothing inside it can change the
+/// height of anything below it. A band of its own between the titlebar and
+/// the content row would have had to be reserved while the rail is open —
+/// a permanent empty stripe paid for a state the operator is usually not
+/// in — or it would have jumped the reading column on every collapse.
+///
+/// Asserted to the pixel on the reading column itself, on both sides of the
+/// toggle and back again. The width is asserted to MOVE, in the other
+/// direction, because a collapse that returned no room would not be worth
+/// having.
+#[gpui::test]
+fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![
+            session("aaaa1111"),
+            session("bbbb2222"),
+            session("cccc3333"),
+        ],
+        "aaaa1111",
+    );
+
+    let well = |vcx: &mut VisualTestContext| {
+        vcx.debug_bounds("content-well")
+            .expect("the reading column did not render")
+    };
+    let bar = |vcx: &mut VisualTestContext| vcx.debug_bounds("titlebar").expect("the titlebar");
+
+    let open = well(vcx);
+    let open_bar = bar(vcx);
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "session-tabs"), "the strip did not mount");
+    let shut = well(vcx);
+    let shut_bar = bar(vcx);
+
+    assert_eq!(
+        (open.origin.y, open.size.height),
+        (shut.origin.y, shut.size.height),
+        "the reading column moved when the tab strip appeared: {open:?} -> \
+         {shut:?}. A layout that jumps on collapse is worse than the dead \
+         end being fixed."
+    );
+    assert_eq!(
+        open_bar.size.height, shut_bar.size.height,
+        "the titlebar changed height to hold the strip, which is the same \
+         bug one element up"
+    );
+    assert!(
+        shut.size.width >= open.size.width + px(200.),
+        "collapsing the rail returned only {:?} of width ({:?} -> {:?}) — \
+         if the strip cost the column what the rail cost it, collapsing \
+         bought nothing",
+        shut.size.width - open.size.width,
+        open.size.width,
+        shut.size.width
+    );
+
+    // ...and back. A toggle that is not an involution leaves the operator
+    // somewhere they cannot get out of.
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    let again = well(vcx);
+    assert_eq!(
+        (open.origin, open.size),
+        (again.origin, again.size),
+        "re-opening the rail did not return the column to where it was"
+    );
+
+    // The strip fits its host with room, asserted as CLEARANCE against
+    // literals rather than as a fit against the constants the layout uses.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(
+            theme::TAB_H <= 32.0,
+            "a tab is {} px tall; the titlebar is 48 and the traffic lights \
+             live in it",
+            theme::TAB_H
+        );
+        assert!(
+            theme::TITLEBAR_H - theme::TAB_H >= 16.0,
+            "the strip leaves {} px of titlebar around it",
+            theme::TITLEBAR_H - theme::TAB_H
+        );
+    }
+}
+
+/// A tab shows a session's NAME, in full, for the name the normal session
+/// actually has.
+///
+/// The requirement Slice AO found nothing was testing — a rail whose every
+/// name read `clau…` passed 241 tests — applied to the new surface. The
+/// name here is `claude code`, the provider fallback an UNNAMED session
+/// paints, because Slice AO's caveat 5 records unnamed-in-one-repo as the
+/// normal case in the operator's own configuration rather than the edge
+/// one.
+///
+/// Shaped at [`theme::WEIGHT_STRONG`], which is what the tab draws.
+/// `real_text_width` shapes at the family's default weight and semibold is
+/// wider — every name-fits assertion in this file that used the plain
+/// helper was measuring a lighter font than the one on screen.
+#[gpui::test]
+fn a_tab_shows_a_realistic_session_name(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+
+    // `real_name_width` shapes at 13 px semibold and guards those two
+    // against the tokens, so a slice that moves the name's size fails here
+    // rather than quietly measuring a font nothing draws.
+    let ink = real_name_width("claude code");
+    let label = vcx
+        .debug_bounds("tab-label-aaaa1111")
+        .expect("the tab's name");
+    assert!(
+        label.size.width >= ink,
+        "`claude code` shapes to {ink:?} and the tab's name slot is {:?} — \
+         a tab that renders the commonest session label as an ellipsis \
+         cannot be used to tell two sessions apart",
+        label.size.width
+    );
+
+    // Nothing on the tab is over the name. The rail's own version of this
+    // invariant was pointed at the wrong element for two slices and could
+    // never fail (`the_action_strip_does_not_cover_the_session_name`); this
+    // one is pointed at the tab's name and at the tab's box, and it is a
+    // containment check rather than a proximity one.
+    let tab = vcx.debug_bounds("tab-aaaa1111").expect("the tab");
+    assert!(
+        label.origin.x >= tab.origin.x + px(8.),
+        "the name starts {:?} into a tab that begins at {:?} — it is \
+         outside the tab's own padding",
+        label.origin.x - tab.origin.x,
+        tab.origin.x
+    );
+    assert!(
+        label.origin.x + label.size.width <= tab.origin.x + tab.size.width - px(8.),
+        "the name runs to {:?} and the tab ends at {:?} — the slot has \
+         eaten its own padding, and the next thing added to a tab will be \
+         on top of the name",
+        label.origin.x + label.size.width,
+        tab.origin.x + tab.size.width
+    );
+
+    // A name too long for a tab CLIPS. It must not widen the tab: a strip
+    // whose tabs are each as wide as their name has no rhythm, and the tab
+    // you are aiming for moves when an unrelated session is renamed.
+    let plain = tab.size.width;
+    let mut long = session("aaaa1111");
+    long.title = Some("chase the rail flake".into());
+    rail_with_selected(&h, vcx, vec![long], "aaaa1111");
+    let wide = vcx
+        .debug_bounds("tab-aaaa1111")
+        .expect("the tab")
+        .size
+        .width;
+    assert_eq!(
+        plain, wide,
+        "a 20-character title made the tab {wide:?} instead of {plain:?} — \
+         tabs are a fixed width and the name truncates into it"
+    );
+}
+
+/// **A tab is not a row.** The strip must not be the rail lying on its
+/// side, or collapsing the rail buys nothing.
+///
+/// The rail states where a session works, how many other sessions are in
+/// those files, how dirty its worktree is, whether it is archived, what
+/// permission posture it holds, and offers five affordances. A tab states
+/// two things: which session, and what state it is in.
+#[gpui::test]
+fn a_tab_is_not_a_rail_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // The most freighted row the rail can build: named, sharing with two,
+    // worktree'd and dirty, on a dangerous posture.
+    let mut loaded = session("aaaa1111");
+    loaded.title = Some("the refactor".into());
+    loaded.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
+    loaded.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
+    loaded.permission_mode = Some("bypassPermissions".into());
+    rail_with_selected(&h, vcx, vec![loaded], "aaaa1111");
+    // Every one of those facts is on the row.
+    for sel in ["cwd-aaaa1111", "marks-aaaa1111"] {
+        assert!(
+            shown(vcx, sel),
+            "{sel} is not on the rail row to begin with"
+        );
+    }
+
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "tab-aaaa1111"), "the tab did not mount");
+    // ...and none of them is on the tab.
+    for sel in [
+        "cwd-aaaa1111",
+        "marks-aaaa1111",
+        "ren-aaaa1111",
+        "arc-aaaa1111",
+        "rail-resource",
+        "rail-archived",
+    ] {
+        assert!(
+            !shown(vcx, sel),
+            "{sel} followed the session onto the tab strip — a strip \
+             carrying the rail's freight needs the rail's room"
+        );
+    }
+
+    // Stated as a width ceiling as well, against literals: the rail is
+    // 248 px wide and gives a name 158 of them, and a tab may approach
+    // neither.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(
+            theme::TAB_W <= 176.0,
+            "a tab is {} px wide; the rail it replaces is 248",
+            theme::TAB_W
+        );
+        assert!(
+            theme::TAB_NAME_W <= 112.0,
+            "the tab's name slot is {} px — at that width it is the rail's \
+             158 px name slot with the folder deleted, not a tab",
+            theme::TAB_NAME_W
+        );
+    }
+}
+
+/// Selection is a neutral raised fill plus a rim, and it moves nothing.
+///
+/// The operator ruled on the rail's version outright — *"no need for purple
+/// bar when selected"* — and the rule the theme states is that the accent
+/// marks where you are ACTING, not where you are. A selected tab is a
+/// location.
+///
+/// What is asserted here is the part that can be: [`theme::selection_rim`]
+/// is a 1 px INSET shadow rather than a border precisely so that selecting
+/// cannot change an element's width, and in a horizontal strip that matters
+/// more than it does in the rail — a 2 px border on one tab would move
+/// every tab after it. Both selections are measured to the pixel, across
+/// every tab.
+#[gpui::test]
+fn selecting_a_tab_moves_no_tab(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let ids = ["aaaa1111", "bbbb2222", "cccc3333"];
+    let infos: Vec<SessionInfo> = ids.iter().map(|id| session(id)).collect();
+    rail_with_selected(&h, vcx, infos.clone(), "aaaa1111");
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+
+    let boxes = |vcx: &mut VisualTestContext| -> Vec<gpui::Bounds<Pixels>> {
+        ["tab-aaaa1111", "tab-bbbb2222", "tab-cccc3333"]
+            .iter()
+            .map(|sel| vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}")))
+            .collect()
+    };
+    let first = boxes(vcx);
+    // Every tab is the same box, which is what makes the strip a strip.
+    for (i, b) in first.iter().enumerate() {
+        assert_eq!(
+            b.size.width,
+            px(theme::TAB_W),
+            "tab {i} is not the fixed width"
+        );
+        assert_eq!(b.size.height, first[0].size.height, "tab {i} height");
+        assert_eq!(b.origin.y, first[0].origin.y, "tab {i} baseline");
+    }
+
+    rail_with_selected(&h, vcx, infos, "bbbb2222");
+    let second = boxes(vcx);
+    for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+        assert_eq!(
+            (a.origin, a.size),
+            (b.origin, b.size),
+            "tab {i} moved when the selection went from the first tab to \
+             the second: {a:?} -> {b:?}. The rim is an inset shadow so that \
+             this cannot happen."
+        );
+    }
+}
+
+/// Many sessions: every one of them has a tab, and the one you are in is
+/// always on screen.
+///
+/// The strip is a fixed-width lane that SCROLLS rather than an overflow
+/// menu or a shrink-to-fit row. What that has to earn is two properties,
+/// and this asserts both: nothing is dropped (a session with no tab is the
+/// dead end again, for that session), and the selected tab is never off the
+/// end (a strip that says nothing about where you are is a strip you cannot
+/// navigate from).
+#[gpui::test]
+fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let ids = [
+        "aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555", "ffff6666", "aaab7777",
+        "bbbc8888", "cccd9999",
+    ];
+    // Distinct activity stamps, newest first, so the rail's order is a
+    // known thing rather than whatever `fold_rail` does with a nine-way tie
+    // — the first version of this test asserted an order the fixture never
+    // specified and read the tie as a bug.
+    let infos: Vec<SessionInfo> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let mut s = session(id);
+            s.last_activity_ms = Some((ids.len() - i) as u64 * 1000);
+            s
+        })
+        .collect();
+    rail_with_selected(&h, vcx, infos.clone(), "aaaa1111");
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+
+    let strip = vcx.debug_bounds("session-tabs").expect("the strip");
+    // The fixture really does overflow — otherwise the two properties below
+    // are asserted about a case that never arises.
+    assert!(
+        px(theme::TAB_W) * (ids.len() as f32) > strip.size.width,
+        "nine tabs fit in {:?}, so this test is not measuring an \
+         overflowing strip at all",
+        strip.size.width
+    );
+
+    let tabs = [
+        "tab-aaaa1111",
+        "tab-bbbb2222",
+        "tab-cccc3333",
+        "tab-dddd4444",
+        "tab-eeee5555",
+        "tab-ffff6666",
+        "tab-aaab7777",
+        "tab-bbbc8888",
+        "tab-cccd9999",
+    ];
+    for sel in tabs {
+        assert!(
+            shown(vcx, sel),
+            "{sel} has no tab — nine sessions is not an exotic number and a \
+             session with no tab is unreachable with the rail shut"
+        );
+    }
+    // In the rail's own order, left to right. Two surfaces disagreeing
+    // about the order of the same list is its own kind of dead end.
+    let xs: Vec<Pixels> = tabs
+        .iter()
+        .map(|sel| vcx.debug_bounds(sel).unwrap().origin.x)
+        .collect();
+    for w in xs.windows(2) {
+        assert!(w[1] > w[0], "the strip is not in the rail's order: {xs:?}");
+    }
+
+    // The LAST session, selected. Its tab has to come to the operator.
+    rail_with_selected(&h, vcx, infos, "cccd9999");
+    let strip = vcx.debug_bounds("session-tabs").expect("the strip");
+    let sel = vcx.debug_bounds("tab-cccd9999").expect("the selected tab");
+    assert!(
+        sel.origin.x >= strip.origin.x
+            && sel.origin.x + sel.size.width <= strip.origin.x + strip.size.width,
+        "the selected tab sits at {:?}..{:?} and the strip runs {:?}..{:?} \
+         — the session you are reading is off the end of the only control \
+         that could take you anywhere else",
+        sel.origin.x,
+        sel.origin.x + sel.size.width,
+        strip.origin.x,
+        strip.origin.x + strip.size.width
+    );
+}
+
+/// A tab identifies its provider the way a row does — a real mark on an
+/// opaque plate, with initials as the fallback.
+///
+/// The plate is not decoration and the contrast argument is
+/// `theme.rs`'s (`a_provider_mark_clears_the_non_text_floor_on_its_own_plate`
+/// measures 6.01:1 on `chip_plate` against 2.55:1 unplated). What a
+/// harness can add is that the SLOT exists, is the rail's size, and is the
+/// same box whether a provider has a logo or not — which is what keeps the
+/// name slot beside it identical across providers.
+///
+/// It cannot assert the mark is visible. `TestAppContext` hardcodes
+/// `Arc::new(())` as its asset source, so every icon in this file lays out
+/// its box and paints nothing.
+#[gpui::test]
+fn a_tab_wears_the_providers_mark_on_the_same_plate_a_row_does(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut known = session("aaaa1111");
+    known.provider = "claude-code".into();
+    let mut unknown = session("bbbb2222");
+    unknown.provider = "some-agent".into();
+    rail_with_selected(&h, vcx, vec![known, unknown], "aaaa1111");
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+
+    for sel in ["tab-chip-aaaa1111", "tab-chip-bbbb2222"] {
+        assert!(shown(vcx, sel), "{sel} did not render");
+    }
+    let a = vcx.debug_bounds("tab-label-aaaa1111").unwrap();
+    let b = vcx.debug_bounds("tab-label-bbbb2222").unwrap();
+    assert_eq!(
+        a.size.width, b.size.width,
+        "a provider with a logo and one without gave their names different \
+         slots — the two chips are supposed to be interchangeable"
+    );
+    // And the fallback really is the initials, which is the only half of a
+    // provider's identity this harness can read at all.
+    assert_eq!(provider_identity("some-agent").0, "SA");
+
+    // The plate is the rail's, at the rail's size, and it leaves the name
+    // its whole slot. Written as a literal: 18 px is `PROVIDER_CHIP`, and
+    // reading it from the constant would let a slice grow the plate and
+    // eat the name with the test moving along underneath.
+    let chip = vcx.debug_bounds("tab-chip-aaaa1111").unwrap();
+    assert!(
+        chip.size.width <= px(12.),
+        "the provider mark is {:?} on a tab. It is 12 px inside an 18 px \
+         plate: a mark at the plate's full size reads as a crop, and every \
+         pixel it takes is one the name does not get",
+        chip.size.width
+    );
+}
+
+/// Five sessions — the operator's own configuration — fit the strip at the
+/// default window with no scrolling at all.
+///
+/// The scroll exists for the ninth session, not for the fifth. A switcher
+/// that made you scroll to reach half of what you have open is a switcher
+/// that hides what it is for, and [`theme::TAB_W`] is set where it is
+/// partly to keep this true.
+///
+/// Measured on the RENDERED strip, never computed from `WINDOW_W` minus the
+/// titlebar's own constants — that arithmetic would agree with the layout
+/// by construction and could not fail.
+#[gpui::test]
+fn five_sessions_fit_the_strip_without_scrolling(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![
+            session("aaaa1111"),
+            session("bbbb2222"),
+            session("cccc3333"),
+            session("dddd4444"),
+            session("eeee5555"),
+        ],
+        "aaaa1111",
+    );
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+
+    let strip = vcx.debug_bounds("session-tabs").expect("the strip");
+    for sel in [
+        "tab-aaaa1111",
+        "tab-bbbb2222",
+        "tab-cccc3333",
+        "tab-dddd4444",
+        "tab-eeee5555",
+    ] {
+        let tab = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+        assert!(
+            tab.origin.x >= strip.origin.x
+                && tab.origin.x + tab.size.width <= strip.origin.x + strip.size.width,
+            "{sel} runs {:?}..{:?} and the strip runs {:?}..{:?} — five \
+             sessions is what the operator runs and all five have to be on \
+             screen at the default window size",
+            tab.origin.x,
+            tab.origin.x + tab.size.width,
+            strip.origin.x,
+            strip.origin.x + strip.size.width
         );
     }
 }

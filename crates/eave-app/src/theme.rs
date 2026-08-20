@@ -1333,6 +1333,96 @@ pub const RAIL_LABEL_SLOT_H: f32 = BODY_LINE + HAIRLINE * 2.0;
 /// self-drawn set for every provider (Slice A directive).
 pub const PROVIDER_CHIP: f32 = 18.0;
 pub const RADIUS_CHIP: f32 = 5.0;
+
+/// The size a session's NAME is drawn at, in the rail and on a tab.
+///
+/// Deliberately not [`BODY_SIZE`] (13.5) and emphatically not [`NAME_SIZE`]
+/// (16). Slice AO shipped 16 and the operator's word for it was
+/// "gigantic": in a 248 px column a 16 px name truncates mid-word, and the
+/// name is the only thing on the row a person reads. Weight and ink carry
+/// the hierarchy; the size step over the folder line (12.5) is half a
+/// point.
+///
+/// It is a constant because it was three different numbers. Slice AO wrote
+/// `px(13.0)` at the two call sites, Slice AL moved [`BODY_SIZE`] to 13.5
+/// underneath it, and `the_action_strip_does_not_cover_the_session_name`
+/// shaped its measurement at **14.0** — so the layout, the token and the
+/// test each believed something different about the same glyphs. The tests
+/// still write `13.0` as a literal (§7: never derive an expectation from
+/// the constant under test) and guard it against this value, so moving the
+/// name's size fails loudly instead of sliding the measurement with it.
+pub const RAIL_NAME_SIZE: f32 = 13.0;
+/// The line box [`RAIL_NAME_SIZE`] sits in. See that constant.
+pub const RAIL_NAME_LINE: f32 = 19.0;
+
+// ---------------------------------------------------------------------------
+// Session tabs (Slice AS) — switching sessions with the rail collapsed.
+//
+// Collapsing the rail used to remove the only way to reach another
+// session: the app became single-session until you opened the rail again,
+// and the click that did it looks like "give me more room", not "give up
+// navigation". The tab strip is the switcher that survives the collapse.
+//
+// **A tab is not a row.** The rail states where a session works, how many
+// other sessions are in those files, how dirty its worktree is, and offers
+// five affordances. A tab states two things — WHICH session and WHAT STATE
+// it is in — because a strip that carried the rest would need the room the
+// rail needed, and then collapsing the rail would have bought nothing.
+
+/// A tab's height.
+///
+/// The tallest thing on a tab is the name's line box ([`RAIL_NAME_LINE`],
+/// 19) — taller than the provider plate (18) and the state dot (6) — plus
+/// `SPACE_1` of air above and below. It must clear [`TITLEBAR_H`], which is
+/// where the strip lives; `the_tab_strip_costs_the_transcript_no_height`
+/// asserts the clearance rather than the fit.
+pub const TAB_H: f32 = RAIL_NAME_LINE + SPACE_1 * 2.0;
+
+/// Everything on a tab that is not the name: the two side pads, the state
+/// dot, the provider plate, and the two gaps between them.
+///
+/// Named so that [`TAB_W`] is stated as *chrome plus a name slot* rather
+/// than as a round number somebody liked. The dot's gap is `SPACE_1` and
+/// not the rail's `SPACE_2`: the dot and the plate are one identity group
+/// here, and the 4 px goes to the name.
+pub const TAB_CHROME_W: f32 = SPACE_2 * 2.0 + STATE_DOT + SPACE_1 + PROVIDER_CHIP + SPACE_2;
+
+/// The name slot on a tab. Every width below is font-kit's, shaped at
+/// [`RAIL_NAME_SIZE`] and [`WEIGHT_STRONG`] — the size and weight a name is
+/// actually drawn at.
+///
+/// **The floor is the widest PROVIDER FALLBACK label**, which is what an
+/// unnamed session paints and which Slice AO's caveat 5 records as the
+/// normal case in the operator's own configuration rather than the edge
+/// one. Of the six providers `launcher::PROVIDERS` registers: `cursor
+/// agent` **80.2 px**, `claude code` 76.5, `hermes` 47.4, `codex` 38.0.
+/// Nothing here may ever ellipsis.
+///
+/// **The target is a three-word operator title** — `package the dmg`
+/// **108.8 px**, `fix the send race` 104.8. Those are what an operator
+/// types, and a strip that clipped all of them would leave two sessions in
+/// the same repo looking alike. 108.8 up to the 4 px unit is **112**.
+///
+/// **The ceiling is the rail.** The rail gives a name 158 px; a tab gives
+/// it 112, which is 71 % of it. A four-word title (`chase the rail flake`,
+/// 118.5 px) therefore reads whole in the rail and clipped on a tab, and
+/// that is the intended difference rather than a shortfall — a strip that
+/// showed as much as a row would need the room the rail needed, and then
+/// collapsing the rail would have bought nothing.
+pub const TAB_NAME_W: f32 = 112.0;
+
+/// A tab's width — fixed, and the same for every tab.
+///
+/// Fixed rather than content-sized for the reason Slice AO's rows are a
+/// uniform 60 px: a strip whose tabs each take the width their name
+/// happens to want has no rhythm, and the tab you are aiming for moves
+/// when an unrelated session is renamed. It is also what makes
+/// [`TAB_NAME_W`] a slot a test can measure a real name against.
+pub const TAB_W: f32 = TAB_CHROME_W + TAB_NAME_W;
+
+/// The gap between tabs. One unit — enough that two selection rims do not
+/// touch, small enough that the strip reads as one control.
+pub const TAB_GAP: f32 = SPACE_1;
 // Slice P3 deleted RAIL_TOGGLE_W/H and RADIUS_GLYPH with the hand-drawn
 // sidebar pictogram they described. The toggles are Solar's
 // `icons::SIDEBAR_MINIMALISTIC_LEFT` / `SIDEBAR_MINIMALISTIC` now, sized

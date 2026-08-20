@@ -13,7 +13,7 @@
 //! per burst. Frame pacing comes from the engine's strict 120 ms delta
 //! folding — no UI frame-pacing timer (spec 03 §Streaming commit).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2694,6 +2694,29 @@ struct Shell {
     /// holds no authoritative state).
     rail_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
+    /// Slice AS — the session-tab strip's scroll offset.
+    ///
+    /// Unlike the two above, this one is *written* as well as read: the
+    /// selected tab is scrolled into view when the selection moves, so a
+    /// switch made from anywhere else (the launcher, a `Select` the engine
+    /// confirms, the rail on its way to being collapsed) cannot leave the
+    /// tab you are in off the end of the strip.
+    tabs_scroll: ScrollHandle,
+    /// Which session the strip has already scrolled to.
+    ///
+    /// `ScrollHandle::scroll_to_item` sets an active item that prepaint
+    /// consumes, so calling it every frame would pin the strip and the
+    /// operator could never scroll away from the selected tab. This makes
+    /// it an EDGE: the strip scrolls when the selection *changes* and not
+    /// otherwise.
+    ///
+    /// A `RefCell` on the shell for exactly the reason `files_wait_since`
+    /// is a `Cell`: it is this window's record of what it has already
+    /// done, not a fact about a session, and the code that reads it takes
+    /// `&self` inside the render pass — an entity write there would notify,
+    /// and a notify per frame is the defect N4's idle floor exists to
+    /// prevent.
+    tab_scrolled_to: RefCell<Option<String>>,
     /// Slice P1 — see [`DemoOverlay`]. No product consumer.
     demo: DemoOverlay,
     /// The rail's inline rename field (Stage AC), when one is open.
@@ -3275,15 +3298,26 @@ impl Shell {
 
     /// Custom titlebar: native drag/double-click via the window-control
     /// area, traffic lights inset by the platform options.
-    fn titlebar(&self, cx: &Context<Self>) -> gpui::Div {
+    fn titlebar(&self, cx: &Context<Self>, phase: Option<f32>) -> gpui::Div {
         let session = self.transcript.read(cx).session_id.clone();
+        // Slice AS: the tab strip takes the slot the 8-char session id and
+        // the spacer shared, and it takes it only while the rail is
+        // collapsed. The id goes with it: it is the same hex string Slice AO
+        // deleted from every rail row on the operator's ruling — *a hex
+        // string nobody chose does not outrank the name* — and here it would
+        // be competing for the strip's room with the tabs that carry the
+        // names. It stays while the rail is open, where the room is free and
+        // the full uuid in the footer is the thing it abbreviates.
+        let tabs = self.sessions.read(cx).collapsed;
         let short = session
             .as_deref()
+            .filter(|_| !tabs)
             .map(|s| s.chars().take(8).collect::<String>());
         // No seam below: the titlebar sits on the same continuous glass
         // ground as the rails (comet's shell) — the content card carries
         // its own outline.
         div()
+            .debug_selector(|| "titlebar".into())
             .w_full()
             .h(px(theme::TITLEBAR_H))
             .flex_none()
@@ -3336,7 +3370,14 @@ impl Shell {
                     .text_color(theme::text_tertiary())
                     .child(s)
             }))
-            .child(div().flex_1())
+            // Slice AS. The strip replaces the spacer rather than sitting
+            // beside it: it is `flex_1` itself, so with no tabs to draw it
+            // is the same empty stretch the spacer was.
+            .child(if tabs {
+                self.session_tabs(cx, phase)
+            } else {
+                div().flex_1().into_any_element()
+            })
             .child(
                 // Files-rail collapse toggle: the same glyph mirrored
                 // (divider on the right third). Slice P3, as above.
@@ -3361,6 +3402,267 @@ impl Shell {
                         "files-toggle-glyph",
                     )),
             )
+    }
+
+    /// Slice AS — the session tab strip: switching, with the rail collapsed.
+    ///
+    /// **What was wrong.** The titlebar's rail toggle removed the only way
+    /// to reach another session. Nothing else in the window lists them, so
+    /// one click on a control that reads as "give me more room" made eave
+    /// single-session until you clicked it again — a dead end a person can
+    /// walk into without meaning to, and the operator did:
+    /// *"when i close the chat panel we need to convert to page tabs for
+    /// sessions so i can still switch"*.
+    ///
+    /// **Where it lives, and why that is the whole answer to "does the
+    /// transcript move?".** The strip sits in the TITLEBAR, in the slot a
+    /// bare `flex_1` spacer occupied. The titlebar is `h(TITLEBAR_H)` and
+    /// `flex_none`, so nothing inside it can change the height of anything
+    /// below it — the reading column's height is not merely *unchanged* by
+    /// this, it is unchangeable by it. The alternative (a band of its own
+    /// between the titlebar and the content row) would have had to be
+    /// reserved when the rail is open, which is a permanent empty stripe
+    /// paid for a state the operator is usually not in.
+    ///
+    /// **What a tab says, and what it deliberately does not.** The session
+    /// name and its state dot, on the rail's own pigments. Not the folder,
+    /// not `+2 here`, not the dirty count, and none of the five
+    /// affordances — those are the rail's, and a strip that carried them
+    /// would need the room the rail needed, at which point collapsing the
+    /// rail buys nothing. See [`theme::TAB_W`].
+    ///
+    /// **Many sessions.** Fixed-width tabs, and the strip SCROLLS. Nothing
+    /// is truncated out of existence and no session is unreachable: every
+    /// session the rail would draw has a tab, in the rail's own order.
+    /// The selected tab is scrolled into view when the selection moves
+    /// ([`Shell::tab_scrolled_to`]), so the one tab you must always be able
+    /// to see is the one that cannot hide. The alternative shapes were an
+    /// overflow menu (needs a measured width the element tree does not have
+    /// at build time, and buries sessions behind a second click) and
+    /// shrink-to-fit (a strip whose tabs get narrower as you open more
+    /// sessions is illegible exactly when you have the most to tell apart).
+    fn session_tabs(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
+        // The same order and the same filter the rail uses. `fold_rail`
+        // decided the order when each row arrived; `rail_shows` is what
+        // decides an archived session is still on screen because it is
+        // selected or because it is asking a question. Two surfaces
+        // disagreeing about which sessions exist would be worse than one
+        // surface being wrong.
+        let selected = self.transcript.read(cx).session_id.clone();
+        let show_archived = self.sessions.read(cx).show_archived;
+        let shown: Vec<SessionInfo> = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
+            .cloned()
+            .collect();
+
+        // Scroll the selected tab into view — on the EDGE of the selection
+        // changing, never every frame. `scroll_to_item` arms an active item
+        // that prepaint consumes, so re-arming it on every pass would pin
+        // the strip to the selected tab and the operator could never scroll
+        // to anything else.
+        {
+            let mut been = self.tab_scrolled_to.borrow_mut();
+            match selected.as_deref() {
+                Some(sel) if been.as_deref() != Some(sel) => {
+                    if let Some(ix) = shown.iter().position(|s| s.session_id == sel) {
+                        self.tabs_scroll.scroll_to_item(ix);
+                        *been = Some(sel.to_string());
+                    }
+                }
+                // Nothing selected (the launcher). Forget where we were, so
+                // that coming back to the same session scrolls to it again
+                // rather than assuming the strip never moved.
+                None => *been = None,
+                _ => {}
+            }
+        }
+
+        let tabs: Vec<AnyElement> = shown
+            .iter()
+            .map(|info| {
+                let is_sel = selected.as_deref() == Some(info.session_id.as_str());
+                let (glyph, provider_label) = provider_identity(&info.provider);
+                let label = row_label(info, &provider_label);
+                let dot = state_color(&info.state);
+                let sid = info.session_id.clone();
+                div()
+                    .id(SharedString::from(format!("tab-{}", info.session_id)))
+                    .debug_selector(|| format!("tab-{}", info.session_id))
+                    .flex_none()
+                    .w(px(theme::TAB_W))
+                    .h(px(theme::TAB_H))
+                    .px(px(theme::SPACE_2))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    // Selection is a NEUTRAL raised fill plus a rim, and
+                    // never an accent bar — the operator ruled on the rail's
+                    // version of this outright ("no need for purple bar when
+                    // selected"), and the rule the theme states is that the
+                    // accent marks where you are ACTING, not where you are.
+                    // A selected tab is a location.
+                    //
+                    // The rim is `theme::selection_rim()` — a 1 px INSET
+                    // shadow, which is the whole reason that function exists
+                    // and this is its first caller. A border would shrink the
+                    // tab's content box by 2 px the moment you clicked it;
+                    // an inset shadow draws the same line inside the
+                    // element's own bounds and costs zero layout, which is
+                    // what `selecting_a_tab_does_not_move_the_strip` holds it
+                    // to. (The rail reaches the same end by always laying out
+                    // a border and only changing its colour. Both are
+                    // legitimate; the tab takes the cheaper one because the
+                    // strip is a scroll container and a per-tab 2 px would
+                    // change where every tab after it starts.)
+                    .when(is_sel, |d| d.shadow(theme::selection_rim()))
+                    // The rail's ladder exactly: a selected thing keeps its
+                    // standing fill and takes no hover step — stated as
+                    // rest == hovered rather than by dropping the fade, so a
+                    // selection flip under a stationary pointer cannot
+                    // strand a half-faded tab.
+                    .hover_fade(
+                        format!("tab-{}", info.session_id),
+                        if is_sel {
+                            theme::overlay_strong()
+                        } else {
+                            theme::wash_rest()
+                        },
+                        if is_sel {
+                            theme::overlay_strong()
+                        } else {
+                            theme::overlay()
+                        },
+                    )
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Same two lines the rail row runs, and for the same
+                        // reason: an open rename field lives in one row's
+                        // label slot, and leaving it open while the selection
+                        // moves strands a keyboard grab on a session the
+                        // operator has walked away from.
+                        this.cancel_rename(cx);
+                        let _ = this.commands.send(Command::Select(sid.clone()));
+                    }))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        // The rail's dot, unchanged: `running` pulses,
+                        // everything else is solid, and the pigments are
+                        // `state_color`'s. It is the only thing on a tab
+                        // that says an agent is working right now.
+                        loaders::work_dot(
+                            theme::STATE_DOT,
+                            dot,
+                            phase.filter(|_| info.state == "running"),
+                        )
+                        .flex_none(),
+                    )
+                    .child(
+                        // The provider's own mark, on the same opaque
+                        // `chip_plate` at the same 18 px the rail row uses.
+                        // A tab has to be identifiable the way a row is, and
+                        // the plate is not decoration: `claude_brand`
+                        // (#D97757) over a wash over the glass ground
+                        // measures 2.55:1 at the bright end of the backdrop
+                        // sweep, under the 3:1 a non-text mark owes its
+                        // surface; on `chip_plate` it is 6.01:1 in every
+                        // state. The initials chip is the fallback for a
+                        // provider eave has no logo for, at the same size, so
+                        // both shapes produce identical tab metrics.
+                        div()
+                            .size(px(theme::PROVIDER_CHIP))
+                            .flex_none()
+                            .rounded(px(theme::RADIUS_CHIP))
+                            .bg(theme::chip_plate())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(match provider_mark(&info.provider) {
+                                Some(mark) => icons::tagged_icon(
+                                    mark,
+                                    12.0,
+                                    provider_mark_ink(&info.provider),
+                                    format!("tab-chip-{}", info.session_id),
+                                )
+                                .into_any_element(),
+                                None => div()
+                                    .debug_selector(|| format!("tab-chip-{}", info.session_id))
+                                    .font_family(theme::MONO)
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .text_color(theme::text_secondary_on_wash())
+                                    .child(SharedString::from(glyph))
+                                    .into_any_element(),
+                            }),
+                    )
+                    .child(
+                        // A FIXED slot, not `flex_1`. Every tab is the same
+                        // width, so the name gets the same room on every one
+                        // of them and `a_tab_shows_a_realistic_session_name`
+                        // has a box to measure a real name against.
+                        //
+                        // `theme::text()` whether the tab is selected or not.
+                        // The name is the one thing on a tab a person reads,
+                        // and dimming the unselected ones would put
+                        // `text_secondary` on a hover wash — 3.81:1, under
+                        // the 4.5 floor, and a known open defect this slice
+                        // is not going to add a fourth instance of. Selection
+                        // is carried by the fill and the rim.
+                        div()
+                            .debug_selector(|| format!("tab-label-{}", info.session_id))
+                            // The row's gap is `SPACE_1` (the dot and the
+                            // plate are one identity group); the name takes
+                            // the rail's `SPACE_2` off the plate, so this is
+                            // the difference and `TAB_CHROME_W` counts both.
+                            .ml(px(theme::SPACE_2 - theme::SPACE_1))
+                            .w(px(theme::TAB_NAME_W))
+                            .flex_none()
+                            .truncate()
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_STRONG)
+                            .text_color(theme::text())
+                            .child(SharedString::from(label)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("session-tabs")
+            .debug_selector(|| "session-tabs".into())
+            // `flex_1` + `min_w(0)`: the strip takes what the titlebar has
+            // left and is allowed to be narrower than its contents, which is
+            // what makes the overflow real rather than a row that pushes the
+            // files-rail toggle off the window.
+            .flex_1()
+            .min_w(px(0.))
+            // Off the wordmark. Without it the first tab's card sits on the
+            // "e" of `eave` — `flex_1` starts exactly where the previous
+            // child ends, and the wordmark carries no trailing margin
+            // because until now nothing followed it but empty space.
+            .ml(px(theme::SPACE_3))
+            .h(px(theme::TAB_H))
+            .overflow_x_scroll()
+            .track_scroll(&self.tabs_scroll)
+            // Without this, scrolling the strip ALSO breaks the transcript's
+            // follow mode: `Shell::on_wheel` is registered on the root, and
+            // gpui runs bubble-phase mouse listeners in reverse registration
+            // order, so the root's handler would see every wheel event that
+            // happened to be over the titlebar. This listener is registered
+            // before the div's own scroll handling and therefore runs after
+            // it, so the strip still scrolls and the transcript is left
+            // alone.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::TAB_GAP))
+            .children(tabs)
+            .into_any_element()
     }
 
     /// The session rail (Slice A): rows on the glass ground, an instrument list of
@@ -3664,8 +3966,8 @@ impl Shell {
                                     // name in place. Any other size and
                                     // opening rename would change the row's
                                     // height under the operator's pointer.
-                                    .text_size(px(13.0))
-                                    .line_height(px(19.0))
+                                    .text_size(px(theme::RAIL_NAME_SIZE))
+                                    .line_height(px(theme::RAIL_NAME_LINE))
                                     .font_weight(theme::WEIGHT_STRONG)
                                     .text_color(theme::text())
                                     // Clicking inside the field is not a
@@ -3738,8 +4040,8 @@ impl Shell {
                                     // curing, and `NAME_SIZE` is still
                                     // correct where it is used — panel
                                     // headings, in a 560 px column.
-                                    .text_size(px(13.0))
-                                    .line_height(px(19.0))
+                                    .text_size(px(theme::RAIL_NAME_SIZE))
+                                    .line_height(px(theme::RAIL_NAME_LINE))
                                     .font_weight(theme::WEIGHT_STRONG)
                                     // Slice AO: primary ink on every row,
                                     // not just the selected one. Selection
@@ -7583,7 +7885,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| this.decide_oldest(true, cx)))
             .on_action(cx.listener(|this, _: &DenyOldest, _, cx| this.decide_oldest(false, cx)))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
-            .child(self.titlebar(cx))
+            .child(self.titlebar(cx, pulse))
             .child(
                 div()
                     .flex_1()
@@ -7598,6 +7900,13 @@ impl Render for Shell {
                         // black wash keeps a solid floor under the reading
                         // column.
                         div()
+                            // Slice AS tagged this so a test can ask the one
+                            // question the tab strip had to answer: does the
+                            // reading column change height when the rail
+                            // collapses? `the_tab_strip_costs_the_transcript
+                            // _no_height` measures this box on both sides of
+                            // the toggle.
+                            .debug_selector(|| "content-well".into())
                             .flex_1()
                             .min_w(px(0.))
                             .mx(px(theme::PLATE_MARGIN))
@@ -8456,6 +8765,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         friction_path_stated: false,
                         rail_scroll: ScrollHandle::new(),
                         files_scroll: ScrollHandle::new(),
+                        tabs_scroll: ScrollHandle::new(),
+                        tab_scrolled_to: RefCell::new(None),
                     }
                 });
                 let handle = shell.read(cx).focus.clone();
