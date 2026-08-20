@@ -141,6 +141,16 @@ pub enum Request {
     Diff {
         session_id: String,
         path: String,
+        /// Which basis to diff against, matching the `files` list the row
+        /// was clicked in.
+        ///
+        /// Without this the pane silently answered a different question
+        /// than the list above it: toggle to "this turn", click a file,
+        /// and the diff was still working-tree — HEAD-relative — so a file
+        /// the turn touched showed every change since the last commit.
+        /// `#[serde(default)]`, so a pre-AA client's frame is unchanged.
+        #[serde(default, skip_serializing_if = "FileScope::is_default")]
+        scope: FileScope,
     },
     /// Cancel a streaming request (`subscribe` / `watch` / `files`) by its
     /// envelope id, on this connection (Slice I1). The engine stops the
@@ -958,6 +968,7 @@ mod tests {
             request: Request::Diff {
                 session_id: "s1".into(),
                 path: "src/lib.rs".into(),
+                scope: FileScope::WorkingTree,
             },
         };
         let line = serde_json::to_string(&req).unwrap();

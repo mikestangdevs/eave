@@ -840,19 +840,25 @@ pub async fn unmerged_count(repo: &Path, branch: &str) -> Option<u64> {
 /// the client re-requests). `file` is the snapshot's entry for the path:
 /// its `untracked`/`orig_path` facts pick the honest strategy. Every
 /// failure shape lands as a stated [`DiffKind`], never an error path.
-pub async fn diff(cwd: &Path, file: &ChangedFile) -> FileDiff {
-    diff_with(Path::new("git"), cwd, GIT_TIMEOUT, file).await
+pub async fn diff(cwd: &Path, file: &ChangedFile, base: Option<&str>) -> FileDiff {
+    diff_with(Path::new("git"), cwd, GIT_TIMEOUT, file, base).await
 }
 
 /// [`diff`] with the git binary and timeout injectable (tests).
-pub async fn diff_with(git: &Path, cwd: &Path, timeout: Duration, file: &ChangedFile) -> FileDiff {
+pub async fn diff_with(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    file: &ChangedFile,
+    base: Option<&str>,
+) -> FileDiff {
     let kind = if file.untracked {
         // `git diff HEAD` cannot see an untracked file; its honest diff
         // is its own content, all additions — read directly, with the
         // same binary/size discipline as the tracked path.
         untracked_kind(&cwd.join(&file.path)).await
     } else {
-        tracked_kind(git, cwd, timeout, file).await
+        tracked_kind(git, cwd, timeout, file, base).await
     };
     FileDiff {
         path: file.path.clone(),
@@ -864,7 +870,17 @@ pub async fn diff_with(git: &Path, cwd: &Path, timeout: Duration, file: &Changed
 /// single delta, the same basis as the snapshot's numstat — with the
 /// empty-tree fallback for a repo with no commits. Renames put both
 /// sides in the pathspec so `-M` can pair them.
-async fn tracked_kind(git: &Path, cwd: &Path, timeout: Duration, file: &ChangedFile) -> DiffKind {
+/// `base` is the tree to diff against: `None` is `HEAD` (the working-tree
+/// scope), `Some(sha)` a turn basis. A turn-scoped LIST with a HEAD-relative
+/// PANE is the bug this parameter exists to prevent — the row says "this
+/// turn touched it" and the diff shows everything since the last commit.
+async fn tracked_kind(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    file: &ChangedFile,
+    base: Option<&str>,
+) -> DiffKind {
     let mut paths: Vec<&str> = vec![&file.path];
     if let Some(orig) = &file.orig_path {
         paths.push(orig);
@@ -874,7 +890,8 @@ async fn tracked_kind(git: &Path, cwd: &Path, timeout: Duration, file: &ChangedF
         a.extend(paths.iter().map(|p| p.to_string()));
         a
     };
-    let out = match run_capped(git, cwd, timeout, &base_args("HEAD"), DIFF_MAX_BYTES).await {
+    let head = base.unwrap_or("HEAD");
+    let out = match run_capped(git, cwd, timeout, &base_args(head), DIFF_MAX_BYTES).await {
         Ok(out) => out,
         Err(GitState::Error { .. }) => {
             // No HEAD yet? Diff against the repo's own empty tree
@@ -1340,7 +1357,7 @@ mod tests {
     async fn scan_and_diff(dir: &Path, path: &str) -> FileDiff {
         let snap = scan(dir).await;
         let f = by_path(&snap, path).clone();
-        diff(dir, &f).await
+        diff(dir, &f, None).await
     }
 
     fn text_hunks(kind: &DiffKind) -> &Vec<DiffHunk> {
@@ -1445,7 +1462,7 @@ mod tests {
         let snap = scan(&dir).await;
         let f = by_path(&snap, "b.txt").clone();
         assert_eq!(f.orig_path.as_deref(), Some("a.txt"));
-        let d = diff(&dir, &f).await;
+        let d = diff(&dir, &f, None).await;
         let hunks = text_hunks(&d.kind);
         assert!(hunks.is_empty(), "pure rename has no hunks: {hunks:?}");
     }
@@ -1536,7 +1553,7 @@ mod tests {
         let snap = scan(&dir).await;
         let f = by_path(&snap, "a.txt").clone();
         assert_eq!(f.status, FileStatus::Conflicted);
-        let d = diff(&dir, &f).await;
+        let d = diff(&dir, &f, None).await;
         match d.kind {
             DiffKind::Text { hunks, .. } => {
                 assert!(!hunks.is_empty(), "conflict diff should show hunks")
@@ -1740,7 +1757,7 @@ mod tests {
             untracked: false,
         };
         let started = std::time::Instant::now();
-        let d = diff_with(&fake, &dir, Duration::from_millis(200), &file).await;
+        let d = diff_with(&fake, &dir, Duration::from_millis(200), &file, None).await;
         assert!(started.elapsed() < Duration::from_secs(5));
         match d.kind {
             DiffKind::Error { message } => assert!(message.contains("timed out"), "{message}"),

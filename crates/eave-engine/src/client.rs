@@ -414,10 +414,23 @@ impl Client {
         session_id: &str,
         path: &str,
     ) -> Result<eave_wire::FileDiff, ClientError> {
+        self.diff_scoped(session_id, path, eave_wire::FileScope::WorkingTree)
+            .await
+    }
+
+    /// [`diff`](Self::diff) against a stated basis — the scope the file list
+    /// was showing when the row was clicked.
+    pub async fn diff_scoped(
+        &self,
+        session_id: &str,
+        path: &str,
+        scope: eave_wire::FileScope,
+    ) -> Result<eave_wire::FileDiff, ClientError> {
         Ok(self
             .request::<eave_wire::DiffOk>(Request::Diff {
                 session_id: session_id.into(),
                 path: path.into(),
+                scope,
             })
             .await?
             .diff)

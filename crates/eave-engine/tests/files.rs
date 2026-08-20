@@ -815,6 +815,76 @@ fn paths(snap: &FilesSnapshot) -> Vec<String> {
     v
 }
 
+/// The PANE answers the same question the LIST does.
+///
+/// Slice AA scoped the file list to the turn and left the diff under it
+/// HEAD-relative. The row was right and the hunks were wrong: click a file
+/// in "this turn" and you saw every change since the last commit, under a
+/// heading saying otherwise. That is worse than showing nothing, because
+/// it looks like an answer.
+#[tokio::test]
+async fn a_turn_scoped_diff_shows_only_the_turn() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    let mut events = c.subscribe("s1", None).await.expect("subscribe");
+
+    // One line edited BEFORE the turn, one DURING it, in the same file.
+    // That is the whole test: a HEAD-relative diff shows both, a
+    // turn-relative diff shows only the second.
+    std::fs::write(repo.join("base.txt"), "one\nBEFORE THE TURN\nthree\n").unwrap();
+    assert!(c.send("s1", "turn one").await.expect("send"));
+    std::fs::write(
+        repo.join("base.txt"),
+        "one\nBEFORE THE TURN\nDURING THE TURN\n",
+    )
+    .unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let working = c.diff("s1", "base.txt").await.expect("working diff");
+    let turn = c
+        .diff_scoped("s1", "base.txt", FileScope::LatestTurn)
+        .await
+        .expect("turn diff");
+
+    // CHANGED lines only. `git diff` prints context too, so an unchanged
+    // "BEFORE THE TURN" appears in both diffs as a `Ctx` line — asserting
+    // on the raw text would fail against a perfectly correct turn diff.
+    // What separates the two bases is which lines are ADDED or REMOVED.
+    let changed = |d: &eave_wire::FileDiff| match &d.kind {
+        DiffKind::Text { hunks, .. } => hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .filter(|l| !matches!(l.op, DiffOp::Ctx))
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("expected a text diff, got {other:?}"),
+    };
+    let w = changed(&working);
+    let t = changed(&turn);
+
+    assert!(
+        w.contains("BEFORE THE TURN") && w.contains("DURING THE TURN"),
+        "the working-tree diff must show both edits:\n{w}"
+    );
+    assert!(
+        t.contains("DURING THE TURN"),
+        "the turn diff lost the turn's own edit:\n{t}"
+    );
+    assert!(
+        !t.contains("BEFORE THE TURN"),
+        "the turn diff is still HEAD-relative — it shows work the turn did \
+         not do:\n{t}"
+    );
+
+    drop(engine);
+}
+
 /// THE acceptance story (Slice AA): three files are dirty and only one of
 /// them belongs to the current turn.
 ///

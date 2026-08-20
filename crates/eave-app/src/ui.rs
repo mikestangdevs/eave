@@ -547,9 +547,15 @@ async fn feed_loop(
                             let client = Arc::clone(&client);
                             let sid = session_id.clone();
                             let plumbing = plumbing.clone();
+                            // The basis the LIST is showing. Clicking a row
+                            // in the "this turn" list and getting a
+                            // HEAD-relative diff was the shipped bug: the
+                            // right file, the wrong hunks, under a heading
+                            // that says otherwise.
+                            let scope = files_scope;
                             tokio::spawn(async move {
                                 let res = client
-                                    .diff(&sid, &path)
+                                    .diff_scoped(&sid, &path, scope)
                                     .await
                                     .map_err(|e| e.to_string());
                                 plumbing.push_diff((sid, path, res));

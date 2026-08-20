@@ -1869,13 +1869,17 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 }
                 Err(message) => ResponseBody::Err { message },
             },
-            Request::Diff { session_id, path } => match engine.session(&session_id) {
+            Request::Diff {
+                session_id,
+                path,
+                scope,
+            } => match engine.session(&session_id) {
                 Ok(handle) => {
                     // Unary, but computed off the connection loop: a slow
                     // repo delays only its own reply — sends and kills on
                     // this connection keep flowing while git works.
                     let w = Arc::clone(&w);
-                    subs.insert(id, tokio::spawn(run_diff(handle, w, id, path)));
+                    subs.insert(id, tokio::spawn(run_diff(handle, w, id, path, scope)));
                     continue;
                 }
                 Err(message) => ResponseBody::Err { message },
@@ -2438,6 +2442,7 @@ async fn run_diff(
     w: Arc<TokioMutex<OwnedWriteHalf>>,
     id: u64,
     path: String,
+    scope: FileScope,
 ) {
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
     let entry = handle
@@ -2454,7 +2459,22 @@ async fn run_diff(
             orig_path: None,
             untracked: false,
         });
-    let diff = crate::git::diff(&cwd, &entry).await;
+    // The pane answers the same question the LIST did. A turn-scoped row
+    // opened against HEAD would show every change since the last commit
+    // under a heading that says "this turn" — the file would be right and
+    // the hunks wrong, which is worse than showing nothing.
+    //
+    // An unavailable basis falls back to the working tree rather than
+    // erroring: the row is already on screen and the rail states the
+    // basis, so a HEAD diff is the honest remainder, not a lie.
+    let base = match scope {
+        FileScope::WorkingTree => None,
+        FileScope::LatestTurn => match &*handle.turn_basis.lock().unwrap() {
+            TurnBasis::Tree { sha, .. } => Some(sha.clone()),
+            _ => None,
+        },
+    };
+    let diff = crate::git::diff(&cwd, &entry, base.as_deref()).await;
     let _ = write_frame(
         &w,
         &ResponseEnvelope {
