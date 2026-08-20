@@ -4347,3 +4347,428 @@ fn a_state_change_never_moves_a_row_under_the_pointer(cx: &mut TestAppContext) {
         "the click landed somewhere else: {cmds:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Slice AD — the transcript reads like a document
+
+/// Click a point offset from an element's own top-left corner.
+///
+/// [`click`] takes the centre, which is exactly wrong for a text block: a
+/// paragraph's box is the full content column and its glyphs stop wherever
+/// the sentence stops, so the centre of the box is usually the empty margin
+/// to the right of the last line. Every link test here clicks near the
+/// first glyph instead.
+#[track_caller]
+fn click_at(vcx: &mut VisualTestContext, selector: &'static str, dx: f32, dy: f32) {
+    let bounds = vcx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("element {selector} did not render"));
+    let p = gpui::point(bounds.origin.x + px(dx), bounds.origin.y + px(dy));
+    assert!(
+        p.x >= px(0.) && p.y >= px(0.),
+        "element {selector} is off-screen at {p:?} — a click there hits \
+         nothing and asserts nothing"
+    );
+    vcx.simulate_click(p, Modifiers::none());
+}
+
+/// Every URL the shell asked the system to open since the last drain.
+fn opened_urls() -> Vec<String> {
+    OPENED_URLS.with(|o| std::mem::take(&mut *o.borrow_mut()))
+}
+
+/// Feed one assistant message into a fresh shell and settle.
+fn transcript_of(
+    cx: &mut TestAppContext,
+    markdown: &str,
+) -> (Harness, &'static mut VisualTestContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![assistant_record(1, markdown)],
+    });
+    vcx.run_until_parked();
+    (h, vcx)
+}
+
+/// A markdown table draws as a table.
+///
+/// Until this slice `Block::Table` fell through to the paragraph arm, so a
+/// table rendered as its own raw source — a wall of `|` pipes, which the
+/// catch-up audit named as the single ugliest thing on screen once a
+/// session is open. This asserts the three things a table has to be: cells
+/// in a grid, columns that LINE UP down the table, and an alignment that
+/// follows the delimiter row rather than the renderer's convenience.
+#[gpui::test]
+fn a_markdown_table_renders_as_columns_and_not_as_pipes(cx: &mut TestAppContext) {
+    let (_h, vcx) = transcript_of(
+        cx,
+        "| file | lines | ok |\n|:---|---:|:---:|\n| ui.rs | 6680 | yes |\n| theme.rs | 1243 | yes |",
+    );
+
+    assert!(shown(vcx, "md-table"), "the table block did not render");
+    assert!(
+        !shown(vcx, "md-para"),
+        "a table that still renders through the paragraph arm is the raw-pipe \
+         render this slice exists to delete"
+    );
+
+    // The grid: every cell of the fixture is present.
+    for sel in [
+        "md-head-0",
+        "md-head-1",
+        "md-head-2",
+        "md-cell-0-0",
+        "md-cell-0-1",
+        "md-cell-0-2",
+        "md-cell-1-0",
+        "md-cell-1-1",
+        "md-cell-1-2",
+    ] {
+        assert!(vcx.debug_bounds(sel).is_some(), "{sel} did not render");
+    }
+
+    // Columns line up: a cell and the header above it share a left edge and
+    // a width, on every column. This is the property "aligned columns"
+    // actually means, and it is the one a per-row layout would break.
+    for c in 0..3 {
+        let head = vcx
+            .debug_bounds(["md-head-0", "md-head-1", "md-head-2"][c])
+            .unwrap();
+        for row in [
+            ["md-cell-0-0", "md-cell-0-1", "md-cell-0-2"],
+            ["md-cell-1-0", "md-cell-1-1", "md-cell-1-2"],
+        ] {
+            let cell = vcx.debug_bounds(row[c]).unwrap();
+            assert_eq!(
+                cell.origin.x, head.origin.x,
+                "column {c} does not line up with its header"
+            );
+            assert_eq!(cell.size.width, head.size.width, "column {c} changes width");
+        }
+    }
+
+    // Rows are rows: every cell of one row shares a top edge, and the
+    // second row sits strictly below the first.
+    let r0 = vcx.debug_bounds("md-cell-0-0").unwrap();
+    assert_eq!(
+        r0.origin.y,
+        vcx.debug_bounds("md-cell-0-2").unwrap().origin.y
+    );
+    let r1 = vcx.debug_bounds("md-cell-1-0").unwrap();
+    assert!(
+        r1.origin.y >= r0.origin.y + r0.size.height,
+        "row 1 overlaps row 0 — {r1:?} against {r0:?}"
+    );
+
+    // The columns are not equal thirds: `file` holds the longest cells and
+    // gets the most room, `ok` the least. A layout that ignored content
+    // would make these three numbers the same.
+    let mut w = |s: &'static str| vcx.debug_bounds(s).unwrap().size.width;
+    let (file, lines, ok) = (w("md-head-0"), w("md-head-1"), w("md-head-2"));
+    assert!(
+        file > lines && lines >= ok,
+        "column widths should follow content: file {file:?}, lines {lines:?}, ok {ok:?}"
+    );
+}
+
+/// A wide table is bounded by the transcript, not the other way round.
+///
+/// The stated choice (see `Shell::render_table`): the table never scrolls
+/// sideways and never widens the transcript. Whatever it holds, the row is
+/// exactly the content column wide; cells wrap; the container clips.
+#[gpui::test]
+fn a_wide_table_never_widens_the_transcript(cx: &mut TestAppContext) {
+    let long = "an unusually long cell of prose that has no business being in a table at all";
+    let src = format!(
+        "| a | b | c | d | e | f |\n|---|---|---|---|---|---|\n| {long} | {long} | {long} | {long} | {long} | {long} |"
+    );
+    let (_h, vcx) = transcript_of(cx, &src);
+
+    let table = vcx.debug_bounds("md-table").expect("the table rendered");
+    assert!(
+        table.size.width <= px(theme::CONTENT_MAX_W),
+        "the table is {:?} wide against a {} px content column — a table that \
+         widens its row makes the WHOLE transcript scroll sideways, so every \
+         paragraph in the session pays for one table",
+        table.size.width,
+        theme::CONTENT_MAX_W
+    );
+    // Every cell stays inside the table's own box.
+    for c in 0..6 {
+        let cell = vcx
+            .debug_bounds(
+                [
+                    "md-cell-0-0",
+                    "md-cell-0-1",
+                    "md-cell-0-2",
+                    "md-cell-0-3",
+                    "md-cell-0-4",
+                    "md-cell-0-5",
+                ][c],
+            )
+            .unwrap();
+        assert!(
+            cell.origin.x + cell.size.width <= table.origin.x + table.size.width + px(0.5),
+            "cell {c} runs past the table's right edge"
+        );
+    }
+    // And it grew DOWNWARD instead: six columns of that much prose cannot
+    // be one line tall.
+    assert!(
+        table.size.height > px(theme::TABLE_ROW_MIN_H * 2.0),
+        "the cells clipped instead of wrapping — table is only {:?} tall",
+        table.size.height
+    );
+}
+
+/// A table is one row of the virtualized list, and its height is bounded.
+///
+/// The list caches a row's measured height, so a row whose height is a
+/// number the agent chose is a list that can no longer promise anything
+/// about scrolling. `fence_view` bounds a fence for exactly this reason;
+/// `table_view` is the same bargain, and this is the assertion that the
+/// bargain is actually kept end to end rather than only in the pure fn.
+#[gpui::test]
+fn a_table_is_one_row_of_the_list_and_cannot_choose_its_own_height(cx: &mut TestAppContext) {
+    let mut src = String::from("before\n\n| n | value |\n|---|---|\n");
+    for i in 0..400 {
+        src.push_str(&format!("| {i} | row {i} |\n"));
+    }
+    src.push_str("\nafter");
+    let (h, vcx) = transcript_of(cx, &src);
+
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).display.len()
+        })
+        .unwrap();
+    assert_eq!(
+        rows, 3,
+        "paragraph + table + paragraph is three display rows — a 400-row \
+         table is still ONE row of the list"
+    );
+
+    // 400 body rows, 60 drawn: the 61st never exists as an element and the
+    // remainder is stated rather than swallowed.
+    assert!(
+        vcx.debug_bounds("md-cell-59-0").is_some(),
+        "row 59 should draw"
+    );
+    assert!(
+        vcx.debug_bounds("md-cell-60-0").is_none(),
+        "row 60 drew — the cap is not being applied at render"
+    );
+    assert!(shown(vcx, "md-capped"), "the cap must state its remainder");
+}
+
+/// A link is a link, and it opens in the browser.
+///
+/// `markdown.rs` parsed a URL and threw it away — the label was underlined
+/// and the click went nowhere. The hit test is the real one
+/// (`TextLayout::index_for_position` against the laid-out glyphs), which is
+/// why the second half of this test can prove it discriminates by POSITION:
+/// the same paragraph, clicked on its plain-text opening, opens nothing.
+#[gpui::test]
+fn clicking_a_link_opens_it_in_the_default_browser(cx: &mut TestAppContext) {
+    let _ = opened_urls();
+    let (_h, vcx) = transcript_of(cx, "[the eave docs](https://eave.sh/docs)");
+    // Near the first glyph: the whole paragraph is the link.
+    click_at(vcx, "md-para", 4.0, theme::BODY_LINE / 2.0);
+    vcx.run_until_parked();
+    assert_eq!(
+        opened_urls(),
+        vec!["https://eave.sh/docs".to_string()],
+        "the link's target never reached the opener"
+    );
+}
+
+#[gpui::test]
+fn plain_text_beside_a_link_takes_the_click_and_opens_nothing(cx: &mut TestAppContext) {
+    let _ = opened_urls();
+    // Twenty plain characters, then the link. A click on the first of them
+    // is inside the block, inside the hitbox, and outside every link range.
+    let (_h, vcx) = transcript_of(cx, "xxxxxxxxxxxxxxxxxxxx [docs](https://eave.sh)");
+    click_at(vcx, "md-para", 4.0, theme::BODY_LINE / 2.0);
+    vcx.run_until_parked();
+    assert!(
+        opened_urls().is_empty(),
+        "a click on prose opened something — the hit test is not reading \
+         the glyph under the pointer"
+    );
+}
+
+/// A link eave will not open is inert, and says so by not looking like a
+/// link at all.
+///
+/// `open(1)` launches whatever has a registered handler, and the target is
+/// a string an agent wrote. Every one of these is refused at the parser AND
+/// at the syscall, and none of them is underlined — the underline is the
+/// app's promise that a click does something.
+#[gpui::test]
+fn a_link_eave_will_not_open_is_drawn_inert_and_takes_no_click(cx: &mut TestAppContext) {
+    for target in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "data:text/html,<h1>hi</h1>",
+        "x-apple-systempreferences://com.apple.preference",
+    ] {
+        let _ = opened_urls();
+        let (_h, vcx) = transcript_of(
+            cx,
+            &format!(
+                "[click me](
+{target})"
+            )
+            .replace('\n', ""),
+        );
+        click_at(vcx, "md-para", 4.0, theme::BODY_LINE / 2.0);
+        vcx.run_until_parked();
+        assert!(
+            opened_urls().is_empty(),
+            "{target} reached the system opener"
+        );
+    }
+    // The control, so this test cannot pass by the click missing: the same
+    // markup with an `https` target, clicked at the same point, opens.
+    let _ = opened_urls();
+    let (_h, vcx) = transcript_of(cx, "[click me](https://eave.sh/ok)");
+    click_at(vcx, "md-para", 4.0, theme::BODY_LINE / 2.0);
+    vcx.run_until_parked();
+    assert_eq!(
+        opened_urls(),
+        vec!["https://eave.sh/ok".to_string()],
+        "the control did not open — every refusal above proved nothing"
+    );
+
+    // ...and the guard is at the syscall too, not only at the parser, so a
+    // future caller cannot route around it.
+    let _ = opened_urls();
+    open_url("javascript:alert(1)");
+    open_url("file:///etc/passwd");
+    assert!(opened_urls().is_empty(), "open_url passed a non-web scheme");
+    open_url("https://eave.sh");
+    assert_eq!(opened_urls(), vec!["https://eave.sh".to_string()]);
+}
+
+/// A list item's marker never collides with its own text.
+///
+/// The gutter is a fixed WIDTH beside a column that wraps — never a fixed
+/// height, which is the shape `overlay::menu_row` got wrong in Slice R1
+/// (a one-line box holding a three-line label drew rows on top of each
+/// other). Both halves are asserted: the widest marker fits the gutter at
+/// real glyph widths, and the rendered text column starts clear of it.
+#[gpui::test]
+fn a_list_marker_never_collides_with_its_own_text(cx: &mut TestAppContext) {
+    // Real metrics first: the widest marker the renderer can produce is a
+    // two-digit ordinal, and it must fit 22 px with room to spare.
+    for marker in ["99.", "•", "◦", "▪"] {
+        let w = real_text_width(marker, theme::SANS, theme::BODY_SIZE);
+        assert!(
+            w <= px(theme::LIST_GUTTER_W) - px(theme::HAIRLINE),
+            "marker {marker:?} needs {w:?}, the gutter gives {} px",
+            theme::LIST_GUTTER_W
+        );
+    }
+
+    let (_h, vcx) = transcript_of(
+        cx,
+        "1. first item\n2. second item\n   - nested under two\n99. ninety-nine",
+    );
+    assert!(shown(vcx, "md-list"), "the list block did not render");
+    assert!(
+        !shown(vcx, "md-para"),
+        "the list still renders as a paragraph of raw markers"
+    );
+
+    let items: Vec<_> = ["md-item-0", "md-item-1", "md-item-2", "md-item-3"]
+        .iter()
+        .map(|s| vcx.debug_bounds(s).unwrap_or_else(|| panic!("{s} missing")))
+        .collect();
+    // Nesting is visible: the nested item's text starts strictly right of
+    // its parent's, by a whole indent step.
+    assert_eq!(
+        items[2].origin.x - items[1].origin.x,
+        px(theme::LIST_INDENT),
+        "one nesting level should indent by exactly one step"
+    );
+    assert_eq!(
+        items[0].origin.x, items[3].origin.x,
+        "same level, same edge"
+    );
+    // Items stack, never overlap — the R1 failure, asserted as CLEARANCE
+    // rather than as "the boxes are different".
+    for w in items.windows(2) {
+        assert!(
+            w[1].origin.y >= w[0].origin.y + w[0].size.height,
+            "list items overlap: {:?} then {:?}",
+            w[0],
+            w[1]
+        );
+    }
+}
+
+/// A task list draws boxes, and a checked one is a different box.
+#[gpui::test]
+fn a_task_list_draws_boxes_instead_of_spelling_out_brackets(cx: &mut TestAppContext) {
+    let (_h, vcx) = transcript_of(cx, "- [ ] not yet\n- [x] finished\n- plain bullet");
+    let open = vcx.debug_bounds("md-task-open").expect("an open checkbox");
+    let done = vcx
+        .debug_bounds("md-task-done")
+        .expect("a checked checkbox");
+    assert_eq!(open.size.width, px(theme::CHECKBOX));
+    assert_eq!(open.size.height, px(theme::CHECKBOX));
+    assert_eq!(done.size, open.size, "checking a box must not resize it");
+    // The box sits on the item's FIRST line, inside it, not above or below.
+    let first = vcx.debug_bounds("md-item-0").unwrap();
+    assert!(
+        open.origin.y >= first.origin.y
+            && open.origin.y + open.size.height <= first.origin.y + px(theme::BODY_LINE),
+        "the checkbox {open:?} is not on the first line of {first:?}"
+    );
+}
+
+/// A blockquote is a rule and quieter ink, and a heading shows no
+/// asterisks.
+///
+/// Both were parsed-and-discarded before this slice: `> note` was a
+/// paragraph that began with a greater-than sign, and a heading was the one
+/// block rendered as a bare string, so `## The **why**` printed its own
+/// markers at heading size.
+#[gpui::test]
+fn a_quote_and_a_heading_render_their_markup_rather_than_showing_it(cx: &mut TestAppContext) {
+    let (h, vcx) = transcript_of(
+        cx,
+        "## The **why**\n\n> a quoted note\n> over two lines\n\nplain tail",
+    );
+    let quote = vcx.debug_bounds("md-quote").expect("the quote block");
+    assert!(
+        quote.size.height >= px(theme::BODY_LINE * 2.0),
+        "two quoted lines should be two lines tall, got {:?}",
+        quote.size.height
+    );
+    // Three blocks, and the heading is not one of the paragraphs.
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).display.len()
+        })
+        .unwrap();
+    assert_eq!(rows, 3, "heading + quote + paragraph");
+
+    // The markers are consumed by the parser, which is what "renders its
+    // markup" means — asserted on the runs, since a painted glyph is not
+    // readable from a test.
+    let runs = inline_runs("The **why**");
+    assert_eq!(
+        runs.iter().map(|r| r.text.as_str()).collect::<String>(),
+        "The why"
+    );
+    assert!(runs.iter().any(|r| r.style.bold && r.text == "why"));
+}

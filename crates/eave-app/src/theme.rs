@@ -877,6 +877,56 @@ pub const FENCE_MAX_LINES: usize = 200;
 /// everywhere else that caps.
 pub const TOOL_BODY_MAX_LINES: usize = 40;
 
+/// How many BODY rows of one markdown table the transcript draws before it
+/// states the remainder.
+///
+/// Same rule as [`FENCE_MAX_LINES`], same reason: a table is ONE row in a
+/// virtualized list, so an uncapped table is a row whose height is whatever
+/// the agent felt like emitting. **Chosen, not derived.** 60 rows at
+/// [`TABLE_ROW_MIN_H`] (29 px) is 1,740 px — more than twice [`WINDOW_H`],
+/// so the cap sits well past "more than a screenful", and the longest table
+/// in this project's own 178 KB of docs is 23 rows, so nothing eave has
+/// actually been asked to draw reaches it.
+pub const TABLE_MAX_ROWS: usize = 60;
+
+/// How many characters of ONE table cell are drawn.
+///
+/// The other half of the height bound: sixty rows of a two-thousand-
+/// character cell is the same unbounded row by another route. **Chosen,
+/// not derived.** 200 characters is ~3 wrapped lines in the widest column
+/// a table can have at [`BODY_SIZE`]; a cell longer than that is prose that
+/// wanted a paragraph.
+pub const TABLE_CELL_MAX_CHARS: usize = 200;
+
+/// How many items of one list block are drawn before the remainder is
+/// stated. Larger than [`TABLE_MAX_ROWS`] because a list item is one line
+/// where a table row is a full-width grid row.
+pub const LIST_MAX_ITEMS: usize = 120;
+
+/// Vertical padding inside a table cell, per edge.
+pub const TABLE_CELL_PAD_Y: f32 = SPACE_1;
+/// Horizontal padding inside a table cell, per edge.
+pub const TABLE_CELL_PAD_X: f32 = SPACE_2;
+/// The shortest a one-line table row can be: one body line plus both pads.
+pub const TABLE_ROW_MIN_H: f32 = BODY_LINE + TABLE_CELL_PAD_Y * 2.0;
+
+/// The marker gutter of a list item — bullet, number or checkbox — and the
+/// step one nesting level indents by.
+///
+/// The gutter must fit the widest marker eave draws, which is a
+/// two-digit ordinal ("99."). Asserted at real glyph widths in
+/// `a_list_marker_never_collides_with_its_own_text`.
+pub const LIST_GUTTER_W: f32 = 22.0;
+pub const LIST_INDENT: f32 = SPACE_4;
+/// Gap between the marker gutter and the item's text.
+pub const LIST_MARKER_GAP: f32 = SPACE_1;
+/// The task checkbox's box.
+pub const CHECKBOX: f32 = 12.0;
+pub const RADIUS_CHECKBOX: f32 = 3.0;
+
+/// The quoted block's left rule.
+pub const QUOTE_BAR_W: f32 = 2.0;
+
 /// WCAG 2.1 AA for normal-size text. Cited, not chosen: SC 1.4.3.
 pub const TEXT_CONTRAST_FLOOR: f32 = 4.5;
 /// WCAG 2.1 AA for large text (SC 1.4.3), used here as the floor for the
@@ -1050,6 +1100,14 @@ mod tests {
                 ("text", text(), TEXT_CONTRAST_FLOOR),
                 ("text_secondary", text_secondary(), TEXT_CONTRAST_FLOOR),
                 ("text_tertiary", text_tertiary(), TEXT_QUIET_CONTRAST_FLOOR),
+                // Slice AD: the two code tiers carry facts on the bare
+                // ground too (inline code in prose, a fence body on the
+                // now-transparent `inset`), and the sweep had never been
+                // pointed at either of them. Both clear; the assertion is
+                // here so that moving one is a decision rather than an
+                // accident.
+                ("code_text", code_text(), TEXT_CONTRAST_FLOOR),
+                ("code_block_text", code_block_text(), TEXT_CONTRAST_FLOOR),
             ] {
                 let c: Rgba = tier.into();
                 let r = contrast_ratio((c.r, c.g, c.b), g);
@@ -1070,6 +1128,68 @@ mod tests {
     /// own ceiling barely touches the quiet floor, and every real token put
     /// through it lands far below (`text_tertiary` did: 1.54:1). No choice of
     /// tier could have fixed it.
+    /// Slice AD: the two surfaces the markdown renderer introduced.
+    ///
+    /// A table header is the first place in the app that uses `overlay()`
+    /// as a RESTING fill rather than as a hover wash, and a task checkbox
+    /// is the first filled state colour with a glyph on top of it. Both
+    /// have to clear the same floors as everything else, and the header
+    /// carries a second finding: the QUIET tier would not have cleared it.
+    #[test]
+    fn the_markdown_surfaces_clear_the_floors_they_stand_on() {
+        for g in grounds() {
+            let header = over(overlay(), g);
+            // The header is a step you can see...
+            assert!(
+                units(header) - units(g) >= SURFACE_STEP_FLOOR,
+                "a table header is only {:.1} units above its ground",
+                units(header) - units(g)
+            );
+            // ...and the ink on it is readable.
+            let ink: Rgba = text().into();
+            let r = contrast_ratio((ink.r, ink.g, ink.b), header);
+            assert!(
+                r >= TEXT_CONTRAST_FLOOR,
+                "table header ink is {r:.2}:1 on ground {:.3}",
+                g.0
+            );
+        }
+        // The reason the header takes the PRIMARY tier, and body cells with
+        // it: the quiet tier does not survive its own wash. Measured across
+        // the whole sweep, never on one desktop — over a black backdrop
+        // `text_secondary` reads 7.35:1 on this header and the problem is
+        // invisible.
+        let quiet: Rgba = text_secondary().into();
+        let worst = grounds()
+            .into_iter()
+            .map(|g| contrast_ratio((quiet.r, quiet.g, quiet.b), over(overlay(), g)))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            worst < TEXT_CONTRAST_FLOOR,
+            "text_secondary now clears the floor over overlay() everywhere \
+             ({worst:.2}:1 at worst) — the comment in `render_table` \
+             explaining why the header cannot use it is stale"
+        );
+        // The checkmark inside a ticked task box, against its own fill.
+        // Opaque, so no ground sweep applies.
+        let tick: Rgba = on_inverse().into();
+        let fill: Rgba = success().into();
+        let r = contrast_ratio((tick.r, tick.g, tick.b), (fill.r, fill.g, fill.b));
+        assert!(
+            r >= TEXT_CONTRAST_FLOOR,
+            "the checkmark is {r:.2}:1 on its own box"
+        );
+        // And the box's own edge is findable when it is empty.
+        for g in grounds() {
+            let rim = over(border_strong(), g);
+            assert!(
+                units(rim) - units(g) >= SURFACE_STEP_FLOOR,
+                "an unchecked task box has no visible edge on ground {:.3}",
+                g.0
+            );
+        }
+    }
+
     #[test]
     fn a_container_opacity_cannot_express_disabled() {
         let ground = grounds()[0];
