@@ -1967,7 +1967,12 @@ fn the_composer_states_that_a_send_will_queue_behind_the_question(cx: &mut TestA
     let hint_before = vcx.debug_bounds("composer-hint").map(|b| b.size.width);
     assert!(
         hint_before.is_some(),
-        "the composer always states its own key"
+        // Slice AN emptied this line at rest (`composer_hint`), so what is
+        // asserted here is that the SLOT is mounted — it is the harness's
+        // probe for "a composer is on screen at all". The width below is
+        // what carries the words.
+        "the composer's trailing slot is not mounted, so the comparison \
+         below would compare nothing to nothing"
     );
 
     ask(
@@ -6075,4 +6080,294 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
         first.origin.x,
         title.origin.x + title.size.width
     );
+}
+
+// ---------------------------------------------------------------------------
+// Slice AN — the empty state.
+//
+// Text system: **Noop for every test in this section.** In-window glyph
+// advances come from gpui's test text system, so a *width* here is not a
+// fact about what a person reads. These assert three things that do not
+// depend on shaping: whether an element is on screen at all, where its box
+// sits relative to another box, and how tall a line's box is (line height
+// is a style property, not a measured advance). The WORDS are asserted as
+// pure functions in `ui.rs`'s own `mod tests`, where they are strings and
+// not pixels.
+
+/// Put one empty session in the rail and select it, which is the exact
+/// gate `an_empty_log_states_only_the_kind_of_empty_it_can_prove` pins:
+/// subscribed, and the engine's own count says the journal is empty.
+fn empty_session(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    cwd: &str,
+    model: Option<&str>,
+) -> SessionInfo {
+    let mut s = session("aaaa1111");
+    s.last_seq = 0;
+    s.cwd = cwd.into();
+    s.model = model.map(|m| m.to_string());
+    h.plumbing.push_rail(vec![s.clone()]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    // Let the card's entrance land before anything measures it. The rise
+    // is a live `top` offset while `motion::entrance_t` is below 1, so a
+    // bounds read on a mid-entrance card is reading the animation, not the
+    // layout — and two reads either side of an unrelated change would
+    // differ for a reason that has nothing to do with the change.
+    drive(h, vcx, Duration::from_millis(10));
+    s
+}
+
+/// The four parts of an empty state, and the claim that a centred grey
+/// string was none of them.
+///
+/// What shipped before this slice was `"nothing sent yet"` at
+/// `SMALL_SIZE`, `text_tertiary`, dead centre of a pane that is roughly
+/// two thirds of the window. It **announced** nothing (it was the app's
+/// quietest rank), it **oriented** nobody (a person who has just opened
+/// eave cannot tell which folder this session runs in or which agent it
+/// drives), and it **offered** nothing.
+///
+/// So this asserts all four are present at once, because any one of them
+/// alone is what was already there.
+#[gpui::test]
+fn the_empty_state_announces_orients_and_offers(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
+
+    assert!(
+        shown(vcx, "transcript-empty"),
+        "a selected session with an empty journal shows no empty state at all"
+    );
+    for part in ["empty-title", "empty-where", "empty-key", "empty-action"] {
+        assert!(
+            shown(vcx, part),
+            "the empty state is missing {part} — announce / orient / offer \
+             is the whole difference between this and a caption"
+        );
+    }
+}
+
+/// **The announce rank is real, not claimed.** `DISPLAY_LINE` is 26 and
+/// `SMALL_LINE` — what the old caption used — is 15. A headline whose box
+/// is 15 px tall is the old caption with a new selector on it.
+///
+/// The number is written as a literal on purpose: reading it back out of
+/// `theme::DISPLAY_LINE` would make this test agree with the constant no
+/// matter what the constant became, which is the one thing it must not do.
+#[gpui::test]
+fn the_empty_states_headline_is_at_the_display_rank(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+
+    let title = vcx.debug_bounds("empty-title").expect("the headline");
+    assert_eq!(
+        title.size.height,
+        px(26.),
+        "the headline's line box is {:?}; the display rank is 26 and the \
+         retired caption's rank was 15",
+        title.size.height
+    );
+
+    // And it is the ONLY thing on the card at that rank — a rank that
+    // appears twice on one surface has stopped announcing anything.
+    for quieter in ["empty-where", "empty-action"] {
+        let b = vcx.debug_bounds(quieter).expect(quieter);
+        assert!(
+            b.size.height < px(26.),
+            "{quieter} is {:?} tall, which is the headline's own rank",
+            b.size.height
+        );
+    }
+}
+
+/// **Clearance, not merely fit.** The card is an absolute overlay bottomed
+/// at `COMPOSER_CLEARANCE`, so it cannot reach the composer — but that is
+/// an argument about the code, and the thing worth pinning is the gap on
+/// screen. A future card that grew a fourth line, or a composer that grew
+/// a second row, would close it silently.
+#[gpui::test]
+fn the_empty_state_clears_the_composer_it_points_at(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
+
+    let action = vcx.debug_bounds("empty-action").expect("the action line");
+    let hint = vcx.debug_bounds("composer-hint").expect("the composer");
+    let card_bottom = action.origin.y + action.size.height;
+    assert!(
+        card_bottom < hint.origin.y,
+        "the empty state runs to {card_bottom:?} and the composer starts at \
+         {:?} — the card is sitting on the input it is telling you to use",
+        hint.origin.y
+    );
+    // Not merely non-overlapping: separated by more than a hairline. The
+    // composer's own card is inset from `COMPOSER_CLEARANCE`, so a gap
+    // this small would already mean something has gone wrong above.
+    assert!(
+        hint.origin.y - card_bottom > px(24.),
+        "only {:?} between the card and the composer",
+        hint.origin.y - card_bottom
+    );
+}
+
+/// **Upper third, not dead centre.** Dead centre is where an alert goes,
+/// which is exactly why a small grey string sitting there read as a
+/// failed load rather than as a rest state.
+///
+/// `EMPTY_ABOVE`:`EMPTY_BELOW` is 1:2, so the free space above the card
+/// should be about a third of the free space total. The bounds are 0.28
+/// and 0.40 as literals: wide enough that the card's own height and a
+/// pixel of rounding do not matter, narrow enough that centring it (0.5)
+/// or flushing it to the top (0.0) fails.
+#[gpui::test]
+fn the_empty_state_sits_in_the_upper_third_not_dead_centre(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
+
+    let pane = vcx.debug_bounds("transcript-empty").expect("the slot");
+    let title = vcx.debug_bounds("empty-title").expect("the headline");
+    let action = vcx.debug_bounds("empty-action").expect("the action line");
+
+    let above = title.origin.y - pane.origin.y;
+    let below = (pane.origin.y + pane.size.height) - (action.origin.y + action.size.height);
+    assert!(
+        above > px(0.) && below > px(0.),
+        "the card is not inside its own slot: above={above:?} below={below:?}"
+    );
+    let share = f32::from(above) / f32::from(above + below);
+    assert!(
+        (0.28..0.40).contains(&share),
+        "the card's free space is {share:.3} above / {:.3} below; 1:2 is \
+         ~0.333, dead centre is 0.5, flush top is 0.0",
+        1.0 - share
+    );
+}
+
+/// **Gone the instant a turn exists**, and a turn is the operator's
+/// message alone — not the agent's reply to it. A card still up while the
+/// first directive is on screen would be claiming the session is empty
+/// over the proof that it is not.
+#[gpui::test]
+fn the_empty_state_is_gone_the_instant_a_turn_exists(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    assert!(shown(vcx, "transcript-empty"));
+
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "the first turn")],
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        !shown(vcx, "transcript-empty"),
+        "one directive landed and the card is still claiming nothing was sent"
+    );
+    for part in ["empty-title", "empty-where", "empty-key", "empty-action"] {
+        assert!(
+            !shown(vcx, part),
+            "{part} outlived the card it belongs to — the container went \
+             away and a piece of it did not"
+        );
+    }
+    // And the composer is still the composer: the card leaving must not
+    // take the input with it.
+    assert!(shown(vcx, "composer-hint"));
+}
+
+/// The card and the launcher answer different questions and can be up in
+/// two windows at once, so a person has to be able to tell which one they
+/// are looking at. They are never on screen together (the launcher owns
+/// "no session"; the card owns "a session with no turns"), and the shapes
+/// are different: the launcher centres its content in a 700 px column,
+/// the card is left-aligned and capped at `DIRECTIVE_MAX_W`.
+#[gpui::test]
+fn the_empty_state_and_the_launcher_are_never_the_same_screen(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(shown(vcx, "launcher"), "a bare boot is the launcher");
+    assert!(
+        !shown(vcx, "transcript-empty"),
+        "the launcher and the card must never stack"
+    );
+    let launcher_title = vcx.debug_bounds("launcher-title").expect("the launcher");
+
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    assert!(!shown(vcx, "launcher"));
+    let card_title = vcx.debug_bounds("empty-title").expect("the card");
+
+    // The launcher's headline is centred in the pane; the card's is on
+    // the transcript's left reading edge. That is the difference a person
+    // reads first, before a single word.
+    assert!(
+        card_title.origin.x < launcher_title.origin.x,
+        "the card's headline starts at {:?} and the launcher's at {:?} — \
+         they are laid out alike and will be mistaken for each other",
+        card_title.origin.x,
+        launcher_title.origin.x
+    );
+}
+
+/// The one clickable thing on the card, and it routes through the seam
+/// that already existed (`open_in_system`) rather than through a command
+/// invented for it. Knowing *where* an agent is about to run is the fact
+/// this whole card is built around; being able to go look is the cheapest
+/// possible way to make that fact checkable.
+#[gpui::test]
+fn the_empty_states_folder_line_opens_the_folder(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    OPENED.with(|o| o.borrow_mut().clear());
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+
+    click(vcx, "empty-where");
+    let opened = OPENED.with(|o| o.borrow().clone());
+    assert_eq!(
+        opened,
+        vec![PathBuf::from("/tmp/eave-harness/repo")],
+        "the cwd line did not open the cwd"
+    );
+}
+
+/// **Emptying the composer's hint moves nothing.** The row's height is
+/// set by the send button (26) and not by the hint (`MICRO_LINE`, 14), so
+/// a hint that comes and goes with the draft must leave every box in the
+/// composer exactly where it was — otherwise the first character typed
+/// would shove the composer, and with it the clearance the empty-state
+/// card is measured against.
+///
+/// This is the same invariant as `the_overlay_moves_nothing_it_floats_over`,
+/// applied to a line of text that now has two states instead of one.
+#[gpui::test]
+fn emptying_the_composer_hint_moves_nothing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+
+    let probes = ["composer-hint", "send", "empty-title", "empty-action"];
+    let quiet: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
+    assert!(
+        quiet.iter().all(|b| b.is_some()),
+        "a probe never rendered, so it proves nothing: {quiet:?}"
+    );
+
+    // One character: the hint appears.
+    vcx.simulate_input("x");
+    vcx.run_until_parked();
+    assert_eq!(composer_draft(vcx, &h), "x", "the keystroke never landed");
+
+    let typing: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
+    for (i, name) in probes.iter().enumerate() {
+        let (a, b) = (quiet[i].unwrap(), typing[i].unwrap());
+        assert_eq!(
+            (a.origin, a.size.height),
+            (b.origin, b.size.height),
+            "{name} moved or changed height when the hint appeared: \
+             {a:?} -> {b:?}"
+        );
+    }
 }
