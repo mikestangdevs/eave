@@ -414,6 +414,25 @@ pub fn danger() -> Hsla {
     rgb(0xe2726a).into()
 }
 
+/// **Accent — selection, at real saturation** (Slice AL's contract).
+///
+/// The same indigo as [`live`], which is deliberate: the app has exactly
+/// one saturated family, and a second one invented for selection would
+/// read as a second kind of importance. Selection is not a state the
+/// agent is in, so it never takes a *state* colour — it takes the app's
+/// own pigment.
+pub fn accent() -> Hsla {
+    rgb(0x7c86ff).into()
+}
+
+/// The selected row's leading-edge bar. Brighter than [`accent`] because
+/// it is 3 px of pigment on a dark ground with a wash over it: at the
+/// bar's width the eye integrates the stripe rather than reading its
+/// colour, so the mark has to win on luminance or it is not a mark.
+pub fn accent_bar() -> Hsla {
+    rgb(0x9aa2ff).into()
+}
+
 /// Panel rings for the attention surfaces. The matching *fills* live in the
 /// glass tints below — Slice AG retired `warning_wash`, `warning_wash_strong`
 /// and `danger_wash` along with `warning_plate`/`warning_plate_strong`/
@@ -500,15 +519,17 @@ pub const CODE_LINE: f32 = 17.5;
 /// Chip/label rank: tool rows, affordances, buttons.
 pub const LABEL_SIZE: f32 = 12.5;
 pub const LABEL_LINE: f32 = 16.0;
-/// Panel detail rank: attention evidence, notice bodies.
-pub const DETAIL_SIZE: f32 = 12.0;
-pub const DETAIL_LINE: f32 = 16.0;
+/// Panel detail rank: attention evidence, notice bodies, and — Slice AO —
+/// the rail row's second line, the working folder.
+pub const DETAIL_SIZE: f32 = 12.5;
+pub const DETAIL_LINE: f32 = 17.0;
 /// Footer / timestamps / markers.
 pub const SMALL_SIZE: f32 = 11.0;
 pub const SMALL_LINE: f32 = 15.0;
-/// Code-block language strip, structural micro-labels.
-pub const MICRO_SIZE: f32 = 10.0;
-pub const MICRO_LINE: f32 = 14.0;
+/// Code-block language strip, structural micro-labels, and the compact
+/// state marks on a rail row's second line (counts, sharing).
+pub const MICRO_SIZE: f32 = 11.0;
+pub const MICRO_LINE: f32 = 15.0;
 /// Diff lines in the files rail (B2): smallest mono rank — the rail is
 /// 248 px, so the shape of the change is the signal; long lines wrap.
 pub const DIFF_SIZE: f32 = 10.0;
@@ -531,6 +552,28 @@ pub const COMPOSER_MIN_H: f32 = 24.0;
 pub const WEIGHT_BODY: FontWeight = FontWeight::NORMAL;
 pub const WEIGHT_LABEL: FontWeight = FontWeight::MEDIUM;
 pub const WEIGHT_STRONG: FontWeight = FontWeight::SEMIBOLD;
+
+// --- Slice AL's type-scale contract -----------------------------------
+//
+// Written against by Slice AO before AL landed, so these names exist here
+// with AL's stated values and AL resolves the overlap at integration. The
+// three ranks below are the ones the type scale was missing: a display
+// rank, a NAME rank between body and display, and a section rank for
+// uppercase tracked headers. `DETAIL` and `MICRO` above moved to AL's
+// values in the same pass.
+
+/// Display rank — the largest text the shell paints.
+pub const DISPLAY_SIZE: f32 = 20.0;
+pub const DISPLAY_LINE: f32 = 26.0;
+/// Names the eye lands on: a session's name in the rail (Slice AO).
+/// This is the rank that makes a list read as a list — every other line
+/// on a row is subordinate to it, and nothing else in the rail is near
+/// this size.
+pub const NAME_SIZE: f32 = 16.0;
+pub const NAME_LINE: f32 = 22.0;
+/// Uppercase, tracked section headers ("SESSIONS").
+pub const SECTION_SIZE: f32 = 11.0;
+pub const SECTION_LINE: f32 = 14.0;
 
 /// Heading ladder relative to body (waku's scale): size, line, weight.
 pub fn heading(level: u8) -> (Pixels, Pixels, FontWeight) {

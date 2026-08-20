@@ -386,12 +386,16 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     }
 }
 
-/// The rail's fact lines are full-width, so the room a fact gets is set
-/// by the layout, not by the glyphs in it. Proven here (two facts of very
-/// different length get identical width) and then relied on: the room is
-/// read from the rendered layout, the fact is measured with real metrics.
+/// Slice AO moved the worktree fact off a line of its own and into the
+/// MARKS group on line two, beside the folder. The group is `flex_none`
+/// and the folder truncates against it, so the question is no longer "does
+/// this line fit the rail" — it is **"is there any folder left"**.
+///
+/// Both halves are asserted. The marks are measured with real font-kit
+/// metrics against the room the rail actually gives them; the folder is
+/// measured from the rendered layout and has to keep a stated floor.
 #[gpui::test]
-fn every_worktree_fact_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContext) {
+fn a_marked_row_still_shows_its_folder(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let mut short = session("aaaa1111");
     short.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
@@ -401,37 +405,143 @@ fn every_worktree_fact_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContex
     h.plumbing.push_rail(vec![short, long]);
     vcx.run_until_parked();
 
-    let room = vcx.debug_bounds("wt-line-aaaa1111").unwrap().size.width;
+    // Line two as a whole is full-width, so the room on it does not depend
+    // on the glyphs in it — the composition every measurement below needs.
+    let line_two = |sel: &'static str, vcx: &mut VisualTestContext| {
+        let cwd = vcx.debug_bounds(sel).unwrap();
+        let marks = vcx
+            .debug_bounds(if sel.ends_with("aaaa1111") {
+                "marks-aaaa1111"
+            } else {
+                "marks-bbbb2222"
+            })
+            .unwrap();
+        (cwd, marks)
+    };
+    let (short_cwd_box, short_marks) = line_two("cwd-aaaa1111", vcx);
+    let (long_cwd_box, long_marks) = line_two("cwd-bbbb2222", vcx);
+    let room = |c: gpui::Bounds<Pixels>, m: gpui::Bounds<Pixels>| {
+        m.origin.x + m.size.width - c.origin.x
+    };
     assert_eq!(
-        room,
-        vcx.debug_bounds("wt-line-bbbb2222").unwrap().size.width,
-        "fact lines must be full-width: the room a fact gets cannot depend \
-         on the fact's own length, or this measurement means nothing"
+        room(short_cwd_box, short_marks),
+        room(long_cwd_box, long_marks),
+        "line two must be full-width: the room a row gets cannot depend on \
+         the length of the path in it, or this measurement means nothing"
     );
 
-    // Every shape `worktree_line` can produce, plus the cwd line and every
-    // badge word — all of them must survive rail width.
-    let shapes = [
-        worktree_line(&worktree("eave/aaaa1111", Some(0), true)),
-        worktree_line(&worktree("eave/aaaa1111", Some(2), true)),
-        worktree_line(&worktree("eave/aaaa1111", Some(999_999), true)),
-        worktree_line(&worktree("eave/aaaa1111", None, true)),
-        worktree_line(&worktree("eave/aaaa1111", Some(2), false)),
+    // Every shape the rail can ACTUALLY put in the marks group, measured
+    // with real metrics. Two combinations are excluded and both exclusions
+    // are proven below rather than asserted in prose:
+    //
+    //  * sharing + a dirty count — `fill_sharing` keys on checkout-root
+    //    equality and `isolate` gives the session a root of its own, so a
+    //    worktree'd session shares with nobody;
+    //  * a dirty count + the id — a worktree'd session's cwd ends in its
+    //    own sid8, so no two worktree'd rows can show the same folder, so
+    //    `rows_needing_id` cannot fire on one.
+    //
+    // 100 px is written as a literal on purpose. It happens to equal
+    // `ROW_MARKS_MAX` today; reading it FROM that constant would mean a
+    // future slice could raise the cap and lengthen a mark in one commit
+    // and this test would move with it and never fail.
+    let iso_a = marked_worktree("aaaa1111", Some(2));
+    let iso_b = marked_worktree("bbbb2222", Some(2));
+    assert!(
+        rows_needing_id(&[iso_a, iso_b], None).is_empty(),
+        "two isolated sessions collided on name and folder — if that is \
+         ever possible, `999999 dirty · <id>` becomes reachable and the \
+         list below is incomplete"
+    );
+    let reachable = [
+        row_marks(&marked(Some(0), 0), false),
+        row_marks(&marked(Some(999_999), 0), false),
+        row_marks(&marked(None, 0), false),
+        row_marks(&marked(None, 9), false),
+        row_marks(&marked(None, 9), true),
+        row_marks(&marked(None, 0), true),
     ];
-    for line in shapes {
-        let w = real_text_width(&line, theme::MONO, theme::MICRO_SIZE);
+    for mark in reachable.into_iter().flatten() {
+        let w = real_text_width(&mark, theme::SANS, theme::MICRO_SIZE);
         assert!(
-            w <= room,
-            "worktree fact {line:?} needs {w:?} but the rail gives {room:?} \
-             — the dirty count is the fact decision 2 protects; it must \
-             never lose to truncation"
+            w <= px(100.),
+            "the marks group {mark:?} shapes to {w:?}; past 100px it starts \
+             truncating, and a truncated count is a wrong count"
         );
     }
     for state in ["quiet", "unresponsive", "failed"] {
         let word = state_badge(state).unwrap();
         let w = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
-        assert!(w <= room, "badge {word:?} needs {w:?}, room is {room:?}");
+        assert!(
+            w <= px(110.),
+            "badge {word:?} needs {w:?} on a line it shares with the name"
+        );
     }
+
+    // And the rendered floor, on the worst row the rail can build: nine
+    // sharers AND a twin, so the group is `+9 here · <id>` — the widest
+    // reachable shape, measured above at 94.97 px.
+    let mut twin_a = session("cccc3333");
+    twin_a.cwd = "/Users/somebody/very/deeply/nested/checkout/of/a/project".into();
+    twin_a.shared_with = (0..9).map(|i| format!("share{i}00000")).collect();
+    let mut twin_b = twin_a.clone();
+    twin_b.session_id = "dddd4444".into();
+    h.plumbing.push_rail(vec![twin_a, twin_b]);
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("marks-cccc3333")
+            .zip(vcx.debug_bounds("marks-dddd4444"))
+            .map(|(a, b)| a.size == b.size),
+        Some(true),
+        "both twins must carry a mark group — that is the case the id \
+         exists for"
+    );
+    let folder = vcx.debug_bounds("cwd-cccc3333").unwrap();
+    assert!(
+        folder.size.width >= px(50.),
+        "the folder was squeezed to {:?} by its own marks — a path with \
+         nothing left of it is worse than no path",
+        folder.size.width
+    );
+
+    // The shape that should not be constructible (sharing AND a worktree,
+    // excluded above) is constructed here anyway, because "cannot happen"
+    // is a claim about the engine and this is the client. It has to
+    // DEGRADE — the cap truncates the group's tail — rather than take the
+    // folder line away.
+    let mut impossible = session("eeee5555");
+    impossible.cwd = "/Users/somebody/very/deeply/nested/checkout/of/a/project".into();
+    impossible.shared_with = (0..9).map(|i| format!("share{i}00000")).collect();
+    impossible.worktree = Some(worktree("eave/eeee5555", Some(999_999), true));
+    h.plumbing.push_rail(vec![impossible]);
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("cwd-eeee5555").unwrap().size.width >= px(45.),
+        "an over-marked row took the whole folder line with it"
+    );
+}
+
+/// A session carrying marks, for the measurements above. `dirty` of
+/// `None` means no worktree at all, which is not the same as a worktree
+/// whose scan failed (`Some(None)` is unreachable through this helper and
+/// is measured directly).
+fn marked_worktree(id: &str, dirty: Option<u64>) -> SessionInfo {
+    let mut s = session("placeholder");
+    s.session_id = id.into();
+    // What `isolate` does: the worktree directory IS the cwd, and it ends
+    // in the session's own 8-char id.
+    s.cwd = format!("/tmp/eave-wt/{id}");
+    s.worktree = Some(worktree(&format!("eave/{id}"), dirty, true));
+    s
+}
+
+fn marked(dirty: Option<u64>, sharers: usize) -> SessionInfo {
+    let mut s = session("aaaa1111");
+    if sharers == 0 {
+        s.worktree = Some(worktree("eave/aaaa1111", dirty, true));
+    }
+    s.shared_with = (0..sharers).map(|i| format!("share{i}00")).collect();
+    s
 }
 
 /// The two facts whose length is unbounded — the sharer list and the
@@ -448,7 +558,10 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
     let mut one = session("aaaa1111");
     one.shared_with = vec!["bbbb2222".into()];
     one.worktree = Some(worktree("eave/aaaa1111", Some(1), true));
-    h.plumbing.push_rail(vec![one]);
+    // Slice AO: the sharer IDENTITIES are on the selected row only — every
+    // other row carries the count as a mark. So this test has to select the
+    // row to reach the fact whose growth it is about.
+    rail_with_selected(&h, vcx, vec![one], "aaaa1111");
     h.plumbing
         .push_row_note(("aaaa1111".into(), Some(RowNote::Error("refused".into()))));
     vcx.run_until_parked();
@@ -457,19 +570,20 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
     let short_note = vcx.debug_bounds("wt-note-aaaa1111").unwrap().size.height;
 
     // Real metrics: these strings genuinely do not fit on one line.
-    let three = shares_line(&[
+    let four = shares_line(&[
         "bbbb2222".to_string(),
         "cccc3333".to_string(),
         "dddd4444".to_string(),
+        "eeee5555".to_string(),
     ]);
     assert!(
-        real_text_width(&three, theme::SANS, theme::SMALL_SIZE) > room,
-        "three sharers should overflow one line — if this ever stops being \
+        real_text_width(&four, theme::MONO, theme::MICRO_SIZE) > room,
+        "four sharers should overflow one line — if this ever stops being \
          true the wrap below is untested, not unnecessary"
     );
     let confirm = "2 uncommitted files, 0 unmerged commits \u{2014} delete again to mean it";
     assert!(
-        real_text_width(confirm, theme::SANS, theme::SMALL_SIZE) > room,
+        real_text_width(confirm, theme::SANS, theme::MICRO_SIZE) > room,
         "the armed confirmation does not fit on one line"
     );
 
@@ -1928,27 +2042,39 @@ fn the_posture_line_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContext) 
     asks.permission_mode = Some("default".into());
     let mut never = session("bbbb2222");
     never.permission_mode = Some("bypassPermissions".into());
-    h.plumbing.push_rail(vec![asks, never]);
+    let mut also_never = session("cccc3333");
+    also_never.permission_mode = Some("acceptEdits".into());
+    h.plumbing.push_rail(vec![asks, never, also_never]);
     vcx.run_until_parked();
 
-    // Same full-width room for both, so the room is layout-derived and
-    // text-independent (the composition this measurement relies on).
-    let room = vcx.debug_bounds("posture-aaaa1111").unwrap().size.width;
+    // Slice AO: the SAFE posture no longer takes a line. `asks before it
+    // writes · default` was a line on every row restating the default, and
+    // a row that says nothing has changed is the row that made the rail
+    // three lines deep. Absence is the assertion — if the safe line ever
+    // comes back it costs every row again.
+    assert!(
+        !shown(vcx, "posture-aaaa1111"),
+        "the asking posture is the default; a line restating it on every \
+         row is what a two-line rail cannot afford"
+    );
+
+    // Same full-width room for both alarms, so the room is layout-derived
+    // and text-independent (the composition this measurement relies on).
+    let room = vcx.debug_bounds("posture-bbbb2222").unwrap().size.width;
     assert_eq!(
         room,
-        vcx.debug_bounds("posture-bbbb2222").unwrap().size.width,
+        vcx.debug_bounds("posture-cccc3333").unwrap().size.width,
         "posture lines must be full-width like every other rail fact"
     );
 
-    for mode in [
-        "default",
-        "manual",
-        "bypassPermissions",
-        "acceptEdits",
-        "dontAsk",
-    ] {
+    for mode in ["bypassPermissions", "acceptEdits", "dontAsk"] {
         let text = posture_line(mode);
-        let w = real_text_width(&text, theme::SANS, theme::SMALL_SIZE);
+        assert!(
+            text.starts_with("NEVER ASKS"),
+            "{mode:?} renders {text:?} — only the alarm still takes a line, \
+             so anything that reaches this element has to BE the alarm"
+        );
+        let w = real_text_width(&text, theme::SANS, theme::MICRO_SIZE);
         assert!(
             w <= room,
             "the posture fact {text:?} shapes to {w:?} but the rail gives it {room:?}"
@@ -2252,7 +2378,16 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
              its bg rather than compositing the neutral wash over it"
         );
     }
-    // Built from a formatted selector, checked at their builder.
+    // Built from a formatted selector, so the check is anchored at the tag
+    // and bounded by the NEXT tag rather than by a character count.
+    //
+    // It was `at + 1400`, and Slice AO broke it by writing a rationale
+    // comment — not by removing anything. That is the failure mode Stage AK
+    // already named in this file: "a proximity window is a heuristic a long
+    // comment defeats". The element's own block is a structural bound, it
+    // cannot be defeated by prose, and it is STRICTER than 1400 characters
+    // for both of these (the row's fade sits ~700 characters after its tag;
+    // the next tag is the accent bar's).
     for (builder, what) in [
         (r#"format!("rail-{}", info.session_id)"#, "the session row"),
         (r#"format!("file-{}", f.path)"#, "the file row"),
@@ -2260,10 +2395,15 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         let at = src
             .find(&format!("debug_selector(|| {builder})"))
             .unwrap_or_else(|| panic!("{what} is no longer tagged"));
-        let window = &src[at..src.len().min(at + 1400)];
+        let rest = &src[at + 1..];
+        let block = match rest.find("debug_selector(") {
+            Some(next) => &rest[..next],
+            None => rest,
+        };
         assert!(
-            window.contains(".hover_fade("),
-            "{what} lost its hover feedback"
+            block.contains(".hover_fade("),
+            "{what} lost its hover feedback — no .hover_fade( between its \
+             own tag and the next tagged element"
         );
     }
     // Stage AK: the five rail affordances are built by one constructor, so
@@ -4351,9 +4491,26 @@ fn two_sessions_in_one_repo_do_not_render_as_the_same_row(cx: &mut TestAppContex
     vcx.run_until_parked();
 
     // Unnamed — and still told apart, without anyone having to do
-    // anything, because the meta line carries the session's identity.
+    // anything. Slice AO moved the identity off the folder line and into a
+    // mark that appears only on a row that needs it; this is that row, so
+    // the mark is here, and it is the hex id.
     assert!(shown(vcx, "cwd-aaaa1111") && shown(vcx, "cwd-bbbb2222"));
-    assert_ne!(rail_meta_line(&a, None), rail_meta_line(&b, None));
+    assert_eq!(
+        vcx.debug_bounds("cwd-aaaa1111").map(|b| b.size),
+        vcx.debug_bounds("cwd-bbbb2222").map(|b| b.size),
+        "the two folder lines are identical — which is exactly why the \
+         mark below has to exist"
+    );
+    let collided = rows_needing_id(&[a.clone(), b.clone()], None);
+    assert_eq!(
+        row_marks(&a, collided.contains(&a.session_id)).as_deref(),
+        Some("aaaa1111")
+    );
+    assert_eq!(
+        row_marks(&b, collided.contains(&b.session_id)).as_deref(),
+        Some("bbbb2222")
+    );
+    assert!(shown(vcx, "marks-aaaa1111") && shown(vcx, "marks-bbbb2222"));
 
     // Named — the label carries it, which is the version an operator
     // actually reads.
@@ -6074,5 +6231,220 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
          buttons are drawn over the session's own name",
         first.origin.x,
         title.origin.x + title.size.width
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice AO — the rail is a list, and a list has to fit.
+
+/// **The slice, in one number.** A session row is two lines.
+///
+/// The photographed rail (`docs/shots/ship-from-applications.png`) fit three
+/// sessions: every row carried a name line, an id-plus-path line, a
+/// `shares files with 9fedaac4, 47890400` line that wrapped to two, and a
+/// strip of text buttons. This holds the row to a ceiling and holds the
+/// SHARING row to the same one, because the sharing row is the one that
+/// blew the budget.
+///
+/// The ceiling is a literal. It is not `SPACE_2 * 2 + NAME_LINE + …`,
+/// because a test built out of the constants the layout uses cannot fail
+/// when the layout changes — §7, and Stage AK found exactly that bug in
+/// this file.
+#[gpui::test]
+fn a_session_row_is_two_lines(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let plain = session("aaaa1111");
+    let mut sharing = session("bbbb2222");
+    sharing.shared_with = vec!["cccc3333".into(), "dddd4444".into()];
+    h.plumbing.push_rail(vec![plain, sharing]);
+    vcx.run_until_parked();
+
+    for row in ["rail-aaaa1111", "rail-bbbb2222"] {
+        let h = vcx.debug_bounds(row).unwrap().size.height;
+        assert!(
+            h <= px(64.),
+            "{row} is {h:?} tall; the rail's whole problem was rows that \
+             cost four lines apiece"
+        );
+    }
+
+    // Both lines are actually there — a ceiling met by dropping a fact is
+    // not the same slice.
+    for sel in [
+        "label-aaaa1111",
+        "cwd-aaaa1111",
+        "label-bbbb2222",
+        "cwd-bbbb2222",
+    ] {
+        assert!(shown(vcx, sel), "{sel} did not render");
+    }
+
+    // And the sharing row costs no more than the plain one. This is the
+    // assertion the old rail could not have passed: the sharer list was
+    // two extra lines on every row that had one.
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().size.height,
+        vcx.debug_bounds("rail-bbbb2222").unwrap().size.height,
+        "the sharing fact still costs the row height — it is supposed to \
+         be a mark on a line that already exists"
+    );
+}
+
+/// Nothing on the row competes with the session's name.
+///
+/// The operator's complaint was that "the name, the id, the path and the
+/// sharing line are all within 2px of the same size" — four facts at one
+/// rank, so nothing told the eye where a row started and the rail read as
+/// a wall. Asserted as CLEARANCE between the ranks rather than as an
+/// ordering: two boxes 1 px apart are ordered and still look identical.
+#[gpui::test]
+fn nothing_on_the_row_competes_with_the_session_name(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut s = session("aaaa1111");
+    s.shared_with = vec!["bbbb2222".into()];
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+
+    let line_h = |sel: &'static str, vcx: &mut VisualTestContext| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .size
+            .height
+    };
+    let name = line_h("label-aaaa1111", vcx);
+    let folder = line_h("cwd-aaaa1111", vcx);
+    let marks = line_h("marks-aaaa1111", vcx);
+
+    assert!(
+        name >= folder + px(4.),
+        "the name's line box is {name:?} and the folder's is {folder:?} — \
+         under 4px apart they read as one rank and the row has no anchor"
+    );
+    assert!(
+        folder >= marks + px(1.),
+        "the folder ({folder:?}) and its marks ({marks:?}) are the same \
+         rank; the marks are supposed to be subordinate to the path"
+    );
+}
+
+/// Selection is a MARK, not a slightly different grey.
+///
+/// `launcher.rs` has always done this properly — its selected provider tile
+/// takes `border_strong` over `overlay` against siblings with `border` over
+/// `wash_rest` — while the rail, the screen a person actually lives in,
+/// had a wash and nothing else. The bar is the rail's version, and it is
+/// `absolute` so that it can never be the thing that moves a row.
+#[gpui::test]
+fn the_selected_row_is_marked_on_its_leading_edge(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+
+    let bar = vcx.debug_bounds("accent-aaaa1111").expect("the accent bar");
+    assert!(
+        vcx.debug_bounds("accent-bbbb2222").is_none(),
+        "an unselected row is wearing the selection mark"
+    );
+
+    let row = vcx.debug_bounds("rail-aaaa1111").unwrap();
+    assert!(
+        bar.origin.x >= row.origin.x,
+        "the bar hangs off the row's left edge"
+    );
+    // Clearance from the row's first content, not merely "does not
+    // overlap": a bar touching the state dot reads as part of it.
+    let dot_x = row.origin.x + px(theme::RAIL_CARD_BLEED);
+    assert!(
+        bar.origin.x + bar.size.width <= dot_x - px(3.),
+        "the bar runs to {:?} and the row's content starts at {dot_x:?} — \
+         under 3px of clearance and the mark reads as a glyph",
+        bar.origin.x + bar.size.width
+    );
+    // It is a bar, not a block: taller than it is wide, by a lot.
+    assert!(
+        bar.size.height >= bar.size.width * 4.,
+        "the accent is {:?} — that is a swatch, not an edge mark",
+        bar.size
+    );
+}
+
+/// Selecting a row does not move it, and neither does hovering it.
+///
+/// Stage AK proved the hover half and the rail depends on it: a virtualized
+/// list with cached row heights cannot have a row that resizes under the
+/// pointer. Slice AO added two things that could break the same invariant
+/// for a different reason — a rim that appears on selection, and a bar —
+/// so the selected/unselected pair is asserted to the pixel as well.
+#[gpui::test]
+fn selecting_a_row_does_not_move_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    vcx.run_until_parked();
+    let before = vcx.debug_bounds("rail-bbbb2222").expect("the second row");
+
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    let selected = vcx.debug_bounds("rail-aaaa1111").expect("the first row");
+    let after = vcx.debug_bounds("rail-bbbb2222").expect("the second row");
+
+    assert_eq!(
+        before.size, after.size,
+        "the unselected row changed size when its neighbour was selected"
+    );
+    assert_eq!(
+        before.origin, after.origin,
+        "selecting the row above moved this one: {:?} -> {:?} — the rim is \
+         supposed to be laid out on every row and only change colour",
+        before.origin, after.origin
+    );
+    assert_eq!(
+        selected.size, after.size,
+        "a selected row is a different height from an unselected one"
+    );
+}
+
+/// The sharer identities were not deleted; they moved.
+///
+/// Slice I2's fact — *which other sessions are working in these files* — is
+/// real and this slice is not allowed to throw it away to save two lines.
+/// So every sharing row states the COUNT, which is the part a person acts
+/// on, and the row they have selected states WHO, in I2's own words.
+#[gpui::test]
+fn the_sharer_identities_survive_the_count_that_replaced_them(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
+    let mut b = session("bbbb2222");
+    b.shared_with = vec!["aaaa1111".into(), "cccc3333".into()];
+    rail_with_selected(&h, vcx, vec![a.clone(), b], "aaaa1111");
+
+    // Every sharing row carries the count.
+    assert!(shown(vcx, "marks-aaaa1111") && shown(vcx, "marks-bbbb2222"));
+    assert_eq!(row_marks(&a, false).as_deref(), Some("+2 here"));
+
+    // The selected row, and only it, carries the identities.
+    assert!(
+        shown(vcx, "shares-aaaa1111"),
+        "the selected row does not say WHO it shares with, so the fact is \
+         gone from the product rather than moved"
+    );
+    assert!(
+        !shown(vcx, "shares-bbbb2222"),
+        "an unselected row is still spending two lines on hex ids"
+    );
+    assert_eq!(
+        shares_line(&["bbbb2222".into(), "cccc3333".into()]),
+        "shares files with bbbb2222, cccc3333",
+        "the detail is Slice I2's own sentence — if it has to be reworded \
+         to fit, it has not been moved, it has been rewritten"
     );
 }
