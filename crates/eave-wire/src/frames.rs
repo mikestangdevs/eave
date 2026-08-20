@@ -120,6 +120,16 @@ pub enum Request {
     /// and never on watch (isolation invariant, enforced by test).
     Files {
         session_id: String,
+        /// Which basis the snapshot is measured against (Slice AA).
+        /// `#[serde(default)]` = `WorkingTree`, so every client predating
+        /// this field asks for exactly what it always got.
+        ///
+        /// Scope is fixed for the life of the subscription: the engine
+        /// only pays for a turn-scoped scan while somebody is subscribed
+        /// at that scope (it costs a full working-tree hash pass), so a
+        /// client that wants the other scope unsubscribes and asks again.
+        #[serde(default, skip_serializing_if = "FileScope::is_default")]
+        scope: FileScope,
     },
     /// One file's diff content (Slice B2), computed by the engine from
     /// `git diff` in the session cwd at request time — unary, not a
@@ -402,10 +412,71 @@ pub struct FilesSnapshot {
     /// isn't would lie by omission).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub watching: bool,
+    /// What this list is measured AGAINST (Slice AA). The default —
+    /// and every engine predating the field — is [`DiffBasis::WorkingTree`],
+    /// which is exactly what those engines produced.
+    ///
+    /// The whole point of the field is that "this turn changed nothing"
+    /// and "there is no turn to measure against" are different answers
+    /// and must not share a rendering. A turn-scoped list whose basis is
+    /// gone carries [`DiffBasis::Unavailable`] with git's or the engine's
+    /// own words, and `files` is empty because there is nothing to say —
+    /// never because nothing changed.
+    #[serde(default, skip_serializing_if = "DiffBasis::is_default")]
+    pub basis: DiffBasis,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// Which basis a `files` subscription asks the engine to measure against
+/// (Slice AA, spec 05 §Files).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileScope {
+    /// Everything uncommitted: the working tree against `HEAD`. The
+    /// original Slice B behaviour and still the default.
+    #[default]
+    WorkingTree,
+    /// Only what changed since the most recent turn was dispatched —
+    /// "what did THIS turn do", separated from whatever was already
+    /// dirty and from whatever the operator edited between turns.
+    LatestTurn,
+}
+
+impl FileScope {
+    fn is_default(&self) -> bool {
+        matches!(self, FileScope::WorkingTree)
+    }
+}
+
+/// What a [`FilesSnapshot`] is measured against — a stated fact on every
+/// frame, because the two ways a turn-scoped list can be empty mean
+/// opposite things.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiffBasis {
+    /// `HEAD` plus the index — everything uncommitted.
+    #[default]
+    WorkingTree,
+    /// The tree captured when the current turn was dispatched. `at` is
+    /// the capture time (ms since epoch), so a surface can say WHICH turn
+    /// it is showing rather than just "the last one".
+    Turn { at: u64 },
+    /// A turn basis was asked for and there is none to answer with. The
+    /// reason is the engine's or git's own words and is meant to be
+    /// rendered verbatim: no turn has been dispatched since this engine
+    /// started (a restart drops it — it is memory, not history), the
+    /// capture failed, or the base tree was pruned out of the object
+    /// store by a `git gc` while the turn ran.
+    Unavailable { reason: String },
+}
+
+impl DiffBasis {
+    fn is_default(&self) -> bool {
+        matches!(self, DiffBasis::WorkingTree)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -718,12 +789,28 @@ mod tests {
             id: 5,
             request: Request::Files {
                 session_id: "s1".into(),
+                scope: FileScope::WorkingTree,
             },
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains("\"method\":\"files\""), "{line}");
+        // The default basis is not written: an engine predating Slice AA
+        // must see the exact frame it always saw.
+        assert!(!line.contains("scope"), "{line}");
         let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back, req);
+
+        let turn = RequestEnvelope {
+            id: 5,
+            request: Request::Files {
+                session_id: "s1".into(),
+                scope: FileScope::LatestTurn,
+            },
+        };
+        let line = serde_json::to_string(&turn).unwrap();
+        assert!(line.contains("\"scope\":\"latest_turn\""), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, turn);
 
         for state in [
             GitState::Ok,
@@ -748,6 +835,7 @@ mod tests {
                         }],
                         omitted: 0,
                         watching: true,
+                        basis: DiffBasis::WorkingTree,
                     },
                 }),
             };
@@ -755,6 +843,37 @@ mod tests {
             assert!(line.contains("\"snapshot\""), "{line}");
             let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
             assert_eq!(back, resp);
+        }
+    }
+
+    /// Slice AA: every basis a snapshot can state survives the wire, and
+    /// the two empty-list cases stay distinguishable after a round trip —
+    /// which is the only reason the field exists.
+    #[test]
+    fn a_files_snapshot_states_its_basis() {
+        for basis in [
+            DiffBasis::WorkingTree,
+            DiffBasis::Turn { at: 1_755_000_000 },
+            DiffBasis::Unavailable {
+                reason: "no turn has started since this engine did".into(),
+            },
+        ] {
+            let snap = FilesSnapshot {
+                state: GitState::Ok,
+                files: Vec::new(),
+                omitted: 0,
+                watching: true,
+                basis: basis.clone(),
+            };
+            let line = serde_json::to_string(&snap).unwrap();
+            // The default stays off the wire; anything else is stated.
+            assert_eq!(
+                line.contains("basis"),
+                !matches!(basis, DiffBasis::WorkingTree),
+                "{line}"
+            );
+            let back: FilesSnapshot = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, snap);
         }
     }
 
@@ -828,6 +947,9 @@ mod tests {
         // Absent `watching` = the polling fallback — exactly what a B1
         // engine's list is.
         assert!(!snap.watching);
+        // Absent `basis` = the working tree, which is the only thing such
+        // an engine could ever have measured.
+        assert_eq!(snap.basis, DiffBasis::WorkingTree);
     }
 
     #[test]

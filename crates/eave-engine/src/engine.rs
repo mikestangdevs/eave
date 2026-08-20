@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -32,10 +33,10 @@ use eave_core::session::{
 use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, ChangedFile, Cursor, DecideOk, Decision, DiffOk, FileStatus, FilesSnapshot,
-    HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, Request, RequestEnvelope,
-    ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, UnsubscribeOk,
-    PROTO_VERSION,
+    socket_path, ChangedFile, Cursor, DecideOk, Decision, DiffBasis, DiffOk, FileScope, FileStatus,
+    FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, Request,
+    RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem,
+    UnsubscribeOk, PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -184,6 +185,25 @@ pub struct SessionHandle {
     files_tx: broadcast::Sender<()>,
     /// Serializes git scans so overlapping triggers can't interleave.
     files_gate: TokioMutex<()>,
+    /// The turn-scoped view of the same cwd (Slice AA), cached beside the
+    /// working-tree one and refreshed by the same poll. Kept separate
+    /// rather than recomputed per subscriber because a turn scan costs a
+    /// full working-tree hash pass; it is only computed while somebody is
+    /// subscribed at that scope (`turn_subs`).
+    files_turn: StdMutex<Option<FilesSnapshot>>,
+    /// How many live `files` subscriptions asked for `latest_turn`. The
+    /// turn scan runs only while this is non-zero — the same
+    /// "nobody is looking, don't pay for it" rule the FS watcher follows.
+    turn_subs: AtomicUsize,
+    /// The tree captured at the last turn dispatch (Slice AA).
+    ///
+    /// **In memory only, and deliberately so.** It is not history — it is
+    /// a measurement basis for one live turn, and an engine restart
+    /// legitimately loses it. That loss is a stated fact
+    /// (`DiffBasis::Unavailable`), never an error and never an empty
+    /// list, which is the whole reason [`TurnBasis`] has a `None` variant
+    /// carrying words instead of being an `Option`.
+    turn_basis: StdMutex<TurnBasis>,
     /// FS-event invalidation (B2): subscriber refcount plus the stop
     /// handle of the watcher task serving them. The watcher runs only
     /// while a `files` subscription is live; `active` gates the
@@ -207,6 +227,43 @@ pub struct SessionHandle {
     /// list`, never engine memory); presence and dirty count stamped by
     /// scans.
     worktree: StdMutex<Option<WorktreeState>>,
+}
+
+/// What the engine has to measure "this turn" from (Slice AA).
+///
+/// Every variant is something to SAY. There is no `Option` here because
+/// the two ways to have no basis — no turn has run, and the basis we had
+/// is gone — are different sentences, and a rail that renders either as
+/// an empty file list is lying about what it knows.
+#[derive(Debug, Clone)]
+enum TurnBasis {
+    /// Nothing has been dispatched since this engine started. Covers a
+    /// never-used session and, identically, every session after an engine
+    /// restart — which is exactly right: the basis was memory, the
+    /// memory is gone, and the sentence is the same either way.
+    None,
+    /// A capture succeeded: the tree sha and when it was taken.
+    Tree { sha: String, at_ms: u64 },
+    /// A capture was attempted at dispatch and git refused. Held so the
+    /// refusal reaches the rail in git's own words instead of silently
+    /// reading as "no turn has started".
+    Failed { reason: String },
+}
+
+impl TurnBasis {
+    /// The words for a basis that cannot be measured from — `None` when
+    /// there IS one to measure from.
+    fn unavailable_reason(&self) -> Option<String> {
+        match self {
+            TurnBasis::None => Some(
+                "no turn has started since this engine did — the turn basis is live memory, \
+                 so an engine restart drops it. The next turn collects a new one."
+                    .into(),
+            ),
+            TurnBasis::Failed { reason } => Some(reason.clone()),
+            TurnBasis::Tree { .. } => None,
+        }
+    }
 }
 
 /// Live permission facts for one session (Slice K). Identity and counts
@@ -415,11 +472,7 @@ impl SessionHandle {
     /// turn-boundary poll stands down while this is true (B2: events
     /// replace polling; polling is the fallback, not a duplicate).
     fn watcher_active(&self) -> bool {
-        self.fs_watch
-            .lock()
-            .unwrap()
-            .active
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.fs_watch.lock().unwrap().active.load(Ordering::Relaxed)
     }
 }
 
@@ -440,9 +493,15 @@ fn fs_watch_enabled() -> bool {
 /// subscription tasks are aborted on disconnect — drop still runs).
 struct FilesSubGuard {
     handle: Arc<SessionHandle>,
+    /// Slice AA: a turn-scoped subscription also holds the refcount that
+    /// makes the poll compute the turn list at all.
+    scope: FileScope,
 }
 
-fn files_subscriber(handle: &Arc<SessionHandle>) -> FilesSubGuard {
+fn files_subscriber(handle: &Arc<SessionHandle>, scope: FileScope) -> FilesSubGuard {
+    if scope == FileScope::LatestTurn {
+        handle.turn_subs.fetch_add(1, Ordering::Relaxed);
+    }
     let mut ctl = handle.fs_watch.lock().unwrap();
     ctl.subscribers += 1;
     if ctl.subscribers == 1 && fs_watch_enabled() {
@@ -454,19 +513,22 @@ fn files_subscriber(handle: &Arc<SessionHandle>) -> FilesSubGuard {
     }
     FilesSubGuard {
         handle: Arc::clone(handle),
+        scope,
     }
 }
 
 impl Drop for FilesSubGuard {
     fn drop(&mut self) {
+        if self.scope == FileScope::LatestTurn {
+            self.handle.turn_subs.fetch_sub(1, Ordering::Relaxed);
+        }
         let mut ctl = self.handle.fs_watch.lock().unwrap();
         ctl.subscribers = ctl.subscribers.saturating_sub(1);
         if ctl.subscribers == 0 {
             if let Some(stop) = ctl.stop.take() {
                 let _ = stop.send(());
             }
-            ctl.active
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            ctl.active.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -652,6 +714,9 @@ impl Engine {
                 files: StdMutex::new(None),
                 files_tx,
                 files_gate: TokioMutex::new(()),
+                files_turn: StdMutex::new(None),
+                turn_subs: AtomicUsize::new(0),
+                turn_basis: StdMutex::new(TurnBasis::None),
                 fs_watch: StdMutex::new(FsWatchCtl::default()),
                 checkout: StdMutex::new(None),
                 approvals: StdMutex::new(ApprovalState::default()),
@@ -729,6 +794,12 @@ impl Engine {
             files: StdMutex::new(None),
             files_tx,
             files_gate: TokioMutex::new(()),
+            files_turn: StdMutex::new(None),
+            // A restart is exactly where the in-memory basis goes: a
+            // loaded session starts with nothing to measure from, and
+            // says so.
+            turn_subs: AtomicUsize::new(0),
+            turn_basis: StdMutex::new(TurnBasis::None),
             fs_watch: StdMutex::new(FsWatchCtl::default()),
             checkout: StdMutex::new(None),
             // The last posture this session ran under is history: read it
@@ -755,6 +826,13 @@ impl Engine {
     async fn send(self: &Arc<Self>, id: &str, text: &str) -> Result<bool, String> {
         let handle = self.session(id)?;
         let mut live = handle.live.lock().await;
+        // Slice AA: the turn's basis is collected HERE — inside the send
+        // lock, before the agent has been spawned and long before it can
+        // be told to do anything. One line later and the base could
+        // already contain the turn's own first write. This costs a
+        // working-tree hash pass on the send path, which is the price of
+        // the question being answerable at all.
+        capture_turn_basis(&handle).await;
         // A returned recorder drops its `extra` receiver, so a closed
         // channel is proof the attached process segment is over even if the
         // completion task hasn't cleared the slot yet — respawn (with
@@ -1654,10 +1732,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 subs.insert(id, tokio::spawn(run_watch(Arc::clone(&engine), w, id)));
                 continue; // snapshots flow on this id; no unary reply
             }
-            Request::Files { session_id } => match engine.session(&session_id) {
+            Request::Files { session_id, scope } => match engine.session(&session_id) {
                 Ok(handle) => {
                     let w = Arc::clone(&w);
-                    subs.insert(id, tokio::spawn(run_files(handle, w, id)));
+                    subs.insert(id, tokio::spawn(run_files(handle, w, id, scope)));
                     continue; // snapshots flow on this id; no unary reply
                 }
                 Err(message) => ResponseBody::Err { message },
@@ -2011,6 +2089,98 @@ async fn run_watch(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: 
 /// so a pathological repo slows its own snapshot but never the event
 /// loop; sessions keep streaming while git runs (build-directive
 /// constraint). Never journaled: git is the store of record.
+/// Where a session's throwaway git indexes live (Slice AA): inside the
+/// session's own directory in eave's data dir.
+///
+/// Never `/tmp` (somebody else's to delete, and a stale one there
+/// outlives the engine) and — the one that actually bites — never inside
+/// the repository: `git add -A` would sweep the index and its lock file
+/// into the tree it is capturing. Two names because the dispatch capture
+/// and the scan capture can run at the same moment; each is reused across
+/// calls so git's stat cache survives and captures after the first are
+/// cheap.
+fn turn_index_path(session_dir: &Path, which: &str) -> PathBuf {
+    session_dir.join(format!("turn-{which}.index"))
+}
+
+/// Collect the turn's measurement basis (Slice AA), called at dispatch.
+///
+/// Every outcome is a sentence: a non-git cwd and a git refusal both land
+/// in `TurnBasis::Failed` so the rail states them, and neither is allowed
+/// to fail the send — the operator asked to talk to an agent, not to take
+/// a diff.
+async fn capture_turn_basis(handle: &Arc<SessionHandle>) {
+    let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+    // The checkout probe already asked git whether this is a repo (Slice
+    // I2). Believing it here keeps a non-git session from paying for a
+    // `git add` that can only fail. `None` = the probe has not landed;
+    // try anyway rather than guess.
+    let known_non_repo = matches!(
+        handle.checkout.lock().unwrap().as_ref(),
+        Some(probe) if !probe.is_repo
+    );
+    let basis = if known_non_repo {
+        TurnBasis::Failed {
+            reason: "not a git repository — there is no tree to measure a turn against".into(),
+        }
+    } else {
+        let index = turn_index_path(&handle.dir, "base");
+        match crate::git::snapshot_tree(&cwd, &index).await {
+            Ok(sha) => TurnBasis::Tree {
+                sha,
+                at_ms: now_ms(),
+            },
+            Err(eave_wire::GitState::NotARepo) => TurnBasis::Failed {
+                reason: "not a git repository — there is no tree to measure a turn against".into(),
+            },
+            Err(eave_wire::GitState::Error { message }) => TurnBasis::Failed { reason: message },
+            Err(eave_wire::GitState::Ok) => TurnBasis::Failed {
+                reason: "git gave no answer when capturing the turn's base tree".into(),
+            },
+        }
+    };
+    *handle.turn_basis.lock().unwrap() = basis;
+    // The previous turn's list is about a basis that no longer applies —
+    // drop it rather than let one stale frame render as this turn's work.
+    *handle.files_turn.lock().unwrap() = None;
+    if handle.turn_subs.load(Ordering::Relaxed) > 0 {
+        tokio::spawn(refresh_files(Arc::clone(handle)));
+    }
+}
+
+/// The turn-scoped half of a poll (Slice AA): the basis, then git.
+///
+/// Returns a snapshot in every case. `Unavailable` carries words and an
+/// empty list, and the two are not interchangeable — the rail renders the
+/// words, never "no changes".
+async fn turn_scan(handle: &Arc<SessionHandle>, cwd: &Path) -> FilesSnapshot {
+    let unavailable = |reason: String| FilesSnapshot {
+        state: eave_wire::GitState::Ok,
+        files: Vec::new(),
+        omitted: 0,
+        watching: false,
+        basis: DiffBasis::Unavailable { reason },
+    };
+    let basis = handle.turn_basis.lock().unwrap().clone();
+    if let Some(reason) = basis.unavailable_reason() {
+        return unavailable(reason);
+    }
+    let TurnBasis::Tree { sha, at_ms } = basis else {
+        unreachable!("unavailable_reason covers every non-Tree variant");
+    };
+    let index = turn_index_path(&handle.dir, "scan");
+    match crate::git::scan_against(cwd, &sha, &index).await {
+        // The base was collected out from under us (a `git gc --prune=now`
+        // can do it: the base tree is unreachable by construction). A
+        // stated fact, not a crash and not an empty list.
+        Err(reason) => unavailable(reason),
+        Ok(mut snapshot) => {
+            snapshot.basis = DiffBasis::Turn { at: at_ms };
+            snapshot
+        }
+    }
+}
+
 async fn refresh_files(handle: Arc<SessionHandle>) {
     let _gate = handle.files_gate.lock().await;
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
@@ -2037,6 +2207,14 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
         }
     };
     *handle.files.lock().unwrap() = Some(snapshot);
+    // Slice AA: the turn-scoped list refreshes on the same triggers as
+    // the working-tree one and under the same gate — but only while
+    // somebody is subscribed at that scope, because it costs a second
+    // full hash pass over the work tree.
+    if handle.turn_subs.load(Ordering::Relaxed) > 0 {
+        let turn = turn_scan(&handle, &cwd).await;
+        *handle.files_turn.lock().unwrap() = Some(turn);
+    }
     let _ = handle.files_tx.send(());
     if wt_changed {
         handle.poke_watch();
@@ -2050,12 +2228,26 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
 /// task holds one session's handle and can serialize nothing but that
 /// session's [`FilesSnapshot`]; the raw-byte leak test in
 /// `tests/files.rs` enforces it end-to-end.
-async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+async fn run_files(
+    handle: Arc<SessionHandle>,
+    w: Arc<TokioMutex<OwnedWriteHalf>>,
+    id: u64,
+    scope: FileScope,
+) {
     // B2: the first live subscriber starts the session's FS watcher; the
     // last one's drop (including task abort on disconnect) stops it.
-    let _guard = files_subscriber(&handle);
+    // Slice AA: the same guard counts turn-scoped subscribers, which is
+    // what turns the second (expensive) scan on and off.
+    let _guard = files_subscriber(&handle, scope);
     let mut rx = handle.files_tx.subscribe();
-    let current = handle.files.lock().unwrap().clone();
+    // Which cache this subscription reads is fixed at subscribe time —
+    // a client that wants the other basis unsubscribes and asks again,
+    // so a scope can never change under a frame in flight.
+    let cache = |h: &SessionHandle| match scope {
+        FileScope::WorkingTree => h.files.lock().unwrap().clone(),
+        FileScope::LatestTurn => h.files_turn.lock().unwrap().clone(),
+    };
+    let current = cache(&handle);
     match current {
         Some(mut snapshot) => {
             // The refresh mode is stamped per FRAME, not per scan: it
@@ -2085,7 +2277,7 @@ async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
-        let Some(mut snapshot) = handle.files.lock().unwrap().clone() else {
+        let Some(mut snapshot) = cache(&handle) else {
             continue;
         };
         snapshot.watching = handle.watcher_active();
@@ -2159,7 +2351,6 @@ async fn watch_session_files(
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) {
     use notify::Watcher;
-    use std::sync::atomic::Ordering;
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), ()>>();
     let mut watcher =

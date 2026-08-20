@@ -36,8 +36,9 @@ use eave_core::session::AgentConfig;
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
 use eave_wire::{
-    AttentionSnapshot, ChangedFile, Cursor, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff,
-    FileStatus, FilesSnapshot, GitState, SessionInfo, SubscriptionItem, WaitReason,
+    AttentionSnapshot, ChangedFile, Cursor, DiffBasis, DiffHunk, DiffKind, DiffLine, DiffOp,
+    FileDiff, FileScope, FileStatus, FilesSnapshot, GitState, SessionInfo, SubscriptionItem,
+    WaitReason,
 };
 
 use crate::display::{DisplayList, RowId};
@@ -172,6 +173,12 @@ enum Command {
         /// passing an empty one (`AgentConfig::model`).
         model: Option<String>,
     },
+    /// Files-rail basis toggle (Slice AA): re-open the `files`
+    /// subscription against the other basis. It is a resubscribe, not a
+    /// filter — the engine only computes the turn-scoped list while
+    /// somebody is subscribed to it, so "which one is on screen" and
+    /// "which one is being computed" are deliberately the same fact.
+    FilesScope(FileScope),
     /// Files-rail row click (B2): fetch one file's diff. Unary and
     /// re-issued on every fresh snapshot while the row stays expanded —
     /// the files channel is the invalidation signal.
@@ -287,6 +294,10 @@ async fn feed_loop(
     // new session and being handed the old one is the bug this flag
     // exists to prevent, not a corner case.
     let mut at_launcher = false;
+    // Slice AA: the basis the files rail is asking for. Loop-level, above
+    // both labels, because it is an operator preference — it must survive
+    // a session switch and a reconnect, not be reset by them.
+    let mut files_scope = FileScope::WorkingTree;
     'conn: loop {
         plumbing.push_conn(if attempt == 0 {
             ConnEvent::Connecting
@@ -408,6 +419,12 @@ async fn feed_loop(
                             }
                             // Already here.
                             Some(Command::NewSession) => {}
+                            // No subscription to re-open here, but the
+                            // preference must still be the one the next
+                            // session subscribes with — dropping it would
+                            // make the rail's label and the engine's
+                            // basis disagree the moment a session opens.
+                            Some(Command::FilesScope(scope)) => files_scope = scope,
                             Some(Command::Isolate(id)) => {
                                 let _ = client.isolate(&id).await;
                             }
@@ -444,10 +461,11 @@ async fn feed_loop(
             // The selected session's changed-file overview rides its own
             // per-session subscription (spec 05 §Files); a switch drops
             // it with the loop. `None` after open = transport gone.
-            let (files_id, mut files_rx) = match client.files_with_id(&session_id).await {
-                Ok((id, rx)) => (id, Some(rx)),
-                Err(_) => continue 'conn,
-            };
+            let (mut files_id, mut files_rx) =
+                match client.files_with_id_scoped(&session_id, files_scope).await {
+                    Ok((id, rx)) => (id, Some(rx)),
+                    Err(_) => continue 'conn,
+                };
             // Why the loop breaks with a reason instead of continuing its
             // labels directly: a switch must first unsubscribe the old
             // streams (Slice I1) — without that the engine keeps streaming
@@ -575,6 +593,28 @@ async fn feed_loop(
                                 };
                                 let _ = client.decide(&sid, &request_id, decision).await;
                             });
+                        }
+                        Some(Command::FilesScope(scope)) => {
+                            // Handled in place rather than through
+                            // StreamEnd::Switch: a basis toggle has
+                            // nothing to do with the transcript, and
+                            // tearing that subscription down would make
+                            // the whole conversation re-replay to answer
+                            // a question about files.
+                            if scope != files_scope {
+                                files_scope = scope;
+                                let _ = client.unsubscribe(files_id).await;
+                                match client
+                                    .files_with_id_scoped(&session_id, files_scope)
+                                    .await
+                                {
+                                    Ok((id, rx)) => {
+                                        files_id = id;
+                                        files_rx = Some(rx);
+                                    }
+                                    Err(_) => break StreamEnd::Conn,
+                                }
+                            }
                         }
                         Some(Command::Resubscribe) => {
                             cursor = None;
@@ -772,6 +812,7 @@ fn synthetic_files_snapshot() -> FilesSnapshot {
         // The harness plays a live-looking rail; the mode line should
         // state the live mode too.
         watching: true,
+        basis: DiffBasis::WorkingTree,
     }
 }
 
@@ -847,6 +888,13 @@ impl SessionsState {
 struct FilesState {
     snapshot: Option<FilesEvent>,
     collapsed: bool,
+    /// Which basis the rail is asking for (Slice AA). This is the
+    /// REQUEST, not the answer — what actually arrived is stated by the
+    /// snapshot's own `basis`, and the two disagree for the moment
+    /// between a toggle and its first frame. The toggle clears
+    /// `snapshot`, so that moment renders as the skeleton rather than as
+    /// the other basis's list wearing this basis's label.
+    scope: FileScope,
     /// The one expanded diff (B2), session-tagged like everything else
     /// in this rail: a switch clears it, a snapshot that no longer lists
     /// its file closes it, and a fresh snapshot re-requests it (the
@@ -2942,6 +2990,17 @@ impl Shell {
                     .into_any_element(),
             ),
             Some(None) => (None, fact("file status unavailable — engine predates it")),
+            // Slice AA: a basis we cannot measure from outranks anything
+            // the scan says, because the scan says nothing. Rendering
+            // this as `GitState::Ok` with an empty list would put "this
+            // turn changed nothing" on screen when the truth is "there is
+            // no turn to compare against" — the one confusion this whole
+            // slice exists to prevent. No count either: zero would be a
+            // claim.
+            Some(Some(FilesSnapshot {
+                basis: DiffBasis::Unavailable { reason },
+                ..
+            })) => (None, fact(reason)),
             Some(Some(snap)) => match &snap.state {
                 GitState::NotARepo => (None, fact("not a git repository")),
                 GitState::Error { message } => (
@@ -2954,7 +3013,16 @@ impl Shell {
                         .child(SharedString::from(format!("git failed: {message}")))
                         .into_any_element(),
                 ),
-                GitState::Ok if snap.files.is_empty() => (Some("0".into()), fact("no changes")),
+                // An empty list under a basis we DO have is a real zero,
+                // and it says which zero it is: nothing uncommitted at
+                // all, or a turn that has not written anything yet.
+                GitState::Ok if snap.files.is_empty() => (
+                    Some("0".into()),
+                    fact(match &snap.basis {
+                        DiffBasis::Turn { .. } => "this turn has changed nothing yet",
+                        _ => "no changes",
+                    }),
+                ),
                 GitState::Ok => {
                     let mut rows: Vec<AnyElement> = Vec::new();
                     for f in &snap.files {
@@ -2990,12 +3058,32 @@ impl Shell {
         // watcher degrades silently — a rail that looks live while
         // polling would lie by omission). Only stated when there is a
         // scanned repo to keep fresh; quiet ghost text, not an alarm.
+        // Slice AA: silent while the basis is unavailable — the body is
+        // already explaining why there is nothing, and "watching file
+        // events" underneath it would describe machinery, not the answer.
+        let scope = self.files.read(cx).scope;
         let mode: Option<&'static str> = match &current {
-            Some(Some(snap)) if matches!(snap.state, GitState::Ok) => Some(if snap.watching {
-                "watching file events"
-            } else {
-                "refreshes at turn end"
-            }),
+            // An engine predating Slice AA ignores the `scope` field and
+            // streams the working tree regardless — serde drops unknown
+            // params rather than refusing them. The toggle would then read
+            // as a lie, so the disagreement is stated: the snapshot's own
+            // basis is the authority on what arrived, never the request.
+            Some(Some(snap))
+                if scope == FileScope::LatestTurn
+                    && matches!(snap.basis, DiffBasis::WorkingTree) =>
+            {
+                Some("engine predates turn scope — showing the whole working tree")
+            }
+            Some(Some(snap))
+                if matches!(snap.state, GitState::Ok)
+                    && !matches!(snap.basis, DiffBasis::Unavailable { .. }) =>
+            {
+                Some(if snap.watching {
+                    "watching file events"
+                } else {
+                    "refreshes at turn end"
+                })
+            }
             _ => None,
         };
         // Rows on the bare glass ground, mirroring rail() — no plate.
@@ -3033,6 +3121,21 @@ impl Shell {
                             .text_color(theme::text_tertiary())
                             .child(SharedString::from(n.to_string()))
                     })),
+            )
+            // Slice AA: the basis toggle. Its own row rather than a third
+            // item in the header — the labels are words, not glyphs, and
+            // squeezing them beside the title and the count is what
+            // produced the overlapping menu rows in R1.
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(theme::RAIL_GUTTER))
+                    .pb(px(theme::SPACE_2))
+                    .flex()
+                    .flex_row()
+                    .gap(px(theme::SPACE_1))
+                    .child(self.scope_segment(FileScope::WorkingTree, "all", scope, cx))
+                    .child(self.scope_segment(FileScope::LatestTurn, "this turn", scope, cx)),
             )
             // Slice M: same edge fade as the session rail, same reason.
             .child(
@@ -3230,6 +3333,77 @@ impl Shell {
         if !same {
             let _ = self.commands.send(Command::Diff(path));
         }
+    }
+
+    /// Switch the files rail's basis (Slice AA).
+    ///
+    /// The held snapshot is dropped, not kept as a placeholder: it
+    /// describes the OTHER basis, and leaving it on screen under the new
+    /// label would be the one lie this slice is about. The skeleton says
+    /// "a list is coming" and is the honest picture for the round trip.
+    /// The expanded diff goes with it — a row that may not exist in the
+    /// new list cannot keep a pane open under it.
+    fn set_files_scope(&self, scope: FileScope, cx: &mut Context<Self>) {
+        if self.files.read(cx).scope == scope {
+            return;
+        }
+        self.files.update(cx, |state, cx| {
+            state.scope = scope;
+            state.snapshot = None;
+            state.diff = None;
+            cx.notify();
+        });
+        let _ = self.commands.send(Command::FilesScope(scope));
+    }
+
+    /// One segment of the files rail's basis toggle (Slice AA).
+    fn scope_segment(
+        &self,
+        scope: FileScope,
+        label: &'static str,
+        selected: FileScope,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let is_sel = scope == selected;
+        let name = match scope {
+            FileScope::WorkingTree => "working-tree",
+            FileScope::LatestTurn => "latest-turn",
+        };
+        div()
+            .id(SharedString::from(format!("files-scope-{name}")))
+            .debug_selector(move || format!("files-scope-{name}"))
+            .flex_1()
+            .min_w(px(0.))
+            .px(px(theme::SPACE_1))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_CHIP))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(theme::SMALL_SIZE))
+            .line_height(px(theme::SMALL_LINE))
+            // One wash, two roles: the selected segment RESTS at
+            // `overlay()`, the other rests invisible and fades up to it.
+            // So hovering an unselected segment previews exactly what
+            // selecting it will look like, and selection needs no second
+            // pigment of its own.
+            .hover_fade(
+                format!("files-scope-{name}"),
+                if is_sel {
+                    theme::overlay()
+                } else {
+                    theme::wash_rest()
+                },
+                theme::overlay(),
+            )
+            .when(is_sel, |d| {
+                d.font_weight(theme::WEIGHT_LABEL).text_color(theme::text())
+            })
+            .when(!is_sel, |d| d.text_color(theme::text_tertiary()))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.set_files_scope(scope, cx)))
+            .child(label)
+            .into_any_element()
     }
 
     /// The selected session's cwd, for resolving a repo-relative path to
@@ -5730,6 +5904,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // measured at its worst, not at a friendly size.
         snapshot: perf_10k.then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
         collapsed: false,
+        scope: FileScope::WorkingTree,
         diff: perf_10k.then(|| DiffSlot {
             session: "perf:10k".into(),
             path: "crates/eave-app/src/ui.rs".into(),

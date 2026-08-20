@@ -22,8 +22,8 @@ use eave_core::proc::{self, ProcIdentity};
 use eave_core::store::Meta;
 use eave_engine::client::Client;
 use eave_wire::{
-    socket_path, DiffKind, DiffOp, FileStatus, FilesSnapshot, GitState, ResponseBody,
-    ResponseEnvelope, SubscriptionItem,
+    socket_path, DiffBasis, DiffKind, DiffOp, FileScope, FileStatus, FilesSnapshot, GitState,
+    ResponseBody, ResponseEnvelope, SubscriptionItem,
 };
 
 fn engined_bin() -> PathBuf {
@@ -214,6 +214,11 @@ async fn files_channel_never_crosses_sessions() {
     // reply's own envelope id, never on any subscription channel.
     const CONTENT_A: &str = "CONTENT_CANARY_A_51d0";
     const CONTENT_B: &str = "CONTENT_CANARY_B_92e7";
+    // Slice AA: turn-scoped canaries. Written AFTER each session's send,
+    // so they exist only in that session's turn diff — a second, narrower
+    // path for one session's file data to reach another's channel.
+    const TURN_CANARY_A: &str = "TURN_CANARY_A_a41c.txt";
+    const TURN_CANARY_B: &str = "TURN_CANARY_B_e6d8.txt";
     let dir = scratch();
     let repo_a = repo();
     let repo_b = repo();
@@ -250,24 +255,47 @@ async fn files_channel_never_crosses_sessions() {
     w.write_all(b"{\"id\":4,\"method\":\"files\",\"params\":{\"session_id\":\"sB\"}}\n")
         .await
         .unwrap();
+    // ids 7/8 = the same two sessions at turn scope (Slice AA). A second
+    // basis is a second engine-side cache and a second scan path, so it
+    // is a second way for one session's file data to end up on another
+    // session's id — it gets the same raw-byte treatment as the first.
+    w.write_all(
+        b"{\"id\":7,\"method\":\"files\",\"params\":{\"session_id\":\"sA\",\"scope\":\"latest_turn\"}}\n",
+    )
+    .await
+    .unwrap();
+    w.write_all(
+        b"{\"id\":8,\"method\":\"files\",\"params\":{\"session_id\":\"sB\",\"scope\":\"latest_turn\"}}\n",
+    )
+    .await
+    .unwrap();
 
     // Drive both sessions through a real turn while we listen — turn
     // boundaries poke the files poll on top of the open-time scans.
     assert!(c.send("sA", "go a").await.expect("send sA"));
     assert!(c.send("sB", "go b").await.expect("send sB"));
+    // Each session's turn canary lands after ITS dispatch, so it belongs
+    // to that turn and to no other.
+    std::fs::write(repo_a.join(TURN_CANARY_A), "turn a\n").unwrap();
+    std::fs::write(repo_b.join(TURN_CANARY_B), "turn b\n").unwrap();
 
     let mut watch_lines: Vec<String> = Vec::new();
     let mut files_a_lines: Vec<String> = Vec::new();
     let mut files_b_lines: Vec<String> = Vec::new();
+    let mut turn_a_lines: Vec<String> = Vec::new();
+    let mut turn_b_lines: Vec<String> = Vec::new();
     let mut saw_a = false;
     let mut saw_b = false;
-    let end = Instant::now() + Duration::from_secs(20);
+    let mut saw_turn_a = false;
+    let mut saw_turn_b = false;
+    let end = Instant::now() + Duration::from_secs(30);
     // Positive controls: each canary must appear on its OWN files id.
-    while !(saw_a && saw_b) {
+    while !(saw_a && saw_b && saw_turn_a && saw_turn_b) {
         let remaining = end.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "canaries never arrived (a: {saw_a}, b: {saw_b})"
+            "canaries never arrived (a: {saw_a}, b: {saw_b}, \
+             turn a: {saw_turn_a}, turn b: {saw_turn_b})"
         );
         let line = tokio::time::timeout(remaining, lines.next_line())
             .await
@@ -300,6 +328,24 @@ async fn files_channel_never_crosses_sessions() {
                 }
                 saw_b |= line.contains(CANARY_B);
                 files_b_lines.push(line);
+            }
+            7 => {
+                if let ResponseBody::Item(SubscriptionItem::Files { session_id, .. }) = &env.body {
+                    assert_eq!(session_id, "sA", "files frame tagged wrong: {line}");
+                } else {
+                    panic!("files id carried a non-files frame: {line}");
+                }
+                saw_turn_a |= line.contains(TURN_CANARY_A);
+                turn_a_lines.push(line);
+            }
+            8 => {
+                if let ResponseBody::Item(SubscriptionItem::Files { session_id, .. }) = &env.body {
+                    assert_eq!(session_id, "sB", "files frame tagged wrong: {line}");
+                } else {
+                    panic!("files id carried a non-files frame: {line}");
+                }
+                saw_turn_b |= line.contains(TURN_CANARY_B);
+                turn_b_lines.push(line);
             }
             _ => {}
         }
@@ -334,6 +380,8 @@ async fn files_channel_never_crosses_sessions() {
             4 => files_b_lines.push(line),
             5 => diff_a_line = Some(line),
             6 => diff_b_line = Some(line),
+            7 => turn_a_lines.push(line),
+            8 => turn_b_lines.push(line),
             _ => {}
         }
     }
@@ -353,6 +401,8 @@ async fn files_channel_never_crosses_sessions() {
     for line in files_a_lines
         .iter()
         .chain(files_b_lines.iter())
+        .chain(turn_a_lines.iter())
+        .chain(turn_b_lines.iter())
         .chain(watch_lines.iter())
     {
         assert!(
@@ -361,23 +411,26 @@ async fn files_channel_never_crosses_sessions() {
         );
     }
 
-    // The isolation invariant, on raw bytes.
-    for line in &files_a_lines {
+    // The isolation invariant, on raw bytes — both bases.
+    for line in files_a_lines.iter().chain(turn_a_lines.iter()) {
         assert!(
-            !line.contains(CANARY_B),
-            "sB file data leaked onto sA's files channel: {line}"
+            !line.contains(CANARY_B) && !line.contains(TURN_CANARY_B),
+            "sB file data leaked onto one of sA's files channels: {line}"
         );
     }
-    for line in &files_b_lines {
+    for line in files_b_lines.iter().chain(turn_b_lines.iter()) {
         assert!(
-            !line.contains(CANARY_A),
-            "sA file data leaked onto sB's files channel: {line}"
+            !line.contains(CANARY_A) && !line.contains(TURN_CANARY_A),
+            "sA file data leaked onto one of sB's files channels: {line}"
         );
     }
     assert!(!watch_lines.is_empty(), "watch stayed silent");
     for line in &watch_lines {
         assert!(
-            !line.contains(CANARY_A) && !line.contains(CANARY_B),
+            !line.contains(CANARY_A)
+                && !line.contains(CANARY_B)
+                && !line.contains(TURN_CANARY_A)
+                && !line.contains(TURN_CANARY_B),
             "file data leaked onto the watch channel: {line}"
         );
         assert!(
@@ -709,4 +762,387 @@ async fn unparseable_requests_error_on_their_own_id() {
         "unknown method must error: {line}"
     );
     drop(engine);
+}
+
+// ---------------------------------------------------------------------------
+// Turn-scoped changes (Slice AA)
+
+/// Wait for the session's current turn to end on the wire. The base is
+/// captured at DISPATCH, so nothing here depends on a turn having
+/// finished — but the acceptance story does ("turn completes; the user
+/// edits out of band"), and a test that skips the wait would be asserting
+/// about an ordering it never established.
+async fn wait_for_turn_end(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SubscriptionItem>) {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < end, "turn never completed");
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(SubscriptionItem::Events { records, .. })) => {
+                if records.iter().any(|r| {
+                    matches!(
+                        &r.event,
+                        eave_core::journal::JournalEvent::Provider {
+                            event: eave_core::events::SessionEvent::TurnCompleted { .. }
+                        }
+                    )
+                }) {
+                    return;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("transcript stream ended"),
+            Err(_) => {}
+        }
+    }
+}
+
+fn paths(snap: &FilesSnapshot) -> Vec<String> {
+    let mut v: Vec<String> = snap.files.iter().map(|f| f.path.clone()).collect();
+    v.sort();
+    v
+}
+
+/// THE acceptance story (Slice AA): three files are dirty and only one of
+/// them belongs to the current turn.
+///
+/// The working tree cannot tell them apart — that is the whole problem —
+/// so the turn scope is measured from a tree captured at dispatch. Note
+/// what the working-tree list is here: it is not wrong, it is answering a
+/// different question, and both answers ship.
+#[tokio::test]
+async fn latest_turn_lists_only_what_the_current_turn_changed() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    let mut events = c.subscribe("s1", None).await.expect("subscribe");
+
+    // Dirt that predates everything: the operator's own uncommitted work.
+    std::fs::write(repo.join("base.txt"), "one\nEDITED BEFORE ANY TURN\n").unwrap();
+
+    // Turn 1 — its base is captured before the agent could touch anything.
+    assert!(c.send("s1", "turn one").await.expect("send 1"));
+    std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    // Between turns, the operator edits something else entirely.
+    std::fs::write(repo.join("b.rs"), "fn b() {}\n").unwrap();
+
+    // Turn 2. Its base now contains base.txt's edit, a.rs and b.rs — all
+    // of which are somebody else's work as far as this turn is concerned.
+    assert!(c.send("s1", "turn two").await.expect("send 2"));
+    std::fs::write(repo.join("a.rs"), "fn a() { /* turn two */ }\n").unwrap();
+
+    let (turn_id, mut turn_rx) = c
+        .files_with_id_scoped("s1", FileScope::LatestTurn)
+        .await
+        .expect("files latest_turn");
+    // The predicate must select the frame that PROVES the claim: a
+    // turn-based snapshot that has already seen a change. An empty one is
+    // consistent with the claim (the write may not have landed yet) and
+    // proves nothing.
+    let turn = wait_for_snapshot(&mut turn_rx, "turn-scoped snapshot", |s| {
+        matches!(s.basis, DiffBasis::Turn { .. }) && !s.files.is_empty()
+    })
+    .await;
+    assert_eq!(
+        paths(&turn),
+        vec!["a.rs".to_string()],
+        "the turn scope must list this turn's file and nothing else"
+    );
+    assert_eq!(turn.files[0].status, FileStatus::Modified);
+
+    let mut all_rx = c.files("s1").await.expect("files working_tree");
+    let all = wait_for_snapshot(&mut all_rx, "working-tree snapshot", |s| s.files.len() >= 3).await;
+    assert_eq!(
+        paths(&all),
+        vec![
+            "a.rs".to_string(),
+            "b.rs".to_string(),
+            "base.txt".to_string()
+        ],
+        "the working tree still answers its own question in full"
+    );
+    assert_eq!(
+        all.basis,
+        DiffBasis::WorkingTree,
+        "a working-tree snapshot states its basis"
+    );
+
+    let _ = c.unsubscribe(turn_id).await;
+    drop(engine);
+}
+
+/// A file that was ALREADY untracked when the turn started is modified
+/// during it. It must read MODIFIED with the turn's line counts, not
+/// as an all-added file with the operator's lines credited to the agent.
+///
+/// This is the property that makes the base a TREE rather than `HEAD`:
+/// both sides of the turn diff carry untracked content, so nothing has to
+/// be synthesized and nothing is misattributed.
+#[tokio::test]
+async fn a_file_untracked_before_the_turn_reads_as_modified() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+
+    // Three lines the operator wrote, never committed, never staged.
+    std::fs::write(repo.join("notes.txt"), "mine one\nmine two\nmine three\n").unwrap();
+    assert!(c.send("s1", "go").await.expect("send"));
+    // The turn appends one line to it.
+    std::fs::write(
+        repo.join("notes.txt"),
+        "mine one\nmine two\nmine three\nagent line\n",
+    )
+    .unwrap();
+
+    let (turn_id, mut turn_rx) = c
+        .files_with_id_scoped("s1", FileScope::LatestTurn)
+        .await
+        .expect("files latest_turn");
+    let turn = wait_for_snapshot(&mut turn_rx, "turn-scoped snapshot", |s| {
+        matches!(s.basis, DiffBasis::Turn { .. }) && !s.files.is_empty()
+    })
+    .await;
+    assert_eq!(paths(&turn), vec!["notes.txt".to_string()]);
+    let f = &turn.files[0];
+    assert_eq!(
+        f.status,
+        FileStatus::Modified,
+        "already-untracked at turn start = modified by the turn, not added"
+    );
+    assert_eq!(
+        (f.adds, f.dels),
+        (Some(1), Some(0)),
+        "only the turn's own line counts"
+    );
+    // The flag still describes the WORKING TREE, because it is what picks
+    // the diff strategy for the file (`git diff HEAD` cannot see it).
+    assert!(f.untracked, "the file is still untracked on disk");
+
+    // And the working-tree scope keeps answering its own question: the
+    // whole file is new relative to HEAD.
+    let mut all_rx = c.files("s1").await.expect("files working_tree");
+    let all = wait_for_snapshot(&mut all_rx, "working-tree snapshot", |s| {
+        !s.files.is_empty()
+    })
+    .await;
+    let f = all.files.iter().find(|f| f.path == "notes.txt").unwrap();
+    assert_eq!(f.status, FileStatus::Added);
+    assert_eq!((f.adds, f.dels), (Some(4), Some(0)));
+
+    let _ = c.unsubscribe(turn_id).await;
+    drop(engine);
+}
+
+/// The turn basis is live memory, and an engine restart drops it. That is
+/// a SENTENCE, not an error and not an empty list — the difference
+/// between "this turn changed nothing" and "there is no turn to measure
+/// against" is the entire point of the feature.
+///
+/// The working-tree scope is untouched by the same restart: git is its
+/// store of record and rebuilds it for free.
+#[tokio::test]
+async fn a_restart_states_that_the_turn_basis_is_gone() {
+    let dir = scratch();
+    let repo = repo();
+    let mut engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    assert!(c.send("s1", "go").await.expect("send"));
+    std::fs::write(repo.join("mid-turn.txt"), "written during the turn\n").unwrap();
+
+    // Prove the basis existed before the kill — otherwise "unavailable"
+    // afterwards would be indistinguishable from a feature that never
+    // worked.
+    let mut turn_rx = c
+        .files_with_id_scoped("s1", FileScope::LatestTurn)
+        .await
+        .expect("files latest_turn")
+        .1;
+    let before = wait_for_snapshot(&mut turn_rx, "pre-kill turn snapshot", |s| {
+        matches!(s.basis, DiffBasis::Turn { .. }) && !s.files.is_empty()
+    })
+    .await;
+    assert_eq!(paths(&before), vec!["mid-turn.txt".to_string()]);
+    drop(c);
+
+    engine.sigkill();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("reconnect");
+    c.open(Some("s1".into()), None).await.expect("reopen");
+
+    let (turn_id, mut turn_rx) = c
+        .files_with_id_scoped("s1", FileScope::LatestTurn)
+        .await
+        .expect("files latest_turn");
+    let after = wait_for_snapshot(&mut turn_rx, "post-restart turn snapshot", |s| {
+        matches!(s.basis, DiffBasis::Unavailable { .. })
+    })
+    .await;
+    let DiffBasis::Unavailable { reason } = &after.basis else {
+        unreachable!("selected by the predicate")
+    };
+    assert!(
+        reason.contains("engine"),
+        "the reason must name what was lost and why: {reason:?}"
+    );
+    assert!(
+        after.files.is_empty(),
+        "an unavailable basis carries words, never a list"
+    );
+    assert_eq!(
+        after.state,
+        GitState::Ok,
+        "the repository is fine — only the basis is gone"
+    );
+
+    // The working tree is completely unaffected by the restart.
+    let mut all_rx = c.files("s1").await.expect("files working_tree");
+    let all = wait_for_snapshot(&mut all_rx, "post-restart working tree", |s| {
+        !s.files.is_empty()
+    })
+    .await;
+    assert_eq!(paths(&all), vec!["mid-turn.txt".to_string()]);
+
+    let _ = c.unsubscribe(turn_id).await;
+    drop(engine);
+}
+
+/// A `git gc --prune=now` inside the session cwd can collect the base
+/// tree: it is written through a throwaway index and nothing references
+/// it, so it is unreachable by construction. eave states that in words
+/// instead of reporting a git failure — or, worse, an empty list.
+#[tokio::test]
+async fn a_pruned_base_tree_is_a_stated_fact() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    // The base has to be UNREACHABLE for a gc to collect it, and a
+    // capture of a pristine checkout is byte-identical to HEAD's own tree
+    // — reachable, and therefore safe. Dirtying the tree first is what
+    // makes the captured tree a genuine orphan, which is the state this
+    // whole risk is about.
+    std::fs::write(repo.join("pre.txt"), "dirty before the turn\n").unwrap();
+    assert!(c.send("s1", "go").await.expect("send"));
+    std::fs::write(repo.join("during.txt"), "during the turn\n").unwrap();
+
+    let (turn_id, mut turn_rx) = c
+        .files_with_id_scoped("s1", FileScope::LatestTurn)
+        .await
+        .expect("files latest_turn");
+    let before = wait_for_snapshot(&mut turn_rx, "pre-gc turn snapshot", |s| {
+        matches!(s.basis, DiffBasis::Turn { .. }) && !s.files.is_empty()
+    })
+    .await;
+    assert_eq!(paths(&before), vec!["during.txt".to_string()]);
+
+    // What an agent running housekeeping does to us.
+    git(&repo, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&repo, &["gc", "--prune=now", "--quiet"]);
+    // Nudge a rescan (the base is only consulted when one runs).
+    std::fs::write(repo.join("during.txt"), "during the turn, again\n").unwrap();
+
+    let after = wait_for_snapshot(&mut turn_rx, "post-gc turn snapshot", |s| {
+        matches!(s.basis, DiffBasis::Unavailable { .. })
+    })
+    .await;
+    let DiffBasis::Unavailable { reason } = &after.basis else {
+        unreachable!("selected by the predicate")
+    };
+    assert!(
+        reason.contains("gc"),
+        "the reason must name what collected the base: {reason:?}"
+    );
+    assert!(after.files.is_empty());
+    assert_eq!(after.state, GitState::Ok);
+
+    let _ = c.unsubscribe(turn_id).await;
+    drop(engine);
+}
+
+/// The capture is invisible to the operator's own git. `git add -A` into
+/// a throwaway `GIT_INDEX_FILE` in eave's data dir leaves `git status
+/// --porcelain` BYTE-identical — including the staged/unstaged split,
+/// which is the part a careless implementation destroys.
+///
+/// Not a hypothetical: put the same index file inside the work tree and
+/// `add -A` sweeps up the index and its lock into the tree it is
+/// capturing, and status grows two entries. That is why the path is a
+/// parameter and why this test pins the property rather than the code.
+#[tokio::test]
+async fn snapshot_tree_never_touches_the_real_index() {
+    let repo = repo();
+    // Deliberately mixed: one staged change, one unstaged change, one
+    // untracked file. A capture that wrote the real index would flatten
+    // all three into "staged".
+    std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+    git(&repo, &["add", "staged.txt"]);
+    std::fs::write(repo.join("base.txt"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+
+    let porcelain = |cwd: &Path| -> Vec<u8> {
+        Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(cwd)
+            .output()
+            .expect("git status")
+            .stdout
+    };
+    let before = porcelain(&repo);
+    assert!(
+        !before.is_empty(),
+        "the fixture must be dirty to prove this"
+    );
+
+    // The index lives in eave's data dir — never /tmp, never the repo.
+    let data_dir = scratch();
+    let index = data_dir.join("sessions").join("s1").join("turn-base.index");
+    let tree = eave_engine::git::snapshot_tree(&repo, &index)
+        .await
+        .expect("capture the working tree");
+
+    let after = porcelain(&repo);
+    assert_eq!(
+        String::from_utf8_lossy(&before),
+        String::from_utf8_lossy(&after),
+        "snapshot_tree must leave `git status --porcelain` byte-identical"
+    );
+    assert!(
+        index.starts_with(&data_dir),
+        "the throwaway index must live in eave's data dir: {index:?}"
+    );
+
+    // Positive control: the tree really did capture the untracked file,
+    // so "status unchanged" is not just "nothing happened".
+    let listing = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", &tree])
+        .current_dir(&repo)
+        .output()
+        .expect("git ls-tree");
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    for expected in ["base.txt", "staged.txt", "untracked.txt"] {
+        assert!(
+            listing.lines().any(|l| l == expected),
+            "capture missed {expected}: {listing:?}"
+        );
+    }
+    // And nothing of eave's own scratch leaked into it.
+    assert!(
+        !listing.contains("turn-base.index"),
+        "the throwaway index leaked into the captured tree: {listing:?}"
+    );
 }

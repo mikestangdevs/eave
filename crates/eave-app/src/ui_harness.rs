@@ -1021,6 +1021,7 @@ fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
             }],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -1452,6 +1453,7 @@ fn the_diff_pane_opens_on_click_and_closes_when_the_file_stops_changing(cx: &mut
         files,
         omitted: 0,
         watching: true,
+        basis: DiffBasis::WorkingTree,
     };
     h.plumbing.push_feed(FeedEvent::Session {
         id: "aaaa1111".into(),
@@ -1540,6 +1542,7 @@ fn cmd_clicking_a_changed_file_opens_it_without_launching_anything(cx: &mut Test
             }],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -2471,6 +2474,7 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
             files: Vec::new(),
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -3074,6 +3078,7 @@ fn a_files_rail_with_no_snapshot_yet_shows_skeleton_rows(cx: &mut TestAppContext
             files: Vec::new(),
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -3105,6 +3110,7 @@ fn a_diff_that_has_not_arrived_shows_skeleton_rows(cx: &mut TestAppContext) {
             }],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -3172,6 +3178,7 @@ fn every_swapped_control_draws_its_glyph_in_the_box_its_token_names(cx: &mut Tes
             }],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -3224,6 +3231,7 @@ fn the_status_glyph_never_moves_the_path_beside_it(cx: &mut TestAppContext) {
             ],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -4009,4 +4017,119 @@ fn the_launcher_shows_no_composer_to_type_into(cx: &mut TestAppContext) {
         shown(vcx, "composer-hint"),
         "the composer did not come back with the session",
     );
+}
+
+/// Slice AA: the basis toggle is a RESUBSCRIBE, not a filter — the engine
+/// only computes the turn-scoped list while somebody is subscribed to it,
+/// so the click has to reach the connection loop. And the list on screen
+/// when it does must not be the other basis's list wearing the new label.
+#[gpui::test]
+fn the_files_basis_toggle_resubscribes_and_drops_the_other_basis_list(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(3),
+                dels: Some(1),
+                orig_path: None,
+                untracked: false,
+            }],
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::WorkingTree,
+        }),
+    ));
+    vcx.run_until_parked();
+    let _ = h.drain();
+    assert!(
+        shown(vcx, "file-src/lib.rs"),
+        "the working-tree list renders"
+    );
+
+    click(vcx, "files-scope-latest-turn");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::FilesScope(FileScope::LatestTurn)]
+        ),
+        "the toggle must re-open the subscription against the other basis, got {cmds:?}"
+    );
+    assert!(
+        !shown(vcx, "file-src/lib.rs"),
+        "the working-tree list must not survive under the turn label — that is \
+         exactly the misattribution this slice exists to prevent"
+    );
+    assert!(
+        shown(vcx, "files-skeleton"),
+        "the honest picture between a toggle and its first frame is 'a list is coming'"
+    );
+
+    // Clicking the segment that is already selected is not a resubscribe.
+    click(vcx, "files-scope-latest-turn");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "re-clicking the current basis must not tear the subscription down"
+    );
+}
+
+/// The two ways a turn-scoped list can be empty mean opposite things, and
+/// the rail has to say which one it is. "No turn to measure against" is a
+/// sentence; rendering it as an empty list would claim the turn changed
+/// nothing.
+#[gpui::test]
+fn an_unavailable_turn_basis_renders_words_not_an_empty_list(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::Unavailable {
+                reason: "no turn has started since this engine did".into(),
+            },
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "files-count"),
+        "a count of 0 under an unavailable basis would be a claim, not a fact"
+    );
+    assert!(
+        !shown(vcx, "files-mode"),
+        "the refresh mode describes machinery; the body is already explaining \
+         why there is no answer"
+    );
+
+    // A real zero under a real basis keeps its count and its mode line.
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::Turn { at: 1_700_000_000 },
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "files-count"),
+        "a turn that has genuinely changed nothing counts zero"
+    );
+    assert!(shown(vcx, "files-mode"));
 }
