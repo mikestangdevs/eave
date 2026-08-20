@@ -219,21 +219,34 @@ pub fn wash_rest() -> Hsla {
     gpui::transparent_black()
 }
 
-/// Hover/selection wash composited over any surface (waku's idiom: no
-/// per-surface hover tokens, just a white wash).
+/// The three state rungs are ONE LADDER, and the floor between them is the
+/// same [`STATE_DELTA_FLOOR`] that separates each from its ground. Slice U
+/// pinned each wash against the ground and stopped there, so `overlay` and
+/// `overlay_strong` were left **2/255 apart** — a hovered row and the
+/// selected row were the same colour to the eye, and the test that was
+/// supposed to catch exactly that could not see it, because it only ever
+/// compared a wash to what was underneath it.
+///
+/// `adjacent_states_are_a_step_apart` is the missing assertion.
+///
+/// Hover wash on an unfilled control: the first rung off the ground.
 pub fn overlay() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.08)
 }
+/// The standing fill of a SELECTED thing — one full step above [`overlay`],
+/// so that "the row under my cursor" and "the row I am in" are never the
+/// same colour. Was `0.09`.
 pub fn overlay_strong() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.09)
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.14)
 }
 /// One step above [`overlay_strong`], for an element whose RESTING fill
 /// is already `overlay_strong` — the unarmed send button. A hover wash
 /// that composites over a surface is the app's idiom, but an element
 /// with its own `bg` replaces rather than composites, so the few filled
-/// controls need their hovered fill named outright (Slice M).
+/// controls need their hovered fill named outright (Slice M). Was `0.14`,
+/// which is now what the rung below it carries.
 pub fn overlay_strongest() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.14)
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.20)
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,6 +1159,44 @@ mod tests {
                 assert!(
                     d >= STATE_DELTA_FLOOR,
                     "{name} moves {d:.1}/255 on ground {:.1}, floor {STATE_DELTA_FLOOR}",
+                    units(g)
+                );
+            }
+        }
+    }
+
+    /// ...and it is one you can tell apart from the OTHER state.
+    ///
+    /// `a_state_change_is_one_you_can_find` measures every wash against the
+    /// ground it sits on and never against its neighbour, so a ladder whose
+    /// rungs all cleared the ground by 13/255 and each other by 2/255 passed
+    /// it clean. That is what shipped: `overlay` at α 0.08 and
+    /// `overlay_strong` at α 0.09 put the hovered row and the SELECTED row
+    /// **2.0/255 apart** — the rail's two most important states, drawn the
+    /// same colour, in the one place a person looks to answer "which session
+    /// am I in?".
+    ///
+    /// The floor is the same one, because the question is the same one: a
+    /// state change the eye can find. Measured on the bright end of the
+    /// sweep, which is the hard end — a white wash over a light ground has
+    /// the least room to move.
+    #[test]
+    fn adjacent_states_are_a_step_apart() {
+        for g in grounds() {
+            let ladder = [
+                ("rest", units(g)),
+                ("overlay", units(over(overlay(), g))),
+                ("overlay_strong", units(over(overlay_strong(), g))),
+                ("overlay_strongest", units(over(overlay_strongest(), g))),
+            ];
+            for w in ladder.windows(2) {
+                let (lo_name, lo) = w[0];
+                let (hi_name, hi) = w[1];
+                assert!(
+                    hi - lo >= STATE_DELTA_FLOOR,
+                    "{lo_name}->{hi_name} is {:.1}/255 on ground {:.1}, floor \
+                     {STATE_DELTA_FLOOR}",
+                    hi - lo,
                     units(g)
                 );
             }
