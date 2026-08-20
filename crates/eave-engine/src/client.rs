@@ -468,6 +468,30 @@ impl Client {
             .info)
     }
 
+    /// File a session away, or bring it back (Stage AC).
+    ///
+    /// One bit in `meta.json`; the journal is never touched, so this is
+    /// reversible by calling it again with the other value. Returns the
+    /// session as the engine now holds it — the caller reads the bit back
+    /// rather than assuming its own write landed.
+    ///
+    /// **Archived sessions keep arriving on `list` and `watch`.** Hiding
+    /// them is the caller's decision, and it has to be, or the bit would
+    /// be unreachable from the surface that set it.
+    pub async fn set_archived(
+        &self,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<SessionInfo, ClientError> {
+        Ok(self
+            .request::<eave_wire::ArchiveOk>(Request::Archive {
+                session_id: session_id.into(),
+                archived,
+            })
+            .await?
+            .info)
+    }
+
     /// Delete a session's eave worktree (Slice I2). `removed: false` is
     /// the engine's refusal restating freshly-measured dirty facts —
     /// re-send with `force: true` only when the operator confirmed

@@ -131,23 +131,35 @@ type FilesEvent = (String, Option<FilesSnapshot>);
 /// (including "unknown method" from an engine predating diffs).
 type DiffEvent = (String, String, Result<FileDiff, String>);
 
-/// One worktree-action outcome (Slice I2), session-tagged. The rail
-/// states it on the session's row; `Settled` clears any standing note
-/// (an isolate landed, a removal completed — the watch snapshot carries
-/// the new facts).
+/// What one of the rail's row actions had to say, session-tagged. The
+/// rail states it on that session's row; `None` clears any standing note
+/// (the action landed, and the watch snapshot carries the new facts).
+///
+/// It began as `WtNote` for Slice I2's isolate/remove pair. Stage AC put
+/// rename and archive on the same row, and their refusals have exactly
+/// the same shape and the same home — so the type was widened and
+/// renamed rather than duplicated. A second per-session note channel is
+/// a second thing that can be showing when the first one should be.
 #[derive(Debug, Clone)]
-enum WtNote {
-    /// The engine refused a non-forced delete, restating fresh counts —
-    /// the delete affordance is now armed: the next click means it.
+enum RowNote {
+    /// The engine refused a non-forced worktree delete, restating fresh
+    /// counts — the delete affordance is now armed: the next click means
+    /// it.
     ConfirmDelete {
         dirty_files: Option<u64>,
         unmerged_commits: Option<u64>,
     },
-    /// A stated refusal/error from isolate or remove (engine's words).
+    /// A stated refusal from any row action, in the ENGINE's own words.
+    ///
+    /// Rename and archive can both fail — an unreadable `meta.json`
+    /// refuses both — and a rename that silently did not stick is the
+    /// worst version of this: the operator types a name, presses return,
+    /// the field closes, and the row says something else. The refusal is
+    /// stated on the row it was aimed at.
     Error(String),
 }
 
-type WtEvent = (String, Option<WtNote>);
+type RowNoteEvent = (String, Option<RowNote>);
 
 #[derive(Debug)]
 enum Command {
@@ -183,6 +195,25 @@ enum Command {
     /// re-issued on every fresh snapshot while the row stays expanded —
     /// the files channel is the invalidation signal.
     Diff(String),
+    /// Rail rename (Stage AC): set this session's operator title, or
+    /// clear it with `None`.
+    ///
+    /// The text is sent RAW. Normalization — trim, fold to one line, cap
+    /// at `TITLE_MAX_CHARS` — is the engine's, and the reply carries what
+    /// actually landed, so there is exactly one implementation of what a
+    /// title is. An empty field is `None`: clearing a name is the same
+    /// verb as setting one.
+    Rename {
+        id: String,
+        title: Option<String>,
+    },
+    /// Rail archive click (Stage AC): file a session away, or bring it
+    /// back. One bit; the engine never touches the journal for it, so it
+    /// is reversible by sending the other value.
+    SetArchived {
+        id: String,
+        archived: bool,
+    },
     /// Rail "isolate" click (Slice I2): opt this never-started session
     /// into its own worktree. The watch snapshot carries the result;
     /// refusals surface as a stated note on the row.
@@ -214,7 +245,7 @@ struct Queues {
     rail: Mutex<VecDeque<RailEvent>>,
     files: Mutex<VecDeque<FilesEvent>>,
     diffs: Mutex<VecDeque<DiffEvent>>,
-    wt: Mutex<VecDeque<WtEvent>>,
+    notes: Mutex<VecDeque<RowNoteEvent>>,
 }
 
 #[derive(Clone)]
@@ -248,8 +279,8 @@ impl Plumbing {
         self.queues.diffs.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
-    fn push_wt(&self, ev: WtEvent) {
-        self.queues.wt.lock().unwrap().push_back(ev);
+    fn push_row_note(&self, ev: RowNoteEvent) {
+        self.queues.notes.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
 }
@@ -435,13 +466,51 @@ async fn feed_loop(
                             Some(Command::RemoveWorktree { id, force }) => {
                                 let _ = client.remove_worktree(&id, force).await;
                             }
-                            // Everything else needs a selected session and
-                            // there is not one: dropped, never queued. A
-                            // send that arrives at the launcher has no
+                            // Stage AC. Serviced HERE as well as in the
+                            // session loop below, because the rail is on
+                            // screen at the launcher too — every row is
+                            // visible and none of them is selected. An
+                            // arm that existed in only one of these two
+                            // loops would be an affordance that silently
+                            // does nothing depending on which pane is up.
+                            Some(Command::Rename { id, title }) => {
+                                let note = match client.rename(&id, title.as_deref()).await {
+                                    Ok(_) => None,
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
+                                };
+                                plumbing.push_row_note((id, note));
+                            }
+                            Some(Command::SetArchived { id, archived }) => {
+                                let note = match client.set_archived(&id, archived).await {
+                                    Ok(_) => None,
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
+                                };
+                                plumbing.push_row_note((id, note));
+                            }
+                            // Everything below needs a selected session
+                            // and there is not one: dropped, never queued.
+                            // A send that arrives at the launcher has no
                             // session to be addressed to, and holding it
                             // to replay into whatever opens next would be
                             // worse than losing it.
-                            Some(_) => {}
+                            //
+                            // **Listed rather than caught by `Some(_)`,
+                            // deliberately (Stage AC).** The session loop
+                            // below matches every variant explicitly, so
+                            // the compiler catches a command nobody
+                            // services there; this arm used to opt this
+                            // loop out of that check, which means a new
+                            // rail affordance could silently do nothing
+                            // whenever the launcher is up — an affordance
+                            // that exists and is never called being the
+                            // exact defect this slice was written to
+                            // close. Naming them costs six lines and
+                            // makes the next one a compile error.
+                            Some(Command::Send(_))
+                            | Some(Command::Kill)
+                            | Some(Command::Resubscribe)
+                            | Some(Command::Diff(_))
+                            | Some(Command::Decide { .. }) => {}
                             None => return, // UI gone
                         },
                     }
@@ -570,9 +639,38 @@ async fn feed_loop(
                             tokio::spawn(async move {
                                 let note = match client.isolate(&sid).await {
                                     Ok(_) => None,
-                                    Err(e) => Some(WtNote::Error(e.to_string())),
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
                                 };
-                                plumbing.push_wt((sid, note));
+                                plumbing.push_row_note((sid, note));
+                            });
+                        }
+                        // Stage AC. Off-loop like isolate: the watch
+                        // snapshot carries success (the label changes, or
+                        // the row leaves the list), so only a refusal
+                        // needs a session-tagged note. A rename that did
+                        // not stick has to SAY so — the field closes
+                        // either way, and a row quietly showing the old
+                        // name is the worst reading of that.
+                        Some(Command::Rename { id, title }) => {
+                            let client = Arc::clone(&client);
+                            let plumbing = plumbing.clone();
+                            tokio::spawn(async move {
+                                let note = match client.rename(&id, title.as_deref()).await {
+                                    Ok(_) => None,
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
+                                };
+                                plumbing.push_row_note((id, note));
+                            });
+                        }
+                        Some(Command::SetArchived { id, archived }) => {
+                            let client = Arc::clone(&client);
+                            let plumbing = plumbing.clone();
+                            tokio::spawn(async move {
+                                let note = match client.set_archived(&id, archived).await {
+                                    Ok(_) => None,
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
+                                };
+                                plumbing.push_row_note((id, note));
                             });
                         }
                         Some(Command::RemoveWorktree { id, force }) => {
@@ -581,13 +679,13 @@ async fn feed_loop(
                             tokio::spawn(async move {
                                 let note = match client.remove_worktree(&id, force).await {
                                     Ok(ok) if ok.removed => None,
-                                    Ok(ok) => Some(WtNote::ConfirmDelete {
+                                    Ok(ok) => Some(RowNote::ConfirmDelete {
                                         dirty_files: ok.dirty_files,
                                         unmerged_commits: ok.unmerged_commits,
                                     }),
-                                    Err(e) => Some(WtNote::Error(e.to_string())),
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
                                 };
-                                plumbing.push_wt((id, note));
+                                plumbing.push_row_note((id, note));
                             });
                         }
                         Some(Command::Decide { request_id, allow, message }) => {
@@ -701,6 +799,7 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         // Unnamed on purpose: the replay rig should measure the row shape
         // an ordinary session actually has, which is the fallback label.
         title: None,
+        archived: false,
         provider: "replay".into(),
         model: None,
         cwd: path.display().to_string(),
@@ -884,11 +983,18 @@ struct SessionsState {
     /// is the app's own — see [`fold_rail`].
     sessions: Vec<SessionInfo>,
     collapsed: bool,
+    /// Whether the rail is currently drawing archived rows (Stage AC).
+    ///
+    /// A pure view preference, like `collapsed`, and deliberately NOT
+    /// persisted: it is a "let me look at the filing cabinet" mode, not a
+    /// setting, and an eave that came back tomorrow still showing every
+    /// archived session would have made the archive bit pointless.
+    show_archived: bool,
     attention: Option<(String, AttentionSnapshot)>,
     /// Standing worktree-action notes per session (Slice I2): a stated
     /// refusal, or an armed delete confirmation restating the engine's
     /// fresh counts. Cleared by a settled action; folded by replacement.
-    wt_notes: std::collections::HashMap<String, WtNote>,
+    row_notes: std::collections::HashMap<String, RowNote>,
 }
 
 impl SessionsState {
@@ -1300,6 +1406,104 @@ fn worktree_line(w: &eave_wire::WorktreeInfo) -> String {
 /// created if it never has (Stage AB).
 fn activity_key(s: &SessionInfo) -> u64 {
     s.last_activity_ms.unwrap_or(s.created_ts_ms)
+}
+
+/// Does the rail draw this row? (Stage AC.)
+///
+/// Archiving hides a session from the DEFAULT listing and does nothing
+/// else — the session is still there, still on `watch`, still one bit
+/// away from coming back. The filter lives here, in the client, because
+/// an engine that omitted archived sessions from its own listing would
+/// leave the bit unreachable from the surface that set it.
+///
+/// The two exceptions are the whole design, and both exist to stop the
+/// filter from swallowing something:
+///
+/// 1. **The selected session always has a row.** Archive the session you
+///    are reading and the transcript would otherwise be sitting there
+///    with no row to unarchive, no row to switch away from, and nothing
+///    in the rail admitting it exists.
+/// 2. **A session parked on a permission question always has a row.**
+///    eave never auto-approves, never auto-denies and never times out
+///    into either (Slice K), so the ONLY way out of `awaiting_approval`
+///    is somebody clicking. Hiding that row would strand the agent for
+///    the life of the process behind an affordance nobody can reach. The
+///    row states why it is there — see [`archived_line`].
+///
+///    Tested on the COUNT **or** the state name, not on either alone.
+///    They come from two different structures engine-side — the count
+///    from `SessionHandle::approvals`, the name from the attention
+///    monitor's own pending list — and this predicate has an asymmetric
+///    cost: showing a row that did not need showing is a cosmetic miss,
+///    hiding one that did strands an agent forever. The disjunction takes
+///    the cheap error.
+///
+/// Note what is deliberately NOT an exception: `running`, `quiet`,
+/// `failed`, `unresponsive`. None of them is blocked on the operator, and
+/// exempting them would mean a session could never be filed away for the
+/// exact reason people file sessions away — it finished, or it failed.
+fn rail_shows(info: &SessionInfo, selected: Option<&str>, show_archived: bool) -> bool {
+    !info.archived
+        || show_archived
+        || selected == Some(info.session_id.as_str())
+        || info.pending_approvals > 0
+        || info.state == "awaiting_approval"
+}
+
+/// The word an archived row wears (Stage AC), or `None` for a row that is
+/// not archived.
+///
+/// An archived row is only ever on screen for a reason, and when that
+/// reason is "it is asking you something" the row says so. Otherwise a
+/// session the operator filed away would reappear in a list they believe
+/// is filtered, with nothing on it explaining why — which reads as the
+/// filter being broken rather than as the filter doing its one job.
+fn archived_line(info: &SessionInfo, show_archived: bool) -> Option<String> {
+    if !info.archived {
+        return None;
+    }
+    // The same disjunction [`rail_shows`] uses, and it has to be the same
+    // one: a row let through by the state name and explained by neither
+    // is a row with no account of why it is there.
+    let asking = info.pending_approvals > 0 || info.state == "awaiting_approval";
+    Some(if !show_archived && asking {
+        "archived · still asking".to_string()
+    } else {
+        "archived".to_string()
+    })
+}
+
+/// The rail's archived toggle, stated as a fact plus the action (Stage AC).
+///
+/// The count is of archived sessions, not of hidden rows, and the wording
+/// is a state rather than an instruction because those two numbers differ:
+/// a selected or still-asking archived row is on screen while the bit is
+/// off. "3 archived · show" is true either way; "show 3 archived" would
+/// promise to reveal three rows and reveal two.
+fn archived_toggle_label(archived: usize, showing: bool) -> String {
+    let action = if showing { "hide" } else { "show" };
+    format!("{archived} archived · {action}")
+}
+
+/// What the rail says when it holds rows and draws none of them
+/// (Stage AC).
+///
+/// "no sessions" over a rail whose sessions are all filed away is a lie
+/// of exactly the shape this codebase keeps finding: a state that lost
+/// the reason it is in. The count is the reason, and the toggle that
+/// undoes it is the line directly above.
+fn rail_empty_note(total: usize, archived: usize) -> String {
+    if total == 0 {
+        "no sessions".to_string()
+    } else if archived >= total {
+        format!("every session is archived ({archived})")
+    } else {
+        // Not reachable through the rail's own filter today — the only
+        // thing that hides a row is the archive bit — but stated rather
+        // than unwrapped, because an empty list with no reason on it is
+        // the failure this whole function exists to prevent.
+        format!("nothing to show — {archived} of {total} archived")
+    }
 }
 
 /// Fold a watch snapshot into the rail's rows, keeping the ORDER of rows
@@ -2003,12 +2207,38 @@ struct Shell {
     files_scroll: ScrollHandle,
     /// Slice P1 — see [`DemoOverlay`]. No product consumer.
     demo: DemoOverlay,
+    /// The rail's inline rename field (Stage AC), when one is open.
+    /// `None` = nobody is naming anything. Held on the shell for the same
+    /// reason `launcher` is: it is a choice in progress, not a fact about
+    /// a session, so it must survive the feed events that rebuild the
+    /// rail underneath it.
+    rename: Option<RenameEdit>,
     /// Slice Q2 — the launcher's own state. Held on the shell rather than
     /// in `TranscriptState` because it is a *choice in progress*, not a
     /// fact about a session: it survives the feed events that clear the
     /// transcript, so pressing `+ new` twice does not reset the agent you
     /// were half-way through picking.
     launcher: LauncherUi,
+}
+
+/// One open rail rename (Stage AC).
+///
+/// `rename` has been complete on the wire since Stage AB — method,
+/// engine, client, persistence, tests — with no caller. This is the
+/// caller.
+///
+/// The buffer is NOT the composer. Sharing eave's one text field would
+/// mean the rename box either eats a session's unsent draft or shows it,
+/// and Slice T went to some trouble to make a draft belong to exactly one
+/// session. A name being typed belongs to a row.
+struct RenameEdit {
+    /// The row being named. The field renders in that row's label slot
+    /// and nowhere else, so a rail that re-folds underneath it cannot
+    /// move the box onto a different session.
+    session_id: String,
+    /// What has been typed. Sent raw — the engine normalizes and the
+    /// reply is what landed (`Command::Rename`).
+    text: String,
 }
 
 /// Slice Q2. The provider strip's selection and the model menu.
@@ -2288,6 +2518,53 @@ impl Shell {
             }
             return;
         }
+        // Stage AC: an open rename field owns the keyboard, exactly the
+        // way P1's menus above do, and for the same reason — a field you
+        // can type past is not a field, and every key that fell through
+        // here would land in a composer draft the operator cannot see
+        // behind the row they are naming.
+        //
+        // Ahead of the no-session return below, because the rail is on
+        // screen at the launcher too: a session can be named while
+        // nothing is selected, and the early return would swallow every
+        // keystroke aimed at the field.
+        //
+        // Ahead of the caret-anchor reset for the same reason as the
+        // overlay gates: nobody is typing in the composer.
+        if self.rename.is_some() {
+            match ks.key.as_str() {
+                "escape" => self.cancel_rename(cx),
+                "enter" => self.commit_rename(cx),
+                "backspace" => {
+                    if let Some(edit) = self.rename.as_mut() {
+                        edit.text.pop();
+                    }
+                    cx.notify();
+                }
+                // Paste, on the same chord the composer uses. A title is
+                // the one field somebody is likely to paste a branch name
+                // into, and the engine's cap is what makes that safe.
+                "v" if ks.modifiers.platform => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(edit) = self.rename.as_mut() {
+                            edit.text.push_str(&text);
+                        }
+                        cx.notify();
+                    }
+                }
+                _ => {
+                    if let Some(ch) = ks.key_char.clone() {
+                        if !ks.modifiers.platform && !ks.modifiers.control {
+                            if let Some(edit) = self.rename.as_mut() {
+                                edit.text.push_str(&ch);
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+            return;
+        }
         // Slice Q2 unmounted the composer at the launcher (`show_launcher`
         // below) but left this handler open, so keystrokes still landed in
         // the buffer behind it — invisible, because the element is not
@@ -2354,6 +2631,55 @@ impl Shell {
                 }
             }
         }
+    }
+
+    /// Open the rail's inline rename field on one row (Stage AC), seeded
+    /// with whatever that session is called now.
+    ///
+    /// Seeded rather than blank because the common edit is a correction,
+    /// and a field that cleared the name you are trying to fix makes
+    /// "leave it alone" the same gesture as "delete it".
+    fn begin_rename(&mut self, id: String, cx: &mut Context<Self>) {
+        let text = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .find(|s| s.session_id == id)
+            .and_then(|s| s.title.clone())
+            .unwrap_or_default();
+        self.rename = Some(RenameEdit {
+            session_id: id,
+            text,
+        });
+        cx.notify();
+    }
+
+    /// Close the field, sending nothing. Escape, and every path that takes
+    /// the row out from under it.
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.rename.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Send what was typed and close the field.
+    ///
+    /// The raw text goes to the engine — normalization is `store::
+    /// normalize_title`'s and the reply is what landed, so there is one
+    /// implementation of what a title is rather than two that drift. An
+    /// empty field clears the name: that is the same verb, which is what
+    /// stops "set" and "clear" from ever disagreeing.
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.rename.take() else {
+            return;
+        };
+        let title = (!edit.text.trim().is_empty()).then_some(edit.text);
+        let _ = self.commands.send(Command::Rename {
+            id: edit.session_id,
+            title,
+        });
+        cx.notify();
     }
 
     /// Is the composer caret drawn this frame? (inventory §1.20 — 500 ms
@@ -2542,11 +2868,31 @@ impl Shell {
     fn rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
         // Already in draw order: `fold_rail` decided it when each row
         // arrived, and deliberately does not re-decide it here (Stage AB).
-        let sessions = self.sessions.read(cx).sessions.clone();
+        let all = self.sessions.read(cx).sessions.clone();
         let selected = self.transcript.read(cx).session_id.clone();
-        let wt_notes = self.sessions.read(cx).wt_notes.clone();
+        let row_notes = self.sessions.read(cx).row_notes.clone();
+        // Stage AC. The filter runs HERE, over the folded rows, and the
+        // rows themselves are untouched — so the count below is a real
+        // count and un-archiving needs nothing to come back from.
+        let show_archived = self.sessions.read(cx).show_archived;
+        let total = all.len();
+        let archived_count = all.iter().filter(|s| s.archived).count();
+        let editing = self
+            .rename
+            .as_ref()
+            .map(|e| (e.session_id.clone(), e.text.clone()));
         let home = std::env::var("HOME").ok();
-        let resource = resource_line(&sessions, physical_memory_cached());
+        // Stage L's aggregate ceiling, computed over EVERY session and not
+        // over the filtered list. An archived agent still holding 2 GB is
+        // precisely the cost the operator has stopped thinking about, and
+        // dropping it out of the total the moment the row is hidden would
+        // make the ceiling quietly optimistic — the one thing a ceiling
+        // may not be.
+        let resource = resource_line(&all, physical_memory_cached());
+        let sessions: Vec<SessionInfo> = all
+            .into_iter()
+            .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
+            .collect();
         // The meta line aligns under the provider label: dot + gap +
         // chip + gap.
         let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
@@ -2582,8 +2928,8 @@ impl Shell {
                     && !info.live
                     && info.worktree.is_none()
                     && !info.shared_with.is_empty();
-                let wt_note = wt_notes.get(&info.session_id).cloned();
-                let armed = matches!(wt_note, Some(WtNote::ConfirmDelete { .. }));
+                let wt_note = row_notes.get(&info.session_id).cloned();
+                let armed = matches!(wt_note, Some(RowNote::ConfirmDelete { .. }));
                 let wt = info.worktree.clone();
                 let wt_line = wt.as_ref().map(worktree_line);
                 // Orphan affordances (decision 2): open in editor, or
@@ -2594,7 +2940,7 @@ impl Shell {
                 let wt_path = info.cwd.clone();
                 let show_wt_buttons = wt.is_some() && !info.live;
                 let note_line = wt_note.as_ref().map(|n| match n {
-                    WtNote::ConfirmDelete {
+                    RowNote::ConfirmDelete {
                         dirty_files,
                         unmerged_commits,
                     } => {
@@ -2610,10 +2956,27 @@ impl Shell {
                             theme::warning(),
                         )
                     }
-                    WtNote::Error(msg) => (msg.clone(), theme::danger()),
+                    RowNote::Error(msg) => (msg.clone(), theme::danger()),
                 });
                 let sid_iso = info.session_id.clone();
                 let sid_del = info.session_id.clone();
+                let sid_ren = info.session_id.clone();
+                let sid_arc = info.session_id.clone();
+                // Stage AC: the row's own facts about being filed away.
+                let archived_word = archived_line(&info, show_archived);
+                let archive_verb = if info.archived {
+                    "unarchive"
+                } else {
+                    "archive"
+                };
+                let archive_to = !info.archived;
+                // The rename field replaces the label IN PLACE, on this
+                // row only. A rail that re-folds while the field is open
+                // therefore cannot slide the box onto another session.
+                let editing_here = editing
+                    .as_ref()
+                    .filter(|(id, _)| id == &info.session_id)
+                    .map(|(_, text)| text.clone());
                 div()
                     .id(SharedString::from(format!("rail-{}", info.session_id)))
                     .debug_selector(|| format!("rail-{}", info.session_id))
@@ -2637,7 +3000,13 @@ impl Shell {
                         if is_sel { theme::overlay_strong() } else { theme::overlay() },
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, _| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Stage AC: selecting anything closes an open
+                        // rename field, discarding it. The field lives in
+                        // one row's label slot; leaving it open while the
+                        // selection moves would strand a keyboard grab on
+                        // a row the operator has walked away from.
+                        this.cancel_rename(cx);
                         let _ = this.commands.send(Command::Select(sid.clone()));
                     }))
                     .flex()
@@ -2678,18 +3047,74 @@ impl Shell {
                                     .text_color(theme::text_secondary())
                                     .child(SharedString::from(glyph)),
                             )
-                            .child(
+                            .child(match editing_here {
+                                // Stage AC: the rename field, in the
+                                // label's own slot. Same box, same
+                                // metrics — see the transparent border on
+                                // the label below for why the row does not
+                                // wobble when this appears.
+                                Some(text) => div()
+                                    .id(SharedString::from(format!(
+                                        "rename-{}",
+                                        info.session_id
+                                    )))
+                                    .debug_selector(|| format!("rename-{}", info.session_id))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .border_1()
+                                    .border_color(theme::border_strong())
+                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .text_size(px(theme::DETAIL_SIZE))
+                                    .line_height(px(theme::DETAIL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(theme::text())
+                                    // Clicking inside the field is not a
+                                    // click on the row: without this, a
+                                    // pointer landing in the box you are
+                                    // typing in re-selects the session and
+                                    // the field survives only by accident.
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    // An I-beam, not a hand. The field is
+                                    // the one thing in eave's rail that is
+                                    // typed into rather than pressed, and
+                                    // `every_clickable_element_says_it_is_clickable`
+                                    // counts both — its property is that a
+                                    // handler always states a cursor, not
+                                    // that every cursor is a pointer.
+                                    .cursor_text()
+                                    // A SOLID caret, deliberately. The
+                                    // composer's blink holds a pulse lease
+                                    // for as long as it is on screen
+                                    // (`caret_lit`), and this field is one
+                                    // more surface that would then be
+                                    // pinned at the frame rate. N4's idle
+                                    // floor is worth more than a blink on
+                                    // a box that is open for four seconds.
+                                    .child(SharedString::from(format!("{text}▏")))
+                                    .into_any_element(),
                                 // Stage AB: `min_w(0)` is what makes
                                 // `truncate` bite inside a flex row — a
                                 // flex item's default minimum is its
                                 // content, so without it a long title
                                 // grows the row and pushes the badge off
                                 // the end instead of clipping itself.
-                                div()
+                                None => div()
                                     .debug_selector(|| format!("label-{}", info.session_id))
                                     .flex_1()
                                     .min_w(px(0.))
                                     .truncate()
+                                    // Stage AC: a border nobody can see,
+                                    // carrying the exact height the rename
+                                    // field's visible one costs. Opening
+                                    // the field must not move the rows
+                                    // under it — a list that shifts while
+                                    // you are typing into it is the comet
+                                    // bug this rail already refuses once,
+                                    // in `fold_rail`.
+                                    .border_1()
+                                    .border_color(gpui::transparent_black())
+                                    .rounded(px(theme::RADIUS_BUTTON))
                                     .text_size(px(theme::DETAIL_SIZE))
                                     .line_height(px(theme::DETAIL_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
@@ -2698,8 +3123,9 @@ impl Shell {
                                     } else {
                                         theme::text_secondary()
                                     })
-                                    .child(SharedString::from(label)),
-                            )
+                                    .child(SharedString::from(label))
+                                    .into_any_element(),
+                            })
                             .children(badge.map(|word| {
                                 div()
                                     .debug_selector(|| format!("badge-{}", info.session_id))
@@ -2721,6 +3147,21 @@ impl Shell {
                             .text_color(theme::text_tertiary())
                             .child(SharedString::from(rail_meta_line(&info, home.as_deref()))),
                     )
+                    // Stage AC: an archived row that is on screen says so,
+                    // and when it is on screen because it is BLOCKED on
+                    // the operator it says that too. A filtered list that
+                    // shows a row it claims to be hiding, with nothing on
+                    // the row explaining why, reads as a broken filter.
+                    .children(archived_word.map(|line| {
+                        div()
+                            .debug_selector(|| format!("archived-{}", info.session_id))
+                            .pl(px(meta_indent))
+                            .truncate()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(line))
+                    }))
                     // Slice K amendment 3: the posture the CLI reported at
                     // init, stated as a rail fact. Full width and wrapping
                     // for the same reason as the shares line — a posture
@@ -2774,16 +3215,98 @@ impl Shell {
                             })
                             .child(SharedString::from(line))
                     }))
-                    // The affordance row (isolate / open / delete) sits on
-                    // its own line beneath the facts it acts on.
-                    .when(can_isolate || show_wt_buttons, |d| {
+                    // The affordance row sits on its own line beneath the
+                    // facts it acts on.
+                    //
+                    // Stage AC: rename and archive appear on the SELECTED
+                    // row only. The rail is 248 px wide and its rows are
+                    // already three or four lines deep — a permanent
+                    // button strip on every one of them would cost more
+                    // sessions on screen than the buttons are worth, and
+                    // hover-revealed children need per-row state the
+                    // rail deliberately does not keep. The selected row is
+                    // the row you are managing.
+                    .when(can_isolate || show_wt_buttons || is_sel, |d| {
                         d.child(
                             div()
                                 .pl(px(meta_indent))
                                 .flex()
                                 .flex_row()
+                                // WRAPS. Five affordances cannot fit
+                                // 160 px of row, and R1 already found what
+                                // a non-wrapping fixed row does with
+                                // content it cannot hold: it draws the
+                                // overflow on top of its neighbour.
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(theme::SPACE_2))
+                                .when(is_sel, |d| {
+                                    d.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "ren-{}",
+                                                info.session_id
+                                            )))
+                                            .debug_selector(|| format!("ren-{}", info.session_id))
+                                            .flex_none()
+                                            .px(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_BUTTON))
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .text_size(px(theme::SMALL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .hover_fade(
+                                                format!("ren-{}", info.session_id),
+                                                theme::wash_rest(),
+                                                theme::overlay(),
+                                            )
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.begin_rename(sid_ren.clone(), cx);
+                                            }))
+                                            .child("rename"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "arc-{}",
+                                                info.session_id
+                                            )))
+                                            .debug_selector(|| format!("arc-{}", info.session_id))
+                                            .flex_none()
+                                            .px(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_BUTTON))
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .text_size(px(theme::SMALL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .hover_fade(
+                                                format!("arc-{}", info.session_id),
+                                                theme::wash_rest(),
+                                                theme::overlay(),
+                                            )
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                // Deliberately NOT a
+                                                // two-step like `delete`.
+                                                // Nothing is destroyed —
+                                                // the same button, one
+                                                // click, brings it back —
+                                                // so a confirmation here
+                                                // would be ceremony with
+                                                // no fact behind it.
+                                                let _ = this.commands.send(Command::SetArchived {
+                                                    id: sid_arc.clone(),
+                                                    archived: archive_to,
+                                                });
+                                            }))
+                                            .child(archive_verb),
+                                    )
+                                })
                                 .when(can_isolate, |d| {
                                     d.child(
                                         div()
@@ -2920,7 +3443,12 @@ impl Shell {
                         .text_size(px(theme::SMALL_SIZE))
                         .line_height(px(theme::SMALL_LINE))
                         .text_color(theme::text_tertiary())
-                        .child("no sessions"),
+                        // Stage AC: "no sessions" over a rail whose
+                        // sessions are all filed away is an empty state
+                        // that lost its reason. `rail_empty_note` keeps
+                        // the reason on screen, and the toggle that undoes
+                        // it is the line directly above.
+                        .child(SharedString::from(rail_empty_note(total, archived_count))),
                 )
                 .into_any_element()]
         } else {
@@ -2985,6 +3513,44 @@ impl Shell {
                             .child("new"),
                     ),
             )
+            // Stage AC: the archived shelf, on its own line rather than
+            // squeezed into the header beside `new`. At 248 px the header
+            // has ~212 px of room and "sessions" plus `new` already take
+            // most of it — a third control up there would be a contest
+            // between a fact and a button, which is the contest a fact
+            // loses. Present only when there is something filed away, so a
+            // rail nobody has archived from looks exactly as it did.
+            .children((archived_count > 0).then(|| {
+                div()
+                    .flex_none()
+                    .px(px(theme::RAIL_GUTTER))
+                    .pb(px(theme::SPACE_2))
+                    .child(
+                        div()
+                            .id("rail-archived")
+                            .debug_selector(|| "rail-archived".into())
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_BUTTON))
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sessions.update(cx, |state, cx| {
+                                    state.show_archived = !state.show_archived;
+                                    cx.notify();
+                                });
+                            }))
+                            .child(SharedString::from(archived_toggle_label(
+                                archived_count,
+                                show_archived,
+                            ))),
+                    )
+            }))
             // Slice M: rows dissolve at the scroller's edges instead of
             // ending on a hard cut. The rail paints no surface of its
             // own, so there is nothing to cut against BUT the desktop
@@ -5999,8 +6565,11 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     let sessions = cx.new(|_| SessionsState {
         sessions: Vec::new(),
         collapsed: false,
+        // Stage AC: eave opens on the working set, always. The toggle is
+        // a mode you enter and leave, never a state you boot into.
+        show_archived: false,
         attention: None,
-        wt_notes: std::collections::HashMap::new(),
+        row_notes: std::collections::HashMap::new(),
     });
     let files = cx.new(|_| FilesState {
         // Perf runs have no feed: seed a synthetic snapshot so the
@@ -6125,8 +6694,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 }
                 let last_attn = attn_events.into_iter().last();
                 let last_rail = rail_events.into_iter().last();
-                let wt_events: Vec<WtEvent> = queues.wt.lock().unwrap().drain(..).collect();
-                if last_attn.is_some() || last_rail.is_some() || !wt_events.is_empty() {
+                let note_events: Vec<RowNoteEvent> =
+                    queues.notes.lock().unwrap().drain(..).collect();
+                if last_attn.is_some() || last_rail.is_some() || !note_events.is_empty() {
                     sessions.update(cx, |state, cx| {
                         if let Some(tagged) = last_attn {
                             state.attention = Some(tagged);
@@ -6141,13 +6711,13 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         }
                         // Worktree notes fold by replacement per
                         // session; a settled action clears its note.
-                        for (sid, note) in wt_events {
+                        for (sid, note) in note_events {
                             match note {
                                 Some(n) => {
-                                    state.wt_notes.insert(sid, n);
+                                    state.row_notes.insert(sid, n);
                                 }
                                 None => {
-                                    state.wt_notes.remove(&sid);
+                                    state.row_notes.remove(&sid);
                                 }
                             }
                         }
@@ -6302,6 +6872,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     Shell {
                         focus: cx.focus_handle(),
                         demo: DemoOverlay::default(),
+                        rename: None,
                         launcher: LauncherUi::default(),
                         conn: conn.clone(),
                         sessions: sessions.clone(),
@@ -6556,6 +7127,7 @@ mod tests {
         SessionInfo {
             session_id: id.into(),
             title: None,
+            archived: false,
             provider: "claude-code".into(),
             model: None,
             cwd: "/tmp/repo".into(),
@@ -6676,5 +7248,126 @@ mod tests {
         // An isolated session's cwd already ends in its own sid8.
         s.cwd = "/Users/x/wt/proj/aaaa1111".into();
         assert_eq!(rail_meta_line(&s, Some("/Users/x")), "~/wt/proj/aaaa1111");
+    }
+
+    // -----------------------------------------------------------------
+    // Stage AC — the archive filter.
+
+    /// The plain rule and its two deliberate exceptions.
+    #[test]
+    fn the_filter_hides_an_archived_row_and_never_hides_a_blocked_one() {
+        let plain = info("aaaa1111", 1, None);
+        assert!(
+            rail_shows(&plain, None, false),
+            "an unarchived session is not affected by the filter"
+        );
+
+        let mut filed = plain.clone();
+        filed.archived = true;
+        assert!(!rail_shows(&filed, None, false), "the bit did nothing");
+        assert!(
+            rail_shows(&filed, None, true),
+            "the toggle did not bring it back"
+        );
+        assert!(
+            rail_shows(&filed, Some("aaaa1111"), false),
+            "the session on screen lost its row — nothing left to \
+             unarchive it with"
+        );
+        assert!(
+            !rail_shows(&filed, Some("bbbb2222"), false),
+            "some OTHER session being selected unhid it"
+        );
+
+        // eave never auto-answers a permission question (Slice K), so the
+        // only way out of `awaiting_approval` is a click. A filter that
+        // hid this row would park the agent for the life of the process.
+        let mut asking = filed.clone();
+        asking.state = "awaiting_approval".into();
+        asking.pending_approvals = 1;
+        assert!(rail_shows(&asking, None, false));
+        // Either half alone is enough. The count and the state name are
+        // maintained by two different engine-side structures, and the
+        // error this predicate must not make is hiding a row that needed
+        // showing — so it takes the union rather than trusting them to
+        // agree on every snapshot.
+        let mut count_only = filed.clone();
+        count_only.pending_approvals = 1;
+        assert!(rail_shows(&count_only, None, false), "the count alone");
+        let mut name_only = filed.clone();
+        name_only.state = "awaiting_approval".into();
+        assert!(rail_shows(&name_only, None, false), "the state name alone");
+
+        // And the states that are NOT exceptions, one at a time — these
+        // are the reasons people archive, so exempting them would make the
+        // bit useless exactly when it is wanted.
+        for state in ["running", "quiet", "failed", "unresponsive", "done"] {
+            let mut s = filed.clone();
+            s.state = state.into();
+            assert!(
+                !rail_shows(&s, None, false),
+                "an archived `{state}` session refused to stay filed away"
+            );
+        }
+    }
+
+    /// A row the filter let through says why it is there.
+    #[test]
+    fn a_visible_archived_row_states_that_it_is_archived() {
+        let mut s = info("aaaa1111", 1, None);
+        assert_eq!(
+            archived_line(&s, false),
+            None,
+            "an ordinary row says nothing"
+        );
+
+        s.archived = true;
+        assert_eq!(archived_line(&s, false).as_deref(), Some("archived"));
+        assert_eq!(archived_line(&s, true).as_deref(), Some("archived"));
+
+        // On screen because it is blocked on the operator, while the
+        // toggle says archived rows are hidden: the row has to account
+        // for its own presence or the filter reads as broken.
+        s.pending_approvals = 2;
+        assert_eq!(
+            archived_line(&s, false).as_deref(),
+            Some("archived · still asking")
+        );
+        // The state name alone gets the row on screen (see `rail_shows`),
+        // so it has to account for itself too.
+        s.pending_approvals = 0;
+        s.state = "awaiting_approval".into();
+        assert_eq!(
+            archived_line(&s, false).as_deref(),
+            Some("archived · still asking")
+        );
+        // With the shelf open every archived row is on screen, so there is
+        // nothing to account for.
+        assert_eq!(archived_line(&s, true).as_deref(), Some("archived"));
+    }
+
+    /// The toggle states a fact and an action, and its count is of
+    /// archived SESSIONS rather than of hidden rows — those two numbers
+    /// differ whenever an exception is on screen.
+    #[test]
+    fn the_archived_toggle_reads_the_same_way_in_both_directions() {
+        assert_eq!(archived_toggle_label(3, false), "3 archived · show");
+        assert_eq!(archived_toggle_label(3, true), "3 archived · hide");
+        assert_eq!(archived_toggle_label(1, false), "1 archived · show");
+    }
+
+    /// An empty rail must never lose the reason it is empty. "no sessions"
+    /// over a rail whose sessions are all filed away is exactly the
+    /// "error state that lost its error" this codebase keeps finding.
+    #[test]
+    fn an_empty_rail_says_why_it_is_empty() {
+        assert_eq!(rail_empty_note(0, 0), "no sessions");
+        assert_eq!(
+            rail_empty_note(4, 4),
+            "every session is archived (4)",
+            "a filtered-to-nothing rail claimed there were no sessions"
+        );
+        // Not reachable through today's filter, and stated anyway.
+        assert_eq!(rail_empty_note(4, 1), "nothing to show — 1 of 4 archived");
     }
 }

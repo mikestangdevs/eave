@@ -340,7 +340,7 @@ async fn the_engine_never_mines_a_title_out_of_the_transcript() {
 ///
 /// The turn is the part worth having a test for. `meta.json` is rewritten
 /// wholesale at spawn and again at `init`, from a snapshot taken before
-/// the rename; without `Meta::save_keeping_title` the name vanishes the
+/// the rename; without `Meta::save_keeping_operator_fields` the name vanishes the
 /// first time you talk to the session you just named.
 #[tokio::test]
 async fn an_operator_title_is_a_durable_session_fact() {
@@ -639,6 +639,190 @@ async fn watch_snapshot_rebuilds_after_engine_restart() {
         by_id("s2").state,
         "new",
         "never-spawned session loads as new"
+    );
+
+    drop(engine2);
+}
+
+/// Stage AC: **the journal is never touched.** That is the entire
+/// contract of the archive bit, and it is asserted the only way worth
+/// asserting it — on the bytes of `journal.jsonl`, before and after, with
+/// a real transcript in the file so there is something to lose.
+///
+/// The rest of the slice depends on this being true: the whole reason
+/// archive is safe to offer as a one-click action is that it is
+/// reversible, and it is only reversible because nothing was destroyed.
+/// An archive that rewrote history would be a delete wearing a softer
+/// word.
+#[tokio::test]
+async fn archiving_never_touches_the_journal() {
+    let dir = scratch();
+    let engine = EngineProc::spawn(&dir, "linger");
+
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open s1");
+    c.send("s1", "write something down").await.expect("send");
+
+    // Wait for a journal with real content in it — archiving an empty file
+    // proves nothing.
+    let journal = dir.join("sessions").join("s1").join("journal.jsonl");
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < end, "the journal never grew a transcript");
+        let bytes = std::fs::read(&journal).unwrap_or_default();
+        if String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+            >= 3
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    c.kill("s1").await.expect("kill");
+    // Settle: a live process can still be appending closers.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = std::fs::read(&journal).expect("read journal");
+    assert!(
+        before.len() > 100,
+        "only {} bytes of journal — nothing here is at risk",
+        before.len()
+    );
+
+    let info = c.set_archived("s1", true).await.expect("archive");
+    assert!(info.archived, "the engine did not report the bit back");
+    assert_eq!(
+        std::fs::read(&journal).expect("read journal"),
+        before,
+        "archiving rewrote the journal — the one thing it may never do"
+    );
+
+    let info = c.set_archived("s1", false).await.expect("unarchive");
+    assert!(!info.archived, "the same method has to flip it back");
+    assert_eq!(
+        std::fs::read(&journal).expect("read journal"),
+        before,
+        "un-archiving rewrote the journal"
+    );
+
+    // And the transcript still replays, byte for byte, to a subscriber —
+    // "the file is unchanged" and "the session still works" are different
+    // claims and the second is the one an operator cares about.
+    c.set_archived("s1", true).await.expect("archive again");
+    let mut t = Transcript::new();
+    let mut rx = c.subscribe("s1", None).await.expect("subscribe");
+    drain_records(&mut rx, &mut t, 1, Duration::from_secs(15)).await;
+    assert!(
+        t.rows
+            .iter()
+            .any(|r| matches!(r, Row::User { text, .. } if text.contains("write something down"))),
+        "an archived session stopped replaying its own transcript: {:?}",
+        t.rows
+    );
+
+    drop(engine);
+}
+
+/// Stage AC: the bit is a durable session fact, it survives the meta
+/// rewrites a turn performs, and **the engine keeps reporting archived
+/// sessions on `list` and `watch`**.
+///
+/// That last claim is the one that makes the feature reversible from a
+/// UI. An engine that filtered its own listing would leave the bit
+/// unreachable from the surface that set it — you could archive a session
+/// and then have no way to ask for it back.
+#[tokio::test]
+async fn an_archived_session_is_durable_and_still_listed() {
+    let dir = scratch();
+    let mut engine1 = EngineProc::spawn(&dir, "linger");
+
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open s1");
+    c.open(Some("s2".into()), None).await.expect("open s2");
+
+    let listed = c.list().await.expect("list");
+    assert!(
+        listed.iter().all(|s| !s.archived),
+        "a fresh session arrives archived"
+    );
+
+    c.set_archived("s1", true).await.expect("archive");
+    let listed = c.list().await.expect("list");
+    assert_eq!(
+        listed.len(),
+        2,
+        "the engine filtered its own listing — the bit is now unreachable \
+         from the client that set it: {listed:?}"
+    );
+    let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+    let s2 = listed.iter().find(|s| s.session_id == "s2").unwrap();
+    assert!(s1.archived);
+    assert!(!s2.archived, "archiving s1 archived its neighbour");
+
+    // Naming and filing are independent fields: setting one must not move
+    // the other, in either direction.
+    c.rename("s1", Some("the landfill")).await.expect("rename");
+    let s1 = c
+        .list()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|s| s.session_id == "s1")
+        .unwrap();
+    assert_eq!(s1.title.as_deref(), Some("the landfill"));
+    assert!(s1.archived, "a rename un-archived the session");
+
+    // A turn rewrites meta twice, from a snapshot that knows about
+    // neither field. Both have to still be there afterwards.
+    c.send("s1", "go").await.expect("send");
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < end, "session never went live");
+        let listed = c.list().await.expect("list");
+        let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+        assert!(
+            s1.archived,
+            "a turn un-archived the session the operator filed away"
+        );
+        assert_eq!(s1.title.as_deref(), Some("the landfill"));
+        if s1.live {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    c.kill("s1").await.expect("kill");
+    engine1.sigkill();
+
+    // Durable: a fresh engine reads it back off disk, and reports it.
+    let engine2 = EngineProc::spawn(&dir, "linger");
+    let c2 = Client::connect(&dir).await.expect("connect 2");
+    let mut watch = c2.watch().await.expect("watch");
+    let item = tokio::time::timeout(Duration::from_secs(10), watch.recv())
+        .await
+        .expect("snapshot in time")
+        .expect("watch open");
+    let SubscriptionItem::Sessions { sessions } = item else {
+        panic!("watch must open with a snapshot");
+    };
+    let s1 = sessions.iter().find(|s| s.session_id == "s1").unwrap();
+    assert!(s1.archived, "the bit did not survive a restart");
+    assert_eq!(s1.title.as_deref(), Some("the landfill"));
+    assert!(
+        sessions.iter().any(|s| s.session_id == "s2" && !s.archived),
+        "the unarchived neighbour vanished across the restart"
+    );
+
+    // Reversible after a restart too, which is the case that actually
+    // matters: the operator comes back tomorrow and wants it back.
+    let info = c2.set_archived("s1", false).await.expect("unarchive");
+    assert!(!info.archived);
+    assert!(
+        !Meta::load(&dir.join("sessions").join("s1"))
+            .expect("meta")
+            .archived,
+        "the reply said unarchived and the disk disagreed"
     );
 
     drop(engine2);

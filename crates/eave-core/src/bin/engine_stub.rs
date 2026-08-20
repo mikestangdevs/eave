@@ -88,6 +88,7 @@ async fn main() {
         state: "running".into(),
         child: Some(session.identity()),
         title: None,
+        archived: false,
     };
     meta.save(&dir).expect("save meta");
 

@@ -87,6 +87,7 @@ fn session(id: &str) -> SessionInfo {
     SessionInfo {
         session_id: id.into(),
         title: None,
+        archived: false,
         provider: "claude-code".into(),
         model: None,
         cwd: "/tmp/eave-harness".into(),
@@ -394,7 +395,7 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
     one.worktree = Some(worktree("eave/aaaa1111", Some(1), true));
     h.plumbing.push_rail(vec![one]);
     h.plumbing
-        .push_wt(("aaaa1111".into(), Some(WtNote::Error("refused".into()))));
+        .push_row_note(("aaaa1111".into(), Some(RowNote::Error("refused".into()))));
     vcx.run_until_parked();
     let room = vcx.debug_bounds("shares-aaaa1111").unwrap().size.width;
     let short_shares = vcx.debug_bounds("shares-aaaa1111").unwrap().size.height;
@@ -422,9 +423,9 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
     many.shared_with = (0..6).map(|i| format!("share{i}00000")).collect();
     many.worktree = Some(worktree("eave/aaaa1111", Some(1), true));
     h.plumbing.push_rail(vec![many]);
-    h.plumbing.push_wt((
+    h.plumbing.push_row_note((
         "aaaa1111".into(),
-        Some(WtNote::ConfirmDelete {
+        Some(RowNote::ConfirmDelete {
             dirty_files: Some(2),
             unmerged_commits: Some(0),
         }),
@@ -571,9 +572,9 @@ fn deleting_a_worktree_takes_two_clicks_and_restates_fresh_counts(cx: &mut TestA
     assert!(!shown(vcx, "wt-note-aaaa1111"), "nothing to state yet");
 
     // The engine refuses with facts; the row states them and arms.
-    h.plumbing.push_wt((
+    h.plumbing.push_row_note((
         "aaaa1111".into(),
-        Some(WtNote::ConfirmDelete {
+        Some(RowNote::ConfirmDelete {
             dirty_files: Some(2),
             unmerged_commits: Some(0),
         }),
@@ -583,9 +584,9 @@ fn deleting_a_worktree_takes_two_clicks_and_restates_fresh_counts(cx: &mut TestA
 
     // A second refusal with different counts replaces the note — the
     // operator always reads what is true now, not what was true then.
-    h.plumbing.push_wt((
+    h.plumbing.push_row_note((
         "aaaa1111".into(),
-        Some(WtNote::ConfirmDelete {
+        Some(RowNote::ConfirmDelete {
             dirty_files: Some(5),
             unmerged_commits: Some(1),
         }),
@@ -597,7 +598,7 @@ fn deleting_a_worktree_takes_two_clicks_and_restates_fresh_counts(cx: &mut TestA
                 .read(cx)
                 .sessions
                 .read(cx)
-                .wt_notes
+                .row_notes
                 .get("aaaa1111")
                 .cloned()
         })
@@ -605,7 +606,7 @@ fn deleting_a_worktree_takes_two_clicks_and_restates_fresh_counts(cx: &mut TestA
     assert!(
         matches!(
             stated,
-            Some(WtNote::ConfirmDelete {
+            Some(RowNote::ConfirmDelete {
                 dirty_files: Some(5),
                 unmerged_commits: Some(1)
             })
@@ -632,16 +633,16 @@ fn clearing_the_note_disarms_the_delete(cx: &mut TestAppContext) {
     let mut info = session("aaaa1111");
     info.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
     h.plumbing.push_rail(vec![info]);
-    h.plumbing.push_wt((
+    h.plumbing.push_row_note((
         "aaaa1111".into(),
-        Some(WtNote::ConfirmDelete {
+        Some(RowNote::ConfirmDelete {
             dirty_files: Some(2),
             unmerged_commits: Some(0),
         }),
     ));
     vcx.run_until_parked();
 
-    h.plumbing.push_wt(("aaaa1111".into(), None)); // settled
+    h.plumbing.push_row_note(("aaaa1111".into(), None)); // settled
     vcx.run_until_parked();
     assert!(
         !shown(vcx, "wt-note-aaaa1111"),
@@ -2108,11 +2109,17 @@ fn the_empty_note_never_becomes_a_row(cx: &mut TestAppContext) {
 fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
     let src = include_str!("ui.rs");
     let clicks = src.matches(".on_click(").count();
-    let cursors = src.matches(".cursor_pointer()").count();
+    // Both cursors count (Stage AC). The property is that a click handler
+    // always states what the pointer becomes — not that every one of them
+    // becomes a hand. The rail's rename field is typed into rather than
+    // pressed and takes an I-beam; `cursor_pointer` there would say
+    // "button" over a text box.
+    let cursors = src.matches(".cursor_pointer()").count() + src.matches(".cursor_text()").count();
     assert_eq!(
         clicks, cursors,
-        "every .on_click site needs a .cursor_pointer — eave had 84 fewer \
-         cursor calls than comet and every one of them was the default arrow"
+        "every .on_click site needs a .cursor_pointer or .cursor_text — \
+         eave had 84 fewer cursor calls than comet and every one of them \
+         was the default arrow"
     );
 
     // Hover coverage, all thirteen controls. Before Slice M five of them
@@ -4345,5 +4352,649 @@ fn a_state_change_never_moves_a_row_under_the_pointer(cx: &mut TestAppContext) {
     assert!(
         matches!(cmds.as_slice(), [Command::Select(id)] if id == "aaaa1111"),
         "the click landed somewhere else: {cmds:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage AC — the rail is a place you manage sessions.
+
+/// What is in the rename buffer right now, straight off the shell.
+fn rename_buffer(vcx: &mut VisualTestContext, h: &Harness) -> Option<String> {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell.read(cx).rename.as_ref().map(|e| e.text.clone())
+    })
+    .unwrap()
+}
+
+fn composer_draft(vcx: &mut VisualTestContext, h: &Harness) -> String {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell.read(cx).composer.read(cx).text.clone()
+    })
+    .unwrap()
+}
+
+/// Put one session in the rail and make it the selected one.
+fn rail_with_selected(h: &Harness, vcx: &mut VisualTestContext, infos: Vec<SessionInfo>, id: &str) {
+    h.plumbing.push_rail(infos);
+    h.plumbing.push_feed(FeedEvent::Session { id: id.into() });
+    vcx.run_until_parked();
+}
+
+/// The slice's first half. `rename` has been complete on the wire since
+/// Stage AB — method, engine, client, persistence, tests — with nothing in
+/// the GUI calling it, which is a half-kept feature by this project's own
+/// rule. This is the caller, driven end to end.
+///
+/// The second assertion is the one worth keeping: the app sends the text
+/// RAW. Normalization is `eave_core::store::normalize_title`'s and the
+/// engine's reply is what landed, so there is exactly one implementation
+/// of what a title is rather than two that eventually disagree about
+/// whether a double space matters.
+#[gpui::test]
+fn the_rail_renames_a_session_and_leaves_normalizing_to_the_engine(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+
+    assert!(shown(vcx, "label-aaaa1111"), "the row states a label");
+    assert!(
+        !shown(vcx, "rename-aaaa1111"),
+        "a field nobody asked for is open"
+    );
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "rename-aaaa1111"),
+        "the rename affordance opened nothing"
+    );
+    assert!(
+        !shown(vcx, "label-aaaa1111"),
+        "the field renders BESIDE the label instead of in its slot — two \
+         names for one row"
+    );
+
+    let _ = h.drain();
+    let typed = "chase  the flake";
+    vcx.simulate_input(typed);
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some(typed),
+        "the field did not take what was typed at it"
+    );
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Rename { id, title: Some(t) }]
+            if id == "aaaa1111" && t == typed),
+        "the app normalized the title itself, or sent something else: {cmds:?}"
+    );
+    assert!(
+        !shown(vcx, "rename-aaaa1111"),
+        "return left the field standing"
+    );
+    assert!(shown(vcx, "label-aaaa1111"), "the label never came back");
+}
+
+/// The field opens on the name it is editing, and escape means escape.
+///
+/// Seeded rather than blank because the common edit is a correction: a
+/// field that cleared the name you are trying to fix makes "leave it
+/// alone" and "delete it" the same gesture.
+#[gpui::test]
+fn the_rename_field_is_seeded_and_escape_sends_nothing(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut named = session("aaaa1111");
+    named.title = Some("the old name".into());
+    rail_with_selected(&h, vcx, vec![named], "aaaa1111");
+
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some("the old name"),
+        "the field opened empty over a session that already has a name"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_input("!!!");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "escape sent a rename — the one thing it must not do"
+    );
+    assert_eq!(rename_buffer(vcx, &h), None, "escape left the field open");
+    assert!(shown(vcx, "label-aaaa1111"), "the label never came back");
+}
+
+/// Clearing a name is the same verb as setting one — an empty field sends
+/// `None`, which is exactly what `Request::Rename` means by it. Two
+/// methods for one field is two things that can disagree about which is
+/// authoritative.
+#[gpui::test]
+fn an_empty_rename_field_clears_the_name(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut named = session("aaaa1111");
+    named.title = Some("abc".into());
+    rail_with_selected(&h, vcx, vec![named], "aaaa1111");
+
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    for _ in 0..3 {
+        vcx.simulate_keystrokes("backspace");
+    }
+    assert_eq!(rename_buffer(vcx, &h).as_deref(), Some(""));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Rename { id, title: None }] if id == "aaaa1111"),
+        "an emptied field did not clear the name: {cmds:?}"
+    );
+
+    // A field holding only spaces is not a name either, and it must not
+    // reach the wire as one.
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    for _ in 0..3 {
+        vcx.simulate_keystrokes("backspace");
+    }
+    vcx.simulate_input("   ");
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Rename { title: None, .. }]),
+        "whitespace became a title: {cmds:?}"
+    );
+}
+
+/// **The field owns the keyboard while it is open**, exactly the way P1's
+/// menus do and for the same reason: a field you can type past is not a
+/// field.
+///
+/// The specific failure this prevents is the one Slice T and Slice Q2 both
+/// shipped a version of — keystrokes landing in a composer buffer nobody
+/// can see, surfacing later as a message the operator never wrote. Here
+/// the composer is mounted and one keystroke away, which is what makes
+/// the assertion worth anything.
+#[gpui::test]
+fn the_rename_field_owns_the_keyboard_and_the_composer_stays_empty(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    assert!(
+        shown(vcx, "composer-hint"),
+        "no composer is mounted — then this test proves nothing"
+    );
+
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_input("naming this");
+    assert_eq!(rename_buffer(vcx, &h).as_deref(), Some("naming this"));
+    assert_eq!(
+        composer_draft(vcx, &h),
+        "",
+        "the keystrokes fell through into the composer's draft"
+    );
+    // Return is the field's, not the composer's: no `Send` may escape.
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Rename { .. }]),
+        "return did something other than commit the name: {cmds:?}"
+    );
+
+    // And with the field closed the composer has it back.
+    vcx.simulate_input("hello");
+    assert_eq!(composer_draft(vcx, &h), "hello");
+}
+
+/// Opening the field must not move the rows under it.
+///
+/// The rail already refuses to move a row under the pointer once
+/// (`fold_rail`, Stage AB — comet's bug). Growing the label slot by the
+/// height of a border would be the same defect arriving through layout
+/// instead of through sorting, and it would happen while the operator is
+/// mid-word.
+#[gpui::test]
+fn opening_the_rename_field_moves_no_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+
+    let row_a = vcx.debug_bounds("rail-aaaa1111").expect("row a");
+    let y_b = vcx.debug_bounds("rail-bbbb2222").expect("row b").origin.y;
+    let label = vcx.debug_bounds("label-aaaa1111").expect("label");
+
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    let field = vcx.debug_bounds("rename-aaaa1111").expect("field");
+
+    assert_eq!(
+        field.size.height, label.size.height,
+        "the field is a different height than the label it replaced — the \
+         invisible border on the label is what keeps these equal"
+    );
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().size.height,
+        row_a.size.height,
+        "the row grew when the field opened"
+    );
+    assert_eq!(
+        vcx.debug_bounds("rail-bbbb2222").unwrap().origin.y,
+        y_b,
+        "the row BELOW moved when the field opened — which is the version \
+         of this that hits a click you were already aiming"
+    );
+}
+
+/// Selecting another row closes the field rather than leaving a keyboard
+/// grab on a row the operator has walked away from.
+#[gpui::test]
+fn selecting_another_row_closes_an_open_rename(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rename-aaaa1111"));
+
+    let _ = h.drain();
+    click(vcx, "rail-bbbb2222");
+    vcx.run_until_parked();
+    assert_eq!(
+        rename_buffer(vcx, &h),
+        None,
+        "the field survived a selection change, still holding the keyboard"
+    );
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "and it swallowed the click that closed it: {cmds:?}"
+    );
+    // Nothing was sent for the abandoned edit — closing is not committing.
+    assert!(!cmds.iter().any(|c| matches!(c, Command::Rename { .. })));
+}
+
+/// Every affordance a selected row can carry, all at once, measured
+/// against the rail it has to live inside — with the words shaped by the
+/// real macOS text system, so a synthetic advance cannot make this pass
+/// vacuously.
+///
+/// Asserted as **clearance**, not fit: two buttons sharing an edge read as
+/// one control, and R1 already found what a non-wrapping row does with
+/// content it cannot hold — it draws the overflow on top of its
+/// neighbour.
+#[gpui::test]
+fn every_affordance_on_a_selected_row_stays_inside_the_rail(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // The widest set that can co-exist: `isolate` needs no worktree and
+    // `open`/`delete` need one, so four is the real worst case.
+    let mut owner = session("aaaa1111");
+    owner.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
+    rail_with_selected(&h, vcx, vec![owner], "aaaa1111");
+
+    let rail = vcx.debug_bounds("rail-rows").expect("the rail scroller");
+    let buttons = [
+        ("ren-aaaa1111", "rename"),
+        ("arc-aaaa1111", "archive"),
+        ("wto-aaaa1111", "open"),
+        ("wtd-aaaa1111", "delete"),
+    ];
+    let mut boxes = Vec::new();
+    for (selector, word) in buttons {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} did not render"));
+        // It kept its whole word. A button clipped to "arch…" states a
+        // different action from the one it performs.
+        let need = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
+        assert!(
+            b.size.width >= need + px(theme::SPACE_2 * 2.0) - px(1.),
+            "{selector} got {:?} for \"{word}\" needing {need:?} plus its \
+             own padding — it is clipping its label",
+            b.size.width
+        );
+        // Inside the rail, on both edges.
+        assert!(
+            b.origin.x >= rail.origin.x,
+            "{selector} starts left of the rail at {:?}",
+            b.origin.x
+        );
+        assert!(
+            b.origin.x + b.size.width <= rail.origin.x + rail.size.width,
+            "{selector} runs {:?} past the rail's right edge",
+            (b.origin.x + b.size.width) - (rail.origin.x + rail.size.width)
+        );
+        boxes.push((selector, b));
+    }
+    // Pairwise clearance. Two buttons on the same line need the row's own
+    // gap between them; two on different lines need daylight vertically.
+    // `> 0` — the check §Traps records as insufficient — would pass on two
+    // boxes sharing an edge.
+    for (i, (sa, a)) in boxes.iter().enumerate() {
+        for (sb, b) in boxes.iter().skip(i + 1) {
+            let dx = if a.origin.x < b.origin.x {
+                b.origin.x - (a.origin.x + a.size.width)
+            } else {
+                a.origin.x - (b.origin.x + b.size.width)
+            };
+            let dy = if a.origin.y < b.origin.y {
+                b.origin.y - (a.origin.y + a.size.height)
+            } else {
+                a.origin.y - (b.origin.y + b.size.height)
+            };
+            assert!(
+                dx >= px(theme::SPACE_2 - 1.0) || dy >= px(0.),
+                "{sa} and {sb} are {dx:?} apart horizontally and {dy:?} \
+                 vertically — the row lays out {:?} of gap and they are \
+                 drawing over each other",
+                px(theme::SPACE_2)
+            );
+        }
+    }
+}
+
+/// Queue row 10, driven: one click files a session away, and the SAME
+/// button one click later brings it back. No two-step, because nothing is
+/// destroyed — the journal is not touched (proved on the engine's side in
+/// `watch::archiving_never_touches_the_journal`), so a confirmation here
+/// would be ceremony with no fact behind it.
+///
+/// It also asserts the thing that reads as a bug and is not:
+/// **archiving the row you are on does not yank it out from under you.**
+/// The row stays, wearing the word `archived`, which is what confirms the
+/// click; it leaves when you move on.
+#[gpui::test]
+fn archiving_is_one_click_and_the_same_click_undoes_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    assert!(
+        !shown(vcx, "archived-aaaa1111"),
+        "a fresh session already claims to be archived"
+    );
+
+    let _ = h.drain();
+    click(vcx, "arc-aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::SetArchived { id, archived: true }]
+            if id == "aaaa1111"),
+        "the archive affordance sent something else: {cmds:?}"
+    );
+
+    // The engine agrees, and the snapshot comes back.
+    let mut filed = session("aaaa1111");
+    filed.archived = true;
+    h.plumbing.push_rail(vec![filed]);
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "rail-aaaa1111"),
+        "archiving the session on screen pulled its row out from under the \
+         click that did it"
+    );
+    assert!(
+        shown(vcx, "archived-aaaa1111"),
+        "nothing on the row confirms it was filed away"
+    );
+
+    let _ = h.drain();
+    click(vcx, "arc-aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::SetArchived { id, archived: false }]
+            if id == "aaaa1111"),
+        "the same button did not offer the way back: {cmds:?}"
+    );
+}
+
+/// The filter, and the shelf that undoes it. An archived session nobody is
+/// looking at leaves the default listing; the toggle states how many are
+/// there and brings them back.
+#[gpui::test]
+fn an_archived_row_leaves_the_rail_and_the_shelf_brings_it_back(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut filed = session("aaaa1111");
+    filed.archived = true;
+    h.plumbing.push_rail(vec![filed, session("bbbb2222")]);
+    vcx.run_until_parked();
+
+    assert!(
+        !shown(vcx, "rail-aaaa1111"),
+        "the archived row is still in the default listing"
+    );
+    assert!(shown(vcx, "rail-bbbb2222"), "it took its neighbour with it");
+    assert!(
+        shown(vcx, "rail-archived"),
+        "the rail hid a session and offered no way to find it"
+    );
+
+    click(vcx, "rail-archived");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-aaaa1111"), "the shelf opened onto nothing");
+    assert!(
+        shown(vcx, "archived-aaaa1111"),
+        "with the shelf open, an archived row is indistinguishable from a \
+         live one"
+    );
+    assert!(shown(vcx, "rail-bbbb2222"), "the shelf hid the working set");
+
+    click(vcx, "rail-archived");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "rail-aaaa1111"), "the shelf would not close");
+}
+
+/// The shelf appears only when there is something on it, so a rail nobody
+/// has archived from looks exactly as it always did.
+#[gpui::test]
+fn a_rail_with_nothing_archived_shows_no_shelf(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-aaaa1111"));
+    assert!(
+        !shown(vcx, "rail-archived"),
+        "a control for a shelf holding nothing"
+    );
+}
+
+/// **The eternal-skeleton guard.** A filter that can produce "no rows"
+/// must never produce "no rows for no stated reason" — an empty state that
+/// lost the reason it is empty is the same defect as a skeleton that lost
+/// its error, and it is the one this rail could plausibly grow.
+///
+/// So a rail whose every session is filed away says so, and the control
+/// that undoes it is on screen at the same time.
+#[gpui::test]
+fn a_rail_filtered_down_to_nothing_says_why(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.archived = true;
+    let mut b = session("bbbb2222");
+    b.archived = true;
+    h.plumbing.push_rail(vec![a, b]);
+    vcx.run_until_parked();
+
+    assert!(!shown(vcx, "rail-aaaa1111") && !shown(vcx, "rail-bbbb2222"));
+    assert!(
+        shown(vcx, "rail-empty"),
+        "an empty rail said nothing at all"
+    );
+    assert_eq!(
+        rail_empty_note(2, 2),
+        "every session is archived (2)",
+        "and what it said was the pre-Stage-AC \"no sessions\", which is \
+         false here"
+    );
+    assert!(
+        shown(vcx, "rail-archived"),
+        "the way out of an all-archived rail is not on screen"
+    );
+
+    click(vcx, "rail-archived");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-aaaa1111") && shown(vcx, "rail-bbbb2222"));
+    assert!(
+        !shown(vcx, "rail-empty"),
+        "the empty note outlived the rows"
+    );
+}
+
+/// eave never auto-approves, never auto-denies and never times out into
+/// either (Slice K), so the only way out of `awaiting_approval` is
+/// somebody clicking. A filter that hid that row would park the agent for
+/// the life of the process behind an affordance nobody can reach.
+///
+/// The row therefore stays, and it accounts for its own presence in a list
+/// the operator believes is filtered.
+#[gpui::test]
+fn an_archived_session_parked_on_a_question_keeps_its_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut asking = session("aaaa1111");
+    asking.archived = true;
+    asking.state = "awaiting_approval".into();
+    asking.pending_approvals = 1;
+    // A second archived session in a state nobody is blocked on, as the
+    // control: if BOTH show, the filter is simply off.
+    let mut done = session("bbbb2222");
+    done.archived = true;
+    done.state = "failed".into();
+    h.plumbing.push_rail(vec![asking, done]);
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "rail-aaaa1111"),
+        "an archived session parked on the operator vanished — nothing can \
+         answer it now"
+    );
+    assert!(
+        shown(vcx, "badge-aaaa1111"),
+        "and it lost the badge that says you are the blocker"
+    );
+    assert!(
+        !shown(vcx, "rail-bbbb2222"),
+        "the archived `failed` session stayed too — the exception is not an \
+         exception, the filter is off"
+    );
+    assert_eq!(
+        archived_line(
+            &{
+                let mut s = session("aaaa1111");
+                s.archived = true;
+                s.pending_approvals = 1;
+                s
+            },
+            false
+        )
+        .as_deref(),
+        Some("archived · still asking"),
+        "the row is on screen against the operator's filter and does not \
+         say why"
+    );
+}
+
+/// N4's floor, applied to the one surface in this slice that could break
+/// it: **a rename field sitting open costs nothing.**
+///
+/// The composer's caret blinks, and a blink never settles — its consumer
+/// holds a pulse lease for as long as it is on screen (`caret_lit`, and
+/// the divergence is documented there). This field draws a SOLID caret
+/// precisely so that the idle floor stays reachable with a text box open.
+#[gpui::test]
+fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    // A files snapshot has to arrive before ANY selected session can
+    // settle: `Shell::work_in_flight` counts "a selected session whose
+    // files snapshot has not arrived" as work in flight, so the skeleton
+    // rows hold a pulse lease for as long as nobody answers. That is a
+    // KNOWN, pre-existing bug (catch-up plan §4.5, still open) and not
+    // this slice's — Slice T hit the identical wall fixing the caret
+    // test. Answering it here is what makes the assertions below about
+    // the rename field rather than about the files rail.
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::WorkingTree,
+        }),
+    ));
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+    assert!(
+        !clock_running(vcx),
+        "the shell was already leasing the clock before the field opened — \
+         then nothing below is measuring the field"
+    );
+
+    click(vcx, "ren-aaaa1111");
+    vcx.simulate_input("naming this one");
+    let entering = drive(&h, vcx, Duration::from_millis(16));
+    assert!(
+        shown(vcx, "rename-aaaa1111"),
+        "the field closed before it was measured"
+    );
+    assert!(
+        entering < 400,
+        "the field never settled after {entering} frames"
+    );
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0,
+        "an open rename field is still asking for frames",
+    );
+    assert!(
+        !clock_running(vcx),
+        "the rename caret leased the pulse clock — the whole reason it is \
+         drawn solid is that a blink here would pin the window at the \
+         frame rate for as long as somebody is naming something",
+    );
+}
+
+/// **Hiding a row does not make its agent free.**
+///
+/// Stage L's aggregate ceiling exists for the session whose cost the
+/// operator has stopped thinking about, and archiving one is the most
+/// literal way there is to stop thinking about it. The filter is a
+/// listing decision; the total is a fact about the machine, and it is
+/// computed over every session the engine reports.
+///
+/// The first version of this slice got it wrong in exactly one line — the
+/// ceiling was computed from the filtered list — and the failure is
+/// invisible by eye: the number is simply smaller than the truth.
+#[gpui::test]
+fn an_archived_agent_still_counts_against_the_memory_ceiling(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut filed = session("aaaa1111");
+    filed.archived = true;
+    filed.live = true;
+    filed.state = "running".into();
+    filed.rss_bytes = Some(2 * 1024 * 1024 * 1024);
+    h.plumbing.push_rail(vec![filed]);
+    vcx.run_until_parked();
+
+    assert!(
+        !shown(vcx, "rail-aaaa1111"),
+        "the row is not hidden — then this measures nothing"
+    );
+    assert!(
+        shown(vcx, "rail-resource"),
+        "the only live agent was archived and the machine's ceiling went \
+         with it: two gigabytes of resident memory stopped being reported \
+         because a row stopped being drawn"
     );
 }

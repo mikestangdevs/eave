@@ -33,10 +33,10 @@ use eave_core::session::{
 use eave_core::store::{normalize_title, EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, ChangedFile, Cursor, DecideOk, Decision, DiffBasis, DiffOk, FileScope, FileStatus,
-    FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, RenameOk, Request,
-    RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem,
-    UnsubscribeOk, PROTO_VERSION,
+    socket_path, ArchiveOk, ChangedFile, Cursor, DecideOk, Decision, DiffBasis, DiffOk, FileScope,
+    FileStatus, FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk,
+    RenameOk, Request, RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo,
+    SubscriptionItem, UnsubscribeOk, PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -151,6 +151,11 @@ struct Shared {
     /// `meta.json`. Never derived from `records` — see
     /// [`eave_wire::SessionInfo::title`].
     title: Option<String>,
+    /// The operator filed this session away (Stage AC), mirroring
+    /// `meta.json`. Engine-side it changes NOTHING about the session —
+    /// it is reported and it is durable, and every decision it drives is
+    /// the client's. See [`eave_wire::SessionInfo::archived`].
+    archived: bool,
     /// When [`Shared::reported_state`] last changed (Stage AB). `None`
     /// until it moves; the rail falls back to `created_ts_ms`.
     last_activity_ms: Option<u64>,
@@ -367,6 +372,10 @@ impl SessionHandle {
             // the isolation invariant (spec 05 §Watch) forbids it, and
             // `watch.rs` proves the forbidding on raw bytes.
             title: s.title.clone(),
+            // Stage AC. Reported like any other session fact — the engine
+            // never filters its own listing on it; see the field's docs
+            // for why that is the client's job.
+            archived: s.archived,
             provider: s.header.provider.clone(),
             // Slice P2. A configured model is a fact ABOUT the session, in
             // the same class as `provider` and `cwd` — not transcript
@@ -742,6 +751,8 @@ impl Engine {
                 child: None,
                 // Stage AB: nobody has named it yet, and eave will not.
                 title: None,
+                // Stage AC: a session is born in the rail, not out of it.
+                archived: false,
             };
             meta.save(&dir).map_err(|e| format!("save meta: {e}"))?;
             let (bcast, _) = broadcast::channel(BROADCAST_CAP);
@@ -763,6 +774,8 @@ impl Engine {
                     // kind (it happens to equal creation today) that stops
                     // being true the moment creation and open diverge.
                     title: None,
+                    // Stage AC: a session is born in the rail.
+                    archived: false,
                     last_activity_ms: None,
                 }),
                 bcast,
@@ -811,11 +824,18 @@ impl Engine {
             .unwrap_or_else(|| "new".into());
         // Keep meta in step with what repair concluded.
         let mut title = None;
+        let mut archived = false;
         if let Ok(mut meta) = Meta::load(&dir) {
             // Stage AB: the operator's name for this session is durable —
             // it is read back here and nowhere else. A meta that fails to
             // load leaves the session unnamed rather than guessing one.
             title = meta.title.clone();
+            // Stage AC, same rule and the same failure posture: a meta
+            // that will not load leaves the session VISIBLE. Guessing
+            // `true` would hide a session nobody filed away, and the
+            // operator would have no way to tell that from a session the
+            // engine lost.
+            archived = meta.archived;
             if meta.state != state || meta.child.is_some() {
                 meta.state = state.clone();
                 meta.child = None;
@@ -852,6 +872,7 @@ impl Engine {
                 pid: None,
                 attention: None,
                 title,
+                archived,
                 last_activity_ms,
             }),
             bcast,
@@ -991,11 +1012,13 @@ impl Engine {
             session_id: handle.session_id.clone(),
             state: "running".into(),
             child: Some(session.identity()),
-            // Stage AB: overwritten by `save_keeping_title` from what is
-            // on disk — `rename` is the only writer of this field.
+            // Stage AB / AC: both overwritten by
+            // `save_keeping_operator_fields` from what is on disk — the
+            // operator methods are the only writers of these two fields.
             title: None,
+            archived: false,
         };
-        meta.save_keeping_title(&handle.dir)
+        meta.save_keeping_operator_fields(&handle.dir)
             .map_err(|e| format!("save meta: {e}"))?;
 
         {
@@ -1384,7 +1407,7 @@ impl Engine {
     /// Name a session, or clear its name with `None` (Stage AB).
     ///
     /// The **only** writer of `Meta::title`, in either direction. Every
-    /// other meta write goes through `save_keeping_title` and preserves
+    /// other meta write goes through `save_keeping_operator_fields` and preserves
     /// whatever this wrote; that single-writer rule is what keeps a rename
     /// from being erased by the next state transition.
     ///
@@ -1409,6 +1432,45 @@ impl Engine {
         // NOT a `settle_state` stamp: naming a session is not the session
         // doing anything, and sorting the rail by "most recently renamed"
         // would be a lie about which agent is working.
+        handle.poke_watch();
+        self.info_with_sharing(id)
+    }
+
+    /// File a session away, or bring it back (Stage AC).
+    ///
+    /// The **only** writer of `Meta::archived`, in either direction —
+    /// the same single-writer rule that keeps a rename from being erased
+    /// by the next state transition, and the reason every other meta
+    /// write goes through `save_keeping_operator_fields`.
+    ///
+    /// **The journal is not opened.** Not read, not appended to, not
+    /// rewritten. That is the whole contract: an archive that touched
+    /// history would be a delete wearing a softer word, and the bit's
+    /// entire value is that flipping it back restores the session exactly.
+    ///
+    /// Allowed in every state, including while live, for the same reason
+    /// `rename` is: there is nothing to serialize against. The engine
+    /// deliberately does not refuse a session that is parked on a
+    /// permission question either — what must not happen is such a
+    /// session becoming *unreachable*, and that is a listing rule kept by
+    /// the client that draws the list (`ui::rail_shows`), not a refusal
+    /// here.
+    fn set_archived(&self, id: &str, archived: bool) -> Result<SessionInfo, String> {
+        let handle = self.session(id)?;
+        let mut meta = Meta::load(&handle.dir).map_err(|e| {
+            format!(
+                "cannot archive {id}: its meta.json is unreadable ({e}) — refusing to \
+                 write a reconstructed one over it"
+            )
+        })?;
+        meta.archived = archived;
+        meta.save(&handle.dir)
+            .map_err(|e| format!("save meta: {e}"))?;
+        handle.shared.lock().unwrap().archived = archived;
+        // A rail row appeared or vanished — watchers re-snapshot.
+        // Deliberately NOT a `settle_state` stamp, for the same reason
+        // `rename` is not one: filing a session away is not the session
+        // doing anything.
         handle.poke_watch();
         self.info_with_sharing(id)
     }
@@ -1917,6 +1979,13 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
             }
             // Stage AB. Unary and on the connection loop: it is two small
             // file operations, unlike `isolate`, which shells out to git.
+            Request::Archive {
+                session_id,
+                archived,
+            } => match engine.set_archived(&session_id, archived) {
+                Ok(info) => ok_value(&ArchiveOk { info }),
+                Err(message) => ResponseBody::Err { message },
+            },
             Request::Rename { session_id, title } => match engine.rename(&session_id, title) {
                 Ok(info) => ok_value(&RenameOk { info }),
                 Err(message) => ResponseBody::Err { message },
