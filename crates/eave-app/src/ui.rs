@@ -1999,7 +1999,7 @@ impl Shell {
                         });
                     }))
                     .child(icons::tagged_icon(
-                        icons::PANEL_LEFT,
+                        icons::SIDEBAR_MINIMALISTIC_LEFT,
                         theme::ICON_TOGGLE,
                         // The pigment the hand-drawn version painted its
                         // border with. Named here, not inherited — gpui
@@ -2041,7 +2041,7 @@ impl Shell {
                         });
                     }))
                     .child(icons::tagged_icon(
-                        icons::PANEL_RIGHT,
+                        icons::SIDEBAR_MINIMALISTIC,
                         theme::ICON_TOGGLE,
                         theme::text_tertiary(),
                         "files-toggle-glyph",
@@ -2481,8 +2481,8 @@ impl Shell {
                             .items_center()
                             .gap(px(theme::SPACE_1))
                             .child(icons::tagged_icon(
-                                icons::PLUS,
-                                theme::ICON_INLINE,
+                                icons::PEN_NEW_SQUARE,
+                                theme::ICON_SM,
                                 theme::text_secondary(),
                                 "new-session-glyph",
                             ))
@@ -4210,7 +4210,7 @@ impl Render for Shell {
                                 }))
                                 .child(icons::tagged_icon(
                                     icons::ARROW_UP,
-                                    theme::ICON_SEND,
+                                    theme::ICON_SM,
                                     if has_draft {
                                         theme::on_inverse()
                                     } else {
@@ -4426,7 +4426,7 @@ impl Render for Shell {
                                                         .gap(px(theme::SPACE_1))
                                                         .child(icons::tagged_icon(
                                                             icons::ARROW_DOWN,
-                                                            theme::ICON_INLINE,
+                                                            theme::ICON_SM,
                                                             theme::text_secondary(),
                                                             "to-bottom-glyph",
                                                         ))

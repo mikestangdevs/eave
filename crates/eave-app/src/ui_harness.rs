@@ -2403,8 +2403,8 @@ fn every_swapped_control_draws_its_glyph_in_the_box_its_token_names(cx: &mut Tes
     vcx.run_until_parked();
 
     for (selector, expected) in [
-        ("send-glyph", theme::ICON_SEND),
-        ("new-session-glyph", theme::ICON_INLINE),
+        ("send-glyph", theme::ICON_SM),
+        ("new-session-glyph", theme::ICON_SM),
         ("rail-toggle-glyph", theme::ICON_TOGGLE),
         ("files-toggle-glyph", theme::ICON_TOGGLE),
         ("file-status-src/lib.rs", theme::ICON_STATUS),

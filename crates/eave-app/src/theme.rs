@@ -524,32 +524,61 @@ pub const STATE_DOT: f32 = 6.0;
 pub const TOOL_DOT: f32 = 5.0;
 
 // ---------------------------------------------------------------------------
-// Icons (Slice P3) — the box a glyph is drawn into.
+// Icons (Slices P3, Q1) — the box a glyph is drawn into.
 //
-// A gpui SVG is rendered INTO its box and tinted with the inherited text
-// colour, so these are the only numbers that decide how heavy the set
-// looks. They are not free-floating: each one is paired with a
-// `stroke-width` in the drawing, and `icons::tests` asserts the product
-// lands in the set's 1.0-1.2 px band. Change one of these and that test
-// tells you which file needs redrawing.
+// A gpui SVG is rendered INTO its box and tinted at paint time, so these
+// are the only numbers that decide how heavy the set looks. They are not
+// free-floating: each is paired with a `stroke-width` in the drawing, and
+// `icons::tests` walks these very constants asserting the product lands in
+// the family's 1.00-1.25 px band. Change one and that test names the class
+// it broke.
+//
+// Q1 REPLACED P3's ten hand-drawn glyphs with Solar Icons (Linear), whose
+// stroke is a fixed 1.5 on the 24-grid. That single number sets the whole
+// ladder: 1.5/24 is legible only between 16 and 20 px, so the 12 px and
+// 14 px slots P3 sized for its own heavier drawings could not survive the
+// swap. They did not shrink the family; the family exposed them.
 
-/// The composer's send arrow, inside the 26 px round button.
-pub const ICON_SEND: f32 = 14.0;
-/// Glyphs that sit inline beside a text label: `+ new`, `↓ bottom`.
-/// Smaller than the label's box on purpose — a glyph matched to the cap
-/// height of the text beside it reads as part of the same line.
-pub const ICON_INLINE: f32 = 12.0;
-/// Both rail collapse toggles in the titlebar. Larger than the 16 px the
-/// hand-drawn pictogram occupied, because the drawing carries its own
-/// padding: the panel rect spans 18 of 24 units, so a 20 px box puts it at
-/// 15 x 11.7 px — within half a pixel of the 16 x 12 rect it replaces. The
-/// visible mark is what should match, not the box around it.
+/// Glyphs beside a text label, and the composer's send arrow inside its
+/// 26 px round button. The family's floor: 1.5/24 x 16 = a 1.00 px stroke.
+///
+/// **This is where `ICON_SEND` (14) and `ICON_INLINE` (12) went.** Both
+/// were sized to sit at the cap height of the text beside them, which is
+/// the correct instinct for a glyph you drew yourself and the wrong one
+/// for a bought family: Solar Linear at 14 px is a 0.875 px stroke, a
+/// hairline that dissolves against `surface()`.
+pub const ICON_SM: f32 = 16.0;
+/// Standalone controls that carry no label of their own — the size the
+/// launcher's row affordances use. 1.5/24 x 18 = 1.125 px.
+pub const ICON_MD: f32 = 18.0;
+/// Both rail collapse toggles in the titlebar, and the family's ceiling:
+/// 1.5/24 x 20 = 1.25 px, the top of the band. Unchanged from P3, where
+/// the number was already chosen so the visible mark — not the box around
+/// it — matched the hand-drawn pictogram it replaced.
 pub const ICON_TOGGLE: f32 = 20.0;
 /// The file status glyph. Exactly [`FILE_STATUS_W`], so the slot is
 /// unchanged and paths stay aligned where the letter left them. The air
 /// is inside the drawing: every status mark spans at most 12 of the 24
 /// grid units, so it reads no larger than the letter it replaces.
+///
+/// These five are `icons::Class::Compact` — drawn at stroke 2.25 rather
+/// than the family's 1.5, which is what lets them hold at 12 px
+/// (2.25/24 x 12 = 1.125 px, mid-band) while the family cannot.
 pub const ICON_STATUS: f32 = 12.0;
+
+// ---------------------------------------------------------------------------
+// Provider marks (Slice Q1) — a vendor's own logo, not a glyph.
+//
+// Marks are fills, not strokes, so no weight band applies and these are
+// pure fit decisions. They are separate constants from the glyph ladder
+// because they will drift apart: a mark is sized so its SILHOUETTE reads
+// beside a name, and every vendor draws to a different bounding box.
+
+/// A mark beside a session's name, in a rail row or a tab.
+pub const ICON_MARK: f32 = 18.0;
+/// A mark as the subject of a launcher tile, where it is the thing being
+/// chosen rather than a label on something else.
+pub const ICON_MARK_LG: f32 = 28.0;
 
 // ---------------------------------------------------------------------------
 // Loaders (Slice N3) — the working indicator and the skeletons.
@@ -623,8 +652,9 @@ pub const PLATE_MARGIN: f32 = SPACE_3;
 pub const PROVIDER_CHIP: f32 = 18.0;
 pub const RADIUS_CHIP: f32 = 5.0;
 // Slice P3 deleted RAIL_TOGGLE_W/H and RADIUS_GLYPH with the hand-drawn
-// sidebar pictogram they described. The toggles are `icons::PANEL_LEFT`
-// and `PANEL_RIGHT` now, sized by `ICON_TOGGLE` above.
+// sidebar pictogram they described. The toggles are Solar's
+// `icons::SIDEBAR_MINIMALISTIC_LEFT` / `SIDEBAR_MINIMALISTIC` now, sized
+// by `ICON_TOGGLE` above.
 
 // ---------------------------------------------------------------------------
 // Files rail (Slice B) — rows on the bare glass ground, mirroring the

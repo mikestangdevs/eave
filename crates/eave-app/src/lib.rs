@@ -19,8 +19,10 @@ mod motion;
 /// and the headless acceptance runs do not.
 mod loaders;
 
-/// The icon pipeline (Slice P3): the embedded glyph set and the
-/// `AssetSource` that serves it. Private like the other render-path
+/// The icon pipeline (Slice P3) and the icon family (Slice Q1): the
+/// embedded glyph set, the `AssetSource` that serves it, and the three
+/// drawing classes that keep a bought family, five in-house glyphs and six
+/// provider marks reading as one set. Private like the other render-path
 /// modules — the headless acceptance runs never draw.
 mod icons;
 
