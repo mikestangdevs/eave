@@ -812,6 +812,17 @@ pub const MENU_SCREEN_MARGIN: f32 = SPACE_2;
 /// pays for it with a fold and a measured height, which is the next slice.
 pub const TOOL_ERROR_MAX_LINES: usize = 6;
 
+/// How many lines of one code fence the transcript draws before it states
+/// the remainder.
+///
+/// A fence is ONE row in a virtualized list, so an uncapped fence is a row
+/// whose height is whatever the agent felt like emitting — and the list's
+/// whole promise is that a row's height is knowable. 200 lines is well past
+/// any fence in the capture corpus and still bounded. The copy button takes
+/// the WHOLE fence, not the drawn part, so the cap costs reading and never
+/// costs data.
+pub const FENCE_MAX_LINES: usize = 200;
+
 pub const DISABLED_OPACITY: f32 = 0.35;
 
 // ---------------------------------------------------------------------------
