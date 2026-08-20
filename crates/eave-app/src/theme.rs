@@ -679,6 +679,27 @@ pub const RAIL_W: f32 = 248.0;
 /// Ground margin around the floating content card (and the air the rails
 /// keep from the window edges).
 pub const PLATE_MARGIN: f32 = SPACE_3;
+
+/// The rail's one left edge, and the rule that goes with it.
+///
+/// **Every direct child of a rail — the header label, a row's TEXT, the
+/// empty state, the footer line — starts on this edge. A row's CARD bleeds
+/// [`RAIL_CARD_BLEED`] outside it on both sides, and the header's trailing
+/// control shares the card's RIGHT edge.**
+///
+/// Written down because it was not, and a spacing scale cannot supply it: a
+/// scale tells you the SIZE of a gap and says nothing about which edge
+/// things line up on. Every value in the rails was already a legal
+/// `SPACE_*` and the result still had four different left edges — header
+/// label 24, row card 20, row text 28, footer 24 — with the row card
+/// overhanging the header's `+ new` button by 4 px. Both rails had it, the
+/// same way, because one was copied from the other.
+pub const RAIL_GUTTER: f32 = SPACE_3;
+
+/// How far a row's card extends outside [`RAIL_GUTTER`] on each side. The
+/// card is a highlight around text, so it must bleed past the text it
+/// highlights or the selection looks clipped.
+pub const RAIL_CARD_BLEED: f32 = SPACE_3;
 /// Provider identity chip: self-drawn monochrome initials on a bordered
 /// rounded square. Deliberately never a third-party mark — one uniform,
 /// self-drawn set for every provider (Slice A directive).
