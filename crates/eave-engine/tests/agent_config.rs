@@ -154,7 +154,10 @@ async fn argv_seen(c: &Client, session_id: &str) -> String {
                 _ => None,
             })
             .collect();
-        if let Some(line) = said.iter().find(|l| l.contains("--session-id") || l.contains("--resume")) {
+        if let Some(line) = said
+            .iter()
+            .find(|l| l.contains("--session-id") || l.contains("--resume"))
+        {
             return line.clone();
         }
         let remaining = end.saturating_duration_since(Instant::now());
@@ -219,7 +222,10 @@ async fn a_session_without_config_spawns_exactly_as_before() {
     let _engine = EngineProc::spawn(&dir, "argv-report");
     let c = Client::connect(&dir).await.expect("connect");
     let info = c.open(Some("s1".into()), None).await.expect("open");
-    assert_eq!(info.model, None, "no model configured means no model stated");
+    assert_eq!(
+        info.model, None,
+        "no model configured means no model stated"
+    );
 
     let argv = argv_seen(&c, "s1").await;
     assert!(
@@ -240,7 +246,10 @@ async fn the_config_survives_a_restart_and_governs_the_resume_spawn() {
             .await
             .expect("open");
         let first = argv_seen(&c, "s1").await;
-        assert!(first.contains("--session-id"), "first spawn names the id: {first}");
+        assert!(
+            first.contains("--session-id"),
+            "first spawn names the id: {first}"
+        );
         assert!(first.contains("--model haiku-9"), "first spawn: {first}");
     }
     // Engine gone. A new one has no memory of the config except the journal.

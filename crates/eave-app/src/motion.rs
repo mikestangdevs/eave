@@ -40,7 +40,6 @@
 //! drives them. (comet reads wall time here and keeps a separate pure core
 //! to stay testable; one time source is simpler and strictly stronger.)
 
-
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -491,26 +490,24 @@ fn epoch(cx: &App) -> Instant {
 /// The one timer. Wakes every [`PULSE_TICK`], reaps expired leases, notifies
 /// whoever is left, and *breaks* — dropping the task — when nobody is.
 fn spawn_ticker(cx: &mut App) {
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor().timer(PULSE_TICK).await;
-            let parked = cx.update(|cx| {
-                let now = cx.background_executor().now();
-                let clock = cx.global_mut::<PulseClock>();
-                clock.leases.retain(|_, until| *until > now);
-                if clock.leases.is_empty() {
-                    clock.running = false;
-                    return true;
-                }
-                let views: Vec<EntityId> = clock.leases.keys().copied().collect();
-                for view in views {
-                    cx.notify(view);
-                }
-                false
-            });
-            if parked {
-                break;
+    cx.spawn(async move |cx| loop {
+        cx.background_executor().timer(PULSE_TICK).await;
+        let parked = cx.update(|cx| {
+            let now = cx.background_executor().now();
+            let clock = cx.global_mut::<PulseClock>();
+            clock.leases.retain(|_, until| *until > now);
+            if clock.leases.is_empty() {
+                clock.running = false;
+                return true;
             }
+            let views: Vec<EntityId> = clock.leases.keys().copied().collect();
+            for view in views {
+                cx.notify(view);
+            }
+            false
+        });
+        if parked {
+            break;
         }
     })
     .detach();
@@ -670,11 +667,11 @@ impl Fades {
     /// it: the wash still has to appear, it just must not take time.
     fn set(&mut self, key: &str, hovered: bool, reduced: bool, now: Instant) {
         let target = if hovered { 1.0 } else { 0.0 };
-        let Some(current) = self
-            .entries
-            .get(key)
-            .map(|e| e.value(now))
-            .or(if hovered { Some(0.0) } else { None })
+        let Some(current) =
+            self.entries
+                .get(key)
+                .map(|e| e.value(now))
+                .or(if hovered { Some(0.0) } else { None })
         else {
             // A leave for an element that was never hovered — a stale entry
             // pruned mid-flight will do this. Nothing to fade back from.
@@ -701,7 +698,11 @@ impl Fades {
         match self.entries.get_mut(key) {
             Some(e) => {
                 e.seen = frame;
-                if reduced { e.target } else { e.value(now) }
+                if reduced {
+                    e.target
+                } else {
+                    e.value(now)
+                }
             }
             None => 0.0,
         }
@@ -889,7 +890,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Context, IntoElement, Render, TestAppContext, Window, div, hsla};
+    use gpui::{div, hsla, Context, IntoElement, Render, TestAppContext, Window};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -938,7 +939,10 @@ mod tests {
             let mut prev = 0.0;
             for i in 0..=1_000u32 {
                 let y = curve.eval(i as f32 / 1_000.0);
-                assert!(y >= prev - 1e-6, "curve went backwards at {i}: {prev} -> {y}");
+                assert!(
+                    y >= prev - 1e-6,
+                    "curve went backwards at {i}: {prev} -> {y}"
+                );
                 prev = y;
             }
         }
@@ -1155,7 +1159,11 @@ mod tests {
 
         cx.executor().advance_clock(Duration::from_millis(32));
         cx.run_until_parked();
-        assert_eq!(renders.get(), before, "a redraw arrived before the tick did");
+        assert_eq!(
+            renders.get(),
+            before,
+            "a redraw arrived before the tick did"
+        );
 
         cx.executor().advance_clock(Duration::from_millis(1));
         cx.run_until_parked();
@@ -1190,7 +1198,10 @@ mod tests {
 
         cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
-        assert!(!running(cx), "the clock never parked after the lease lapsed");
+        assert!(
+            !running(cx),
+            "the clock never parked after the lease lapsed"
+        );
 
         let quiet = renders.get();
         cx.executor().advance_clock(Duration::from_secs(1));
@@ -1420,7 +1431,11 @@ mod tests {
         let mut f = Fades::default();
         let t0 = Instant::now();
         frame(&mut f, t0, false);
-        assert_eq!(f.entrance("in:pill", DIALOG_IN, t0), 0.0, "it should start at zero");
+        assert_eq!(
+            f.entrance("in:pill", DIALOG_IN, t0),
+            0.0,
+            "it should start at zero"
+        );
 
         let arrived = t0 + Duration::from_millis(300);
         frame(&mut f, arrived, false);
@@ -1645,12 +1660,28 @@ mod tests {
         // `wash_rest`, which is transparent black; a filled one rests at its
         // own pigment.
         let pairs: [(&str, Hsla, Hsla); 6] = [
-            ("unfilled controls (9 of them)", theme::wash_rest(), theme::overlay()),
-            ("the selected rail row", theme::overlay_strong(), theme::overlay_strong()),
+            (
+                "unfilled controls (9 of them)",
+                theme::wash_rest(),
+                theme::overlay(),
+            ),
+            (
+                "the selected rail row",
+                theme::overlay_strong(),
+                theme::overlay_strong(),
+            ),
             ("an expanded file row", theme::overlay(), theme::overlay()),
-            ("attn-kill", theme::danger_wash_strong(), theme::danger_wash_hover()),
+            (
+                "attn-kill",
+                theme::danger_wash_strong(),
+                theme::danger_wash_hover(),
+            ),
             ("send, armed", theme::inverse(), theme::inverse_hover()),
-            ("send, unarmed", theme::overlay_strong(), theme::overlay_strongest()),
+            (
+                "send, unarmed",
+                theme::overlay_strong(),
+                theme::overlay_strongest(),
+            ),
         ];
         // Composite over eave's dark ground and report luminance. The
         // ground is the literal `#1A1A1A` of `canvas()`'s opaque branch
@@ -1666,10 +1697,11 @@ mod tests {
             let mix1 = |f: f32| f * c.a + GROUND * (1.0 - c.a);
             0.2126 * mix1(c.r) + 0.7152 * mix1(c.g) + 0.0722 * mix1(c.b)
         };
-        for (what, rest, hovered) in pairs
-            .into_iter()
-            .chain([("the ↓-bottom pill", theme::chrome_glass(), theme::chrome_glass_hover())])
-        {
+        for (what, rest, hovered) in pairs.into_iter().chain([(
+            "the ↓-bottom pill",
+            theme::chrome_glass(),
+            theme::chrome_glass_hover(),
+        )]) {
             let floor = over(rest).min(over(hovered));
             for i in 0..=100 {
                 let t = i as f32 / 100.0;

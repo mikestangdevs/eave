@@ -257,10 +257,7 @@ impl<T> Popup<T> {
                     return Some((1.0, 0.0));
                 }
                 let t = eased(&MENU_IN, now.saturating_duration_since(l.opened));
-                Some((
-                    lerp(MENU_OPACITY_FROM, 1.0, t),
-                    -MENU_RISE * (1.0 - t),
-                ))
+                Some((lerp(MENU_OPACITY_FROM, 1.0, t), -MENU_RISE * (1.0 - t)))
             }
             Phase::Closing(e) => {
                 if reduced {
@@ -362,7 +359,10 @@ fn entrance_opacity(elapsed: std::time::Duration) -> f32 {
 ///
 /// `MENU_OUT.scaled_total()`, so `EAVE_MOTION_SCALE` stretches the mounted
 /// life along with the tween it is there to outlast.
-pub fn reap<V: 'static>(cx: &mut Context<V>, finish: impl FnOnce(&mut V, &mut Context<V>) + 'static) {
+pub fn reap<V: 'static>(
+    cx: &mut Context<V>,
+    finish: impl FnOnce(&mut V, &mut Context<V>) + 'static,
+) {
     let span = MENU_OUT.scaled_total();
     cx.spawn(async move |view, cx| {
         cx.background_executor().timer(span).await;
@@ -466,12 +466,7 @@ pub fn menu_row(
             // By token, not by opacity — see the note in `launcher::tile`.
             theme::text_disabled()
         })
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .child(item.label.clone()),
-        )
+        .child(div().flex_1().min_w(px(0.)).child(item.label.clone()))
         .children(item.trailing.clone().map(|t| {
             div()
                 .flex_none()
@@ -545,9 +540,7 @@ pub fn menu_layer<T>(
                 .right_0()
                 .bottom_0()
                 .occlude()
-                .when(live, |d| {
-                    d.on_mouse_down(MouseButton::Left, on_dismiss)
-                })
+                .when(live, |d| d.on_mouse_down(MouseButton::Left, on_dismiss))
                 .child(
                     anchored()
                         .anchor(Anchor::TopLeft)
@@ -640,7 +633,9 @@ mod tests {
         let mut last = f32::INFINITY;
         for ms in [0u64, 10, 25, 50, 75, 99] {
             let at = closed_at + Duration::from_millis(ms);
-            let (o, _) = p.motion_at(at, false).expect("still mounted through the exit");
+            let (o, _) = p
+                .motion_at(at, false)
+                .expect("still mounted through the exit");
             assert!(o <= last, "opacity rose during the exit: {o} after {last}");
             // Sampling is not a side effect.
             for _ in 0..100 {
@@ -709,7 +704,10 @@ mod tests {
         assert_eq!(p.highlighted(), None, "a closing menu still had a cursor");
         p.highlight_next();
         assert_eq!(p.highlighted(), None, "a closing menu moved its cursor");
-        assert!(p.data().is_some(), "the exit lost the data it must paint with");
+        assert!(
+            p.data().is_some(),
+            "the exit lost the data it must paint with"
+        );
     }
 
     /// Reduced motion has no exit to play, so there is nothing to keep
@@ -742,7 +740,10 @@ mod tests {
         let (mut p, now) = menu();
         assert!(p.in_flight(now, false));
         let settled = now + MENU_IN.scaled_total();
-        assert!(!p.in_flight(settled, false), "the entrance outlived its span");
+        assert!(
+            !p.in_flight(settled, false),
+            "the entrance outlived its span"
+        );
         p.begin_close(settled, false);
         assert!(p.in_flight(settled, false));
         assert!(!p.in_flight(settled + MENU_OUT.scaled_total(), false));
@@ -760,7 +761,11 @@ mod tests {
         p.highlight_next();
         assert_eq!(p.highlighted(), Some(1));
         p.highlight_next();
-        assert_eq!(p.highlighted(), Some(3), "the highlight landed on a disabled row");
+        assert_eq!(
+            p.highlighted(),
+            Some(3),
+            "the highlight landed on a disabled row"
+        );
         p.highlight_next();
         assert_eq!(p.highlighted(), Some(0), "the highlight did not wrap");
         p.highlight_prev();
@@ -803,7 +808,10 @@ mod tests {
         let (mut p, now) = menu();
         p.begin_close(now, false);
         let later = now + Duration::from_millis(60);
-        assert!(p.begin_close(later, false), "still mounted, still needs reaping");
+        assert!(
+            p.begin_close(later, false),
+            "still mounted, still needs reaping"
+        );
         // Reaping on the ORIGINAL schedule, not a restarted one.
         p.finish_close(now + MENU_OUT.scaled_total());
         assert!(!p.is_mounted(), "the second escape extended the exit");

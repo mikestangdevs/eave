@@ -20,7 +20,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use eave_wire::{ChangedFile, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff, FileStatus, FilesSnapshot, GitState};
+use eave_wire::{
+    ChangedFile, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff, FileStatus, FilesSnapshot,
+    GitState,
+};
 
 /// Bound on every git call. Generous — a cold `status` on a large repo
 /// legitimately takes seconds — but hard: past it the child is killed
@@ -57,34 +60,95 @@ pub async fn scan(cwd: &Path) -> FilesSnapshot {
 /// [`scan`] with the git binary and timeout injectable (tests: a fake
 /// git that hangs proves the timeout, at test-scale duration).
 pub async fn scan_with(git: &Path, cwd: &Path, timeout: Duration) -> FilesSnapshot {
-    let status_bytes = match run(git, cwd, timeout, &["status", "--porcelain=v2", "-z", "--untracked-files=all"]).await {
+    let status_bytes = match run(
+        git,
+        cwd,
+        timeout,
+        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+    )
+    .await
+    {
         Ok(bytes) => bytes,
-        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+        Err(state) => {
+            return FilesSnapshot {
+                state,
+                files: Vec::new(),
+                omitted: 0,
+                watching: false,
+            }
+        }
     };
     let mut files = parse_status_v2(&status_bytes);
     if files.is_empty() {
-        return FilesSnapshot { state: GitState::Ok, files, omitted: 0, watching: false };
+        return FilesSnapshot {
+            state: GitState::Ok,
+            files,
+            omitted: 0,
+            watching: false,
+        };
     }
 
     // Line counts for tracked changes: one numstat against HEAD covers
     // staged + unstaged as a single per-file delta. A repo with no
     // commits has no HEAD — diff against its own empty tree instead
     // (hash-object, so SHA-1 and SHA-256 repos both answer).
-    let numstat = match run(git, cwd, timeout, &["diff", "--numstat", "-z", "-M", "HEAD", "--"]).await {
+    let numstat = match run(
+        git,
+        cwd,
+        timeout,
+        &["diff", "--numstat", "-z", "-M", "HEAD", "--"],
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(GitState::Error { .. }) => {
-            match run(git, cwd, timeout, &["hash-object", "-t", "tree", "/dev/null"]).await {
+            match run(
+                git,
+                cwd,
+                timeout,
+                &["hash-object", "-t", "tree", "/dev/null"],
+            )
+            .await
+            {
                 Ok(tree) => {
                     let tree = String::from_utf8_lossy(&tree).trim().to_string();
-                    match run(git, cwd, timeout, &["diff", "--numstat", "-z", "-M", &tree, "--"]).await {
+                    match run(
+                        git,
+                        cwd,
+                        timeout,
+                        &["diff", "--numstat", "-z", "-M", &tree, "--"],
+                    )
+                    .await
+                    {
                         Ok(bytes) => bytes,
-                        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+                        Err(state) => {
+                            return FilesSnapshot {
+                                state,
+                                files: Vec::new(),
+                                omitted: 0,
+                                watching: false,
+                            }
+                        }
                     }
                 }
-                Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+                Err(state) => {
+                    return FilesSnapshot {
+                        state,
+                        files: Vec::new(),
+                        omitted: 0,
+                        watching: false,
+                    }
+                }
             }
         }
-        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+        Err(state) => {
+            return FilesSnapshot {
+                state,
+                files: Vec::new(),
+                omitted: 0,
+                watching: false,
+            }
+        }
     };
     let counts = parse_numstat(&numstat);
     for f in &mut files {
@@ -114,12 +178,22 @@ pub async fn scan_with(git: &Path, cwd: &Path, timeout: Duration) -> FilesSnapsh
             }
         }
     }
-    FilesSnapshot { state: GitState::Ok, files, omitted, watching: false }
+    FilesSnapshot {
+        state: GitState::Ok,
+        files,
+        omitted,
+        watching: false,
+    }
 }
 
 /// Run one git command; classify failure as a stated fact. The child is
 /// killed on timeout (`kill_on_drop`).
-async fn run(git: &Path, cwd: &Path, timeout: Duration, args: &[&str]) -> Result<Vec<u8>, GitState> {
+async fn run(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    args: &[&str],
+) -> Result<Vec<u8>, GitState> {
     let child = Command::new(git)
         .args(args)
         .current_dir(cwd)
@@ -315,18 +389,34 @@ pub struct CheckoutProbe {
 
 pub async fn checkout_root(cwd: &Path) -> CheckoutProbe {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    match run(Path::new("git"), cwd, GIT_TIMEOUT, &["rev-parse", "--show-toplevel"]).await {
+    match run(
+        Path::new("git"),
+        cwd,
+        GIT_TIMEOUT,
+        &["rev-parse", "--show-toplevel"],
+    )
+    .await
+    {
         Ok(out) => {
             let top = String::from_utf8_lossy(&out).trim().to_string();
             if top.is_empty() {
                 // Inside a bare repo / .git dir: no worktree. Fall back
                 // to the directory itself.
-                CheckoutProbe { root: canon(cwd), is_repo: false }
+                CheckoutProbe {
+                    root: canon(cwd),
+                    is_repo: false,
+                }
             } else {
-                CheckoutProbe { root: canon(Path::new(&top)), is_repo: true }
+                CheckoutProbe {
+                    root: canon(Path::new(&top)),
+                    is_repo: true,
+                }
             }
         }
-        Err(_) => CheckoutProbe { root: canon(cwd), is_repo: false },
+        Err(_) => CheckoutProbe {
+            root: canon(cwd),
+            is_repo: false,
+        },
     }
 }
 
@@ -399,10 +489,15 @@ pub async fn worktree_prune(base: &Path) -> Result<(), String> {
 /// `git branch -D` — the engine only ever calls this for `eave/`
 /// branches it created (the guard lives at the call site).
 pub async fn branch_delete(base: &Path, branch: &str) -> Result<(), String> {
-    run(Path::new("git"), base, GIT_TIMEOUT, &["branch", "-D", "--", branch])
-        .await
-        .map(drop)
-        .map_err(stated)
+    run(
+        Path::new("git"),
+        base,
+        GIT_TIMEOUT,
+        &["branch", "-D", "--", branch],
+    )
+    .await
+    .map(drop)
+    .map_err(stated)
 }
 
 /// Worktree paths registered in the base repo (`git worktree list
@@ -441,7 +536,14 @@ pub async fn unmerged_count(repo: &Path, branch: &str) -> Option<u64> {
         repo,
         GIT_TIMEOUT,
         &[
-            "rev-list", "--count", branch, "--not", &exclude, "--branches", "--tags", "--remotes",
+            "rev-list",
+            "--count",
+            branch,
+            "--not",
+            &exclude,
+            "--branches",
+            "--tags",
+            "--remotes",
         ],
     )
     .await
@@ -496,7 +598,14 @@ async fn tracked_kind(git: &Path, cwd: &Path, timeout: Duration, file: &ChangedF
         Err(GitState::Error { .. }) => {
             // No HEAD yet? Diff against the repo's own empty tree
             // (hash-object, so SHA-1 and SHA-256 repos both answer).
-            let tree = match run(git, cwd, timeout, &["hash-object", "-t", "tree", "/dev/null"]).await {
+            let tree = match run(
+                git,
+                cwd,
+                timeout,
+                &["hash-object", "-t", "tree", "/dev/null"],
+            )
+            .await
+            {
                 Ok(t) => String::from_utf8_lossy(&t).trim().to_string(),
                 Err(state) => return state_to_kind(state),
             };
@@ -585,7 +694,10 @@ async fn run_capped(
             // Enough: kill the child (drop does) and state the cut.
             drop(child);
             bytes.truncate(cap);
-            return Ok(CappedOutput { bytes, truncated: true });
+            return Ok(CappedOutput {
+                bytes,
+                truncated: true,
+            });
         }
     }
     let status = match tokio::time::timeout_at(deadline, child.wait()).await {
@@ -598,7 +710,10 @@ async fn run_capped(
         Err(_elapsed) => return Err(timed_out()),
     };
     if status.success() {
-        return Ok(CappedOutput { bytes, truncated: false });
+        return Ok(CappedOutput {
+            bytes,
+            truncated: false,
+        });
     }
     let mut stderr_bytes = Vec::new();
     if let Some(mut se) = child.stderr.take() {
@@ -655,7 +770,9 @@ fn parse_diff(bytes: &[u8], byte_truncated: bool) -> DiffKind {
         }
         // File-header lines (diff --git, index, ---/+++, mode) precede
         // the first hunk; skip anything not inside one.
-        let Some(hunk) = hunks.last_mut() else { continue };
+        let Some(hunk) = hunks.last_mut() else {
+            continue;
+        };
         let (op, content) = match line.as_bytes().first() {
             Some(b'+') => (DiffOp::Add, &line[1..]),
             Some(b'-') => (DiffOp::Del, &line[1..]),
@@ -947,7 +1064,10 @@ mod tests {
 
     fn text_hunks(kind: &DiffKind) -> &Vec<DiffHunk> {
         match kind {
-            DiffKind::Text { hunks, truncated: false } => hunks,
+            DiffKind::Text {
+                hunks,
+                truncated: false,
+            } => hunks,
             other => panic!("expected untruncated text diff, got {other:?}"),
         }
     }
@@ -1085,7 +1205,11 @@ mod tests {
             .current_dir(&dir)
             .output()
             .expect("submodule add");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         git(&dir, &["commit", "-qm", "add sub"]);
         // Move the submodule's checked-out commit: the outer repo now
         // sees a pointer change.
@@ -1173,7 +1297,9 @@ mod tests {
         std::fs::write(dir.join("wide.txt"), body).unwrap();
         let d = scan_and_diff(&dir, "wide.txt").await;
         match d.kind {
-            DiffKind::Text { truncated, .. } => assert!(truncated, "byte cap must state truncation"),
+            DiffKind::Text { truncated, .. } => {
+                assert!(truncated, "byte cap must state truncation")
+            }
             other => panic!("expected truncated text, got {other:?}"),
         }
     }
@@ -1226,7 +1352,11 @@ mod tests {
 
         let wt_snap = scan(&wt).await;
         assert_eq!(wt_snap.state, GitState::Ok);
-        assert!(wt_snap.files.is_empty(), "worktree starts clean: {:?}", wt_snap.files);
+        assert!(
+            wt_snap.files.is_empty(),
+            "worktree starts clean: {:?}",
+            wt_snap.files
+        );
 
         let base_snap = scan(&base).await;
         assert_eq!(base_snap.files.len(), 1, "base keeps its dirty edit");

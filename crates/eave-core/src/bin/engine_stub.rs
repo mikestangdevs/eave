@@ -71,7 +71,7 @@ async fn main() {
         provider: "fake-agent".into(),
         cwd: cwd.display().to_string(),
         created_ts_ms: now_ms(),
-            agent: Default::default(),
+        agent: Default::default(),
     };
     let writer =
         JournalWriter::create(&Store::journal_path(&dir), &header).expect("create journal");

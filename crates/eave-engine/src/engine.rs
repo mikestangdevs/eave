@@ -19,7 +19,9 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 
 use eave_core::attention::{probe_failure, AttentionSnapshot, Classifier, ProbeFacts};
 use eave_core::claude::ClaudeCodeSession;
-use eave_core::journal::{self, now_ms, Header, JournalEvent, JournalWriter, Record, FORMAT_VERSION};
+use eave_core::journal::{
+    self, now_ms, Header, JournalEvent, JournalWriter, Record, FORMAT_VERSION,
+};
 use eave_core::proc::{self, PidState, ProcIdentity};
 use eave_core::process;
 use eave_core::recorder::{record_session, send_and_journal};
@@ -83,7 +85,11 @@ impl EngineConfig {
         // Slice K: the posture the fake agent will announce, so the
         // acceptance tests can drive the refusal paths through the real
         // spawn/verify path rather than around it.
-        for key in ["FAKE_PERMISSION_MODE", "FAKE_APPROVAL_TOOL", "FAKE_APPROVAL_PATH"] {
+        for key in [
+            "FAKE_PERMISSION_MODE",
+            "FAKE_APPROVAL_TOOL",
+            "FAKE_APPROVAL_PATH",
+        ] {
             if let Ok(v) = std::env::var(format!("EAVE_{key}")) {
                 agent_env.push((key.to_string(), v));
             }
@@ -248,7 +254,10 @@ fn load_worktree_meta(session_dir: &Path) -> Option<WorktreeMeta> {
 
 fn save_worktree_meta(session_dir: &Path, meta: &WorktreeMeta) -> io::Result<()> {
     let tmp = session_dir.join("worktree.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(meta).expect("worktree meta serializes"))?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(meta).expect("worktree meta serializes"),
+    )?;
     std::fs::rename(&tmp, worktree_meta_path(session_dir))
 }
 
@@ -310,14 +319,17 @@ impl SessionHandle {
             // value would freeze on an idle session, which is exactly the
             // session whose cost the operator has stopped thinking about.
             rss_bytes: s.pid.and_then(proc::resident_bytes),
-            worktree: self.worktree.lock().unwrap().as_ref().map(|w| {
-                eave_wire::WorktreeInfo {
+            worktree: self
+                .worktree
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|w| eave_wire::WorktreeInfo {
                     base: w.base.display().to_string(),
                     branch: w.branch.clone(),
                     present: w.present,
                     dirty_files: w.dirty_files,
-                }
-            }),
+                }),
         }
     }
 
@@ -342,8 +354,12 @@ impl SessionHandle {
         });
         let (mut items, floor) = match cursor {
             Some(c) if c.epoch == s.epoch && c.seq <= last_seq => {
-                let tail: Vec<Record> =
-                    s.records.iter().filter(|r| r.seq > c.seq).cloned().collect();
+                let tail: Vec<Record> = s
+                    .records
+                    .iter()
+                    .filter(|r| r.seq > c.seq)
+                    .cloned()
+                    .collect();
                 let mut items = Vec::new();
                 if !tail.is_empty() {
                     items.push(SubscriptionItem::Events {
@@ -412,7 +428,11 @@ impl SessionHandle {
 fn fs_watch_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EAVE_NO_FSWATCH").map(|v| v != "1").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("EAVE_NO_FSWATCH")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
 }
 
 /// RAII refcount of one `files` subscription: the first subscriber
@@ -481,10 +501,7 @@ impl Engine {
     /// asked for a model and would otherwise get another, which is the kind
     /// of quiet substitution this codebase states instead of doing.
     /// Re-opening with the same config, or with none, is fine.
-    fn reject_config_change(
-        have: &AgentConfig,
-        want: Option<&AgentConfig>,
-    ) -> Result<(), String> {
+    fn reject_config_change(have: &AgentConfig, want: Option<&AgentConfig>) -> Result<(), String> {
         match want {
             Some(w) if w != have => Err(format!(
                 "session already exists with a different agent config (has {have:?}, asked for \
@@ -577,8 +594,7 @@ impl Engine {
             // (fake-agent, other CLIs) accept any id; generated ids are
             // always UUIDs and pass. Existing journals are exempt: their
             // history is real and loadable regardless.
-            if self.cfg.agent_program == Path::new("claude")
-                && uuid::Uuid::parse_str(&id).is_err()
+            if self.cfg.agent_program == Path::new("claude") && uuid::Uuid::parse_str(&id).is_err()
             {
                 return Err(format!(
                     "session id {id:?} is not a UUID — the claude CLI rejects non-UUID session ids"
@@ -804,7 +820,11 @@ impl Engine {
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cfg.agent_program.clone());
-        let mut cfg = SpawnConfig::new(program, PathBuf::from(&header.cwd), handle.session_id.clone());
+        let mut cfg = SpawnConfig::new(
+            program,
+            PathBuf::from(&header.cwd),
+            handle.session_id.clone(),
+        );
         cfg.resume = resume;
         cfg.extra_env = self.cfg.agent_env.clone();
         cfg.model = agent.model.clone();
@@ -825,7 +845,8 @@ impl Engine {
             state: "running".into(),
             child: Some(session.identity()),
         };
-        meta.save(&handle.dir).map_err(|e| format!("save meta: {e}"))?;
+        meta.save(&handle.dir)
+            .map_err(|e| format!("save meta: {e}"))?;
 
         {
             let mut s = handle.shared.lock().unwrap();
@@ -924,7 +945,9 @@ impl Engine {
             // answered now (Slice K). The mode it ran under stays — that is
             // history the rail keeps stating.
             done_handle.approvals.lock().unwrap().pending.clear();
-            let _ = done_handle.bcast.send(Fanout::Attention(AttentionSnapshot::Running));
+            let _ = done_handle
+                .bcast
+                .send(Fanout::Attention(AttentionSnapshot::Running));
             done_handle.poke_watch();
             *done_handle.live.lock().await = None;
         });
@@ -1262,7 +1285,10 @@ fn write_unclaimed_report(path: &Path, root: &Path, found: &[PathBuf]) {
 fn last_permission_mode(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|r| match &r.event {
         JournalEvent::Provider {
-            event: eave_core::events::SessionEvent::Init { permission_mode, .. },
+            event:
+                eave_core::events::SessionEvent::Init {
+                    permission_mode, ..
+                },
         } => permission_mode.clone(),
         _ => None,
     })
@@ -1279,8 +1305,12 @@ fn fill_sharing(infos: &mut [SessionInfo]) {
         }
     }
     for s in infos.iter_mut() {
-        let Some(root) = &s.checkout_root else { continue };
-        let Some(ids) = by_root.get(root) else { continue };
+        let Some(root) = &s.checkout_root else {
+            continue;
+        };
+        let Some(ids) = by_root.get(root) else {
+            continue;
+        };
         s.shared_with = ids
             .iter()
             .filter(|id| **id != s.session_id)
@@ -1298,7 +1328,9 @@ fn track_approvals(handle: &Arc<SessionHandle>, rec: &Record) -> bool {
     let mut a = handle.approvals.lock().unwrap();
     match &rec.event {
         JournalEvent::Provider { event } => match event {
-            E::Init { permission_mode, .. } => {
+            E::Init {
+                permission_mode, ..
+            } => {
                 let changed = a.mode != *permission_mode;
                 a.mode = permission_mode.clone();
                 changed
@@ -1372,7 +1404,9 @@ async fn verify_worktree(handle: Arc<SessionHandle>) {
     let Some(wt) = handle.worktree.lock().unwrap().clone() else {
         return;
     };
-    let listed = crate::git::worktree_list(&wt.base).await.unwrap_or_default();
+    let listed = crate::git::worktree_list(&wt.base)
+        .await
+        .unwrap_or_default();
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let target = canon(&wt.path);
     let present = wt.path.exists() && listed.iter().any(|p| canon(p) == target);
@@ -1427,7 +1461,11 @@ pub async fn serve(cfg: EngineConfig) -> Result<(), ServeError> {
     serve_locked(cfg, store, lock).await
 }
 
-async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Result<(), ServeError> {
+async fn serve_locked(
+    cfg: EngineConfig,
+    store: Store,
+    _lock: EngineLock,
+) -> Result<(), ServeError> {
     let identity = proc::identity_of(std::process::id() as i32).unwrap_or(ProcIdentity {
         pid: std::process::id() as i32,
         start_tvsec: 0,
@@ -1456,7 +1494,11 @@ async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Res
         }
         match engine.load_from_disk(&id) {
             Ok(handle) => {
-                engine.sessions.lock().unwrap().insert(id, Arc::clone(&handle));
+                engine
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .insert(id, Arc::clone(&handle));
                 // Slice I2: checkout-root probe for the sharing fact, and
                 // worktree re-detection for sessions that claim one —
                 // verified against `git worktree list`, never memory, and
@@ -1491,7 +1533,9 @@ async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Res
             let mut found: Vec<PathBuf> = Vec::new();
             if let Ok(repos) = std::fs::read_dir(&root) {
                 for repo in repos.flatten().filter(|e| e.path().is_dir()) {
-                    let Ok(trees) = std::fs::read_dir(repo.path()) else { continue };
+                    let Ok(trees) = std::fs::read_dir(repo.path()) else {
+                        continue;
+                    };
                     for tree in trees.flatten().filter(|e| e.path().is_dir()) {
                         let path = canon(&tree.path());
                         if !claimed.contains(&path) {
@@ -1689,7 +1733,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 ok_value(&UnsubscribeOk { stopped })
             }
         };
-        if write_frame(&w, &ResponseEnvelope { id, body }).await.is_err() {
+        if write_frame(&w, &ResponseEnvelope { id, body })
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -1976,9 +2023,7 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
         match slot.as_mut() {
             Some(w) => {
                 let dirty = match snapshot.state {
-                    eave_wire::GitState::Ok => {
-                        Some(snapshot.files.len() as u64 + snapshot.omitted)
-                    }
+                    eave_wire::GitState::Ok => Some(snapshot.files.len() as u64 + snapshot.omitted),
                     // Failed scan = unknown, never a fake zero.
                     _ => None,
                 };
@@ -2117,14 +2162,13 @@ async fn watch_session_files(
     use std::sync::atomic::Ordering;
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), ()>>();
-    let mut watcher = match notify::recommended_watcher(
-        move |res: Result<notify::Event, notify::Error>| {
+    let mut watcher =
+        match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             let _ = tx.send(res.map(|_| ()).map_err(|_| ()));
-        },
-    ) {
-        Ok(w) => w,
-        Err(_) => return, // polling fallback stands
-    };
+        }) {
+            Ok(w) => w,
+            Err(_) => return, // polling fallback stands
+        };
     if watcher
         .watch(&cwd, notify::RecursiveMode::Recursive)
         .is_err()

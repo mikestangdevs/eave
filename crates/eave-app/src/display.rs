@@ -115,9 +115,7 @@ fn msg_content_hash(row: &Row) -> u64 {
             };
             fnv1a_more(fnv1a(&[0, tag]), text.as_bytes())
         }
-        Row::Assistant { text, live } => {
-            fnv1a_more(fnv1a(&[1, *live as u8]), text.as_bytes())
-        }
+        Row::Assistant { text, live } => fnv1a_more(fnv1a(&[1, *live as u8]), text.as_bytes()),
         Row::Tool {
             id,
             name,
@@ -399,7 +397,10 @@ mod tests {
         d.update(&t);
         set(&mut t, 0, "hello world, more text", true);
         let ops = d.update(&t);
-        assert!(ops.splice.is_none(), "in-place growth must not splice: {ops:?}");
+        assert!(
+            ops.splice.is_none(),
+            "in-place growth must not splice: {ops:?}"
+        );
         assert_eq!(ops.remeasure, Some(0..1));
     }
 
@@ -438,7 +439,10 @@ mod tests {
         // …and the message settles (live→complete).
         set(&mut t, 0, "intro\n\n```rust\nlet x = 1;\n```", false);
         let ops2 = d.update(&t);
-        assert!(ops2.splice.is_none(), "settle must remeasure, never splice: {ops2:?}");
+        assert!(
+            ops2.splice.is_none(),
+            "settle must remeasure, never splice: {ops2:?}"
+        );
         assert!(ops2.remeasure.is_some());
         let after: Vec<RowId> = d.rows().iter().map(|r| r.id).collect();
         assert_eq!(before, after, "row identity stable across close+settle");

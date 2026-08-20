@@ -274,7 +274,11 @@ pub fn claude_brand() -> Hsla {
 /// icon that changes shape, and the whole point of the fixed box is that
 /// the surrounding layout cannot move it.
 pub fn icon(path: &'static str, size: f32, color: Hsla) -> Svg {
-    svg().path(path).size(px(size)).text_color(color).flex_none()
+    svg()
+        .path(path)
+        .size(px(size))
+        .text_color(color)
+        .flex_none()
 }
 
 /// Same, with a `debug_selector` so the harness can find its box.
@@ -286,12 +290,7 @@ pub fn icon(path: &'static str, size: f32, color: Hsla) -> Svg {
 /// rail draws one of these PER ROW: a shared tag there would make
 /// `debug_bounds` ambiguous, and an alignment test that measures whichever
 /// row the lookup happened to reach first proves nothing.
-pub fn tagged_icon(
-    path: &'static str,
-    size: f32,
-    color: Hsla,
-    selector: impl Into<String>,
-) -> Svg {
+pub fn tagged_icon(path: &'static str, size: f32, color: Hsla, selector: impl Into<String>) -> Svg {
     let selector = selector.into();
     icon(path, size, color).debug_selector(move || selector)
 }
@@ -354,7 +353,10 @@ mod tests {
         for (path, bytes, _) in REGISTRY {
             let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())
                 .unwrap_or_else(|e| panic!("{path} does not parse: {e}"));
-            assert!(tree.root().has_children(), "{path} parses but draws nothing");
+            assert!(
+                tree.root().has_children(),
+                "{path} parses but draws nothing"
+            );
         }
     }
 
@@ -366,7 +368,10 @@ mod tests {
     fn every_line_glyph_is_solar_linear_on_the_same_grid() {
         for path in of(Class::Line) {
             let src = body(path);
-            assert!(src.contains(r#"viewBox="0 0 24 24""#), "{path}: not 24-grid");
+            assert!(
+                src.contains(r#"viewBox="0 0 24 24""#),
+                "{path}: not 24-grid"
+            );
             assert!(
                 src.contains(r#"stroke-width="1.5""#),
                 "{path}: not the Linear weight",
@@ -400,7 +405,10 @@ mod tests {
     fn every_mark_is_a_fill_with_no_stroke_to_weigh() {
         for path in of(Class::Mark) {
             let src = body(path);
-            assert!(src.contains("fill="), "{path}: a mark with no fill draws nothing");
+            assert!(
+                src.contains("fill="),
+                "{path}: a mark with no fill draws nothing"
+            );
             assert!(
                 !src.contains("stroke-width="),
                 "{path}: carries a stroke, so it belongs in a weighed class",
@@ -483,8 +491,7 @@ mod tests {
             .map(|e| format!("icons/{}", e.unwrap().file_name().to_string_lossy()))
             .collect();
         on_disk.sort();
-        let mut registered: Vec<String> =
-            REGISTRY.iter().map(|(p, _, _)| p.to_string()).collect();
+        let mut registered: Vec<String> = REGISTRY.iter().map(|(p, _, _)| p.to_string()).collect();
         registered.sort();
         assert_eq!(on_disk, registered);
     }

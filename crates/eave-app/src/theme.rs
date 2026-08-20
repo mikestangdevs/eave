@@ -12,7 +12,6 @@
 //! was deleted 2026-08-19. The waku lineage of the TYPE and hairlines
 //! stands; the surfaces are all washes now.)
 
-
 use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
@@ -48,7 +47,6 @@ use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 //   - Chrome that floats over in-window content (the ↓-bottom pill)
 //     keeps the pre-blended opaque plate: any alpha there ghosts the
 //     log through it, and no blur will save it.
-
 
 // The wash primitives. Private, and still worth keeping separate from the
 // public tokens above: they are the values the elevation tests compose
@@ -1065,10 +1063,7 @@ mod tests {
     #[test]
     fn a_container_opacity_cannot_express_disabled() {
         let ground = grounds()[0];
-        let ceiling = over(
-            hsla(0.0, 0.0, 1.0, DISABLED_OPACITY),
-            ground,
-        );
+        let ceiling = over(hsla(0.0, 0.0, 1.0, DISABLED_OPACITY), ground);
         let r = contrast_ratio(ceiling, ground);
         assert!(
             r < TEXT_CONTRAST_FLOOR,
@@ -1164,7 +1159,10 @@ mod tests {
             let v = b as f32 / 255.0;
             let g = over(glass_canvas(), (v, v, v));
             assert!(luma(over(wash_content(), g)) < luma(g), "backdrop {b}");
-            assert!(luma(over(wash_warning_plate(), g)) > luma(g), "backdrop {b}");
+            assert!(
+                luma(over(wash_warning_plate(), g)) > luma(g),
+                "backdrop {b}"
+            );
             assert!(luma(over(wash_danger_plate(), g)) > luma(g), "backdrop {b}");
         }
     }
@@ -1193,9 +1191,19 @@ mod tests {
                 );
             }
         }
-        let opaque = (0x1a as f32 / 255.0, 0x1a as f32 / 255.0, 0x1a as f32 / 255.0);
-        close(over(success().opacity(DIFF_WASH_ALPHA), opaque), rgb(0x212c25).into());
-        close(over(danger().opacity(DIFF_WASH_ALPHA), opaque), rgb(0x2e2322).into());
+        let opaque = (
+            0x1a as f32 / 255.0,
+            0x1a as f32 / 255.0,
+            0x1a as f32 / 255.0,
+        );
+        close(
+            over(success().opacity(DIFF_WASH_ALPHA), opaque),
+            rgb(0x212c25).into(),
+        );
+        close(
+            over(danger().opacity(DIFF_WASH_ALPHA), opaque),
+            rgb(0x2e2322).into(),
+        );
     }
 
     /// The reason rungs are washes, not plates: over EVERY backdrop

@@ -193,7 +193,11 @@ impl Client {
             pending.lock().unwrap().clear();
         });
 
-        let hello: HelloOk = client.request(Request::Hello { proto: PROTO_VERSION }).await?;
+        let hello: HelloOk = client
+            .request(Request::Hello {
+                proto: PROTO_VERSION,
+            })
+            .await?;
         if hello.proto != PROTO_VERSION {
             return Err(ClientError::Protocol(format!(
                 "engine speaks proto {}, we speak {PROTO_VERSION}",
@@ -310,9 +314,7 @@ impl Client {
     /// Watch the session set (spec 05 §Watch): yields `Sessions` snapshot
     /// frames — one immediately, one on every session-set/state change.
     /// Fold by replacement. Carries no transcript content, ever.
-    pub async fn watch(
-        &self,
-    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+    pub async fn watch(&self) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.pending.lock().unwrap().insert(id, Pending::Stream(tx));

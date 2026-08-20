@@ -295,12 +295,18 @@ async fn sharing_is_stated_and_isolate_is_the_opt_in() {
     let wt = info.worktree.expect("worktree fact");
     assert_eq!(wt.branch, "eave/s2");
     assert!(wt.present);
-    assert!(expected_wt.join("base.txt").exists(), "checkout materialized");
+    assert!(
+        expected_wt.join("base.txt").exists(),
+        "checkout materialized"
+    );
 
     // git agrees: base + one linked worktree; the sharing fact clears.
     let listed_git = git(&base, &["worktree", "list", "--porcelain"]);
     assert_eq!(
-        listed_git.lines().filter(|l| l.starts_with("worktree ")).count(),
+        listed_git
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
         2,
         "{listed_git}"
     );
@@ -309,7 +315,10 @@ async fn sharing_is_stated_and_isolate_is_the_opt_in() {
     })
     .await;
     assert!(
-        dir.join("sessions").join("s2").join("worktree.json").exists(),
+        dir.join("sessions")
+            .join("s2")
+            .join("worktree.json")
+            .exists(),
         "durable claim written"
     );
 }
@@ -448,7 +457,10 @@ async fn two_isolated_sessions_in_one_repo_do_not_cross() {
             saw.1 = true;
         }
     }
-    assert!(saw.0 && saw.1, "positive controls: both canaries must appear once each on their own id ({lines:?})");
+    assert!(
+        saw.0 && saw.1,
+        "positive controls: both canaries must appear once each on their own id ({lines:?})"
+    );
 
     // Each agent runs IN its worktree: the linger children's cwds.
     for (sid, wt) in [("s1", &wt1), ("s2", &wt2)] {
@@ -501,7 +513,10 @@ async fn clean_removal_leaves_no_trace() {
     assert!(!wt_path.exists());
     let listed = git(&base, &["worktree", "list", "--porcelain"]);
     assert_eq!(
-        listed.lines().filter(|l| l.starts_with("worktree ")).count(),
+        listed
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
         1,
         "{listed}"
     );
@@ -510,7 +525,11 @@ async fn clean_removal_leaves_no_trace() {
         "",
         "no stale eave/ branch"
     );
-    assert!(!dir.join("sessions").join("s1").join("worktree.json").exists());
+    assert!(!dir
+        .join("sessions")
+        .join("s1")
+        .join("worktree.json")
+        .exists());
     let sessions = wait_list(&c, "worktree fact cleared", |s| {
         by_id(s, "s1").worktree.is_none()
     })
@@ -574,10 +593,7 @@ async fn worktree_deleted_out_from_under_is_stated_then_cleaned() {
     // A files subscription triggers the scan that discovers it.
     let _rx = c.files("s1").await.expect("files");
     wait_list(&c, "missing worktree stated", |s| {
-        by_id(s, "s1")
-            .worktree
-            .as_ref()
-            .is_some_and(|w| !w.present)
+        by_id(s, "s1").worktree.as_ref().is_some_and(|w| !w.present)
     })
     .await;
     assert!(!wt_path.exists(), "eave never recreates a deleted worktree");
@@ -586,7 +602,10 @@ async fn worktree_deleted_out_from_under_is_stated_then_cleaned() {
     assert!(ok.removed, "nothing left to protect: {ok:?}");
     let listed = git(&base, &["worktree", "list", "--porcelain"]);
     assert_eq!(
-        listed.lines().filter(|l| l.starts_with("worktree ")).count(),
+        listed
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
         1,
         "pruned: {listed}"
     );
@@ -621,8 +640,7 @@ async fn crash_orphan_is_redetected_with_dirty_count() {
 
     engine.sigkill();
     drop(c);
-    let _engine2 =
-        EngineProc::spawn_with_env(&dir, "linger", &[("EAVE_WORKTREES_DIR", &wtroot_s)]);
+    let _engine2 = EngineProc::spawn_with_env(&dir, "linger", &[("EAVE_WORKTREES_DIR", &wtroot_s)]);
     let c2 = Client::connect(&dir).await.expect("reconnect");
     let sessions = wait_list(&c2, "orphan restated with dirty count", |s| {
         by_id(s, "s1")
@@ -633,7 +651,11 @@ async fn crash_orphan_is_redetected_with_dirty_count() {
     .await;
     let s1 = by_id(&sessions, "s1");
     assert_eq!(s1.state, "interrupted", "crash repair settled the state");
-    assert_eq!(s1.cwd, wt_path.display().to_string(), "cwd rewrite survived");
+    assert_eq!(
+        s1.cwd,
+        wt_path.display().to_string(),
+        "cwd rewrite survived"
+    );
     assert!(wt_path.join("uncommitted.txt").exists(), "nothing deleted");
     assert_eq!(
         s1.worktree.as_ref().unwrap().branch,
@@ -666,7 +688,10 @@ async fn an_unclaimed_worktree_is_stated_where_it_can_be_found() {
             EngineProc::spawn_with_env(&dir, "linger", &[("EAVE_WORKTREES_DIR", &wtroot_s)]);
         let deadline = Instant::now() + Duration::from_secs(15);
         while !report.exists() {
-            assert!(Instant::now() < deadline, "the sweep never stated its finding");
+            assert!(
+                Instant::now() < deadline,
+                "the sweep never stated its finding"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         let body = std::fs::read_to_string(&report).unwrap();

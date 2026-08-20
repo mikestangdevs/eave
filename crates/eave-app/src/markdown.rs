@@ -67,7 +67,9 @@ fn is_list_line(line: &str) -> bool {
         || t.starts_with("* ")
         || t.starts_with("+ ")
         || t.split_once('.')
-            .map(|(n, rest)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' '))
+            .map(|(n, rest)| {
+                !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' ')
+            })
             .unwrap_or(false)
 }
 
@@ -359,7 +361,9 @@ mod tests {
         let runs = inline_runs("a **b** `c` *d* [e](https://x) f");
         let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, vec!["a ", "b", " ", "c", " ", "d", " ", "e", " f"]);
-        assert!(runs[1].style.bold && runs[3].style.code && runs[5].style.italic && runs[7].style.link);
+        assert!(
+            runs[1].style.bold && runs[3].style.code && runs[5].style.italic && runs[7].style.link
+        );
     }
 
     #[test]

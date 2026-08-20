@@ -36,8 +36,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::AgentConfig;
 use crate::events::SessionEvent;
+use crate::session::AgentConfig;
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -202,7 +202,10 @@ impl JournalWriter {
     /// (spec 02 §Durability). The containing directory is fsynced too so the
     /// file's existence survives a crash.
     pub fn create(path: &Path, header: &Header) -> io::Result<Self> {
-        let mut file = OpenOptions::new().create_new(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(path)?;
         let mut line = serde_json::to_vec(header).map_err(to_io)?;
         line.push(b'\n');
         file.write_all(&line)?;

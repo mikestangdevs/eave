@@ -174,7 +174,9 @@ async fn watch_channel_never_carries_transcript_content() {
         .unwrap();
     let hello = lines.next_line().await.unwrap().expect("hello reply");
     assert!(hello.contains("\"ok\""), "{hello}");
-    w.write_all(b"{\"id\":2,\"method\":\"watch\"}\n").await.unwrap();
+    w.write_all(b"{\"id\":2,\"method\":\"watch\"}\n")
+        .await
+        .unwrap();
 
     // A second, normal client drives a session through its whole life
     // with the canary in the user text (a journal record's content).
@@ -396,7 +398,11 @@ async fn watch_snapshot_rebuilds_after_engine_restart() {
     // and states come from the repair-backed load.
     assert!(!by_id("s1").live);
     assert!(!by_id("s2").live);
-    assert_eq!(by_id("s2").state, "new", "never-spawned session loads as new");
+    assert_eq!(
+        by_id("s2").state,
+        "new",
+        "never-spawned session loads as new"
+    );
 
     drop(engine2);
 }

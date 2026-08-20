@@ -402,7 +402,10 @@ async fn unsubscribe_stops_a_record_stream_dead() {
     let end = Instant::now() + Duration::from_secs(15);
     let mut saw_second = false;
     while !saw_second {
-        assert!(Instant::now() < end, "fresh subscribe never replayed turn 2");
+        assert!(
+            Instant::now() < end,
+            "fresh subscribe never replayed turn 2"
+        );
         let line = raw.next("fresh replay", Duration::from_secs(15)).await;
         assert_eq!(frame_id(&line), 30, "only id 30 may flow now: {line}");
         saw_second = line.contains("second turn");
@@ -453,7 +456,10 @@ async fn unsubscribe_releases_the_files_watcher() {
     std::fs::write(cwd.join("marker.txt"), "seen by the live watcher\n").unwrap();
     let end = Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(Instant::now() < end, "live watcher never scanned marker.txt");
+        assert!(
+            Instant::now() < end,
+            "live watcher never scanned marker.txt"
+        );
         let line = raw.next("marker frame", Duration::from_secs(15)).await;
         assert_eq!(frame_id(&line), 20);
         if line.contains("marker.txt") {
@@ -509,7 +515,9 @@ async fn unsubscribe_releases_the_files_watcher() {
             Instant::now() < end,
             "no startup scan after resubscribe — the watcher refcount never dropped to zero"
         );
-        let line = raw.next("startup-scan frame", Duration::from_secs(15)).await;
+        let line = raw
+            .next("startup-scan frame", Duration::from_secs(15))
+            .await;
         assert_eq!(frame_id(&line), 40);
         if line.contains("orphan.txt") {
             break;
@@ -610,7 +618,10 @@ async fn engine_restart_with_n_live_sessions_recovers_all_honestly() {
     // demonstrably reached disk, or repair has nothing to conclude from.
     let end = Instant::now() + Duration::from_secs(15);
     for i in 0..N {
-        let jpath = dir.join("sessions").join(format!("s{i}")).join("journal.jsonl");
+        let jpath = dir
+            .join("sessions")
+            .join(format!("s{i}"))
+            .join("journal.jsonl");
         loop {
             let text = std::fs::read_to_string(&jpath).unwrap_or_default();
             if text.contains("user_delivered") && text.contains("tick") {
@@ -637,7 +648,9 @@ async fn engine_restart_with_n_live_sessions_recovers_all_honestly() {
     let engine2 = EngineProc::spawn(&dir, "slow-stream");
     for id in &identities {
         assert!(
-            proc::identity_of(id.pid).map(|now| now != *id).unwrap_or(true),
+            proc::identity_of(id.pid)
+                .map(|now| now != *id)
+                .unwrap_or(true),
             "orphaned agent pid {} survived the restart reap",
             id.pid
         );
@@ -646,7 +659,11 @@ async fn engine_restart_with_n_live_sessions_recovers_all_honestly() {
     let sessions = c2.list().await.expect("list");
     assert_eq!(sessions.len(), N);
     for s in &sessions {
-        assert!(!s.live, "{} must not report live after restart", s.session_id);
+        assert!(
+            !s.live,
+            "{} must not report live after restart",
+            s.session_id
+        );
         assert_eq!(
             s.state, "interrupted",
             "{} was killed mid-turn with the engine — repair must conclude interrupted",
@@ -706,7 +723,10 @@ async fn background_attention_reaches_watch_while_subscribed_elsewhere() {
             break;
         }
     }
-    assert!(saw_quiet, "quiet precedes unresponsive on the watch channel");
+    assert!(
+        saw_quiet,
+        "quiet precedes unresponsive on the watch channel"
+    );
 
     drop(engine);
 }
@@ -841,8 +861,14 @@ async fn no_content_crosses_sessions_on_any_channel_at_n() {
         own_text |= id == 3 && line.contains(TEXT[1]);
         own_file |= id == 4 && line.contains(FILE[1]);
     }
-    assert!(own_text, "positive control: s1's text canary on its subscribe id");
-    assert!(own_file, "positive control: s1's file canary on its files id");
+    assert!(
+        own_text,
+        "positive control: s1's text canary on its subscribe id"
+    );
+    assert!(
+        own_file,
+        "positive control: s1's file canary on its files id"
+    );
 
     drop(engine);
 }

@@ -444,7 +444,11 @@ fn main() {
                         "is_error": !allowed,
                     }]},
                 }));
-                emit_text(if allowed { "did the thing" } else { "stood down" });
+                emit_text(if allowed {
+                    "did the thing"
+                } else {
+                    "stood down"
+                });
                 emit_result();
                 std::thread::sleep(Duration::from_millis(100));
                 return;

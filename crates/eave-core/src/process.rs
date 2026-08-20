@@ -49,7 +49,9 @@ pub async fn await_group_empty(pgid: i32, window: Duration) -> bool {
 pub enum OrphanOutcome {
     /// The breadcrumb no longer matches a live process — nothing to do.
     AlreadyGone,
-    Reaped { escalated: bool },
+    Reaped {
+        escalated: bool,
+    },
     /// Exit could not be proven; never reported reaped on hope.
     Unproven,
 }

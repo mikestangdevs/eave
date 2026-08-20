@@ -241,7 +241,9 @@ async fn files_channel_never_crosses_sessions() {
         .unwrap();
     let hello = lines.next_line().await.unwrap().expect("hello reply");
     assert!(hello.contains("\"ok\""), "{hello}");
-    w.write_all(b"{\"id\":2,\"method\":\"watch\"}\n").await.unwrap();
+    w.write_all(b"{\"id\":2,\"method\":\"watch\"}\n")
+        .await
+        .unwrap();
     w.write_all(b"{\"id\":3,\"method\":\"files\",\"params\":{\"session_id\":\"sA\"}}\n")
         .await
         .unwrap();
@@ -463,7 +465,10 @@ async fn turn_boundary_poll_is_the_fallback_without_a_watcher() {
     assert_eq!(snap.state, GitState::Ok);
     // The mode is a stated fact on the wire: no watcher → the snapshot
     // says so (the rail renders "refreshes at turn end" from this).
-    assert!(!snap.watching, "fallback snapshots must state watching=false");
+    assert!(
+        !snap.watching,
+        "fallback snapshots must state watching=false"
+    );
     let f = &snap.files[0];
     assert_eq!(f.path, "base.txt");
     assert_eq!(f.status, FileStatus::Modified);

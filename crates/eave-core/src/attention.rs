@@ -55,7 +55,10 @@ pub enum AttentionSnapshot {
     Running,
     /// Alive and ambiguous. Escalating notice only; persists indefinitely;
     /// never a kill (spec 01).
-    Quiet { since_ms: u64, reason: WaitReason },
+    Quiet {
+        since_ms: u64,
+        reason: WaitReason,
+    },
     /// Alive but demonstrably doing nothing: zero CPU across N consecutive
     /// samples with nothing in flight. Evidence shown, kill affordance
     /// offered, **never auto-killed** (spec 01).
@@ -84,7 +87,10 @@ pub enum AttentionSnapshot {
     /// Provable death from OS facts — immediate, no timer (spec 01). The
     /// journal's terminal truth still comes from the recorder; this is the
     /// surface overlay carrying the concrete cause.
-    Failed { since_ms: u64, cause: String },
+    Failed {
+        since_ms: u64,
+        cause: String,
+    },
 }
 
 impl AttentionSnapshot {
@@ -315,11 +321,8 @@ impl Classifier {
                         .iter()
                         .any(|(id, _, _)| id == request_id)
                     {
-                        self.pending_approvals.push((
-                            request_id.clone(),
-                            tool.clone(),
-                            now_ms,
-                        ));
+                        self.pending_approvals
+                            .push((request_id.clone(), tool.clone(), now_ms));
                     }
                     self.settle_approvals(now_ms)
                 }
@@ -495,7 +498,10 @@ impl Classifier {
 fn status_is_requesting(raw: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
-        .and_then(|v| v.get("status").and_then(|s| s.as_str().map(|s| s == "requesting")))
+        .and_then(|v| {
+            v.get("status")
+                .and_then(|s| s.as_str().map(|s| s == "requesting"))
+        })
         .unwrap_or(false)
 }
 
@@ -542,7 +548,10 @@ mod tests {
     fn idle_between_turns_never_trips_any_clock() {
         let mut c = Classifier::new(TH, 0);
         delivered(&mut c, 0);
-        c.on_record(&provider(SessionEvent::TextDelta { text: "hi".into() }), 1_000);
+        c.on_record(
+            &provider(SessionEvent::TextDelta { text: "hi".into() }),
+            1_000,
+        );
         completed(&mut c, 2_000);
         for t in (3_000..7_200_000).step_by(60_000) {
             assert_eq!(c.on_tick(t), None, "tick at {t} must not classify");
@@ -579,7 +588,10 @@ mod tests {
     fn silent_mid_turn_goes_quiet_idle_at_threshold() {
         let mut c = Classifier::new(TH, 0);
         delivered(&mut c, 0);
-        c.on_record(&provider(SessionEvent::TextDelta { text: "x".into() }), 5_000);
+        c.on_record(
+            &provider(SessionEvent::TextDelta { text: "x".into() }),
+            5_000,
+        );
         assert_eq!(c.on_tick(5_000 + TH.quiet_after_ms - 1), None);
         match c.on_tick(5_000 + TH.quiet_after_ms) {
             Some(AttentionSnapshot::Quiet {
@@ -610,7 +622,10 @@ mod tests {
         }
         // Response bytes clear the request mark and the notice.
         assert_eq!(
-            c.on_record(&provider(SessionEvent::TextDelta { text: "r".into() }), 200_000),
+            c.on_record(
+                &provider(SessionEvent::TextDelta { text: "r".into() }),
+                200_000
+            ),
             Some(AttentionSnapshot::Running)
         );
     }
@@ -634,7 +649,11 @@ mod tests {
         }
         match c.on_tick(1_000 + TH.tool_exec_after_ms) {
             Some(AttentionSnapshot::Quiet {
-                reason: WaitReason::Tool { name, since_ms: 1_000 },
+                reason:
+                    WaitReason::Tool {
+                        name,
+                        since_ms: 1_000,
+                    },
                 ..
             }) => assert_eq!(name, "Bash"),
             other => panic!("expected quiet/tool, got {other:?}"),
@@ -679,7 +698,11 @@ mod tests {
         let mut t = TH.quiet_after_ms;
         for i in 1..TH.cpu_samples {
             t += TH.cpu_sample_interval_ms;
-            assert_eq!(c.on_cpu_sample(true, t), None, "sample {i} not yet conclusive");
+            assert_eq!(
+                c.on_cpu_sample(true, t),
+                None,
+                "sample {i} not yet conclusive"
+            );
         }
         t += TH.cpu_sample_interval_ms;
         match c.on_cpu_sample(true, t) {
@@ -689,7 +712,10 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(zero_samples, TH.cpu_samples);
-                assert_eq!(sampled_ms, u64::from(TH.cpu_samples) * TH.cpu_sample_interval_ms);
+                assert_eq!(
+                    sampled_ms,
+                    u64::from(TH.cpu_samples) * TH.cpu_sample_interval_ms
+                );
             }
             other => panic!("expected unresponsive, got {other:?}"),
         }
@@ -704,7 +730,10 @@ mod tests {
         }
         // A real byte → running.
         assert_eq!(
-            c.on_record(&provider(SessionEvent::TextDelta { text: "b".into() }), t + 6_000),
+            c.on_record(
+                &provider(SessionEvent::TextDelta { text: "b".into() }),
+                t + 6_000
+            ),
             Some(AttentionSnapshot::Running)
         );
     }
@@ -757,8 +786,11 @@ mod tests {
         );
         // The question lands: parked immediately, not two minutes later.
         match c.on_record(&approval_requested("req-1", "Write"), 1_100) {
-            Some(AttentionSnapshot::AwaitingApproval { pending: 1, ref tool, .. })
-                if tool == "Write" => {}
+            Some(AttentionSnapshot::AwaitingApproval {
+                pending: 1,
+                ref tool,
+                ..
+            }) if tool == "Write" => {}
             other => panic!("expected awaiting_approval at once, got {other:?}"),
         }
         // One hour of ticks: both thresholds are long past and neither
@@ -771,7 +803,10 @@ mod tests {
         // even a forced run of zero samples cannot harden this state.
         assert!(!c.wants_cpu_sampling());
         for i in 0..(TH.cpu_samples * 4) {
-            assert_eq!(c.on_cpu_sample(true, 3_600_000 + u64::from(i) * 5_000), None);
+            assert_eq!(
+                c.on_cpu_sample(true, 3_600_000 + u64::from(i) * 5_000),
+                None
+            );
         }
         assert_eq!(c.snapshot().state_name(), "awaiting_approval");
     }
@@ -786,7 +821,9 @@ mod tests {
         c.on_record(&approval_requested("req-1", "Write"), 1_000);
         for t in (2_000..60_000).step_by(5_000) {
             c.on_record(
-                &provider(SessionEvent::TextDelta { text: "waiting…".into() }),
+                &provider(SessionEvent::TextDelta {
+                    text: "waiting…".into(),
+                }),
                 t,
             );
             assert_eq!(c.snapshot().state_name(), "awaiting_approval");
@@ -848,8 +885,11 @@ mod tests {
         delivered(&mut c, 0);
         c.on_record(&approval_requested("req-1", "Write"), 1_000);
         match c.on_record(&approval_requested("req-2", "Bash"), 2_000) {
-            Some(AttentionSnapshot::AwaitingApproval { pending: 2, ref tool, since_ms })
-                if tool == "Write" && since_ms == 1_000 => {}
+            Some(AttentionSnapshot::AwaitingApproval {
+                pending: 2,
+                ref tool,
+                since_ms,
+            }) if tool == "Write" && since_ms == 1_000 => {}
             other => panic!("expected 2 pending named by the oldest, got {other:?}"),
         }
         // Answering the newer one leaves the session parked on the older.
@@ -861,8 +901,11 @@ mod tests {
             }),
             3_000,
         ) {
-            Some(AttentionSnapshot::AwaitingApproval { pending: 1, ref tool, .. })
-                if tool == "Write" => {}
+            Some(AttentionSnapshot::AwaitingApproval {
+                pending: 1,
+                ref tool,
+                ..
+            }) if tool == "Write" => {}
             other => panic!("expected still parked on req-1, got {other:?}"),
         }
         assert_eq!(c.on_tick(3_600_000), None);
@@ -879,34 +922,65 @@ mod tests {
             in_turn: true,
         };
         assert_eq!(probe_failure(&base), None);
-        assert_eq!(probe_failure(&ProbeFacts { exited: true, zombie: true, ..base }), None);
-        assert!(probe_failure(&ProbeFacts { zombie: true, ..base })
-            .unwrap()
-            .contains("zombie"));
-        assert!(probe_failure(&ProbeFacts { vanished: true, ..base })
-            .unwrap()
-            .contains("vanished"));
-        assert!(probe_failure(&ProbeFacts { parent_ok: false, ..base })
-            .unwrap()
-            .contains("parent"));
-        assert!(probe_failure(&ProbeFacts { stdout_eof: true, ..base })
-            .unwrap()
-            .contains("mid-turn"));
-        assert!(probe_failure(&ProbeFacts { stdout_eof: true, in_turn: false, ..base })
-            .unwrap()
-            .contains("stdout closed"));
+        assert_eq!(
+            probe_failure(&ProbeFacts {
+                exited: true,
+                zombie: true,
+                ..base
+            }),
+            None
+        );
+        assert!(probe_failure(&ProbeFacts {
+            zombie: true,
+            ..base
+        })
+        .unwrap()
+        .contains("zombie"));
+        assert!(probe_failure(&ProbeFacts {
+            vanished: true,
+            ..base
+        })
+        .unwrap()
+        .contains("vanished"));
+        assert!(probe_failure(&ProbeFacts {
+            parent_ok: false,
+            ..base
+        })
+        .unwrap()
+        .contains("parent"));
+        assert!(probe_failure(&ProbeFacts {
+            stdout_eof: true,
+            ..base
+        })
+        .unwrap()
+        .contains("mid-turn"));
+        assert!(probe_failure(&ProbeFacts {
+            stdout_eof: true,
+            in_turn: false,
+            ..base
+        })
+        .unwrap()
+        .contains("stdout closed"));
     }
 
     #[test]
     fn failed_is_sticky_and_immediate() {
         let mut c = Classifier::new(TH, 0);
         delivered(&mut c, 0);
-        let snap = c.fail("stdout closed mid-turn while the process is alive".into(), 500);
+        let snap = c.fail(
+            "stdout closed mid-turn while the process is alive".into(),
+            500,
+        );
         assert!(matches!(snap, Some(AttentionSnapshot::Failed { .. })));
         // A stale descendant byte must not resurrect a provably dead
         // session.
         assert_eq!(
-            c.on_record(&provider(SessionEvent::TextDelta { text: "ghost".into() }), 600),
+            c.on_record(
+                &provider(SessionEvent::TextDelta {
+                    text: "ghost".into()
+                }),
+                600
+            ),
             None
         );
         assert_eq!(c.snapshot().state_name(), "failed");

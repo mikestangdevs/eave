@@ -19,17 +19,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use gpui::Animation;
+use gpui::AnimationExt as _;
 use gpui::{
     actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent, Context,
     Corners, Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
     MouseDownEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString,
-    StrikethroughStyle, StyledText,
-    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowHandle, WindowOptions,
+    StrikethroughStyle, StyledText, TextRun, TitlebarOptions, UnderlineStyle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
 };
-use gpui::Animation;
-use gpui::AnimationExt as _;
 use gpui_platform::application;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -44,10 +43,10 @@ use eave_wire::{
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
 use crate::icons;
+use crate::launcher::{self, PROVIDERS};
 use crate::loaders;
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::motion::{self, HoverFade as _};
-use crate::launcher::{self, PROVIDERS};
 use crate::overlay::{self, MenuItem, Popup};
 use crate::theme;
 
@@ -65,12 +64,20 @@ const APPROVAL_INPUT_CAP: usize = 1200;
 #[derive(Debug, Clone)]
 enum ConnEvent {
     Connecting,
-    Connected { engine_pid: i32 },
-    Reconnecting { attempt: u32 },
+    Connected {
+        engine_pid: i32,
+    },
+    Reconnecting {
+        attempt: u32,
+    },
     /// Contended start: another engine holds the data dir (spec 02
     /// §Contended start). `None` = "holder unknown" — still actionable.
-    Busy { holder_pid: Option<i32> },
-    Failed { message: String },
+    Busy {
+        holder_pid: Option<i32>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// Feed frames are tagged with the session they belong to: a selection
@@ -79,7 +86,9 @@ enum ConnEvent {
 /// current session (no event bleed between sessions).
 #[derive(Debug)]
 enum FeedEvent {
-    Session { id: String },
+    Session {
+        id: String,
+    },
     /// Nothing is selected and nothing will be opened for you — the
     /// launcher's state (Slice Q2). Distinct from "the selected session's
     /// journal is empty": this says there is no session at all.
@@ -87,7 +96,9 @@ enum FeedEvent {
     /// `error` carries the engine's own words when a launch was refused —
     /// the posture gate's message, verbatim. Silence there would be the
     /// worst of both: a button that does nothing and says nothing.
-    NoSession { error: Option<String> },
+    NoSession {
+        error: Option<String>,
+    },
     Reset {
         id: String,
     },
@@ -173,7 +184,10 @@ enum Command {
     /// the engine refuses with fresh counts if anything would be lost,
     /// which arms the affordance; the second click sends `force: true`
     /// (decision 2's two-step).
-    RemoveWorktree { id: String, force: bool },
+    RemoveWorktree {
+        id: String,
+        force: bool,
+    },
     /// Answer one open permission question (Slice K). `message` is the
     /// operator's own words on a deny — the provider hands them to the
     /// model verbatim, so "denied, commit first" is a different
@@ -261,7 +275,9 @@ async fn feed_loop(
     // inside its 250 ms backoff and quietly change what agent sessions
     // spawn. With the gate set, the human relaunching their engine
     // always wins.
-    let no_spawn = std::env::var("EAVE_NO_SPAWN").map(|v| v == "1").unwrap_or(false);
+    let no_spawn = std::env::var("EAVE_NO_SPAWN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let mut attempt: u32 = 0;
     let mut cursor: Option<Cursor> = None;
     let mut selected: Option<String> = None;
@@ -623,7 +639,10 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         }
     };
     plumbing.push_conn(ConnEvent::Connected { engine_pid: 0 });
-    let sid = format!("replay:{}", path.file_name().unwrap_or_default().to_string_lossy());
+    let sid = format!(
+        "replay:{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
     plumbing.push_feed(FeedEvent::Session { id: sid.clone() });
     // A synthetic rail snapshot so harness runs (replay assert, captures)
     // exercise the real constrained-width layout with the rail present.
@@ -763,7 +782,11 @@ fn synthetic_files_snapshot() -> FilesSnapshot {
 fn synthetic_long_diff() -> FileDiff {
     let hunks = (0..40)
         .map(|h| DiffHunk {
-            header: format!("@@ -{},50 +{},50 @@ fn section_{h}()", h * 60 + 1, h * 60 + 1),
+            header: format!(
+                "@@ -{},50 +{},50 @@ fn section_{h}()",
+                h * 60 + 1,
+                h * 60 + 1
+            ),
             lines: (0..50)
                 .map(|i| DiffLine {
                     op: match i % 5 {
@@ -904,13 +927,11 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
         // Slice N3: the diff is on its way. Skeleton lines in the pane's
         // own line rhythm, so the arriving hunks land where the skeleton
         // already was.
-        DiffFetch::Loading => {
-            children.push(
-                loaders::skeleton(theme::SKELETON_ROWS, phase)
-                    .debug_selector(|| "diff-skeleton".into())
-                    .into_any_element(),
-            )
-        }
+        DiffFetch::Loading => children.push(
+            loaders::skeleton(theme::SKELETON_ROWS, phase)
+                .debug_selector(|| "diff-skeleton".into())
+                .into_any_element(),
+        ),
         DiffFetch::Failed(message) => children.push(fact(format!("diff unavailable: {message}"))),
         DiffFetch::Ready(diff) => match &diff.kind {
             DiffKind::Binary => children.push(fact("binary file — no text diff".into())),
@@ -1141,7 +1162,10 @@ const AGENT_MEMORY_WARN_FRACTION: f64 = 0.5;
 /// only, so tool children are uncounted, and resident sizes double-count
 /// shared pages, so the sum is an upper bound. Provider rate contention —
 /// the other thing that bites at high N — is not measurable here at all.
-fn resource_line(sessions: &[eave_wire::SessionInfo], physical: Option<u64>) -> Option<(String, bool)> {
+fn resource_line(
+    sessions: &[eave_wire::SessionInfo],
+    physical: Option<u64>,
+) -> Option<(String, bool)> {
     let reporting: Vec<u64> = sessions
         .iter()
         .filter(|s| s.live)
@@ -1281,7 +1305,9 @@ enum ScrollMode {
     Follow,
     /// Pin the given transcript row's first display row to the viewport
     /// top, re-asserted on every update.
-    Pinned { msg: u32 },
+    Pinned {
+        msg: u32,
+    },
     /// Waiting for our just-sent message's row to appear in the feed.
     PinOnNextUserRow,
     Free,
@@ -1392,16 +1418,25 @@ impl TranscriptState {
     }
 
     fn live_len(&self) -> Option<(u32, usize)> {
-        self.transcript.rows.iter().enumerate().rev().find_map(|(ix, r)| match r {
-            Row::Assistant { text, live: true } => Some((ix as u32, text.len())),
-            _ => None,
-        })
+        self.transcript
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, r)| match r {
+                Row::Assistant { text, live: true } => Some((ix as u32, text.len())),
+                _ => None,
+            })
     }
 
     /// Fold one record batch and mirror the change into the `ListState`
     /// with minimal ops (splice for structure, remeasure for in-place
     /// growth/settle — spec 03 §Rendering).
-    fn apply_records(&mut self, epoch: u64, records: &[eave_core::journal::Record]) -> Result<(), ()> {
+    fn apply_records(
+        &mut self,
+        epoch: u64,
+        records: &[eave_core::journal::Record],
+    ) -> Result<(), ()> {
         let before_live = self.live_len();
         let user_rows_before = self.transcript.rows.len();
         if self.transcript.apply(epoch, records).is_err() {
@@ -1460,10 +1495,8 @@ impl TranscriptState {
                         self.ema_ms = 0.8 * self.ema_ms + 0.2 * dt;
                     }
                     self.last_growth = Some(now);
-                    let duration =
-                        Duration::from_millis(self.ema_ms.clamp(120.0, 400.0) as u64);
-                    let generation =
-                        self.veil.as_ref().map(|v| v.generation + 1).unwrap_or(1);
+                    let duration = Duration::from_millis(self.ema_ms.clamp(120.0, 400.0) as u64);
+                    let generation = self.veil.as_ref().map(|v| v.generation + 1).unwrap_or(1);
                     self.veil = Some(Veil {
                         msg,
                         from_byte: old_len,
@@ -1649,7 +1682,11 @@ impl VeiledBlock {
             if run.style.code {
                 font.family = theme::MONO.into();
             }
-            let color = if run.style.code { self.code_color } else { self.color };
+            let color = if run.style.code {
+                self.code_color
+            } else {
+                self.color
+            };
             let underline = run.style.link.then(|| UnderlineStyle {
                 thickness: px(theme::HAIRLINE),
                 color: None,
@@ -2088,7 +2125,8 @@ impl Shell {
         // that blinked through them would be flashing at someone who is
         // actively using the composer.
         let struck = cx.background_executor().now();
-        self.composer.update(cx, |c, _| c.caret_anchor = Some(struck));
+        self.composer
+            .update(cx, |c, _| c.caret_anchor = Some(struck));
         match ks.key.as_str() {
             "enter" => self.send_current(cx),
             "backspace" => {
@@ -2168,7 +2206,7 @@ impl Shell {
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         // User scroll breaks follow/pin; wheel back to the end restores
         // follow (spec 03 §Scroll). Work is deferred out of the scroll
-    	// handler (known ListState borrow papercut, spec 03 §No-fork
+        // handler (known ListState borrow papercut, spec 03 §No-fork
         // consequences).
         let up = ev.delta.pixel_delta(window.line_height()).y > px(0.);
         if std::env::var("EAVE_DEBUG_SCROLL").is_ok() {
@@ -2190,9 +2228,7 @@ impl Shell {
                     t.assert_scroll();
                     cx.notify();
                 }
-            } else if t.scroll == ScrollMode::Free
-                && t.list.is_scrolled_to_end().unwrap_or(false)
-            {
+            } else if t.scroll == ScrollMode::Free && t.list.is_scrolled_to_end().unwrap_or(false) {
                 t.scroll = ScrollMode::Follow;
                 t.assert_scroll();
                 cx.notify();
@@ -2799,7 +2835,11 @@ impl Shell {
                             } else {
                                 theme::WEIGHT_BODY
                             })
-                            .text_color(if over { theme::warning() } else { theme::text_tertiary() })
+                            .text_color(if over {
+                                theme::warning()
+                            } else {
+                                theme::text_tertiary()
+                            })
                             .child(SharedString::from(line)),
                     )
             }))
@@ -2873,8 +2913,7 @@ impl Shell {
                 GitState::Ok => {
                     let mut rows: Vec<AnyElement> = Vec::new();
                     for f in &snap.files {
-                        let expanded =
-                            matches!(&diff_slot, Some((p, _)) if p.as_str() == f.path);
+                        let expanded = matches!(&diff_slot, Some((p, _)) if p.as_str() == f.path);
                         rows.push(self.file_row(f, expanded, cx));
                         if expanded {
                             if let Some((_, fetch)) = &diff_slot {
@@ -2887,7 +2926,11 @@ impl Shell {
                         rows.push(fact(&format!("… and {} more files", snap.omitted)));
                     }
                     let label = if snap.omitted > 0 {
-                        format!("{} of {}", snap.files.len(), snap.files.len() as u64 + snap.omitted)
+                        format!(
+                            "{} of {}",
+                            snap.files.len(),
+                            snap.files.len() as u64 + snap.omitted
+                        )
                     } else {
                         snap.files.len().to_string()
                     };
@@ -3015,7 +3058,11 @@ impl Shell {
             // is the same colour — rest == hovered, no flicker on expand.
             .hover_fade(
                 format!("file-{}", f.path),
-                if expanded { theme::overlay() } else { theme::wash_rest() },
+                if expanded {
+                    theme::overlay()
+                } else {
+                    theme::wash_rest()
+                },
                 theme::overlay(),
             )
             .cursor_pointer()
@@ -3086,8 +3133,16 @@ impl Shell {
                     .font_family(theme::MONO)
                     .text_size(px(theme::SMALL_SIZE))
                     .line_height(px(theme::SMALL_LINE))
-                    .child(div().text_color(theme::success()).child(SharedString::from(adds)))
-                    .child(div().text_color(theme::danger()).child(SharedString::from(dels)))
+                    .child(
+                        div()
+                            .text_color(theme::success())
+                            .child(SharedString::from(adds)),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme::danger())
+                            .child(SharedString::from(dels)),
+                    )
                     .into_any_element(),
                 // Unknowable (binary / oversized): one honest dash.
                 None => div()
@@ -3153,9 +3208,10 @@ impl Shell {
             ConnEvent::Connected { engine_pid } => {
                 (theme::success(), format!("engine {engine_pid}"))
             }
-            ConnEvent::Reconnecting { attempt } => {
-                (theme::warning(), format!("reconnecting (attempt {attempt})…"))
-            }
+            ConnEvent::Reconnecting { attempt } => (
+                theme::warning(),
+                format!("reconnecting (attempt {attempt})…"),
+            ),
             ConnEvent::Busy { .. } => (theme::danger(), "engine busy".into()),
             ConnEvent::Failed { .. } => (theme::danger(), "engine unreachable".into()),
         };
@@ -3167,8 +3223,7 @@ impl Shell {
             .border_color(theme::border())
             .pt(px(theme::SPACE_1))
             .pb(px(theme::SPACE_3))
-            .child(
-            Self::column(
+            .child(Self::column(
                 div()
                     .w_full()
                     .flex()
@@ -3184,12 +3239,7 @@ impl Shell {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .size(px(theme::STATE_DOT))
-                                    .rounded_full()
-                                    .bg(dot),
-                            )
+                            .child(div().size(px(theme::STATE_DOT)).rounded_full().bg(dot))
                             .child(label)
                             .children(self.friction.as_ref().map(|(_, note)| {
                                 div()
@@ -3197,11 +3247,8 @@ impl Shell {
                                     .child(SharedString::from(note.clone()))
                             })),
                     )
-                    .children(session.map(|s| {
-                        div().text_color(theme::text_tertiary()).child(s)
-                    })),
-            ),
-        )
+                    .children(session.map(|s| div().text_color(theme::text_tertiary()).child(s))),
+            ))
     }
 
     /// Loud connection states get a real panel above the composer with the
@@ -3462,7 +3509,10 @@ impl Shell {
             } => panel(theme::danger_ring(), theme::danger_plate_glass())
                 .child(label(
                     theme::danger(),
-                    format!("unresponsive for {}", fmt_elapsed(now.saturating_sub(since_ms))),
+                    format!(
+                        "unresponsive for {}",
+                        fmt_elapsed(now.saturating_sub(since_ms))
+                    ),
                     true,
                 ))
                 .child(format!(
@@ -3760,7 +3810,13 @@ impl Shell {
                 input_json,
                 status,
             } => Self::render_approval(
-                state, request_id, tool, description, path, input_json, status,
+                state,
+                request_id,
+                tool,
+                description,
+                path,
+                input_json,
+                status,
             ),
             Row::Marker { text } => div()
                 .py(px(theme::SPACE_3))
@@ -3780,7 +3836,10 @@ impl Shell {
                         .child(SharedString::from(text.clone())),
                 )
                 .into_any_element(),
-            Row::Assistant { text: msg_text, live } => {
+            Row::Assistant {
+                text: msg_text,
+                live,
+            } => {
                 let Some(block) = state.display.block(id) else {
                     // Placeholder row of an empty live message. Slice N3
                     // replaced the static `▌` here: a caret that never
@@ -3913,12 +3972,10 @@ impl Shell {
             card = card.child(line(theme::text(), description.to_string()));
         }
         if let Some(p) = path {
-            card = card.child(
-                mono(p.clone()).debug_selector({
-                    let rid = rid.clone();
-                    move || format!("approval-path-{rid}")
-                }),
-            );
+            card = card.child(mono(p.clone()).debug_selector({
+                let rid = rid.clone();
+                move || format!("approval-path-{rid}")
+            }));
         }
         // The full input, stated. Truncation is stated too — a silently
         // shortened input is the same lie as a silently shortened fact
@@ -3960,8 +4017,20 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap_2()
-                        .child(Self::decision_button(state, &rid, true, "approve", theme::live()))
-                        .child(Self::decision_button(state, &rid, false, "deny", theme::danger())),
+                        .child(Self::decision_button(
+                            state,
+                            &rid,
+                            true,
+                            "approve",
+                            theme::live(),
+                        ))
+                        .child(Self::decision_button(
+                            state,
+                            &rid,
+                            false,
+                            "deny",
+                            theme::danger(),
+                        )),
                 )
                 .child(line(
                     theme::text_tertiary(),
@@ -4036,7 +4105,10 @@ impl Shell {
     ) -> AnyElement {
         let is_tail = state
             .display
-            .block(RowId { msg: id.msg, block: id.block + 1 })
+            .block(RowId {
+                msg: id.msg,
+                block: id.block + 1,
+            })
             .is_none();
         match block {
             // Mending for fences is structural: `split_blocks` yields the
@@ -4085,16 +4157,17 @@ impl Shell {
                                     ))
                                     .on_click(move |_, _, cx| {
                                         cx.stop_propagation();
-                                        cx.write_to_clipboard(
-                                            gpui::ClipboardItem::new_string(whole.clone()),
-                                        );
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            whole.clone(),
+                                        ));
                                         // The WHOLE fence, not the drawn
                                         // part: a cap is a reading limit,
                                         // and a copy that silently gave you
                                         // the first 200 lines of a 500-line
                                         // block would be the worst kind of
                                         // quiet failure.
-                                        if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade())
+                                        if let Some(shell) =
+                                            shell.as_ref().and_then(|s| s.upgrade())
                                         {
                                             shell.update(cx, |shell, cx| {
                                                 shell.transient_note(
@@ -4144,9 +4217,10 @@ impl Shell {
                 let total_chars = flat.chars().count();
                 // Paint-only veil on the growing tail block of the live
                 // message (spec 03 §Rendering).
-                let veil = state.veil.as_ref().filter(|v| {
-                    live && is_tail && v.msg == id.msg && v.from_byte < msg_text.len()
-                });
+                let veil = state
+                    .veil
+                    .as_ref()
+                    .filter(|v| live && is_tail && v.msg == id.msg && v.from_byte < msg_text.len());
                 let block_el = VeiledBlock {
                     text: SharedString::from(flat),
                     runs,
@@ -4174,7 +4248,10 @@ impl Shell {
                             // the element-id PATH and replays from t=0 on
                             // remount, so a veil whose id did not change
                             // per burst would restart on every re-render.
-                            ("veil", ((id.msg as u64) << 32) | (v.generation & 0xffff_ffff)),
+                            (
+                                "veil",
+                                ((id.msg as u64) << 32) | (v.generation & 0xffff_ffff),
+                            ),
                             // Slice M (§1.21): the curve, not the
                             // multi-chunk rewrite. `Animation::new`
                             // defaults to LINEAR, which put the fade's
@@ -4573,15 +4650,13 @@ impl Shell {
                                         theme::overlay(),
                                     )
                                     .cursor_pointer()
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, window, cx| {
-                                            let at = window.mouse_position();
-                                            this.open_model_menu(
-                                                point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
-                                                cx,
-                                            );
-                                        },
-                                    ))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        let at = window.mouse_position();
+                                        this.open_model_menu(
+                                            point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
+                                            cx,
+                                        );
+                                    }))
                                     .child(format!("{model}  ⌄")),
                             )
                             .child(
@@ -4657,16 +4732,14 @@ impl Render for Shell {
                     // frame deltas on a vsync-locked display sit at the
                     // refresh period when healthy — a frame that blew the
                     // budget shows up as a missed vsync (≥2 periods).
-                    let mut t: Vec<Duration> =
-                        perf.frame_times.iter().skip(10).copied().collect();
+                    let mut t: Vec<Duration> = perf.frame_times.iter().skip(10).copied().collect();
                     t.sort();
                     let p = |q: f64| t[((t.len() - 1) as f64 * q) as usize];
                     let missed = t
                         .iter()
                         .filter(|d| **d > Duration::from_micros(25_000))
                         .count();
-                    let mut c: Vec<Duration> =
-                        perf.cpu_times.iter().skip(10).copied().collect();
+                    let mut c: Vec<Duration> = perf.cpu_times.iter().skip(10).copied().collect();
                     // Where did the worst CPU frame land? Deterministic
                     // position across runs = content-driven (e.g. first-use
                     // font shaping); wandering position = load noise.
@@ -4680,7 +4753,10 @@ impl Render for Shell {
                         .unwrap_or(0);
                     c.sort();
                     let pc = |q: f64| c[((c.len() - 1) as f64 * q) as usize];
-                    println!("PERF cpu_max_at_frame={max_at} (~row {})", max_at * PERF_ROWS_PER_FRAME);
+                    println!(
+                        "PERF cpu_max_at_frame={max_at} (~row {})",
+                        max_at * PERF_ROWS_PER_FRAME
+                    );
                     println!(
                         "PERF frames={} rows={} wall[p50={:?} p95={:?} p99={:?} max={:?} missed_vsync={}] cpu[p50={:?} p95={:?} p99={:?} max={:?}]",
                         t.len(),
@@ -4893,8 +4969,16 @@ impl Render for Shell {
                                 // at once and only the hover progress is smooth.
                                 .hover_fade(
                                     "send",
-                                    if has_draft { theme::inverse() } else { theme::overlay_strong() },
-                                    if has_draft { theme::inverse_hover() } else { theme::overlay_strongest() },
+                                    if has_draft {
+                                        theme::inverse()
+                                    } else {
+                                        theme::overlay_strong()
+                                    },
+                                    if has_draft {
+                                        theme::inverse_hover()
+                                    } else {
+                                        theme::overlay_strongest()
+                                    },
                                 )
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -4952,12 +5036,8 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key))
             // Slice K: answering is a real action with a real binding, not
             // a character the composer happens not to want.
-            .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| {
-                this.decide_oldest(true, cx)
-            }))
-            .on_action(cx.listener(|this, _: &DenyOldest, _, cx| {
-                this.decide_oldest(false, cx)
-            }))
+            .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| this.decide_oldest(true, cx)))
+            .on_action(cx.listener(|this, _: &DenyOldest, _, cx| this.decide_oldest(false, cx)))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             .child(self.titlebar(cx))
             .child(
@@ -5038,10 +5118,8 @@ impl Render for Shell {
                                         // above the composer's clearance)
                                         // and `relative()` would destroy
                                         // that positioning outright.
-                                        let t = motion::entrance_t(
-                                            "in:empty-note",
-                                            motion::FADE_IN,
-                                        );
+                                        let t =
+                                            motion::entrance_t("in:empty-note", motion::FADE_IN);
                                         div()
                                             .debug_selector(|| "transcript-empty".into())
                                             .absolute()
@@ -5302,45 +5380,56 @@ pub fn run(data_dir: PathBuf) -> ! {
             .unwrap_or(1.0);
         (PathBuf::from(p), speed)
     });
-    let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
+    let perf_10k = std::env::var("EAVE_PERF")
+        .map(|v| v == "10k")
+        .unwrap_or(false);
 
     // Slice P3: the one place an `Application` is built, so the one place
     // the icon set can be registered. `bootstrap` cannot do it — assets are
     // an `Application`-level concern and gpui exposes no `App` setter — which
     // is why the harness renders every glyph as empty coverage (icons.rs).
-    application().with_assets(icons::Icons).run(move |cx: &mut App| {
-        let queues = Arc::new(Queues::default());
-        let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
-        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
+    application()
+        .with_assets(icons::Icons)
+        .run(move |cx: &mut App| {
+            let queues = Arc::new(Queues::default());
+            let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
+            let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
 
-        // Feed source: live engine, or fixture replay (Stage D acceptance
-        // harness) — the pump and entities cannot tell the difference.
-        {
-            let plumbing = Plumbing {
-                queues: Arc::clone(&queues),
-                wake: wake_tx,
-            };
-            match replay.clone() {
-                Some((path, speed)) => {
-                    std::thread::spawn(move || replay_loop(path, speed, plumbing));
-                    drop(cmd_rx);
-                }
-                None if perf_10k => drop(cmd_rx), // no feed at all
-                None => {
-                    let data_dir = data_dir.clone();
-                    std::thread::spawn(move || {
-                        tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("tokio runtime")
-                            .block_on(feed_loop(data_dir, plumbing, cmd_rx));
-                    });
+            // Feed source: live engine, or fixture replay (Stage D acceptance
+            // harness) — the pump and entities cannot tell the difference.
+            {
+                let plumbing = Plumbing {
+                    queues: Arc::clone(&queues),
+                    wake: wake_tx,
+                };
+                match replay.clone() {
+                    Some((path, speed)) => {
+                        std::thread::spawn(move || replay_loop(path, speed, plumbing));
+                        drop(cmd_rx);
+                    }
+                    None if perf_10k => drop(cmd_rx), // no feed at all
+                    None => {
+                        let data_dir = data_dir.clone();
+                        std::thread::spawn(move || {
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("tokio runtime")
+                                .block_on(feed_loop(data_dir, plumbing, cmd_rx));
+                        });
+                    }
                 }
             }
-        }
 
-        bootstrap(cx, Feed { queues, wake_rx, cmd_tx });
-    });
+            bootstrap(
+                cx,
+                Feed {
+                    queues,
+                    wake_rx,
+                    cmd_tx,
+                },
+            );
+        });
     std::process::exit(0);
 }
 
@@ -5375,7 +5464,8 @@ struct Feed {
 /// papered over with a polling timer — a polling timer is exactly the
 /// per-frame machinery this slice does not build.
 fn reduce_motion_preference() -> bool {
-    if let Some(forced) = reduce_motion_override(std::env::var("EAVE_REDUCE_MOTION").ok().as_deref())
+    if let Some(forced) =
+        reduce_motion_override(std::env::var("EAVE_REDUCE_MOTION").ok().as_deref())
     {
         return forced;
     }
@@ -5431,13 +5521,7 @@ fn macos_reduce_motion() -> Option<bool> {
     // pointer outlives this function.
     unsafe {
         let mk = |s: &str| -> CFTypeRef {
-            CFStringCreateWithBytes(
-                std::ptr::null(),
-                s.as_ptr(),
-                s.len() as isize,
-                UTF8,
-                0,
-            )
+            CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as isize, UTF8, 0)
         };
         let key = mk("reduceMotion");
         let domain = mk("com.apple.universalaccess");
@@ -5456,7 +5540,8 @@ fn macos_reduce_motion() -> Option<bool> {
         if value.is_null() {
             return None;
         }
-        let out = (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
+        let out =
+            (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
         CFRelease(value);
         out
     }
@@ -5471,7 +5556,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         mut wake_rx,
         cmd_tx,
     } = feed;
-    let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
+    let perf_10k = std::env::var("EAVE_PERF")
+        .map(|v| v == "10k")
+        .unwrap_or(false);
 
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
@@ -5504,8 +5591,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // measured layout includes a populated files rail — and (B2)
         // a cap-size expanded diff, so the long-diff render path is
         // measured at its worst, not at a friendly size.
-        snapshot: perf_10k
-            .then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
+        snapshot: perf_10k.then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
         collapsed: false,
         diff: perf_10k.then(|| DiffSlot {
             session: "perf:10k".into(),
@@ -5535,9 +5621,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let sessions = sessions.clone();
         let transcript = transcript.clone();
         cx.spawn(async move |cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_secs(1))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(1)).await;
             if sessions.read_with(cx, |s, _| s.notice_standing()) {
                 sessions.update(cx, |_, cx| cx.notify());
             }
@@ -5565,8 +5649,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let cmd_tx = cmd_tx.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
-                let conn_events: Vec<ConnEvent> =
-                    queues.conn.lock().unwrap().drain(..).collect();
+                let conn_events: Vec<ConnEvent> = queues.conn.lock().unwrap().drain(..).collect();
                 if let Some(last) = conn_events.into_iter().last() {
                     conn.update(cx, |state, cx| {
                         state.status = last;
@@ -5575,16 +5658,13 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 }
                 // Attention is current-state, not a log: the last
                 // frame of the burst wins.
-                let attn_events: Vec<AttnEvent> =
-                    queues.attn.lock().unwrap().drain(..).collect();
-                let rail_events: Vec<RailEvent> =
-                    queues.rail.lock().unwrap().drain(..).collect();
+                let attn_events: Vec<AttnEvent> = queues.attn.lock().unwrap().drain(..).collect();
+                let rail_events: Vec<RailEvent> = queues.rail.lock().unwrap().drain(..).collect();
                 // Files snapshots fold by replacement — last of the
                 // burst wins; the render filters by session tag.
                 let files_events: Vec<FilesEvent> =
                     queues.files.lock().unwrap().drain(..).collect();
-                let diff_events: Vec<DiffEvent> =
-                    queues.diffs.lock().unwrap().drain(..).collect();
+                let diff_events: Vec<DiffEvent> = queues.diffs.lock().unwrap().drain(..).collect();
                 if !files_events.is_empty() || !diff_events.is_empty() {
                     let cmd_tx = cmd_tx.clone();
                     files.update(cx, |state, cx| {
@@ -5602,8 +5682,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                             && s.files.iter().any(|f| f.path == slot.path)
                                     });
                                     if listed {
-                                        let _ =
-                                            cmd_tx.send(Command::Diff(slot.path.clone()));
+                                        let _ = cmd_tx.send(Command::Diff(slot.path.clone()));
                                     } else {
                                         state.diff = None;
                                     }
@@ -5629,8 +5708,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 }
                 let last_attn = attn_events.into_iter().last();
                 let last_rail = rail_events.into_iter().last();
-                let wt_events: Vec<WtEvent> =
-                    queues.wt.lock().unwrap().drain(..).collect();
+                let wt_events: Vec<WtEvent> = queues.wt.lock().unwrap().drain(..).collect();
                 if last_attn.is_some() || last_rail.is_some() || !wt_events.is_empty() {
                     sessions.update(cx, |state, cx| {
                         if let Some(tagged) = last_attn {
@@ -5656,8 +5734,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         cx.notify();
                     });
                 }
-                let feed_events: Vec<FeedEvent> =
-                    queues.feed.lock().unwrap().drain(..).collect();
+                let feed_events: Vec<FeedEvent> = queues.feed.lock().unwrap().drain(..).collect();
                 if !feed_events.is_empty() {
                     let cmd_tx = cmd_tx.clone();
                     let mut switched = false;
@@ -5758,98 +5835,100 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     }
 
     let bounds = Bounds::centered(None, size(px(theme::WINDOW_W), px(theme::WINDOW_H)), cx);
-    let handle = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
-            // Glass is the only look (ruled 2026-08-17, opaque path deleted
-            // 2026-08-19). theme.rs owns the tints this blur sits under.
-            window_background: WindowBackgroundAppearance::Blurred,
-            titlebar: Some(TitlebarOptions {
-                title: Some("eave".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
-            }),
-            ..Default::default()
-        },
-        |window, cx| {
-            let shell = cx.new(|cx| {
-                let composer = cx.new(|_| ComposerState {
-                    text: String::new(),
-                    key: String::new(),
-                    drafts: HashMap::new(),
-                    caret_anchor: None,
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
+                // Glass is the only look (ruled 2026-08-17, opaque path deleted
+                // 2026-08-19). theme.rs owns the tints this blur sits under.
+                window_background: WindowBackgroundAppearance::Blurred,
+                titlebar: Some(TitlebarOptions {
+                    title: Some("eave".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let shell = cx.new(|cx| {
+                    let composer = cx.new(|_| ComposerState {
+                        text: String::new(),
+                        key: String::new(),
+                        drafts: HashMap::new(),
+                        caret_anchor: None,
+                    });
+                    // Slice K: the approval card's buttons are built by a
+                    // static row fn with no `Context`, so give the transcript
+                    // state the two handles they need — the shell's own
+                    // command channel and the composer they read the deny
+                    // reason from.
+                    let weak_shell = cx.weak_entity();
+                    transcript.update(cx, |t, _| {
+                        t.commands = Some(cmd_tx.clone());
+                        t.composer = Some(composer.clone());
+                        t.shell = Some(weak_shell);
+                    });
+                    cx.observe(&conn, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&files, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+                    Shell {
+                        focus: cx.focus_handle(),
+                        demo: DemoOverlay::default(),
+                        launcher: LauncherUi::default(),
+                        conn: conn.clone(),
+                        sessions: sessions.clone(),
+                        files: files.clone(),
+                        transcript: transcript.clone(),
+                        composer,
+                        commands: cmd_tx.clone(),
+                        perf: perf_10k.then(|| PerfProbe {
+                            frame_times: Vec::new(),
+                            cpu_times: Vec::new(),
+                            last_cpu: None,
+                            last_frame: None,
+                            item_ix: 0,
+                            done: false,
+                        }),
+                        friction: None,
+                        friction_gen: 0,
+                        friction_path_stated: false,
+                        rail_scroll: ScrollHandle::new(),
+                        files_scroll: ScrollHandle::new(),
+                    }
                 });
-                // Slice K: the approval card's buttons are built by a
-                // static row fn with no `Context`, so give the transcript
-                // state the two handles they need — the shell's own
-                // command channel and the composer they read the deny
-                // reason from.
-                let weak_shell = cx.weak_entity();
-                transcript.update(cx, |t, _| {
-                    t.commands = Some(cmd_tx.clone());
-                    t.composer = Some(composer.clone());
-                    t.shell = Some(weak_shell);
-                });
-                cx.observe(&conn, |_, _, cx| cx.notify()).detach();
-                cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
-                cx.observe(&files, |_, _, cx| cx.notify()).detach();
-                cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
-                cx.observe(&composer, |_, _, cx| cx.notify()).detach();
-                Shell {
-                    focus: cx.focus_handle(),
-                    demo: DemoOverlay::default(),
-                    launcher: LauncherUi::default(),
-                    conn: conn.clone(),
-                    sessions: sessions.clone(),
-                    files: files.clone(),
-                    transcript: transcript.clone(),
-                    composer,
-                    commands: cmd_tx.clone(),
-                    perf: perf_10k.then(|| PerfProbe {
-                        frame_times: Vec::new(),
-                        cpu_times: Vec::new(),
-                        last_cpu: None,
-                        last_frame: None,
-                        item_ix: 0,
-                        done: false,
-                    }),
-                    friction: None,
-                    friction_gen: 0,
-                    friction_path_stated: false,
-                    rail_scroll: ScrollHandle::new(),
-                    files_scroll: ScrollHandle::new(),
+                let handle = shell.read(cx).focus.clone();
+                window.focus(&handle, cx);
+                // Slice P1: `EAVE_OVERLAY_DEMO=open` opens the menu on the
+                // first frame, so the surface can be looked at rather than
+                // only asserted. A fixed anchor rather than the pointer's,
+                // because there is no pointer yet.
+                if overlay::demo_opens_at_boot() {
+                    shell.update(cx, |s, cx| s.open_demo_menu(point(px(240.), px(180.)), cx));
                 }
-            });
-            let handle = shell.read(cx).focus.clone();
-            window.focus(&handle, cx);
-            // Slice P1: `EAVE_OVERLAY_DEMO=open` opens the menu on the
-            // first frame, so the surface can be looked at rather than
-            // only asserted. A fixed anchor rather than the pointer's,
-            // because there is no pointer yet.
-            if overlay::demo_opens_at_boot() {
-                shell.update(cx, |s, cx| {
-                    s.open_demo_menu(point(px(240.), px(180.)), cx)
-                });
-            }
-            // Slice Q2: `EAVE_LAUNCH_AT_BOOT=1` presses the launcher's own
-            // start button on the first frame.
-            //
-            // This exists because the launcher's HALF that a capture can
-            // prove is the half that does nothing: a shot shows eave
-            // resting instead of auto-opening, and cannot show a click
-            // producing a session. The harness cannot cover it either —
-            // it replaces the connection loop with plumbing, so
-            // `Command::Launch` reaching a real `open_with_agent` is
-            // exercised by no test in the suite. Same shape and same
-            // reason as P1's `EAVE_OVERLAY_DEMO`.
-            if std::env::var("EAVE_LAUNCH_AT_BOOT").map(|v| v == "1").unwrap_or(false) {
-                shell.update(cx, |s, cx| s.launch(cx));
-            }
-            shell
-        },
-    )
-    .expect("open window");
+                // Slice Q2: `EAVE_LAUNCH_AT_BOOT=1` presses the launcher's own
+                // start button on the first frame.
+                //
+                // This exists because the launcher's HALF that a capture can
+                // prove is the half that does nothing: a shot shows eave
+                // resting instead of auto-opening, and cannot show a click
+                // producing a session. The harness cannot cover it either —
+                // it replaces the connection loop with plumbing, so
+                // `Command::Launch` reaching a real `open_with_agent` is
+                // exercised by no test in the suite. Same shape and same
+                // reason as P1's `EAVE_OVERLAY_DEMO`.
+                if std::env::var("EAVE_LAUNCH_AT_BOOT")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    shell.update(cx, |s, cx| s.launch(cx));
+                }
+                shell
+            },
+        )
+        .expect("open window");
     cx.activate(true);
     handle
 }
@@ -5920,7 +5999,10 @@ mod tests {
             view.contains(&format!("copy takes all {}", theme::FENCE_MAX_LINES + 40)),
             "a cap that does not say copy is unaffected reads as data loss"
         );
-        assert!(view.starts_with("line 0"), "the cap drops the TAIL, not the head");
+        assert!(
+            view.starts_with("line 0"),
+            "the cap drops the TAIL, not the head"
+        );
     }
 
     use super::*;

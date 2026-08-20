@@ -34,7 +34,7 @@ fn test_header(session_id: &str) -> Header {
         provider: "fake-agent".into(),
         cwd: "/tmp".into(),
         created_ts_ms: journal::now_ms(),
-            agent: Default::default(),
+        agent: Default::default(),
     }
 }
 
@@ -86,7 +86,10 @@ fn probe_lock(root: &Path) -> (Option<i32>, String) {
         .env("STUB_DATA_DIR", root)
         .output()
         .expect("run lock probe");
-    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
 }
 
 /// Poll a file until its contents satisfy `pred` (the journal flushes every
@@ -120,12 +123,11 @@ fn journal_round_trips_records() {
             permission_mode: Some("default".into()),
         }))
         .unwrap(),
-        w.append(JournalEvent::UserSent { text: "hi".into() }).unwrap(),
+        w.append(JournalEvent::UserSent { text: "hi".into() })
+            .unwrap(),
         w.append(JournalEvent::UserDelivered {}).unwrap(),
-        w.append(provider(SessionEvent::TextDelta {
-            text: "hel".into(),
-        }))
-        .unwrap(),
+        w.append(provider(SessionEvent::TextDelta { text: "hel".into() }))
+            .unwrap(),
         w.append(provider(SessionEvent::TurnCompleted {
             subtype: "success".into(),
             is_error: false,
@@ -142,7 +144,10 @@ fn journal_round_trips_records() {
     assert_eq!(loaded.header, header);
     assert_eq!(loaded.records, written);
     assert!(loaded.is_terminal());
-    assert!(loaded.repair.already_terminal, "load must not have appended");
+    assert!(
+        loaded.repair.already_terminal,
+        "load must not have appended"
+    );
     assert!(!loaded.torn_tail_repaired);
     assert!(loaded.undelivered_user_sends().is_empty());
 }
@@ -254,8 +259,8 @@ fn torn_tail_truncates_to_last_valid_record_at_every_byte() {
     for cut in last_start..original.len() {
         let case = root.join(format!("torn-{cut}.jsonl"));
         std::fs::write(&case, &original[..cut]).unwrap();
-        let loaded = journal::load(&case)
-            .unwrap_or_else(|e| panic!("cut at byte {cut} must load, got {e}"));
+        let loaded =
+            journal::load(&case).unwrap_or_else(|e| panic!("cut at byte {cut} must load, got {e}"));
         // A partial final record must never surface; the only complete-parse
         // cut is at original.len()-1 (the record intact minus its newline).
         // Load also applies crash-tail repair: the streaming turn settles
@@ -265,7 +270,9 @@ fn torn_tail_truncates_to_last_valid_record_at_every_byte() {
         for rec in &loaded.records[..surviving] {
             assert!(matches!(
                 &rec.event,
-                JournalEvent::Provider { event: SessionEvent::TextDelta { .. } }
+                JournalEvent::Provider {
+                    event: SessionEvent::TextDelta { .. }
+                }
             ));
         }
         assert!(matches!(
@@ -274,7 +281,9 @@ fn torn_tail_truncates_to_last_valid_record_at_every_byte() {
         ));
         assert!(matches!(
             &loaded.records[surviving + 1].event,
-            JournalEvent::Closed { outcome: Outcome::Interrupted }
+            JournalEvent::Closed {
+                outcome: Outcome::Interrupted
+            }
         ));
         // Loading repaired the file: a reload is clean and identical.
         let reloaded = journal::load(&case).unwrap();
@@ -382,10 +391,15 @@ fn crash_tail_repair_settles_open_turn_as_interrupted() {
         tail[tail.len() - 3],
         JournalEvent::ToolInterrupted { id } if id == "toolu_x"
     ));
-    assert!(matches!(tail[tail.len() - 2], JournalEvent::TurnInterrupted { .. }));
+    assert!(matches!(
+        tail[tail.len() - 2],
+        JournalEvent::TurnInterrupted { .. }
+    ));
     assert!(matches!(
         tail[tail.len() - 1],
-        JournalEvent::Closed { outcome: Outcome::Interrupted }
+        JournalEvent::Closed {
+            outcome: Outcome::Interrupted
+        }
     ));
 
     // The send was journaled but never confirmed: undelivered backfill.
@@ -417,13 +431,24 @@ async fn exit_143_is_recorded_as_killed_not_crashed() {
     let jpath = Store::journal_path(&dir);
     let writer = JournalWriter::create(&jpath, &test_header(&sid)).unwrap();
 
-    let mut cfg = SpawnConfig::new(env!("CARGO_BIN_EXE_fake-agent"), std::env::temp_dir(), sid.clone());
+    let mut cfg = SpawnConfig::new(
+        env!("CARGO_BIN_EXE_fake-agent"),
+        std::env::temp_dir(),
+        sid.clone(),
+    );
     cfg.extra_env.push(("FAKE_MODE".into(), "term-143".into()));
     let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
 
     let (extra_tx, extra_rx) = mpsc::channel(1);
     drop(extra_tx);
-    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid), None));
+    let rec = tokio::spawn(record_session(
+        events,
+        extra_rx,
+        writer,
+        dir.clone(),
+        test_meta(&sid),
+        None,
+    ));
 
     wait_for_file(&jpath, |c| c.contains("alive and catching TERM")).await;
     session.kill().await.expect("kill must be provable");
@@ -446,7 +471,12 @@ async fn exit_143_is_recorded_as_killed_not_crashed() {
     assert!(loaded.repair.already_terminal);
     assert!(matches!(
         &loaded.records.last().unwrap().event,
-        JournalEvent::Closed { outcome: Outcome::Killed { code: Some(143), .. } }
+        JournalEvent::Closed {
+            outcome: Outcome::Killed {
+                code: Some(143),
+                ..
+            }
+        }
     ));
     let meta = Meta::load(&dir).unwrap();
     assert_eq!(meta.state, "killed");
@@ -471,10 +501,18 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         std::env::temp_dir(),
         sid.clone(),
     );
-    cfg.extra_env.push(("FAKE_MODE".into(), "stdin-closed".into()));
+    cfg.extra_env
+        .push(("FAKE_MODE".into(), "stdin-closed".into()));
     let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
     let (extra_tx, extra_rx) = mpsc::channel(8);
-    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid), None));
+    let rec = tokio::spawn(record_session(
+        events,
+        extra_rx,
+        writer,
+        dir.clone(),
+        test_meta(&sid),
+        None,
+    ));
     wait_for_file(&jpath, |c| c.contains("init")).await;
 
     let delivered = send_and_journal(&mut session, &extra_tx, "into the void")
@@ -510,7 +548,8 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         std::env::temp_dir(),
         sid2.clone(),
     );
-    cfg2.extra_env.push(("FAKE_MODE".into(), "tool-cycle".into()));
+    cfg2.extra_env
+        .push(("FAKE_MODE".into(), "tool-cycle".into()));
     let (mut session2, events2) = ClaudeCodeSession::spawn(&cfg2).unwrap();
     let (extra_tx2, extra_rx2) = mpsc::channel(8);
     let rec2 = tokio::spawn(record_session(
@@ -525,8 +564,15 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         .await
         .unwrap());
     drop(extra_tx2);
-    tokio::time::timeout(TEST_TIMEOUT, rec2).await.unwrap().unwrap().unwrap();
-    assert!(journal::load(&jpath2).unwrap().undelivered_user_sends().is_empty());
+    tokio::time::timeout(TEST_TIMEOUT, rec2)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(journal::load(&jpath2)
+        .unwrap()
+        .undelivered_user_sends()
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +621,10 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
         JournalEvent::UserSent { text } if text == "please hang in a tool"
     )));
     assert!(!loaded.repair.already_terminal);
-    assert_eq!(loaded.repair.tools_interrupted, vec!["toolu_hang".to_string()]);
+    assert_eq!(
+        loaded.repair.tools_interrupted,
+        vec!["toolu_hang".to_string()]
+    );
     assert!(loaded.repair.turn_interrupted);
     assert!(loaded.is_terminal());
     // The message reached the agent's stdin before the engine died.
@@ -589,7 +638,8 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
         loaded.header.session_id.clone(),
     );
     cfg.resume = true;
-    cfg.extra_env.push(("FAKE_MODE".into(), "resume-probe".into()));
+    cfg.extra_env
+        .push(("FAKE_MODE".into(), "resume-probe".into()));
     let (mut session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
     // resume-probe answers the continuation message, like the real CLI —
     // cold resume is always user-initiated (spec 02: no auto-redispatch).
@@ -758,7 +808,9 @@ fn concurrent_sessions_in_one_store_do_not_cross_contaminate() {
     const N: usize = 6;
     let root = scratch();
     let sids: Vec<String> = (0..N).map(|_| uuid::Uuid::new_v4().to_string()).collect();
-    let messages: Vec<String> = (0..N).map(|i| format!("message for session #{i}")).collect();
+    let messages: Vec<String> = (0..N)
+        .map(|i| format!("message for session #{i}"))
+        .collect();
     let mut children: Vec<_> = sids
         .iter()
         .zip(&messages)
@@ -775,7 +827,9 @@ fn concurrent_sessions_in_one_store_do_not_cross_contaminate() {
         assert!(loaded.is_terminal());
         assert!(matches!(
             &loaded.records.last().unwrap().event,
-            JournalEvent::Closed { outcome: Outcome::Done }
+            JournalEvent::Closed {
+                outcome: Outcome::Done
+            }
         ));
         let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
         assert!(text.contains(&messages[i]));
@@ -811,7 +865,14 @@ async fn real_claude_journal_and_cold_resume() {
     let cfg = SpawnConfig::new("claude", std::env::temp_dir(), sid.clone());
     let (mut session, events) = ClaudeCodeSession::spawn(&cfg).unwrap();
     let (extra_tx, extra_rx) = mpsc::channel(4);
-    let rec = tokio::spawn(record_session(events, extra_rx, writer, dir.clone(), test_meta(&sid), None));
+    let rec = tokio::spawn(record_session(
+        events,
+        extra_rx,
+        writer,
+        dir.clone(),
+        test_meta(&sid),
+        None,
+    ));
 
     let msg = format!("Remember the codeword: {CODEWORD}. Reply with exactly: noted");
     extra_tx
@@ -832,7 +893,13 @@ async fn real_claude_journal_and_cold_resume() {
     }
     session.kill().await.unwrap();
     let outcome = rec.await.unwrap().unwrap();
-    assert!(matches!(outcome, Outcome::Killed { code: Some(143), .. }));
+    assert!(matches!(
+        outcome,
+        Outcome::Killed {
+            code: Some(143),
+            ..
+        }
+    ));
     assert!(journal::load(&jpath).unwrap().is_terminal());
 
     // Cold resume from the journal's cursor: fresh process, same session.

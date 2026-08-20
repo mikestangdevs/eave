@@ -36,11 +36,15 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     /// The operator's words, handed to the model verbatim.
-    Denied { message: String },
+    Denied {
+        message: String,
+    },
     /// Nobody answered and the question is gone — the provider withdrew
     /// it, or the process ended under it. It can never be answered now,
     /// and a card that pretends otherwise is a lie.
-    Withdrawn { reason: String },
+    Withdrawn {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +53,6 @@ pub enum ToolStatus {
     Finished,
     Interrupted,
 }
-
 
 /// The one line a tool row states about what it was asked to do.
 ///
@@ -98,10 +101,16 @@ pub fn tool_detail(name: &str, input: &str) -> Option<String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    User { text: String, delivery: Delivery },
+    User {
+        text: String,
+        delivery: Delivery,
+    },
     /// Assistant text; `live` while streaming deltas, settled by the
     /// snapshot or a turn end.
-    Assistant { text: String, live: bool },
+    Assistant {
+        text: String,
+        live: bool,
+    },
     /// A tool call. `input` is the provider's request object as compact
     /// JSON and `result` its reply as text — both already bounded by
     /// `eave_core::events::TOOL_PAYLOAD_CAP` before they reach here, so a
@@ -128,7 +137,9 @@ pub enum Row {
     },
     /// Non-content markers rendered inline: session start, turn ends,
     /// interruptions, terminal outcome.
-    Marker { text: String },
+    Marker {
+        text: String,
+    },
 }
 
 /// One session's projected transcript plus its resume cursor.
@@ -395,10 +406,14 @@ impl Transcript {
     }
 
     fn last_live_assistant_ix(&self) -> Option<usize> {
-        self.rows.iter().enumerate().rev().find_map(|(ix, row)| match row {
-            Row::Assistant { live, .. } if *live => Some(ix),
-            _ => None,
-        })
+        self.rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, row)| match row {
+                Row::Assistant { live, .. } if *live => Some(ix),
+                _ => None,
+            })
     }
 
     fn settle_live_rows(&mut self) {
@@ -470,7 +485,10 @@ impl Transcript {
 
     fn set_tool_status(&mut self, id: &str, status: ToolStatus) {
         for ix in 0..self.rows.len() {
-            if let Row::Tool { id: rid, status: s, .. } = &mut self.rows[ix] {
+            if let Row::Tool {
+                id: rid, status: s, ..
+            } = &mut self.rows[ix]
+            {
                 if rid == id {
                     *s = status;
                     self.touch(ix);
@@ -555,7 +573,12 @@ mod tests {
             &[
                 rec(1, JournalEvent::UserSent { text: "hi".into() }),
                 rec(2, JournalEvent::UserDelivered {}),
-                rec(3, JournalEvent::UserSent { text: "lost".into() }),
+                rec(
+                    3,
+                    JournalEvent::UserSent {
+                        text: "lost".into(),
+                    },
+                ),
                 rec(
                     4,
                     JournalEvent::Closed {

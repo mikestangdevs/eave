@@ -32,8 +32,8 @@
 use serde::{Deserialize, Serialize};
 
 use eave_core::journal::{Header, Record};
-use eave_core::session::AgentConfig;
 use eave_core::proc::ProcIdentity;
+use eave_core::session::AgentConfig;
 
 pub use eave_core::attention::{AttentionSnapshot, WaitReason};
 
@@ -59,7 +59,9 @@ pub struct RequestEnvelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
-    Hello { proto: u32 },
+    Hello {
+        proto: u32,
+    },
     /// All sessions the engine knows (on disk or live).
     List,
     /// Create a session (fresh id if `None`) or load an existing one.
@@ -95,9 +97,14 @@ pub enum Request {
     /// engine fully journals and attempts delivery of one send before the
     /// next — the order-paired delivery state depends on this (spec 02
     /// §Delivery state; do NOT pipeline).
-    Send { session_id: String, text: String },
+    Send {
+        session_id: String,
+        text: String,
+    },
     /// Kill the session's live process (verified kill ladder, spec 01).
-    Kill { session_id: String },
+    Kill {
+        session_id: String,
+    },
     /// Observe the session SET (spec 05 §Watch): items flow on this
     /// request's id as `Sessions` snapshots — one immediately, one on
     /// every session-set / state / attention change. This is the only
@@ -111,7 +118,9 @@ pub enum Request {
     /// one after every engine-side git poll. Strictly per-session: file
     /// data for session A never flows on any other session's files id,
     /// and never on watch (isolation invariant, enforced by test).
-    Files { session_id: String },
+    Files {
+        session_id: String,
+    },
     /// One file's diff content (Slice B2), computed by the engine from
     /// `git diff` in the session cwd at request time — unary, not a
     /// subscription. There is deliberately no engine-held diff state to
@@ -119,7 +128,10 @@ pub enum Request {
     /// [`FilesSnapshot`] means "re-request any diff you are showing").
     /// Every failure shape is a stated fact inside [`FileDiff`], never a
     /// hang — and every underlying git call is timeout-bounded.
-    Diff { session_id: String, path: String },
+    Diff {
+        session_id: String,
+        path: String,
+    },
     /// Cancel a streaming request (`subscribe` / `watch` / `files`) by its
     /// envelope id, on this connection (Slice I1). The engine stops the
     /// stream's task and releases any subscriber-scoped resource it held
@@ -128,7 +140,9 @@ pub enum Request {
     /// disconnect or a stream the engine ended on its own. Without this, a
     /// client that switches sessions leaks the old stream for the
     /// connection's whole life; connection close remains the backstop.
-    Unsubscribe { id: u64 },
+    Unsubscribe {
+        id: u64,
+    },
     /// Move a session into its own git worktree (Slice I2). Allowed only
     /// while nothing has ever spawned (state `new`, no records) — after
     /// the first send the provider has seen the cwd and it is fixed for
@@ -138,7 +152,9 @@ pub enum Request {
     /// session's cwd to it. Isolation is the operator's choice, never
     /// automatic (Slice I2 decision 1): detection of a shared checkout is
     /// stated on `watch`; this method is the opt-in.
-    Isolate { session_id: String },
+    Isolate {
+        session_id: String,
+    },
     /// Delete a session's eave-created worktree (Slice I2). The engine
     /// re-checks state freshly at call time: a LIVE session refuses (kill
     /// first); uncommitted files or commits unreachable from any other
@@ -146,7 +162,10 @@ pub enum Request {
     /// operator confirms against facts, not a stale rail row (decision 2:
     /// eave never deletes dirty work without the operator meaning it).
     /// Clean removal also prunes and deletes the `eave/` branch.
-    RemoveWorktree { session_id: String, force: bool },
+    RemoveWorktree {
+        session_id: String,
+        force: bool,
+    },
     /// Answer one open permission question (Slice K). The agent is parked
     /// until this arrives and there is no other way out — eave never
     /// auto-approves, never auto-denies, and never times out into either.
@@ -191,7 +210,9 @@ pub enum ResponseBody {
     /// Unary success. Payload shape depends on the request (`HelloOk`,
     /// `ListOk`, `OpenOk`, `SendOk`, `KillOk`) — loose on purpose.
     Ok(serde_json::Value),
-    Err { message: String },
+    Err {
+        message: String,
+    },
     /// One subscription frame; carries the `Subscribe` request's id.
     Item(SubscriptionItem),
 }
@@ -756,20 +777,38 @@ mod tests {
                 hunks: vec![DiffHunk {
                     header: "@@ -1,2 +1,3 @@".into(),
                     lines: vec![
-                        DiffLine { op: DiffOp::Ctx, text: "one".into() },
-                        DiffLine { op: DiffOp::Del, text: "two".into() },
-                        DiffLine { op: DiffOp::Add, text: "TWO".into() },
+                        DiffLine {
+                            op: DiffOp::Ctx,
+                            text: "one".into(),
+                        },
+                        DiffLine {
+                            op: DiffOp::Del,
+                            text: "two".into(),
+                        },
+                        DiffLine {
+                            op: DiffOp::Add,
+                            text: "TWO".into(),
+                        },
                     ],
                 }],
                 truncated: true,
             },
             DiffKind::Binary,
-            DiffKind::Submodule { detail: "abc1234 → def5678 (dirty)".into() },
-            DiffKind::Symlink { target: "../elsewhere".into() },
-            DiffKind::Error { message: "git diff timed out".into() },
+            DiffKind::Submodule {
+                detail: "abc1234 → def5678 (dirty)".into(),
+            },
+            DiffKind::Symlink {
+                target: "../elsewhere".into(),
+            },
+            DiffKind::Error {
+                message: "git diff timed out".into(),
+            },
         ] {
             let ok = DiffOk {
-                diff: FileDiff { path: "src/lib.rs".into(), kind },
+                diff: FileDiff {
+                    path: "src/lib.rs".into(),
+                    kind,
+                },
             };
             let v = serde_json::to_value(&ok).unwrap();
             let back: DiffOk = serde_json::from_value(v).unwrap();

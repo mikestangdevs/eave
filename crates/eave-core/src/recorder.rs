@@ -35,7 +35,10 @@ pub async fn send_and_journal<S: AgentSession + ?Sized>(
         .map_err(gone)?;
     match session.send_user_message(text).await {
         Ok(()) => {
-            extra.send(JournalEvent::UserDelivered {}).await.map_err(gone)?;
+            extra
+                .send(JournalEvent::UserDelivered {})
+                .await
+                .map_err(gone)?;
             Ok(true)
         }
         Err(_) => Ok(false),

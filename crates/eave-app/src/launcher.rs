@@ -44,8 +44,8 @@
 //! same as sending an empty one.
 
 use gpui::{
-    div, px, AnyElement, App, ClickEvent, InteractiveElement as _, IntoElement,
-    ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px, AnyElement, App, ClickEvent, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window,
 };
 
 use crate::{icons, theme};
@@ -307,7 +307,12 @@ mod tests {
                 p.id,
                 p.mark,
             );
-            assert!(!seen.contains(&p.mark), "{}: {} is used twice", p.id, p.mark);
+            assert!(
+                !seen.contains(&p.mark),
+                "{}: {} is used twice",
+                p.id,
+                p.mark
+            );
             seen.push(p.mark);
         }
     }

@@ -69,9 +69,7 @@ pub fn identity_of(pid: i32) -> Option<ProcIdentity> {
 /// matches the recorded identity.
 pub fn identity_matches(id: &ProcIdentity) -> bool {
     match inspect(id.pid) {
-        Some(info) => {
-            info.start_tvsec == id.start_tvsec && info.start_tvusec == id.start_tvusec
-        }
+        Some(info) => info.start_tvsec == id.start_tvsec && info.start_tvusec == id.start_tvusec,
         None => false,
     }
 }
