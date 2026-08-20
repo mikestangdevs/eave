@@ -118,13 +118,40 @@ fn msg_content_hash(row: &Row) -> u64 {
         Row::Assistant { text, live } => {
             fnv1a_more(fnv1a(&[1, *live as u8]), text.as_bytes())
         }
-        Row::Tool { id, name, status } => {
+        Row::Tool {
+            id,
+            name,
+            status,
+            input,
+            result,
+            is_error,
+        } => {
             let tag: u8 = match status {
                 ToolStatus::Running => 1,
                 ToolStatus::Finished => 2,
                 ToolStatus::Interrupted => 3,
             };
-            fnv1a_more(fnv1a_more(fnv1a(&[2, tag]), id.as_bytes()), name.as_bytes())
+            let h = fnv1a_more(
+                fnv1a_more(fnv1a(&[2, tag, *is_error as u8]), id.as_bytes()),
+                name.as_bytes(),
+            );
+            // Length plus a BOUNDED prefix, not the whole payload. Payloads
+            // are already capped at 8 KiB apiece, but this runs per changed
+            // row inside the fold, and the 10k-row gate builds every row
+            // cold — hashing 8 KiB × 10k would put 80 MB through FNV inside
+            // a 4 ms budget. The cost of the shortcut is a false cache hit
+            // for two payloads of identical length differing only past the
+            // prefix, whose worst case is one row rendering stale until its
+            // next change. That trade is why the length is in the hash.
+            fn bounded(h: u64, s: &str) -> u64 {
+                const PREFIX: usize = 256;
+                let mut end = s.len().min(PREFIX);
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                fnv1a_more(fnv1a_more(h, &s.len().to_le_bytes()), s[..end].as_bytes())
+            }
+            bounded(bounded(h, input), result)
         }
         Row::Marker { text } => fnv1a_more(fnv1a(&[3]), text.as_bytes()),
         // Slice K: the status is part of the content — an answered card

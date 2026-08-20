@@ -115,7 +115,24 @@ fn click_with(vcx: &mut VisualTestContext, selector: &'static str, modifiers: Mo
     let bounds = vcx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("element {selector} did not render"));
-    vcx.simulate_click(bounds.center(), modifiers);
+    // `debug_bounds` answers "was this painted", NOT "can it be clicked". An
+    // element scrolled out of the viewport still reports bounds — with a
+    // NEGATIVE origin — and `simulate_click` on a point outside the window
+    // hits nothing and reports nothing, so the test goes green having
+    // exercised no handler at all.
+    //
+    // Found the hard way: a code fence 250 lines tall put its own header
+    // strip at y = -2972px in a bottom-aligned list, and the copy-button
+    // test passed its click and then failed on the clipboard, which is a
+    // confusing way to learn the click never happened.
+    let c = bounds.center();
+    assert!(
+        c.x >= px(0.) && c.y >= px(0.),
+        "element {selector} is off-screen at {c:?} — a click there hits \
+         nothing and asserts nothing; scroll it into view or use a fixture \
+         that fits"
+    );
+    vcx.simulate_click(c, modifiers);
 }
 
 /// Is this element on screen at all?
@@ -640,6 +657,173 @@ fn user_record(seq: u64, text: &str) -> eave_core::journal::Record {
         ts_ms: seq * 10,
         event: eave_core::journal::JournalEvent::UserSent { text: text.into() },
     }
+}
+
+fn tool_started(seq: u64, id: &str, name: &str, input: &str) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseStarted {
+                id: id.into(),
+                name: name.into(),
+                input: input.into(),
+            },
+        },
+    }
+}
+
+fn tool_finished(seq: u64, id: &str, result: &str, is_error: bool) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseFinished {
+                id: id.into(),
+                result: result.into(),
+                is_error,
+            },
+        },
+    }
+}
+
+fn assistant_record(seq: u64, text: &str) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::AssistantText { text: text.into() },
+        },
+    }
+}
+
+/// A code block can leave the app, whole.
+///
+/// Until this slice there was no way to get code out of eave at all: no
+/// selection, no copy button, ⌘C unbound. The transcript could show you a
+/// patch and the only way to use it was to retype it.
+///
+/// This test is about the click and the clipboard only. That copy takes the
+/// WHOLE fence when the view is capped is a property of `fence_view` and is
+/// asserted there, purely — a fence tall enough to be capped puts its own
+/// copy button ~3000 px above the viewport, where a simulated click hits
+/// nothing (see the note in `click_with`).
+#[gpui::test]
+fn a_fence_leaves_the_app_when_you_click_copy(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+
+    // Deliberately SHORT. This test is about the click and the clipboard;
+    // the cap is pure logic and is tested as such in `fence_view`'s own
+    // unit tests, because a fence tall enough to be capped puts its own
+    // copy button thousands of pixels above the viewport.
+    let fence = "```rust\nlet x = 1;\nlet y = 2;\n```";
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![assistant_record(1, fence)],
+    });
+    vcx.run_until_parked();
+
+    click(vcx, "fence-copy");
+    vcx.run_until_parked();
+
+    let got = vcx
+        .read_from_clipboard()
+        .and_then(|i| i.text())
+        .expect("the clipboard holds the fence");
+    assert_eq!(got, "let x = 1;\nlet y = 2;", "the code, and only the code");
+    assert!(!got.contains("```"), "the fence markers were copied");
+    assert!(!got.contains("rust"), "the language label was copied");
+
+    // ...and the app says so, rather than leaving you to guess.
+    let note = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).friction.clone())
+        .unwrap();
+    assert!(
+        note.is_some_and(|(_, n)| n.contains("copied 2 lines")),
+        "a copy that states nothing is a copy you have to verify by pasting"
+    );
+}
+
+/// A tool row states what it was asked to do.
+///
+/// Before this slice the transcript rendered `Bash  done`: the parser kept
+/// a `tool_result`'s id and threw away its `content`, and kept a `tool_use`'s
+/// id and name and threw away its `input`. An agent could run the whole test
+/// suite and eave would show you two words, neither of them the command.
+#[gpui::test]
+fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(
+            1,
+            "toolu_1",
+            "Bash",
+            r#"{"command":"cargo test --workspace"}"#,
+        )],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-detail").is_some(),
+        "a running tool row states no command"
+    );
+
+    // ...and a failure states why, in place.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_finished(2, "toolu_1", "error: 3 tests failed", true)],
+    });
+    vcx.run_until_parked();
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).transcript.rows.clone()
+        })
+        .unwrap();
+    let tool = rows
+        .iter()
+        .find_map(|r| match r {
+            eave_wire::model::Row::Tool {
+                input,
+                result,
+                is_error,
+                ..
+            } => Some((input.clone(), result.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("a tool row");
+    assert!(tool.0.contains("cargo test --workspace"), "input dropped");
+    assert_eq!(tool.1, "error: 3 tests failed", "result dropped");
+    assert!(tool.2, "the provider's error flag dropped");
+    assert!(
+        vcx.debug_bounds("tool-detail").is_some(),
+        "the command stopped being stated once the tool finished"
+    );
+}
+
+/// A tool eave has no summary key for states its name and nothing else,
+/// rather than inventing a detail from an arbitrary input field.
+#[gpui::test]
+fn an_unknown_tool_states_no_detail(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(1, "toolu_1", "SomeMcpTool", r#"{"opaque":1}"#)],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-detail").is_none(),
+        "a detail was invented for a tool with no known summary key"
+    );
 }
 
 /// Clicking a row only *requests* a switch — the rail's highlight is a

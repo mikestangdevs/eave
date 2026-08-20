@@ -1215,6 +1215,31 @@ fn short_cwd(cwd: &str, home: Option<&str>) -> String {
     }
 }
 
+/// What a fence DRAWS, which is not always what it holds.
+///
+/// A fence is one row in a virtualized list, so its height is a promise the
+/// list makes. An agent that emits a 4,000-line file would otherwise make
+/// one row 80,000 px tall. Past [`theme::FENCE_MAX_LINES`] the view stops
+/// and states the remainder — and states that copy is unaffected, because
+/// the honest failure mode of a cap is someone believing it truncated their
+/// data.
+fn fence_view(code: &str) -> String {
+    let total = code.lines().count();
+    if total <= theme::FENCE_MAX_LINES {
+        return code.to_string();
+    }
+    let mut out = code
+        .lines()
+        .take(theme::FENCE_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push_str(&format!(
+        "\n… {} more lines — copy takes all {total}",
+        total - theme::FENCE_MAX_LINES
+    ));
+    out
+}
+
 /// Open a path with the system handler (macOS `open`). Both call sites —
 /// the worktree "open" affordance and the diff pane's ⌘-click — route
 /// through here so the Stage J harness can assert the *intent* without
@@ -1309,6 +1334,11 @@ struct TranscriptState {
     /// The composer, read at deny time for the operator's reason and
     /// cleared once it has been spent (see [`Shell::deny_reason`]).
     composer: Option<Entity<ComposerState>>,
+    /// A weak handle back to the shell, for the same reason `composer` is
+    /// here (Slice K): the rows are built by STATIC fns with no `Context`,
+    /// and the fence copy button has to state that it copied. Weak so the
+    /// shell owning this state does not own a cycle back to itself.
+    shell: Option<gpui::WeakEntity<Shell>>,
     /// Slice N3 — the live-turn clock behind the working trailer.
     ///
     /// A signed BALANCE, never a bool. The recorder's two input channels
@@ -1346,6 +1376,7 @@ impl TranscriptState {
             assert_replay: None,
             commands: None,
             composer: None,
+            shell: None,
             turn_balance: 0,
             turn_started_ms: None,
         }
@@ -1917,6 +1948,18 @@ impl Shell {
             Ok(()) => format!("logged {}", &stamp[11..]),
             Err(e) => format!("log failed: {e}"),
         };
+        self.transient_note(note, cx);
+    }
+
+    /// State one fact in the footer for [`FRICTION_NOTE_TTL`], then take it
+    /// back.
+    ///
+    /// Extracted from `friction_log`, which was its only writer until the
+    /// fence copy button needed the same shape. The generation counter is
+    /// the load-bearing part: two notes in quick succession each arm their
+    /// own timer, and without it the FIRST timer would clear the SECOND
+    /// note early — the note would vanish while it was still true.
+    fn transient_note(&mut self, note: String, cx: &mut Context<Self>) {
         self.friction_gen += 1;
         let gen = self.friction_gen;
         self.friction = Some((gen, note));
@@ -3579,16 +3622,47 @@ impl Shell {
                     _ => wrap.into_any_element(),
                 }
             }
-            Row::Tool { id: _, name, status } => {
+            Row::Tool {
+                id: _,
+                name,
+                status,
+                input,
+                result,
+                is_error,
+            } => {
                 let (label, dot) = match status {
                     ToolStatus::Running => ("running…", theme::live()),
+                    ToolStatus::Finished if *is_error => ("failed", theme::danger()),
                     ToolStatus::Finished => ("done", theme::text_ghost()),
                     ToolStatus::Interrupted => ("interrupted", theme::danger()),
                 };
-                div()
-                    .pt(px(theme::SPACE_2))
-                    .pb(px(theme::SPACE_1))
-                    .pl(px(theme::TOOL_INDENT))
+                // What the tool was ASKED to do. Until this slice a row was
+                // the tool's name and a status word, so an agent running
+                // `cargo test --workspace` rendered "Bash  done" — the one
+                // fact an operator is watching for was the one eave threw
+                // away (`stream.rs` kept the id and dropped the input).
+                let detail = eave_wire::model::tool_detail(name, input);
+                // A failed tool states why. A successful one does not: its
+                // output is usually long, usually uninteresting, and always
+                // a row height inside a virtualized list.
+                let failure = (*is_error && !result.trim().is_empty()).then(|| {
+                    let total = result.lines().count();
+                    let mut text = result
+                        .lines()
+                        .take(theme::TOOL_ERROR_MAX_LINES)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if total > theme::TOOL_ERROR_MAX_LINES {
+                        // State the remainder rather than trailing off, the
+                        // way the diff pane states its own cap.
+                        text.push_str(&format!(
+                            "\n… {} more lines",
+                            total - theme::TOOL_ERROR_MAX_LINES
+                        ));
+                    }
+                    text
+                });
+                let head = div()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3609,13 +3683,53 @@ impl Shell {
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(name.clone())),
                     )
+                    .children(detail.map(|d| {
+                        div()
+                            .debug_selector(|| "tool-detail".into())
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::TOOL_NAME_SIZE))
+                            .line_height(px(theme::TOOL_NAME_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(d))
+                    }))
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(if *is_error {
+                                theme::danger()
+                            } else {
+                                theme::text_tertiary()
+                            })
                             .child(label),
-                    )
+                    );
+                div()
+                    .pt(px(theme::SPACE_2))
+                    .pb(px(theme::SPACE_1))
+                    .pl(px(theme::TOOL_INDENT))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACE_1))
+                    .child(head)
+                    .children(failure.map(|f| {
+                        div()
+                            .ml(px(theme::TOOL_INDENT))
+                            .rounded(px(theme::RADIUS_CODE))
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::inset())
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(f))
+                    }))
                     .into_any_element()
             }
             // Slice K: the question itself. Every fact an operator needs
@@ -3934,9 +4048,53 @@ impl Shell {
                             .line_height(px(theme::MICRO_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
                             .text_color(theme::text_ghost())
-                            .child(SharedString::from(label.to_string())),
+                            .child(SharedString::from(label.to_string()))
+                            // The strip's remaining width, so the button
+                            // sits at the far edge without a spacer div.
+                            .child(div().flex_1())
+                            .child({
+                                let whole = code.trim_end().to_string();
+                                let lines = whole.lines().count();
+                                let shell = state.shell.clone();
+                                div()
+                                    .id(("fence-copy", id.block))
+                                    .debug_selector(|| "fence-copy".into())
+                                    .cursor_pointer()
+                                    .px(px(theme::SPACE_1))
+                                    .text_color(theme::text_tertiary())
+                                    .child(icons::icon(
+                                        icons::COPY,
+                                        theme::ICON_SM,
+                                        theme::text_tertiary(),
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.write_to_clipboard(
+                                            gpui::ClipboardItem::new_string(whole.clone()),
+                                        );
+                                        // The WHOLE fence, not the drawn
+                                        // part: a cap is a reading limit,
+                                        // and a copy that silently gave you
+                                        // the first 200 lines of a 500-line
+                                        // block would be the worst kind of
+                                        // quiet failure.
+                                        if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade())
+                                        {
+                                            shell.update(cx, |shell, cx| {
+                                                shell.transient_note(
+                                                    format!(
+                                                        "copied {lines} line{}",
+                                                        if lines == 1 { "" } else { "s" }
+                                                    ),
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    })
+                            }),
                     )
-                    .child(
+                    .child({
+                        let drawn = fence_view(code.trim_end());
                         div()
                             .px(px(theme::SPACE_3))
                             .py(px(theme::SPACE_2))
@@ -3944,8 +4102,8 @@ impl Shell {
                             .text_size(px(theme::CODE_SIZE))
                             .line_height(px(theme::CODE_LINE))
                             .text_color(theme::code_block_text())
-                            .child(SharedString::from(code.trim_end().to_string())),
-                    )
+                            .child(SharedString::from(drawn))
+                    })
                     .into_any_element()
             }
             Block::Heading { level, text } => {
@@ -5611,9 +5769,11 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 // state the two handles they need — the shell's own
                 // command channel and the composer they read the deny
                 // reason from.
+                let weak_shell = cx.weak_entity();
                 transcript.update(cx, |t, _| {
                     t.commands = Some(cmd_tx.clone());
                     t.composer = Some(composer.clone());
+                    t.shell = Some(weak_shell);
                 });
                 cx.observe(&conn, |_, _, cx| cx.notify()).detach();
                 cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
@@ -5721,6 +5881,32 @@ mod harness;
 
 #[cfg(test)]
 mod tests {
+    /// A fence under the cap is drawn verbatim; over it, the view stops and
+    /// says so — including that copy is unaffected, because the failure this
+    /// notice prevents is someone believing eave truncated their data.
+    #[test]
+    fn a_long_fence_states_what_it_is_not_drawing() {
+        let short = "let x = 1;\nlet y = 2;";
+        assert_eq!(fence_view(short), short, "under the cap, verbatim");
+
+        let long: String = (0..theme::FENCE_MAX_LINES + 40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = fence_view(&long);
+        assert_eq!(
+            view.lines().count(),
+            theme::FENCE_MAX_LINES + 1,
+            "the drawn fence is the cap plus its own one-line notice"
+        );
+        assert!(view.contains("40 more lines"), "the remainder is stated");
+        assert!(
+            view.contains(&format!("copy takes all {}", theme::FENCE_MAX_LINES + 40)),
+            "a cap that does not say copy is unaffected reads as data loss"
+        );
+        assert!(view.starts_with("line 0"), "the cap drops the TAIL, not the head");
+    }
+
     use super::*;
 
     /// Slice M (§1.21). The veil's curve is an ease-OUT: it must reach
