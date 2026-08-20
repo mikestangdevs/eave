@@ -468,9 +468,19 @@ pub fn menu_row(
         })
         .child(div().flex_1().min_w(px(0.)).child(item.label.clone()))
         .children(item.trailing.clone().map(|t| {
+            // **Slice AQ: no `text_size` here.** The trailing state used to
+            // be `DETAIL_SIZE` against the row's `LABEL_SIZE` — 12.0 against
+            // 12.5, half a pixel apart. Half a pixel is not a rank; it is
+            // two type sizes in one row pretending to be a hierarchy, and
+            // the only thing it actually achieved was putting the keycap on
+            // a different baseline grid from the word it belongs to.
+            //
+            // The rank is real and it is already carried, by INK: `text` for
+            // the label, `text_tertiary` for the state. One channel, spent
+            // once. (Same lesson as the decision buttons: size, weight and
+            // ink are three channels and a rank is a budget across them.)
             div()
                 .flex_none()
-                .text_size(px(theme::DETAIL_SIZE))
                 .text_color(theme::text_tertiary())
                 .child(t)
         }));
@@ -597,6 +607,42 @@ mod tests {
         let mut p = Popup::default();
         p.open(7, vec![true, true, false, true], now);
         (p, now)
+    }
+
+    /// **Slice AQ: a menu row declares its type size ONCE.**
+    ///
+    /// The trailing state — a keybinding, a count, a checkmark — used to
+    /// carry `DETAIL_SIZE` against the row's own `LABEL_SIZE`. 12.0 against
+    /// 12.5. Half a pixel is not a rank; it is two type sizes in one row
+    /// pretending to be a hierarchy, and what it actually bought was a
+    /// keycap sitting on a different baseline from the word it belongs to.
+    ///
+    /// The rank between a label and its trailing state is real and it is
+    /// already carried by INK (`text` against `text_tertiary`), which is one
+    /// channel spent once. Size, weight and ink are three separate channels
+    /// and a rank is a budget across them, not a licence to spend all three.
+    ///
+    /// Structural, because gpui resolves the text style into its own stack
+    /// and a `debug_bounds` box on the Noop text system reports the same
+    /// height either way — the defect is invisible to every instrument this
+    /// project has except this one and a photograph.
+    #[test]
+    fn a_menu_row_declares_its_type_size_once() {
+        let src = include_str!("overlay.rs");
+        let at = src.find("pub fn menu_row(").expect("menu_row");
+        let end = at + src[at..].find("\n// ---").expect("end of the row section");
+        let body = &src[at..end];
+        assert_eq!(
+            body.matches(".text_size(").count(),
+            1,
+            "a menu row set its type size more than once — the second one is a \
+             rank being paid for twice"
+        );
+        assert!(
+            body.contains("theme::text_tertiary()"),
+            "the trailing state stopped being distinguished by ink, which is \
+             now the ONLY channel carrying that rank"
+        );
     }
 
     /// The durations, as literals.

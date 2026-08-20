@@ -436,6 +436,76 @@ pub fn danger_wash_hover() -> Hsla {
     danger().opacity(0.24)
 }
 
+// ---------------------------------------------------------------------------
+// Slice AQ — one contiguous block, deliberately. Slice AL owns this file and
+// is re-valuing the tiers in parallel; everything below either DELEGATES to a
+// token AL already owns (so AL's value flows through without a second edit
+// here) or is a colour that did not exist in any form.
+
+/// The app's primary plate — a near-white fill with a near-black label. The
+/// launcher's `Start Claude Code` button and the armed send button already
+/// paint it; approve is the third consumer.
+///
+/// A role name pointing at [`inverse`], not a second definition of it. The
+/// pair was named for the MECHANISM ("this control inverts the ground"),
+/// which is why nothing outside the launcher ever reached for it; `solid` /
+/// [`on_solid`] names the JOB, which is what a consumer looks for. Two names
+/// for one colour is the thing this file refuses, so this is a delegation and
+/// not a hex — when AL retires `inverse`, one line here follows it.
+pub fn solid() -> Hsla {
+    inverse()
+}
+/// The paired ink for [`solid`]. A saturated or near-white fill can only
+/// carry text if the ink is solved against the FILL rather than against the
+/// ground, which is the whole reason the two are named as a pair.
+pub fn on_solid() -> Hsla {
+    on_inverse()
+}
+/// [`solid`] under the pointer. A filled control REPLACES its bg rather than
+/// compositing a wash over it, so both ends of its fade have to be named
+/// (Slice M).
+pub fn solid_hover() -> Hsla {
+    inverse_hover()
+}
+
+/// The QUIET ink on a [`solid`] plate — a keycap printed on a button, where
+/// [`on_solid`] is the label beside it.
+///
+/// `#6a6d75` reads **4.26:1** on `solid` and 4.78:1 on `solid_hover`, against
+/// the [`TEXT_QUIET_CONTRAST_FLOOR`] the same rank clears on the dark side.
+/// Opaque rather than `on_solid().opacity(..)`: an alpha would have to be
+/// re-solved for the hovered fill, and a keycap that changed contrast under
+/// the pointer is a hierarchy that moves when you look at it.
+pub fn on_solid_quiet() -> Hsla {
+    rgb(0x6a6d75).into()
+}
+
+/// The danger pigment as an INK — a word rendered IN it, as opposed to a fill
+/// or a rim rendered in it.
+///
+/// **[`danger`] cannot carry a word anywhere eave draws one.** Measured where
+/// it is actually painted rather than against the bare ground:
+/// **3.95:1** on the pending approval plate, **3.19:1** on that plate under a
+/// hover wash, 3.67:1 on the kill button's resting fill, 3.14:1 on its
+/// hovered one — and 4.54:1 on the bare well, a fit rather than a clearance.
+/// Slice U's sweep only ever measured the NEUTRAL tiers, so the saturated
+/// pigment has never been swept at all;
+/// `saturated_pigment_is_measured_where_it_is_drawn` is the assertion, and
+/// `docs/reports/stage-aq-approval-and-popups.md` §3 carries the census.
+///
+/// `#f2a49e` is [`danger`]'s hue lifted until it clears 4.5:1 with the 0.35
+/// of margin the token→pixel skew costs at the worst site it lands on: 4.93:1
+/// on the plate under a hover wash. The same move `text_secondary_on_wash`
+/// made for the quiet tier, for the same reason and against the same sweep.
+///
+/// **The fill and the rim keep [`danger`].** A fill is measured as a step,
+/// not as contrast, and desaturating it would flatten the one hue the app
+/// uses to mean "this is destructive".
+pub fn danger_ink() -> Hsla {
+    rgb(0xf2a49e).into()
+}
+// --- end Slice AQ ----------------------------------------------------------
+
 /// Diff line fills (Slice B2) — the only place state pigment tints a
 /// surface inside the rails, because add/remove IS state (the stance:
 /// color speaks only when state deserves attention). Glass: state-color
@@ -887,7 +957,15 @@ pub const MENU_ROW_INSET: f32 = SPACE_1;
 /// and below, so the wash clears the glyphs by one grid unit.
 pub const MENU_ROW_H: f32 = LABEL_LINE + SPACE_1 * 2.0;
 /// Horizontal pad inside a row's wash.
-pub const MENU_ROW_PAD_X: f32 = SPACE_2;
+///
+/// Slice AQ, `SPACE_2` → `SPACE_3`. The label sat 12 px from the surface
+/// edge (`MENU_ROW_INSET` 4 + this 8) while the surface's own vertical pad
+/// put the first glyph 8 px from the top — so the card was tighter
+/// horizontally than vertically, which is backwards for a list of words and
+/// is what made the popover read as text floating with no card around it
+/// (`docs/shots/aq-before-menu.png`). 16 px puts the horizontal inset a
+/// clear grid unit ahead of the vertical one.
+pub const MENU_ROW_PAD_X: f32 = SPACE_3;
 /// Minimum gap between a row's label and its trailing state, so the two
 /// never close up on a long label.
 pub const MENU_ROW_GAP: f32 = SPACE_3;
@@ -1430,22 +1508,38 @@ mod tests {
     /// measurable here, so it is a bonus and never the argument.
     #[test]
     fn floating_chrome_is_always_carried_by_something() {
+        // **Slice AQ: both grounds, and the WELL is the real one.** This
+        // swept the bare frost only, and neither consumer sits on it — the
+        // composer and the ↓-bottom pill are both inside the reading
+        // column's content well, which is the frost under a 0.25 black wash.
+        // The conclusion was right on the wrong surface (14.4/255 carried on
+        // the bare frost, 14.2/255 in the well), so nothing moved on screen;
+        // what changes is that the claim is now about where the chrome is.
+        // Same correction Slice AG made to the elevation ladder and Slice AF
+        // to the state washes, and the fourth instance of one question:
+        // **above what, and does anything paint it?**
         let mut worst = (f32::MAX, 0.0f32, 0.0f32, 0.0f32);
-        for g in grounds() {
-            let chrome = over(chrome_glass(), g);
-            let rim = over(border_strong(), chrome);
-            let fill_d = (units(chrome) - units(g)).abs();
-            let rim_d = (units(rim) - units(g)).abs();
-            let carried = fill_d.max(rim_d);
-            if carried < worst.0 {
-                worst = (carried, units(g), fill_d, rim_d);
+        for bare in grounds() {
+            for (where_, g) in [
+                ("bare frost", bare),
+                ("the well", over(wash_content(), bare)),
+            ] {
+                let chrome = over(chrome_glass(), g);
+                let rim = over(border_strong(), chrome);
+                let fill_d = (units(chrome) - units(g)).abs();
+                let rim_d = (units(rim) - units(g)).abs();
+                let carried = fill_d.max(rim_d);
+                if carried < worst.0 {
+                    worst = (carried, units(g), fill_d, rim_d);
+                }
+                assert!(
+                    carried >= SURFACE_STEP_FLOOR,
+                    "floating chrome is invisible on {where_} at backdrop {:.1}: \
+                     fill {fill_d:.1}/255, rim {rim_d:.1}/255, floor \
+                     {SURFACE_STEP_FLOOR}",
+                    units(bare)
+                );
             }
-            assert!(
-                carried >= SURFACE_STEP_FLOOR,
-                "floating chrome is invisible on ground {:.1}: fill {fill_d:.1}/255, \
-                 rim {rim_d:.1}/255, floor {SURFACE_STEP_FLOOR}",
-                units(g)
-            );
         }
         // Clearance, not fit: the worst backdrop in the sweep must not be
         // sitting ON the floor. Quoted rather than derived from the floor,
@@ -1977,6 +2071,57 @@ mod tests {
                 TEXT_CONTRAST_FLOOR,
                 vec![wash_content(), plate],
             ),
+            // Slice AQ — the decision pair. Approve's fill is OPAQUE, so its
+            // two inks are measured on the plate itself and the sweep only
+            // proves the ground cannot reach them.
+            (
+                "approve label",
+                on_solid(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), plate, solid()],
+            ),
+            (
+                "approve label, hovered",
+                on_solid(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), plate, solid_hover()],
+            ),
+            (
+                "approve keycap",
+                on_solid_quiet(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), plate, solid()],
+            ),
+            (
+                "approve keycap, hovered",
+                on_solid_quiet(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), plate, solid_hover()],
+            ),
+            (
+                "deny label",
+                danger_ink(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), plate],
+            ),
+            (
+                "deny label, hovered",
+                danger_ink(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), plate, danger_wash_strong()],
+            ),
+            (
+                "deny keycap",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), plate],
+            ),
+            (
+                "deny keycap, hovered",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), plate, danger_wash_strong()],
+            ),
             (
                 "approval card body, decided",
                 text_secondary(),
@@ -2134,6 +2279,335 @@ mod tests {
             tightest.2,
             tightest.3,
             tightest.0
+        );
+    }
+
+    /// **Slice AQ.** The table above enumerates the NEUTRAL tiers. The
+    /// saturated pigment — `live`, `success`, `warning`, `danger` — has never
+    /// been swept anywhere in this file, in any form, on any surface, and it
+    /// carries words at twenty-one sites.
+    ///
+    /// This is the third instance of one defect and the first time the class
+    /// has been named twice in a row: Slice U put floors on TOKENS rather
+    /// than on SURFACES, Slice AF found it in the state ladder, Slice AD
+    /// found it in quiet text under a wash — and all three were about the
+    /// neutral ramp. **The question is still "above what, and does anything
+    /// paint it?", and for the state colours the answer was "nothing has ever
+    /// asked".**
+    ///
+    /// What the sweep found, measured at the site rather than against the
+    /// bare ground: **sixteen of twenty-one drawn combinations are under
+    /// their floor or fit it without clearance.** The worst is the rail's
+    /// unverified-posture line at **2.10:1** on a hovered selected row. The
+    /// two `danger` labels this slice owns were **3.95:1** and **3.19:1**;
+    /// fixing those four leaves **twelve** sites of recorded debt below.
+    ///
+    /// # Why this test does not simply demand the floor everywhere
+    ///
+    /// Because sixteen of those sites are in three other slices' regions,
+    /// and one of them — the rail — cannot be fixed by any ink. The rail row
+    /// wash is the ladder's third rung, and solving a saturated ink against
+    /// it lands outside the gamut, which is the same wall `text_ghost` hit
+    /// from the other direction. That is a slice, not a line.
+    ///
+    /// So the shape is a **ratchet**, the same one a suite uses to carve out
+    /// pre-existing failures by name. Every site is measured. A site marked
+    /// [`Ink::Clears`] must clear its floor with the 0.35 the token→pixel
+    /// skew costs. A site marked [`Ink::Under`] must be **no worse than the
+    /// number recorded here** — so the debt is executable and named, a fix
+    /// passes (and then moves its own row), and nothing can quietly get
+    /// worse. The recorded numbers are literals; they are what this sweep
+    /// measured on 2026-08-20, not expressions over the tokens they check.
+    // The kill button's hovered label measures 3.14:1 and clippy reads that
+    // as a fumbled π. It is a contrast ratio; rounding it to placate the lint
+    // would falsify the one number the row exists to record.
+    #[allow(clippy::approx_constant)]
+    #[test]
+    fn saturated_pigment_is_measured_where_it_is_drawn() {
+        /// `Clears` = fixed, and held to the floor. `Under(worst)` = known
+        /// debt, held to the number it was found at.
+        enum Ink {
+            Clears,
+            Under(f32),
+        }
+        use Ink::*;
+        let plate = warning_plate_strong_glass();
+        let well = wash_content();
+        // (site, region, ink, stack, status). The floor is TEXT_CONTRAST_FLOOR
+        // for every row: each of these is a word, and a word that names a
+        // failure is not structural chrome.
+        let sites: Vec<(&str, &str, Hsla, Vec<Hsla>, Ink)> = vec![
+            // --- the two this slice owns, fixed
+            (
+                "approve label",
+                "AQ",
+                on_solid(),
+                vec![well, plate, solid()],
+                Clears,
+            ),
+            ("deny label", "AQ", danger_ink(), vec![well, plate], Clears),
+            (
+                "deny label, hovered",
+                "AQ",
+                danger_ink(),
+                vec![well, plate, danger_wash_strong()],
+                Clears,
+            ),
+            // --- already clear before this slice, and pinned so they stay
+            (
+                "approval head 'needs your approval'",
+                "AQ",
+                warning(),
+                vec![well, plate],
+                Clears,
+            ),
+            (
+                "composer hint while a question is open",
+                "AQ",
+                warning(),
+                vec![well, chrome_glass()],
+                Clears,
+            ),
+            (
+                "attention label, quiet",
+                "chrome",
+                warning(),
+                vec![well, warning_plate_glass()],
+                Clears,
+            ),
+            (
+                "attention label, prominent",
+                "chrome",
+                warning(),
+                vec![well, plate],
+                Clears,
+            ),
+            (
+                "files rail resource ceiling, over budget",
+                "files",
+                warning(),
+                vec![],
+                Clears,
+            ),
+            // --- the debt, by region. Every one of these is a word rendered
+            //     in `danger` or `success`, and `danger` as an INK is the
+            //     single token behind eleven of the thirteen.
+            (
+                "rail posture line, unverified (selected)",
+                "rail",
+                danger(),
+                vec![overlay_strong()],
+                Under(2.52),
+            ),
+            (
+                "rail posture line, unverified (selected + hover)",
+                "rail",
+                danger(),
+                vec![overlay_strong(), overlay()],
+                Under(2.10),
+            ),
+            (
+                "rail worktree missing",
+                "rail",
+                warning(),
+                vec![overlay_strong()],
+                Under(3.98),
+            ),
+            (
+                "diff stat adds",
+                "files",
+                success(),
+                vec![overlay()],
+                Under(4.41),
+            ),
+            (
+                "diff stat dels",
+                "files",
+                danger(),
+                vec![overlay()],
+                Under(2.96),
+            ),
+            (
+                "connection panel 'engine unavailable'",
+                "chrome",
+                danger(),
+                vec![well, danger_plate_glass()],
+                Under(4.48),
+            ),
+            (
+                "attention label, unresponsive/failed",
+                "chrome",
+                danger(),
+                vec![well, danger_plate_glass()],
+                Under(4.48),
+            ),
+            (
+                "kill button label",
+                "chrome",
+                danger(),
+                vec![well, danger_plate_glass(), danger_wash_strong()],
+                Under(3.67),
+            ),
+            (
+                "kill button label, hovered",
+                "chrome",
+                danger(),
+                vec![well, danger_plate_glass(), danger_wash_hover()],
+                Under(3.14),
+            ),
+            (
+                "undelivered send note",
+                "transcript",
+                danger(),
+                vec![well],
+                Under(4.54),
+            ),
+            (
+                "tool status 'failed'/'interrupted'",
+                "transcript",
+                danger(),
+                vec![well],
+                Under(4.54),
+            ),
+            (
+                "launcher error",
+                "launcher",
+                danger(),
+                vec![well],
+                Under(4.54),
+            ),
+        ];
+
+        let mut debt = 0;
+        for (site, region, ink, stack, status) in &sites {
+            let c: Rgba = (*ink).into();
+            let mut got = f32::MAX;
+            for g in grounds() {
+                let mut surface = g;
+                for wash in stack {
+                    surface = over(*wash, surface);
+                }
+                got = got.min(contrast_ratio((c.r, c.g, c.b), surface));
+            }
+            match status {
+                Clears => assert!(
+                    got >= TEXT_CONTRAST_FLOOR + 0.35,
+                    "[{region}] {site} is {got:.2}:1 at its worst backdrop — a word \
+                     needs {TEXT_CONTRAST_FLOOR} plus the 0.35 the token→pixel skew \
+                     costs"
+                ),
+                Under(recorded) => {
+                    debt += 1;
+                    assert!(
+                        got >= *recorded - 0.01,
+                        "[{region}] {site} got WORSE: {got:.2}:1 against the \
+                         {recorded:.2}:1 recorded on 2026-08-20. This site is \
+                         already under the {TEXT_CONTRAST_FLOOR} floor; it may be \
+                         fixed, it may not be deepened"
+                    );
+                    assert!(
+                        got < TEXT_CONTRAST_FLOOR + 0.35,
+                        "[{region}] {site} now reads {got:.2}:1 and clears the floor \
+                         — somebody fixed it. Move this row to `Clears` and drop the \
+                         recorded number, or the next regression here goes unnoticed"
+                    );
+                }
+            }
+        }
+        // The size of the debt, as a literal. A new site drawn in a saturated
+        // pigment lands in one of the two arms above; this is what makes
+        // *adding* one a deliberate act rather than a quiet one.
+        assert_eq!(
+            debt, 12,
+            "the saturated-pigment debt is 12 sites (2026-08-20). Changing this \
+             number means a site was fixed or added — say which in the commit"
+        );
+    }
+
+    /// **Slice AQ.** `a_popover_clears_the_chrome_it_floats_on` measures the
+    /// menu against `chrome_glass`, which is the one ground a menu almost
+    /// never opens over: chrome is the composer strip and the ↓-bottom pill.
+    /// Menus anchor at the pointer, so the grounds they actually land on are
+    /// the reading column's well and the bare frost the rails sit on.
+    ///
+    /// Measured on those two, the popover's FILL **inverts**: −3.9/255
+    /// against the well and **−17.5/255 against the bare frost** at the
+    /// bright end of the backdrop sweep. A popover that goes darker than
+    /// what it floats on is an edgeless rectangle, which is exactly what
+    /// `docs/shots/aq-before-menu.png` shows.
+    ///
+    /// # The ruling, which is the same ruling twice already
+    ///
+    /// **Leave the fill; let the rim carry it.** `menu_glass`'s tint
+    /// (`#282828`, 40/255) sits INSIDE the range of grounds it must clear
+    /// (8→59/255), and the step is `α · (tint − ground)` — so it passes
+    /// through zero and no alpha closes it. Only a tint above 65/255 would,
+    /// and that is `#444444`, the light-gray slab the 2026-08-17 retune
+    /// already threw out. This is the third surface to reach that wall:
+    /// `a_sunken_plate_is_read_from_its_rim` recorded it for `inset`, and
+    /// Slice AF recorded it for `chrome_glass`.
+    ///
+    /// So this test asserts what is actually load-bearing — that the RIM
+    /// clears every ground the popover can float over — and states the
+    /// inversion rather than pretending the fill does the work. The
+    /// composer is measured the same way, against the well it sits in
+    /// rather than against the bare frost, for the same reason.
+    #[test]
+    fn a_popover_is_read_from_its_rim_on_every_ground_it_floats_over() {
+        // Resolved eagerly rather than as three closures: a menu opens over
+        // whatever happens to be under the pointer, so "the grounds a
+        // popover can float over" is a list of surfaces, not a list of
+        // functions.
+        let under = [
+            ("bare frost", grounds()),
+            (
+                "the well",
+                grounds()
+                    .into_iter()
+                    .map(|g| over(wash_content(), g))
+                    .collect(),
+            ),
+            (
+                "the chrome",
+                grounds()
+                    .into_iter()
+                    .map(|g| over(chrome_glass(), over(wash_content(), g)))
+                    .collect(),
+            ),
+        ];
+
+        let mut worst_fill = (f32::MAX, "");
+        for (name, surfaces) in under {
+            for (g, ground) in grounds().into_iter().zip(surfaces) {
+                let menu = over(menu_glass(), ground);
+                let rim = over(edge_modal(), menu);
+                // The rim is the carrier: it has to be findable against what
+                // is OUTSIDE the menu, which is the edge the eye looks for.
+                let d = units(rim) - units(ground);
+                assert!(
+                    d >= SURFACE_STEP_FLOOR,
+                    "the popover's rim is {d:+.1}/255 against {name} on backdrop \
+                     {:.1}/255, floor {SURFACE_STEP_FLOOR} — the fill is ruled out \
+                     as the carrier, so this is the whole edge",
+                    units(g)
+                );
+                let fill = units(menu) - units(ground);
+                if fill < worst_fill.0 {
+                    worst_fill = (fill, name);
+                }
+            }
+        }
+        // The finding, pinned so that a later tint change has to confront it
+        // rather than inherit it. If someone lifts the tint out of the
+        // grounds' range this fails and the ruling above is what they should
+        // read first.
+        assert!(
+            worst_fill.0 < 0.0,
+            "the popover's fill now clears every ground it floats over \
+             ({:+.1}/255 at worst, over {}) — the rim-carries-it ruling is \
+             stale and `menu_glass`'s doc comment should say so",
+            worst_fill.0,
+            worst_fill.1
         );
     }
 }

@@ -1668,6 +1668,19 @@ fn approval_record(
     }
 }
 
+/// The operator's answer to one question, as the engine journals it.
+fn decided_record(seq: u64, request_id: &str, allowed: bool) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::ApprovalDecided {
+            request_id: request_id.into(),
+            allowed,
+            message: None,
+        },
+    }
+}
+
 /// Put one open question on screen in session `aaaa1111`.
 fn ask(h: &Harness, vcx: &mut VisualTestContext, records: Vec<eave_core::journal::Record>) {
     h.plumbing.push_feed(FeedEvent::Session {
@@ -1864,6 +1877,204 @@ fn a_settled_question_stops_offering_an_answer(cx: &mut TestAppContext) {
     assert!(
         shown(vcx, "approval-status-req-1"),
         "and it must say what became of it"
+    );
+}
+
+/// **Slice AQ.** Approving a tool call is the only irreversible action in
+/// this UI, and until this slice it looked exactly like the rest of the
+/// chrome: approve and deny were the same outlined chip at the same size
+/// and the same weight, told apart by hue alone — and approve's hue was
+/// [`theme::live`], the pigment that means *something is running right
+/// now*.
+///
+/// This is a structural check on the source for the same reason
+/// `every_clickable_element_says_it_is_clickable` is one: gpui resolves
+/// fills inside its own style pass and exposes neither the computed style
+/// nor the painted scene to a test, so a rendered assertion can see that
+/// a button EXISTS and not what colour it is. What can be pinned is the
+/// property that would decay — the pair drifting back into two chips.
+///
+/// The colours themselves are measured in `theme`'s ink table, where the
+/// four new drawn combinations are enumerated by name.
+#[gpui::test]
+fn approve_is_the_apps_solid_plate_and_deny_is_not(_cx: &mut TestAppContext) {
+    let src = include_str!("ui.rs");
+    let at = src.find("fn decision_button(").expect("decision_button");
+    let end = at
+        + src[at..]
+            .find("\n    /// A quiet trailer")
+            .expect("end of builder");
+    let body = &src[at..end];
+
+    assert!(
+        body.contains("theme::solid()") && body.contains("theme::on_solid()"),
+        "approve stopped carrying the app's solid plate — the same near-white \
+         fill and near-black label the launcher's start button paints"
+    );
+    assert!(
+        body.contains("theme::solid_hover()"),
+        "a filled control REPLACES its bg rather than compositing a wash over \
+         it, so approve has to name BOTH ends of its fade (Slice M)"
+    );
+    assert!(
+        body.contains("theme::danger_ink()") && body.contains("theme::danger_ring()"),
+        "deny stopped being legible as destructive"
+    );
+    // The one that actually holds the line: deny must not acquire a fill of
+    // its own. A destructive button louder than the primary one is worse
+    // than the flat pair this replaced.
+    assert!(
+        !body.contains("theme::danger_wash_hover()"),
+        "deny reached for the kill affordance's hovered fill. Its resting \
+         state is unfilled and its hover is one rung below kill's REST \
+         (`danger_wash_strong`); matching kill says deny is as destructive as \
+         killing the agent"
+    );
+    assert!(
+        !body.contains("theme::live()"),
+        "`live` is the pigment for 'something is running right now' — the \
+         streaming cursor, a running tool's dot, the work bar. It is not a \
+         verb and it is not an answer"
+    );
+}
+
+/// The two bindings are printed ON the buttons they fire.
+///
+/// They are declared at `ui.rs:56` and used to be announced by a trailer
+/// that opened `⇧⌘A approve · ⇧⌘D deny · …` — a sentence under the card
+/// that restated both button words in order to introduce two keys. A
+/// keycap on the button is the same fact costing no sentence, and it binds
+/// the key to the thing rather than to the paragraph.
+///
+/// Asserted as CONTAINMENT rather than presence: an element that merely
+/// exists somewhere could be anywhere, and "discoverable" means the key is
+/// on the control.
+///
+/// Text system: Noop. Every glyph carries the same synthetic advance, so
+/// the horizontal extents here are not real — but containment in `y` and
+/// the fact of the box are decided by the fold and the flex row, not by
+/// shaping.
+#[gpui::test]
+fn each_decision_button_carries_its_own_binding(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    ask(
+        &h,
+        vcx,
+        vec![approval_record(1, "req-1", "Bash", "/repo/target")],
+    );
+    let _ = h.drain();
+
+    for (button, key) in [
+        ("approve-req-1", "approve-key-req-1"),
+        ("deny-req-1", "deny-key-req-1"),
+    ] {
+        let b = vcx
+            .debug_bounds(button)
+            .unwrap_or_else(|| panic!("{button} is not on screen"));
+        let k = vcx
+            .debug_bounds(key)
+            .unwrap_or_else(|| panic!("{key} is not on screen — the binding is unstated"));
+        assert!(
+            k.origin.y >= b.origin.y && k.origin.y + k.size.height <= b.origin.y + b.size.height,
+            "{key} is not inside {button}: key {k:?} vs button {b:?}"
+        );
+    }
+
+    // And the trailer no longer spends its opening on words that are now on
+    // the buttons. Source rather than render: the harness can see that a
+    // line is on screen, never what it says.
+    let src = include_str!("ui.rs");
+    // The opening quote is load-bearing: the sentence is quoted in
+    // `decision_button`'s own doc comment as the thing it replaced, so a
+    // bare substring search finds the prose rather than a string literal.
+    assert!(
+        !src.contains("\"⇧⌘A approve"),
+        "the trailer went back to introducing the bindings the buttons carry"
+    );
+    assert!(
+        src.contains("deny sends whatever is in the composer as the reason"),
+        "the one fact about answering that no button can show — because it is \
+         about something outside the card — was lost with the sentence that \
+         used to carry it"
+    );
+}
+
+/// **Slice AQ, found by eye in `docs/shots/aq-before-approval.png`.** A
+/// session parked on a permission question was captioned `working for
+/// 99h 49m`, with a running work bar beside it, in the slot immediately
+/// above the composer.
+///
+/// It is a composition defect rather than a local one, which is why no
+/// test had it. The attention notice suppresses itself while the question
+/// is on screen — that is the 2026-08-18 occlusion fix, and it is right —
+/// and the working trailer then takes the slot the notice gave up. Both
+/// decisions are correct in their own terms; `in_turn` really is true,
+/// because the CLI is waiting rather than finished. The sentence is still
+/// false: what is happening is that eave is waiting for the operator.
+///
+/// The slot stands empty, deliberately. The card IS the notice while it is
+/// on screen (Slice K), and it says `Bash — needs your approval / waiting`
+/// in the warning pigment, which is strictly more than the trailer could.
+#[gpui::test]
+fn a_session_parked_on_a_question_is_never_captioned_working(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+    assert!(
+        shown(vcx, "work-trailer"),
+        "precondition: an open turn with nothing asked does say it is working"
+    );
+
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![approval_record(3, "req-1", "Bash", "/repo/target")],
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    assert!(
+        shown(vcx, "approve-req-1"),
+        "precondition: the question is on screen with its buttons"
+    );
+    assert!(
+        !shown(vcx, "work-trailer"),
+        "eave told the operator it was working while it was waiting on them"
+    );
+    // …and the other half of the slot stays down too, with the engine's own
+    // classification standing. `the_notice_never_stands_on_top_of_the_question_it_points_at`
+    // owns the notice's suppression; this is the pair being checked
+    // TOGETHER, which is the composition nothing was watching.
+    h.plumbing.push_attn((
+        "aaaa1111".into(),
+        AttentionSnapshot::AwaitingApproval {
+            since_ms: 0,
+            pending: 1,
+            tool: "Bash".into(),
+        },
+    ));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "work-trailer"),
+        "the notice stood down for the card and the trailer walked into the \
+         slot it vacated"
+    );
+
+    // Answering hands the slot back: the turn never ended, so the trailer is
+    // the right thing to be in it again. The engine reclassifies as it goes
+    // — `Running` is its word for "clear any notice" — and without that the
+    // notice this test just stood up would take the slot instead, which is
+    // its job and not a defect.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![decided_record(4, "req-1", true)],
+    });
+    h.plumbing
+        .push_attn(("aaaa1111".into(), AttentionSnapshot::Running));
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "work-trailer"),
+        "the trailer did not come back after the question was answered"
     );
 }
 
@@ -2289,8 +2500,15 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         assert!(src.contains(key), "the affordance keyed {key} is gone");
     }
     // approve / deny share one builder and one selector expression.
+    //
+    // Slice AQ: bounded by the NEXT item rather than by a byte count. The
+    // count was 2400 and the builder's doc comment grew past it, so this
+    // read a window that stopped short of the code and reported the
+    // affordance gone. A byte budget is a guess about how long a function's
+    // prose is allowed to be, which is not a property anyone should have to
+    // maintain.
     let at = src.find("fn decision_button(").expect("decision_button");
-    let window = &src[at..src.len().min(at + 2400)];
+    let window = &src[at..at + src[at..].find("\n    /// A quiet trailer").expect("end")];
     assert!(
         window.contains(".hover_fade("),
         "approve and deny lost their hover feedback"
@@ -3091,9 +3309,21 @@ fn the_turn_clock_nets_the_delivery_pair_in_either_order(cx: &mut TestAppContext
 /// is not a row: it lives in the floating chrome stack, a sibling of the
 /// list. So the trailer appearing and disappearing must move nothing.
 ///
-/// The instrument is an approval card's button, because it is the one
-/// thing rendered INSIDE a list row that carries a selector — its bounds
-/// are a direct readout of the list's layout.
+/// The instrument is an approval CARD, because it is the one thing
+/// rendered INSIDE a list row that carries a selector — its bounds are a
+/// direct readout of the list's layout.
+///
+/// **Slice AQ moved the instrument from the card's approve button to the
+/// card itself, and answered the question the old form was really
+/// asking.** It used to open a *pending* question and assert the trailer
+/// was up beside it; a session parked on a permission question is now
+/// never captioned `working` (see `Shell::work_trailer`), so that
+/// arrangement can no longer produce a trailer to toggle. The question is
+/// therefore settled here, which leaves the card in the log — with its
+/// buttons gone — while the turn stays open. Same list, same row, same
+/// differential; the only thing that changed is which selector inside the
+/// row is read, and `approval-req-1` is the card's own box rather than a
+/// button inside it, so it is if anything the better readout.
 ///
 /// **This assertion is mutation-checked, and it needed to be.** The
 /// harness runs on the Noop text system, where every glyph has the same
@@ -3120,11 +3350,16 @@ fn the_trailer_never_participates_in_a_row_height(cx: &mut TestAppContext) {
             user_record(1, "go"),
             delivered_record(2),
             approval_record(3, "req-1", "Write", "/repo/src/main.rs"),
+            decided_record(4, "req-1", true),
         ],
     );
     assert!(shown(vcx, "work-trailer"), "the turn is open");
+    assert!(
+        !shown(vcx, "approve-req-1"),
+        "precondition: the question is settled, so nothing suppresses the trailer"
+    );
     let before = vcx
-        .debug_bounds("approve-req-1")
+        .debug_bounds("approval-req-1")
         .expect("the approval row must be on screen to measure it");
 
     // End the turn: the trailer goes, and `TurnCompleted` adds no row of
@@ -3132,12 +3367,12 @@ fn the_trailer_never_participates_in_a_row_height(cx: &mut TestAppContext) {
     h.plumbing.push_feed(FeedEvent::Records {
         id: "aaaa1111".into(),
         epoch: 1,
-        records: vec![turn_completed_record(4)],
+        records: vec![turn_completed_record(5)],
     });
     vcx.run_until_parked();
     assert!(!shown(vcx, "work-trailer"));
     let after = vcx
-        .debug_bounds("approve-req-1")
+        .debug_bounds("approval-req-1")
         .expect("the approval row must still be on screen");
     assert_eq!(
         before, after,
