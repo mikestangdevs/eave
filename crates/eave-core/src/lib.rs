@@ -10,6 +10,7 @@ pub mod events;
 pub mod journal;
 pub mod proc;
 pub mod process;
+pub mod provider;
 pub mod recorder;
 pub mod session;
 pub mod store;

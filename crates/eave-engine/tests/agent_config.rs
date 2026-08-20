@@ -56,20 +56,31 @@ struct EngineProc {
 
 impl EngineProc {
     fn spawn(data_dir: &Path, fake_mode: &str) -> Self {
+        Self::spawn_with(data_dir, |cmd| {
+            cmd.env("EAVE_AGENT", fake_agent_bin())
+                .env("EAVE_FAKE_MODE", fake_mode);
+        })
+    }
+
+    /// Slice AT: an engine whose environment the test controls. Used to
+    /// run one **without** an `EAVE_AGENT` pin, which is the only way to
+    /// exercise the path where a session's own provider resolves its own
+    /// CLI — the path every operator is actually on.
+    fn spawn_with(data_dir: &Path, env: impl FnOnce(&mut Command)) -> Self {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(data_dir.join("engine-test.log"))
             .unwrap();
-        let child = Command::new(engined_bin())
-            .args(["--data-dir", &data_dir.display().to_string()])
-            .env("EAVE_AGENT", fake_agent_bin())
-            .env("EAVE_FAKE_MODE", fake_mode)
+        let mut cmd = Command::new(engined_bin());
+        cmd.args(["--data-dir", &data_dir.display().to_string()])
+            .env_remove("EAVE_AGENT")
+            .env_remove("EAVE_FAKE_MODE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("spawn eave-engined");
+            .stderr(log);
+        env(&mut cmd);
+        let child = cmd.spawn().expect("spawn eave-engined");
         let me = Self {
             child,
             data_dir: data_dir.to_path_buf(),
@@ -273,37 +284,166 @@ async fn the_config_survives_a_restart_and_governs_the_resume_spawn() {
     );
 }
 
-/// 3. Slice K's blocker, guarded at the door per-session config opens. An
-///    unverified provider is refused with the reason, and — the part that
-///    matters — NOTHING is created for it.
+/// 3. Slice K's blocker, guarded at the door per-session config opens. A
+///    provider eave cannot drive is refused with the reason, and — the
+///    part that matters — NOTHING is created for it.
+///
+/// **Slice AT rewrote this test rather than working around it.** It used
+/// to name `codex` as its example of an unverified provider, which was
+/// true only for as long as no codex adapter existed; four adapters are
+/// landing beside this slice and each would have broken it. It now asks
+/// the registry which providers eave cannot drive and refuses those, so
+/// it asserts the *rule* and needs no edit when the answer changes.
 #[tokio::test]
-async fn an_unverified_provider_is_refused_and_leaves_no_session_behind() {
+async fn a_provider_eave_cannot_drive_is_refused_and_leaves_no_session_behind() {
     let dir = scratch();
     let _engine = EngineProc::spawn(&dir, "argv-report");
     let c = Client::connect(&dir).await.expect("connect");
-    let err = c
-        .open_with_agent(
-            Some("s1".into()),
-            None,
-            Some(AgentConfig {
-                provider: Some("codex".into()),
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect_err("an unverified provider must not open");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("codex") && msg.contains("posture"),
-        "the refusal must name the provider and the reason: {msg}"
-    );
-    assert!(
-        !dir.join("sessions").join("s1").exists(),
-        "a refused open left a session directory behind"
-    );
+
+    // Every provider eave names and cannot drive, plus one it has never
+    // heard of. The second is the case that can never become stale.
+    let refusable: Vec<String> = eave_core::provider::CATALOG
+        .iter()
+        .map(|e| e.id.to_string())
+        .filter(|id| !eave_core::session::posture_is_verified(id))
+        .chain(std::iter::once(
+            "an-agent-eave-has-never-heard-of".to_string(),
+        ))
+        .collect();
+
+    for (n, provider) in refusable.iter().enumerate() {
+        let sid = format!("s{n}");
+        let err = c
+            .open_with_agent(
+                Some(sid.clone()),
+                None,
+                Some(AgentConfig {
+                    provider: Some(provider.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("a provider eave cannot drive must not open");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(provider),
+            "the refusal must name the provider: {msg}"
+        );
+        // And it must say what eave CAN start, so the message is a way
+        // forward rather than a dead end.
+        assert!(
+            msg.contains("claude-code"),
+            "the refusal must state what eave can start: {msg}"
+        );
+        assert!(
+            !dir.join("sessions").join(&sid).exists(),
+            "a refused open left a session directory behind"
+        );
+    }
     assert!(
         c.list().await.expect("list").is_empty(),
         "a refused open left a session in the registry"
+    );
+}
+
+/// Slice AT — **the provider id chooses the adapter, and `EAVE_AGENT`
+/// chooses the binary.** They used to be one field, which is why the
+/// engine's default provider was called `fake-agent` in every test run.
+///
+/// Driven with `EAVE_PROVIDER` pointed at a provider eave names and
+/// cannot drive: a session that configures nothing at all inherits it and
+/// is refused at spawn, naming it. That proves the default provider is
+/// really what selects the adapter rather than decoration on a header.
+#[tokio::test]
+async fn the_engines_default_provider_selects_the_adapter() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn_with(&dir, |cmd| {
+        cmd.env("EAVE_PROVIDER", "cursor-agent");
+    });
+    let c = Client::connect(&dir).await.expect("connect");
+    let sid = uuid::Uuid::new_v4().to_string();
+    let info = c.open(Some(sid.clone()), None).await.expect("open");
+    assert_eq!(
+        info.provider, "cursor-agent",
+        "the session inherited the engine's provider as a fact about itself"
+    );
+
+    let err = tokio::time::timeout(Duration::from_secs(20), c.send(&sid, "hello"))
+        .await
+        .expect("the engine never answered")
+        .expect_err("a provider with no adapter must not spawn");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cursor-agent"),
+        "the refusal must name the provider it inherited: {msg}"
+    );
+}
+
+/// Slice AT — **a CLI that is not on the machine is a stated refusal, at
+/// the moment of spawn, and nothing else.**
+///
+/// Not a panic, not an `ENOENT` shrugged out of `Command::spawn`, and not
+/// a session that hangs looking alive. Driven through the real engine
+/// with no `EAVE_AGENT` pin, so the resolution being exercised is the one
+/// every operator is on: the session names a provider, the provider names
+/// a binary, and the binary is not there.
+///
+/// `EAVE_PROVIDER_BIN_CLAUDE_CODE` is what makes this testable without
+/// uninstalling anything — and it is authoritative rather than a first
+/// guess, so pointing it at nothing means nothing, not "fall back to the
+/// copy on PATH".
+#[tokio::test]
+async fn a_provider_whose_cli_is_missing_refuses_with_a_reason() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn_with(&dir, |cmd| {
+        cmd.env(
+            "EAVE_PROVIDER_BIN_CLAUDE_CODE",
+            "/nowhere/at/all/claude-that-is-not-installed",
+        );
+    });
+    let c = Client::connect(&dir).await.expect("connect");
+
+    // A UUID, because with no pin this session runs the real `claude`
+    // name and the engine refuses non-UUID ids against it.
+    let sid = uuid::Uuid::new_v4().to_string();
+    c.open_with_agent(
+        Some(sid.clone()),
+        None,
+        Some(AgentConfig {
+            provider: Some("claude-code".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("opening a session for an uninstalled CLI is legal — only spawning is not");
+
+    // Spawn happens on the first send. It must come back, and it must say
+    // what is wrong; a 20 s ceiling because a hang is the failure mode
+    // being ruled out, not a slow answer.
+    let err = tokio::time::timeout(Duration::from_secs(20), c.send(&sid, "hello"))
+        .await
+        .expect("the engine never answered a send against a missing CLI")
+        .expect_err("a missing CLI must not report a successful send");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("claude") && msg.contains("not installed"),
+        "the refusal must name the CLI and say it is missing: {msg}"
+    );
+    assert!(
+        msg.contains("EAVE_PROVIDER_BIN_CLAUDE_CODE"),
+        "the refusal must name the way out: {msg}"
+    );
+
+    // And the session is still there, unstarted, rather than half-created
+    // or wedged: install the CLI and it works.
+    let sessions = c.list().await.expect("list");
+    let s = sessions
+        .iter()
+        .find(|s| s.session_id == sid)
+        .expect("the session survived a refused spawn");
+    assert_ne!(
+        s.state, "running",
+        "a session that never spawned is running"
     );
 }
 

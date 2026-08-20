@@ -4270,9 +4270,13 @@ fn a_session_replaces_the_launcher(cx: &mut TestAppContext) {
 ///
 /// A live tile takes the click; a dead one does not — no handler at all,
 /// so the selection does not move. This is the launcher's whole honesty
-/// property: `launcher::is_live` reads
-/// `eave_core::session::POSTURE_VERIFIED_PROVIDERS`, the same constant the
-/// engine refuses on, so a tile that looks clickable is one that starts.
+/// property: `launcher::eave_can_drive` asks `posture_is_verified`, the
+/// same gate the engine refuses on, so a tile that looks clickable is one
+/// eave would try to start.
+///
+/// Slice AT: asked of the ADAPTER, never of whether the CLI is installed.
+/// A machine without `claude` on it would otherwise flip every tile in
+/// this test to dead and make the assertion mean nothing.
 #[gpui::test]
 fn a_provider_with_no_adapter_takes_no_click(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -4283,7 +4287,7 @@ fn a_provider_with_no_adapter_takes_no_click(cx: &mut TestAppContext) {
     let live: Vec<usize> = crate::launcher::PROVIDERS
         .iter()
         .enumerate()
-        .filter(|(_, p)| crate::launcher::is_live(p))
+        .filter(|(_, p)| crate::launcher::eave_can_drive(p))
         .map(|(ix, _)| ix)
         .collect();
     let dead: Vec<usize> = (0..crate::launcher::PROVIDERS.len())

@@ -46,19 +46,30 @@ pub struct AgentConfig {
     pub extra_args: Vec<String>,
 }
 
-/// The ONLY provider whose permission posture eave has actually proven.
+/// Every provider whose permission posture an adapter has declared proven.
+///
+/// **Derived from the registry, not maintained here.** This used to be a
+/// hand-kept `[&str; 1]`, which meant the list of providers the engine
+/// would spawn and the list of adapters that exist were two facts that
+/// could disagree. They are now one fact: an adapter declares
+/// [`crate::provider::PostureProof`] as a required associated const, and
+/// this reads it.
 ///
 /// Slice K established what makes the Claude CLI ask before it writes —
 /// `--permission-prompt-tool stdio` with no `--permission-mode`, verified
 /// against the CLI's own `init.permissionMode` rather than assumed — and
 /// every part of that proof is Claude-specific and lives in `claude.rs`.
-/// It transfers to no other CLI.
-pub const POSTURE_VERIFIED_PROVIDERS: [&str; 1] = ["claude-code"];
+/// It transfers to no other CLI, which is exactly why each adapter has to
+/// state its own.
+pub fn posture_verified_providers() -> Vec<&'static str> {
+    crate::provider::posture_verified_providers()
+}
 
 /// Is this provider's permission posture proven? **Fail-closed by
 /// construction**, exactly like Slice K's `ASKING_MODES`: an unrecognised
 /// provider is refused, never spawned on the assumption that it behaves
-/// like Claude.
+/// like Claude. A provider with no registered adapter is unrecognised; so
+/// is one whose adapter declares its own posture unproven.
 ///
 /// This is the door Slice K closed, and the reason it is guarded here
 /// rather than at the UI: per-session config makes it possible to name any
@@ -66,7 +77,7 @@ pub const POSTURE_VERIFIED_PROVIDERS: [&str; 1] = ["claude-code"];
 /// v0 auto-accept blocker by the side door — a session writing to disk
 /// with nothing able to review it.
 pub fn posture_is_verified(provider: &str) -> bool {
-    POSTURE_VERIFIED_PROVIDERS.contains(&provider)
+    crate::provider::adapter(provider).is_some_and(|a| a.posture.is_verified())
 }
 
 /// Flags a caller may not smuggle through [`AgentConfig::extra_args`],

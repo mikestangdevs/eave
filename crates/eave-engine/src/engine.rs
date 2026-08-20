@@ -19,16 +19,16 @@ use tokio::net::{unix::OwnedWriteHalf, UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 
 use eave_core::attention::{probe_failure, AttentionSnapshot, Classifier, ProbeFacts};
-use eave_core::claude::ClaudeCodeSession;
 use eave_core::journal::{
     self, now_ms, Header, JournalEvent, JournalWriter, Record, FORMAT_VERSION,
 };
 use eave_core::proc::{self, PidState, ProcIdentity};
 use eave_core::process;
+use eave_core::provider::{self, Availability, BoxedSession, ProgramResolution};
 use eave_core::recorder::{record_session, send_and_journal};
 use eave_core::session::{
-    conflicts_with_eave_flags, posture_is_verified, AgentConfig, AgentSession, ApprovalDecision,
-    SessionWatch, SpawnConfig, POSTURE_VERIFIED_PROVIDERS,
+    conflicts_with_eave_flags, posture_is_verified, posture_verified_providers, AgentConfig,
+    ApprovalDecision, SessionWatch, SpawnConfig,
 };
 use eave_core::store::{normalize_title, EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
@@ -49,10 +49,30 @@ const FILES_CAP: usize = 16;
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub data_dir: PathBuf,
-    /// Agent CLI binary; `claude` unless overridden (tests: fake-agent).
-    pub agent_program: PathBuf,
+    /// The agent binary the operator **pinned** with `EAVE_AGENT`, if
+    /// they pinned one.
+    ///
+    /// `Some` overrides every provider's own binary: it is what lets the
+    /// acceptance suite point every session at `fake-agent` regardless of
+    /// which provider that session names, and what lets an operator run a
+    /// wrapper script. `None` — the shipped default — means each session
+    /// resolves the CLI belonging to **its own provider** through
+    /// [`eave_core::provider`] (Slice AT). That is the difference between
+    /// a codex session running `codex` and a codex session running
+    /// whatever `EAVE_AGENT` happened to be.
+    pub agent_program: Option<PathBuf>,
     /// Extra env for spawned agents (tests: `FAKE_MODE`).
     pub agent_env: Vec<(String, String)>,
+    /// The provider a session that names none inherits — the id that
+    /// **selects the adapter** (Slice AT). `claude-code` unless
+    /// `EAVE_PROVIDER` says otherwise.
+    ///
+    /// Deliberately independent of [`Self::agent_program`]: `EAVE_AGENT`
+    /// swaps the *binary*, this swaps the *protocol*. The acceptance
+    /// suite is the reason the two must not be one field — `fake-agent`
+    /// speaks Claude's stream-JSON, so it is a different binary under the
+    /// same adapter, and a single field would have to call it a provider
+    /// eave has never heard of.
     pub provider: String,
     /// cwd recorded for sessions opened without one.
     pub default_cwd: PathBuf,
@@ -66,19 +86,27 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// Configuration from the environment: `EAVE_AGENT` overrides the agent
-    /// binary, `EAVE_FAKE_MODE` becomes the fake agent's `FAKE_MODE`. The
-    /// engine reads `EAVE_*` itself; spawned agents never see them — the
-    /// adapter strips the namespace from child env (spec 01 §Spawn).
+    /// **binary**, `EAVE_PROVIDER` overrides the default **provider id**
+    /// (which picks the adapter), `EAVE_FAKE_MODE` becomes the fake
+    /// agent's `FAKE_MODE`. The engine reads `EAVE_*` itself; spawned
+    /// agents never see them — the adapter strips the namespace from
+    /// child env (spec 01 §Spawn).
+    ///
+    /// The two overrides are separate because they answer different
+    /// questions. `EAVE_AGENT=/…/fake-agent` runs a different executable
+    /// under Claude's protocol (what the acceptance suite needs);
+    /// `EAVE_PROVIDER=codex` runs a different protocol. Setting only the
+    /// first with a real vendor CLI would drive that CLI with the wrong
+    /// adapter, so an operator pointing eave at another agent sets both.
+    /// A session's own `AgentConfig` beats either.
     pub fn from_env(data_dir: PathBuf) -> Self {
-        let agent = std::env::var("EAVE_AGENT").unwrap_or_else(|_| "claude".into());
-        let provider = if agent == "claude" {
-            "claude-code".to_string()
-        } else {
-            PathBuf::from(&agent)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unknown".into())
-        };
+        let agent = std::env::var_os("EAVE_AGENT")
+            .filter(|a| !a.is_empty())
+            .map(PathBuf::from);
+        let provider = std::env::var("EAVE_PROVIDER")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "claude-code".to_string());
         let mut agent_env = Vec::new();
         if let Ok(mode) = std::env::var("EAVE_FAKE_MODE") {
             agent_env.push(("FAKE_MODE".to_string(), mode));
@@ -109,7 +137,7 @@ impl EngineConfig {
             });
         Self {
             data_dir,
-            agent_program: agent.into(),
+            agent_program: agent,
             agent_env,
             provider,
             default_cwd,
@@ -187,7 +215,12 @@ enum Fanout {
 }
 
 struct Live {
-    session: ClaudeCodeSession,
+    /// The running agent behind dynamic dispatch (Slice AT). Was
+    /// `ClaudeCodeSession`; the engine now holds whatever the registry
+    /// handed it and never learns which provider that was. See
+    /// [`eave_core::provider::BoxedSession`] for why boxed rather than an
+    /// enum.
+    session: BoxedSession,
     extra_tx: mpsc::Sender<JournalEvent>,
 }
 
@@ -603,6 +636,74 @@ pub struct Engine {
     watch_tx: broadcast::Sender<()>,
 }
 
+/// Whether a program resolution may come from the memo or must hit the
+/// filesystem. The launcher's tiles can live with a second-old answer;
+/// a spawn cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freshness {
+    Cached,
+    Uncached,
+}
+
+/// The provider id that decides which adapter runs this session: the
+/// session's own, else the engine's default.
+///
+/// A free function over [`EngineConfig`] rather than a method, so the
+/// resolution policy can be tested with plain values and no engine, no
+/// socket and no child process. It is a decision, not an action.
+fn provider_of<'a>(cfg: &'a EngineConfig, agent: &'a AgentConfig) -> &'a str {
+    agent.provider.as_deref().unwrap_or(&cfg.provider)
+}
+
+/// **Which binary this session would execute**, and — when there is
+/// none — where eave looked (Slice AT).
+///
+/// The order is the whole of the resolution policy, and it is
+/// deliberate:
+///
+/// 1. The session's own `AgentConfig::program`. The most specific
+///    thing anybody said, taken verbatim and unresolved: a caller who
+///    names a path means that path.
+/// 2. The engine's `EAVE_AGENT`, when the operator pinned one. This
+///    is what points the whole acceptance suite at `fake-agent`, and
+///    it must outrank the provider's own binary or every test would
+///    spawn the real `claude`.
+/// 3. **The provider's own CLI, resolved on this machine.** This is
+///    the line that closes the launcher's worst latent bug, recorded
+///    in `launcher.rs` before any second adapter existed: the strip
+///    sends `AgentConfig { provider, program: None }`, so before this
+///    slice a `codex` tile would have spawned whatever `EAVE_AGENT`
+///    pointed at — the *other vendor's* CLI, while reporting itself
+///    as codex.
+/// 4. A provider eave does not catalogue: its id, used as a program
+///    name. Unreachable while `from_env` defaults the provider to a
+///    catalogued one, and kept so this function is total rather than
+///    panicking on a journal written by another build.
+///
+/// Returns a resolution, not a `Result`: a missing binary is only an
+/// error at spawn. Opening a session for a CLI you have not installed
+/// yet is legal, and the launcher says so before you pick.
+fn program_plan(
+    cfg: &EngineConfig,
+    agent: &AgentConfig,
+    freshness: Freshness,
+) -> ProgramResolution {
+    if let Some(p) = agent.program.as_ref() {
+        return ProgramResolution::Found(PathBuf::from(p));
+    }
+    if let Some(p) = cfg.agent_program.as_ref() {
+        return ProgramResolution::Found(p.clone());
+    }
+    let id = provider_of(cfg, agent);
+    match provider::catalog(id) {
+        Some(entry) => match freshness {
+            Freshness::Cached => provider::resolve_program(entry),
+            Freshness::Uncached => provider::resolve_program_uncached(entry),
+        },
+        None => ProgramResolution::Found(PathBuf::from(id)),
+    }
+}
+
 impl Engine {
     /// Resolve a session's agent config against the engine's defaults and
     /// **refuse anything whose permission posture is not proven** (Slice P2).
@@ -654,13 +755,30 @@ impl Engine {
                 extra_args: want.extra_args.clone(),
             });
         };
-        if !posture_is_verified(&provider) {
-            return Err(format!(
-                "provider {provider:?} has no verified permission posture — eave only knows how \
-                 to make {:?} ask before it writes, and refuses to run an agent whose writes it \
-                 cannot review. Slice K established the proof and it is provider-specific.",
-                POSTURE_VERIFIED_PROVIDERS.join(", ")
-            ));
+        // Slice AT: the refusal now says WHICH kind of no it is, because
+        // the fixes differ. "eave has no adapter for cursor-agent" is
+        // eave's work; "the codex CLI is not installed" is a `brew
+        // install`; "posture unproven" is a proof somebody has to do. The
+        // one message this used to give said the last thing about all
+        // three.
+        //
+        // **`NotInstalled` is deliberately not refused here.** A session
+        // can legitimately be created before its CLI exists — the journal
+        // and the cwd are real either way — and the launcher already
+        // states the absence before the operator picks. Spawning is where
+        // the binary has to be on disk, and `spawn_live` refuses there.
+        match provider::availability(&provider) {
+            Availability::Ready { .. } | Availability::NotInstalled { .. } => {}
+            other => {
+                let why = other
+                    .why_not(&provider)
+                    .unwrap_or_else(|| format!("eave cannot run {provider}"));
+                return Err(format!(
+                    "{why}. eave refuses to run an agent whose writes it cannot review; it can \
+                     start: {}",
+                    posture_verified_providers().join(", ")
+                ));
+            }
         }
         if let Some(bad) = want
             .extra_args
@@ -713,8 +831,19 @@ impl Engine {
             // (fake-agent, other CLIs) accept any id; generated ids are
             // always UUIDs and pass. Existing journals are exempt: their
             // history is real and loadable regardless.
-            if self.cfg.agent_program == Path::new("claude") && uuid::Uuid::parse_str(&id).is_err()
-            {
+            //
+            // Slice AT: asked of the binary this session would actually
+            // run, by name, rather than of `agent_program == "claude"`.
+            // The old spelling silently stopped applying the moment the
+            // path was absolute — `EAVE_AGENT=/opt/homebrew/bin/claude`
+            // is the real CLI and used to slip past.
+            let default_agent = AgentConfig::default();
+            let will_run = program_plan(
+                &self.cfg,
+                agent.as_ref().unwrap_or(&default_agent),
+                Freshness::Cached,
+            );
+            if will_run.program_name() == Some("claude") && uuid::Uuid::parse_str(&id).is_err() {
                 return Err(format!(
                     "session id {id:?} is not a UUID — the claude CLI rejects non-UUID session ids"
                 ));
@@ -935,7 +1064,10 @@ impl Engine {
             *live = Some(self.spawn_live(&handle).await?);
         }
         let l = live.as_mut().unwrap();
-        send_and_journal(&mut l.session, &l.extra_tx, text)
+        // `&mut *` unsizes the box to `dyn AgentSession`; `send_and_journal`
+        // has always been `?Sized`, so nothing about it had to change to
+        // accept a provider it does not know.
+        send_and_journal(&mut *l.session, &l.extra_tx, text)
             .await
             .map_err(|e| format!("recorder gone: {e}"))
     }
@@ -983,11 +1115,23 @@ impl Engine {
                 ));
             }
         }
-        let program: PathBuf = agent
-            .program
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.cfg.agent_program.clone());
+        // Slice AT: the binary comes from the session's own provider, not
+        // from the engine's environment. Resolved UNCACHED — this is the
+        // last moment before a process exists, and a memo from a second
+        // ago is not what the spawn should be betting on.
+        let program: PathBuf = match program_plan(&self.cfg, agent, Freshness::Uncached) {
+            ProgramResolution::Found(p) => p,
+            missing => {
+                let provider = provider_of(&self.cfg, agent);
+                return Err(format!(
+                    "refusing to spawn session {}: {}",
+                    handle.session_id,
+                    missing
+                        .why_not(provider)
+                        .unwrap_or_else(|| "the agent CLI could not be resolved".into()),
+                ));
+            }
+        };
         let mut cfg = SpawnConfig::new(
             program,
             PathBuf::from(&header.cwd),
@@ -1002,8 +1146,20 @@ impl Engine {
             .filter(|a| !conflicts_with_eave_flags(a))
             .cloned()
             .collect();
-        let (session, events) =
-            ClaudeCodeSession::spawn(&cfg).map_err(|e| format!("spawn agent: {e}"))?;
+        // **The dispatch.** This used to be `ClaudeCodeSession::spawn`
+        // spelled out; the engine now looks the provider up and never
+        // learns which adapter it got. Adding a fifth agent touches no
+        // line in this file.
+        let provider_id = provider_of(&self.cfg, agent);
+        let adapter = provider::adapter(provider_id).ok_or_else(|| {
+            format!(
+                "no adapter for provider {provider_id:?} — eave can start: {}",
+                posture_verified_providers().join(", ")
+            )
+        })?;
+        let (session, events) = adapter
+            .spawn(&cfg)
+            .map_err(|e| format!("spawn agent: {e}"))?;
 
         let mut meta = Meta {
             format_version: META_FORMAT_VERSION,
@@ -2675,4 +2831,177 @@ async fn send_item(
         },
     )
     .await
+}
+
+/// Slice AT — **which binary a session runs**, tested as a decision over
+/// plain values.
+///
+/// This is a policy with four rules and no I/O worth mocking, so it is
+/// tested here rather than only through a spawned engine: the end-to-end
+/// suite can prove that `EAVE_AGENT` still reaches a child (it does, in
+/// `agent_config.rs`), but it cannot cheaply prove what a `codex` session
+/// would run on a machine, because that would mean installing codex.
+#[cfg(test)]
+mod program_resolution {
+    use super::*;
+
+    fn cfg(agent_program: Option<&str>, provider: &str) -> EngineConfig {
+        EngineConfig {
+            data_dir: PathBuf::from("/tmp/eave-test"),
+            agent_program: agent_program.map(PathBuf::from),
+            agent_env: Vec::new(),
+            provider: provider.to_string(),
+            default_cwd: PathBuf::from("/tmp"),
+            worktrees_root: PathBuf::from("/tmp/eave-test-worktrees"),
+        }
+    }
+
+    fn named(provider: &str) -> AgentConfig {
+        AgentConfig {
+            provider: Some(provider.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn plan(cfg: &EngineConfig, agent: &AgentConfig) -> ProgramResolution {
+        program_plan(cfg, agent, Freshness::Uncached)
+    }
+
+    /// **The launcher's worst latent bug, now impossible.**
+    ///
+    /// `launcher.rs` recorded it before a second adapter existed: the
+    /// strip sends `program: None`, so a session naming one provider used
+    /// to run the engine's default binary — another vendor's CLI, under
+    /// the wrong protocol, reporting itself as the provider it was not.
+    /// The assertion is that the *provider* decides, and it is written
+    /// against every catalogued provider rather than against one name, so
+    /// the four adapters landing beside this cannot slip past it.
+    #[test]
+    fn a_session_runs_its_own_providers_binary_not_the_engines() {
+        let engine = cfg(None, "claude-code");
+        for entry in eave_core::provider::CATALOG {
+            let plan = plan(&engine, &named(entry.id));
+            assert_eq!(
+                plan.program_name(),
+                Some(entry.program.bin),
+                "a {} session would have run {:?}",
+                entry.id,
+                plan.program_name(),
+            );
+        }
+    }
+
+    /// `EAVE_AGENT` outranks the provider's own binary. Everything in the
+    /// acceptance suite depends on this: every test session names
+    /// `claude-code` and every one of them must reach `fake-agent`, not
+    /// the real CLI on the machine running the tests.
+    #[test]
+    fn a_pinned_agent_binary_outranks_every_providers_own() {
+        let engine = cfg(Some("/tmp/fake-agent"), "claude-code");
+        for entry in eave_core::provider::CATALOG {
+            assert_eq!(
+                plan(&engine, &named(entry.id)),
+                ProgramResolution::Found(PathBuf::from("/tmp/fake-agent")),
+                "{} escaped the pinned binary",
+                entry.id,
+            );
+        }
+    }
+
+    /// A session that names its own program beats both. The most specific
+    /// thing anybody said wins, and it is taken verbatim — a caller who
+    /// writes a path means that path, not something resolved near it.
+    #[test]
+    fn a_sessions_own_program_beats_the_pin_and_the_provider() {
+        let engine = cfg(Some("/tmp/fake-agent"), "claude-code");
+        let agent = AgentConfig {
+            provider: Some("claude-code".into()),
+            program: Some("/tmp/a-particular-binary".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan(&engine, &agent),
+            ProgramResolution::Found(PathBuf::from("/tmp/a-particular-binary")),
+        );
+    }
+
+    /// A session with no provider inherits the engine's, and the engine's
+    /// default is Claude — the behaviour that predates this slice, kept.
+    #[test]
+    fn an_unconfigured_session_still_runs_the_engines_default() {
+        let engine = cfg(None, "claude-code");
+        assert_eq!(
+            plan(&engine, &AgentConfig::default()).program_name(),
+            Some("claude"),
+        );
+        assert_eq!(provider_of(&engine, &AgentConfig::default()), "claude-code");
+    }
+
+    /// A provider eave does not catalogue resolves to something rather
+    /// than panicking — a journal written by another build must load.
+    #[test]
+    fn an_uncatalogued_provider_resolves_rather_than_panicking() {
+        let engine = cfg(None, "claude-code");
+        let plan = plan(&engine, &named("some-agent-from-the-future"));
+        assert_eq!(plan.program_name(), Some("some-agent-from-the-future"));
+    }
+
+    /// The engine's default provider is one it can actually drive. If
+    /// this ever fails, every unconfigured session on the machine is
+    /// about to be refused at spawn.
+    #[test]
+    fn the_shipped_default_provider_has_an_adapter() {
+        let shipped = cfg(None, "claude-code");
+        assert!(
+            eave_core::provider::adapter(&shipped.provider).is_some(),
+            "the engine's default provider {:?} has no adapter",
+            shipped.provider,
+        );
+    }
+}
+
+/// Slice AT — **the seam itself**, guarded in the one place a future
+/// change would quietly undo it.
+#[cfg(test)]
+mod dispatch_seam {
+    /// The engine must not name an adapter type.
+    ///
+    /// This is the property the whole slice exists to create, and it is
+    /// the one no behavioural test can see: an engine that special-cased
+    /// one provider would pass every other test in this file. It is also
+    /// the instruction the four adapter slices were given — *add a line
+    /// to the registry, touch nothing here* — so it is worth being a
+    /// failing test rather than a paragraph in a report.
+    ///
+    /// Matched on identifiers, never on layout: nothing here depends on
+    /// how a line is indented or wrapped.
+    #[test]
+    fn the_spawn_path_names_no_provider_adapter() {
+        // Comment lines are dropped first: the rule is about what the
+        // engine *does*, and the prose is allowed — indeed required — to
+        // say what it used to do. Line-based and whitespace-insensitive,
+        // so re-indenting or re-wrapping anything below cannot break it.
+        let src: String = include_str!("engine.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Assembled at runtime so this test's own source does not contain
+        // the strings it forbids — the first version failed on itself,
+        // which is at least an honest kind of failure.
+        let forbidden = [
+            concat!("ClaudeCode", "Session"),
+            concat!("eave_core", "::claude"),
+        ];
+        for named in forbidden {
+            assert!(
+                !src.contains(named),
+                "engine.rs names {named} — the spawn path must dispatch through                  `eave_core::provider`, or every new adapter is an edit to this file",
+            );
+        }
+        assert!(
+            src.contains("provider::adapter("),
+            "the engine no longer looks an adapter up by id",
+        );
+    }
 }

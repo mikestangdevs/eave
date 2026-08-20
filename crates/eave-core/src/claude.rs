@@ -318,6 +318,31 @@ impl ClaudeCodeSession {
     }
 }
 
+/// The reference registration (Slice AT). Nothing about how this adapter
+/// behaves changed when the registry landed — `spawn` below forwards to
+/// the inherent one, byte for byte the same process with the same flags.
+/// What changed is that the engine now finds it by id instead of naming
+/// the type.
+impl crate::provider::AgentAdapter for ClaudeCodeSession {
+    const PROVIDER_ID: &'static str = "claude-code";
+
+    /// Slice K's proof, and the pointer to where it is enforced: this
+    /// adapter's stdout reader checks the CLI's own `init.permissionMode`
+    /// against [`ASKING_MODES`] on every spawn and emits
+    /// `SessionEvent::PostureRefused` when it cannot prove the CLI asks —
+    /// see [`posture_refusal`]. The engine kills the session on that
+    /// event. It is a per-spawn runtime check, not a claim in a table.
+    const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Verified {
+        evidence: "claude.rs `posture_refusal`: the CLI's own init.permissionMode is checked \
+                   against ASKING_MODES on every spawn, and a session that cannot prove it asks \
+                   emits PostureRefused and is killed",
+    };
+
+    fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
+        ClaudeCodeSession::spawn(cfg)
+    }
+}
+
 #[async_trait]
 impl AgentSession for ClaudeCodeSession {
     fn identity(&self) -> ProcIdentity {

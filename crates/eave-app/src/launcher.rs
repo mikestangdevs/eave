@@ -16,23 +16,49 @@
 //!
 //! # Why the strip is honest rather than aspirational
 //!
-//! Six marks, and exactly **one** of them can be started today. That is
-//! not a placeholder — it is
-//! [`eave_core::session::POSTURE_VERIFIED_PROVIDERS`], the fail-closed
-//! gate Slice P2 put in front of per-session config, and it currently
-//! reads `["claude-code"]` because Slice K's posture proof is
-//! Claude-specific and transfers to no other CLI.
+//! The tiles read their state from **the same table the engine spawns
+//! from** — [`eave_core::provider`] — rather than from a bool in this
+//! file. A tile cannot claim to work when the engine would refuse it, and
+//! an adapter cannot land without its tile lighting up, because there is
+//! no second list to forget to update
+//! ([`tests::the_strip_names_exactly_the_providers_eave_catalogues`]).
 //!
-//! So the tiles read their liveness from **the same constant the engine
-//! refuses on** ([`is_live`]) rather than from a bool in this file. A tile
-//! cannot claim to work when the engine would refuse it, and an adapter
-//! cannot land without its tile lighting up — [`tests::every_verified_provider_has_a_tile`]
-//! fails if the two ever disagree.
+//! # "No adapter yet" was one word for two different problems
 //!
-//! The five that are not live are drawn, dimmed, and inert. Hiding them
-//! would be tidier and less true: the shape of the product is that eave
-//! drives several agents, and the strip is where that promise is either
-//! kept or visibly outstanding.
+//! Until Slice AT every tile eave could not start said *"no adapter
+//! yet"*, and five of six said it. That sentence was true of Cursor and
+//! **false of Codex, Grok, Hermes and Pi the moment their adapters
+//! landed** — and it would have gone on being the only thing a tile could
+//! say to somebody who simply had not installed the CLI. The two states
+//! have different fixes: one is a release eave owes you, the other is an
+//! install you can do in ten seconds. A grey tile that says the first
+//! when it means the second tells you to wait for something you do not
+//! need.
+//!
+//! So a tile states one of four things, from
+//! [`eave_core::provider::Availability`]:
+//!
+//! | tile says | means | the fix |
+//! | --- | --- | --- |
+//! | `ready` | adapter, verified posture, CLI on this machine | — |
+//! | `not installed` | eave can drive it; the CLI is not here | install it |
+//! | `posture unproven` | the adapter declines to run unsupervised | a proof |
+//! | `no adapter yet` | eave names it and cannot drive it | eave's work |
+//!
+//! **A tile eave would accept is selectable whether or not the CLI is
+//! installed**, and its caption is the reason. Installed-ness is a
+//! fact about the machine that can change between two frames; the
+//! adapter's existence cannot. Making the click depend on the first would
+//! make the strip's behaviour — and every test of it — depend on what
+//! happens to be in `/opt/homebrew/bin` on the machine running it.
+//! Pressing start on an uninstalled provider gets the engine's own
+//! refusal on `launcher-error`, which is the authoritative one, because
+//! **the engine is the process that spawns**.
+//!
+//! The tiles eave cannot drive are still drawn, dimmed, and inert. Hiding
+//! them would be tidier and less true: the shape of the product is that
+//! eave drives several agents, and the strip is where that promise is
+//! either kept or visibly outstanding.
 //!
 //! # The model list is a convenience, not a validation
 //!
@@ -50,37 +76,44 @@ use gpui::{
 
 use crate::{icons, theme};
 
-/// One agent eave knows how to name. Not one it can necessarily run —
-/// see [`is_live`].
+/// One agent eave knows how to name, and the things only a UI needs to
+/// know about it. Whether eave can *run* it is not a field here — see
+/// [`availability`].
 pub struct Provider {
-    /// The value that goes in `AgentConfig::provider`, and the string the
-    /// engine's gate is checked against.
+    /// The value that goes in `AgentConfig::provider`. It selects the
+    /// adapter, the binary and the posture proof — one id, one row in
+    /// [`eave_core::provider::CATALOG`], enforced by
+    /// [`tests::the_strip_names_exactly_the_providers_eave_catalogues`].
     ///
-    /// **Only `claude-code` is meaningful today.** The other five are the
-    /// ids we expect their adapters to register under; nothing depends on
-    /// them being right, because nothing can start them. When an adapter
-    /// lands, its id here has to match the gate or
-    /// [`tests::every_verified_provider_has_a_tile`] fails.
+    /// # The bug this used to warn about is fixed
     ///
-    /// **Read this before adding the second live provider.** The launcher
-    /// sends `AgentConfig { provider, model, program: None, .. }`, and
-    /// `program: None` means *the engine's own `EAVE_AGENT` binary*
-    /// (`Engine::resolve_agent`). The id is a posture assertion, not a
-    /// binary selector. Today that is harmless — the only startable tile
-    /// is the one `EAVE_AGENT` already points at — but the moment two
-    /// tiles are live, a tile that does not also carry a `program` would
-    /// spawn the *other* vendor's CLI while claiming to be itself. That is
-    /// the single worst bug this file could grow, and there is no test
-    /// that would catch it, because no second provider exists to catch it
-    /// with.
+    /// The warning that stood here said: the launcher sends
+    /// `AgentConfig { provider, model, program: None }`, `program: None`
+    /// meant *the engine's own `EAVE_AGENT` binary*, so the moment a
+    /// second tile went live it would spawn **the other vendor's CLI
+    /// while claiming to be itself** — "the single worst bug this file
+    /// could grow", with no test able to catch it because no second
+    /// provider existed to catch it with.
+    ///
+    /// Slice AT closed it in the engine rather than here, which is where
+    /// it belonged: `program: None` with a named provider now resolves
+    /// **that provider's own CLI** (`Engine::program_plan`). The launcher
+    /// still sends no program, and that is now the correct thing to send
+    /// — the id is the selector.
     pub id: &'static str,
     pub name: &'static str,
     /// A [`icons::Class::Mark`] path — the vendor's own logo.
     pub mark: &'static str,
-    /// Well-known `--model` aliases, first entry always [`MODEL_DEFAULT`].
-    /// Empty for a provider eave cannot start: offering model choices for
-    /// an agent that will not spawn is the kind of detail that makes a UI
-    /// feel fake.
+    /// Well-known `--model` aliases for the picker; when non-empty the
+    /// first entry is always [`MODEL_DEFAULT`].
+    ///
+    /// **Empty is legal and means "this CLI's own default only"** — see
+    /// [`model_choices`]. An adapter can land without anybody knowing
+    /// that vendor's aliases, and eave does not invent model names (it
+    /// passes `--model` verbatim and does not validate it, P2 caveat 5).
+    /// What stays forbidden is the reverse: a provider eave cannot drive
+    /// offering a menu of models, which is the exact texture of a
+    /// mocked-up UI ([`tests::a_provider_eave_cannot_drive_offers_no_models`]).
     pub models: &'static [&'static str],
 }
 
@@ -88,8 +121,9 @@ pub struct Provider {
 /// is `None` and **no `--model` flag is passed**.
 pub const MODEL_DEFAULT: &str = "CLI default";
 
-/// Every agent eave names, in strip order. Claude first because it is the
-/// only one that starts.
+/// Every agent eave names, in strip order. Claude first because it is
+/// the reference adapter — the one whose permission posture was proven
+/// first and against which the others are written.
 pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "claude-code",
@@ -131,24 +165,62 @@ pub const PROVIDERS: &[Provider] = &[
     },
 ];
 
-/// Can eave actually start this one?
+/// What eave can do about this provider on this machine right now.
 ///
-/// Delegates to `eave-core` — the **same** constant the engine refuses
-/// on — rather than answering from a field here. Two sources of truth for
-/// "is this provider supported" is exactly how a UI ends up offering a
-/// button that produces an error.
-pub fn is_live(p: &Provider) -> bool {
+/// Delegates to `eave-core` — the **same** table the engine spawns from —
+/// rather than answering from a field here. Two sources of truth for "is
+/// this provider supported" is exactly how a UI ends up offering a button
+/// that produces an error.
+pub fn availability(p: &Provider) -> eave_core::provider::Availability {
+    eave_core::provider::availability(p.id)
+}
+
+/// Would the engine accept a session naming this provider at all — is
+/// there a registered adapter that has declared a verified posture?
+///
+/// **This, not installed-ness, is what makes a tile clickable.** It is a
+/// fact about eave's own code, so it is the same on every machine and at
+/// every frame; whether the CLI is on disk is neither. See the module
+/// doc.
+///
+/// The same call the engine's gate makes, so the two cannot drift
+/// ([`tests::a_live_tile_is_one_the_engine_would_accept`]).
+pub fn eave_can_drive(p: &Provider) -> bool {
     eave_core::session::posture_is_verified(p.id)
 }
 
-/// The tile the launcher opens on: the first provider eave can start.
+/// The tile the launcher opens on: the first provider eave has an adapter
+/// for.
+///
+/// **Deliberately not the first *ready* one.** Opening on a different
+/// tile depending on which CLIs happen to be installed would make the
+/// rest state of the app a property of the machine, and would move under
+/// an operator who installed something. It opens where eave's own
+/// capability says it should and lets the caption carry the machine's
+/// side of it.
 ///
 /// Returns an index rather than a reference so it can be held in state.
-/// Falls back to 0 only if nothing is live, which would mean the gate list
-/// is empty — a state `every_verified_provider_has_a_tile` would already
-/// have failed on, but the render path still has to produce something.
+/// Falls back to 0 only if eave has no adapters at all — a state
+/// [`tests::the_reference_adapter_is_registered`] refuses, but the render
+/// path still has to produce something.
 pub fn default_provider() -> usize {
-    PROVIDERS.iter().position(is_live).unwrap_or(0)
+    PROVIDERS.iter().position(eave_can_drive).unwrap_or(0)
+}
+
+/// The model choices to offer for a provider: always at least
+/// [`MODEL_DEFAULT`], which sends no `--model` flag at all.
+///
+/// An adapter can land before anybody has catalogued that vendor's model
+/// aliases, and "let the CLI decide" is a real, correct choice for every
+/// agent — so the picker is never empty and never has to be special-cased
+/// by the caller.
+pub fn model_choices(p: &Provider) -> &'static [&'static str] {
+    if p.models.is_empty() {
+        const JUST_THE_DEFAULT: &[&str] = &[MODEL_DEFAULT];
+        JUST_THE_DEFAULT
+    } else {
+        p.models
+    }
 }
 
 /// One provider tile.
@@ -158,13 +230,23 @@ pub fn default_provider() -> usize {
 /// "does nothing" is a clearer answer than "falls through to whatever is
 /// behind me". Same treatment P1 gave a disabled menu row, same
 /// [`theme::DISABLED_OPACITY`].
+///
+/// The caption is [`eave_core::provider::Availability::tile_status`] —
+/// the state read off the registry at draw time, not a string chosen
+/// here. A provider eave can drive but whose CLI is absent reads *not
+/// installed* and stays live to the click; see the module doc for why
+/// that split falls where it does.
 pub fn tile(
     ix: usize,
     p: &Provider,
     selected: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let live = is_live(p);
+    // Two different questions, and the tile answers both. `live` is
+    // eave's capability and decides the click; `status` is this machine's
+    // and decides the caption.
+    let live = eave_can_drive(p);
+    let status = availability(p).tile_status();
     // The mark's colour is a required argument (`icons::icon`) — gpui does
     // not cascade text colour into an SVG, so a tile that forgets this
     // lays out a perfectly correct 28px box and paints nothing.
@@ -221,7 +303,7 @@ pub fn tile(
                 .text_size(px(theme::MICRO_SIZE))
                 .line_height(px(theme::MICRO_LINE))
                 .text_color(theme::text_tertiary())
-                .child(if live { "ready" } else { "no adapter yet" }),
+                .child(status),
         );
 
     if live {
@@ -247,54 +329,177 @@ pub fn tile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eave_core::provider::{self, Availability};
 
-    /// The invariant that keeps the strip honest: **every provider the
-    /// engine would accept has a tile**, and its id matches. If an adapter
-    /// lands in `eave-core`'s gate and nobody adds it here, the launcher
-    /// would silently keep refusing to offer something that works.
+    /// The invariant that keeps the strip honest: **the strip and the
+    /// registry name the same providers**. An adapter that lands in
+    /// `eave-core` with no tile here is a capability nobody can reach; a
+    /// tile whose id is in no catalog row is one the engine would refuse
+    /// with "eave does not know a provider".
+    ///
+    /// Both directions, because before Slice AT only one of them was
+    /// checked and the unchecked one was where the drift would have gone.
     #[test]
-    fn every_verified_provider_has_a_tile() {
-        for id in eave_core::session::POSTURE_VERIFIED_PROVIDERS {
-            let tile = PROVIDERS.iter().find(|p| p.id == id);
+    fn the_strip_names_exactly_the_providers_eave_catalogues() {
+        for e in provider::CATALOG {
             assert!(
-                tile.is_some(),
+                PROVIDERS.iter().any(|p| p.id == e.id),
+                "{} is catalogued in eave-core but the launcher has no tile for it",
+                e.id,
+            );
+        }
+        for p in PROVIDERS {
+            assert!(
+                provider::catalog(p.id).is_some(),
+                "the launcher offers a tile for {}, which eave-core does not name — the engine \
+                 would refuse it",
+                p.id,
+            );
+        }
+        assert_eq!(PROVIDERS.len(), provider::CATALOG.len());
+    }
+
+    /// Every adapter eave registers can be reached from the UI, and every
+    /// tile the UI treats as live has an adapter behind it. Stated as the
+    /// rule rather than as a count: four adapters are landing in parallel
+    /// and a number here would have to be edited by each of them.
+    #[test]
+    fn a_live_tile_is_one_the_engine_would_accept() {
+        for p in PROVIDERS {
+            assert_eq!(
+                eave_can_drive(p),
+                eave_core::session::posture_is_verified(p.id),
+                "{}: the launcher and the engine's gate disagree about whether eave can drive it",
+                p.id,
+            );
+        }
+        for id in eave_core::session::posture_verified_providers() {
+            assert!(
+                PROVIDERS.iter().any(|p| p.id == id),
                 "{id} is posture-verified but the launcher has no tile for it",
             );
         }
     }
 
-    /// The mirror: a tile is live *because* the gate says so, never
-    /// because this file says so. Stated as a count so that adding an
-    /// adapter is a deliberate two-line change (gate + this number) rather
-    /// than something that drifts.
+    /// Claude is the reference adapter and the strip's first tile. The
+    /// one thing here that is allowed to be a specific claim, because it
+    /// is the thing every other adapter is written against.
     #[test]
-    fn exactly_one_provider_can_be_started_today() {
-        assert_eq!(PROVIDERS.iter().filter(|p| is_live(p)).count(), 1);
-        assert!(is_live(&PROVIDERS[0]), "Claude is the strip's first tile");
+    fn the_reference_adapter_is_registered() {
+        assert_eq!(PROVIDERS[0].id, "claude-code", "Claude leads the strip");
+        assert!(
+            eave_can_drive(&PROVIDERS[0]),
+            "the reference adapter is gone"
+        );
+        assert!(
+            PROVIDERS.iter().any(eave_can_drive),
+            "no provider has an adapter, so the launcher can start nothing"
+        );
     }
 
-    /// A dead provider offers no models. Model choices for an agent that
-    /// cannot spawn is the exact texture of a mocked-up UI.
+    /// A provider eave cannot drive offers no models. Model choices for
+    /// an agent that cannot spawn is the exact texture of a mocked-up UI.
+    ///
+    /// The converse is **not** asserted: an adapter may land before
+    /// anybody knows that vendor's aliases, and [`model_choices`] gives
+    /// it the CLI's own default rather than an empty menu.
     #[test]
-    fn only_a_startable_provider_offers_models() {
+    fn a_provider_eave_cannot_drive_offers_no_models() {
         for p in PROVIDERS {
-            if is_live(p) {
-                assert!(!p.models.is_empty(), "{} is live with no models", p.id);
+            if !eave_can_drive(p) {
+                assert!(p.models.is_empty(), "{} is not startable", p.id);
+            }
+            if !p.models.is_empty() {
                 assert_eq!(
                     p.models[0], MODEL_DEFAULT,
                     "{}: the first choice must be the CLI's own default",
                     p.id,
                 );
-            } else {
-                assert!(p.models.is_empty(), "{} is not startable", p.id);
             }
+            let offered = model_choices(p);
+            assert_eq!(
+                offered[0], MODEL_DEFAULT,
+                "{}: every picker opens on the CLI's own default",
+                p.id,
+            );
+            assert!(!offered.is_empty(), "{}: an empty model picker", p.id);
         }
     }
 
-    /// The launcher opens on something you can actually start.
+    /// The launcher opens on something eave has an adapter for — and on
+    /// the same tile regardless of what is installed, which is what makes
+    /// this assertion mean anything on a machine other than mine.
     #[test]
-    fn the_default_selection_is_a_live_tile() {
-        assert!(is_live(&PROVIDERS[default_provider()]));
+    fn the_default_selection_is_a_tile_eave_can_drive() {
+        assert!(eave_can_drive(&PROVIDERS[default_provider()]));
+    }
+
+    /// **The user-visible half of Slice AT.** A tile says which kind of
+    /// "not now" it is, and the four sentences are distinct — a caption
+    /// that read the same for "eave cannot do this yet" and "you have not
+    /// installed it" is the defect this slice exists to fix.
+    #[test]
+    fn a_tile_distinguishes_a_missing_adapter_from_a_missing_cli() {
+        let sentences = [
+            Availability::Ready {
+                program: std::path::PathBuf::from("/somewhere/claude"),
+            },
+            Availability::NotInstalled {
+                bin: "cursor-agent",
+                searched: vec![std::path::PathBuf::from("/usr/bin/cursor-agent")],
+            },
+            Availability::PostureUnproven {
+                reason: "nobody has shown it asks",
+            },
+            Availability::NoAdapter,
+        ]
+        .map(|a| a.tile_status());
+        for (i, s) in sentences.iter().enumerate() {
+            assert!(!s.is_empty(), "state {i} says nothing");
+            assert!(
+                sentences.iter().skip(i + 1).all(|o| o != s),
+                "two different states both say {s:?}, which is the bug this test exists for",
+            );
+        }
+        // And the one every tile in the strip actually shows resolves.
+        for p in PROVIDERS {
+            let a = availability(p);
+            assert!(
+                !a.tile_status().is_empty(),
+                "{} draws a tile with no caption",
+                p.id
+            );
+            assert_eq!(
+                a.is_ready(),
+                a.why_not(p.id).is_none(),
+                "{}: a tile that is not ready must state why",
+                p.id
+            );
+        }
+    }
+
+    /// A tile eave cannot drive still **draws, says something true, and
+    /// takes no click** — the promise the strip makes by showing six
+    /// marks when it can start one.
+    ///
+    /// Over every such provider rather than a named one: this was written
+    /// against `cursor-agent` while its CLI was absent from the machine,
+    /// and the CLI appeared three hours later.
+    #[test]
+    fn a_tile_eave_cannot_drive_still_draws_and_says_why() {
+        let dead: Vec<&Provider> = PROVIDERS.iter().filter(|p| !eave_can_drive(p)).collect();
+        assert!(!dead.is_empty(), "nothing to prove if every tile is live");
+        for p in dead {
+            assert_eq!(
+                availability(p),
+                Availability::NoAdapter,
+                "{}: eave cannot drive it, so the tile must say that and not something about \
+                 this machine",
+                p.id
+            );
+            assert_eq!(availability(p).tile_status(), "no adapter yet");
+            assert!(availability(p).why_not(p.id).is_some());
+        }
     }
 
     /// Every mark resolves. `icons` already proves each registered path

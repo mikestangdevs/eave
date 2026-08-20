@@ -6538,8 +6538,7 @@ impl Shell {
     /// are", which is a different fact from "this is what is set".
     fn model_items(&self) -> Vec<MenuItem> {
         let current = self.launcher.model;
-        self.provider()
-            .models
+        launcher::model_choices(self.provider())
             .iter()
             .map(|m| {
                 let is_current = match current {
@@ -6579,7 +6578,7 @@ impl Shell {
     }
 
     fn choose_model(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(m) = self.provider().models.get(ix) {
+        if let Some(m) = launcher::model_choices(self.provider()).get(ix) {
             // The first entry means "send no --model flag", which is a
             // different thing from sending the string "CLI default".
             self.launcher.model = if *m == launcher::MODEL_DEFAULT {
@@ -6787,6 +6786,30 @@ impl Shell {
                                 )
                             })),
                     )
+                    // Slice AT: **the machine's side of the answer, in a
+                    // whole sentence.** The tile says which state the
+                    // selected provider is in ("not installed", "no
+                    // adapter yet"); this says what to do about it —
+                    // install the CLI, or point `EAVE_PROVIDER_BIN_*` at
+                    // it. Absent entirely when the provider is ready, so
+                    // the resting launcher is unchanged.
+                    //
+                    // Read in the APP process from the same
+                    // `eave_core::provider` table the ENGINE spawns from.
+                    // The engine is still the authority — it re-resolves
+                    // uncached at spawn and its refusal lands on
+                    // `launcher-error` below — but stating this before
+                    // the click is the whole point: an operator should
+                    // not have to press start to find out.
+                    .children(launcher::availability(p).why_not(p.id).map(|why| {
+                        div()
+                            .debug_selector(|| "launcher-availability".into())
+                            .max_w(px(theme::LAUNCHER_MAX_W))
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(why)
+                    }))
                     .child(
                         div()
                             .flex()
