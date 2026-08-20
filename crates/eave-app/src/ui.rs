@@ -1259,7 +1259,7 @@ fn open_in_system(path: &std::path::Path) {
 thread_local! {
     /// Every path the UI asked the system to open, in order (test-only).
     static OPENED: std::cell::RefCell<Vec<PathBuf>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn fmt_elapsed(ms: u64) -> String {
@@ -1662,7 +1662,7 @@ impl VeiledBlock {
                 font: font.clone(),
                 color: color.opacity(alpha * color.a),
                 background_color: None,
-                underline: underline.clone(),
+                underline,
                 strikethrough: None::<StrikethroughStyle>,
             };
             if seen + chars <= self.settled_chars {
@@ -2316,7 +2316,7 @@ impl Shell {
     /// *requests* a switch.
     fn rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
         let mut sessions = self.sessions.read(cx).sessions.clone();
-        sessions.sort_by(|a, b| b.created_ts_ms.cmp(&a.created_ts_ms));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.created_ts_ms));
         let selected = self.transcript.read(cx).session_id.clone();
         let wt_notes = self.sessions.read(cx).wt_notes.clone();
         let home = std::env::var("HOME").ok();
@@ -3882,7 +3882,7 @@ impl Shell {
                             .child(SharedString::from(if pending {
                                 format!("{tool} — needs your approval")
                             } else {
-                                format!("{tool}")
+                                tool.to_string()
                             })),
                     )
                     .child(
@@ -5568,7 +5568,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 let conn_events: Vec<ConnEvent> =
                     queues.conn.lock().unwrap().drain(..).collect();
                 if let Some(last) = conn_events.into_iter().last() {
-                    let _ = conn.update(cx, |state, cx| {
+                    conn.update(cx, |state, cx| {
                         state.status = last;
                         cx.notify();
                     });
@@ -5587,7 +5587,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     queues.diffs.lock().unwrap().drain(..).collect();
                 if !files_events.is_empty() || !diff_events.is_empty() {
                     let cmd_tx = cmd_tx.clone();
-                    let _ = files.update(cx, |state, cx| {
+                    files.update(cx, |state, cx| {
                         if let Some((sid, snap)) = files_events.into_iter().last() {
                             // A fresh snapshot is the diff's
                             // invalidation signal (B2): re-request
@@ -5632,7 +5632,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 let wt_events: Vec<WtEvent> =
                     queues.wt.lock().unwrap().drain(..).collect();
                 if last_attn.is_some() || last_rail.is_some() || !wt_events.is_empty() {
-                    let _ = sessions.update(cx, |state, cx| {
+                    sessions.update(cx, |state, cx| {
                         if let Some(tagged) = last_attn {
                             state.attention = Some(tagged);
                         }
@@ -5661,7 +5661,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 if !feed_events.is_empty() {
                     let cmd_tx = cmd_tx.clone();
                     let mut switched = false;
-                    let _ = transcript.update(cx, |state, cx| {
+                    transcript.update(cx, |state, cx| {
                         for ev in feed_events {
                             match ev {
                                 FeedEvent::Session { id } => {
@@ -5711,7 +5711,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     // A real selection switch closes the diff pane:
                     // it belongs to the session that just left.
                     if switched {
-                        let _ = files.update(cx, |state, cx| {
+                        files.update(cx, |state, cx| {
                             if state.diff.take().is_some() {
                                 cx.notify();
                             }
@@ -5745,7 +5745,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                             state.composer.clone().map(|c| (c, key))
                         });
                         if let Some((composer, key)) = moved {
-                            let _ = composer.update(cx, |c, cx| {
+                            composer.update(cx, |c, cx| {
                                 c.switch_to(key);
                                 cx.notify();
                             });

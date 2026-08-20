@@ -374,7 +374,7 @@ pub fn caret_visible(elapsed: Duration) -> bool {
     if half.is_zero() {
         return true;
     }
-    (elapsed.as_nanos() / half.as_nanos()) % 2 == 0
+    (elapsed.as_nanos() / half.as_nanos()).is_multiple_of(2)
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1053,9 @@ mod tests {
     }
 
     impl Ticker {
+        // The tuple names three test handles; a type alias for a helper used
+        // twice in one module would be indirection, not clarity.
+        #[allow(clippy::type_complexity)]
         fn new(subscribed: bool) -> (Self, Rc<Cell<usize>>, Rc<RefCell<Vec<f32>>>) {
             let renders = Rc::new(Cell::new(0));
             let phases = Rc::new(RefCell::new(Vec::new()));

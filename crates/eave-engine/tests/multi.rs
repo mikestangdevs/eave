@@ -288,7 +288,10 @@ async fn n_sessions_stream_concurrently_and_switching_disturbs_nothing() {
     }
 
     // First tour: all four are streaming; read each mid-stream.
-    let mut seen_seq = vec![0u64; N];
+    let mut seen_seq = [0u64; N];
+    // `i` names the SESSION ("s{i}"), not just the slot it indexes,
+    // so the range loop is the form that says what this is.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..N {
         let sid = format!("s{i}");
         let (sub_id, mut rx) = c.subscribe_with_id(&sid, None).await.expect("subscribe");
@@ -312,6 +315,9 @@ async fn n_sessions_stream_concurrently_and_switching_disturbs_nothing() {
     // and its log must have advanced well past where we left it, with the
     // turn still open — switching stopped, paused, and dropped nothing.
     tokio::time::sleep(Duration::from_millis(700)).await;
+    // `i` names the SESSION ("s{i}"), not just the slot it indexes,
+    // so the range loop is the form that says what this is.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..N {
         let sid = format!("s{i}");
         let (sub_id, mut rx) = c.subscribe_with_id(&sid, None).await.expect("resubscribe");
@@ -573,8 +579,8 @@ async fn killing_one_session_leaves_the_others_streaming() {
                 .unwrap()
         };
         if state("s0") == ("killed".to_string(), false) {
-            assert_eq!(state("s1").1, true, "s1 still live");
-            assert_eq!(state("s2").1, true, "s2 still live");
+            assert!(state("s1").1, "s1 still live");
+            assert!(state("s2").1, "s2 still live");
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

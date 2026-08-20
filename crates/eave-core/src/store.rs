@@ -101,6 +101,13 @@ pub struct EngineLock {
 }
 
 impl EngineLock {
+    // clippy::suspicious_open_options wants `.truncate(true)` here. Taking
+    // that advice is the bug: a process that merely LOSES the flock race
+    // would erase the winner's identity record on its way to finding out it
+    // lost, and the loser's whole job is to display that record. The absent
+    // O_TRUNC is the feature; `set_len(0)` below runs only on the winning
+    // path, after the lock is held.
+    #[allow(clippy::suspicious_open_options)]
     pub fn acquire(data_dir: &Path) -> Result<Self, LockError> {
         let path = data_dir.join("engine.lock");
         // No O_TRUNC: a losing open must not erase the winner's record.

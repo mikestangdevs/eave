@@ -395,7 +395,7 @@ pub fn load(path: &Path) -> Result<LoadedJournal, LoadError> {
 
     let mut records: Vec<Record> = Vec::new();
     let mut torn_tail_repaired = false;
-    let mut last_ok_unterminated = header_terminated == false && segments.len() == 1;
+    let mut last_ok_unterminated = !header_terminated && segments.len() == 1;
     for (idx, &(offset, seg, terminated)) in segments.iter().enumerate().skip(1) {
         let is_last = idx == segments.len() - 1;
         let line_no = idx + 1;

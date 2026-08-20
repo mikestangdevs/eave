@@ -401,6 +401,9 @@ async fn a_question_left_open_settles_when_the_process_goes() {
     // The late click: a stated fact, never an error and never journaled
     // as if it had landed.
     let err = c.decide("s1", &rid, Decision::Allow).await;
+    // Both arms are the point: either outcome is a stated fact, and an
+    // `if let` would hide that the Err branch is equally correct.
+    #[allow(clippy::single_match)]
     match err {
         Ok(answered) => assert!(!answered, "a dead session cannot have been answered"),
         Err(_) => {} // "session is not live" — equally stated

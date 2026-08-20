@@ -246,8 +246,7 @@ fn torn_tail_truncates_to_last_valid_record_at_every_byte() {
     let original = std::fs::read(&path).unwrap();
     let last_line_len = original
         .split(|b| *b == b'\n')
-        .filter(|s| !s.is_empty())
-        .last()
+        .rfind(|s| !s.is_empty())
         .unwrap()
         .len();
     let last_start = original.len() - (last_line_len + 1);

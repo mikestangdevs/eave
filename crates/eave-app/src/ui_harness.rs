@@ -2980,7 +2980,12 @@ fn the_status_glyph_never_moves_the_path_beside_it(cx: &mut TestAppContext) {
     // ...and the slot really is the fixed one, not just five glyphs that
     // happen to agree: the box is the token's, inside the rail's slot.
     assert_eq!(first.size.width, px(theme::ICON_STATUS));
-    assert!(theme::ICON_STATUS <= theme::FILE_STATUS_W);
+    // Constant today, which is exactly why it is asserted: it fires the day
+    // someone moves either token so the glyph stops fitting its slot.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(theme::ICON_STATUS <= theme::FILE_STATUS_W);
+    }
 }
 
 /// Both toggles still toggle. Replacing the child of a clickable `div` is

@@ -1151,8 +1151,8 @@ impl Engine {
             Some(0) // the directory is gone; no files left to protect
         };
         let unmerged_commits = crate::git::unmerged_count(&wt.base, &wt.branch).await;
-        let protectable = dirty_files.map_or(true, |n| n > 0)
-            || unmerged_commits.map_or(true, |n| n > 0);
+        let protectable =
+            dirty_files.is_none_or(|n| n > 0) || unmerged_commits.is_none_or(|n| n > 0);
         if protectable && !force {
             // A refusal carrying its facts, not an error. Stamp the fresh
             // count so the rail states what the reply states.
@@ -1199,7 +1199,7 @@ impl Engine {
         let sessions = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = sessions.values().map(|h| h.info()).collect();
         drop(sessions);
-        infos.sort_by(|a, b| a.created_ts_ms.cmp(&b.created_ts_ms));
+        infos.sort_by_key(|a| a.created_ts_ms);
         fill_sharing(&mut infos);
         ListOk { sessions: infos }
     }
