@@ -845,6 +845,119 @@ fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
     );
 }
 
+/// A successful tool's output is reachable.
+///
+/// Slice V deliberately shipped only the failure case: a failed tool
+/// states why, a successful one states nothing, because its output is
+/// usually long and always a row height inside a virtualized list. The
+/// missing half was that there was no way to see it AT ALL — the payload
+/// crossed the wire and then sat in a row nobody could open.
+#[gpui::test]
+fn a_tool_card_opens_to_show_what_came_back(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started(1, "toolu_1", "Bash", r#"{"command":"cargo test"}"#),
+            tool_finished(2, "toolu_1", "test result: ok. 356 passed", false),
+        ],
+    });
+    vcx.run_until_parked();
+
+    // Closed by default: a `Read` must not make the transcript taller.
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "a tool card opened itself"
+    );
+    let closed = vcx
+        .debug_bounds("tool-head")
+        .expect("a tool with a body is clickable")
+        .size
+        .height;
+
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_some(),
+        "clicking the row did not open it"
+    );
+
+    // ...and it really got taller. This is the assertion that catches a
+    // stale `ListState` height: the body can render while the row's cached
+    // measurement still says otherwise, and then the rows below it overlap.
+    let open_row = vcx
+        .debug_bounds("tool-row")
+        .expect("the tool row renders")
+        .size
+        .height;
+    assert!(
+        open_row > closed,
+        "the row did not grow when it opened ({open_row:?} vs head {closed:?}) — \
+         a cached ListState height would look exactly like this"
+    );
+
+    // Clicking again closes it.
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "the card would not close"
+    );
+}
+
+/// A switch takes the open cards with it. Tool ids are per-session and
+/// two sessions can carry the same one.
+#[gpui::test]
+fn opened_cards_do_not_outlive_their_session(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started(1, "toolu_1", "Bash", r#"{"command":"cargo test"}"#),
+            tool_finished(2, "toolu_1", "ok", false),
+        ],
+    });
+    vcx.run_until_parked();
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tool-body").is_some());
+
+    // Session B, same tool id.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "bbbb2222".into(),
+        epoch: 1,
+        records: vec![
+            tool_started(1, "toolu_1", "Bash", r#"{"command":"other"}"#),
+            tool_finished(2, "toolu_1", "ok", false),
+        ],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "B's identically-id'd tool opened itself because A had opened one"
+    );
+}
+
 /// A tool eave has no summary key for states its name and nothing else,
 /// rather than inventing a detail from an arbitrary input field.
 #[gpui::test]

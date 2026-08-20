@@ -1239,6 +1239,20 @@ fn short_cwd(cwd: &str, home: Option<&str>) -> String {
     }
 }
 
+/// Bound one block of tool payload for display, stating the remainder.
+///
+/// Same rule as [`fence_view`] and the diff pane: a row inside a
+/// virtualized list may not have a height the agent chooses.
+fn tool_body_view(text: &str, max: usize) -> String {
+    let total = text.lines().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let mut out = text.lines().take(max).collect::<Vec<_>>().join("\n");
+    out.push_str(&format!("\n… {} more lines", total - max));
+    out
+}
+
 /// What a fence DRAWS, which is not always what it holds.
 ///
 /// A fence is one row in a virtualized list, so its height is a promise the
@@ -1365,6 +1379,14 @@ struct TranscriptState {
     /// and the fence copy button has to state that it copied. Weak so the
     /// shell owning this state does not own a cycle back to itself.
     shell: Option<gpui::WeakEntity<Shell>>,
+    /// Tool rows the reader has opened, by tool id.
+    ///
+    /// Deliberately NOT cleared by `reset()`: a resubscribe replays the
+    /// same conversation, and a reader who opened a card to study it
+    /// should not have it shut by the engine reconnecting. It IS dropped
+    /// on a real session switch, with everything else that belongs to the
+    /// session that left.
+    open_tools: std::collections::HashSet<String>,
     /// Slice N3 — the live-turn clock behind the working trailer.
     ///
     /// A signed BALANCE, never a bool. The recorder's two input channels
@@ -1403,6 +1425,7 @@ impl TranscriptState {
             commands: None,
             composer: None,
             shell: None,
+            open_tools: std::collections::HashSet::new(),
             turn_balance: 0,
             turn_started_ms: None,
         }
@@ -1573,6 +1596,28 @@ impl TranscriptState {
     /// Re-assert the scroll intent after content changed (spec 03: the
     /// pin is "re-asserted each layout"; follow-tail is the list's own
     /// mode).
+    /// Re-measure the display row carrying `tool_id`.
+    ///
+    /// Opening a card changes its HEIGHT, and `ListState` caches heights.
+    /// The display fold's own remeasure path cannot help here: it keys off
+    /// the row's content fingerprint, and open-ness is view state that
+    /// deliberately does not live on the `Row` — a fold over journal
+    /// records has no business knowing what the reader has expanded. So
+    /// the toggle re-measures the one row it changed, which is the same
+    /// remeasure-never-splice rule the fold follows (`display::diff`),
+    /// applied from the other side.
+    fn remeasure_tool(&mut self, tool_id: &str) {
+        let msg = self
+            .transcript
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Tool { id, .. } if id == tool_id));
+        let Some(msg) = msg else { return };
+        if let Some(ix) = self.display.first_row_of_msg(msg as u32) {
+            self.list.remeasure_items(ix..ix + 1);
+        }
+    }
+
     fn assert_scroll(&mut self) {
         match self.scroll {
             ScrollMode::Follow => {
@@ -3689,13 +3734,18 @@ impl Shell {
                 }
             }
             Row::Tool {
-                id: _,
+                id: tool_id,
                 name,
                 status,
                 input,
                 result,
                 is_error,
             } => {
+                // Slice Z: a tool with anything to show can be opened, and
+                // a FAILED one shows its reason without being opened —
+                // Slice V's rule stands, this only adds the other half.
+                let has_body = !input.trim().is_empty() || !result.trim().is_empty();
+                let open = state.open_tools.contains(tool_id);
                 let (label, dot) = match status {
                     ToolStatus::Running => ("running…", theme::live()),
                     ToolStatus::Finished if *is_error => ("failed", theme::danger()),
@@ -3711,7 +3761,7 @@ impl Shell {
                 // A failed tool states why. A successful one does not: its
                 // output is usually long, usually uninteresting, and always
                 // a row height inside a virtualized list.
-                let failure = (*is_error && !result.trim().is_empty()).then(|| {
+                let failure = (*is_error && !open && !result.trim().is_empty()).then(|| {
                     let total = result.lines().count();
                     let mut text = result
                         .lines()
@@ -3729,6 +3779,28 @@ impl Shell {
                     text
                 });
                 let head = div()
+                    .id(SharedString::from(format!("tool-{tool_id}")))
+                    .when(has_body, |d| {
+                        let tid = tool_id.clone();
+                        let shell = state.shell.clone();
+                        d.cursor_pointer()
+                            .debug_selector(|| "tool-head".into())
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                                    let tid = tid.clone();
+                                    shell.update(cx, |shell, cx| {
+                                        shell.transcript.update(cx, |t, cx| {
+                                            if !t.open_tools.remove(&tid) {
+                                                t.open_tools.insert(tid.clone());
+                                            }
+                                            t.remeasure_tool(&tid);
+                                            cx.notify();
+                                        });
+                                    });
+                                }
+                            })
+                    })
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3774,6 +3846,7 @@ impl Shell {
                             .child(label),
                     );
                 div()
+                    .debug_selector(|| "tool-row".into())
                     .pt(px(theme::SPACE_2))
                     .pb(px(theme::SPACE_1))
                     .pl(px(theme::TOOL_INDENT))
@@ -3781,6 +3854,57 @@ impl Shell {
                     .flex_col()
                     .gap(px(theme::SPACE_1))
                     .child(head)
+                    .children(open.then(|| {
+                        // Opened: what it was asked, and what came back.
+                        // Both verbatim, both bounded, each labelled —
+                        // an unlabelled pair of blobs would make the
+                        // reader guess which is which.
+                        let mut parts: Vec<(&str, String)> = Vec::new();
+                        if !input.trim().is_empty() {
+                            parts
+                                .push(("input", tool_body_view(input, theme::TOOL_BODY_MAX_LINES)));
+                        }
+                        if !result.trim().is_empty() {
+                            parts.push((
+                                if *is_error { "error" } else { "result" },
+                                tool_body_view(result, theme::TOOL_BODY_MAX_LINES),
+                            ));
+                        }
+                        div()
+                            .debug_selector(|| "tool-body".into())
+                            .ml(px(theme::TOOL_INDENT))
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .children(parts.into_iter().map(|(label, body)| {
+                                div()
+                                    .rounded(px(theme::RADIUS_CODE))
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .bg(theme::inset())
+                                    .px(px(theme::SPACE_2))
+                                    .py(px(theme::SPACE_1))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_1))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .font_weight(theme::WEIGHT_LABEL)
+                                            .text_color(theme::text_tertiary())
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(theme::MONO)
+                                            .text_size(px(theme::DETAIL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .child(SharedString::from(body)),
+                                    )
+                            }))
+                    }))
                     .children(failure.map(|f| {
                         div()
                             .ml(px(theme::TOOL_INDENT))
@@ -5831,6 +5955,11 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         let moved = transcript.update(cx, |state, _| {
                             state.scroll = ScrollMode::Follow;
                             state.assert_scroll();
+                            // ...and the open tool cards go with it. They
+                            // are keyed by tool id, and a tool id from the
+                            // session that left can collide with one in the
+                            // session arriving.
+                            state.open_tools.clear();
                             let key = state.session_id.clone().unwrap_or_default();
                             state.composer.clone().map(|c| (c, key))
                         });

@@ -867,6 +867,16 @@ pub const TOOL_ERROR_MAX_LINES: usize = 6;
 /// costs data.
 pub const FENCE_MAX_LINES: usize = 200;
 
+/// How many lines of an OPENED tool card's body the transcript draws.
+///
+/// Larger than [`TOOL_ERROR_MAX_LINES`] because opening a card is a
+/// deliberate act — the reader asked — and smaller than
+/// [`FENCE_MAX_LINES`] because the card is still a row in a virtualized
+/// list and the payload behind it is already bounded at 8 KiB by
+/// `eave_core::events::TOOL_PAYLOAD_CAP`. The remainder is stated, as
+/// everywhere else that caps.
+pub const TOOL_BODY_MAX_LINES: usize = 40;
+
 /// WCAG 2.1 AA for normal-size text. Cited, not chosen: SC 1.4.3.
 pub const TEXT_CONTRAST_FLOOR: f32 = 4.5;
 /// WCAG 2.1 AA for large text (SC 1.4.3), used here as the floor for the
