@@ -892,7 +892,7 @@ impl Engine {
 
     /// Send one user message, spawning the agent first if the session is
     /// not live. Returns delivery per spec 02 §Delivery state.
-    async fn send(self: &Arc<Self>, id: &str, text: &str) -> Result<bool, String> {
+    async fn send(self: &Arc<Self>, id: &str, text: &str) -> Result<Option<String>, String> {
         let handle = self.session(id)?;
         let mut live = handle.live.lock().await;
         // Slice AA: the turn's basis is collected HERE — inside the send
@@ -1838,7 +1838,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Err(message) => ResponseBody::Err { message },
             },
             Request::Send { session_id, text } => match engine.send(&session_id, &text).await {
-                Ok(delivered) => ok_value(&SendOk { delivered }),
+                Ok(reason) => ok_value(&SendOk {
+                    delivered: reason.is_none(),
+                    reason,
+                }),
                 Err(message) => ResponseBody::Err { message },
             },
             Request::Kill { session_id } => match engine.kill(&session_id).await {

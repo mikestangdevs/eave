@@ -670,6 +670,14 @@ pub struct OpenOk {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendOk {
+    /// Why the write did not reach the agent, when `delivered` is false.
+    ///
+    /// `#[serde(default)]` so a pre-existing engine's reply still parses.
+    /// This exists because "delivered: false" with no cause is a dead end:
+    /// the reason was discarded at the source for the life of the project
+    /// and no test that hit it could report anything but the assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The pipe write reached the agent's stdin. `false` means the message
     /// is journaled-but-undelivered — the `UserSent` record will never gain
     /// a `UserDelivered` pair, and no surface may render it as sent

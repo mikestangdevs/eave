@@ -516,10 +516,14 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
     ));
     wait_for_file(&jpath, |c| c.contains("init")).await;
 
-    let delivered = send_and_journal(&mut session, &extra_tx, "into the void")
+    let refusal = send_and_journal(&mut session, &extra_tx, "into the void")
         .await
         .unwrap();
-    assert!(!delivered, "pipe write to a closed stdin must fail");
+    // The reason is now kept, so this asserts the failure AND that the
+    // engine can say what it was — an undelivered send with no explanation
+    // is what made this class of failure unreadable everywhere else.
+    let why = refusal.expect("pipe write to a closed stdin must fail");
+    assert!(!why.is_empty(), "a refused write must state a reason");
     drop(extra_tx);
     session.kill().await.expect("kill must be provable");
     rec.await.unwrap().unwrap();
@@ -561,9 +565,13 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         test_meta(&sid2),
         None,
     ));
-    assert!(send_and_journal(&mut session2, &extra_tx2, "hello there")
-        .await
-        .unwrap());
+    assert!(
+        send_and_journal(&mut session2, &extra_tx2, "hello there")
+            .await
+            .unwrap()
+            .is_none(),
+        "the resumed session must accept a send"
+    );
     drop(extra_tx2);
     tokio::time::timeout(TEST_TIMEOUT, rec2)
         .await

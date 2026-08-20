@@ -276,13 +276,22 @@ impl Client {
     /// Sequential sends only — the delivery state is order-paired
     /// (spec 02 §Delivery state). Await each send before the next.
     pub async fn send(&self, session_id: &str, text: &str) -> Result<bool, ClientError> {
-        Ok(self
-            .request::<SendOk>(Request::Send {
-                session_id: session_id.into(),
-                text: text.into(),
-            })
-            .await?
-            .delivered)
+        Ok(self.send_detailed(session_id, text).await?.delivered)
+    }
+
+    /// [`send`](Self::send) keeping the engine's reason for a refusal.
+    ///
+    /// Exists so a FAILING test can say why. `send`'s bool is the delivery
+    /// contract and stays the common path; an assertion on it alone reports
+    /// that something did not arrive and nothing about what happened, which
+    /// is precisely how an undelivered send stayed unexplained across
+    /// several slices.
+    pub async fn send_detailed(&self, session_id: &str, text: &str) -> Result<SendOk, ClientError> {
+        self.request::<SendOk>(Request::Send {
+            session_id: session_id.into(),
+            text: text.into(),
+        })
+        .await
     }
 
     pub async fn kill(&self, session_id: &str) -> Result<KillOk, ClientError> {

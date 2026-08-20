@@ -272,8 +272,21 @@ async fn files_channel_never_crosses_sessions() {
 
     // Drive both sessions through a real turn while we listen — turn
     // boundaries poke the files poll on top of the open-time scans.
-    assert!(c.send("sA", "go a").await.expect("send sA"));
-    assert!(c.send("sB", "go b").await.expect("send sB"));
+    // `send_detailed`, not `send`: this pair has been an intermittent
+    // failure under load for several slices and a bare `assert!` on the
+    // bool could only ever report "it was false". The engine now keeps the
+    // agent's own words about a refused write; if this fires again, the
+    // message names the fault instead of the symptom.
+    for sid in ["sA", "sB"] {
+        let ok = c.send_detailed(sid, "go").await.expect("send");
+        assert!(
+            ok.delivered,
+            "{sid}: the write never reached the agent — {}",
+            ok.reason
+                .as_deref()
+                .unwrap_or("and the engine gave no reason")
+        );
+    }
     // Each session's turn canary lands after ITS dispatch, so it belongs
     // to that turn and to no other.
     std::fs::write(repo_a.join(TURN_CANARY_A), "turn a\n").unwrap();
