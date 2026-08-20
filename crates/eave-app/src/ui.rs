@@ -1314,11 +1314,19 @@ fn diff_runs(lines: &[DiffLine], budget: usize) -> Vec<(DiffOp, String, usize)> 
 /// then steady elapsed reporting").
 const PROMINENT_AFTER_MS: u64 = 10 * 60 * 1000;
 
-/// Self-drawn provider identity (Slice A directive): one uniform,
-/// monochrome initials chip + a plain text label, generated from the
-/// provider string — deliberately never a third-party mark, not even
-/// where a provider publishes assets. `claude-code` → ("CC", "claude
-/// code"); a one-word provider takes its first two letters.
+/// Provider identity as INITIALS and a label, generated from the provider
+/// string. `claude-code` → ("CC", "claude code"); a one-word provider takes
+/// its first two letters.
+///
+/// **Slice A\'s "never a third-party mark" directive is withdrawn** (the
+/// operator\'s call, 2026-08-20). The initials chip is now the FALLBACK:
+/// [`provider_mark`] answers first, and this answers for a provider eave
+/// has no logo for. The label half is unaffected and is still what carries
+/// the provider\'s name in text — which matters here more than usual,
+/// because the test harness cannot paint an icon at all
+/// (`TestAppContext` hardcodes `Arc::new(())` as its asset source), so a
+/// row whose identity lived only in the mark would be unreadable to every
+/// test in this file.
 fn provider_identity(provider: &str) -> (String, String) {
     let segs: Vec<&str> = provider
         .split(['-', '_', ' '])
@@ -1335,6 +1343,34 @@ fn provider_identity(provider: &str) -> (String, String) {
         segs.join(" ")
     };
     (glyph.to_uppercase(), label)
+}
+
+/// The vendor\'s own logo for this provider, or `None` for one eave has no
+/// mark for (which then takes the initials chip).
+///
+/// It reads `launcher::PROVIDERS` rather than carrying a second table.
+/// Two lists of provider→logo would be one commit away from the rail and
+/// the launcher disagreeing about what a session is, and the launcher\'s
+/// list is already the one with a test that every mark it names resolves
+/// (`launcher::tests::every_tile_names_a_distinct_registered_mark`).
+fn provider_mark(provider: &str) -> Option<&'static str> {
+    launcher::PROVIDERS
+        .iter()
+        .find(|p| p.id == provider)
+        .map(|p| p.mark)
+}
+
+/// The ink a provider\'s mark takes in the rail.
+///
+/// The same rule `launcher.rs` applies to its tiles: Claude\'s is the one
+/// mark with a sourced brand colour, and every other logo renders in
+/// eave\'s own text ink rather than a hex nobody sourced.
+fn provider_mark_ink(provider: &str) -> Hsla {
+    if provider == "claude-code" {
+        icons::claude_brand()
+    } else {
+        theme::text_secondary_on_wash()
+    }
 }
 
 /// State pigment per the stance: color only when state deserves attention.
@@ -1466,31 +1502,86 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
-/// The shared-checkout fact (Slice I2): who else works in these files,
-/// by 8-char session prefix — identity, never content.
-fn shares_line(shared_with: &[String]) -> String {
-    let names: Vec<String> = shared_with
-        .iter()
-        .map(|id| id.chars().take(8).collect())
-        .collect();
-    format!("shares files with {}", names.join(", "))
+/// The worktree's state as a compact MARK (Slice AO), for the second line
+/// of a two-line row.
+///
+/// Slice I2 spent a whole line on this and led it with the word
+/// `worktree ·`, which named the container rather than the fact. On a row
+/// whose second line already says where the session works, the container is
+/// implied and the only thing worth 40 px is **how much is uncommitted**.
+/// Every shape I2 stated is still stated: clean, a count, an honest unknown
+/// for a scan that failed.
+///
+/// `None` for a worktree that is GONE — that one is not a mark. It is a
+/// failure, it takes [`WORKTREE_MISSING`] on a line of its own in
+/// [`theme::warning`], and it is the one worktree fact allowed to cost a
+/// row its compactness.
+fn worktree_mark(w: &eave_wire::WorktreeInfo) -> Option<String> {
+    if !w.present {
+        return None;
+    }
+    Some(match w.dirty_files {
+        Some(0) => "clean".to_string(),
+        Some(n) => format!("{n} dirty"),
+        None => "dirty —".to_string(),
+    })
 }
 
-/// The worktree fact line (Slice I2). Every shape is a stated fact:
-/// clean, a dirty count, an honest unknown (`dirty —`, a failed scan),
-/// or the directory being gone. The branch is deliberately NOT repeated
-/// here — it is the predictable `eave/<sid8>` and the cwd line above
-/// already ends in `<sid8>`; at rail width the dirty count must never
-/// lose to truncation (it is the fact decision 2 protects).
-fn worktree_line(w: &eave_wire::WorktreeInfo) -> String {
-    if !w.present {
-        return "worktree missing".to_string();
+/// The one worktree fact that is not a mark: the directory eave created is
+/// no longer there. Loud, full width, `warning` ink — an isolated session
+/// whose checkout has been deleted underneath it is about to fail in a way
+/// the operator cannot diagnose from the row.
+const WORKTREE_MISSING: &str = "worktree missing";
+
+/// The compact sharing mark (Slice AO): how many OTHER sessions are working
+/// in these same files, and nothing else.
+///
+/// Slice I2 rendered `shares files with 9fedaac4, 47890400` — two raw hex
+/// ids, wrapping to a second line, on every sharing row. The count is the
+/// part a person acts on ("somebody else is in here"); the identities are
+/// the part they look up once, and they now live on the SELECTED row only
+/// (see [`shares_line`], still the full statement, still the same words).
+///
+/// Deliberately NOT [`theme::warning`]. Slice I2's decision 1 is that
+/// sharing is legitimate and merely stated — detection is automatic,
+/// nothing acts on it, and the operator opts into isolation. A mark that
+/// glowed amber would be this row arguing with that decision.
+fn sharing_mark(n: usize) -> String {
+    format!("+{n} here")
+}
+
+/// Everything on the second line that is not the folder (Slice AO), in one
+/// element: how many other sessions are in these files, and how much is
+/// uncommitted.
+///
+/// **The session id is not here, and it is nowhere else on the row.** It
+/// was the first thing on Stage AB's meta line and it cost the folder the
+/// space; a shorter version of this function put it back as a mark on
+/// rows that would otherwise be duplicates, and the operator looked at the
+/// result — `~/Des… · +3 here · d9802bc3` — and settled it: the path is
+/// the only thing on that line a person recognises, and a hex string they
+/// did not choose and cannot type does not outrank it. The full UUID is
+/// already printed in the status bar for the selected session.
+///
+/// What that costs is real and is not hidden: two UNNAMED sessions in one
+/// folder now render as the same row again, which is the state Stage AB
+/// existed to fix. What changed since Stage AB is that `rename` has a GUI
+/// affordance (Stage AK's pen) — so the fix is now a thing the operator
+/// can do in one click, rather than a fact the rail had to force on them.
+///
+/// One string rather than a row of chips, because at 11 px in ~70 px of
+/// space a chip's border costs more than the word inside it is worth. The
+/// group is `flex_none` at the call site and the folder truncates against
+/// it: a count cannot be half-read, a path can.
+fn row_marks(info: &SessionInfo) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !info.shared_with.is_empty() {
+        parts.push(sharing_mark(info.shared_with.len()));
     }
-    match w.dirty_files {
-        Some(0) => "worktree · clean".to_string(),
-        Some(n) => format!("worktree · {n} dirty"),
-        None => "worktree · dirty —".to_string(),
+    if let Some(mark) = info.worktree.as_ref().and_then(worktree_mark) {
+        parts.push(mark);
     }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// Where a row sorts: when this session's state last moved, or when it was
@@ -1576,6 +1667,26 @@ fn archived_line(info: &SessionInfo, show_archived: bool) -> Option<String> {
 /// miss means selecting the session instead of archiving it — the two
 /// outcomes are not close enough for a tight target to be acceptable.
 const ROW_ACTION_HIT: f32 = 24.0;
+
+/// Slice AO — the ceiling on the marks group at the end of line two.
+///
+/// Line two has `RAIL_W 248 − PLATE_MARGIN 12 − RAIL_CARD_BLEED 12 (the
+/// scroller's right pad) − 2 × RAIL_CARD_BLEED 12 (the row's own) −
+/// meta_indent 40 − SPACE_2 8 (the gap)` = **152 px** for the folder and
+/// the marks together.
+///
+/// 70 is set by the widest group the rail can produce — `999999 dirty`,
+/// which font-kit shapes to 64.6 px at `MICRO_SIZE` — with room above it.
+/// It leaves the folder **82 px**, which is what `~/Desktop/eave` needs,
+/// and that ordering is the point: the path is what a person recognises
+/// and it gets the line; the count is what they act on and it gets a
+/// corner of it.
+///
+/// The group truncates against this rather than the folder shrinking to
+/// nothing. Nothing the rail can build reaches the cap; it is there so
+/// that a fact arriving longer than any of these degrades on its own line
+/// instead of taking the path with it.
+const ROW_MARKS_MAX: f32 = 70.0;
 
 /// The glyph inside that target. Smaller than `ICON_SM`, and the gap
 /// between the two numbers is the point: these sit in the row's corner
@@ -1714,25 +1825,14 @@ fn row_label(info: &SessionInfo, provider_label: &str) -> String {
         .unwrap_or_else(|| provider_label.to_string())
 }
 
-/// The rail's meta line: which session, and where it works (Stage AB).
+/// Home-relative cwd — the whole of a rail row's second line (Slice AO).
 ///
-/// The 8-char id is here because it is the ONLY thing that tells two
-/// untitled sessions in one repo apart without an operator naming them —
-/// and because it is pure identity, the one class of fact `watch` has
-/// always been allowed to carry. It is dropped when the cwd already ends
-/// in it, which is every isolated session (`isolate` puts the sid8 at the
-/// end of the worktree path), where repeating it would say the same thing
-/// twice on one line.
-fn rail_meta_line(info: &SessionInfo, home: Option<&str>) -> String {
-    let cwd = short_cwd(&info.cwd, home);
-    let sid8: String = info.session_id.chars().take(8).collect();
-    if sid8.is_empty() || cwd.ends_with(&sid8) {
-        return cwd;
-    }
-    format!("{sid8} · {cwd}")
-}
-
-/// Home-relative cwd for the rail's meta line.
+/// Stage AB's `rail_meta_line` put the 8-char session id in front of this
+/// and joined the two with a `·`, so the path — the thing the operator
+/// recognises — truncated to make room for a hex string they never chose
+/// and cannot use. The id now appears only when [`rows_needing_id`] proves
+/// it is load-bearing, and it appears AFTER the folder, as the last of the
+/// line's marks.
 fn short_cwd(cwd: &str, home: Option<&str>) -> String {
     match home {
         Some(h) if !h.is_empty() && cwd.starts_with(h) => format!("~{}", &cwd[h.len()..]),
@@ -3298,7 +3398,7 @@ impl Shell {
             .into_iter()
             .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
             .collect();
-        // The meta line aligns under the provider label: dot + gap +
+        // The second line aligns under the session name: dot + gap +
         // chip + gap.
         let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
         let rows: Vec<AnyElement> = sessions
@@ -3318,15 +3418,27 @@ impl Shell {
                         word.to_string()
                     }
                 });
-                let posture = info.permission_mode.as_deref().map(posture_line);
-                let posture_asks =
-                    matches!(info.permission_mode.as_deref(), Some("default") | Some("manual"));
+                // Slice AO: the posture line states the DANGEROUS posture
+                // only. `asks before it writes · default` is the safe
+                // default, and a line on every row restating the default
+                // is the definition of noise — it pushed the rail from two
+                // lines to three to say nothing had changed. `NEVER ASKS`
+                // is a different kind of fact and keeps its full-width,
+                // danger-inked line.
+                let posture = info
+                    .permission_mode
+                    .as_deref()
+                    .filter(|m| !matches!(*m, "default" | "manual"))
+                    .map(posture_line);
                 let sid = info.session_id.clone();
-                // Slice I2 facts, stated as quiet meta lines. Sharing:
-                // sessions working in the same checkout (decision 1 —
-                // detection automatic, stated, never acted on).
-                let shares =
-                    (!info.shared_with.is_empty()).then(|| shares_line(&info.shared_with));
+                // Slice AO: the sharing fact as a COUNT and nothing else.
+                // `shares files with 9fedaac4, 47890400` was two hex ids
+                // wrapping to a second line on every sharing row; a first
+                // pass moved the identities to the selected row, which
+                // made one row three lines tall and kept the hex. The
+                // operator settled it: the count is the part a person acts
+                // on, the identities are not a rail fact at all.
+                let marks = row_marks(&info);
                 // Isolation is offered only while it is still possible:
                 // nothing ever spawned, and a collision actually stands.
                 let can_isolate = info.state == "new"
@@ -3336,7 +3448,9 @@ impl Shell {
                 let wt_note = row_notes.get(&info.session_id).cloned();
                 let armed = matches!(wt_note, Some(RowNote::ConfirmDelete { .. }));
                 let wt = info.worktree.clone();
-                let wt_line = wt.as_ref().map(worktree_line);
+                // The dirty count is a MARK now (`row_marks`); only a
+                // missing worktree still takes a line.
+                let wt_missing = wt.as_ref().is_some_and(|w| !w.present);
                 // Orphan affordances (decision 2): open in editor, or
                 // delete — never while a process is live in it.
                 let wt_present = wt.as_ref().map(|w| w.present).unwrap_or(false);
@@ -3387,6 +3501,26 @@ impl Shell {
                     .px(px(theme::RAIL_CARD_BLEED))
                     .py(px(theme::SPACE_2))
                     .rounded(px(theme::RADIUS_BUTTON))
+                    // Slice AO: selection reads as a RIM as well as a wash,
+                    // which is the treatment `launcher.rs` has always used
+                    // for its provider tiles — selected takes
+                    // `border_strong` over `overlay`, unselected takes
+                    // `border` over `wash_rest`. The rail had the wash and
+                    // not the rim, so the one screen a person lives in was
+                    // saying "this one" more weakly than the screen they
+                    // see once.
+                    //
+                    // The border is ALWAYS laid out and only ever changes
+                    // colour. A border that appeared on selection would
+                    // move every row below it by 2 px the moment the
+                    // operator clicked — the same reason the label below
+                    // carries a border nobody can see.
+                    .border_1()
+                    .border_color(if is_sel {
+                        theme::border_strong()
+                    } else {
+                        gpui::transparent_black()
+                    })
                     // A newly-arrived row fades in (§1.4). Opacity only, and
                     // opacity never participates in layout — the rail's
                     // structure is untouched.
@@ -3436,20 +3570,76 @@ impl Shell {
                                 )
                                 .flex_none(),
                             )
+                            // Slice AO: the provider's OWN mark, in the box
+                            // the initials chip used to occupy. Same size,
+                            // same slot, so line one's metrics are
+                            // unchanged — the marks and the monogram are
+                            // interchangeable and the row cannot tell which
+                            // it got.
+                            //
+                            // `launcher.rs` has painted these since Slice
+                            // Q2; the rail carried a monochrome `CC`
+                            // because Slice A's directive forbade a
+                            // third-party mark. That directive is
+                            // withdrawn. The initials remain the fallback
+                            // for a provider eave has no logo for, so a
+                            // future adapter cannot produce an empty chip.
+                            // Both shapes are the SAME 18 px plate, and
+                            // that is what makes them interchangeable: a
+                            // provider with a logo and one without produce
+                            // rows with identical metrics, so the folder
+                            // line under them aligns either way.
+                            //
+                            // The plate is not decoration. `claude_brand`
+                            // (#D97757) on a washed row measures 2.55:1 at
+                            // the bright end of the backdrop sweep, under
+                            // the 3:1 non-text floor; on `chip_plate` it is
+                            // 6.01:1 on every row in every state, because
+                            // an opaque plate takes the desktop out of the
+                            // question entirely. Measured in
+                            // `theme::tests::a_provider_mark_clears_the_non_text_floor_on_its_own_plate`.
                             .child(
                                 div()
                                     .size(px(theme::PROVIDER_CHIP))
                                     .flex_none()
                                     .rounded(px(theme::RADIUS_CHIP))
-                                    .border_1()
-                                    .border_color(theme::border_strong())
+                                    .bg(theme::chip_plate())
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .font_family(theme::MONO)
-                                    .text_size(px(theme::MICRO_SIZE))
-                                    .text_color(theme::text_secondary_on_wash())
-                                    .child(SharedString::from(glyph)),
+                                    .child(match provider_mark(&info.provider) {
+                                        // 12 in an 18 px plate. A mark at
+                                        // the plate's full size reads as a
+                                        // crop rather than as an icon, and
+                                        // the launcher's `ICON_MARK_LG`
+                                        // (28) is sized for a 112 px tile
+                                        // where the mark is the subject —
+                                        // here it is a label for the name
+                                        // beside it, and every pixel it
+                                        // takes is one the name does not
+                                        // get.
+                                        Some(mark) => icons::tagged_icon(
+                                            mark,
+                                            12.0,
+                                            provider_mark_ink(&info.provider),
+                                            format!("chip-{}", info.session_id),
+                                        )
+                                        .into_any_element(),
+                                        // The fallback for a provider eave
+                                        // has no logo for. It keeps the
+                                        // plate, so an unknown provider is
+                                        // a different chip rather than a
+                                        // missing one.
+                                        None => div()
+                                            .debug_selector(|| {
+                                                format!("chip-{}", info.session_id)
+                                            })
+                                            .font_family(theme::MONO)
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .text_color(theme::text_secondary_on_wash())
+                                            .child(SharedString::from(glyph))
+                                            .into_any_element(),
+                                    }),
                             )
                             .child(match editing_here {
                                 // Stage AC: the rename field, in the
@@ -3469,9 +3659,14 @@ impl Shell {
                                     .border_1()
                                     .border_color(theme::border_strong())
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
-                                    .font_weight(theme::WEIGHT_LABEL)
+                                    // Slice AO: the field wears the name's
+                                    // exact metrics because it replaces the
+                                    // name in place. Any other size and
+                                    // opening rename would change the row's
+                                    // height under the operator's pointer.
+                                    .text_size(px(13.0))
+                                    .line_height(px(19.0))
+                                    .font_weight(theme::WEIGHT_STRONG)
                                     .text_color(theme::text())
                                     // Clicking inside the field is not a
                                     // click on the row: without this, a
@@ -3519,14 +3714,42 @@ impl Shell {
                                     .border_1()
                                     .border_color(gpui::transparent_black())
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
-                                    .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(if is_sel {
-                                        theme::text()
-                                    } else {
-                                        theme::text_secondary_on_wash()
-                                    })
+                                    // Slice AO — the anchor of the row.
+                                    // 13 px, and deliberately NOT
+                                    // `NAME_SIZE` (16), which is correct in
+                                    // a 560 px panel and "gigantic" (the
+                                    // operator's word) in a 248 px rail.
+                                    //
+                                    // Three channels separate this from the
+                                    // folder line — size, weight and ink —
+                                    // and all three at full strength read
+                                    // as a shout rather than as an anchor.
+                                    // Weight and ink do the work; the size
+                                    // step is 13 against 12.5, half a
+                                    // point, and it is enough. Every pixel
+                                    // the name does not spend on its own
+                                    // height is one more character of it on
+                                    // screen, which is the fact this row
+                                    // was actually failing at.
+                                    //
+                                    // Inline rather than a `ROW_NAME_SIZE`
+                                    // constant: ten named sizes across four
+                                    // pixels is the disease Slice AL is
+                                    // curing, and `NAME_SIZE` is still
+                                    // correct where it is used — panel
+                                    // headings, in a 560 px column.
+                                    .text_size(px(13.0))
+                                    .line_height(px(19.0))
+                                    .font_weight(theme::WEIGHT_STRONG)
+                                    // Slice AO: primary ink on every row,
+                                    // not just the selected one. Selection
+                                    // is carried by the bar, the rim and
+                                    // the wash — three signals — so it no
+                                    // longer has to be carried by dimming
+                                    // every OTHER session's name, which is
+                                    // what made an unselected row hard to
+                                    // read rather than merely unselected.
+                                    .text_color(theme::text())
                                     .child(SharedString::from(label))
                                     .into_any_element(),
                             })
@@ -3541,15 +3764,45 @@ impl Shell {
                                     .child(SharedString::from(word))
                             })),
                     )
+                    // Slice AO — LINE TWO, and the row ends here in the
+                    // common case. The folder is the thing the operator
+                    // recognises, so it gets the line and the rank; the
+                    // marks are `flex_none` beside it and the folder
+                    // truncates against them, because a path can be
+                    // half-read from its tail and a count cannot be
+                    // half-read at all.
                     .child(
                         div()
-                            .debug_selector(|| format!("cwd-{}", info.session_id))
                             .pl(px(meta_indent))
-                            .truncate()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_secondary())
-                            .child(SharedString::from(rail_meta_line(&info, home.as_deref()))),
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap(px(theme::SPACE_2))
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("cwd-{}", info.session_id))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(theme::DETAIL_SIZE))
+                                    .line_height(px(theme::DETAIL_LINE))
+                                    .text_color(theme::text_secondary())
+                                    .child(SharedString::from(short_cwd(
+                                        &info.cwd,
+                                        home.as_deref(),
+                                    ))),
+                            )
+                            .children(marks.map(|line| {
+                                div()
+                                    .debug_selector(|| format!("marks-{}", info.session_id))
+                                    .flex_none()
+                                    .max_w(px(ROW_MARKS_MAX))
+                                    .truncate()
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(line))
+                            })),
                     )
                     // Stage AC: an archived row that is on screen says so,
                     // and when it is on screen because it is BLOCKED on
@@ -3561,8 +3814,8 @@ impl Shell {
                             .debug_selector(|| format!("archived-{}", info.session_id))
                             .pl(px(meta_indent))
                             .truncate()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(line))
                     }))
@@ -3574,50 +3827,23 @@ impl Shell {
                         div()
                             .debug_selector(|| format!("posture-{}", info.session_id))
                             .pl(px(meta_indent))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .font_weight(if posture_asks {
-                                theme::WEIGHT_LABEL
-                            } else {
-                                theme::WEIGHT_STRONG
-                            })
-                            .text_color(if posture_asks {
-                                theme::text_secondary()
-                            } else {
-                                theme::danger()
-                            })
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .font_weight(theme::WEIGHT_STRONG)
+                            .text_color(theme::danger())
                             .child(SharedString::from(line))
                     }))
-                    // Slice I2: shared-checkout fact, full row width — at
-                    // rail width a fact must never lose to a button. It
-                    // WRAPS rather than clips: the list grows with the
-                    // number of sharers (two 8-char ids already sit 3 px
-                    // from the edge), and a half-stated "shares files
-                    // with bbbb2222, cc…" names the wrong set. Found by
-                    // the Stage J harness, not by eye.
-                    .children(shares.map(|line| {
-                        div()
-                            .debug_selector(|| format!("shares-{}", info.session_id))
-                            .pl(px(meta_indent))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_secondary())
-                            .child(SharedString::from(line))
-                    }))
-                    // Slice I2: worktree fact line, also full width.
-                    .children(wt_line.map(|line| {
+                    // The worktree is GONE. Not a mark — a failure, full
+                    // width, in warning ink (Slice AO).
+                    .children(wt_missing.then(|| {
                         div()
                             .debug_selector(|| format!("wt-line-{}", info.session_id))
                             .pl(px(meta_indent))
                             .truncate()
-                            .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
-                            .text_color(if wt_present {
-                                theme::text_secondary()
-                            } else {
-                                theme::warning()
-                            })
-                            .child(SharedString::from(line))
+                            .line_height(px(theme::MICRO_LINE))
+                            .text_color(theme::warning())
+                            .child(WORKTREE_MISSING)
                     }))
                     // The affordance row sits on its own line beneath the
                     // facts it acts on.
@@ -3666,6 +3892,39 @@ impl Shell {
                             d.child(
                                 div()
                                     .absolute()
+                                    // **Slice AO: what this strip covers,
+                                    // measured.** Stage AK's test for it
+                                    // was pointed at `rail-title` — the
+                                    // rail's SESSIONS header, not the row's
+                                    // name — so it cleared by a hundred
+                                    // pixels and could never fail.
+                                    // Repointed at `label-{sid}`: at two
+                                    // affordances the strip clears the name
+                                    // by 35 px, at three by 7, and at four
+                                    // (a selected, dead, worktree'd row) it
+                                    // reaches 21 px INTO it.
+                                    //
+                                    // Reserving the strip's width on line
+                                    // one fixes that and was tried; it costs
+                                    // the name 56–112 px of a 158 px line,
+                                    // and the photograph of it reads
+                                    // `clau…`. The operator's ruling on
+                                    // this row is that the name and the
+                                    // path come first, so the reservation
+                                    // is gone and the name renders in full
+                                    // at rest.
+                                    //
+                                    // What is left is a real invariant and
+                                    // is tested as one: the strip never
+                                    // reaches the START of the name, so the
+                                    // row stays identifiable while a person
+                                    // is reaching for the button that
+                                    // archives it. The absolute version —
+                                    // covering nothing — is not available
+                                    // at four 24 px targets on a 61 px row,
+                                    // and the fix for that is to offer
+                                    // fewer of them in the corner.
+                                    //
                                     // The row's top-right CORNER, not its
                                     // vertical middle: centred, the strip
                                     // floats beside the id/path line and
@@ -3771,8 +4030,8 @@ impl Shell {
                         div()
                             .debug_selector(|| format!("wt-note-{}", info.session_id))
                             .pl(px(meta_indent))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
                             .text_color(color)
                             .child(SharedString::from(line))
                     }))
@@ -3826,12 +4085,20 @@ impl Shell {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .font_weight(theme::WEIGHT_LABEL)
+                            // Slice AO: the SECTION rank. Uppercase, so the
+                            // header reads as a label for the list rather
+                            // than as the first item in it — at the same
+                            // size and case as a row's own text it was
+                            // neither. (gpui at this revision exposes no
+                            // letter-spacing, so AL's "tracked" half of the
+                            // section role is not available here; the case
+                            // change is.)
+                            .text_size(px(theme::SECTION_SIZE))
+                            .line_height(px(theme::SECTION_LINE))
+                            .font_weight(theme::WEIGHT_STRONG)
                             .debug_selector(|| "rail-title".into())
                             .text_color(theme::text_tertiary())
-                            .child("sessions"),
+                            .child("SESSIONS"),
                     )
                     .child(
                         div()
@@ -8308,19 +8575,51 @@ mod tests {
         assert!(matches!(seen, None | Some(true) | Some(false)));
     }
 
+    /// **Slice A's "never a third-party mark" directive is withdrawn**
+    /// (the operator's call, 2026-08-20), so the rule this asserts is the
+    /// new one rather than nothing: **a provider eave has a logo for gets
+    /// the logo; a provider it does not gets initials.**
+    ///
+    /// The initials half is unchanged and still tested, because it is no
+    /// longer decoration — it is the fallback that stops an unknown
+    /// provider from rendering an empty chip. The label half is unchanged
+    /// too, and it is what every test in `ui_harness.rs` reads a row's
+    /// provider from: the harness cannot paint an icon at all.
     #[test]
-    fn provider_identity_is_uniform_and_never_a_mark() {
+    fn a_provider_with_a_mark_gets_it_and_one_without_gets_initials() {
+        // Every launcher tile's provider is marked, and the rail reads
+        // that same table rather than a second copy of it.
+        for p in launcher::PROVIDERS {
+            assert_eq!(
+                provider_mark(p.id),
+                Some(p.mark),
+                "the rail and the launcher disagree about {}'s mark",
+                p.id
+            );
+        }
+        assert_eq!(provider_mark("claude-code"), Some(icons::CLAUDE_MARK));
+        // Claude's is the one mark with a sourced brand colour; the rest
+        // take eave's own ink, exactly as in `launcher::tile`.
+        assert_eq!(provider_mark_ink("claude-code"), icons::claude_brand());
+        assert_eq!(provider_mark_ink("codex"), theme::text_secondary_on_wash());
+
+        // No mark: the initials chip, which is why it still exists.
+        assert_eq!(provider_mark("fake-agent"), None);
+        assert_eq!(provider_mark(""), None);
+        assert_eq!(
+            provider_identity("fake-agent"),
+            ("FA".into(), "fake agent".into())
+        );
+        assert_eq!(provider_identity(""), ("?".into(), "".into()));
+
+        // The LABEL is generated for every provider, marked or not — it is
+        // the only half of a row's identity a test can read.
         assert_eq!(
             provider_identity("claude-code"),
             ("CC".to_string(), "claude code".to_string())
         );
         assert_eq!(provider_identity("codex"), ("CO".into(), "codex".into()));
         assert_eq!(provider_identity("cursor"), ("CU".into(), "cursor".into()));
-        assert_eq!(
-            provider_identity("fake-agent"),
-            ("FA".into(), "fake agent".into())
-        );
-        assert_eq!(provider_identity(""), ("?".into(), "".into()));
     }
 
     #[test]
@@ -8356,19 +8655,69 @@ mod tests {
             present: true,
             dirty_files: Some(0),
         };
-        assert_eq!(worktree_line(&w), "worktree · clean");
+        // Slice AO dropped the `worktree ·` prefix and kept every shape
+        // Slice I2 stated. The prefix named the container; the row's own
+        // second line already says where the session works.
+        assert_eq!(worktree_mark(&w).as_deref(), Some("clean"));
         w.dirty_files = Some(3);
-        assert_eq!(worktree_line(&w), "worktree · 3 dirty");
+        assert_eq!(worktree_mark(&w).as_deref(), Some("3 dirty"));
         // A failed scan is an honest unknown, never a fake zero.
         w.dirty_files = None;
-        assert_eq!(worktree_line(&w), "worktree · dirty —");
+        assert_eq!(worktree_mark(&w).as_deref(), Some("dirty —"));
+        // A worktree that is GONE is not a mark at all — it is a failure
+        // and it takes its own warning line.
         w.present = false;
-        assert_eq!(worktree_line(&w), "worktree missing");
+        assert_eq!(worktree_mark(&w), None);
 
-        assert_eq!(
-            shares_line(&["0a1b2c3d-4444-5555".into(), "ffff0000-1".into()]),
-            "shares files with 0a1b2c3d, ffff0000"
-        );
+        assert_eq!(sharing_mark(1), "+1 here");
+        assert_eq!(sharing_mark(9), "+9 here");
+    }
+
+    /// Slice AO. **The row prints no session id, in any circumstance.**
+    ///
+    /// A first pass put the 8-char id back as a mark on rows that would
+    /// otherwise be duplicates. The operator looked at the result —
+    /// `~/Des… · +3 here · d9802bc3`, a seven-character path — and settled
+    /// it: the folder is what a person recognises, hex is not, and the
+    /// status bar already prints the selected session's full UUID.
+    ///
+    /// Asserted as an ABSENCE over every shape a row can take, because
+    /// that is the only form this rule has. What it costs is written down
+    /// in `row_marks` and in the report: two unnamed sessions in one
+    /// folder are once again one row drawn twice, and renaming is now a
+    /// one-click affordance rather than something only the wire could do.
+    #[test]
+    fn the_row_never_prints_a_session_id() {
+        let mut s = info("aaaa1111", 1, None);
+        assert_eq!(row_marks(&s), None);
+
+        s.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
+        assert_eq!(row_marks(&s).as_deref(), Some("+2 here"));
+
+        s.shared_with.clear();
+        s.worktree = Some(eave_wire::WorktreeInfo {
+            base: "/repo".into(),
+            branch: "eave/aaaa1111".into(),
+            present: true,
+            dirty_files: Some(2),
+        });
+        assert_eq!(row_marks(&s).as_deref(), Some("2 dirty"));
+
+        // Both at once cannot arise from the engine (a worktree'd session
+        // has a checkout root of its own, so it shares with nobody) but the
+        // client is not the place to assume that.
+        s.shared_with = vec!["bbbb2222".into()];
+        assert_eq!(row_marks(&s).as_deref(), Some("+1 here · 2 dirty"));
+
+        // The rule, over every one of them.
+        s.title = Some("review the parser".into());
+        for shape in [row_marks(&s), row_marks(&info("aaaa1111", 1, None))] {
+            let text = shape.unwrap_or_default();
+            assert!(
+                !text.contains("aaaa1111"),
+                "a row mark carries the session id: {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -8482,27 +8831,22 @@ mod tests {
         assert_eq!(row_label(&s, "claude code"), "review the parser");
     }
 
-    /// The meta line is what tells two untitled sessions in one repo apart,
-    /// so the identity has to be on it — except where it would be said
-    /// twice.
+    /// Slice AO: line two is the FOLDER, whole, and nothing else shares
+    /// its start. Stage AB's `rail_meta_line` put the hex id in front of
+    /// it, so the path — the one thing on that line a person recognises —
+    /// truncated to make room for a string they never chose.
     #[test]
-    fn the_meta_line_names_the_session_unless_the_path_already_does() {
+    fn line_two_is_the_folder() {
         let mut s = info("aaaa1111", 1, None);
         s.cwd = "/Users/x/proj".into();
-        assert_eq!(rail_meta_line(&s, Some("/Users/x")), "aaaa1111 · ~/proj");
+        assert_eq!(short_cwd(&s.cwd, Some("/Users/x")), "~/proj");
+        assert_eq!(short_cwd("/opt/proj", Some("/Users/x")), "/opt/proj");
 
-        let mut other = s.clone();
-        other.session_id = "bbbb2222".into();
-        assert_ne!(
-            rail_meta_line(&s, Some("/Users/x")),
-            rail_meta_line(&other, Some("/Users/x")),
-            "same repo, same provider — the meta line is the only thing \
-             left to tell them apart"
-        );
-
-        // An isolated session's cwd already ends in its own sid8.
+        // An isolated session's cwd ends in its own sid8. That is the path
+        // the engine gave it, so the row prints it — which is not the same
+        // as the row printing an id, and is why `isolate` remains legible.
         s.cwd = "/Users/x/wt/proj/aaaa1111".into();
-        assert_eq!(rail_meta_line(&s, Some("/Users/x")), "~/wt/proj/aaaa1111");
+        assert_eq!(short_cwd(&s.cwd, Some("/Users/x")), "~/wt/proj/aaaa1111");
     }
 
     // -----------------------------------------------------------------

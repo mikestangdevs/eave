@@ -386,12 +386,16 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     }
 }
 
-/// The rail's fact lines are full-width, so the room a fact gets is set
-/// by the layout, not by the glyphs in it. Proven here (two facts of very
-/// different length get identical width) and then relied on: the room is
-/// read from the rendered layout, the fact is measured with real metrics.
+/// Slice AO moved the worktree fact off a line of its own and into the
+/// MARKS group on line two, beside the folder. The group is `flex_none`
+/// and the folder truncates against it, so the question is no longer "does
+/// this line fit the rail" — it is **"is there any folder left"**.
+///
+/// Both halves are asserted. The marks are measured with real font-kit
+/// metrics against the room the rail actually gives them; the folder is
+/// measured from the rendered layout and has to keep a stated floor.
 #[gpui::test]
-fn every_worktree_fact_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContext) {
+fn a_marked_row_still_shows_its_folder(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let mut short = session("aaaa1111");
     short.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
@@ -401,47 +405,108 @@ fn every_worktree_fact_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContex
     h.plumbing.push_rail(vec![short, long]);
     vcx.run_until_parked();
 
-    let room = vcx.debug_bounds("wt-line-aaaa1111").unwrap().size.width;
+    // Line two as a whole is full-width, so the room on it does not depend
+    // on the glyphs in it — the composition every measurement below needs.
+    let line_two = |sel: &'static str, vcx: &mut VisualTestContext| {
+        let cwd = vcx.debug_bounds(sel).unwrap();
+        let marks = vcx
+            .debug_bounds(if sel.ends_with("aaaa1111") {
+                "marks-aaaa1111"
+            } else {
+                "marks-bbbb2222"
+            })
+            .unwrap();
+        (cwd, marks)
+    };
+    let (short_cwd_box, short_marks) = line_two("cwd-aaaa1111", vcx);
+    let (long_cwd_box, long_marks) = line_two("cwd-bbbb2222", vcx);
+    let room =
+        |c: gpui::Bounds<Pixels>, m: gpui::Bounds<Pixels>| m.origin.x + m.size.width - c.origin.x;
     assert_eq!(
-        room,
-        vcx.debug_bounds("wt-line-bbbb2222").unwrap().size.width,
-        "fact lines must be full-width: the room a fact gets cannot depend \
-         on the fact's own length, or this measurement means nothing"
+        room(short_cwd_box, short_marks),
+        room(long_cwd_box, long_marks),
+        "line two must be full-width: the room a row gets cannot depend on \
+         the length of the path in it, or this measurement means nothing"
     );
 
-    // Every shape `worktree_line` can produce, plus the cwd line and every
-    // badge word — all of them must survive rail width.
-    let shapes = [
-        worktree_line(&worktree("eave/aaaa1111", Some(0), true)),
-        worktree_line(&worktree("eave/aaaa1111", Some(2), true)),
-        worktree_line(&worktree("eave/aaaa1111", Some(999_999), true)),
-        worktree_line(&worktree("eave/aaaa1111", None, true)),
-        worktree_line(&worktree("eave/aaaa1111", Some(2), false)),
+    // Every shape the rail can put in the marks group, measured with real
+    // metrics. The id is not among them — Slice AO prints no session id on
+    // a row — so the widest is a six-figure dirty count.
+    //
+    // 70 px is written as a literal on purpose. It happens to equal
+    // `ROW_MARKS_MAX` today; reading it FROM that constant would mean a
+    // future slice could raise the cap and lengthen a mark in one commit
+    // and this test would move with it and never fail.
+    let reachable = [
+        row_marks(&marked(Some(0), 0)),
+        row_marks(&marked(Some(999_999), 0)),
+        row_marks(&marked(None, 0)),
+        row_marks(&marked(None, 9)),
     ];
-    for line in shapes {
-        let w = real_text_width(&line, theme::MONO, theme::MICRO_SIZE);
+    for mark in reachable.into_iter().flatten() {
         assert!(
-            w <= room,
-            "worktree fact {line:?} needs {w:?} but the rail gives {room:?} \
-             — the dirty count is the fact decision 2 protects; it must \
-             never lose to truncation"
+            !mark.contains("aaaa1111"),
+            "the marks group is printing a session id: {mark:?}"
+        );
+        let w = real_text_width(&mark, theme::SANS, theme::MICRO_SIZE);
+        assert!(
+            w <= px(70.),
+            "the marks group {mark:?} shapes to {w:?}; past 70px it starts \
+             truncating, and a truncated count is a wrong count"
         );
     }
     for state in ["quiet", "unresponsive", "failed"] {
         let word = state_badge(state).unwrap();
         let w = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
-        assert!(w <= room, "badge {word:?} needs {w:?}, room is {room:?}");
+        assert!(
+            w <= px(110.),
+            "badge {word:?} needs {w:?} on a line it shares with the name"
+        );
     }
+
+    // And the rendered floor: with the widest marks on it, the folder is
+    // still a folder. 82 px is what `~/Desktop/eave` needs at
+    // `DETAIL_SIZE`; the assertion is a round number under that rather
+    // than the layout's own arithmetic.
+    let mut crowded = session("cccc3333");
+    crowded.cwd = "/Users/somebody/very/deeply/nested/checkout/of/a/project".into();
+    crowded.shared_with = (0..9).map(|i| format!("share{i}00000")).collect();
+    crowded.worktree = Some(worktree("eave/cccc3333", Some(999_999), true));
+    h.plumbing.push_rail(vec![crowded]);
+    vcx.run_until_parked();
+    let folder = vcx.debug_bounds("cwd-cccc3333").unwrap();
+    assert!(
+        folder.size.width >= px(80.),
+        "the folder was squeezed to {:?} by its own marks — the path is \
+         the one thing on that line a person recognises",
+        folder.size.width
+    );
 }
 
-/// The two facts whose length is unbounded — the sharer list and the
-/// engine's stated note — must WRAP, never clip. A clipped sharer list
-/// names the wrong set of sessions; a clipped confirmation hides "delete
+/// A session carrying marks, for the measurements above. `dirty` of
+/// `None` means no worktree at all, which is not the same as a worktree
+/// whose scan failed (`Some(None)` is unreachable through this helper and
+/// is measured directly).
+fn marked(dirty: Option<u64>, sharers: usize) -> SessionInfo {
+    let mut s = session("aaaa1111");
+    if sharers == 0 {
+        s.worktree = Some(worktree("eave/aaaa1111", dirty, true));
+    }
+    s.shared_with = (0..sharers).map(|i| format!("share{i}00")).collect();
+    s
+}
+
+/// The one fact on a row whose length is unbounded — the engine's stated
+/// note — must WRAP, never clip. A clipped confirmation hides "delete
 /// again to mean it", which is the whole explanation of an armed button.
 ///
-/// Real metrics prove the wrap is required (three sharers already
-/// overflow); the rendered layout proves the element actually grows
-/// instead of holding one line and swallowing the tail.
+/// Slice I2's sharer list was the other half of this test and is gone: the
+/// rail states a count now, and a count has a known width. That is the
+/// fact this used to protect, protected by construction instead.
+///
+/// Real metrics prove the wrap is required; the rendered layout proves the
+/// element actually grows instead of holding one line and swallowing the
+/// tail.
 #[gpui::test]
 fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -452,32 +517,15 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
     h.plumbing
         .push_row_note(("aaaa1111".into(), Some(RowNote::Error("refused".into()))));
     vcx.run_until_parked();
-    let room = vcx.debug_bounds("shares-aaaa1111").unwrap().size.width;
-    let short_shares = vcx.debug_bounds("shares-aaaa1111").unwrap().size.height;
+    let room = vcx.debug_bounds("wt-note-aaaa1111").unwrap().size.width;
     let short_note = vcx.debug_bounds("wt-note-aaaa1111").unwrap().size.height;
 
-    // Real metrics: these strings genuinely do not fit on one line.
-    let three = shares_line(&[
-        "bbbb2222".to_string(),
-        "cccc3333".to_string(),
-        "dddd4444".to_string(),
-    ]);
-    assert!(
-        real_text_width(&three, theme::SANS, theme::SMALL_SIZE) > room,
-        "three sharers should overflow one line — if this ever stops being \
-         true the wrap below is untested, not unnecessary"
-    );
     let confirm = "2 uncommitted files, 0 unmerged commits \u{2014} delete again to mean it";
     assert!(
-        real_text_width(confirm, theme::SANS, theme::SMALL_SIZE) > room,
+        real_text_width(confirm, theme::SANS, theme::MICRO_SIZE) > room,
         "the armed confirmation does not fit on one line"
     );
 
-    // Rendered layout: the elements grow to hold the overflow.
-    let mut many = session("aaaa1111");
-    many.shared_with = (0..6).map(|i| format!("share{i}00000")).collect();
-    many.worktree = Some(worktree("eave/aaaa1111", Some(1), true));
-    h.plumbing.push_rail(vec![many]);
     h.plumbing.push_row_note((
         "aaaa1111".into(),
         Some(RowNote::ConfirmDelete {
@@ -486,11 +534,6 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
         }),
     ));
     vcx.run_until_parked();
-    assert!(
-        vcx.debug_bounds("shares-aaaa1111").unwrap().size.height > short_shares,
-        "the sharer list clipped instead of wrapping — the operator would \
-         read a truncated set of session ids as the whole set"
-    );
     assert!(
         vcx.debug_bounds("wt-note-aaaa1111").unwrap().size.height > short_note,
         "the armed confirmation clipped instead of wrapping"
@@ -1928,27 +1971,39 @@ fn the_posture_line_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContext) 
     asks.permission_mode = Some("default".into());
     let mut never = session("bbbb2222");
     never.permission_mode = Some("bypassPermissions".into());
-    h.plumbing.push_rail(vec![asks, never]);
+    let mut also_never = session("cccc3333");
+    also_never.permission_mode = Some("acceptEdits".into());
+    h.plumbing.push_rail(vec![asks, never, also_never]);
     vcx.run_until_parked();
 
-    // Same full-width room for both, so the room is layout-derived and
-    // text-independent (the composition this measurement relies on).
-    let room = vcx.debug_bounds("posture-aaaa1111").unwrap().size.width;
+    // Slice AO: the SAFE posture no longer takes a line. `asks before it
+    // writes · default` was a line on every row restating the default, and
+    // a row that says nothing has changed is the row that made the rail
+    // three lines deep. Absence is the assertion — if the safe line ever
+    // comes back it costs every row again.
+    assert!(
+        !shown(vcx, "posture-aaaa1111"),
+        "the asking posture is the default; a line restating it on every \
+         row is what a two-line rail cannot afford"
+    );
+
+    // Same full-width room for both alarms, so the room is layout-derived
+    // and text-independent (the composition this measurement relies on).
+    let room = vcx.debug_bounds("posture-bbbb2222").unwrap().size.width;
     assert_eq!(
         room,
-        vcx.debug_bounds("posture-bbbb2222").unwrap().size.width,
+        vcx.debug_bounds("posture-cccc3333").unwrap().size.width,
         "posture lines must be full-width like every other rail fact"
     );
 
-    for mode in [
-        "default",
-        "manual",
-        "bypassPermissions",
-        "acceptEdits",
-        "dontAsk",
-    ] {
+    for mode in ["bypassPermissions", "acceptEdits", "dontAsk"] {
         let text = posture_line(mode);
-        let w = real_text_width(&text, theme::SANS, theme::SMALL_SIZE);
+        assert!(
+            text.starts_with("NEVER ASKS"),
+            "{mode:?} renders {text:?} — only the alarm still takes a line, \
+             so anything that reaches this element has to BE the alarm"
+        );
+        let w = real_text_width(&text, theme::SANS, theme::MICRO_SIZE);
         assert!(
             w <= room,
             "the posture fact {text:?} shapes to {w:?} but the rail gives it {room:?}"
@@ -2257,7 +2312,16 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
              its bg rather than compositing the neutral wash over it"
         );
     }
-    // Built from a formatted selector, checked at their builder.
+    // Built from a formatted selector, so the check is anchored at the tag
+    // and bounded by the NEXT tag rather than by a character count.
+    //
+    // It was `at + 1400`, and Slice AO broke it by writing a rationale
+    // comment — not by removing anything. That is the failure mode Stage AK
+    // already named in this file: "a proximity window is a heuristic a long
+    // comment defeats". The element's own block is a structural bound, it
+    // cannot be defeated by prose, and it is STRICTER than 1400 characters
+    // for both of these (the row's fade sits ~700 characters after its tag;
+    // the next tag is the accent bar's).
     for (builder, what) in [
         (r#"format!("rail-{}", info.session_id)"#, "the session row"),
         (r#"format!("file-{}", f.path)"#, "the file row"),
@@ -2265,10 +2329,15 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         let at = src
             .find(&format!("debug_selector(|| {builder})"))
             .unwrap_or_else(|| panic!("{what} is no longer tagged"));
-        let window = &src[at..src.len().min(at + 1400)];
+        let rest = &src[at + 1..];
+        let block = match rest.find("debug_selector(") {
+            Some(next) => &rest[..next],
+            None => rest,
+        };
         assert!(
-            window.contains(".hover_fade("),
-            "{what} lost its hover feedback"
+            block.contains(".hover_fade("),
+            "{what} lost its hover feedback — no .hover_fade( between its \
+             own tag and the next tagged element"
         );
     }
     // Stage AK: the five rail affordances are built by one constructor, so
@@ -4341,38 +4410,61 @@ fn a_long_title_clips_itself_before_it_crowds_the_badge(cx: &mut TestAppContext)
     );
 }
 
-/// The slice's whole point. Two sessions in the same repo, under the same
-/// provider, in the same state used to be one row drawn twice.
+/// Stage AB's case, and **the rule that replaced its answer.**
+///
+/// Stage AB put the 8-char session id on every row because two untitled
+/// sessions in one repo were "one row drawn twice". Slice AO takes it off
+/// every row: the operator looked at `~/Des… · +3 here · d9802bc3` and
+/// ruled that a path truncated to seven characters to make room for hex is
+/// backwards.
+///
+/// So this asserts the COST as well as the benefit, because the cost is
+/// real and hiding it would make the next slice re-derive it: unnamed
+/// twins ARE indistinguishable in the rail again. What changed since Stage
+/// AB is that `rename` is a one-click affordance (Stage AK's pen) instead
+/// of a wire method with no caller — the fix moved from something the rail
+/// forced on everyone to something the operator does once, on the two rows
+/// it actually matters for.
 #[gpui::test]
-fn two_sessions_in_one_repo_do_not_render_as_the_same_row(cx: &mut TestAppContext) {
+fn unnamed_twins_are_told_apart_by_naming_them_not_by_hex(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let a = session("aaaa1111");
     let b = session("bbbb2222");
-    // Identical in every fact the rail stated before this slice.
     assert_eq!(a.provider, b.provider);
     assert_eq!(a.cwd, b.cwd);
     assert_eq!(a.state, b.state);
     h.plumbing.push_rail(vec![a.clone(), b.clone()]);
     vcx.run_until_parked();
 
-    // Unnamed — and still told apart, without anyone having to do
-    // anything, because the meta line carries the session's identity.
+    // The cost, stated: nothing on either row distinguishes them, and no
+    // row carries an id to fall back on.
     assert!(shown(vcx, "cwd-aaaa1111") && shown(vcx, "cwd-bbbb2222"));
-    assert_ne!(rail_meta_line(&a, None), rail_meta_line(&b, None));
+    assert_eq!(
+        vcx.debug_bounds("cwd-aaaa1111").map(|b| b.size),
+        vcx.debug_bounds("cwd-bbbb2222").map(|b| b.size)
+    );
+    assert_eq!(row_marks(&a), None, "an unmarked row states nothing extra");
+    assert!(
+        !shown(vcx, "marks-aaaa1111") && !shown(vcx, "marks-bbbb2222"),
+        "a plain row is painting a marks group — the id is supposed to be \
+         gone from the row entirely"
+    );
 
-    // Named — the label carries it, which is the version an operator
-    // actually reads.
+    // The answer: name one. The label carries it, which is the version an
+    // operator actually reads.
     let mut named_a = a.clone();
     named_a.title = Some("review the parser".into());
     let mut named_b = b.clone();
     named_b.title = Some("chase the flake".into());
-    h.plumbing.push_rail(vec![named_a.clone(), named_b.clone()]);
-    vcx.run_until_parked();
+    rail_with_selected(&h, vcx, vec![named_a.clone(), named_b.clone()], "aaaa1111");
     assert!(shown(vcx, "label-aaaa1111") && shown(vcx, "label-bbbb2222"));
     assert_ne!(
         row_label(&named_a, "claude code"),
         row_label(&named_b, "claude code")
     );
+    // ...and the affordance that sets a name is reachable on the row, so
+    // "name them" is advice the rail can actually take.
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
 }
 
 /// A session with an empty journal has no title — and states that by not
@@ -6058,27 +6150,354 @@ fn hovering_a_row_does_not_move_it(cx: &mut TestAppContext) {
     );
 }
 
-/// The strip sits over the row's right edge, not over its title.
+/// The strip sits over the row's right edge, not over its name.
 ///
-/// Absolute positioning buys the height invariant above and costs this one:
-/// nothing in the layout stops the strip covering whatever is beneath it.
-/// The session's NAME is the one thing on the row that must stay readable
-/// while a person reaches for its buttons.
+/// Absolute positioning buys the height invariant above and costs this
+/// one: nothing in the layout stops the strip covering whatever is beneath
+/// it. The session's NAME is the one thing on the row that must stay
+/// readable while a person reaches for its buttons.
+///
+/// **Slice AO repointed this test, and it then failed.** Stage AK wrote it
+/// against `rail-title`, which is the rail's `SESSIONS` HEADER — not the
+/// row's name, which is tagged `label-{sid}`. The header sits at the top of
+/// the rail and is about 60 px wide, so "the strip starts to the right of
+/// it" was true by a hundred pixels and would have stayed true no matter
+/// what the strip covered. The test could not fail. Repointed, it caught a
+/// real overlap of 21 px at four affordances — see `row_strip_reserve`.
+///
+/// It measures the name's drawn INK, not its box. The label is `flex_1`,
+/// so its box runs to the row's right edge whatever the name is and the
+/// strip overlaps that box by construction; what must not be covered is
+/// glyphs. Shaped with the real text system at the row's own 14 px, at the
+/// default weight — a slight UNDER-estimate of the semibold the row paints,
+/// which is why the clearance below is 8 px and not 1.
 #[gpui::test]
 fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
 
-    // One row on screen, so the shared selector is unambiguous.
-    let title = vcx.debug_bounds("rail-title").expect("the row's title");
-    let first = vcx.debug_bounds("ren-aaaa1111").expect("the first action");
+    // An unnamed session falls back to the provider label, which is what
+    // this row paints.
+    let ink = real_text_width("claude code", theme::SANS, 14.0);
+    // What the row DRAWS is `min(ink, box)`: the label truncates, so a name
+    // longer than its slot ends at the slot's edge with an ellipsis rather
+    // than running on under the buttons.
+    let clear = |vcx: &mut VisualTestContext| {
+        let label = vcx.debug_bounds("label-aaaa1111").expect("the row's name");
+        let first = vcx.debug_bounds("ren-aaaa1111").expect("the first action");
+        first.origin.x - (label.origin.x + ink.min(label.size.width))
+    };
+    let two_icons = clear(vcx);
     assert!(
-        first.origin.x >= title.origin.x + title.size.width,
-        "the action strip starts at {:?} and the title runs to {:?} — the \
-         buttons are drawn over the session's own name",
-        first.origin.x,
-        title.origin.x + title.size.width
+        two_icons >= px(8.),
+        "the name runs {ink:?} and the action strip leaves {two_icons:?} \
+         after it — rename and archive are on every row and must never be \
+         over the name they belong to"
+    );
+
+    // And the WIDEST strip the rail can build: a selected, dead,
+    // worktree\'d session shows pen, archive, open and delete — four 24 px
+    // targets and three gaps, twice the width of the case above.
+    //
+    // **This one does overlap, and the assertion says so.** Four targets
+    // reach 21 px into `claude code`, and no arrangement of a 61 px row
+    // makes them not: reserving their width on line one was tried and it
+    // cuts the name to `clau…`, which is a worse row at rest than a
+    // partly-covered name is for the moment a pointer is on it.
+    //
+    // What must hold — and does — is that the strip never reaches the
+    // START of the name. A person reaching for `archive` has to be able to
+    // see which session they are archiving. 48 px is about six characters
+    // at this size, written as a literal rather than derived from the
+    // strip\'s own geometry.
+    let mut wide = session("aaaa1111");
+    wide.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
+    rail_with_selected(&h, vcx, vec![wide], "aaaa1111");
+    hover_row(&h, vcx, "rail-aaaa1111", "wtd-aaaa1111");
+    assert!(
+        shown(vcx, "arc-aaaa1111") && shown(vcx, "wto-aaaa1111"),
+        "the four-affordance strip did not render, so this measures the \
+         narrow case twice"
+    );
+    let label = vcx.debug_bounds("label-aaaa1111").expect("the row\'s name");
+    let strip = vcx.debug_bounds("ren-aaaa1111").expect("the first action");
+    let visible = strip.origin.x - label.origin.x;
+    assert!(
+        visible < ink,
+        "the four-icon strip clears the name entirely ({visible:?} of \
+         {ink:?}) — if that is now true, this test should be asserting the \
+         stronger invariant instead of this one"
+    );
+    assert!(
+        visible >= px(48.),
+        "the widest strip leaves only {visible:?} of the name showing; a \
+         row you cannot identify is a row you archive by mistake"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice AO — the rail is a list, and a list has to fit.
+
+/// **The slice, in one number.** A session row is two lines.
+///
+/// The photographed rail (`docs/shots/ship-from-applications.png`) fit three
+/// sessions: every row carried a name line, an id-plus-path line, a
+/// `shares files with 9fedaac4, 47890400` line that wrapped to two, and a
+/// strip of text buttons. This holds the row to a ceiling and holds the
+/// SHARING row to the same one, because the sharing row is the one that
+/// blew the budget.
+///
+/// The ceiling is a literal. It is not `SPACE_2 * 2 + NAME_LINE + …`,
+/// because a test built out of the constants the layout uses cannot fail
+/// when the layout changes — §7, and Stage AK found exactly that bug in
+/// this file.
+#[gpui::test]
+fn a_session_row_is_two_lines(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let plain = session("aaaa1111");
+    let mut sharing = session("bbbb2222");
+    sharing.shared_with = vec!["cccc3333".into(), "dddd4444".into()];
+    h.plumbing.push_rail(vec![plain, sharing]);
+    vcx.run_until_parked();
+
+    for row in ["rail-aaaa1111", "rail-bbbb2222"] {
+        let h = vcx.debug_bounds(row).unwrap().size.height;
+        assert!(
+            h <= px(64.),
+            "{row} is {h:?} tall; the rail's whole problem was rows that \
+             cost four lines apiece"
+        );
+    }
+
+    // Both lines are actually there — a ceiling met by dropping a fact is
+    // not the same slice.
+    for sel in [
+        "label-aaaa1111",
+        "cwd-aaaa1111",
+        "label-bbbb2222",
+        "cwd-bbbb2222",
+    ] {
+        assert!(shown(vcx, sel), "{sel} did not render");
+    }
+
+    // And the sharing row costs no more than the plain one. This is the
+    // assertion the old rail could not have passed: the sharer list was
+    // two extra lines on every row that had one.
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().size.height,
+        vcx.debug_bounds("rail-bbbb2222").unwrap().size.height,
+        "the sharing fact still costs the row height — it is supposed to \
+         be a mark on a line that already exists"
+    );
+}
+
+/// Nothing on the row competes with the session's name.
+///
+/// The operator's complaint was that "the name, the id, the path and the
+/// sharing line are all within 2px of the same size" — four facts at one
+/// rank, so nothing told the eye where a row started and the rail read as
+/// a wall. Asserted as CLEARANCE between the ranks rather than as an
+/// ordering: two boxes 1 px apart are ordered and still look identical.
+#[gpui::test]
+fn nothing_on_the_row_competes_with_the_session_name(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut s = session("aaaa1111");
+    s.shared_with = vec!["bbbb2222".into()];
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+
+    let line_h = |sel: &'static str, vcx: &mut VisualTestContext| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .size
+            .height
+    };
+    let name = line_h("label-aaaa1111", vcx);
+    let folder = line_h("cwd-aaaa1111", vcx);
+    let marks = line_h("marks-aaaa1111", vcx);
+
+    assert!(
+        name >= folder + px(4.),
+        "the name's line box is {name:?} and the folder's is {folder:?} — \
+         under 4px apart they read as one rank and the row has no anchor"
+    );
+    assert!(
+        folder >= marks + px(1.),
+        "the folder ({folder:?}) and its marks ({marks:?}) are the same \
+         rank; the marks are supposed to be subordinate to the path"
+    );
+}
+
+/// **The requirement this slice was actually failing, pinned.**
+///
+/// Every test in this file passed while the photographed rail read
+/// `clau…`, `claude c…`, `chase the rai…`, `package…` — four names out of
+/// five truncated, most of them mid-word. The session name is the one
+/// thing on the row a person identifies the session by, and nothing was
+/// testing that it fit. A row that shows ten characters of a name is worse
+/// than the four-line row this slice replaced, which at least showed all
+/// of it.
+///
+/// Asserted against a literal character count and the ink the text system
+/// actually shapes — never against `RAIL_W` minus the constants the layout
+/// uses, which is the derived-expectation trap that has already cost this
+/// project a test that could not fail.
+#[gpui::test]
+fn a_realistically_named_session_shows_its_whole_name(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // Twenty characters, which is a name somebody types: it is the length
+    // of "chase the rail flake".
+    let name = "chase the rail flake";
+    assert_eq!(name.chars().count(), 20);
+    let mut named = session("aaaa1111");
+    named.title = Some(name.into());
+    // ...on the row carrying the most other freight it can: shared with
+    // two, so the marks group is on line two beside the folder.
+    named.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
+    rail_with_selected(&h, vcx, vec![named], "aaaa1111");
+
+    let label = vcx.debug_bounds("label-aaaa1111").expect("the row\'s name");
+    let ink = real_text_width(name, theme::SANS, 13.0);
+    assert!(
+        label.size.width >= ink,
+        "{name:?} shapes to {ink:?} and its slot is {:?} — the row would \
+         render it as an ellipsis, and a name nobody can read is the whole \
+         defect this slice was fixing",
+        label.size.width
+    );
+
+    // And the folder beside it, on the same row, at the same time.
+    let folder = vcx.debug_bounds("cwd-aaaa1111").expect("the folder");
+    assert!(
+        folder.size.width >= px(80.),
+        "the folder is {:?} wide on a named, shared row",
+        folder.size.width
+    );
+}
+
+/// Selection reads as a FILL and a RIM — `launcher.rs`\'s treatment for its
+/// provider tiles, which is the one place in this app that already did
+/// selection properly.
+///
+/// An accent bar down the row\'s leading edge was tried and photographed.
+/// The operator\'s ruling: *"no need for purple bar when selected"* — the
+/// fill and the rim carried it on their own. What this asserts now is that
+/// the rim is real and, more importantly, that it is laid out on EVERY row
+/// so selecting one cannot move the rest.
+#[gpui::test]
+fn selection_is_a_fill_and_a_rim_and_never_a_bar(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    assert!(
+        !shown(vcx, "accent-aaaa1111"),
+        "the accent bar is back on the selected row"
+    );
+    // The rim is a border on every row that only ever changes colour — a
+    // border that APPEARED on selection would move every row below it the
+    // moment the operator clicked. Proven by the size equality, which a
+    // 2 px border on one row and none on the other could not satisfy.
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").map(|r| r.size),
+        vcx.debug_bounds("rail-bbbb2222").map(|r| r.size),
+        "the selected row is a different size from its neighbour"
+    );
+}
+
+/// Selecting a row does not move it, and neither does hovering it.
+///
+/// Stage AK proved the hover half and the rail depends on it: a virtualized
+/// list with cached row heights cannot have a row that resizes under the
+/// pointer. Slice AO added two things that could break the same invariant
+/// for a different reason — a rim that appears on selection — so the
+/// selected/unselected pair is asserted to the pixel as well.
+#[gpui::test]
+fn selecting_a_row_does_not_move_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    vcx.run_until_parked();
+    let before = vcx.debug_bounds("rail-bbbb2222").expect("the second row");
+
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    let selected = vcx.debug_bounds("rail-aaaa1111").expect("the first row");
+    let after = vcx.debug_bounds("rail-bbbb2222").expect("the second row");
+
+    assert_eq!(
+        before.size, after.size,
+        "the unselected row changed size when its neighbour was selected"
+    );
+    assert_eq!(
+        before.origin, after.origin,
+        "selecting the row above moved this one: {:?} -> {:?} — the rim is \
+         supposed to be laid out on every row and only change colour",
+        before.origin, after.origin
+    );
+    assert_eq!(
+        selected.size, after.size,
+        "a selected row is a different height from an unselected one"
+    );
+}
+
+/// The sharing fact is a COUNT, on every row, and never a list of ids.
+///
+/// Slice I2 rendered `shares files with 9fedaac4, 47890400` — two hex ids
+/// wrapping to a second line, on every sharing row. A first pass at this
+/// slice moved the identities to the selected row, which made one row
+/// three lines tall and kept the hex; the operator called that out as the
+/// single ugliest thing in the shot.
+///
+/// What survives is the part a person acts on: **somebody else is in these
+/// files, and there are N of them.** The action it leads to — `isolate` —
+/// is on the row and does not need the identities to work.
+#[gpui::test]
+fn the_sharing_fact_is_a_count_not_a_list_of_ids(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
+    let mut b = session("bbbb2222");
+    b.shared_with = vec!["aaaa1111".into(), "cccc3333".into()];
+    rail_with_selected(&h, vcx, vec![a.clone(), b], "aaaa1111");
+
+    assert!(shown(vcx, "marks-aaaa1111") && shown(vcx, "marks-bbbb2222"));
+    assert_eq!(row_marks(&a).as_deref(), Some("+2 here"));
+
+    // Selection changes nothing about it. The selected row is not a detail
+    // pane and must not become one — that is what made the first pass's
+    // selected row three lines tall.
+    assert_eq!(
+        vcx.debug_bounds("marks-aaaa1111").map(|r| r.size),
+        vcx.debug_bounds("marks-bbbb2222").map(|r| r.size),
+        "the selected row states the sharing fact differently from its \
+         neighbour"
+    );
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").map(|r| r.size.height),
+        vcx.debug_bounds("rail-bbbb2222").map(|r| r.size.height),
+        "selecting a sharing row grew it — the identities are back"
+    );
+
+    // And no sharer is named anywhere in what the row states.
+    let widest = row_marks(&a).unwrap();
+    for id in ["bbbb2222", "cccc3333"] {
+        assert!(
+            !widest.contains(id),
+            "the marks group names a sharer: {widest:?}"
+        );
+    }
+    assert!(
+        !shown(vcx, "shares-aaaa1111") && !shown(vcx, "shares-bbbb2222"),
+        "the sharer list is back on a row"
     );
 }
 

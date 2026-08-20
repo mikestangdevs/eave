@@ -389,6 +389,30 @@ pub fn inverse() -> Hsla {
 pub fn on_inverse() -> Hsla {
     rgb(0x17181c).into()
 }
+/// **The plate a vendor mark sits on** (Slice AO).
+///
+/// This exists because of a measurement, not a preference. The rail's
+/// provider chip carries `icons::claude_brand()` (`#D97757`), and inside a
+/// washed session card that lands at **2.55:1** — under the 3:1 non-text
+/// floor. On the bare frost outside the wash it is 3.59:1 and fine, which
+/// is exactly the sort of "it depends where you paint it" failure Slice AG
+/// spent a whole slice on.
+///
+/// An opaque plate takes the question away: the mark is no longer over a
+/// wash over a glass ground over a desktop of unknown brightness, it is
+/// over this, and the ratio is the same on every row in every state. At
+/// `#121212` the brand orange reads **6.01:1** and the fallback initials
+/// (`text_secondary_on_wash`) **11.9:1** — see
+/// `a_provider_mark_clears_the_non_text_floor_on_its_own_plate`.
+///
+/// One step off black, so it sits BELOW every surface in the elevation
+/// ladder rather than on it. That is deliberate: the chip is not a raised
+/// card, it is a hole in the row with a logo in it, which is what an app
+/// icon is everywhere else a person has seen one.
+pub fn chip_plate() -> Hsla {
+    rgb(0x121212).into()
+}
+
 /// The armed send button under the pointer: the same fill, lifted. The
 /// only direction available — [`inverse`] is already the brightest fill
 /// in the app, so hover goes to white rather than adding a wash that
@@ -412,6 +436,25 @@ pub fn warning() -> Hsla {
 }
 pub fn danger() -> Hsla {
     rgb(0xe2726a).into()
+}
+
+/// **Accent — selection, at real saturation** (Slice AL's contract).
+///
+/// The same indigo as [`live`], which is deliberate: the app has exactly
+/// one saturated family, and a second one invented for selection would
+/// read as a second kind of importance. Selection is not a state the
+/// agent is in, so it never takes a *state* colour — it takes the app's
+/// own pigment.
+pub fn accent() -> Hsla {
+    rgb(0x7c86ff).into()
+}
+
+/// The selected row's leading-edge bar. Brighter than [`accent`] because
+/// it is 3 px of pigment on a dark ground with a wash over it: at the
+/// bar's width the eye integrates the stripe rather than reading its
+/// colour, so the mark has to win on luminance or it is not a mark.
+pub fn accent_bar() -> Hsla {
+    rgb(0x9aa2ff).into()
 }
 
 /// Panel rings for the attention surfaces. The matching *fills* live in the
@@ -514,15 +557,17 @@ pub const CODE_LINE: f32 = 17.5;
 /// Chip/label rank: tool rows, affordances, buttons.
 pub const LABEL_SIZE: f32 = 12.5;
 pub const LABEL_LINE: f32 = 16.0;
-/// Panel detail rank: attention evidence, notice bodies.
-pub const DETAIL_SIZE: f32 = 12.0;
-pub const DETAIL_LINE: f32 = 16.0;
+/// Panel detail rank: attention evidence, notice bodies, and — Slice AO —
+/// the rail row's second line, the working folder.
+pub const DETAIL_SIZE: f32 = 12.5;
+pub const DETAIL_LINE: f32 = 17.0;
 /// Footer / timestamps / markers.
 pub const SMALL_SIZE: f32 = 11.0;
 pub const SMALL_LINE: f32 = 15.0;
-/// Code-block language strip, structural micro-labels.
-pub const MICRO_SIZE: f32 = 10.0;
-pub const MICRO_LINE: f32 = 14.0;
+/// Code-block language strip, structural micro-labels, and the compact
+/// state marks on a rail row's second line (counts, sharing).
+pub const MICRO_SIZE: f32 = 11.0;
+pub const MICRO_LINE: f32 = 15.0;
 /// Diff lines in the files rail (B2): smallest mono rank — the rail is
 /// 248 px, so the shape of the change is the signal; long lines wrap.
 pub const DIFF_SIZE: f32 = 10.0;
@@ -545,6 +590,28 @@ pub const COMPOSER_MIN_H: f32 = 24.0;
 pub const WEIGHT_BODY: FontWeight = FontWeight::NORMAL;
 pub const WEIGHT_LABEL: FontWeight = FontWeight::MEDIUM;
 pub const WEIGHT_STRONG: FontWeight = FontWeight::SEMIBOLD;
+
+// --- Slice AL's type-scale contract -----------------------------------
+//
+// Written against by Slice AO before AL landed, so these names exist here
+// with AL's stated values and AL resolves the overlap at integration. The
+// three ranks below are the ones the type scale was missing: a display
+// rank, a NAME rank between body and display, and a section rank for
+// uppercase tracked headers. `DETAIL` and `MICRO` above moved to AL's
+// values in the same pass.
+
+/// Display rank — the largest text the shell paints.
+pub const DISPLAY_SIZE: f32 = 20.0;
+pub const DISPLAY_LINE: f32 = 26.0;
+/// Names the eye lands on: a session's name in the rail (Slice AO).
+/// This is the rank that makes a list read as a list — every other line
+/// on a row is subordinate to it, and nothing else in the rail is near
+/// this size.
+pub const NAME_SIZE: f32 = 16.0;
+pub const NAME_LINE: f32 = 22.0;
+/// Uppercase, tracked section headers ("SESSIONS").
+pub const SECTION_SIZE: f32 = 11.0;
+pub const SECTION_LINE: f32 = 14.0;
 
 /// Heading ladder relative to body (waku's scale): size, line, weight.
 pub fn heading(level: u8) -> (Pixels, Pixels, FontWeight) {
@@ -1221,6 +1288,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A vendor mark is non-text pigment and has a floor too** (Slice AO).
+    ///
+    /// The rail used to draw a monochrome `CC` monogram, because Slice A's
+    /// directive forbade a third-party mark; the operator withdrew that
+    /// directive on 2026-08-20 and the rail now paints the real Claude
+    /// asterisk. That put saturated brand pigment inside a washed session
+    /// card for the first time, where it measures **2.55:1** — under
+    /// [`TEXT_QUIET_CONTRAST_FLOOR`], which is also the WCAG non-text floor.
+    ///
+    /// [`chip_plate`] is the fix and this is what makes it a fix rather
+    /// than a hope. Note what is NOT swept here: the glass grounds. That is
+    /// the point of an opaque plate — the mark stops depending on the
+    /// desktop behind the window, so there is one number instead of 52.
+    #[test]
+    fn a_provider_mark_clears_the_non_text_floor_on_its_own_plate() {
+        let plate: Rgba = chip_plate().into();
+        let ground = (plate.r, plate.g, plate.b);
+        for (name, ink) in [
+            ("claude_brand", crate::icons::claude_brand()),
+            // The ink every OTHER provider's mark takes, and the fallback
+            // initials chip with it.
+            ("text_secondary_on_wash", text_secondary_on_wash()),
+            ("text", text()),
+        ] {
+            let c: Rgba = ink.into();
+            let r = contrast_ratio((c.r, c.g, c.b), ground);
+            assert!(
+                r >= TEXT_QUIET_CONTRAST_FLOOR,
+                "{name} is {r:.2}:1 on the chip plate, floor \
+                 {TEXT_QUIET_CONTRAST_FLOOR}"
+            );
+        }
+
+        // And the reason the plate exists, asserted rather than recounted:
+        // the same pigment on the SELECTED row's wash does not clear it.
+        //
+        // Swept over every backdrop, because that is where this hides. On a
+        // dark desktop the unplated mark reads 4.71:1 and looks fine — a
+        // screenshot on this machine would have said so. The frost
+        // lightens to `#3b3b3b` as the desktop behind it brightens, the
+        // wash lightens it further, and the mark's own luminance is fixed,
+        // so the ratio falls as the room gets brighter. The worst case is
+        // the one that matters and it is under the floor.
+        let brand: Rgba = crate::icons::claude_brand().into();
+        let worst = grounds()
+            .into_iter()
+            .map(|g| contrast_ratio((brand.r, brand.g, brand.b), over(overlay_strong(), g)))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            worst < TEXT_QUIET_CONTRAST_FLOOR,
+            "the brand mark now clears {worst:.2}:1 unplated on every \
+             backdrop — if that is genuinely true, `chip_plate` has stopped \
+             earning its place and this test should be the one that says so"
+        );
     }
 
     /// A disabled control is still a control.
