@@ -166,6 +166,24 @@ pub enum Request {
         session_id: String,
         force: bool,
     },
+    /// Set (or clear, with `None`) a session's operator title (Stage AB).
+    /// Normalized and length-capped engine-side
+    /// (`eave_core::store::normalize_title`) and persisted in `meta.json`,
+    /// so it survives a restart.
+    ///
+    /// **Operator-authored, never engine-derived.** The rail needs to say
+    /// which session a row is, and the obvious source — the session's
+    /// first `UserSent` — is transcript content, which may not cross
+    /// `watch` (spec 05 §Watch). So the title arrives the only way a
+    /// session fact legitimately can: someone typed it *as* the label.
+    /// The engine never reads a journal to fill it; see
+    /// `watch.rs::the_engine_never_mines_a_title_out_of_the_transcript`.
+    Rename {
+        session_id: String,
+        /// `None` clears the title back to unstated. So does any string
+        /// that normalizes to empty — a title of spaces is not a title.
+        title: Option<String>,
+    },
     /// Answer one open permission question (Slice K). The agent is parked
     /// until this arrives and there is no other way out — eave never
     /// auto-approves, never auto-denies, and never times out into either.
@@ -282,6 +300,27 @@ pub struct HelloOk {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
+    /// The operator's own name for this session (Stage AB). `None` = never
+    /// named, which is the honest default and renders as no line at all —
+    /// eave does not invent a title.
+    ///
+    /// **Read this before making it automatic.** The natural implementation
+    /// is to derive it from the session's first `UserSent`, capped. That is
+    /// forbidden here, and the reason is the isolation invariant (spec 05
+    /// §Watch): `watch` is the ONE cross-session broadcast, and it may
+    /// carry facts ABOUT a session and never a byte of any session's
+    /// transcript. A prompt's first words are the transcript. The raw-byte
+    /// canary in `eave-engine/tests/watch.rs` proves the rule holds, and it
+    /// plants its marker at the head of the first prompt — so a
+    /// leading-words title does not merely violate the invariant in
+    /// principle, it fails that test by name.
+    ///
+    /// The distinction this field keeps is the same one
+    /// [`SessionInfo::pending_approvals`] keeps: a COUNT of open questions
+    /// may cross, the tool and path may not. Here, a label the operator
+    /// chose may cross, the words the agent was given may not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub provider: String,
     /// The model this session is configured to run (Slice P2), verbatim as
     /// it will be passed to the CLI. `None` = the provider's own default,
@@ -297,6 +336,21 @@ pub struct SessionInfo {
     pub model: Option<String>,
     pub cwd: String,
     pub created_ts_ms: u64,
+    /// When this session's reported [`state`](SessionInfo::state) last
+    /// moved (Stage AB), for the rail's ordering. `None` = it has not moved
+    /// since the engine loaded the session — sort on `created_ts_ms`
+    /// instead, never on a fabricated zero, which would sort every
+    /// never-started session to 1970.
+    ///
+    /// **Stamped only where `state`/`live` change, and nowhere else.** That
+    /// is what keeps it inside the isolation invariant rather than beside
+    /// it: a timestamp that advanced per journal record would turn `watch`
+    /// into a side channel reporting the *rate* of a session's transcript
+    /// to every client — content inferred rather than sent. Stamping
+    /// exactly the transitions `state` already announces adds no
+    /// observation a watcher did not already have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<u64>,
     /// Current state name (spec 01 §States; "new" before any spawn).
     pub state: String,
     /// A live agent process is attached right now.
@@ -576,6 +630,16 @@ pub struct IsolateOk {
     pub info: SessionInfo,
 }
 
+/// Reply to [`Request::Rename`] (Stage AB): the session as it now stands,
+/// so the caller reads back the NORMALIZED title rather than the string it
+/// sent. Those differ whenever the engine trimmed, folded a newline, or hit
+/// the length cap — and a caller that assumed its own string landed would
+/// render a title the engine does not hold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenameOk {
+    pub info: SessionInfo,
+}
+
 /// Reply to [`Request::RemoveWorktree`] (Slice I2). `removed: false` is
 /// a refusal with its facts: the counts the operator must confirm
 /// against (`force: true` re-sends meaning it). The counts are measured
@@ -684,10 +748,12 @@ mod tests {
             body: ResponseBody::Item(SubscriptionItem::Sessions {
                 sessions: vec![SessionInfo {
                     session_id: "s1".into(),
+                    title: Some("ship the rail".into()),
                     provider: "claude-code".into(),
                     model: None,
                     cwd: "/tmp".into(),
                     created_ts_ms: 1,
+                    last_activity_ms: Some(1_700),
                     state: "running".into(),
                     live: true,
                     epoch: 9,
@@ -828,6 +894,45 @@ mod tests {
         // Absent `watching` = the polling fallback — exactly what a B1
         // engine's list is.
         assert!(!snap.watching);
+    }
+
+    /// Stage AB. Two shapes, one test: naming a session and un-naming it
+    /// are the same method, which is what stops "clear the title" from
+    /// becoming a second verb that can disagree with the first.
+    #[test]
+    fn rename_round_trips_in_both_directions() {
+        for title in [Some("ship the rail".to_string()), None] {
+            let req = RequestEnvelope {
+                id: 21,
+                request: Request::Rename {
+                    session_id: "s1".into(),
+                    title: title.clone(),
+                },
+            };
+            let line = serde_json::to_string(&req).unwrap();
+            assert!(line.contains("\"method\":\"rename\""), "{line}");
+            let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, req);
+        }
+    }
+
+    /// Wire-compat: a pre-Stage-AB engine's `SessionInfo` still parses —
+    /// unnamed, and with no activity stamp. Both degrade to the honest
+    /// reading (nobody named it; sort it by creation), which is exactly
+    /// what such an engine means.
+    #[test]
+    fn pre_stage_ab_session_info_still_parses() {
+        let line = r#"{"session_id":"s1","provider":"claude-code","cwd":"/tmp",
+            "created_ts_ms":7,"state":"new","live":false,"epoch":1,"last_seq":0}"#;
+        let info: SessionInfo = serde_json::from_str(line).unwrap();
+        assert_eq!(info.title, None);
+        assert_eq!(info.last_activity_ms, None);
+        // And the absence is absence on the way out too: an unnamed
+        // session must not put an empty string on the wire for a rail to
+        // render as a blank line.
+        let back = serde_json::to_string(&info).unwrap();
+        assert!(!back.contains("title"), "{back}");
+        assert!(!back.contains("last_activity_ms"), "{back}");
     }
 
     #[test]

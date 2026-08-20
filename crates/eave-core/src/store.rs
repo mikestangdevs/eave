@@ -152,6 +152,55 @@ pub struct Meta {
     /// Live child, if any — the orphan-detection breadcrumb. Cleared on
     /// terminal outcomes.
     pub child: Option<ProcIdentity>,
+    /// The operator's name for this session (Stage AB), already through
+    /// [`normalize_title`]. `None` = unnamed, and eave never fills it in.
+    ///
+    /// It lives HERE and not in the journal header for the same reason
+    /// `header.agent` lives there and not here: the header is the
+    /// session's immutable identity, written once before anything spawns,
+    /// and a name the operator can change at any time is not identity.
+    /// `meta.json` is the mutable file, rewritten atomically on every
+    /// state change — which is exactly the write pattern a rename needs.
+    ///
+    /// `#[serde(default)]`, so a meta written before this field existed
+    /// reads back as unnamed. `format_version` did not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// The longest operator title eave will hold, in **characters** — a cap in
+/// bytes would split a multi-byte character and store invalid text.
+///
+/// Why a cap exists at all: the title is a session fact, and session facts
+/// ride `watch`, which re-broadcasts EVERY session to EVERY client on every
+/// state change. An uncapped title makes one paste into a rename box a
+/// permanent multiplier on that broadcast.
+///
+/// Why this value and not a tighter one: it is deliberately PAST what the
+/// rail can draw. Bounding the wire and bounding the display are different
+/// jobs — a cap tight enough to double as the visual limit would silently
+/// destroy the operator's text, where truncation only hides it. That
+/// relationship is asserted rather than assumed:
+/// `ui_harness::a_long_title_clips_itself_before_it_crowds_the_badge`
+/// measures a title at this cap against the label slot's real width and
+/// requires the cap to exceed it.
+pub const TITLE_MAX_CHARS: usize = 64;
+
+/// Bring an operator-supplied title to the one shape eave stores: single
+/// line, trimmed, capped. `None` out means "not a title" — which is what an
+/// empty or whitespace-only string is, and is how a rename clears one.
+///
+/// The whitespace fold is not cosmetic. The rail draws the title on one
+/// line, so an embedded newline would render as a space anyway while the
+/// stored string kept a break the operator could not see — the sort of
+/// invisible difference that makes two identical-looking titles compare
+/// unequal.
+pub fn normalize_title(raw: &str) -> Option<String> {
+    let folded = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.is_empty() {
+        return None;
+    }
+    Some(folded.chars().take(TITLE_MAX_CHARS).collect())
 }
 
 impl Meta {
@@ -166,6 +215,24 @@ impl Meta {
         fs::rename(&tmp, Store::meta_path(session_dir))
     }
 
+    /// Save, keeping whatever [`title`](Meta::title) is on disk (Stage AB).
+    ///
+    /// `meta.json` has two writers with different concerns: the state
+    /// machine (state, child, resume cursor) rewrites it on every
+    /// transition, and a rename writes exactly one field. Because every
+    /// save rewrites the whole file, either writer erases the other's work
+    /// unless one rule holds — **`rename` is the only writer of `title`,
+    /// and every other writer preserves it.** This is that rule.
+    ///
+    /// Without it the bug is quiet and specific: name a session, send it a
+    /// message, and the spawn's meta write drops the name you just gave it.
+    pub fn save_keeping_title(&mut self, session_dir: &Path) -> io::Result<()> {
+        if let Ok(on_disk) = Self::load(session_dir) {
+            self.title = on_disk.title;
+        }
+        self.save(session_dir)
+    }
+
     pub fn load(session_dir: &Path) -> io::Result<Self> {
         let bytes = fs::read(Store::meta_path(session_dir))?;
         serde_json::from_slice(&bytes).map_err(invalid)
@@ -174,4 +241,58 @@ impl Meta {
 
 fn invalid(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shape a rename box can produce, and the one shape eave keeps.
+    #[test]
+    fn a_title_is_one_trimmed_line_or_nothing_at_all() {
+        assert_eq!(
+            normalize_title("  ship the rail  "),
+            Some("ship the rail".into())
+        );
+        assert_eq!(
+            normalize_title("ship\nthe\trail"),
+            Some("ship the rail".into()),
+            "a title renders on one line; it must be stored as one"
+        );
+        // Blank input is not an empty title — it is no title. Anything
+        // else would put an empty string on the wire and an empty line in
+        // the rail.
+        assert_eq!(normalize_title(""), None);
+        assert_eq!(normalize_title("   \n\t "), None);
+    }
+
+    /// The cap counts characters, not bytes. A byte cap here would cut a
+    /// multi-byte character in half and store text that is not text.
+    #[test]
+    fn the_title_cap_never_splits_a_character() {
+        // Written as an escape, not as a literal: a precomposed é and an
+        // e plus combining accent look identical in a source file and
+        // would make this test measure something else.
+        let wide = "\u{e9}".repeat(TITLE_MAX_CHARS * 2);
+        let capped = normalize_title(&wide).unwrap();
+        assert_eq!(capped.chars().count(), TITLE_MAX_CHARS);
+        assert_eq!(capped.len(), TITLE_MAX_CHARS * 2, "two bytes per char");
+        assert!(capped.chars().all(|c| c == '\u{e9}'));
+        // Exactly at the cap is untouched — an off-by-one here would trim
+        // a legal title.
+        let exact = "a".repeat(TITLE_MAX_CHARS);
+        assert_eq!(normalize_title(&exact), Some(exact));
+    }
+
+    /// Stage AB: a meta written before titles existed reads back unnamed,
+    /// and an unnamed session writes no `title` key at all.
+    #[test]
+    fn meta_without_a_title_still_loads_and_stays_silent() {
+        let line = r#"{"format_version":1,"provider":"claude-code","cwd":"/tmp",
+            "session_id":"s1","state":"new","child":null}"#;
+        let meta: Meta = serde_json::from_str(line).unwrap();
+        assert_eq!(meta.title, None);
+        let back = serde_json::to_string(&meta).unwrap();
+        assert!(!back.contains("title"), "{back}");
+    }
 }

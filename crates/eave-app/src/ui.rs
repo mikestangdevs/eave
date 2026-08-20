@@ -334,7 +334,11 @@ async fn feed_loop(
         'session: loop {
             // Validate the held selection against the engine's set; a
             // vanished session (fresh data dir, changed disk) degrades to
-            // the most recent session.
+            // the most recently ACTIVE session (Stage AB — it used to be
+            // the most recently created, which after a restart is rarely
+            // the one you were working in). Sessions that never ran fall
+            // back to creation order, so the old behaviour is the floor
+            // rather than a special case.
             let sessions = match client.list().await {
                 Ok(s) => s,
                 Err(_) => continue 'conn,
@@ -353,7 +357,7 @@ async fn feed_loop(
                     .or_else(|| {
                         sessions
                             .iter()
-                            .max_by_key(|s| s.created_ts_ms)
+                            .max_by_key(|s| activity_key(s))
                             .map(|s| s.session_id.clone())
                     })
             };
@@ -648,10 +652,14 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
     // exercise the real constrained-width layout with the rail present.
     plumbing.push_rail(vec![SessionInfo {
         session_id: sid.clone(),
+        // Unnamed on purpose: the replay rig should measure the row shape
+        // an ordinary session actually has, which is the fallback label.
+        title: None,
         provider: "replay".into(),
         model: None,
         cwd: path.display().to_string(),
         created_ts_ms: 0,
+        last_activity_ms: None,
         state: "running".into(),
         live: true,
         epoch: 0,
@@ -824,6 +832,9 @@ struct ConnectionState {
 /// here — it is `TranscriptState::session_id`, i.e. whatever the feed
 /// task actually subscribed; the rail highlights that fact.
 struct SessionsState {
+    /// The rail's rows, **in the order they are drawn** (Stage AB). Facts
+    /// still fold by replacement from every watch snapshot; only the order
+    /// is the app's own — see [`fold_rail`].
     sessions: Vec<SessionInfo>,
     collapsed: bool,
     attention: Option<(String, AttentionSnapshot)>,
@@ -1229,6 +1240,85 @@ fn worktree_line(w: &eave_wire::WorktreeInfo) -> String {
         Some(n) => format!("worktree · {n} dirty"),
         None => "worktree · dirty —".to_string(),
     }
+}
+
+/// Where a row sorts: when this session's state last moved, or when it was
+/// created if it never has (Stage AB).
+fn activity_key(s: &SessionInfo) -> u64 {
+    s.last_activity_ms.unwrap_or(s.created_ts_ms)
+}
+
+/// Fold a watch snapshot into the rail's rows, keeping the ORDER of rows
+/// that were already there (Stage AB).
+///
+/// Facts still fold by replacement — every surviving row takes the
+/// snapshot's `SessionInfo` wholesale, so nothing is merged and nothing
+/// goes stale. What is preserved is position, which is not an engine fact
+/// at all: `watch` sends a set, and where a row sits in that set is the
+/// app's decision.
+///
+/// **Activity decides position exactly once, when a row arrives.** After
+/// that the row stays put for as long as the session exists. Re-sorting
+/// live is the bug comet shipped: it ordered the rail by attention, so
+/// merely opening a session changed that session's state, which re-sorted
+/// the rail, which slid the row out from under the pointer that had just
+/// clicked it. A list you cannot click is worse than a list in a stale
+/// order — and the order is not even stale, because the thing an operator
+/// tracks a session by is where they last saw it.
+fn fold_rail(rows: &mut Vec<SessionInfo>, snapshot: Vec<SessionInfo>) {
+    let mut incoming: std::collections::HashMap<String, SessionInfo> = snapshot
+        .into_iter()
+        .map(|s| (s.session_id.clone(), s))
+        .collect();
+    // Surviving rows, in the order they already had, refreshed. A row
+    // whose session is gone from the snapshot is simply dropped.
+    let kept: Vec<SessionInfo> = rows
+        .drain(..)
+        .filter_map(|old| incoming.remove(&old.session_id))
+        .collect();
+    // Everything still in `incoming` has no row yet.
+    let mut arrivals: Vec<SessionInfo> = incoming.into_values().collect();
+    arrivals.sort_by(|a, b| {
+        activity_key(b)
+            .cmp(&activity_key(a))
+            // Two sessions opened in the same millisecond must still land
+            // in a defined order, or the rail flickers between snapshots.
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    arrivals.extend(kept);
+    *rows = arrivals;
+}
+
+/// The row's primary label: the operator's title when there is one, the
+/// provider label otherwise (Stage AB).
+///
+/// A fallback rather than a second line, because a session nobody has named
+/// must render no title at all — an empty line with a title's weight is a
+/// blank the operator reads as a bug. The provider identity is not lost
+/// when a title takes the slot: the chip beside it is drawn from the same
+/// `provider_identity` call.
+fn row_label(info: &SessionInfo, provider_label: &str) -> String {
+    info.title
+        .clone()
+        .unwrap_or_else(|| provider_label.to_string())
+}
+
+/// The rail's meta line: which session, and where it works (Stage AB).
+///
+/// The 8-char id is here because it is the ONLY thing that tells two
+/// untitled sessions in one repo apart without an operator naming them —
+/// and because it is pure identity, the one class of fact `watch` has
+/// always been allowed to carry. It is dropped when the cwd already ends
+/// in it, which is every isolated session (`isolate` puts the sid8 at the
+/// end of the worktree path), where repeating it would say the same thing
+/// twice on one line.
+fn rail_meta_line(info: &SessionInfo, home: Option<&str>) -> String {
+    let cwd = short_cwd(&info.cwd, home);
+    let sid8: String = info.session_id.chars().take(8).collect();
+    if sid8.is_empty() || cwd.ends_with(&sid8) {
+        return cwd;
+    }
+    format!("{sid8} · {cwd}")
 }
 
 /// Home-relative cwd for the rail's meta line.
@@ -2396,8 +2486,9 @@ impl Shell {
     /// subscription (`TranscriptState::session_id`); clicking only
     /// *requests* a switch.
     fn rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
-        let mut sessions = self.sessions.read(cx).sessions.clone();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.created_ts_ms));
+        // Already in draw order: `fold_rail` decided it when each row
+        // arrived, and deliberately does not re-decide it here (Stage AB).
+        let sessions = self.sessions.read(cx).sessions.clone();
         let selected = self.transcript.read(cx).session_id.clone();
         let wt_notes = self.sessions.read(cx).wt_notes.clone();
         let home = std::env::var("HOME").ok();
@@ -2409,7 +2500,8 @@ impl Shell {
             .into_iter()
             .map(|info| {
                 let is_sel = selected.as_deref() == Some(info.session_id.as_str());
-                let (glyph, label) = provider_identity(&info.provider);
+                let (glyph, provider_label) = provider_identity(&info.provider);
+                let label = row_label(&info, &provider_label);
                 let dot = state_color(&info.state);
                 // Slice K: the badge counts the open questions when there
                 // is more than one — "waiting on you (3)" is a different
@@ -2533,7 +2625,14 @@ impl Shell {
                                     .child(SharedString::from(glyph)),
                             )
                             .child(
+                                // Stage AB: `min_w(0)` is what makes
+                                // `truncate` bite inside a flex row — a
+                                // flex item's default minimum is its
+                                // content, so without it a long title
+                                // grows the row and pushes the badge off
+                                // the end instead of clipping itself.
                                 div()
+                                    .debug_selector(|| format!("label-{}", info.session_id))
                                     .flex_1()
                                     .min_w(px(0.))
                                     .truncate()
@@ -2566,7 +2665,7 @@ impl Shell {
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .text_color(theme::text_tertiary())
-                            .child(SharedString::from(short_cwd(&info.cwd, home.as_deref()))),
+                            .child(SharedString::from(rail_meta_line(&info, home.as_deref()))),
                     )
                     // Slice K amendment 3: the posture the CLI reported at
                     // init, stated as a rail fact. Full width and wrapping
@@ -5852,9 +5951,12 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                             state.attention = Some(tagged);
                         }
                         // Watch snapshots fold by replacement — the
-                        // engine's set is the truth, never merged.
+                        // engine's set is the truth, never merged. Row
+                        // ORDER is the one thing carried across (Stage AB):
+                        // it is not an engine fact, and re-deciding it on
+                        // every state change moves rows under the pointer.
                         if let Some(snapshot) = last_rail {
-                            state.sessions = snapshot;
+                            fold_rail(&mut state.sessions, snapshot);
                         }
                         // Worktree notes fold by replacement per
                         // session; a settled action clears its note.
@@ -6267,5 +6369,131 @@ mod tests {
         assert_eq!(short_cwd("/Users/x/proj", Some("/Users/x")), "~/proj");
         assert_eq!(short_cwd("/opt/proj", Some("/Users/x")), "/opt/proj");
         assert_eq!(short_cwd("/opt/proj", None), "/opt/proj");
+    }
+
+    fn info(id: &str, created: u64, activity: Option<u64>) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            title: None,
+            provider: "claude-code".into(),
+            model: None,
+            cwd: "/tmp/repo".into(),
+            created_ts_ms: created,
+            last_activity_ms: activity,
+            state: "idle".into(),
+            live: false,
+            epoch: 1,
+            last_seq: 0,
+            checkout_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            pending_approvals: 0,
+            permission_mode: None,
+            rss_bytes: None,
+        }
+    }
+
+    /// Stage AB. Activity decides where a row LANDS; it never decides
+    /// again. Both halves are asserted here because either alone is the
+    /// wrong product: sort-always is comet's moving-target rail, and
+    /// sort-never means the session you were last working in can be
+    /// anywhere after a restart.
+    #[test]
+    fn activity_places_a_row_once_and_then_leaves_it_alone() {
+        let mut rows = Vec::new();
+
+        // Cold start: everything is an arrival, so everything sorts.
+        // `b` was created first but acted most recently — activity wins,
+        // which is the whole reason the field exists.
+        fold_rail(
+            &mut rows,
+            vec![
+                info("a", 100, None),
+                info("b", 10, Some(900)),
+                info("c", 300, None),
+            ],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["b", "c", "a"]);
+
+        // The same sessions again, with `a` now the most recently active
+        // by a wide margin. Nothing moves.
+        fold_rail(
+            &mut rows,
+            vec![
+                info("a", 100, Some(99_999)),
+                info("b", 10, Some(900)),
+                info("c", 300, None),
+            ],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["b", "c", "a"],
+            "a state change re-sorted the rail — that is the bug that moves \
+             a row out from under a click"
+        );
+        // ...but the FACTS did fold by replacement.
+        assert_eq!(rows[2].last_activity_ms, Some(99_999));
+
+        // A genuinely new session is an arrival, so it does place itself,
+        // and a session that is gone from the snapshot loses its row.
+        fold_rail(
+            &mut rows,
+            vec![
+                info("a", 100, Some(99_999)),
+                info("c", 300, None),
+                info("d", 400, None),
+            ],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["d", "c", "a"], "arrivals place, survivors hold");
+    }
+
+    /// Two sessions opened inside the same millisecond still need a
+    /// defined order, or the rail reshuffles itself between snapshots.
+    #[test]
+    fn a_tie_in_activity_is_broken_by_identity() {
+        let mut rows = Vec::new();
+        fold_rail(
+            &mut rows,
+            vec![info("bbbb", 5, None), info("aaaa", 5, None)],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["aaaa", "bbbb"]);
+    }
+
+    /// Stage AB: the row's primary label. A named session says its name; an
+    /// unnamed one says its provider — never an empty string, which is what
+    /// would draw the blank line this slice is not allowed to produce.
+    #[test]
+    fn an_unnamed_row_falls_back_to_the_provider_rather_than_to_nothing() {
+        let mut s = info("aaaa1111", 1, None);
+        assert_eq!(row_label(&s, "claude code"), "claude code");
+        s.title = Some("review the parser".into());
+        assert_eq!(row_label(&s, "claude code"), "review the parser");
+    }
+
+    /// The meta line is what tells two untitled sessions in one repo apart,
+    /// so the identity has to be on it — except where it would be said
+    /// twice.
+    #[test]
+    fn the_meta_line_names_the_session_unless_the_path_already_does() {
+        let mut s = info("aaaa1111", 1, None);
+        s.cwd = "/Users/x/proj".into();
+        assert_eq!(rail_meta_line(&s, Some("/Users/x")), "aaaa1111 · ~/proj");
+
+        let mut other = s.clone();
+        other.session_id = "bbbb2222".into();
+        assert_ne!(
+            rail_meta_line(&s, Some("/Users/x")),
+            rail_meta_line(&other, Some("/Users/x")),
+            "same repo, same provider — the meta line is the only thing \
+             left to tell them apart"
+        );
+
+        // An isolated session's cwd already ends in its own sid8.
+        s.cwd = "/Users/x/wt/proj/aaaa1111".into();
+        assert_eq!(rail_meta_line(&s, Some("/Users/x")), "~/wt/proj/aaaa1111");
     }
 }

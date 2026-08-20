@@ -86,10 +86,12 @@ fn boot(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext) {
 fn session(id: &str) -> SessionInfo {
     SessionInfo {
         session_id: id.into(),
+        title: None,
         provider: "claude-code".into(),
         model: None,
         cwd: "/tmp/eave-harness".into(),
         created_ts_ms: 1,
+        last_activity_ms: None,
         state: "idle".into(),
         live: false,
         epoch: 1,
@@ -4008,5 +4010,217 @@ fn the_launcher_shows_no_composer_to_type_into(cx: &mut TestAppContext) {
     assert!(
         shown(vcx, "composer-hint"),
         "the composer did not come back with the session",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage AB — the rail says which session.
+
+/// The title is the only rail fact whose length the OPERATOR controls, and
+/// it shares its line with the badge — the fact that says a session is
+/// waiting on you. The title has to lose that contest every time, by
+/// clipping itself rather than growing the row.
+///
+/// Asserted as **clearance**, not as fit. §Traps records the bug where
+/// "does not overflow" and "does not touch" turned out to be different
+/// questions: a title whose last glyph ends exactly where the badge begins
+/// reads as one run of text, and passes any test that only checks the row
+/// did not overflow.
+#[gpui::test]
+fn a_long_title_clips_itself_before_it_crowds_the_badge(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // The worst case that can actually reach a row: a title at the storage
+    // cap, on the state whose badge word is the longest, with the count
+    // suffix that makes it longer still.
+    let widest = "M".repeat(eave_core::store::TITLE_MAX_CHARS);
+    let mut named = session("aaaa1111");
+    named.title = Some(widest.clone());
+    named.state = "awaiting_approval".into();
+    named.pending_approvals = 3;
+    h.plumbing.push_rail(vec![named]);
+    vcx.run_until_parked();
+
+    let row = vcx.debug_bounds("rail-aaaa1111").expect("the row renders");
+    let label = vcx
+        .debug_bounds("label-aaaa1111")
+        .expect("the row states a label");
+    let badge = vcx
+        .debug_bounds("badge-aaaa1111")
+        .expect("the badge renders beside it");
+
+    // The badge kept its whole word. A badge squeezed to "waiting on…"
+    // states the wrong fact, and the row it is on is the one the operator
+    // is being asked to act on. The 1 px slack here and below is for
+    // rounding between the shaper and the laid-out box, never for a
+    // smaller gap.
+    let word = "waiting on you (3)";
+    let need = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
+    assert!(
+        badge.size.width >= need - px(1.),
+        "the badge got {:?} for a word needing {need:?} — the title took \
+         room that is not its to take",
+        badge.size.width
+    );
+
+    // The title genuinely could not fit, so this measures truncation and
+    // not a happy accident. It is also where the storage cap earns its
+    // value: `TITLE_MAX_CHARS` is deliberately past what the row can draw,
+    // because bounding the wire and bounding the display are different
+    // jobs and a cap tight enough to be the visual limit would silently
+    // destroy the operator's text.
+    let wanted = real_text_width(&widest, theme::SANS, theme::DETAIL_SIZE);
+    assert!(
+        wanted > label.size.width,
+        "a title at the cap ({wanted:?}) fits the label slot ({:?}) — then \
+         nothing here is testing truncation",
+        label.size.width
+    );
+
+    // Clearance, not adjacency: the row declares `gap_2`, and the whole of
+    // it has to still be there after the title clipped. `> 0` — the test
+    // §Traps records as insufficient — would pass on two boxes sharing an
+    // edge, which reads as one run of text.
+    let clearance = badge.origin.x - (label.origin.x + label.size.width);
+    assert!(
+        clearance >= px(theme::SPACE_2 - 1.0),
+        "only {clearance:?} between the title and the badge — the row lays \
+         out {:?} of gap and the title ate it",
+        px(theme::SPACE_2)
+    );
+
+    // And the badge is inside the rail, not pushed off its end.
+    assert!(
+        badge.origin.x + badge.size.width <= row.origin.x + row.size.width,
+        "the badge ran past the row's edge"
+    );
+}
+
+/// The slice's whole point. Two sessions in the same repo, under the same
+/// provider, in the same state used to be one row drawn twice.
+#[gpui::test]
+fn two_sessions_in_one_repo_do_not_render_as_the_same_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let a = session("aaaa1111");
+    let b = session("bbbb2222");
+    // Identical in every fact the rail stated before this slice.
+    assert_eq!(a.provider, b.provider);
+    assert_eq!(a.cwd, b.cwd);
+    assert_eq!(a.state, b.state);
+    h.plumbing.push_rail(vec![a.clone(), b.clone()]);
+    vcx.run_until_parked();
+
+    // Unnamed — and still told apart, without anyone having to do
+    // anything, because the meta line carries the session's identity.
+    assert!(shown(vcx, "cwd-aaaa1111") && shown(vcx, "cwd-bbbb2222"));
+    assert_ne!(rail_meta_line(&a, None), rail_meta_line(&b, None));
+
+    // Named — the label carries it, which is the version an operator
+    // actually reads.
+    let mut named_a = a.clone();
+    named_a.title = Some("review the parser".into());
+    let mut named_b = b.clone();
+    named_b.title = Some("chase the flake".into());
+    h.plumbing.push_rail(vec![named_a.clone(), named_b.clone()]);
+    vcx.run_until_parked();
+    assert!(shown(vcx, "label-aaaa1111") && shown(vcx, "label-bbbb2222"));
+    assert_ne!(
+        row_label(&named_a, "claude code"),
+        row_label(&named_b, "claude code")
+    );
+}
+
+/// A session with an empty journal has no title — and states that by not
+/// having a title line at all.
+///
+/// The assertion is on row HEIGHT, because "renders no empty line" is
+/// exactly the claim that a named row and an unnamed one are the same
+/// height: the title takes the label's slot rather than adding one above
+/// it. A blank line reserved for an absent title is the kind of defect
+/// that reads as a rendering bug rather than as an absent fact.
+#[gpui::test]
+fn an_unnamed_session_states_no_title_and_draws_no_empty_line(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let fresh = session("aaaa1111");
+    assert_eq!(fresh.title, None, "a fresh session is unnamed");
+    assert_eq!(fresh.last_seq, 0, "and its journal is empty");
+    h.plumbing.push_rail(vec![fresh.clone()]);
+    vcx.run_until_parked();
+
+    let unnamed_row = vcx.debug_bounds("rail-aaaa1111").unwrap().size.height;
+    let unnamed_label = vcx.debug_bounds("label-aaaa1111").unwrap().size.height;
+    // What it draws instead of nothing.
+    assert_eq!(row_label(&fresh, "claude code"), "claude code");
+
+    let mut named = fresh.clone();
+    named.title = Some("review the parser".into());
+    h.plumbing.push_rail(vec![named]);
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().size.height,
+        unnamed_row,
+        "the named row is a different height — the title added a line \
+         instead of taking the label's slot, which means the unnamed row \
+         has a blank one"
+    );
+    assert_eq!(
+        vcx.debug_bounds("label-aaaa1111").unwrap().size.height,
+        unnamed_label
+    );
+}
+
+/// comet shipped this bug: its rail sorted by attention, so merely opening
+/// a session changed that session's state, which re-sorted the rail, which
+/// slid the row out from under the pointer that had just clicked it.
+///
+/// So the ordering is asserted twice — that activity DOES place a row when
+/// it arrives, and that a state transition afterwards moves nothing — and
+/// then the click is actually performed, because a y-coordinate that holds
+/// still is only interesting if the click it protects lands.
+#[gpui::test]
+fn a_state_change_never_moves_a_row_under_the_pointer(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut older = session("aaaa1111");
+    older.created_ts_ms = 100;
+    let mut newer = session("bbbb2222");
+    newer.created_ts_ms = 200;
+    h.plumbing.push_rail(vec![older.clone(), newer.clone()]);
+    vcx.run_until_parked();
+
+    let y_older = vcx.debug_bounds("rail-aaaa1111").unwrap().origin.y;
+    let y_newer = vcx.debug_bounds("rail-bbbb2222").unwrap().origin.y;
+    assert!(
+        y_newer < y_older,
+        "activity has to decide position when a row arrives, or the rail \
+         is just insertion order"
+    );
+
+    // The older session becomes the most recently active one by a wide
+    // margin — the exact transition that made comet's rail jump.
+    older.state = "running".into();
+    older.live = true;
+    older.last_activity_ms = Some(9_000_000);
+    h.plumbing.push_rail(vec![older.clone(), newer.clone()]);
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().origin.y,
+        y_older,
+        "the row moved when its state changed"
+    );
+    assert_eq!(
+        vcx.debug_bounds("rail-bbbb2222").unwrap().origin.y,
+        y_newer,
+        "the OTHER row moved when a state changed — which is the version \
+         of this bug that hits the row you were aiming at"
+    );
+
+    // The fact did fold through, so the order is stable by choice rather
+    // than because nothing arrived.
+    h.drain();
+    click(vcx, "rail-aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Select(id)] if id == "aaaa1111"),
+        "the click landed somewhere else: {cmds:?}"
     );
 }
