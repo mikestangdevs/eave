@@ -6510,6 +6510,292 @@ impl Shell {
             )
             .into_any_element()
     }
+
+    /// A session that exists and has no turns yet (Slice AN).
+    ///
+    /// # What this replaced, and why three words were not an empty state
+    ///
+    /// Slice M put `"nothing sent yet"` in `text_tertiary` at
+    /// `SMALL_SIZE`, centred in a pane that is roughly two thirds of the
+    /// window. Photographed (`docs/shots/ah-eternal-skeleton-after.png`)
+    /// it reads as a failed load, not as a rest state — dead centre is the
+    /// **modal** position, so a small grey string sitting there is shaped
+    /// exactly like an error dialog with its buttons missing.
+    ///
+    /// The finding worth keeping is not that the caption was too small.
+    /// It is that **eave already had this design one screen away**: the
+    /// launcher ([`Shell::launcher_view`]) is a display headline, a quiet
+    /// line naming the working folder, and one obvious next step, and it
+    /// is the best-looking surface in the app. The transcript's empty
+    /// state was not missing a design — it was missing the design already
+    /// in the building. So this mirrors the launcher's ranks
+    /// ([`theme::DISPLAY_SIZE`] headline, [`theme::DETAIL_SIZE`] "in
+    /// <cwd>" line) rather than inventing a second idiom.
+    ///
+    /// # How it stays distinguishable from the launcher
+    ///
+    /// They answer different questions — the launcher asks *which agent,
+    /// in which folder*; this says *this session exists and has no turns*
+    /// — and both can be up in two windows at once, so telling them apart
+    /// at a glance is a requirement, not a nicety. Four things separate
+    /// them, and none of them is the wording:
+    ///
+    /// 1. **Shape.** The launcher is centred, unbounded, 700 px wide.
+    ///    This is a bounded card with a rim and a shadow, capped at
+    ///    [`theme::DIRECTIVE_MAX_W`] (560).
+    /// 2. **Alignment.** The launcher centres its text. This is left-
+    ///    aligned, on the transcript's own reading column.
+    /// 3. **Height.** The launcher sits dead centre of a pane with no
+    ///    composer under it. This sits at the upper third
+    ///    ([`theme::EMPTY_ABOVE`]:[`theme::EMPTY_BELOW`]) of the space
+    ///    above a composer that is mounted.
+    /// 4. **The near-white plate.** The launcher's `Start Claude Code` is
+    ///    the app's primary-action treatment and it stays unique to a
+    ///    screen that HAS a primary action. What carries the pigment here
+    ///    is a keycap, and the difference is the point (see below).
+    ///
+    /// # Why there is no button on it
+    ///
+    /// The brief allowed either "say what pressing return will do" or
+    /// "offer the primary action". There is no primary action to offer,
+    /// and shipping one would have meant shipping a lie:
+    ///
+    /// - **There is no focus step.** `on_key` is mounted on the shell's
+    ///   root focus handle, so every keystroke already reaches the
+    ///   composer the instant a session is selected. A "Write the first
+    ///   message" button would call `window.focus` on a handle that
+    ///   already has focus — a no-op wearing the app's loudest pigment.
+    /// - **`send_current` on an empty draft emits nothing**, so a "Send"
+    ///   button would be inert in exactly the state this card is up for.
+    /// - Prefilling a canned prompt is the third option and it is worse
+    ///   than both: it invents a command and puts words in the operator's
+    ///   mouth.
+    ///
+    /// So the action is stated, on a keycap, in the primary pigment — and
+    /// the sentence beside it is the one deleted from the composer, moved
+    /// to the one screen where its reader has not yet learned it.
+    ///
+    /// The **cwd line is clickable** and is the only clickable thing on
+    /// the card: it routes through [`open_in_system`], which already
+    /// exists for the worktree affordance and the diff pane's ⌘-click, so
+    /// no new command was invented and the harness can assert the intent
+    /// without launching Finder.
+    ///
+    /// # Where it mounts
+    ///
+    /// The same slot the caption used and the launcher uses: an absolute
+    /// overlay bottomed at [`theme::COMPOSER_CLEARANCE`], outside the
+    /// edge-fade scope and outside the virtualized list. That is what
+    /// makes "it cannot collide with the composer" a property of the
+    /// layout rather than of a measurement, and what keeps it from ever
+    /// touching a cached row height.
+    fn transcript_empty_view(e: EmptyState) -> AnyElement {
+        // The entrance rides an INNER div, and the key is Slice M's
+        // (`in:empty-note`): this box is absolute, `relative()` on it
+        // would destroy that outright, and re-keying it would silently
+        // re-run the entrance for a card that is already on screen.
+        let t = motion::entrance_t("in:empty-note", motion::FADE_IN);
+        let cwd = e.cwd.clone();
+
+        div()
+            .debug_selector(|| "transcript-empty".into())
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom(px(theme::COMPOSER_CLEARANCE))
+            .flex()
+            .flex_col()
+            // The upper-third placement, as spacers rather than as a pad:
+            // a fixed top pad is a number that is right at one window
+            // height and wrong at every other, and this pane's height is
+            // whatever is left after a titlebar, a plate margin and a
+            // composer.
+            .child(div().flex_grow(theme::EMPTY_ABOVE).min_h(px(0.)))
+            .child(
+                Self::column(
+                    div().flex().flex_col().items_start().child(
+                        div()
+                            .opacity(t)
+                            .relative()
+                            .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
+                            .max_w(px(theme::DIRECTIVE_MAX_W))
+                            .min_w(px(0.))
+                            .rounded(px(theme::RADIUS_PANEL))
+                            .border_1()
+                            .border_color(theme::border_strong())
+                            .bg(theme::chrome_glass())
+                            .shadow(theme::shadow_panel())
+                            .px(px(theme::SPACE_4))
+                            .py(px(theme::SPACE_3))
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_3))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_HALF))
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "empty-title".into())
+                                            .text_size(px(theme::DISPLAY_SIZE))
+                                            .line_height(px(theme::DISPLAY_LINE))
+                                            .font_weight(theme::WEIGHT_STRONG)
+                                            .text_color(theme::text())
+                                            .child("Ready for the first turn"),
+                                    )
+                                    .child(
+                                        // Where it will run and what
+                                        // it will drive, stated before
+                                        // it runs rather than
+                                        // discovered afterwards — the
+                                        // launcher's own argument for
+                                        // its cwd line, and the same
+                                        // rank.
+                                        div()
+                                            .id("empty-where")
+                                            .debug_selector(|| "empty-where".into())
+                                            .text_size(px(theme::DETAIL_SIZE))
+                                            .line_height(px(theme::DETAIL_LINE))
+                                            .text_color(theme::text_tertiary())
+                                            .cursor_pointer()
+                                            .on_click(move |_, _, _| {
+                                                open_in_system(Path::new(&cwd));
+                                            })
+                                            .child(e.where_line()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_2))
+                                    .child(
+                                        // A KEYCAP, not a button. Every
+                                        // button in this app carries a
+                                        // verb ("new", "rename",
+                                        // "isolate", "Start Claude
+                                        // Code"); a plate holding the
+                                        // name of a key and no verb is
+                                        // not one, and it takes no
+                                        // pointer cursor and no hover
+                                        // fade, so it never offers a
+                                        // press it cannot honour.
+                                        div()
+                                            .debug_selector(|| "empty-key".into())
+                                            .px(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_BUTTON))
+                                            .bg(theme::inverse())
+                                            .text_size(px(theme::LABEL_SIZE))
+                                            .line_height(px(theme::LABEL_LINE))
+                                            .font_weight(theme::WEIGHT_LABEL)
+                                            .text_color(theme::on_inverse())
+                                            .child(RETURN_KEY),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "empty-action".into())
+                                            .text_size(px(theme::DETAIL_SIZE))
+                                            .line_height(px(theme::DETAIL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .child(EMPTY_ACTION),
+                                    ),
+                            ),
+                    ),
+                )
+                .flex_none(),
+            )
+            .child(div().flex_grow(theme::EMPTY_BELOW).min_h(px(0.)))
+            .into_any_element()
+    }
+}
+
+/// What the composer's trailing line says, if anything (Slice AN).
+///
+/// Empty is a real answer and the common one. `"return to send"` used to
+/// be printed on every frame of every session forever — a caption
+/// describing an action the reader mostly could not take, because
+/// `Shell::send_current` emits nothing on an empty draft. It burned the
+/// composer's second line on a hint that had already been read.
+///
+/// The three cases, in the order they are checked:
+///
+/// 1. **A question is open.** Slice K's warning, unconditionally. This is
+///    not a hint — the CLI silently queues a message sent while a
+///    permission is pending (capture N, 2026-08-18), so this is a live
+///    fact about what the send will do, and it outranks everything.
+/// 2. **A draft exists.** Then the hint is describing something the
+///    reader can do right now, and it is worth its line. This is the
+///    brief's "show it on focus", spelled for an app whose composer has
+///    no focus of its own: `Shell::on_key` is mounted on the shell's root
+///    handle, so a non-empty draft is the only honest signal that
+///    somebody is typing into it.
+/// 3. **Neither.** Nothing. The first-run reader who has not learned the
+///    keystroke is looking at the empty-state card
+///    ([`Shell::transcript_empty_view`]), which states it on a keycap;
+///    every other reader has sent a message before.
+fn composer_hint(pending: usize, has_draft: bool) -> &'static str {
+    if pending > 0 {
+        "return to send — queued behind the approval above until you answer"
+    } else if has_draft {
+        "return to send"
+    } else {
+        ""
+    }
+}
+
+/// The name of the key on a macOS keyboard. Spelled out rather than drawn
+/// as `⏎`, because the physical key this refers to has the word printed
+/// on it and a glyph would be eave's translation of it.
+const RETURN_KEY: &str = "return";
+
+/// What that key does, on the one screen whose reader has not learned it
+/// yet. This sentence used to live in the composer permanently, on every
+/// screen, forever (see the `composer-hint` build).
+const EMPTY_ACTION: &str = "sends what you type below";
+
+/// The two facts the empty-state card orients on, lifted off the session
+/// the rail already holds.
+///
+/// A struct rather than a formatted string so the *composition* of the
+/// line is testable as a pure function — `where_line` is the thing with
+/// branches in it, and it has none of a window's dependencies.
+#[derive(Debug, Clone, PartialEq)]
+struct EmptyState {
+    /// The provider's display label, from [`provider_identity`] — the same
+    /// call the rail row's chip and label are drawn from, so the card and
+    /// the row can never name the same session's agent differently.
+    provider: String,
+    /// Verbatim as the session reports it, for [`open_in_system`]; the
+    /// displayed form is home-relative.
+    cwd: String,
+    /// `None` = the CLI's own default. Omitted from the line rather than
+    /// rendered as a guess: the launcher's "CLI default" is vocabulary for
+    /// *choosing* not to pass `--model`, and repeating it here would
+    /// present the absence of a flag as the name of a model.
+    model: Option<String>,
+}
+
+impl EmptyState {
+    fn of(info: &SessionInfo) -> Self {
+        let (_, provider) = provider_identity(&info.provider);
+        Self {
+            provider,
+            cwd: info.cwd.clone(),
+            model: info.model.clone(),
+        }
+    }
+
+    /// `claude code · opus · in ~/Desktop/eave/eave`
+    fn where_line(&self) -> String {
+        let cwd = tilde(Path::new(&self.cwd));
+        match self.model.as_deref() {
+            Some(m) => format!("{} · {m} · in {cwd}", self.provider),
+            None => format!("{} · in {cwd}", self.provider),
+        }
+    }
 }
 
 impl Render for Shell {
@@ -6642,9 +6928,18 @@ impl Render for Shell {
         // says nothing still says nothing — a replay in flight over a
         // 200-message journal must not be captioned "nothing sent yet" for
         // the length of a round trip.
+        //
+        // Slice AN turned the second case from a three-word caption into a
+        // card, so what this computes is no longer a string but the two
+        // facts the card orients on: where the session works and what it
+        // drives. **The gate itself is byte-for-byte the one Slice M
+        // wrote** — same `find`, same `last_seq == 0` filter, same three
+        // outcomes — because the case analysis above is the part that was
+        // right, and a card is a lie in exactly the same circumstances a
+        // caption was.
         let show_launcher = state.session_id.is_none();
         let launch_error = state.launch_error.clone();
-        let empty_note: Option<&'static str> = if !state.display.is_empty() {
+        let empty_state: Option<EmptyState> = if !state.display.is_empty() {
             None
         } else if let Some(sid) = state.session_id.as_deref() {
             self.sessions
@@ -6653,7 +6948,7 @@ impl Render for Shell {
                 .iter()
                 .find(|s| s.session_id == sid)
                 .filter(|s| s.last_seq == 0)
-                .map(|_| "nothing sent yet")
+                .map(EmptyState::of)
         } else {
             None
         };
@@ -6751,13 +7046,45 @@ impl Render for Shell {
                                 // that would show as a send stuck pending
                                 // with no stated reason, so the composer
                                 // says the reason.
-                                .child(SharedString::from(if pending_here > 0 {
-                                    "return to send — queued behind the approval above until \
-                                     you answer"
-                                        .to_string()
-                                } else {
-                                    "return to send".to_string()
-                                })),
+                                //
+                                // Slice AN: the slot is the same, and what
+                                // it says now depends on whether there is
+                                // anything true to say. `"return to send"`
+                                // used to be printed here on every frame
+                                // of every session forever, which is a
+                                // permanent caption describing an action
+                                // the reader mostly cannot take — with an
+                                // empty draft, `send_current` emits
+                                // nothing. So:
+                                //
+                                //   pending approval -> the WARNING, always
+                                //                       (a live fact about
+                                //                       what your send will
+                                //                       do, not a hint)
+                                //   a draft exists   -> the hint, which is
+                                //                       now describing an
+                                //                       action that is
+                                //                       actually available
+                                //   otherwise        -> nothing at all
+                                //
+                                // "Show it on focus" was the brief's other
+                                // option and this is that, in an app whose
+                                // composer has no focus of its own: every
+                                // keystroke reaches the shell's root focus
+                                // handle, so a non-empty draft is the only
+                                // honest signal that somebody is in the
+                                // composer.
+                                //
+                                // **The element stays mounted either way.**
+                                // `composer-hint` is the harness's probe
+                                // for "is a composer on screen at all"
+                                // (three tests), and the row's height is
+                                // set by `SEND_BUTTON` (26) rather than by
+                                // this line (`MICRO_LINE`, 14) — so
+                                // emptying it changes no geometry, which
+                                // `emptying_the_composer_hint_moves_nothing`
+                                // pins.
+                                .child(SharedString::from(composer_hint(pending_here, has_draft))),
                         )
                         .child(div().flex_1())
                         .child(
@@ -6835,6 +7162,9 @@ impl Render for Shell {
         // model menu both need `self` and `cx`, and the element chain
         // below has neither to spare.
         let launcher_el = show_launcher.then(|| self.launcher_view(launch_error.as_deref(), cx));
+        // Built here for the same reason the launcher is: the element
+        // chain below has neither `self` nor `cx` to spare.
+        let empty_el = empty_state.map(Self::transcript_empty_view);
         let launcher_menu = self.launcher_menu_layer(cx);
 
         // Opaque window by default, custom titlebar — locked decision
@@ -6928,36 +7258,12 @@ impl Render for Shell {
                                     // a row height. Held above the
                                     // composer's clearance so it is never
                                     // read through the frost.
-                                    .children(empty_note.map(|note| {
-                                        // §1.3. The entrance rides an INNER
-                                        // div: the note's own box is
-                                        // absolute (it is an overlay pinned
-                                        // above the composer's clearance)
-                                        // and `relative()` would destroy
-                                        // that positioning outright.
-                                        let t =
-                                            motion::entrance_t("in:empty-note", motion::FADE_IN);
-                                        div()
-                                            .debug_selector(|| "transcript-empty".into())
-                                            .absolute()
-                                            .top_0()
-                                            .left_0()
-                                            .right_0()
-                                            .bottom(px(theme::COMPOSER_CLEARANCE))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(theme::SMALL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_tertiary())
-                                            .child(
-                                                div()
-                                                    .opacity(t)
-                                                    .relative()
-                                                    .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
-                                                    .child(note),
-                                            )
-                                    }))
+                                    //
+                                    // Slice AN kept the slot exactly and
+                                    // replaced what sits in it; the
+                                    // reasoning above is why the slot is
+                                    // the right one for a card too.
+                                    .children(empty_el)
                                     // Slice Q2 — the launcher, in exactly
                                     // the slot the note it replaced used:
                                     // an overlay outside both the fade
@@ -8317,5 +8623,78 @@ mod tests {
         );
         // Not reachable through today's filter, and stated anyway.
         assert_eq!(rail_empty_note(4, 1), "nothing to show — 1 of 4 archived");
+    }
+
+    // -----------------------------------------------------------------
+    // Slice AN — the empty state's words.
+
+    /// The card's orientation line names **where** and **what**, and it
+    /// gets both from the session the rail already holds rather than from
+    /// anything it guesses.
+    ///
+    /// The provider comes through `provider_identity`, which is the same
+    /// call the rail row's chip and label are drawn from — so the card and
+    /// the row can never name one session's agent two different ways.
+    #[test]
+    fn the_empty_state_names_the_folder_and_the_agent() {
+        let mut s = info("aaaa1111", 1, None);
+        s.provider = "claude-code".into();
+        s.cwd = "/tmp/repo".into();
+        s.model = None;
+        assert_eq!(
+            EmptyState::of(&s).where_line(),
+            "claude code · in /tmp/repo",
+            "the orientation line lost the folder or the agent"
+        );
+
+        // A configured model is a fact about this session and belongs on
+        // the line.
+        s.model = Some("opus".into());
+        assert_eq!(
+            EmptyState::of(&s).where_line(),
+            "claude code · opus · in /tmp/repo"
+        );
+    }
+
+    /// **An unset model is omitted, never rendered as a name.** The
+    /// launcher's "CLI default" is vocabulary for *choosing* not to pass
+    /// `--model`; repeated here it would present the absence of a flag as
+    /// the name of a model, which is the same class of lie as inventing a
+    /// session title.
+    #[test]
+    fn an_unset_model_is_left_off_rather_than_guessed() {
+        let mut s = info("aaaa1111", 1, None);
+        s.model = None;
+        let line = EmptyState::of(&s).where_line();
+        assert!(
+            !line.contains("default") && !line.contains("·  ·"),
+            "an unconfigured model surfaced as a name: {line:?}"
+        );
+    }
+
+    /// The composer's trailing line, which used to be a permanent caption.
+    ///
+    /// The ordering is the assertion: a pending question outranks a draft,
+    /// because that string is not a hint at all — it is Slice K's warning
+    /// that the CLI will swallow the send until the question is answered,
+    /// and a person mid-sentence is exactly who needs to be told.
+    #[test]
+    fn the_composer_states_the_keystroke_only_when_it_is_true() {
+        assert_eq!(
+            composer_hint(0, false),
+            "",
+            "the composer is still captioning an action nobody can take — \
+             `send_current` emits nothing on an empty draft"
+        );
+        assert_eq!(composer_hint(0, true), "return to send");
+
+        for drafting in [false, true] {
+            let warned = composer_hint(2, drafting);
+            assert!(
+                warned.contains("queued behind the approval"),
+                "a question is open and the composer did not say the send \
+                 would queue (draft={drafting}): {warned:?}"
+            );
+        }
     }
 }

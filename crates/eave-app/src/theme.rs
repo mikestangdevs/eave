@@ -488,6 +488,20 @@ pub const SANS: &str = ".SystemUIFont";
 /// Menlo ships on every macOS; SF Mono and JetBrains Mono do not.
 pub const MONO: &str = "Menlo";
 
+/// **The announce rank.** The one line on a screen that is allowed to be
+/// big, and the only rank above a heading: the launcher's "Start a
+/// session", the transcript's empty-state headline. Nothing that recurs
+/// may use it — a rank that appears twice on one screen has stopped
+/// announcing anything.
+///
+/// 20/26 are [`LAUNCHER_TITLE_SIZE`]/[`LAUNCHER_TITLE_LINE`]'s values,
+/// promoted to a name. The launcher already had the app's only display
+/// line and had to invent a private constant for it; this is that
+/// constant given a role, so the second consumer inherits the first's
+/// numbers rather than picking its own.
+pub const DISPLAY_SIZE: f32 = 20.0;
+pub const DISPLAY_LINE: f32 = 26.0;
+
 /// Prose body (assistant text): waku `BODY`.
 pub const BODY_SIZE: f32 = 13.5;
 pub const BODY_LINE: f32 = 21.0;
@@ -666,6 +680,21 @@ pub const LAUNCHER_MAX_W: f32 = 700.0;
 /// place eave says its own name.
 pub const LAUNCHER_TITLE_SIZE: f32 = 20.0;
 pub const LAUNCHER_TITLE_LINE: f32 = 26.0;
+
+/// Where the transcript's empty-state card sits in the free space above
+/// the composer, as a flex-grow pair: `EMPTY_ABOVE` parts of spacer over
+/// it, `EMPTY_BELOW` parts under it.
+///
+/// **Dead centre is the modal convention** — a box in the exact middle of
+/// a pane is what an alert looks like, which is why "nothing sent yet"
+/// centred in a black rectangle read as a failure rather than as a rest
+/// state. 1:2 puts the card's top edge at a third of the free height,
+/// which is where an opening block sits on a page, and leaves the gap
+/// between the card and the composer visibly larger than the gap above
+/// it — so the card reads as belonging to the top of the pane rather than
+/// as hovering over the input.
+pub const EMPTY_ABOVE: f32 = 1.0;
+pub const EMPTY_BELOW: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
 // Provider marks (Slice Q1) — a vendor's own logo, not a glyph.
