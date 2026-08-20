@@ -118,6 +118,259 @@ fn hang_forever() -> ! {
     }
 }
 
+// ---- Slice AV: the ACP (Grok) protocol ------------------------------
+//
+// `GrokSession` speaks JSON-RPC over the same pipes, so these modes answer
+// an `initialize`/`session/new`/`session/prompt` handshake instead of
+// printing Claude's stream-JSON. Everything else about the harness — the
+// process group, the SIGTERM behaviours, the hang modes — is protocol
+// agnostic and is reused by the Grok tests unchanged.
+
+/// The session id the fake ACP agent issues. Grok mints its own at
+/// `session/new` (it accepts no caller-chosen id), so this is deliberately
+/// NOT derived from argv the way `session_id()` is.
+fn acp_session_id() -> String {
+    std::env::var("FAKE_ACP_SESSION")
+        .unwrap_or_else(|_| "01a0fake-0000-7000-8000-000000000001".into())
+}
+
+fn acp_result(id: &serde_json::Value, result: serde_json::Value) {
+    emit(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+}
+
+/// A session update on the standard ACP channel.
+fn acp_update(update: serde_json::Value) {
+    emit(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "sessionId": acp_session_id(), "update": update },
+    }));
+}
+
+/// A session update on Grok's vendor channel. `turn_completed` really does
+/// arrive only here, so the tests must see it here too.
+fn acp_vendor_update(update: serde_json::Value) {
+    emit(json!({
+        "jsonrpc": "2.0",
+        "method": "_x.ai/session_notification",
+        "params": { "sessionId": acp_session_id(), "update": update },
+    }));
+}
+
+/// The posture record. `yolo` is the fact eave gates the whole session on.
+fn acp_posture(yolo: bool) {
+    emit(json!({
+        "jsonrpc": "2.0",
+        "method": "_x.ai/sessions/changed",
+        "params": {
+            "upserted": [{
+                "sessionId": acp_session_id(),
+                "cwd": std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "modelId": "grok-4.6",
+                "yolo": yolo,
+                "activity": "working",
+                "resident": true,
+            }],
+            "removed": [],
+        },
+    }));
+}
+
+fn acp_read() -> Option<serde_json::Value> {
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => serde_json::from_str(&line).ok(),
+    }
+}
+
+/// Drive one ACP conversation. `mode` selects what happens on the first
+/// `session/prompt`.
+fn run_acp(mode: &str) {
+    let mut turns = 0;
+    loop {
+        let Some(msg) = acp_read() else { return };
+        let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match msg.get("method").and_then(|m| m.as_str()) {
+            Some("initialize") => acp_result(
+                &id,
+                json!({
+                    "protocolVersion": 1,
+                    "agentCapabilities": { "loadSession": true },
+                }),
+            ),
+            Some("session/new") => {
+                acp_result(&id, json!({ "sessionId": acp_session_id() }));
+            }
+            Some("session/load") => {
+                // Resume: the id came from the caller, so the result names
+                // metadata only — exactly as the real agent does.
+                acp_result(&id, json!({ "models": { "currentModelId": "grok-4.6" } }));
+            }
+            Some("session/prompt") => {
+                turns += 1;
+                let text = msg["params"]["prompt"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                acp_turn(mode, &id, &text, turns);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn acp_turn(mode: &str, id: &serde_json::Value, text: &str, turns: u32) {
+    match mode {
+        "acp-asks" => {
+            acp_posture(false);
+            acp_update(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": format!("heard: {text}") },
+            }));
+            acp_vendor_update(json!({
+                "sessionUpdate": "turn_completed",
+                "stop_reason": "end_turn",
+            }));
+            acp_result(id, json!({ "stopReason": "end_turn" }));
+        }
+        // A session running with auto-approve: it states the posture and
+        // eave must refuse it before anything happens.
+        "acp-yolo" => {
+            acp_posture(true);
+            acp_update(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "working unsupervised" },
+            }));
+            acp_vendor_update(json!({
+                "sessionUpdate": "turn_completed",
+                "stop_reason": "end_turn",
+            }));
+            acp_result(id, json!({ "stopReason": "end_turn" }));
+        }
+        // A session that never states a posture and starts a tool anyway:
+        // the fail-closed backstop.
+        "acp-no-posture" => {
+            acp_update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-fake-1",
+                "title": "write",
+                "rawInput": { "file_path": "/tmp/eave-fake/x.txt" },
+                "_meta": { "x.ai/tool": { "name": "write", "label": "Write" } },
+            }));
+            acp_vendor_update(json!({
+                "sessionUpdate": "turn_completed",
+                "stop_reason": "end_turn",
+            }));
+            acp_result(id, json!({ "stopReason": "end_turn" }));
+        }
+        // Ask once, then report exactly what the operator decided — the
+        // round trip that proves eave's answer reached the agent.
+        "acp-approval" | "acp-approval-hang" => {
+            // A denial ends the turn, so the operator's follow-up message
+            // arrives as a SECOND prompt. Echo it rather than re-asking.
+            if turns > 1 {
+                acp_update(json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": format!("FOLLOWUP:{text}") },
+                }));
+                acp_vendor_update(json!({
+                    "sessionUpdate": "turn_completed",
+                    "stop_reason": "end_turn",
+                }));
+                acp_result(id, json!({ "stopReason": "end_turn" }));
+                return;
+            }
+            acp_posture(false);
+            let path = std::env::var("FAKE_APPROVAL_PATH")
+                .unwrap_or_else(|_| "/tmp/eave-fake/note.txt".into());
+            acp_update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-fake-1",
+                "title": format!("Write `{path}`"),
+                "rawInput": { "file_path": path, "content": "hi" },
+                "_meta": { "x.ai/tool": { "name": "write", "label": "Write" } },
+            }));
+            emit(json!({
+                "jsonrpc": "2.0",
+                "id": 900,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": acp_session_id(),
+                    "toolCall": {
+                        "toolCallId": "call-fake-1",
+                        "kind": "edit",
+                        "title": format!("Write `{path}`"),
+                        "rawInput": { "file_path": path, "content": "hi" },
+                        "_meta": { "x.ai/tool": {
+                            "name": "write", "label": "Write", "read_only": false,
+                            "input": { "path": path },
+                        }},
+                    },
+                    "options": [
+                        { "optionId": "allow-edits-session",
+                          "name": "Yes, allow all edits during this session",
+                          "kind": "allow_always" },
+                        { "optionId": "allow-once", "name": "Yes", "kind": "allow_once" },
+                        { "optionId": "reject-once",
+                          "name": "No, and tell Grok what to do differently",
+                          "kind": "reject_once" },
+                    ],
+                },
+            }));
+            if mode == "acp-approval-hang" {
+                // Nobody will ever be told the answer: the deterministic
+                // shape for the clock-hold and withdrawal tests.
+                hang_forever();
+            }
+            // Wait for the decision, ignoring anything else on stdin.
+            loop {
+                let Some(reply) = acp_read() else { return };
+                if reply.get("id").and_then(|i| i.as_i64()) != Some(900) {
+                    continue;
+                }
+                let outcome = &reply["result"]["outcome"];
+                let verdict = match outcome["outcome"].as_str() {
+                    Some("selected") => outcome["optionId"].as_str().unwrap_or("?").to_string(),
+                    Some(other) => other.to_string(),
+                    None => "malformed".to_string(),
+                };
+                let allowed = verdict == "allow-once";
+                acp_update(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-fake-1",
+                    "status": if allowed { "completed" } else { "failed" },
+                    "content": [{ "type": "content", "content": {
+                        "type": "text",
+                        "text": format!("DECISION:{verdict}"),
+                    }}],
+                }));
+                acp_update(json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": format!("DECISION:{verdict}") },
+                }));
+                acp_vendor_update(json!({
+                    "sessionUpdate": "turn_completed",
+                    "stop_reason": if allowed { "end_turn" } else { "cancelled" },
+                }));
+                acp_result(
+                    id,
+                    json!({
+                        "stopReason": if allowed { "end_turn" } else { "cancelled" },
+                    }),
+                );
+                return;
+            }
+        }
+        other => {
+            eprintln!("fake-agent: unknown ACP mode {other}");
+            std::process::exit(64);
+        }
+    }
+}
+
 fn main() {
     let mode = std::env::var("FAKE_MODE").unwrap_or_else(|_| "normal".into());
 
@@ -517,6 +770,9 @@ fn main() {
             emit_text(&report);
             emit_result();
         }
+        // Slice AV: the Grok adapter's protocol. These answer JSON-RPC on
+        // stdin rather than printing stream-JSON at startup.
+        acp if acp.starts_with("acp-") => run_acp(acp),
         other => {
             eprintln!("fake-agent: unknown FAKE_MODE {other}");
             std::process::exit(64);
