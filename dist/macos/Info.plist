@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template for eave.app/Contents/Info.plist. `scripts/package-macos.sh`
+     substitutes __VERSION__ from the workspace version before copying it in.
+
+     CFBundleIdentifier is load-bearing and effectively permanent: macOS keys
+     preferences, Keychain items, TCC grants (accessibility, screen capture)
+     and notarization records off it. Changing it later orphans every one of
+     those on machines that already ran an older build. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>eave</string>
+    <key>CFBundleExecutable</key>
+    <string>eave</string>
+    <key>CFBundleIconFile</key>
+    <string>eave.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.summitpoint.eave</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>eave</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <!-- gpui at our pin targets Metal 3 features available from Ventura. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 Michael Stang</string>
+    <!-- gpui renders via Metal. -->
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>

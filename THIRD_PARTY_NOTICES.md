@@ -39,3 +39,21 @@ enough" imitation of someone's logo is a worse position than not using one.
 
 None embedded. eave asks the platform for `theme::SANS` / `theme::MONO` by
 name and takes what the system resolves.
+
+## Build tooling
+
+`scripts/package-macos.sh` is adapted from **comet**'s script of the same name
+(Copyright © 2026 Wing, **MIT**), in the same workspace. MIT requires the
+copyright notice and permission notice to travel with substantial portions of
+the work, and the bundling, signing and notarisation sequence here is
+substantially theirs — the codesign flags, the staple-before-tar ordering, and
+the `dmgbuild` settings block in particular.
+
+The MIT text is reproduced with the upstream source; the notice it requires is
+this entry. Nothing from comet is embedded in eave's binary: this is build
+tooling, and it is listed for the same reason the icons are — because the
+licence asks, not as a courtesy.
+
+Where this script diverges from theirs the divergence is marked in a comment:
+the icon step is optional (eave has no app mark yet), the dmg carries no
+background artwork, and there is no Linux target.
