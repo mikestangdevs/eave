@@ -3394,7 +3394,7 @@ impl Shell {
             .collect();
         // The second line aligns under the session name: dot + gap +
         // chip + gap.
-        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::ICON_SM + theme::SPACE_2;
+        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
         let rows: Vec<AnyElement> = sessions
             .into_iter()
             .map(|info| {
@@ -3578,46 +3578,63 @@ impl Shell {
                             // withdrawn. The initials remain the fallback
                             // for a provider eave has no logo for, so a
                             // future adapter cannot produce an empty chip.
-                            .child(match provider_mark(&info.provider) {
-                                // `ICON_SM`, not `ICON_MARK` (18) and
-                                // certainly not the launcher's
-                                // `ICON_MARK_LG` (28): a tile is 112 px
-                                // wide and its mark is the subject, a rail
-                                // row is 224 px wide and its mark is a
-                                // label for the name beside it. Every pixel
-                                // here is one the name does not get, and
-                                // the name is what a person reads the row
-                                // by. No new constant — 16 is a rank the
-                                // theme already has.
-                                Some(mark) => div()
-                                    .size(px(theme::ICON_SM))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(icons::tagged_icon(
-                                        mark,
-                                        theme::ICON_SM,
-                                        provider_mark_ink(&info.provider),
-                                        format!("chip-{}", info.session_id),
-                                    ))
-                                    .into_any_element(),
-                                None => div()
-                                    .debug_selector(|| format!("chip-{}", info.session_id))
-                                    .size(px(theme::ICON_SM))
+                            // Both shapes are the SAME 18 px plate, and
+                            // that is what makes them interchangeable: a
+                            // provider with a logo and one without produce
+                            // rows with identical metrics, so the folder
+                            // line under them aligns either way.
+                            //
+                            // The plate is not decoration. `claude_brand`
+                            // (#D97757) on a washed row measures 2.55:1 at
+                            // the bright end of the backdrop sweep, under
+                            // the 3:1 non-text floor; on `chip_plate` it is
+                            // 6.01:1 on every row in every state, because
+                            // an opaque plate takes the desktop out of the
+                            // question entirely. Measured in
+                            // `theme::tests::a_provider_mark_clears_the_non_text_floor_on_its_own_plate`.
+                            .child(
+                                div()
+                                    .size(px(theme::PROVIDER_CHIP))
                                     .flex_none()
                                     .rounded(px(theme::RADIUS_CHIP))
-                                    .border_1()
-                                    .border_color(theme::border_strong())
+                                    .bg(theme::chip_plate())
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .font_family(theme::MONO)
-                                    .text_size(px(theme::MICRO_SIZE))
-                                    .text_color(theme::text_secondary_on_wash())
-                                    .child(SharedString::from(glyph))
-                                    .into_any_element(),
-                            })
+                                    .child(match provider_mark(&info.provider) {
+                                        // 12 in an 18 px plate. A mark at
+                                        // the plate's full size reads as a
+                                        // crop rather than as an icon, and
+                                        // the launcher's `ICON_MARK_LG`
+                                        // (28) is sized for a 112 px tile
+                                        // where the mark is the subject —
+                                        // here it is a label for the name
+                                        // beside it, and every pixel it
+                                        // takes is one the name does not
+                                        // get.
+                                        Some(mark) => icons::tagged_icon(
+                                            mark,
+                                            12.0,
+                                            provider_mark_ink(&info.provider),
+                                            format!("chip-{}", info.session_id),
+                                        )
+                                        .into_any_element(),
+                                        // The fallback for a provider eave
+                                        // has no logo for. It keeps the
+                                        // plate, so an unknown provider is
+                                        // a different chip rather than a
+                                        // missing one.
+                                        None => div()
+                                            .debug_selector(|| {
+                                                format!("chip-{}", info.session_id)
+                                            })
+                                            .font_family(theme::MONO)
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .text_color(theme::text_secondary_on_wash())
+                                            .child(SharedString::from(glyph))
+                                            .into_any_element(),
+                                    }),
+                            )
                             .child(match editing_here {
                                 // Stage AC: the rename field, in the
                                 // label's own slot. Same box, same
