@@ -4836,7 +4836,16 @@ impl Shell {
                             .w(px(theme::LIST_GUTTER_W))
                             .flex_shrink_0()
                             .flex()
-                            .justify_end()
+                            // An ordinal is read from its RIGHT edge — the
+                            // periods of "9." and "10." line up or the
+                            // column looks broken. A bullet and a checkbox
+                            // are read from their centres, and a capture of
+                            // a mixed list showed the two disagreeing by
+                            // eight pixels when everything was right-aligned.
+                            .map(|d| match item.marker {
+                                Marker::Number(_) => d.justify_end(),
+                                _ => d.justify_center(),
+                            })
                             .child(Self::list_marker(item.marker, item.depth)),
                     )
                     .child(
@@ -4860,17 +4869,21 @@ impl Shell {
 
     /// A pipe table, as columns.
     ///
-    /// **The width decision, stated:** the table never scrolls and never
-    /// widens the transcript. Columns are laid out with a zero basis and a
-    /// flex grow proportional to their longest cell, so the row is exactly
-    /// the content column wide whatever the table holds; cell text WRAPS
-    /// inside its column; and the container clips, which only bites for a
-    /// single unbreakable token wider than its own column (a long URL in a
-    /// narrow column). The alternatives were rejected for one reason each:
-    /// a horizontally scrolling row hides data behind a gesture with no
-    /// affordance in a list that already owns the vertical one, and
-    /// letting the row grow makes the whole transcript scroll sideways —
-    /// every paragraph in the session paying for one table.
+    /// **The width decision, stated: it WRAPS.** The table never scrolls
+    /// and never widens the transcript. Columns take a zero flex basis and
+    /// a grow proportional to their longest cell, so the row is exactly the
+    /// content column wide whatever the table holds, and cell text wraps
+    /// inside its own column. `overflow_hidden` is a backstop rather than
+    /// the mechanism — verified by capture, gpui breaks even a single
+    /// unbreakable 120-character token at the column edge rather than
+    /// letting it overhang, so the clip is what catches a case that has not
+    /// been produced yet, not the everyday behaviour.
+    ///
+    /// The two alternatives were rejected for one reason each: a
+    /// horizontally scrolling row hides data behind a gesture with no
+    /// affordance, inside a list that already owns the vertical one; and
+    /// letting the row grow makes the WHOLE transcript scroll sideways, so
+    /// every paragraph in the session pays for one table.
     fn render_table(text: &str) -> AnyElement {
         let t = markdown::table_view(text, theme::TABLE_MAX_ROWS, theme::TABLE_CELL_MAX_CHARS);
         if t.cols() == 0 {
