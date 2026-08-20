@@ -6216,17 +6216,19 @@ fn the_empty_state_clears_the_composer_it_points_at(cx: &mut TestAppContext) {
     );
 }
 
-/// **Upper third, not dead centre.** Dead centre is where an alert goes,
-/// which is exactly why a small grey string sitting there read as a
-/// failed load rather than as a rest state.
+/// **Above centre, not at it.** Dead centre is where an alert goes, which
+/// is exactly why a small grey string sitting there read as a failed load
+/// rather than as a rest state. But the first pass overcorrected to the
+/// upper third and the card read as orphaned, so the ratio moved to 4:5.
 ///
-/// `EMPTY_ABOVE`:`EMPTY_BELOW` is 1:2, so the free space above the card
-/// should be about a third of the free space total. The bounds are 0.28
-/// and 0.40 as literals: wide enough that the card's own height and a
-/// pixel of rounding do not matter, narrow enough that centring it (0.5)
-/// or flushing it to the top (0.0) fails.
+/// `EMPTY_ABOVE`:`EMPTY_BELOW` is 4:5, so the free space above the card
+/// should be about 4/9 of the free space total. The bounds are 0.38 and
+/// 0.48 as literals, NOT derived from the constants they check: wide
+/// enough that the card's own height and a pixel of rounding do not
+/// matter, narrow enough that both failure modes fail — dead centre
+/// (0.5) and the upper third this replaced (0.333).
 #[gpui::test]
-fn the_empty_state_sits_in_the_upper_third_not_dead_centre(cx: &mut TestAppContext) {
+fn the_empty_state_sits_above_centre_but_not_at_the_top(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
 
@@ -6242,9 +6244,9 @@ fn the_empty_state_sits_in_the_upper_third_not_dead_centre(cx: &mut TestAppConte
     );
     let share = f32::from(above) / f32::from(above + below);
     assert!(
-        (0.28..0.40).contains(&share),
-        "the card's free space is {share:.3} above / {:.3} below; 1:2 is \
-         ~0.333, dead centre is 0.5, flush top is 0.0",
+        (0.38..0.48).contains(&share),
+        "the card's free space is {share:.3} above / {:.3} below; 4:5 is \
+         ~0.444, dead centre is 0.5, the old upper third was 0.333",
         1.0 - share
     );
 }

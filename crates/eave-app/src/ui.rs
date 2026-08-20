@@ -6614,11 +6614,12 @@ impl Shell {
             .child(div().flex_grow(theme::EMPTY_ABOVE).min_h(px(0.)))
             .child(
                 Self::column(
-                    div().flex().flex_col().items_start().child(
+                    div().flex().flex_col().items_start().w_full().child(
                         div()
                             .opacity(t)
                             .relative()
                             .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
+                            .w_full()
                             .max_w(px(theme::DIRECTIVE_MAX_W))
                             .min_w(px(0.))
                             .rounded(px(theme::RADIUS_PANEL))

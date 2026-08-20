@@ -688,13 +688,19 @@ pub const LAUNCHER_TITLE_LINE: f32 = 26.0;
 /// **Dead centre is the modal convention** — a box in the exact middle of
 /// a pane is what an alert looks like, which is why "nothing sent yet"
 /// centred in a black rectangle read as a failure rather than as a rest
-/// state. 1:2 puts the card's top edge at a third of the free height,
-/// which is where an opening block sits on a page, and leaves the gap
-/// between the card and the composer visibly larger than the gap above
-/// it — so the card reads as belonging to the top of the pane rather than
-/// as hovering over the input.
-pub const EMPTY_ABOVE: f32 = 1.0;
-pub const EMPTY_BELOW: f32 = 2.0;
+/// state. So the card sits above centre, but only just.
+///
+/// 4:5 was 1:2 until the card was photographed. At a third of the free
+/// height, and shrink-wrapped to its text, the card read as *orphaned* in
+/// the upper-left of a very large empty pane — it drew the eye to how
+/// much nothing surrounded it, which is the opposite of what an empty
+/// state is for. Widening it to the reading column and dropping it to
+/// 4/9 (~0.44) keeps it clear of the alert position while letting it
+/// occupy the space rather than float in it. The gap below is still
+/// visibly larger than the gap above, so it belongs to the pane rather
+/// than hovering over the composer.
+pub const EMPTY_ABOVE: f32 = 4.0;
+pub const EMPTY_BELOW: f32 = 5.0;
 
 // ---------------------------------------------------------------------------
 // Provider marks (Slice Q1) — a vendor's own logo, not a glyph.
