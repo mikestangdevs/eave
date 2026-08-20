@@ -2231,21 +2231,40 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         ("files-toggle", "wash_rest"),
         ("new-session", "wash_rest"),
         ("attn-kill", "danger_wash_hover"),
-        ("send", "solid_hover"),
+        ("send", "accent_hover"),
         ("to-bottom", "chrome_glass_hover"),
     ] {
-        let anchor = format!(r#"debug_selector(|| "{selector}".into())"#);
-        let at = src
-            .find(&anchor)
-            .unwrap_or_else(|| panic!("{selector} is no longer tagged"));
-        // Wide enough to clear the rationale comments that sit between a
-        // selector and its wash; a fade that genuinely moved elsewhere in
-        // the tree would take its selector with it.
-        let window = &src[at..src.len().min(at + 1600)];
+        // **Anchored on the FADE's key, not on proximity to the selector.**
+        // It used to search 1600 characters after `debug_selector` for a
+        // `.hover_fade(`, and Slice AL broke that twice in one sitting —
+        // once by splitting the rail row so the fade and the selector ended
+        // up on different elements, and once by writing nine lines of
+        // rationale above the send button's fade, which pushed its wash to
+        // 1882 characters out. Both times the message read "this control
+        // lost its hover feedback" and both times nothing of the sort had
+        // happened. Proximity in a source file is not a property; a fade
+        // registered under the control's own key is.
         assert!(
-            window.contains(".hover_fade("),
-            "{selector} lost its hover feedback (or went back to a snapping .hover)"
+            src.contains(&format!(r#"debug_selector(|| "{selector}".into())"#)),
+            "{selector} is no longer tagged"
         );
+        // The key is written inline at some sites and on its own line at
+        // others, so this walks every occurrence of the quoted key and keeps
+        // the one whose immediately preceding non-whitespace is
+        // `.hover_fade(`. Whitespace-insensitive by construction — which is
+        // the point, because rustfmt reserves the right to move it.
+        let quoted = format!("\"{selector}\",");
+        let at = src
+            .match_indices(&quoted)
+            .find(|(ix, _)| src[..*ix].trim_end().ends_with(".hover_fade("))
+            .map(|(ix, _)| ix)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{selector} has no hover_fade keyed to itself (or went \
+                     back to a snapping .hover)"
+                )
+            });
+        let window = &src[at..src.len().min(at + 600)];
         assert!(
             window.contains(wash),
             "{selector} should hover to {wash} — a filled control replaces \
@@ -4516,10 +4535,13 @@ fn rail_with_selected(h: &Harness, vcx: &mut VisualTestContext, infos: Vec<Sessi
 /// Before this slice a session's name was `DETAIL_SIZE` = 12.0 and the facts
 /// under it `SMALL_SIZE` = 11.0: a 1.09x "hierarchy" on the app's primary
 /// navigation surface, which is why the rail read as one grey block. The
-/// name now takes `NAME_SIZE` and the facts `MICRO_SIZE`.
+/// name now takes `BODY_SIZE` and the facts `MICRO_SIZE`. (It reached for
+/// `NAME_SIZE` first and the operator overruled it: at 248 px, 16 truncates
+/// the name mid-word, and the name is the only thing on the row a person
+/// reads. `NAME_SIZE` is for surfaces with 560 px or more.)
 ///
-/// The 1.3x here is deliberately looser than the 1.45x the two ranks give
-/// (24 px against 15 with the label's hairlines counted), so the test states
+/// The 1.3x here is deliberately looser than the 1.53x the two ranks give
+/// (23 px against 15 with the label's hairlines counted), so the test states
 /// "there is a hierarchy you can see" rather than re-deriving the two
 /// constants it is testing — which would pass no matter what they became.
 #[gpui::test]
@@ -4552,22 +4574,28 @@ fn a_rail_row_says_its_name_louder_than_its_facts(cx: &mut TestAppContext) {
     );
 }
 
-/// Slice AL. Selection reads as an accent bar on the row's leading edge,
-/// and the bar is OUTSIDE the washed card on purpose.
+/// Slice AL. The rail row is a bare leading strip plus a washed card, and
+/// the state mark lives on the strip.
 ///
-/// That is not decoration. Inside the card, over the selected row's wash at
-/// the brightest ground in the sweep, `danger()` measures **2.75:1** and
-/// `live()` **2.54:1** against the 3:1 a non-text mark owes its surface — so
-/// the row's state dot was under the floor exactly where an operator looks,
-/// and it stays under it with the ported pigments, because the surface was
-/// what was wrong. The strip puts both marks on the bare frost (3.88:1 and
-/// 3.58:1) with nothing desaturated, and the selection bar is what the strip
-/// is otherwise for.
+/// That is not decoration and it is not selection, either — the accent bar
+/// this test was originally written for was overruled the day it shipped
+/// ("no need for purple bar when selected"), and selection went back to a
+/// neutral fill plus a rim. **The strip stayed**, because it was never really
+/// about selection: over the row's own wash at the brightest ground in the
+/// sweep, `danger()` measures **2.51:1** and `live()` **2.46:1** against the
+/// 3:1 a non-text mark owes its surface, so the row's state dot was under the
+/// floor exactly where an operator looks. On the bare frost the same marks
+/// read 3.88:1 and 3.58:1 with nothing desaturated.
+///
+/// The strip costs the session name nothing: `RAIL_STRIP_W` is `STATE_DOT +
+/// SPACE_2`, which is precisely what the dot and its gap cost when they were
+/// inside the card. This test asserts that equality on the RENDERED boxes,
+/// which is the claim Slice AO's width budget depends on.
 ///
 /// `debug_bounds` is the instrument, not a screenshot: the harness cannot
-/// paint, and this asserts geometry and presence, which layout decides.
+/// paint, and this asserts geometry, which layout decides.
 #[gpui::test]
-fn selection_is_a_bar_on_the_leading_edge_outside_the_wash(cx: &mut TestAppContext) {
+fn the_state_mark_sits_on_bare_frost_outside_the_row_wash(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(
         &h,
@@ -4576,40 +4604,44 @@ fn selection_is_a_bar_on_the_leading_edge_outside_the_wash(cx: &mut TestAppConte
         "aaaa1111",
     );
 
-    let bar = vcx
-        .debug_bounds("sel-bar-aaaa1111")
-        .expect("the selected row draws a selection bar");
-    assert!(
-        vcx.debug_bounds("sel-bar-bbbb2222").is_none(),
-        "an unselected row is drawing a selection bar — then the bar states \
-         nothing"
-    );
-
     let row = vcx.debug_bounds("rail-aaaa1111").expect("the row renders");
     let card = vcx
         .debug_bounds("rail-card-aaaa1111")
         .expect("the row's washed card renders");
 
-    // The bar is on the row's own leading edge...
+    // The card is inset from the row's leading edge by exactly the strip...
     assert_eq!(
-        bar.origin.x, row.origin.x,
-        "the selection bar is inset from the row's leading edge"
+        card.origin.x - row.origin.x,
+        px(theme::RAIL_STRIP_W),
+        "the washed card does not start where the strip ends — then the mark \
+         is either on the wash or the row grew"
     );
-    // ...and entirely clear of the card that carries the wash. Clearance,
-    // not adjacency: sharing an edge would put the bar's outer pixels on the
-    // wash, which is the surface it cannot clear.
-    assert!(
-        bar.origin.x + bar.size.width <= card.origin.x - px(theme::SELECTION_BAR_W),
-        "the selection bar ends at {:?} and the washed card starts at {:?} — \
-         the bar has to sit on the bare frost, not on the wash",
-        bar.origin.x + bar.size.width,
-        card.origin.x
+    // ...and by nothing at all on the trailing edge, so the strip is bought
+    // out of the card's own width and not out of the rail's.
+    assert_eq!(
+        row.origin.x + row.size.width,
+        card.origin.x + card.size.width,
+        "the row and its card end on different edges"
     );
-    // And it is a bar, not a block: shorter than the row it marks.
-    assert!(
-        bar.size.height < row.size.height,
-        "the selection bar is the full height of its row — that is a border \
-         on a card the bar is deliberately outside of"
+
+    // And the meta line still hangs under the session's NAME rather than
+    // under the provider chip beside it. That alignment used to come out of
+    // `STATE_DOT + SPACE_2 + PROVIDER_CHIP + SPACE_2`; the dot's half of that
+    // sum left the card with the dot, so the indent shrank by exactly the
+    // strip's width and the rendered result has to be identical.
+    //
+    // `debug_bounds` returns the padding box, so the fact line's ORIGIN is
+    // the card's content edge and its `pl` is what carries it across.
+    let cwd = vcx
+        .debug_bounds("cwd-aaaa1111")
+        .expect("the row states its directory");
+    let label = vcx
+        .debug_bounds("label-aaaa1111")
+        .expect("the row states a name");
+    assert_eq!(
+        cwd.origin.x + px(theme::PROVIDER_CHIP + theme::SPACE_2),
+        label.origin.x,
+        "the meta line no longer hangs under the name it belongs to"
     );
 }
 

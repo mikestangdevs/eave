@@ -184,12 +184,13 @@ pub fn tile(
         .h(px(theme::TILE_H))
         .rounded(px(theme::RADIUS_TILE))
         .border_1()
-        // Slice AL: the chosen tile takes the accent rim. Selection reads
-        // the same way here as it does in the rail — a saturated violet on a
-        // bare edge — instead of a slightly-stronger grey hairline that was
-        // 0.14 of white away from the unselected one.
+        // Slice AL tried the accent here and put it back. A chosen tile is
+        // a SELECTION — where you are, not where you are acting — and the
+        // accent's rule (see `theme::accent`) does not care that this
+        // particular selection happens to be short-lived. The rim stays
+        // neutral and the tile's own wash carries the state.
         .border_color(if selected {
-            theme::accent()
+            theme::border_strong()
         } else {
             theme::border()
         })

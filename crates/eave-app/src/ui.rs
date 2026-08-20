@@ -3439,35 +3439,21 @@ impl Shell {
                     // box: the wash, the state dot and the text all inside
                     // it. That put the dot on the selection wash whenever
                     // its row was selected, where `danger()` reads
-                    // **2.75:1** and `live()` **2.54:1** against the 3:1 a
+                    // **2.51:1** and `live()` **2.46:1** against the 3:1 a
                     // mark owes its surface. Splitting the row moves both
                     // onto the bare frost (3.88:1 and 3.58:1) with no
-                    // pigment touched, and gives the selection bar the one
-                    // place in the rail where a saturated colour can live.
+                    // pigment touched.
                     //
                     // `RAIL_STRIP_W` is exactly what the dot and its gap
                     // used to cost inside the card, so nothing to the right
-                    // of it moved by a pixel.
+                    // of it moved by a pixel — which is also why the strip
+                    // survived the selection bar being overruled: folding it
+                    // back would return ZERO pixels to the session name and
+                    // would put the mark back under its floor.
                     .child(
                         div()
                             .flex_none()
                             .w(px(theme::RAIL_STRIP_W))
-                            .relative()
-                            .when(is_sel, |d| {
-                                d.child(
-                                    div()
-                                        .debug_selector(|| {
-                                            format!("sel-bar-{}", info.session_id)
-                                        })
-                                        .absolute()
-                                        .left_0()
-                                        .top(px(theme::SELECTION_BAR_INSET))
-                                        .bottom(px(theme::SELECTION_BAR_INSET))
-                                        .w(px(theme::SELECTION_BAR_W))
-                                        .rounded(px(theme::RADIUS_SELECTION_BAR))
-                                        .bg(theme::accent()),
-                                )
-                            })
                             .child(
                                 // Aligned to the label's own slot rather
                                 // than centred in the row: a row is three
@@ -3514,18 +3500,20 @@ impl Shell {
                             // The KEY is still `rail-{sid}` even though the
                             // element moved, because Stage AK's action strip
                             // reads that key's hover progress.
-                            // Slice AL: the selected row's standing fill is
-                            // the ACCENT at α .24, not the neutral wash.
-                            // comet carries selection as a saturated colour
-                            // at a third of an alpha and never as grey; the
-                            // alpha is solved rather than copied, because
-                            // `STATE_DELTA_FLOOR` makes eave's ladder the
-                            // stricter of the two.
                             .hover_fade(
                                 format!("rail-{}", info.session_id),
-                                if is_sel { theme::accent_wash() } else { theme::wash_rest() },
-                                if is_sel { theme::accent_wash() } else { theme::overlay() },
+                                if is_sel { theme::overlay_strong() } else { theme::wash_rest() },
+                                if is_sel { theme::overlay_strong() } else { theme::overlay() },
                             )
+                            // Slice AL: selection is a raised neutral fill
+                            // AND a rim. This slice first shipped it as an
+                            // accent bar over an accent-tinted wash and was
+                            // overruled — the accent marks where you are
+                            // ACTING, not where you are, and a selected row
+                            // is a location. The rim is an INSET shadow, not
+                            // a border, so a click cannot change the row's
+                            // width (`theme::selection_rim`).
+                            .when(is_sel, |d| d.shadow(theme::selection_rim()))
                             .flex()
                             .flex_col()
                             .gap(px(theme::SPACE_1))
@@ -3568,8 +3556,8 @@ impl Shell {
                                     .border_1()
                                     .border_color(theme::border_strong())
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    .text_size(px(theme::NAME_SIZE))
-                                    .line_height(px(theme::NAME_LINE))
+                                    .text_size(px(theme::BODY_SIZE))
+                                    .line_height(px(theme::BODY_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
                                     .text_color(theme::text())
                                     // Clicking inside the field is not a
@@ -3618,13 +3606,17 @@ impl Shell {
                                     .border_1()
                                     .border_color(gpui::transparent_black())
                                     .rounded(px(theme::RADIUS_BUTTON))
-                                    // Slice AL: a session's name takes the
-                                    // NAME rank. It was `DETAIL_SIZE` = 12.0
-                                    // over `SMALL_SIZE` = 11.0 metadata —
-                                    // one pixel of hierarchy on the app's
-                                    // primary navigation surface.
-                                    .text_size(px(theme::NAME_SIZE))
-                                    .line_height(px(theme::NAME_LINE))
+                                    // Slice AL: a session's name is reading
+                                    // text — `BODY` over `MICRO` metadata is
+                                    // 1.23x, where 12.0 over 11.0 was 1.09x
+                                    // and not a hierarchy at all. It reached
+                                    // for `NAME` (16) first and the operator
+                                    // overruled that: at 248 px the name
+                                    // truncates mid-word, and the name is
+                                    // the only thing on this row a person
+                                    // reads.
+                                    .text_size(px(theme::BODY_SIZE))
+                                    .line_height(px(theme::BODY_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
                                     .text_color(if is_sel {
                                         theme::text()
@@ -6887,7 +6879,17 @@ impl Render for Shell {
                 .w_full()
                 .rounded(px(theme::RADIUS_COMPOSER))
                 .border_1()
-                .border_color(theme::border_strong())
+                // Slice AL: eave's only focus ring. The composer is the app's
+                // one text field, so "focused" and "holding a draft" are the
+                // same fact here, and a draft is unambiguously where the
+                // operator is ACTING — which is the accent's whole rule. The
+                // rim, the caret inside it and the send button beside it all
+                // arm together, and they are the same colour on purpose.
+                .border_color(if has_draft {
+                    theme::accent()
+                } else {
+                    theme::border_strong()
+                })
                 .bg(theme::chrome_glass())
                 .shadow(theme::shadow_panel())
                 .p(px(theme::SPACE_3))
@@ -7009,15 +7011,24 @@ impl Render for Shell {
                                 // the fade interpolates between whatever the two
                                 // ends are this frame, so the armed colour arrives
                                 // at once and only the hover progress is smooth.
+                                //
+                                // Slice AL: the armed fill is the ACCENT, not
+                                // the neutral solid plate. An armed send is
+                                // the most action-shaped thing in the window
+                                // — it exists only while there is something
+                                // to send — which is exactly what the accent
+                                // is for. The launcher's "Start …" keeps
+                                // `solid()`: it is always there, so it is a
+                                // place rather than a moment.
                                 .hover_fade(
                                     "send",
                                     if has_draft {
-                                        theme::solid()
+                                        theme::accent()
                                     } else {
                                         theme::overlay_strong()
                                     },
                                     if has_draft {
-                                        theme::solid_hover()
+                                        theme::accent_hover()
                                     } else {
                                         theme::overlay_strongest()
                                     },

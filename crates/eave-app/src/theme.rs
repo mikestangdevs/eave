@@ -421,6 +421,29 @@ pub fn shadow_modal() -> Vec<BoxShadow> {
     vec![BoxShadow::new(px(0.0), px(8.0), shadow_ink(0.50)).blur_radius(px(24.0))]
 }
 
+/// A selected rail row's rim — **a 1 px INSET shadow, not a border**, ported
+/// from comet's `card_selected_shadows`.
+///
+/// A border would be honest and would also move the row: the card is
+/// `flex_1`, so adding one shrinks its content by 2 px, and adding one only
+/// when selected makes a row change width the moment you click it —
+/// `a_state_change_never_moves_a_row_under_the_pointer` exists because that
+/// class of bug is real here. An inset shadow with a 1 px spread and no blur
+/// draws the same line inside the element's own bounds and costs **zero
+/// layout**, which is why comet reaches for it in the same situation.
+///
+/// It is [`border_strong`] rather than a pigment. Selection is a location,
+/// not an action — see [`accent`].
+pub fn selection_rim() -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: border_strong(),
+        offset: gpui::point(px(0.0), px(0.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(1.0),
+        inset: true,
+    }]
+}
+
 // ---------------------------------------------------------------------------
 // Edges
 
@@ -501,13 +524,8 @@ pub fn text_tertiary() -> Hsla {
 /// text. Solved against `overlay_strong` over the brightest ground in the
 /// sweep (82.5/255), where it reads **4.91:1**.
 ///
-/// Slice AL: the selected rail row is no longer `overlay_strong` — it is
-/// [`accent_wash`], which composites *slightly darker* (relative luminance
-/// 0.082 against 0.085 at the bright end), so every ink on it gained a
-/// little. The surface this tier was solved for is still the worst one it
-/// lands on; it is now the hovered file row rather than the selected session
-/// row. `every_ink_clears_its_floor_on_every_surface_it_lands_on` enumerates
-/// both.
+/// Slice AL briefly moved the selected rail row onto a tinted selection wash
+/// and was overruled; the surface this tier is solved for is unchanged.
 ///
 /// It exists because the state ladder leaves no room for the plain tier.
 /// At the bright end the ground is 59.0/255 and [`STATE_DELTA_FLOOR`] forces
@@ -560,13 +578,12 @@ pub fn solid() -> Hsla {
 pub fn on_solid() -> Hsla {
     grey(0x0e)
 }
-/// The armed send button under the pointer: the same fill, lifted. The
-/// only direction available — [`solid`] is already the brightest fill
-/// in the app, so hover goes to white rather than adding a wash that
-/// would darken it (Slice M).
-pub fn solid_hover() -> Hsla {
-    grey(0xf7)
-}
+// `solid_hover` was here and is gone. It was "the armed send button, the
+// same fill lifted", and the armed send button is [`accent`]'s now, so it
+// had zero call sites — which this project counts as a defect rather than
+// as spare capacity. [`accent_hover`] does the job for the one control that
+// needed it. `solid` itself keeps the launcher's "Start …" button, which is
+// the pattern this slice promoted rather than replaced.
 
 // ---------------------------------------------------------------------------
 // Accent — the app's identity colour, and the only pigment that is not a
@@ -590,11 +607,35 @@ pub fn solid_hover() -> Hsla {
 /// far enough that "the row I chose" and "the session that is working" are
 /// never the same colour, and they sit 10 px apart in the rail.
 ///
-/// **Above its floor**, which is the constraint that fixed the *step*: as
-/// the selection bar it lands on the rail's bare ground (see the leading
-/// strip in `ui.rs`), where it measures **3.93:1** against a 3:1 floor. Over
-/// the row's own wash it would have been **2.70:1** — under the floor
-/// outright — and that is why the bar has a strip of its own.
+/// **The rule, and it is the operator's, not mine: the accent marks where
+/// you are ACTING, not where you are.** A selected rail row is a *location*
+/// — persistent, and it is where you already were. A caret, a focused
+/// composer, an armed send button are *actions* — momentary, and they are
+/// where your attention is going next.
+///
+/// This slice shipped it the other way round first: an accent bar plus an
+/// accent-tinted wash on the selected row. It was overruled, and the
+/// overrule is right — the operator had already rejected a *subtler*
+/// version of the same thing on another branch ("no need for purple bar when
+/// selected") an hour before this shipped. Selection went back to a neutral
+/// fill and a rim; the accent moved onto the three momentary things below.
+/// The report keeps the whole argument, because the arithmetic that got here
+/// was sound and only its target was wrong.
+///
+/// **Where it is spent, and what each clears** (3:1, a mark's floor):
+///
+///  - the **composer caret** — 6.05:1 on the composer's glass, and the one
+///    element on screen that is always eave's and never the agent's;
+///  - the **composer's rim while it holds a draft** — the app's only focus
+///    ring, 6.05:1 against the glass inside it and 5.09:1 against the well
+///    outside;
+///  - the **armed send button's fill**, with [`on_solid`] on the glyph.
+///
+/// **Where it is NOT spent, and the measurement that decided it**: the
+/// rename field, which is otherwise the perfect focus ring — the one control
+/// in eave that takes the keyboard. It lives *inside* the rail row's washed
+/// card, where the accent reads **2.70:1**. That is the same wall the state
+/// dot hit, and the reason `RAIL_STRIP_W` exists.
 ///
 /// Text on an accent fill is [`on_solid`], not a token of its own. comet's
 /// `on_accent` is near-white because comet's accent fill is indigo-500, a
@@ -605,18 +646,16 @@ pub fn solid_hover() -> Hsla {
 pub fn accent() -> Hsla {
     oklch(0.702, 0.183, 293.541)
 }
-/// Selection as a tinted wash rather than a grey one: the accent at α .24,
-/// the standing fill of a selected rail row.
+/// The armed send button under the pointer — **Tailwind violet-300**,
+/// `oklch(0.811 0.111 293.571)`, one step up the same ramp.
 ///
-/// comet carries the same idea as `selection: hsla(0.66, 0.6, 0.55, 0.35)` —
-/// a saturated colour at a third of an alpha, never a neutral wash. The α
-/// here is solved rather than copied, because eave's ladder is stricter than
-/// comet's: [`STATE_DELTA_FLOOR`] requires a selected row to sit a visible
-/// step above a hovered one, and α .20 lands 1/255 above [`overlay`] at the
-/// bright end. .24 clears it by 12/255 on the brightest backdrop and 20/255
-/// on the darkest.
-pub fn accent_wash() -> Hsla {
-    accent().opacity(0.24)
+/// A filled control REPLACES its bg rather than compositing a wash over it,
+/// so a filled control has to name its hovered fill outright (Slice M). This
+/// is the accent's, and it replaces `solid_hover` — which had exactly one
+/// call site, the armed send button, and lost it when that button became the
+/// accent's.
+pub fn accent_hover() -> Hsla {
+    oklch(0.811, 0.111, 293.571)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,19 +803,36 @@ pub const MONO: &str = "Menlo";
 pub const DISPLAY_SIZE: f32 = 20.0;
 pub const DISPLAY_LINE: f32 = 26.0;
 
-/// Names and panel headings: the titlebar, a session's name in the rail, the
-/// heading of an attention or approval card. 16/22.
+/// Names and panel headings — **on a wide surface**: the titlebar, the
+/// heading of an attention, connection or approval card, markdown's h2/h3.
+/// 16/22.
 ///
-/// The titlebar was `TITLE_SIZE` = 13.0 — *smaller than body text*, which is
-/// not a taste question. A rail row's session name was `DETAIL_SIZE` = 12.0
-/// against `SMALL_SIZE` = 11.0 metadata beneath it: one pixel of hierarchy
-/// across the app's primary navigation surface.
+/// The titlebar was `TITLE_SIZE` = 13.0, *smaller than the body text under
+/// it*, which is not a taste question.
+///
+/// **It is deliberately NOT the rail's session name, and that was settled by
+/// the operator against this slice's first attempt.** The rail row is the
+/// one place the abstract argument and the real column disagree:
+///
+///  - The principle still holds and is written at [`DETAIL_SIZE`] — a rank
+///    is a budget across size, weight and ink, and this slice spent exactly
+///    one of the three where Slice AO spent all three and got "this text is
+///    gigantic".
+///  - But the rail is **248 px** wide and the row already carries a provider
+///    mark, a state mark, a badge and a hover strip. At 16 the name truncates
+///    mid-word, and the name is the only thing on that row a person reads.
+///    Spending fewer channels does not buy back glyphs.
+///
+/// So the rank is right and the column is too narrow for it. The rail's name
+/// is [`BODY_SIZE`]; this rank is for surfaces 560 px and wider, where it has
+/// room to announce.
 pub const NAME_SIZE: f32 = 16.0;
 pub const NAME_LINE: f32 = 22.0;
 
-/// Reading text: transcript prose, the composer, a user directive.
-/// **Unchanged** — this slice does not churn the one rank that was already
-/// solved.
+/// Reading text: transcript prose, the composer, a user directive — and a
+/// session's name in the rail, which is reading text on a 248 px column.
+/// **The value is unchanged** at 13.5: this slice does not churn the one
+/// rank that was already solved.
 pub const BODY_SIZE: f32 = 13.5;
 pub const BODY_LINE: f32 = 21.0;
 
@@ -1109,18 +1165,22 @@ pub const RAIL_CARD_BLEED: f32 = SPACE_3;
 /// no other pixel: the provider chip, the session name, the badge and every
 /// meta line start on the same x they did before, and every rail width test
 /// measures the same room it measured before.
+///
+/// **That identity is also the answer to "does the strip still pay for
+/// itself now that the selection bar is gone?"** The rail is 248 px and
+/// Slice AO is fighting for every one of them, so it is a fair question, and
+/// the arithmetic is: the strip costs the session name **zero** pixels,
+/// because the dot cost it the same 14 either way. Folding the strip back
+/// into the card would return nothing to the name and would put the state
+/// mark back on the selection wash at 2.51:1. It stays for the mark alone.
 pub const RAIL_STRIP_W: f32 = STATE_DOT + SPACE_2;
-/// The selection bar itself, on the leading edge of the strip.
-pub const SELECTION_BAR_W: f32 = 3.0;
-/// Its height as a fraction of the row: a bar that ran the row's full height
-/// would read as a border on the card it is deliberately outside of.
-pub const SELECTION_BAR_INSET: f32 = SPACE_2;
-pub const RADIUS_SELECTION_BAR: f32 = SELECTION_BAR_W / 2.0;
 /// A rail row's first line — the slot the session name, the rename field and
 /// the state mark all align to. The rename field draws a visible 1 px border
 /// and the resting label draws a transparent one of the same weight (Stage
 /// AC), so the slot is the name's line plus both hairlines.
-pub const RAIL_LABEL_SLOT_H: f32 = NAME_LINE + HAIRLINE * 2.0;
+///
+/// The name is [`BODY_SIZE`], not [`NAME_SIZE`] — see that constant.
+pub const RAIL_LABEL_SLOT_H: f32 = BODY_LINE + HAIRLINE * 2.0;
 /// Provider identity chip: self-drawn monochrome initials on a bordered
 /// rounded square. Deliberately never a third-party mark — one uniform,
 /// self-drawn set for every provider (Slice A directive).
@@ -2036,29 +2096,6 @@ mod tests {
                     units(g)
                 );
             }
-
-            // Slice AL: the RAIL ROW's own two fills, which are no longer
-            // two rungs of the neutral ladder above. A hovered row takes
-            // `overlay`; a selected one takes `accent_wash`, a tinted
-            // selection rather than a grey one (comet carries `selection` as
-            // a saturated colour at a third of an alpha and never as a
-            // wash of white).
-            //
-            // The alpha was SOLVED against this assertion rather than copied
-            // from comet: at α .20 the accent wash lands 1/255 above
-            // `overlay` at the bright end, which is the same defect Slice AF
-            // found between `overlay` and `overlay_strong` — "the row under
-            // my cursor" and "the row I am in" drawn the same colour. .24
-            // clears the floor at every backdrop.
-            let hovered = units(over(overlay(), g));
-            let selected = units(over(accent_wash(), g));
-            assert!(
-                selected - hovered >= STATE_DELTA_FLOOR,
-                "a selected rail row is {:.1}/255 above a hovered one on \
-                 ground {:.1}, floor {STATE_DELTA_FLOOR}",
-                selected - hovered,
-                units(g)
-            );
         }
     }
 
@@ -2217,6 +2254,7 @@ mod tests {
             ("danger / red-400", danger(), [255, 100, 103]),
             ("warning / amber-400", warning(), [255, 185, 0]),
             ("success / emerald-400", success(), [0, 212, 146]),
+            ("accent_hover / violet-300", accent_hover(), [196, 180, 255]),
         ] {
             assert_eq!(srgb_u8(got), want, "{name} drifted off its Tailwind step");
         }
@@ -2242,7 +2280,6 @@ mod tests {
             ("text_secondary_on_wash", text_secondary_on_wash()),
             ("solid", solid()),
             ("on_solid", on_solid()),
-            ("solid_hover", solid_hover()),
             ("glass_canvas", glass_canvas()),
             ("wash_content", wash_content()),
             ("overlay", overlay()),
@@ -2272,6 +2309,7 @@ mod tests {
             ("warning", warning()),
             ("danger", danger()),
             ("accent", accent()),
+            ("accent_hover", accent_hover()),
         ] {
             assert!(
                 c.s >= 0.5,
@@ -2379,7 +2417,6 @@ mod tests {
             ("rail state mark, quiet or awaiting you", warning(), bare()),
             ("rail state mark, unresponsive or failed", danger(), bare()),
             ("rail state mark, settled", text_secondary(), bare()),
-            ("rail selection bar", accent(), bare()),
             // --- the reading column, on the content well
             ("tool dot, running", live(), well()),
             ("tool dot, failed", danger(), well()),
@@ -2415,16 +2452,30 @@ mod tests {
             ("connection panel dot", danger(), danger_plate()),
             ("kill button rim", danger(), danger_plate()),
             ("approval card ring, pending", warning(), loud_plate()),
-            // --- the launcher, inside the well
+            // --- the accent, on the three momentary things it is spent on.
+            //     The composer's rim is measured against BOTH neighbours,
+            //     the well outside it and its own glass inside; a rim that
+            //     clears one and not the other has an invisible side.
+            ("composer rim holding a draft — outside", accent(), well()),
             (
-                "launcher tile rim, chosen — outside",
+                "composer rim holding a draft — inside",
                 accent(),
-                vec![wash_content()],
+                vec![wash_content(), chrome_glass()],
             ),
             (
-                "launcher tile rim, chosen — inside",
+                "armed send fill",
                 accent(),
-                vec![wash_content(), overlay()],
+                vec![wash_content(), chrome_glass()],
+            ),
+            (
+                "armed send fill, hovered",
+                accent_hover(),
+                vec![wash_content(), chrome_glass()],
+            ),
+            (
+                "composer caret",
+                accent(),
+                vec![wash_content(), chrome_glass()],
             ),
         ];
 
@@ -2521,19 +2572,19 @@ mod tests {
                 "rail label, selected",
                 text(),
                 TEXT_CONTRAST_FLOOR,
-                vec![accent_wash()],
+                vec![overlay_strong()],
             ),
             (
                 "rail provider chip",
                 text_secondary_on_wash(),
                 TEXT_CONTRAST_FLOOR,
-                vec![accent_wash()],
+                vec![overlay_strong()],
             ),
             (
                 "rail cwd/posture/shares/worktree lines",
                 text_secondary(),
                 TEXT_QUIET_CONTRAST_FLOOR,
-                vec![accent_wash()],
+                vec![overlay_strong()],
             ),
             (
                 // Slice AL: the loud half of the posture line ("NEVER
@@ -2543,13 +2594,13 @@ mod tests {
                 "rail posture and worktree lines, loud",
                 text(),
                 TEXT_CONTRAST_FLOOR,
-                vec![accent_wash()],
+                vec![overlay_strong()],
             ),
             (
                 "rail worktree note",
                 text_secondary_on_wash(),
                 TEXT_CONTRAST_FLOOR,
-                vec![accent_wash()],
+                vec![overlay_strong()],
             ),
             (
                 "rail resource ceiling, over budget",
@@ -2561,7 +2612,7 @@ mod tests {
                 "rail row affordance, hovered on a selected row",
                 text(),
                 TEXT_CONTRAST_FLOOR,
-                vec![accent_wash(), overlay()],
+                vec![overlay_strong(), overlay()],
             ),
             (
                 "rail row affordance, hovered on an unselected row",
@@ -2744,12 +2795,6 @@ mod tests {
                 vec![danger()],
             ),
             (
-                "composer caret",
-                accent(),
-                TEXT_CONTRAST_FLOOR,
-                vec![wash_content(), chrome_glass()],
-            ),
-            (
                 "composer hint, queued behind a question",
                 warning(),
                 TEXT_CONTRAST_FLOOR,
@@ -2846,6 +2891,18 @@ mod tests {
                 text_secondary(),
                 TEXT_CONTRAST_FLOOR,
                 vec![wash_content(), chrome_glass_hover()],
+            ),
+            (
+                "send glyph, armed",
+                on_solid(),
+                TEXT_CONTRAST_FLOOR,
+                vec![accent()],
+            ),
+            (
+                "send glyph, armed and hovered",
+                on_solid(),
+                TEXT_CONTRAST_FLOOR,
+                vec![accent_hover()],
             ),
             (
                 "send glyph, unarmed and hovered",
