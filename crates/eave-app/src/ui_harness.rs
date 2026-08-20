@@ -740,6 +740,154 @@ fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
     assert!(h.drain().is_empty(), "return on an empty draft is not a send");
 }
 
+/// A draft belongs to the session it was typed into.
+///
+/// Before Slice S the composer was one buffer for every session: type into
+/// A, select B, press Return, and A's sentence was addressed to B. Nothing
+/// in the switch path cleared it and nothing keyed it. The words move with
+/// the session now, and the switch is the only thing that moves them.
+#[gpui::test]
+fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    let draft = |vcx: &mut VisualTestContext, h: &Harness| {
+        vcx.read_window(&h.window, |shell, cx| {
+            shell.read(cx).composer.read(cx).text.clone()
+        })
+        .unwrap()
+    };
+
+    vcx.simulate_input("for aaaa");
+    assert_eq!(draft(vcx, &h), "for aaaa");
+
+    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    vcx.run_until_parked();
+    assert_eq!(
+        draft(vcx, &h),
+        "",
+        "B opened still wearing A's unsent words"
+    );
+
+    vcx.simulate_input("for bbbb");
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    assert_eq!(draft(vcx, &h), "for aaaa", "A's draft did not come back");
+
+    // ...and Return sends A's words, once, to the session they were for.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Send(t)] if t == "for aaaa"),
+        "the wrong draft was sent, got {cmds:?}"
+    );
+
+    // B's words are untouched by A's send: one draft has one home.
+    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    vcx.run_until_parked();
+    assert_eq!(draft(vcx, &h), "for bbbb", "sending A's draft spent B's");
+}
+
+/// A session switch restores follow.
+///
+/// `TranscriptState::reset()` clears the transcript, the display, the list,
+/// the veil and the turn clock — and never cleared the scroll mode. So a
+/// session switched into inherited the last one's: `Free`, which leaves a
+/// live reply streaming off the bottom of a viewport that will not follow it
+/// and a ↓-bottom pill over a transcript already at its bottom; or a
+/// `Pinned { msg }` whose row id then resolved against a transcript that
+/// never held that message. Stage G caveat 2 filed the symptom as "not
+/// code; watched".
+///
+/// The mode is written here rather than driven by a wheel event because the
+/// defect is in the SWITCH path, not the wheel path: what has to be proven
+/// is that a stale mode cannot survive a switch, whatever set it.
+#[gpui::test]
+fn a_session_switch_restores_follow(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    let mode = |vcx: &mut VisualTestContext, h: &Harness| {
+        vcx.read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).scroll
+        })
+        .unwrap()
+    };
+
+    // The reader scrolls up and away from the tail.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.transcript.update(cx, |t, _| t.scroll = ScrollMode::Free);
+        })
+        .unwrap();
+    assert_eq!(mode(vcx, &h), ScrollMode::Free);
+
+    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    vcx.run_until_parked();
+    assert_eq!(
+        mode(vcx, &h),
+        ScrollMode::Follow,
+        "B opened wearing A's scroll mode"
+    );
+
+    // A pin is the worse case: its message id would resolve against a
+    // transcript that never held it.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.transcript.update(cx, |t, _| t.scroll = ScrollMode::Pinned { msg: 7 });
+        })
+        .unwrap();
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    assert_eq!(mode(vcx, &h), ScrollMode::Follow, "a pin outlived its session");
+}
+
+/// The launcher reaches no composer.
+///
+/// Q2 unmounted the field but left the key handler open, so the keyboard
+/// still filled a buffer nobody could see, and Return dispatched a `Send`
+/// the rest loop drops — there being no session to address it to. The words
+/// then surfaced in whatever session opened next. Q2's comment at the mount
+/// site says an input that silently eats what you type is the one thing
+/// this must not be; this is the assertion that holds it to that.
+#[gpui::test]
+fn the_launcher_reaches_no_composer(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    vcx.run_until_parked();
+    let draft = |vcx: &mut VisualTestContext, h: &Harness| {
+        vcx.read_window(&h.window, |shell, cx| {
+            shell.read(cx).composer.read(cx).text.clone()
+        })
+        .unwrap()
+    };
+
+    // No `Session` event has been pushed: this is the launcher, and it
+    // states so by having no composer to find.
+    assert!(
+        vcx.debug_bounds("composer-text").is_none(),
+        "the launcher rendered a composer"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_input("typed at the launcher");
+    vcx.simulate_keystrokes("enter");
+    assert_eq!(draft(vcx, &h), "", "the launcher filled the hidden buffer");
+    assert!(
+        h.drain().is_empty(),
+        "the launcher dispatched a command with no session to address"
+    );
+
+    // ...and the session that opens next opens clean.
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
+    assert_eq!(
+        draft(vcx, &h),
+        "",
+        "the launcher's keystrokes surfaced in the first session opened"
+    );
+}
+
 /// Color speaks only when state deserves attention: the rail badges the
 /// three states an operator may need to act on and stays quiet for the
 /// rest. The unresponsive notice offers a kill and never withdraws it on
@@ -1738,6 +1886,39 @@ fn the_empty_note_enters_once_and_does_not_replay_on_later_frames(cx: &mut TestA
 #[gpui::test]
 fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    // A session, because the caret is a property of a composer and there is
+    // no composer at the launcher. This test used to type straight into a
+    // bare boot and pass, which is the defect
+    // `the_launcher_reaches_no_composer` now pins: the keystrokes were
+    // landing in an unmounted buffer. The lease assertion is unchanged —
+    // an open session with an empty draft still takes none.
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "settled")],
+    });
+    // ...and its files snapshot, or the rail's skeleton rows hold a lease
+    // for the life of the process (`Shell::work_in_flight`: a selected
+    // session whose snapshot has not arrived IS work in flight). That is
+    // the shape of the trap N3 recorded — an eternal skeleton is an error
+    // state that lost its error, and the tell is CPU, not pixels.
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+        }),
+    ));
+    vcx.run_until_parked();
+    // Past every entrance: a session that just mounted is animating. The
+    // assertion is about a SETTLED shell, which is what the invariant is
+    // about — a window with nothing mid-flight schedules nothing at all.
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(10));
     assert!(
         !vcx.update(|_, cx| motion::clock_running(cx)),
@@ -1761,6 +1942,10 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
         !vcx.update(|_, cx| motion::clock_running(cx)),
         "the clock kept ticking after the draft was sent"
     );
+    // Drain the entrances the send itself armed (the pin flip re-asserts
+    // scroll, and the fade store ages in RENDERS, not wall time — so the
+    // frames have to be spent, not waited out).
+    drive(&h, vcx, Duration::from_millis(600));
     assert_eq!(h.window.update(vcx, |_, window, cx| window.simulate_next_frame(cx)).unwrap(), 0);
 }
 
@@ -2748,6 +2933,13 @@ fn a_disabled_row_is_present_and_inert(cx: &mut TestAppContext) {
 #[gpui::test]
 fn an_open_menu_swallows_typing(cx: &mut TestAppContext) {
     let (h, vcx, _) = open_menu(cx);
+    // `open_menu` pushes a RAIL, not a selection, so the shell behind the
+    // menu was the launcher — and the second half of this test ("the
+    // composer got the keyboard back") was asserting against a composer
+    // that was never mounted. Select one, so the surface this test is about
+    // is a menu over a session, which is the only place a menu opens.
+    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
             shell.read(cx).composer.read(cx).text.clone()
