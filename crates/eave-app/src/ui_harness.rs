@@ -5422,3 +5422,270 @@ fn a_quote_and_a_heading_render_their_markup_rather_than_showing_it(cx: &mut Tes
     );
     assert!(runs.iter().any(|r| r.style.bold && r.text == "why"));
 }
+
+// ---------------------------------------------------------------------------
+// Slice AH — the eternal skeleton
+//
+// N4's idle floor says "a window with nothing mid-flight schedules
+// nothing". `a_settled_window_is_never_told_to_re_render` proves it for a
+// window with nothing SELECTED, and every other test in this file that
+// selects a session answers its files channel by hand — Slice T's caret
+// test and Stage AC's rename test both say so in their own comments,
+// because neither could settle until they did.
+//
+// So the invariant held in the suite while a real running app broke it:
+// the harness always delivered a snapshot and the real engine may not.
+// These are the members of that family that do NOT answer.
+//
+// The instrument is N4's: count the redraws (`watch_redraws` observes the
+// shell, and the shell notifies itself whenever any of its five state
+// entities changes, so a notification on the shell IS "this window must be
+// drawn again"). `simulate_next_frame` is the WRONG instrument here — it
+// counts animation-frame REQUESTS, which is how hand-driven tweens are
+// paced, and the pulse clock does not use them: it drives on its own
+// 33 ms timer and `cx.notify`. A test written against `simulate_next_frame`
+// reports a pulsing window as settled. (It reported one to me first.)
+// ---------------------------------------------------------------------------
+
+/// Advance drawn time in 100 ms steps until the pulse clock parks, and
+/// report how many steps that took. Panics past `cap` rather than
+/// spinning — an eternal skeleton is precisely a loop that never ends,
+/// and it must fail as a test rather than as a hung suite.
+#[track_caller]
+fn steps_until_parked(vcx: &mut VisualTestContext, cap: usize, what: &str) -> usize {
+    let mut steps = 0usize;
+    while clock_running(vcx) {
+        steps += 1;
+        assert!(steps < cap, "{what}");
+        vcx.executor().advance_clock(Duration::from_millis(100));
+        vcx.run_until_parked();
+    }
+    steps
+}
+
+/// **The one the old code fails.** A selected session whose files
+/// snapshot never arrives used to hold a pulse lease for the life of the
+/// process — a 30 fps drive over a still picture on a window where
+/// nothing is happening, costing +8.7 points of a core (N2) for as long
+/// as eave is open.
+///
+/// Both halves are asserted, because they fail in opposite directions:
+///
+///   - Give up too early and the rail lies the other way — "no file list"
+///     over a scan that is still legitimately running. One of the
+///     engine's own git calls is bounded at 10 s
+///     (`eave_engine::git::GIT_TIMEOUT`), so the rail has to out-wait one
+///     of those before it may say anything at all.
+///   - Give up never and you have the bug.
+///
+/// The step bounds are LITERALS. Deriving them from `FILES_PATIENCE`
+/// would make this pass at any patience including zero and including
+/// forever, which is the defective test N1 shipped and mutation testing
+/// caught (progress.md §Traps). At a 100 ms step, 100 steps is 10 s of
+/// drawn time and 300 is 30 s: the wait must clear the first and end
+/// before the second.
+#[gpui::test]
+fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // A live engine: this is the case where elapsed time is the ONLY
+    // evidence available, which is the case the patience exists for.
+    h.plumbing.push_conn(ConnEvent::Connected { engine_pid: 4242 });
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    // No `push_files`. That absence is the whole test.
+
+    assert!(
+        shown(vcx, "files-skeleton"),
+        "a list that has just been asked for should still say one is coming"
+    );
+    assert!(
+        clock_running(vcx),
+        "the skeleton is not moving at all — then nothing below is \
+         measuring the lease this slice bounds"
+    );
+
+    let drawing = watch_redraws(&h, vcx);
+    let steps = steps_until_parked(
+        vcx,
+        300,
+        "the files skeleton was still driving the clock after 30 s of drawn \
+         time — this is the eternal skeleton, and it runs for the life of \
+         the process",
+    );
+    assert!(
+        steps > 100,
+        "the rail gave up after {steps} steps (~{} s) — it must out-wait \
+         one of the engine's own timed-out git calls, or it will put an \
+         error on screen over a healthy slow scan",
+        steps / 10
+    );
+    assert!(
+        drawing.get() > 100,
+        "only {} redraws while the skeleton was up — the wait was not \
+         actually costing frames, so the bound below proves nothing",
+        drawing.get()
+    );
+
+    // The idle floor, applied to the state that used to defeat it: ten
+    // more seconds, and the window is told to draw itself zero times.
+    let settled = watch_redraws(&h, vcx);
+    for _ in 0..10 {
+        vcx.executor().advance_clock(Duration::from_secs(1));
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        settled.get(),
+        0,
+        "a window whose file list is never coming still redrew itself while \
+         the operator was away from the desk"
+    );
+
+    assert!(
+        !shown(vcx, "files-skeleton"),
+        "the skeleton is still on screen saying a list is coming"
+    );
+    assert!(
+        shown(vcx, "files-silence"),
+        "the animation stopped and took the fact with it — an eternal \
+         skeleton is an error state that lost its error, and a FROZEN \
+         skeleton is the same error state, cheaper"
+    );
+    assert!(
+        shown(vcx, "files-retry"),
+        "the connection is live, so there is something to try again, and \
+         nothing offers it"
+    );
+
+    // Giving up bounds the picture and the clock, never the subscription:
+    // a snapshot that arrives late renders exactly as an early one does.
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/late.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(1),
+                dels: Some(0),
+                untracked: false,
+                orig_path: None,
+            }],
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::WorkingTree,
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "files-silence"),
+        "the rail kept stating silence after it had been answered"
+    );
+    assert!(
+        shown(vcx, "files-count"),
+        "a snapshot that arrived after the rail gave up did not render"
+    );
+    let _ = h.drain();
+}
+
+/// The connection's own truth outranks any clock.
+///
+/// When the engine is unreachable the window already HOLDS the fact —
+/// `ConnEvent::Failed` carries the words. Waiting 20 s to invent a vaguer
+/// version of a sentence you can already read is what this project calls
+/// inventing a fact, so this path costs no patience at all: the rail
+/// states the connection's own message and parks.
+///
+/// And it offers no `try again`. After the 5-attempt breaker the feed
+/// loop has RETURNED, so `Command::Resubscribe` would reach nobody — an
+/// affordance that silently does nothing is the defect Stage AC widened
+/// the launcher's command match to prevent.
+#[gpui::test]
+fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
+    cx: &mut TestAppContext,
+) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_conn(ConnEvent::Connected { engine_pid: 4242 });
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    assert!(shown(vcx, "files-skeleton"), "nothing was ever waiting");
+    assert!(clock_running(vcx), "nothing was ever moving");
+
+    h.plumbing.push_conn(ConnEvent::Failed {
+        message: "engine unreachable after 5 attempts: connection refused".into(),
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        !shown(vcx, "files-skeleton"),
+        "the rail is animating a list from an engine it cannot reach"
+    );
+    assert!(
+        shown(vcx, "files-silence"),
+        "the rail went quiet without saying why"
+    );
+    assert!(
+        !shown(vcx, "files-retry"),
+        "there is nothing left to ask — the feed loop returned with the \
+         breaker, so this button cannot do what it says"
+    );
+    // The lease lapses rather than being revoked, so this is "it stopped",
+    // not "it stopped this instant" — the same reading
+    // `a_running_session_leases_the_clock_and_a_settled_one_lets_it_park`
+    // takes. What matters is that it stops WITHOUT the 20 s patience.
+    let steps = steps_until_parked(
+        vcx,
+        20,
+        "an unreachable engine still leased the pulse clock two seconds later",
+    );
+    assert!(
+        steps < 10,
+        "the rail spent {steps} steps timing out a fact it already had"
+    );
+
+    let settled = watch_redraws(&h, vcx);
+    for _ in 0..10 {
+        vcx.executor().advance_clock(Duration::from_secs(1));
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        settled.get(),
+        0,
+        "a window that knows no answer is coming still redrew itself"
+    );
+}
+
+/// The affordance does what it says, and asking again buys real patience.
+///
+/// Two failures this catches, and the second is why it exists: a `try
+/// again` that emits nothing, and one that emits the command but leaves
+/// the expired wait in place — that second one re-states the old silence
+/// on the very next frame and reads as a dead button.
+#[gpui::test]
+fn trying_again_re_asks_and_restarts_the_rails_patience(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing.push_conn(ConnEvent::Connected { engine_pid: 4242 });
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    steps_until_parked(vcx, 300, "never gave up");
+    assert!(shown(vcx, "files-retry"), "nothing to click");
+
+    let _ = h.drain();
+    click(vcx, "files-retry");
+    vcx.run_until_parked();
+
+    assert!(
+        h.drain().iter().any(|c| matches!(c, Command::Resubscribe)),
+        "`try again` asked nobody for anything"
+    );
+    assert!(
+        shown(vcx, "files-skeleton"),
+        "the rail is still stating the silence it just re-asked about"
+    );
+    assert!(
+        !shown(vcx, "files-silence"),
+        "the old sentence outlived the request that replaced it"
+    );
+    // ...and the second wait is a real one, not a frame of politeness.
+    let again = steps_until_parked(vcx, 300, "the second wait never ended");
+    assert!(
+        again > 100,
+        "asking again bought only {again} steps of patience"
+    );
+}

@@ -13,6 +13,7 @@
 //! per burst. Frame pacing comes from the engine's strict 120 ms delta
 //! folding — no UI frame-pacing timer (spec 03 §Streaming commit).
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1025,6 +1026,77 @@ struct FilesState {
     /// files channel is the invalidation signal — the diff itself is
     /// never cached engine-side).
     diff: Option<DiffSlot>,
+}
+
+/// How long the files rail waits for an answer before it states that
+/// nothing has given one (Slice AH — the eternal skeleton).
+///
+/// **Derived from the engine's own ceiling, not chosen.** `refresh_files`
+/// shells out to git and every call is bounded by
+/// [`eave_engine::git::GIT_TIMEOUT`], so a healthy engine whose first git
+/// call times out legitimately owes its first frame that long. Two of
+/// them covers one fully timed-out call PLUS the whole rest of a normal
+/// scan — measured at 0.04–0.07 s wall on this repo (N4 §2.3) — which is
+/// three orders of magnitude of slack on the part that is not the
+/// timeout. The multiplier lives here rather than in a comment so that
+/// raising the engine's timeout cannot silently make the rail impatient.
+///
+/// **The ceiling is what being wrong costs.** While the rail waits it
+/// holds a pulse lease, and a lease at 30 fps is +8.7 points of a core
+/// (measured in N2, quoted in N3 §3). Before this slice that cost ran for
+/// the life of the process; this bounds it.
+///
+/// It bounds the ANIMATION and the WORDS, never the subscription. Nothing
+/// is unsubscribed, nothing is killed, no session is touched (progress.md
+/// §Known failures: no timer ever kills), and a snapshot arriving at 21 s
+/// renders exactly as one arriving at 2 s does.
+const FILES_PATIENCE: Duration =
+    Duration::from_secs(2 * eave_engine::git::GIT_TIMEOUT.as_secs());
+
+/// What the files rail knows about the selected session's file list, on
+/// this frame (Slice AH).
+///
+/// The gate and the render read the SAME answer — [`Shell::files_wait`] —
+/// because the defect this closes was exactly the two disagreeing: the
+/// render drew "a list is coming" forever while the gate believed it,
+/// forever, and paid 30 fps for the belief.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilesWait {
+    /// Nothing to wait for: an answer for the selected session is in hand,
+    /// or nothing is selected.
+    Answered,
+    /// Waiting, and still inside [`FILES_PATIENCE`]. The skeleton is the
+    /// honest picture here — a list really is on its way.
+    Waiting,
+    /// The wait is over without an answer, and these are the words for
+    /// why. An eternal skeleton is an error state that lost its error;
+    /// this is the error, found again.
+    Silent(String),
+}
+
+/// The connection facts that mean no file list is coming, in the
+/// connection's own words (Slice AH).
+///
+/// Read rather than timed, and preferred over [`FILES_PATIENCE`] wherever
+/// it answers: a timeout invents a fact where this states one. `None`
+/// means the connection is live or still coming up, so the only evidence
+/// available is elapsed time.
+///
+/// `Reconnecting` is deliberately NOT here. It is bounded — five attempts
+/// with a doubling 250 ms backoff, ~7.75 s in total — and it ends in
+/// `Failed`, which is. Calling a 250 ms blip "no file list" would be the
+/// opposite defect: an error state that never had an error.
+fn conn_silence(status: &ConnEvent) -> Option<String> {
+    match status {
+        ConnEvent::Failed { message } => Some(format!("no file list — {message}")),
+        ConnEvent::Busy { holder_pid } => Some(match holder_pid {
+            Some(pid) => format!("no file list — another eave (pid {pid}) holds the engine"),
+            None => "no file list — another eave holds the engine".into(),
+        }),
+        ConnEvent::Connecting | ConnEvent::Connected { .. } | ConnEvent::Reconnecting { .. } => {
+            None
+        }
+    }
 }
 
 struct DiffSlot {
@@ -2456,6 +2528,22 @@ struct Shell {
     /// transcript, so pressing `+ new` twice does not reset the agent you
     /// were half-way through picking.
     launcher: LauncherUi,
+    /// Slice AH — since when the files rail has had no answer, and for
+    /// which session. `None` = it is not waiting.
+    ///
+    /// A `Cell` on the shell rather than a field on `FilesState`, for two
+    /// reasons that are the same reason. It is not a fact about the
+    /// session — it is this window's record of its own patience, so it has
+    /// no business in a projection of engine state. And the gate that
+    /// reads it ([`Shell::work_in_flight`]) takes `&self` and runs inside
+    /// the render pass: an entity write there would notify, and a notify
+    /// per frame is a second way to build the exact defect this closes.
+    ///
+    /// The clock is the executor's ([`gpui::BackgroundExecutor::now`]),
+    /// never `Instant::now`, so the deterministic scheduler can advance it
+    /// — the same choice `motion::pulse_now` makes and for the same
+    /// reason.
+    files_wait_since: Cell<Option<(String, Instant)>>,
 }
 
 /// One open rail rename (Stage AC).
@@ -3887,16 +3975,24 @@ impl Shell {
             // character `…` was the same picture whether it was seconds
             // away or never coming; skeleton rows at least say a LIST is
             // what is coming, in the rhythm it will arrive in.
-            None => (
-                None,
-                div()
-                    .px(px(theme::SPACE_2))
-                    .child(
-                        loaders::skeleton(theme::SKELETON_ROWS, phase)
-                            .debug_selector(|| "files-skeleton".into()),
-                    )
-                    .into_any_element(),
-            ),
+            //
+            // Slice AH: and now they stop saying it when it stops being
+            // true. `files_wait` is the same answer the pulse gate reads,
+            // so the skeleton is on screen exactly while a lease is held
+            // and never one frame longer.
+            None => match self.files_wait(cx) {
+                FilesWait::Silent(reason) => (None, self.files_silence(&reason, cx)),
+                FilesWait::Answered | FilesWait::Waiting => (
+                    None,
+                    div()
+                        .px(px(theme::SPACE_2))
+                        .child(
+                            loaders::skeleton(theme::SKELETON_ROWS, phase)
+                                .debug_selector(|| "files-skeleton".into()),
+                        )
+                        .into_any_element(),
+                ),
+            },
             Some(None) => (None, fact("file status unavailable — engine predates it")),
             // Slice AA: a basis we cannot measure from outranks anything
             // the scan says, because the scan says nothing. Rendering
@@ -4081,6 +4177,63 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The files rail when nothing answered (Slice AH): the error the
+    /// eternal skeleton had lost, plus an affordance where one can
+    /// actually do something.
+    ///
+    /// Written in the rail's own `fact` voice — quiet tertiary words on
+    /// the bare ground, the same as "not a git repository" and "no
+    /// changes" — because it is the same kind of statement and a louder
+    /// one would read as an alarm about the engine that this window is not
+    /// in a position to raise.
+    ///
+    /// **`try again` appears only while the connection is live.** It sends
+    /// `Command::Resubscribe`, which the feed loop services inside its
+    /// session loop; after the 5-attempt breaker that loop has returned,
+    /// so the button would be an affordance that silently does nothing —
+    /// the exact defect Stage AC widened the launcher's command match to
+    /// prevent. A stated fact with no button beats a button that lies.
+    fn files_silence(&self, reason: &str, cx: &Context<Self>) -> AnyElement {
+        let live = matches!(self.conn.read(cx).status, ConnEvent::Connected { .. });
+        div()
+            .px(px(theme::SPACE_2))
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_1))
+            .child(
+                div()
+                    .debug_selector(|| "files-silence".into())
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(reason.to_string())),
+            )
+            .children(live.then(|| {
+                div()
+                    .id("files-retry")
+                    .debug_selector(|| "files-retry".into())
+                    .w_full()
+                    .px(px(theme::SPACE_1))
+                    .py(px(theme::SPACE_1))
+                    .rounded(px(theme::RADIUS_CHIP))
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(theme::text_secondary())
+                    .hover_fade("files-retry", theme::wash_rest(), theme::overlay())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // Restart the patience with the request, or the
+                        // rail would re-state the old silence on the very
+                        // next frame and the button would read as broken.
+                        this.files_wait_since.set(None);
+                        let _ = this.commands.send(Command::Resubscribe);
+                        cx.notify();
+                    }))
+                    .child("try again")
+            }))
+            .into_any_element()
+    }
+
     /// One changed file: status glyph in a fixed slot, path, +/− counts.
     /// Counts wear the existing state pigments (adds success, removals
     /// danger). B2: click toggles the file's inline diff; ⌘-click opens
@@ -4261,6 +4414,10 @@ impl Shell {
             state.diff = None;
             cx.notify();
         });
+        // Slice AH: a toggle is a fresh request, so it gets fresh patience.
+        // Without this a rail that had already given up on one basis would
+        // state that silence over the other one before it had been asked.
+        self.files_wait_since.set(None);
         let _ = self.commands.send(Command::FilesScope(scope));
     }
 
@@ -4430,6 +4587,63 @@ impl Shell {
         )
     }
 
+    /// What the files rail knows about the selected session's list, and
+    /// therefore both whether it may animate and what it must say
+    /// (Slice AH).
+    ///
+    /// **The defect this closes.** The gate used to ask "is there a
+    /// snapshot for the selected session?" and answer "no" forever. A
+    /// skeleton that never resolves looks like a skeleton, which looks
+    /// like loading, which looks fine — so nobody notices by looking, and
+    /// the tell is CPU: the rail held a pulse lease for the life of the
+    /// process. An eternal skeleton is an error state that lost its error.
+    ///
+    /// **Two kinds of evidence, and the stronger one first.** If the
+    /// connection itself says no answer is coming, that is a fact and it
+    /// is stated at once with no clock involved ([`conn_silence`]). Only
+    /// when the connection is live — so the only evidence available is
+    /// elapsed time — does [`FILES_PATIENCE`] apply, and what it then
+    /// states is what this window actually knows ("nothing answered in
+    /// 20s"), never a diagnosis of the engine it cannot make.
+    ///
+    /// **Idempotent.** Both the gate and the render call it on the same
+    /// frame; the second call reads the wait the first one started, so the
+    /// picture and the timer can never disagree about whether a list is on
+    /// its way. That disagreement was the whole bug.
+    fn files_wait(&self, cx: &Context<Self>) -> FilesWait {
+        let Some(selected) = self.transcript.read(cx).session_id.clone() else {
+            self.files_wait_since.set(None);
+            return FilesWait::Answered;
+        };
+        // `Some((sid, None))` counts as arrived: "the engine refused this
+        // method" is an answer. Only an absent tag, or one belonging to a
+        // session that is no longer selected, is a wait.
+        if matches!(&self.files.read(cx).snapshot, Some((sid, _)) if sid == &selected) {
+            self.files_wait_since.set(None);
+            return FilesWait::Answered;
+        }
+        if let Some(reason) = conn_silence(&self.conn.read(cx).status) {
+            self.files_wait_since.set(None);
+            return FilesWait::Silent(reason);
+        }
+        let now = cx.background_executor().now();
+        let since = match self.files_wait_since.take() {
+            // A wait belongs to one session: switching restarts it, which
+            // is why the tag is stored beside the instant.
+            Some((sid, started)) if sid == selected => started,
+            _ => now,
+        };
+        self.files_wait_since.set(Some((selected, since)));
+        if now.saturating_duration_since(since) >= FILES_PATIENCE {
+            FilesWait::Silent(format!(
+                "no file list — nothing answered in {}s",
+                FILES_PATIENCE.as_secs()
+            ))
+        } else {
+            FilesWait::Waiting
+        }
+    }
+
     /// Is anything in this window mid-flight this frame? (Slice N3.)
     ///
     /// The ONE place that decides whether the pulse clock gets a lease,
@@ -4451,15 +4665,19 @@ impl Shell {
         {
             return true;
         }
-        let selected = self.transcript.read(cx).session_id.clone();
         let files = self.files.read(cx);
         // The files rail: a selected session whose snapshot has not
         // arrived (the skeleton rows).
-        if !files.collapsed && selected.is_some() {
-            let arrived = matches!(&files.snapshot, Some((sid, _)) if Some(sid.as_str()) == selected.as_deref());
-            if !arrived {
-                return true;
-            }
+        //
+        // **Slice AH.** This arm used to be "selected, and no snapshot",
+        // full stop — an unbounded predicate, so a subscription nobody
+        // ever answered held the lease for the life of the process and
+        // eave sat at 30 fps drawing a picture that said a list was
+        // coming. The bound is in `files_wait`, which is also what the
+        // rail renders from, so the gate and the picture can no longer
+        // disagree about whether anything is on its way.
+        if !files.collapsed && self.files_wait(cx) == FilesWait::Waiting {
+            return true;
         }
         // The diff pane's own load.
         if matches!(&files.diff, Some(d) if matches!(d.fetch, DiffFetch::Loading)) {
@@ -7388,6 +7606,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         demo: DemoOverlay::default(),
                         rename: None,
                         launcher: LauncherUi::default(),
+                        files_wait_since: Cell::new(None),
                         conn: conn.clone(),
                         sessions: sessions.clone(),
                         files: files.clone(),
@@ -7489,6 +7708,93 @@ mod harness;
 
 #[cfg(test)]
 mod tests {
+    // -----------------------------------------------------------------
+    // Slice AH — the eternal skeleton
+
+    /// **Where the rail's patience comes from, and what it may not do.**
+    ///
+    /// A number that only has to make one test pass can be anything. This
+    /// one is pinned from both sides against constants it does not own:
+    ///
+    ///   - **Below** by the engine's own ceiling. `refresh_files` shells
+    ///     out to git and every call is bounded by `GIT_TIMEOUT`, so a
+    ///     healthy engine whose first git call times out owes its first
+    ///     frame that long. A rail that gave up inside that window would
+    ///     call a live scan a failure — the opposite defect, and a louder
+    ///     one, because it puts an error on screen where none happened.
+    ///   - **Above** by what being wrong costs. The rail holds a pulse
+    ///     lease while it waits, and a lease at 30 fps is +8.7 points of a
+    ///     core (measured in N2). A minute of that on a window where
+    ///     nothing is happening is not a loading state, it is the bug.
+    ///
+    /// The 30 s ceiling is a literal rather than a multiple of
+    /// `GIT_TIMEOUT`: deriving BOTH bounds from the same constant would
+    /// let the pair slide together and assert nothing.
+    #[test]
+    fn the_rails_patience_clears_the_engines_git_ceiling_and_stops_inside_a_minute() {
+        let git = eave_engine::git::GIT_TIMEOUT;
+        assert!(
+            FILES_PATIENCE >= git + git / 2,
+            "the files rail gives up in {:?}, but one of the engine's own \
+             git calls may legitimately take {git:?} — the rail would put \
+             `no file list` on screen over a scan that is still running",
+            FILES_PATIENCE
+        );
+        assert!(
+            FILES_PATIENCE <= Duration::from_secs(30),
+            "the rail waits {:?} before it says anything, and it holds a \
+             30 fps pulse lease the whole time",
+            FILES_PATIENCE
+        );
+    }
+
+    /// The connection facts the rail is allowed to read off instead of
+    /// timing, and — the half that matters — the ones it is not.
+    ///
+    /// `Failed` must carry the ENGINE'S OWN WORDS through. The failure
+    /// this catches is a rail that swallows "engine unreachable after 5
+    /// attempts: …" and prints a house-style shrug, which is the same
+    /// defect as the eternal skeleton one layer up: an error state that
+    /// lost its error.
+    #[test]
+    fn only_a_settled_connection_answers_for_the_files_rail() {
+        let failed = conn_silence(&ConnEvent::Failed {
+            message: "engine unreachable after 5 attempts: no such file".into(),
+        })
+        .expect("a failed connection is a stated fact, not a wait");
+        assert!(
+            failed.contains("engine unreachable after 5 attempts: no such file"),
+            "the rail dropped the engine's own words: {failed}"
+        );
+        assert!(
+            conn_silence(&ConnEvent::Busy {
+                holder_pid: Some(991)
+            })
+            .is_some_and(|w| w.contains("991")),
+            "a contended start names the holder or it is not actionable"
+        );
+        assert!(
+            conn_silence(&ConnEvent::Busy { holder_pid: None }).is_some(),
+            "an unknown holder is still a reason no list is coming"
+        );
+
+        // The live ones. `Reconnecting` is bounded — five attempts with a
+        // doubling 250 ms backoff — and ends in `Failed`, so calling a
+        // 250 ms blip `no file list` would be an error state that never
+        // had an error.
+        for live in [
+            ConnEvent::Connecting,
+            ConnEvent::Connected { engine_pid: 7 },
+            ConnEvent::Reconnecting { attempt: 4 },
+        ] {
+            assert_eq!(
+                conn_silence(&live),
+                None,
+                "{live:?} is not a reason to stop expecting a file list"
+            );
+        }
+    }
+
     /// A fence under the cap is drawn verbatim; over it, the view stops and
     /// says so — including that copy is unaffected, because the failure this
     /// notice prevents is someone believing eave truncated their data.
