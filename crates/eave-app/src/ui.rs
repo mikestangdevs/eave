@@ -5047,6 +5047,31 @@ impl Shell {
         if !state.in_turn() {
             return None;
         }
+        // **Slice AQ — found by eye, in `docs/shots/aq-before-approval.png`.**
+        // A session parked on a permission question was captioned `working
+        // for 99h 49m`, with a running work bar beside it, in the slot
+        // directly above the composer.
+        //
+        // Both halves of that were true in their own terms and the sentence
+        // was false: `in_turn` is `turn_balance > 0`, and a turn parked on a
+        // question is indeed still open — the CLI is waiting, not finished.
+        // But the operator is not being told what is running, they are being
+        // told what is happening, and what is happening is that eave is
+        // waiting for THEM.
+        //
+        // It is a consequence of the fix directly above: the attention
+        // notice suppresses itself while the question is on screen (the
+        // 2026-08-18 occlusion defect), and this trailer takes the slot the
+        // notice gave up. Two correct local decisions composing into a
+        // wrong sentence — which is why the guard belongs here, in the arm
+        // that renders the words, rather than in the notice.
+        //
+        // Nothing stands in: the card IS the notice while it is on screen
+        // (Slice K), and it says `Bash — needs your approval / waiting` in
+        // the warning pigment, which is more than this trailer ever could.
+        if state.transcript.pending_approvals().next().is_some() {
+            return None;
+        }
         // No `UserSent` seen means no honest clock to report; the
         // indicator alone still states that something is running. Never
         // invent a start time from when this process attached.
@@ -5763,68 +5788,142 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap_2()
-                        .child(Self::decision_button(
-                            state,
-                            &rid,
-                            true,
-                            "approve",
-                            theme::live(),
-                        ))
-                        .child(Self::decision_button(
-                            state,
-                            &rid,
-                            false,
-                            "deny",
-                            theme::danger(),
-                        )),
+                        .child(Self::decision_button(state, &rid, true))
+                        .child(Self::decision_button(state, &rid, false)),
                 )
+                // What is left to say once each button carries its own key.
+                // The trailer used to open `⇧⌘A approve · ⇧⌘D deny · …`,
+                // repeating both button words to introduce two bindings that
+                // now sit ON the buttons; this is the one fact about
+                // answering that no button can show, because it is about
+                // something outside the card.
                 .child(line(
                     theme::text_tertiary(),
-                    "⇧⌘A approve · ⇧⌘D deny · whatever is in the composer is sent as the \
-                     deny reason"
-                        .to_string(),
+                    "deny sends whatever is in the composer as the reason".to_string(),
                 ));
         }
         Self::column(card).into_any_element()
     }
 
+    /// One of the two most consequential clicks in the application.
+    ///
+    /// **Slice AQ.** Both used to be the same outlined chip in two hues —
+    /// approve in [`theme::live`], deny in [`theme::danger`] — at the same
+    /// size, the same weight and the same rim, differing only by pigment.
+    /// Two things were wrong with that beyond the sameness:
+    ///
+    ///   - `live` is the pigment for *something is running right now* (the
+    ///     streaming cursor, a running tool's dot, the work bar). Borrowed
+    ///     for a verb it read as a link chip rather than as an answer, and
+    ///     it meant the transcript's busiest colour was also its most
+    ///     irreversible button.
+    ///   - approving is the one action in this UI that cannot be taken
+    ///     back, and it looked exactly like the rest of the chrome.
+    ///
+    /// So the pair is now asymmetric on ONE channel each, and neither is
+    /// asymmetric on more than one:
+    ///
+    ///   - **approve** takes the app's [`theme::solid`] plate — the same
+    ///     near-white fill with a near-black label that the launcher's
+    ///     `Start Claude Code` and the armed send button already paint. Its
+    ///     size and weight are unchanged; the FILL is the whole of its
+    ///     promotion. (Size, weight and ink are three channels and stacking
+    ///     all three overshoots — an hour of another slice's day says so.)
+    ///   - **deny** keeps the unfilled shape every other affordance in eave
+    ///     has, and carries its meaning in HUE: a `danger_ring` rim and a
+    ///     [`theme::danger_ink`] word. Destructive, legible as such, and
+    ///     quieter than a near-white plate by construction.
+    ///
+    /// The hover ends differ for the same reason the resting ones do. A
+    /// filled control replaces its bg rather than compositing a wash over
+    /// it, so approve names both ends outright; deny warms into
+    /// `danger_wash_strong` rather than the neutral wash, which puts it one
+    /// rung below the kill affordance (whose RESTING fill that is) on a
+    /// single danger ladder.
+    ///
+    /// **Slice M's ruling on the neutral hover is not undone, it is
+    /// spent.** Its reason was that hover must never read as "this one is
+    /// chosen" — true when the pair was two identical chips whose only
+    /// difference was hue. Now the plate says which is primary at rest,
+    /// permanently, so a warm hover on deny cannot be mistaken for a
+    /// selection; there is nothing to select.
+    ///
+    /// The keycap rides the button rather than a sentence underneath it.
+    /// `⇧⌘A`/`⇧⌘D` are declared at `ui.rs:56` and were previously announced
+    /// by a trailer that opened by repeating both button words.
     fn decision_button(
         state: &TranscriptState,
         rid: &str,
         allow: bool,
-        word: &str,
-        color: Hsla,
     ) -> gpui::Stateful<gpui::Div> {
         let rid = rid.to_string();
         let id: SharedString = format!("{}-{rid}", if allow { "approve" } else { "deny" }).into();
         let tx = state.commands.clone();
         let composer = state.composer.clone();
+        let word = if allow { "approve" } else { "deny" };
+        let key = if allow { "⇧⌘A" } else { "⇧⌘D" };
         div()
             .px(px(theme::SPACE_3))
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
-            .border_1()
-            .border_color(color)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_2))
             .text_size(px(theme::DETAIL_SIZE))
             .font_weight(theme::WEIGHT_LABEL)
-            .text_color(color)
+            .when(!allow, |d| {
+                d.border_1()
+                    .border_color(theme::danger_ring())
+                    .text_color(theme::danger_ink())
+            })
+            .when(allow, |d| d.text_color(theme::on_solid()))
             .child(SharedString::from(word.to_string()))
+            .child(
+                // The binding, printed where the thing it fires is. Quiet by
+                // INK on both buttons — it is a second rank inside a button,
+                // not a second button.
+                div()
+                    .debug_selector({
+                        let rid = rid.clone();
+                        move || format!("{}-key-{rid}", if allow { "approve" } else { "deny" })
+                    })
+                    // Deny takes the SECONDARY tier, not the quiet one:
+                    // its hover paints a danger wash under this glyph, and
+                    // `text_tertiary` may not be drawn where a state wash
+                    // can land on it (see `theme::text_tertiary`). Measured
+                    // it would read 3.07:1 hovered — a fit, not a
+                    // clearance. The demotion is the rule, not a nudge.
+                    .text_color(if allow {
+                        theme::on_solid_quiet()
+                    } else {
+                        theme::text_secondary()
+                    })
+                    .child(key),
+            )
             .id(id.clone())
             .debug_selector({
                 let rid = rid.clone();
                 move || format!("{}-{rid}", if allow { "approve" } else { "deny" })
             })
-            // Slice M (§2.2). The neutral wash, not the button's own
-            // pigment: approve and deny are the two most consequential
-            // clicks in the app, and hover must say "the pointer is
-            // here" without ever reading as "this one is chosen".
-            //
             // The only two hover fades in the app that live INSIDE the
             // virtualized list, so their reads land in prepaint rather
             // than in the root render — which is the whole reason the
             // store's staleness rule carries a frame of grace
             // (`motion::Fades::begin`).
-            .hover_fade(id.to_string(), theme::wash_rest(), theme::overlay())
+            .hover_fade(
+                id.to_string(),
+                if allow {
+                    theme::solid()
+                } else {
+                    theme::wash_rest()
+                },
+                if allow {
+                    theme::solid_hover()
+                } else {
+                    theme::danger_wash_strong()
+                },
+            )
             .cursor_pointer()
             .on_click(move |_, _, cx| {
                 let message = if allow {
@@ -7300,7 +7399,28 @@ impl Render for Shell {
                         .child(
                             div()
                                 .debug_selector(|| "composer-hint".into())
-                                .text_size(px(theme::MICRO_SIZE))
+                                // **Slice AQ: `MICRO_SIZE` → `DETAIL_SIZE`.**
+                                // This slot was the SMALLEST type in the
+                                // application, and on its loud branch it
+                                // carries the warning pigment — the two
+                                // channels were arguing. Size said footnote;
+                                // ink said "a live fact about what your send
+                                // will do".
+                                //
+                                // `DETAIL` is the rank the attention notice's
+                                // body takes, and this is the same kind of
+                                // sentence: chrome, stating a condition. The
+                                // ink was already spending the budget, so
+                                // this is an under-spend corrected rather
+                                // than a third channel added — the weight is
+                                // untouched.
+                                //
+                                // Geometry is unaffected in both directions:
+                                // the row's height is `SEND_BUTTON` (26) and
+                                // `DETAIL_LINE` (16) clears it as `MICRO_LINE`
+                                // (14) did.
+                                .text_size(px(theme::DETAIL_SIZE))
+                                .line_height(px(theme::DETAIL_LINE))
                                 .text_color(if pending_here > 0 {
                                     theme::warning()
                                 } else {
