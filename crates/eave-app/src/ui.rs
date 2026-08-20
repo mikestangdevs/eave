@@ -4619,6 +4619,12 @@ impl Shell {
     /// frame; the second call reads the wait the first one started, so the
     /// picture and the timer can never disagree about whether a list is on
     /// its way. That disagreement was the whole bug.
+    ///
+    /// A COLLAPSED rail calls it from neither — `work_in_flight`
+    /// short-circuits on `collapsed` and `files_rail` is not built — so a
+    /// rail nobody can see costs nothing and starts its patience fresh
+    /// when it is opened. That is the right reading: the wait is about a
+    /// picture, and a hidden picture is not waiting for anything.
     fn files_wait(&self, cx: &Context<Self>) -> FilesWait {
         let Some(selected) = self.transcript.read(cx).session_id.clone() else {
             self.files_wait_since.set(None);
