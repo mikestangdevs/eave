@@ -5566,8 +5566,21 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // bindings rather than living only inside the key handler.
         KeyBinding::new("cmd-shift-a", ApproveOldest, None),
         KeyBinding::new("cmd-shift-d", DenyOldest, None),
+        // Slice Y: the three a macOS user reaches for without thinking.
+        // Bound here rather than expressed as `OsAction`s because eave's
+        // gpui pin has no Minimize/Close variants (see `app_menus`).
+        KeyBinding::new("cmd-w", crate::app_menus::CloseWindow, None),
+        KeyBinding::new("cmd-m", crate::app_menus::Minimize, None),
+        KeyBinding::new("cmd-h", crate::app_menus::Hide, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+    // The menu bar. Registered HERE rather than in `main` so the harness
+    // boots the same wiring the app does — and note this is not what makes
+    // ⌘Q work (the binding above already did, and always has). It is what
+    // makes the bar exist at all: gpui calls `setMainMenu_` only from
+    // `set_menus`, so without this `NSApp.mainMenu` is nil and the
+    // auto-hidden system bar has nothing to reveal.
+    crate::app_menus::init(cx); // handlers only — the bar goes in last
 
     // Slice M (§1.22): honoured for the one animation eave has. gpui
     // applies this inside `with_animation` itself — a oneshot renders its
@@ -5929,6 +5942,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             },
         )
         .expect("open window");
+    // The bar, last: a `setMainMenu_` issued before the window exists and
+    // before activation does not stick (see `app_menus::install`).
+    crate::app_menus::install(cx);
     cx.activate(true);
     handle
 }
