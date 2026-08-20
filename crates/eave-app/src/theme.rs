@@ -627,7 +627,7 @@ pub fn on_solid() -> Hsla {
 ///  - the **composer caret** — 6.05:1 on the composer's glass, and the one
 ///    element on screen that is always eave's and never the agent's;
 ///  - the **composer's rim while it holds a draft** — the app's only focus
-///    ring, 6.05:1 against the glass inside it and 5.09:1 against the well
+///    ring, 6.05:1 against the glass inside it and 4.88:1 against the well
 ///    outside;
 ///  - the **armed send button's fill**, with [`on_solid`] on the glyph.
 ///
