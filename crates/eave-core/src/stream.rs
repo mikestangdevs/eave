@@ -118,18 +118,19 @@ impl ClaudeStream {
                     .map(str::to_string);
                 self.parse_control_request(&v["request"], line)
             }
-            Some("control_cancel_request") => {
-                match v.get("request_id").and_then(Value::as_str) {
-                    Some(id) => vec![SessionEvent::ApprovalWithdrawn {
-                        request_id: {
-                            self.pending.remove(id);
-                            id.to_string()
-                        },
-                        reason: "the provider withdrew the request".into(),
-                    }],
-                    None => vec![malformed(line, "control_cancel_request without request_id".into())],
-                }
-            }
+            Some("control_cancel_request") => match v.get("request_id").and_then(Value::as_str) {
+                Some(id) => vec![SessionEvent::ApprovalWithdrawn {
+                    request_id: {
+                        self.pending.remove(id);
+                        id.to_string()
+                    },
+                    reason: "the provider withdrew the request".into(),
+                }],
+                None => vec![malformed(
+                    line,
+                    "control_cancel_request without request_id".into(),
+                )],
+            },
             // Our own decisions, echoed back by the CLI. The engine journals
             // the decision itself at the moment it reaches the pipe, so the
             // echo carries nothing new — dropped, not journaled twice.
@@ -201,9 +202,7 @@ impl ClaudeStream {
                         .to_string(),
                     path,
                     input_json: input.to_string(),
-                    suggestions_json: req
-                        .get("permission_suggestions")
-                        .map(|s| s.to_string()),
+                    suggestions_json: req.get("permission_suggestions").map(|s| s.to_string()),
                 }]
             }
             other => vec![SessionEvent::DialogRefused {
@@ -223,21 +222,24 @@ impl ClaudeStream {
                     Vec::new()
                 }
             }
-            Some("content_block_delta") => {
-                match ev["delta"].get("text").and_then(Value::as_str) {
-                    Some(text) => vec![SessionEvent::TextDelta {
-                        text: text.to_string(),
-                    }],
-                    None => Vec::new(),
-                }
-            }
+            Some("content_block_delta") => match ev["delta"].get("text").and_then(Value::as_str) {
+                Some(text) => vec![SessionEvent::TextDelta {
+                    text: text.to_string(),
+                }],
+                None => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
 
     fn parse_assistant(&mut self, msg: &Value) -> Vec<SessionEvent> {
         let mut out = Vec::new();
-        for block in msg.get("content").and_then(Value::as_array).into_iter().flatten() {
+        for block in msg
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
@@ -260,12 +262,19 @@ impl ClaudeStream {
                 for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
                         Some("tool_result") => {
-                            if let Some(id) =
-                                block.get("tool_use_id").and_then(Value::as_str)
-                            {
+                            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
                                 if self.outstanding.remove(id) {
                                     out.push(SessionEvent::ToolUseFinished {
                                         id: id.to_string(),
+                                        result: tool_result_text(block),
+                                        // The provider's own flag. Never
+                                        // inferred from the text: "error"
+                                        // appears in plenty of successful
+                                        // output.
+                                        is_error: block
+                                            .get("is_error")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false),
                                     });
                                 }
                             }
@@ -300,11 +309,43 @@ impl ClaudeStream {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                // Re-serialised compactly rather than kept verbatim: the
+                // provider's whitespace is not a fact about the tool call,
+                // and a compact form is what the cap is measured against.
+                // A missing `input` is an empty string, not `"null"` — the
+                // row then states the tool and nothing more, which is
+                // accurate.
+                input: block
+                    .get("input")
+                    .filter(|v| !v.is_null())
+                    .map(|v| crate::events::cap_payload(&v.to_string()))
+                    .unwrap_or_default(),
             })
         } else {
             None
         }
     }
+}
+
+/// Flatten a `tool_result` block's content to text, bounded.
+///
+/// The provider sends either a bare string (what every call in the
+/// 2026-08-18 capture corpus does) or the API's array-of-blocks form. Both
+/// are real; the array form keeps only its `text` blocks, joined by
+/// newlines, because an image in a tool result has no text to state and a
+/// row that rendered `[object]` would be worse than one that renders
+/// nothing.
+fn tool_result_text(block: &Value) -> String {
+    let raw = match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    crate::events::cap_payload(&raw)
 }
 
 fn malformed(line: &str, error: String) -> SessionEvent {
@@ -356,7 +397,10 @@ mod tests {
                 // `blocked_path` — it is not in the tool input at all.
                 assert_eq!(path.as_deref(), Some("/tmp/pc3/out.txt"));
                 assert!(input_json.contains("echo hello-from-bash > out.txt"));
-                assert!(suggestions_json.as_ref().unwrap().contains("addDirectories"));
+                assert!(suggestions_json
+                    .as_ref()
+                    .unwrap()
+                    .contains("addDirectories"));
             }
             other => panic!("expected one ApprovalRequested, got {other:?}"),
         }
@@ -369,7 +413,11 @@ mod tests {
         let mut s = ClaudeStream::new();
         let line = r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Write","display_name":"Write","input":{"file_path":"/repo/note.txt","content":"hi"},"description":"note.txt","tool_use_id":"toolu_1"}}"#;
         match s.parse_line(line).as_slice() {
-            [SessionEvent::ApprovalRequested { path, suggestions_json, .. }] => {
+            [SessionEvent::ApprovalRequested {
+                path,
+                suggestions_json,
+                ..
+            }] => {
                 assert_eq!(path.as_deref(), Some("/repo/note.txt"));
                 assert!(suggestions_json.is_none());
             }
@@ -419,9 +467,13 @@ mod tests {
     #[test]
     fn init_carries_the_permission_mode_the_cli_reports() {
         let mut s = ClaudeStream::new();
-        let line = r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default"}"#;
+        let line =
+            r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default"}"#;
         match s.parse_line(line).as_slice() {
-            [SessionEvent::Init { session_id, permission_mode }] => {
+            [SessionEvent::Init {
+                session_id,
+                permission_mode,
+            }] => {
                 assert_eq!(session_id, "abc");
                 assert_eq!(permission_mode.as_deref(), Some("default"));
             }
@@ -430,7 +482,9 @@ mod tests {
         // A CLI that states no mode leaves it unproven — never assumed.
         let bare = r#"{"type":"system","subtype":"init","session_id":"abc"}"#;
         match ClaudeStream::new().parse_line(bare).as_slice() {
-            [SessionEvent::Init { permission_mode, .. }] => assert!(permission_mode.is_none()),
+            [SessionEvent::Init {
+                permission_mode, ..
+            }] => assert!(permission_mode.is_none()),
             other => panic!("got {other:?}"),
         }
     }

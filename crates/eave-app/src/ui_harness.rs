@@ -86,10 +86,12 @@ fn boot(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext) {
 fn session(id: &str) -> SessionInfo {
     SessionInfo {
         session_id: id.into(),
+        title: None,
         provider: "claude-code".into(),
         model: None,
         cwd: "/tmp/eave-harness".into(),
         created_ts_ms: 1,
+        last_activity_ms: None,
         state: "idle".into(),
         live: false,
         epoch: 1,
@@ -115,7 +117,24 @@ fn click_with(vcx: &mut VisualTestContext, selector: &'static str, modifiers: Mo
     let bounds = vcx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("element {selector} did not render"));
-    vcx.simulate_click(bounds.center(), modifiers);
+    // `debug_bounds` answers "was this painted", NOT "can it be clicked". An
+    // element scrolled out of the viewport still reports bounds — with a
+    // NEGATIVE origin — and `simulate_click` on a point outside the window
+    // hits nothing and reports nothing, so the test goes green having
+    // exercised no handler at all.
+    //
+    // Found the hard way: a code fence 250 lines tall put its own header
+    // strip at y = -2972px in a bottom-aligned list, and the copy-button
+    // test passed its click and then failed on the clipboard, which is a
+    // confusing way to learn the click never happened.
+    let c = bounds.center();
+    assert!(
+        c.x >= px(0.) && c.y >= px(0.),
+        "element {selector} is off-screen at {c:?} — a click there hits \
+         nothing and asserts nothing; scroll it into view or use a fixture \
+         that fits"
+    );
+    vcx.simulate_click(c, modifiers);
 }
 
 /// Is this element on screen at all?
@@ -234,13 +253,21 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     let mut unprobed = session("dddd4444");
     unprobed.live = true;
 
-    let all = vec![live_a.clone(), live_b.clone(), dead.clone(), unprobed.clone()];
+    let all = vec![
+        live_a.clone(),
+        live_b.clone(),
+        dead.clone(),
+        unprobed.clone(),
+    ];
     let (line, over) = resource_line(&all, Some(32 * GB)).expect("two live agents report");
     assert_eq!(line, "2 agents · 0.5 GB of 32.0 GB");
     assert!(!over, "half a gig of thirty-two is not a warning");
 
     let (one, _) = resource_line(&[live_a.clone()], Some(32 * GB)).unwrap();
-    assert_eq!(one, "1 agent · 0.2 GB of 32.0 GB", "singular reads as singular");
+    assert_eq!(
+        one, "1 agent · 0.2 GB of 32.0 GB",
+        "singular reads as singular"
+    );
 
     let mut hog = session("eeee5555");
     hog.live = true;
@@ -251,7 +278,10 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     // No denominator is stated as absence, never invented.
     let (bare, over) = resource_line(&all, None).unwrap();
     assert_eq!(bare, "2 agents · 0.5 GB resident");
-    assert!(!over, "without a machine size there is no ratio to warn about");
+    assert!(
+        !over,
+        "without a machine size there is no ratio to warn about"
+    );
 
     // Nothing live that reports memory ⇒ no line at all. A "0.0 GB" over
     // a running agent would be a lie; silence is the honest shape.
@@ -363,10 +393,8 @@ fn facts_that_grow_wrap_instead_of_losing_their_tail(cx: &mut TestAppContext) {
     one.shared_with = vec!["bbbb2222".into()];
     one.worktree = Some(worktree("eave/aaaa1111", Some(1), true));
     h.plumbing.push_rail(vec![one]);
-    h.plumbing.push_wt((
-        "aaaa1111".into(),
-        Some(WtNote::Error("refused".into())),
-    ));
+    h.plumbing
+        .push_wt(("aaaa1111".into(), Some(WtNote::Error("refused".into()))));
     vcx.run_until_parked();
     let room = vcx.debug_bounds("shares-aaaa1111").unwrap().size.width;
     let short_shares = vcx.debug_bounds("shares-aaaa1111").unwrap().size.height;
@@ -444,11 +472,17 @@ fn isolate_is_offered_only_while_it_is_still_possible(cx: &mut TestAppContext) {
 
     let mut alone = ready.clone();
     alone.shared_with.clear();
-    assert!(!offered(alone, &h, vcx), "no collision, nothing to opt out of");
+    assert!(
+        !offered(alone, &h, vcx),
+        "no collision, nothing to opt out of"
+    );
 
     let mut started = ready.clone();
     started.state = "idle".into();
-    assert!(!offered(started, &h, vcx), "cwd is fixed after the first send");
+    assert!(
+        !offered(started, &h, vcx),
+        "cwd is fixed after the first send"
+    );
 
     let mut live = ready.clone();
     live.live = true;
@@ -559,13 +593,22 @@ fn deleting_a_worktree_takes_two_clicks_and_restates_fresh_counts(cx: &mut TestA
     vcx.run_until_parked();
     let stated = vcx
         .read_window(&h.window, |shell, cx| {
-            shell.read(cx).sessions.read(cx).wt_notes.get("aaaa1111").cloned()
+            shell
+                .read(cx)
+                .sessions
+                .read(cx)
+                .wt_notes
+                .get("aaaa1111")
+                .cloned()
         })
         .unwrap();
     assert!(
         matches!(
             stated,
-            Some(WtNote::ConfirmDelete { dirty_files: Some(5), unmerged_commits: Some(1) })
+            Some(WtNote::ConfirmDelete {
+                dirty_files: Some(5),
+                unmerged_commits: Some(1)
+            })
         ),
         "the note must carry the freshest counts, got {stated:?}"
     );
@@ -600,13 +643,19 @@ fn clearing_the_note_disarms_the_delete(cx: &mut TestAppContext) {
 
     h.plumbing.push_wt(("aaaa1111".into(), None)); // settled
     vcx.run_until_parked();
-    assert!(!shown(vcx, "wt-note-aaaa1111"), "a settled action states nothing");
+    assert!(
+        !shown(vcx, "wt-note-aaaa1111"),
+        "a settled action states nothing"
+    );
 
     let _ = h.drain();
     click(vcx, "wtd-aaaa1111");
     let cmds = h.drain();
     assert!(
-        matches!(cmds.as_slice(), [Command::RemoveWorktree { force: false, .. }]),
+        matches!(
+            cmds.as_slice(),
+            [Command::RemoveWorktree { force: false, .. }]
+        ),
         "a disarmed delete asks again, got {cmds:?}"
     );
 }
@@ -642,6 +691,409 @@ fn user_record(seq: u64, text: &str) -> eave_core::journal::Record {
     }
 }
 
+fn tool_started(seq: u64, id: &str, name: &str, input: &str) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseStarted {
+                id: id.into(),
+                name: name.into(),
+                input: input.into(),
+            },
+        },
+    }
+}
+
+fn tool_finished(seq: u64, id: &str, result: &str, is_error: bool) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseFinished {
+                id: id.into(),
+                result: result.into(),
+                is_error,
+            },
+        },
+    }
+}
+
+fn assistant_record(seq: u64, text: &str) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::AssistantText { text: text.into() },
+        },
+    }
+}
+
+/// A code block can leave the app, whole.
+///
+/// Until this slice there was no way to get code out of eave at all: no
+/// selection, no copy button, ⌘C unbound. The transcript could show you a
+/// patch and the only way to use it was to retype it.
+///
+/// This test is about the click and the clipboard only. That copy takes the
+/// WHOLE fence when the view is capped is a property of `fence_view` and is
+/// asserted there, purely — a fence tall enough to be capped puts its own
+/// copy button ~3000 px above the viewport, where a simulated click hits
+/// nothing (see the note in `click_with`).
+#[gpui::test]
+fn a_fence_leaves_the_app_when_you_click_copy(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+
+    // Deliberately SHORT. This test is about the click and the clipboard;
+    // the cap is pure logic and is tested as such in `fence_view`'s own
+    // unit tests, because a fence tall enough to be capped puts its own
+    // copy button thousands of pixels above the viewport.
+    let fence = "```rust\nlet x = 1;\nlet y = 2;\n```";
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![assistant_record(1, fence)],
+    });
+    vcx.run_until_parked();
+
+    click(vcx, "fence-copy");
+    vcx.run_until_parked();
+
+    let got = vcx
+        .read_from_clipboard()
+        .and_then(|i| i.text())
+        .expect("the clipboard holds the fence");
+    assert_eq!(got, "let x = 1;\nlet y = 2;", "the code, and only the code");
+    assert!(!got.contains("```"), "the fence markers were copied");
+    assert!(!got.contains("rust"), "the language label was copied");
+
+    // ...and the app says so, rather than leaving you to guess.
+    let note = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).friction.clone())
+        .unwrap();
+    assert!(
+        note.is_some_and(|(_, n)| n.contains("copied 2 lines")),
+        "a copy that states nothing is a copy you have to verify by pasting"
+    );
+}
+
+/// A tool row states what it was asked to do.
+///
+/// Before this slice the transcript rendered `Bash  done`: the parser kept
+/// a `tool_result`'s id and threw away its `content`, and kept a `tool_use`'s
+/// id and name and threw away its `input`. An agent could run the whole test
+/// suite and eave would show you two words, neither of them the command.
+#[gpui::test]
+fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(
+            1,
+            "toolu_1",
+            "Bash",
+            r#"{"command":"cargo test --workspace"}"#,
+        )],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-detail").is_some(),
+        "a running tool row states no command"
+    );
+
+    // ...and a failure states why, in place.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_finished(2, "toolu_1", "error: 3 tests failed", true)],
+    });
+    vcx.run_until_parked();
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).transcript.rows.clone()
+        })
+        .unwrap();
+    let tool = rows
+        .iter()
+        .find_map(|r| match r {
+            eave_wire::model::Row::Tool {
+                input,
+                result,
+                is_error,
+                ..
+            } => Some((input.clone(), result.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("a tool row");
+    assert!(tool.0.contains("cargo test --workspace"), "input dropped");
+    assert_eq!(tool.1, "error: 3 tests failed", "result dropped");
+    assert!(tool.2, "the provider's error flag dropped");
+    assert!(
+        vcx.debug_bounds("tool-detail").is_some(),
+        "the command stopped being stated once the tool finished"
+    );
+}
+
+/// A successful tool's output is reachable.
+///
+/// Slice V deliberately shipped only the failure case: a failed tool
+/// states why, a successful one states nothing, because its output is
+/// usually long and always a row height inside a virtualized list. The
+/// missing half was that there was no way to see it AT ALL — the payload
+/// crossed the wire and then sat in a row nobody could open.
+#[gpui::test]
+fn a_tool_card_opens_to_show_what_came_back(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started(1, "toolu_1", "Bash", r#"{"command":"cargo test"}"#),
+            tool_finished(2, "toolu_1", "test result: ok. 356 passed", false),
+        ],
+    });
+    vcx.run_until_parked();
+
+    // Closed by default: a `Read` must not make the transcript taller.
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "a tool card opened itself"
+    );
+    let closed = vcx
+        .debug_bounds("tool-head")
+        .expect("a tool with a body is clickable")
+        .size
+        .height;
+
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_some(),
+        "clicking the row did not open it"
+    );
+
+    // ...and it really got taller. This is the assertion that catches a
+    // stale `ListState` height: the body can render while the row's cached
+    // measurement still says otherwise, and then the rows below it overlap.
+    let open_row = vcx
+        .debug_bounds("tool-row")
+        .expect("the tool row renders")
+        .size
+        .height;
+    assert!(
+        open_row > closed,
+        "the row did not grow when it opened ({open_row:?} vs head {closed:?}) — \
+         a cached ListState height would look exactly like this"
+    );
+
+    // Clicking again closes it.
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "the card would not close"
+    );
+}
+
+/// A switch takes the open cards with it. Tool ids are per-session and
+/// two sessions can carry the same one.
+#[gpui::test]
+fn opened_cards_do_not_outlive_their_session(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started(1, "toolu_1", "Bash", r#"{"command":"cargo test"}"#),
+            tool_finished(2, "toolu_1", "ok", false),
+        ],
+    });
+    vcx.run_until_parked();
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tool-body").is_some());
+
+    // Session B, same tool id.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "bbbb2222".into(),
+        epoch: 1,
+        records: vec![
+            tool_started(1, "toolu_1", "Bash", r#"{"command":"other"}"#),
+            tool_finished(2, "toolu_1", "ok", false),
+        ],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "B's identically-id'd tool opened itself because A had opened one"
+    );
+}
+
+/// A tool eave has no summary key for states its name and nothing else,
+/// rather than inventing a detail from an arbitrary input field.
+#[gpui::test]
+fn an_unknown_tool_states_no_detail(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(1, "toolu_1", "SomeMcpTool", r#"{"opaque":1}"#)],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-detail").is_none(),
+        "a detail was invented for a tool with no known summary key"
+    );
+}
+
+/// A rail has ONE left edge.
+///
+/// It had four. Every value was a legal `SPACE_*` and the scale was applied
+/// everywhere — which is the point: **a spacing scale tells you the SIZE of
+/// a gap and says nothing about which edge things line up on.** The header
+/// label sat at 24, a row's card at 20, the empty state at 28 and the
+/// footer at 24, with the row card overhanging the `+ new` button by 4 px.
+/// Both rails had it, identically, because one was copied from the other.
+///
+/// The assertions compare MEASURED edges against each other and never
+/// against `RAIL_GUTTER`. A test that computed its expectation from the
+/// constant it is testing would pass for any value of that constant, which
+/// is the trap §Traps already names.
+#[gpui::test]
+fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // `live` with reported memory, because the footer's resource line is
+    // absent entirely when nothing live reports any — and that line is one
+    // of the two edges under test.
+    let mut only = session("aaaa1111");
+    only.live = true;
+    only.rss_bytes = Some(64 * 1024 * 1024);
+    h.plumbing.push_rail(vec![only]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(1),
+                dels: Some(0),
+                orig_path: None,
+                untracked: false,
+            }],
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::WorkingTree,
+        }),
+    ));
+    vcx.run_until_parked();
+
+    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .origin
+            .x
+    };
+    let right = |vcx: &mut VisualTestContext, sel: &'static str| {
+        let b = vcx
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"));
+        b.origin.x + b.size.width
+    };
+
+    // Header label and footer fact are both text directly on the rail, so
+    // they share the gutter.
+    assert_eq!(
+        x(vcx, "rail-title"),
+        x(vcx, "rail-resource"),
+        "the sessions rail's header and footer start on different edges"
+    );
+    // The header's trailing control and a row's card share their RIGHT
+    // edge — this is the 4 px overhang, asserted.
+    assert_eq!(
+        right(vcx, "new-session"),
+        right(vcx, "rail-aaaa1111"),
+        "the row card and the + new button end on different edges"
+    );
+
+    // The files rail is the same rule, and had the same drift.
+    assert_eq!(
+        x(vcx, "files-title"),
+        x(vcx, "files-mode"),
+        "the files rail's header and mode line start on different edges"
+    );
+    // The files header's trailing slot holds a count, not a control — but
+    // it is still the trailing element, so the rule is the same one.
+    // (`files-toggle` is the TITLEBAR's collapse control and lives outside
+    // the rail entirely; asserting against it was measuring two different
+    // columns.)
+    assert_eq!(
+        right(vcx, "files-count"),
+        right(vcx, "file-src/lib.rs"),
+        "the file row and the rail's trailing count end on different edges"
+    );
+}
+
+/// ...and the empty state is on it too, which is the one that read as a
+/// typo rather than as drift: "no sessions" was indented PAST the header it
+/// sits under.
+#[gpui::test]
+fn the_empty_state_starts_on_the_gutter(cx: &mut TestAppContext) {
+    let (_h, vcx) = boot(cx);
+    vcx.run_until_parked();
+    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .origin
+            .x
+    };
+    assert_eq!(
+        x(vcx, "rail-empty"),
+        x(vcx, "rail-title"),
+        "the empty state is indented past the header it sits under"
+    );
+}
+
 /// Clicking a row only *requests* a switch — the rail's highlight is a
 /// projection of the feed's actual subscription. And once the feed has
 /// moved on, frames still in flight from the session that just left must
@@ -662,8 +1114,12 @@ fn selecting_a_row_requests_a_switch_and_stale_frames_never_render(cx: &mut Test
     );
 
     // The feed answers: session a, with one row in it.
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
     h.plumbing.push_feed(FeedEvent::Records {
         id: "aaaa1111".into(),
         epoch: 1,
@@ -679,8 +1135,12 @@ fn selecting_a_row_requests_a_switch_and_stale_frames_never_render(cx: &mut Test
     assert_eq!(rows(vcx, &h), 1, "the selected session's row should render");
 
     // The feed switches to b — and a's straggler arrives afterwards.
-    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "bbbb2222".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "bbbb2222".into(),
+    });
     h.plumbing.push_feed(FeedEvent::Records {
         id: "aaaa1111".into(),
         epoch: 1,
@@ -706,7 +1166,9 @@ fn selecting_a_row_requests_a_switch_and_stale_frames_never_render(cx: &mut Test
 #[gpui::test]
 fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
@@ -737,7 +1199,10 @@ fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
     // An empty composer sends nothing at all.
     let _ = h.drain();
     vcx.simulate_keystrokes("enter");
-    assert!(h.drain().is_empty(), "return on an empty draft is not a send");
+    assert!(
+        h.drain().is_empty(),
+        "return on an empty draft is not a send"
+    );
 }
 
 /// A draft belongs to the session it was typed into.
@@ -749,7 +1214,9 @@ fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
@@ -761,7 +1228,9 @@ fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
     vcx.simulate_input("for aaaa");
     assert_eq!(draft(vcx, &h), "for aaaa");
 
-    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
     vcx.run_until_parked();
     assert_eq!(
         draft(vcx, &h),
@@ -770,7 +1239,9 @@ fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
     );
 
     vcx.simulate_input("for bbbb");
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     assert_eq!(draft(vcx, &h), "for aaaa", "A's draft did not come back");
 
@@ -784,7 +1255,9 @@ fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
     );
 
     // B's words are untouched by A's send: one draft has one home.
-    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
     vcx.run_until_parked();
     assert_eq!(draft(vcx, &h), "for bbbb", "sending A's draft spent B's");
 }
@@ -806,7 +1279,9 @@ fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_session_switch_restores_follow(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     let mode = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
@@ -818,12 +1293,16 @@ fn a_session_switch_restores_follow(cx: &mut TestAppContext) {
     // The reader scrolls up and away from the tail.
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.transcript.update(cx, |t, _| t.scroll = ScrollMode::Free);
+            shell
+                .transcript
+                .update(cx, |t, _| t.scroll = ScrollMode::Free);
         })
         .unwrap();
     assert_eq!(mode(vcx, &h), ScrollMode::Free);
 
-    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
     vcx.run_until_parked();
     assert_eq!(
         mode(vcx, &h),
@@ -835,12 +1314,20 @@ fn a_session_switch_restores_follow(cx: &mut TestAppContext) {
     // transcript that never held it.
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.transcript.update(cx, |t, _| t.scroll = ScrollMode::Pinned { msg: 7 });
+            shell
+                .transcript
+                .update(cx, |t, _| t.scroll = ScrollMode::Pinned { msg: 7 });
         })
         .unwrap();
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
-    assert_eq!(mode(vcx, &h), ScrollMode::Follow, "a pin outlived its session");
+    assert_eq!(
+        mode(vcx, &h),
+        ScrollMode::Follow,
+        "a pin outlived its session"
+    );
 }
 
 /// The launcher reaches no composer.
@@ -879,7 +1366,9 @@ fn the_launcher_reaches_no_composer(cx: &mut TestAppContext) {
     );
 
     // ...and the session that opens next opens clean.
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     assert_eq!(
         draft(vcx, &h),
@@ -916,7 +1405,9 @@ fn the_badge_ladder_states_only_what_deserves_attention(cx: &mut TestAppContext)
     }
 
     // The standing notice for the selected session, and its kill.
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     h.plumbing.push_attn((
         "aaaa1111".into(),
         AttentionSnapshot::Unresponsive {
@@ -964,8 +1455,11 @@ fn the_diff_pane_opens_on_click_and_closes_when_the_file_stops_changing(cx: &mut
         files,
         omitted: 0,
         watching: true,
+        basis: DiffBasis::WorkingTree,
     };
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     h.plumbing
         .push_files(("aaaa1111".into(), Some(snapshot(vec![one.clone()]))));
     vcx.run_until_parked();
@@ -980,7 +1474,13 @@ fn the_diff_pane_opens_on_click_and_closes_when_the_file_stops_changing(cx: &mut
 
     let open_path = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).files.read(cx).diff.as_ref().map(|d| d.path.clone())
+            shell
+                .read(cx)
+                .files
+                .read(cx)
+                .diff
+                .as_ref()
+                .map(|d| d.path.clone())
         })
         .unwrap()
     };
@@ -1027,7 +1527,9 @@ fn cmd_clicking_a_changed_file_opens_it_without_launching_anything(cx: &mut Test
     let mut info = session("aaaa1111");
     info.cwd = "/tmp/eave-harness/repo".into();
     h.plumbing.push_rail(vec![info]);
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     h.plumbing.push_files((
         "aaaa1111".into(),
         Some(FilesSnapshot {
@@ -1042,6 +1544,7 @@ fn cmd_clicking_a_changed_file_opens_it_without_launching_anything(cx: &mut Test
             }],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -1055,7 +1558,10 @@ fn cmd_clicking_a_changed_file_opens_it_without_launching_anything(cx: &mut Test
         },
     );
     let opened = OPENED.with(|o| o.borrow().clone());
-    assert_eq!(opened, vec![PathBuf::from("/tmp/eave-harness/repo/src/lib.rs")]);
+    assert_eq!(
+        opened,
+        vec![PathBuf::from("/tmp/eave-harness/repo/src/lib.rs")]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,7 +1577,12 @@ fn cmd_clicking_a_changed_file_opens_it_without_launching_anything(cx: &mut Test
 // below (amendment 1: the decision is made per test, not once).
 
 /// A journalled permission question, exactly as the adapter produces one.
-fn approval_record(seq: u64, request_id: &str, tool: &str, path: &str) -> eave_core::journal::Record {
+fn approval_record(
+    seq: u64,
+    request_id: &str,
+    tool: &str,
+    path: &str,
+) -> eave_core::journal::Record {
     eave_core::journal::Record {
         seq,
         ts_ms: seq * 10,
@@ -1091,8 +1602,12 @@ fn approval_record(seq: u64, request_id: &str, tool: &str, path: &str) -> eave_c
 
 /// Put one open question on screen in session `aaaa1111`.
 fn ask(h: &Harness, vcx: &mut VisualTestContext, records: Vec<eave_core::journal::Record>) {
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
     h.plumbing.push_feed(FeedEvent::Records {
         id: "aaaa1111".into(),
         epoch: 1,
@@ -1106,10 +1621,17 @@ fn ask(h: &Harness, vcx: &mut VisualTestContext, records: Vec<eave_core::journal
 #[gpui::test]
 fn approving_states_the_facts_and_answers_that_request(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    ask(&h, vcx, vec![approval_record(1, "req-1", "Write", "/repo/src/main.rs")]);
+    ask(
+        &h,
+        vcx,
+        vec![approval_record(1, "req-1", "Write", "/repo/src/main.rs")],
+    );
     let _ = h.drain();
 
-    assert!(shown(vcx, "approval-req-1"), "the question must be on screen");
+    assert!(
+        shown(vcx, "approval-req-1"),
+        "the question must be on screen"
+    );
     assert!(
         shown(vcx, "approval-path-req-1"),
         "the path it would touch is the fact that most needs stating"
@@ -1136,7 +1658,11 @@ fn approving_states_the_facts_and_answers_that_request(cx: &mut TestAppContext) 
 #[gpui::test]
 fn denying_carries_the_operators_reason_and_clears_the_composer(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    ask(&h, vcx, vec![approval_record(1, "req-1", "Bash", "/repo/out.txt")]);
+    ask(
+        &h,
+        vcx,
+        vec![approval_record(1, "req-1", "Bash", "/repo/out.txt")],
+    );
     vcx.simulate_input("commit first");
     vcx.run_until_parked();
     let _ = h.drain();
@@ -1162,7 +1688,11 @@ fn denying_carries_the_operators_reason_and_clears_the_composer(cx: &mut TestApp
     );
 
     // And a plain deny with nothing typed is still a deny.
-    ask(&h, vcx, vec![approval_record(1, "req-2", "Bash", "/repo/out.txt")]);
+    ask(
+        &h,
+        vcx,
+        vec![approval_record(1, "req-2", "Bash", "/repo/out.txt")],
+    );
     let _ = h.drain();
     click(vcx, "deny-req-2");
     assert!(
@@ -1231,7 +1761,11 @@ fn the_keyboard_answers_the_oldest_open_question(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_settled_question_stops_offering_an_answer(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    ask(&h, vcx, vec![approval_record(1, "req-1", "Write", "/repo/a.txt")]);
+    ask(
+        &h,
+        vcx,
+        vec![approval_record(1, "req-1", "Write", "/repo/a.txt")],
+    );
     assert!(shown(vcx, "approve-req-1") && shown(vcx, "deny-req-1"));
 
     h.plumbing.push_feed(FeedEvent::Records {
@@ -1338,7 +1872,13 @@ fn the_posture_line_fits_the_rail_at_real_glyph_widths(cx: &mut TestAppContext) 
         "posture lines must be full-width like every other rail fact"
     );
 
-    for mode in ["default", "manual", "bypassPermissions", "acceptEdits", "dontAsk"] {
+    for mode in [
+        "default",
+        "manual",
+        "bypassPermissions",
+        "acceptEdits",
+        "dontAsk",
+    ] {
         let text = posture_line(mode);
         let w = real_text_width(&text, theme::SANS, theme::SMALL_SIZE);
         assert!(
@@ -1357,7 +1897,10 @@ fn the_composer_states_that_a_send_will_queue_behind_the_question(cx: &mut TestA
     let (h, vcx) = boot(cx);
     ask(&h, vcx, vec![user_record(1, "go")]);
     let hint_before = vcx.debug_bounds("composer-hint").map(|b| b.size.width);
-    assert!(hint_before.is_some(), "the composer always states its own key");
+    assert!(
+        hint_before.is_some(),
+        "the composer always states its own key"
+    );
 
     ask(
         &h,
@@ -1386,7 +1929,11 @@ fn the_composer_states_that_a_send_will_queue_behind_the_question(cx: &mut TestA
 #[gpui::test]
 fn the_notice_never_stands_on_top_of_the_question_it_points_at(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    ask(&h, vcx, vec![approval_record(1, "req-1", "Bash", "/repo/target")]);
+    ask(
+        &h,
+        vcx,
+        vec![approval_record(1, "req-1", "Bash", "/repo/target")],
+    );
     h.plumbing.push_attn((
         "aaaa1111".into(),
         AttentionSnapshot::AwaitingApproval {
@@ -1409,7 +1956,9 @@ fn the_notice_never_stands_on_top_of_the_question_it_points_at(cx: &mut TestAppC
     // With the same notice standing but no question on screen — the
     // projection was reset, or attention outran the records — the panel
     // is the only thing that can tell the operator, so it renders.
-    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     assert!(
         !shown(vcx, "approval-req-1"),
@@ -1478,8 +2027,12 @@ fn an_empty_log_states_only_the_kind_of_empty_it_can_prove(cx: &mut TestAppConte
     let mut fresh = session("aaaa1111");
     fresh.last_seq = 0;
     h.plumbing.push_rail(vec![fresh]);
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     assert!(
         shown(vcx, "transcript-empty"),
@@ -1491,8 +2044,12 @@ fn an_empty_log_states_only_the_kind_of_empty_it_can_prove(cx: &mut TestAppConte
     let mut loaded = session("bbbb2222");
     loaded.last_seq = 41;
     h.plumbing.push_rail(vec![loaded]);
-    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "bbbb2222".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "bbbb2222".into(),
+    });
     vcx.run_until_parked();
     assert!(
         !shown(vcx, "transcript-empty"),
@@ -1519,8 +2076,12 @@ fn an_empty_log_states_only_the_kind_of_empty_it_can_prove(cx: &mut TestAppConte
 #[gpui::test]
 fn the_empty_note_never_becomes_a_row(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     let items = vcx
         .read_window(&h.window, |shell, cx| {
@@ -1659,9 +2220,7 @@ fn an_idle_shell_asks_for_no_frames_and_a_claim_buys_exactly_one(cx: &mut TestAp
 
     // Something declares itself mid-flight, then the shell renders.
     motion::mark_active();
-    h.window
-        .update(vcx, |_, _, cx| cx.notify())
-        .unwrap();
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
     vcx.run_until_parked();
 
     let asked = h
@@ -1695,9 +2254,7 @@ fn reduced_motion_stops_the_tail_from_asking_for_frames(cx: &mut TestAppContext)
     vcx.update(|_, cx| cx.set_reduce_motion(true));
 
     motion::mark_active();
-    h.window
-        .update(vcx, |_, _, cx| cx.notify())
-        .unwrap();
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
     vcx.run_until_parked();
 
     let asked = h
@@ -1843,8 +2400,12 @@ fn the_empty_note_enters_once_and_does_not_replay_on_later_frames(cx: &mut TestA
     let mut fresh = session("aaaa1111");
     fresh.last_seq = 0;
     h.plumbing.push_rail(vec![fresh]);
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     assert!(
         shown(vcx, "transcript-empty"),
@@ -1892,8 +2453,12 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
     // `the_launcher_reaches_no_composer` now pins: the keystrokes were
     // landing in an unmounted buffer. The lease assertion is unchanged —
     // an open session with an empty draft still takes none.
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
-    h.plumbing.push_feed(FeedEvent::Reset { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
     h.plumbing.push_feed(FeedEvent::Records {
         id: "aaaa1111".into(),
         epoch: 1,
@@ -1911,6 +2476,7 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
             files: Vec::new(),
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -1946,7 +2512,12 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
     // scroll, and the fade store ages in RENDERS, not wall time — so the
     // frames have to be spent, not waited out).
     drive(&h, vcx, Duration::from_millis(600));
-    assert_eq!(h.window.update(vcx, |_, window, cx| window.simulate_next_frame(cx)).unwrap(), 0);
+    assert_eq!(
+        h.window
+            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap(),
+        0
+    );
 }
 
 /// §1.3's rise is a RELATIVE inset, and this is what that buys: the panel
@@ -1968,7 +2539,9 @@ fn an_entrance_that_rises_moves_itself_and_nothing_else(cx: &mut TestAppContext)
     let (h, vcx) = boot(cx);
     drive(&h, vcx, Duration::from_millis(10));
 
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     h.plumbing.push_attn((
         "aaaa1111".into(),
         AttentionSnapshot::Unresponsive {
@@ -2029,7 +2602,9 @@ fn the_caret_blink_never_moves_a_pixel_of_the_composer(cx: &mut TestAppContext) 
     // Q2: the composer is not mounted at the launcher — a draft typed with
     // no session has nothing to be addressed to — so this needs a session
     // before there is a composer to measure.
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(10));
 
@@ -2078,9 +2653,7 @@ fn the_caret_blink_never_moves_a_pixel_of_the_composer(cx: &mut TestAppContext) 
 /// make a metrics test pass vacuously, which is the exact failure that
 /// amendment exists to prevent).
 #[gpui::test]
-fn a_glyph_swap_would_move_the_text_which_is_why_the_blink_recolours(
-    _cx: &mut TestAppContext,
-) {
+fn a_glyph_swap_would_move_the_text_which_is_why_the_blink_recolours(_cx: &mut TestAppContext) {
     let caret = real_text_width("▏", theme::SANS, theme::BODY_SIZE);
     let blank = real_text_width(" ", theme::SANS, theme::BODY_SIZE);
     assert!(
@@ -2168,7 +2741,9 @@ fn a_window_with_nothing_in_flight_never_starts_the_pulse_clock(cx: &mut TestApp
 /// a percentage measured at load 361 measures the load.
 fn watch_redraws(h: &Harness, vcx: &mut VisualTestContext) -> Redraws {
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let shell = vcx.read_window(&h.window, |shell, _| shell.clone()).unwrap();
+    let shell = vcx
+        .read_window(&h.window, |shell, _| shell.clone())
+        .unwrap();
     let sub = {
         let count = Arc::clone(&count);
         vcx.update(move |_, cx| {
@@ -2505,6 +3080,7 @@ fn a_files_rail_with_no_snapshot_yet_shows_skeleton_rows(cx: &mut TestAppContext
             files: Vec::new(),
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -2536,6 +3112,7 @@ fn a_diff_that_has_not_arrived_shows_skeleton_rows(cx: &mut TestAppContext) {
             }],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -2603,6 +3180,7 @@ fn every_swapped_control_draws_its_glyph_in_the_box_its_token_names(cx: &mut Tes
             }],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -2655,6 +3233,7 @@ fn the_status_glyph_never_moves_the_path_beside_it(cx: &mut TestAppContext) {
             ],
             omitted: 0,
             watching: true,
+            basis: DiffBasis::WorkingTree,
         }),
     ));
     vcx.run_until_parked();
@@ -2688,7 +3267,12 @@ fn the_status_glyph_never_moves_the_path_beside_it(cx: &mut TestAppContext) {
     // ...and the slot really is the fixed one, not just five glyphs that
     // happen to agree: the box is the token's, inside the rail's slot.
     assert_eq!(first.size.width, px(theme::ICON_STATUS));
-    assert!(theme::ICON_STATUS <= theme::FILE_STATUS_W);
+    // Constant today, which is exactly why it is asserted: it fires the day
+    // someone moves either token so the glyph stops fitting its slot.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(theme::ICON_STATUS <= theme::FILE_STATUS_W);
+    }
 }
 
 /// Both toggles still toggle. Replacing the child of a clickable `div` is
@@ -2800,7 +3384,10 @@ fn a_menu_opens_over_the_shell_and_a_click_outside_takes_it_away(cx: &mut TestAp
     vcx.simulate_click(outside, Modifiers::none());
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
-    assert!(!shown(vcx, "overlay-menu"), "the menu outlived its dismissal");
+    assert!(
+        !shown(vcx, "overlay-menu"),
+        "the menu outlived its dismissal"
+    );
 }
 
 #[gpui::test]
@@ -2893,7 +3480,11 @@ fn the_arrows_skip_the_disabled_row_and_return_chooses(cx: &mut TestAppContext) 
     vcx.simulate_keystrokes("down");
     assert_eq!(hl(vcx, &h), Some(1));
     vcx.simulate_keystrokes("down");
-    assert_eq!(hl(vcx, &h), Some(0), "the cursor stopped on the disabled row");
+    assert_eq!(
+        hl(vcx, &h),
+        Some(0),
+        "the cursor stopped on the disabled row"
+    );
 
     vcx.simulate_keystrokes("down enter");
     let (chosen, mounted) = vcx
@@ -2938,7 +3529,9 @@ fn an_open_menu_swallows_typing(cx: &mut TestAppContext) {
     // composer got the keyboard back") was asserting against a composer
     // that was never mounted. Select one, so the surface this test is about
     // is a menu over a session, which is the only place a menu opens.
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
@@ -2947,11 +3540,19 @@ fn an_open_menu_swallows_typing(cx: &mut TestAppContext) {
         .unwrap()
     };
     vcx.simulate_input("hello");
-    assert_eq!(draft(vcx, &h), "", "typing reached the composer through the menu");
+    assert_eq!(
+        draft(vcx, &h),
+        "",
+        "typing reached the composer through the menu"
+    );
     vcx.simulate_keystrokes("escape");
     drive(&h, vcx, Duration::from_millis(16));
     vcx.simulate_input("hello");
-    assert_eq!(draft(vcx, &h), "hello", "the composer never got the keyboard back");
+    assert_eq!(
+        draft(vcx, &h),
+        "hello",
+        "the composer never got the keyboard back"
+    );
 }
 
 /// The constraint that decides where the layer mounts: **an overlay must
@@ -2966,7 +3567,9 @@ fn the_overlay_moves_nothing_it_floats_over(cx: &mut TestAppContext) {
         .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
     // Q2: `composer-hint` is one of the probes below, and the composer is
     // only mounted once a session is selected.
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
 
@@ -2990,7 +3593,10 @@ fn the_overlay_moves_nothing_it_floats_over(cx: &mut TestAppContext) {
     click(vcx, "overlay-demo");
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
-    assert!(shown(vcx, "overlay-menu"), "the menu must be up for this to mean anything");
+    assert!(
+        shown(vcx, "overlay-menu"),
+        "the menu must be up for this to mean anything"
+    );
 
     let after: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
     assert_eq!(before, after, "the overlay moved the shell underneath it");
@@ -3051,7 +3657,10 @@ fn a_menu_costs_frames_only_while_it_moves(cx: &mut TestAppContext) {
 fn the_surface_stays_up_and_dead_through_its_exit(cx: &mut TestAppContext) {
     let (mut h, vcx, menu) = open_menu(cx);
     let rail = vcx.debug_bounds("rail-aaaa1111").expect("no rail row");
-    assert!(overlaps(menu, rail), "the fixture must cover a live affordance");
+    assert!(
+        overlaps(menu, rail),
+        "the fixture must cover a live affordance"
+    );
 
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
@@ -3093,7 +3702,10 @@ fn reduced_motion_gets_a_menu_with_no_travel_at_all(cx: &mut TestAppContext) {
     click(vcx, "overlay-demo");
     vcx.run_until_parked();
     // No clock advanced, no frames driven: it is already fully there.
-    assert!(shown(vcx, "overlay-menu"), "the menu waited for a frame it will never get");
+    assert!(
+        shown(vcx, "overlay-menu"),
+        "the menu waited for a frame it will never get"
+    );
     let opacity = vcx
         .read_window(&h.window, |shell, cx| {
             shell
@@ -3103,7 +3715,11 @@ fn reduced_motion_gets_a_menu_with_no_travel_at_all(cx: &mut TestAppContext) {
                 .motion_at(cx.background_executor().now(), true)
         })
         .unwrap();
-    assert_eq!(opacity, Some((1.0, 0.0)), "reduced motion drew a part-way menu");
+    assert_eq!(
+        opacity,
+        Some((1.0, 0.0)),
+        "reduced motion drew a part-way menu"
+    );
 
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
@@ -3167,7 +3783,9 @@ fn the_launcher_never_becomes_a_row(cx: &mut TestAppContext) {
 fn a_session_replaces_the_launcher(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     assert!(shown(vcx, "launcher"));
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     assert!(!shown(vcx, "launcher"), "the launcher outlived its session");
 
@@ -3218,7 +3836,10 @@ fn a_provider_with_no_adapter_takes_no_click(cx: &mut TestAppContext) {
 
     let before = picked(vcx);
     for ix in dead {
-        click(vcx, Box::leak(format!("provider-tile-{ix}").into_boxed_str()));
+        click(
+            vcx,
+            Box::leak(format!("provider-tile-{ix}").into_boxed_str()),
+        );
         vcx.run_until_parked();
         assert_eq!(
             picked(vcx),
@@ -3337,7 +3958,10 @@ fn a_refused_launch_states_the_engines_own_words(cx: &mut TestAppContext) {
 fn a_settled_launcher_asks_for_no_frames(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let entering = drive(&h, vcx, Duration::from_millis(16));
-    assert!(entering > 0, "the launcher's entrance never asked for a frame");
+    assert!(
+        entering > 0,
+        "the launcher's entrance never asked for a frame"
+    );
     assert!(shown(vcx, "launcher"));
     assert_eq!(
         h.window
@@ -3363,7 +3987,10 @@ fn escape_closes_the_model_menu_and_not_the_launcher(cx: &mut TestAppContext) {
     assert!(shown(vcx, "overlay-menu"));
     vcx.simulate_keystrokes("escape");
     drive(&h, vcx, Duration::from_millis(16));
-    assert!(!shown(vcx, "overlay-menu"), "escape did not dismiss the menu");
+    assert!(
+        !shown(vcx, "overlay-menu"),
+        "escape did not dismiss the menu"
+    );
     assert!(shown(vcx, "launcher"), "escape took the launcher with it");
 }
 
@@ -3383,11 +4010,340 @@ fn the_launcher_shows_no_composer_to_type_into(cx: &mut TestAppContext) {
         "the launcher offered a composer with no session to send to",
     );
 
-    h.plumbing.push_feed(FeedEvent::Session { id: "aaaa1111".into() });
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
     vcx.run_until_parked();
     assert!(!shown(vcx, "launcher"));
     assert!(
         shown(vcx, "composer-hint"),
         "the composer did not come back with the session",
+    );
+}
+
+/// Slice AA: the basis toggle is a RESUBSCRIBE, not a filter — the engine
+/// only computes the turn-scoped list while somebody is subscribed to it,
+/// so the click has to reach the connection loop. And the list on screen
+/// when it does must not be the other basis's list wearing the new label.
+#[gpui::test]
+fn the_files_basis_toggle_resubscribes_and_drops_the_other_basis_list(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(3),
+                dels: Some(1),
+                orig_path: None,
+                untracked: false,
+            }],
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::WorkingTree,
+        }),
+    ));
+    vcx.run_until_parked();
+    let _ = h.drain();
+    assert!(
+        shown(vcx, "file-src/lib.rs"),
+        "the working-tree list renders"
+    );
+
+    click(vcx, "files-scope-latest-turn");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::FilesScope(FileScope::LatestTurn)]
+        ),
+        "the toggle must re-open the subscription against the other basis, got {cmds:?}"
+    );
+    assert!(
+        !shown(vcx, "file-src/lib.rs"),
+        "the working-tree list must not survive under the turn label — that is \
+         exactly the misattribution this slice exists to prevent"
+    );
+    assert!(
+        shown(vcx, "files-skeleton"),
+        "the honest picture between a toggle and its first frame is 'a list is coming'"
+    );
+
+    // Clicking the segment that is already selected is not a resubscribe.
+    click(vcx, "files-scope-latest-turn");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "re-clicking the current basis must not tear the subscription down"
+    );
+}
+
+/// The two ways a turn-scoped list can be empty mean opposite things, and
+/// the rail has to say which one it is. "No turn to measure against" is a
+/// sentence; rendering it as an empty list would claim the turn changed
+/// nothing.
+#[gpui::test]
+fn an_unavailable_turn_basis_renders_words_not_an_empty_list(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::Unavailable {
+                reason: "no turn has started since this engine did".into(),
+            },
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "files-count"),
+        "a count of 0 under an unavailable basis would be a claim, not a fact"
+    );
+    assert!(
+        !shown(vcx, "files-mode"),
+        "the refresh mode describes machinery; the body is already explaining \
+         why there is no answer"
+    );
+
+    // A real zero under a real basis keeps its count and its mode line.
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: Vec::new(),
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::Turn { at: 1_700_000_000 },
+        }),
+    ));
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "files-count"),
+        "a turn that has genuinely changed nothing counts zero"
+    );
+    assert!(shown(vcx, "files-mode"));
+}
+
+// ---------------------------------------------------------------------------
+// Stage AB — the rail says which session.
+
+/// The title is the only rail fact whose length the OPERATOR controls, and
+/// it shares its line with the badge — the fact that says a session is
+/// waiting on you. The title has to lose that contest every time, by
+/// clipping itself rather than growing the row.
+///
+/// Asserted as **clearance**, not as fit. §Traps records the bug where
+/// "does not overflow" and "does not touch" turned out to be different
+/// questions: a title whose last glyph ends exactly where the badge begins
+/// reads as one run of text, and passes any test that only checks the row
+/// did not overflow.
+#[gpui::test]
+fn a_long_title_clips_itself_before_it_crowds_the_badge(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // The worst case that can actually reach a row: a title at the storage
+    // cap, on the state whose badge word is the longest, with the count
+    // suffix that makes it longer still.
+    let widest = "M".repeat(eave_core::store::TITLE_MAX_CHARS);
+    let mut named = session("aaaa1111");
+    named.title = Some(widest.clone());
+    named.state = "awaiting_approval".into();
+    named.pending_approvals = 3;
+    h.plumbing.push_rail(vec![named]);
+    vcx.run_until_parked();
+
+    let row = vcx.debug_bounds("rail-aaaa1111").expect("the row renders");
+    let label = vcx
+        .debug_bounds("label-aaaa1111")
+        .expect("the row states a label");
+    let badge = vcx
+        .debug_bounds("badge-aaaa1111")
+        .expect("the badge renders beside it");
+
+    // The badge kept its whole word. A badge squeezed to "waiting on…"
+    // states the wrong fact, and the row it is on is the one the operator
+    // is being asked to act on. The 1 px slack here and below is for
+    // rounding between the shaper and the laid-out box, never for a
+    // smaller gap.
+    let word = "waiting on you (3)";
+    let need = real_text_width(word, theme::SANS, theme::SMALL_SIZE);
+    assert!(
+        badge.size.width >= need - px(1.),
+        "the badge got {:?} for a word needing {need:?} — the title took \
+         room that is not its to take",
+        badge.size.width
+    );
+
+    // The title genuinely could not fit, so this measures truncation and
+    // not a happy accident. It is also where the storage cap earns its
+    // value: `TITLE_MAX_CHARS` is deliberately past what the row can draw,
+    // because bounding the wire and bounding the display are different
+    // jobs and a cap tight enough to be the visual limit would silently
+    // destroy the operator's text.
+    let wanted = real_text_width(&widest, theme::SANS, theme::DETAIL_SIZE);
+    assert!(
+        wanted > label.size.width,
+        "a title at the cap ({wanted:?}) fits the label slot ({:?}) — then \
+         nothing here is testing truncation",
+        label.size.width
+    );
+
+    // Clearance, not adjacency: the row declares `gap_2`, and the whole of
+    // it has to still be there after the title clipped. `> 0` — the test
+    // §Traps records as insufficient — would pass on two boxes sharing an
+    // edge, which reads as one run of text.
+    let clearance = badge.origin.x - (label.origin.x + label.size.width);
+    assert!(
+        clearance >= px(theme::SPACE_2 - 1.0),
+        "only {clearance:?} between the title and the badge — the row lays \
+         out {:?} of gap and the title ate it",
+        px(theme::SPACE_2)
+    );
+
+    // And the badge is inside the rail, not pushed off its end.
+    assert!(
+        badge.origin.x + badge.size.width <= row.origin.x + row.size.width,
+        "the badge ran past the row's edge"
+    );
+}
+
+/// The slice's whole point. Two sessions in the same repo, under the same
+/// provider, in the same state used to be one row drawn twice.
+#[gpui::test]
+fn two_sessions_in_one_repo_do_not_render_as_the_same_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let a = session("aaaa1111");
+    let b = session("bbbb2222");
+    // Identical in every fact the rail stated before this slice.
+    assert_eq!(a.provider, b.provider);
+    assert_eq!(a.cwd, b.cwd);
+    assert_eq!(a.state, b.state);
+    h.plumbing.push_rail(vec![a.clone(), b.clone()]);
+    vcx.run_until_parked();
+
+    // Unnamed — and still told apart, without anyone having to do
+    // anything, because the meta line carries the session's identity.
+    assert!(shown(vcx, "cwd-aaaa1111") && shown(vcx, "cwd-bbbb2222"));
+    assert_ne!(rail_meta_line(&a, None), rail_meta_line(&b, None));
+
+    // Named — the label carries it, which is the version an operator
+    // actually reads.
+    let mut named_a = a.clone();
+    named_a.title = Some("review the parser".into());
+    let mut named_b = b.clone();
+    named_b.title = Some("chase the flake".into());
+    h.plumbing.push_rail(vec![named_a.clone(), named_b.clone()]);
+    vcx.run_until_parked();
+    assert!(shown(vcx, "label-aaaa1111") && shown(vcx, "label-bbbb2222"));
+    assert_ne!(
+        row_label(&named_a, "claude code"),
+        row_label(&named_b, "claude code")
+    );
+}
+
+/// A session with an empty journal has no title — and states that by not
+/// having a title line at all.
+///
+/// The assertion is on row HEIGHT, because "renders no empty line" is
+/// exactly the claim that a named row and an unnamed one are the same
+/// height: the title takes the label's slot rather than adding one above
+/// it. A blank line reserved for an absent title is the kind of defect
+/// that reads as a rendering bug rather than as an absent fact.
+#[gpui::test]
+fn an_unnamed_session_states_no_title_and_draws_no_empty_line(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let fresh = session("aaaa1111");
+    assert_eq!(fresh.title, None, "a fresh session is unnamed");
+    assert_eq!(fresh.last_seq, 0, "and its journal is empty");
+    h.plumbing.push_rail(vec![fresh.clone()]);
+    vcx.run_until_parked();
+
+    let unnamed_row = vcx.debug_bounds("rail-aaaa1111").unwrap().size.height;
+    let unnamed_label = vcx.debug_bounds("label-aaaa1111").unwrap().size.height;
+    // What it draws instead of nothing.
+    assert_eq!(row_label(&fresh, "claude code"), "claude code");
+
+    let mut named = fresh.clone();
+    named.title = Some("review the parser".into());
+    h.plumbing.push_rail(vec![named]);
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().size.height,
+        unnamed_row,
+        "the named row is a different height — the title added a line \
+         instead of taking the label's slot, which means the unnamed row \
+         has a blank one"
+    );
+    assert_eq!(
+        vcx.debug_bounds("label-aaaa1111").unwrap().size.height,
+        unnamed_label
+    );
+}
+
+/// comet shipped this bug: its rail sorted by attention, so merely opening
+/// a session changed that session's state, which re-sorted the rail, which
+/// slid the row out from under the pointer that had just clicked it.
+///
+/// So the ordering is asserted twice — that activity DOES place a row when
+/// it arrives, and that a state transition afterwards moves nothing — and
+/// then the click is actually performed, because a y-coordinate that holds
+/// still is only interesting if the click it protects lands.
+#[gpui::test]
+fn a_state_change_never_moves_a_row_under_the_pointer(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut older = session("aaaa1111");
+    older.created_ts_ms = 100;
+    let mut newer = session("bbbb2222");
+    newer.created_ts_ms = 200;
+    h.plumbing.push_rail(vec![older.clone(), newer.clone()]);
+    vcx.run_until_parked();
+
+    let y_older = vcx.debug_bounds("rail-aaaa1111").unwrap().origin.y;
+    let y_newer = vcx.debug_bounds("rail-bbbb2222").unwrap().origin.y;
+    assert!(
+        y_newer < y_older,
+        "activity has to decide position when a row arrives, or the rail \
+         is just insertion order"
+    );
+
+    // The older session becomes the most recently active one by a wide
+    // margin — the exact transition that made comet's rail jump.
+    older.state = "running".into();
+    older.live = true;
+    older.last_activity_ms = Some(9_000_000);
+    h.plumbing.push_rail(vec![older.clone(), newer.clone()]);
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().origin.y,
+        y_older,
+        "the row moved when its state changed"
+    );
+    assert_eq!(
+        vcx.debug_bounds("rail-bbbb2222").unwrap().origin.y,
+        y_newer,
+        "the OTHER row moved when a state changed — which is the version \
+         of this bug that hits the row you were aiming at"
+    );
+
+    // The fact did fold through, so the order is stable by choice rather
+    // than because nothing arrived.
+    h.drain();
+    click(vcx, "rail-aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Select(id)] if id == "aaaa1111"),
+        "the click landed somewhere else: {cmds:?}"
     );
 }

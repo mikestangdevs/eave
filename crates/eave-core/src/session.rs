@@ -172,7 +172,9 @@ pub enum ApprovalDecision {
     /// The message reaches the model verbatim as the tool result, so
     /// "denied — commit first" is a genuinely different instruction from
     /// "denied" (capture D, 2026-08-18).
-    Deny { message: String },
+    Deny {
+        message: String,
+    },
 }
 
 /// What a verified kill established (spec 01 §Kill & verify).

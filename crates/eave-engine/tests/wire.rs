@@ -26,10 +26,7 @@ fn engined_bin() -> PathBuf {
 }
 
 fn fake_agent_bin() -> PathBuf {
-    let path = engined_bin()
-        .parent()
-        .expect("bin dir")
-        .join("fake-agent");
+    let path = engined_bin().parent().expect("bin dir").join("fake-agent");
     assert!(
         path.exists(),
         "fake-agent not built at {path:?} — run `cargo test` from the workspace root"
@@ -135,7 +132,11 @@ async fn drain_records(
     let end = Instant::now() + deadline;
     while got.len() < min_records {
         let remaining = end.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for records (have {})", got.len());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for records (have {})",
+            got.len()
+        );
         let item = tokio::time::timeout(remaining, rx.recv())
             .await
             .expect("subscription item in time")
@@ -184,7 +185,10 @@ async fn warm_reconnect_streams_across_client_generations() {
 
     // Generation 2: resume from cursor — replay continues at seq+1.
     let c2 = Client::connect(&dir).await.expect("connect gen2");
-    let mut rx2 = c2.subscribe("s1", Some(cursor1)).await.expect("subscribe gen2");
+    let mut rx2 = c2
+        .subscribe("s1", Some(cursor1))
+        .await
+        .expect("subscribe gen2");
     let mut t2 = Transcript::new();
     t2.cursor = Some(cursor1);
     let second = drain_records(&mut rx2, &mut t2, 8, Duration::from_secs(15)).await;
@@ -196,7 +200,11 @@ async fn warm_reconnect_streams_across_client_generations() {
     // The disconnected window kept streaming: more than one tick arrived
     // in the first batch after resubscribe.
     assert!(
-        second.iter().filter(|r| r.seq <= cursor1.seq + 600 / 50).count() > 3,
+        second
+            .iter()
+            .filter(|r| r.seq <= cursor1.seq + 600 / 50)
+            .count()
+            > 3,
         "records accumulated while no client was attached"
     );
     let cursor2 = t2.cursor.unwrap();
@@ -206,7 +214,10 @@ async fn warm_reconnect_streams_across_client_generations() {
     // Generation 3: again — and this time also prove the no-cursor path
     // (a relaunched UI holds no projection): full replay from seq 1.
     let c3 = Client::connect(&dir).await.expect("connect gen3");
-    let mut rx3 = c3.subscribe("s1", Some(cursor2)).await.expect("subscribe gen3");
+    let mut rx3 = c3
+        .subscribe("s1", Some(cursor2))
+        .await
+        .expect("subscribe gen3");
     let mut t3 = Transcript::new();
     t3.cursor = Some(cursor2);
     let third = drain_records(&mut rx3, &mut t3, 4, Duration::from_secs(15)).await;
@@ -214,7 +225,13 @@ async fn warm_reconnect_streams_across_client_generations() {
 
     let mut t_full = Transcript::new();
     let mut rx_full = c3.subscribe("s1", None).await.expect("subscribe full");
-    let full = drain_records(&mut rx_full, &mut t_full, cursor2.seq as usize, Duration::from_secs(15)).await;
+    let full = drain_records(
+        &mut rx_full,
+        &mut t_full,
+        cursor2.seq as usize,
+        Duration::from_secs(15),
+    )
+    .await;
     assert_eq!(full.first().unwrap().seq, 1);
     let seqs: Vec<u64> = full.iter().map(|r| r.seq).collect();
     for w in seqs.windows(2) {
@@ -252,11 +269,15 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
     loop {
         assert!(Instant::now() < deadline, "tool never started");
         drain_records(&mut rx1, &mut t1, 1, Duration::from_secs(15)).await;
-        if t1
-            .rows
-            .iter()
-            .any(|r| matches!(r, Row::Tool { status: ToolStatus::Running, .. }))
-        {
+        if t1.rows.iter().any(|r| {
+            matches!(
+                r,
+                Row::Tool {
+                    status: ToolStatus::Running,
+                    ..
+                }
+            )
+        }) {
             break;
         }
     }
@@ -292,7 +313,9 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
     if let Some(id) = agent {
         let gone_by = Instant::now() + Duration::from_secs(10);
         loop {
-            let alive = proc::identity_of(id.pid).map(|cur| cur == id).unwrap_or(false);
+            let alive = proc::identity_of(id.pid)
+                .map(|cur| cur == id)
+                .unwrap_or(false);
             if !alive {
                 break;
             }
@@ -301,7 +324,10 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
         }
     }
 
-    let mut rx2 = c2.subscribe("s1", Some(stale_cursor)).await.expect("subscribe 2");
+    let mut rx2 = c2
+        .subscribe("s1", Some(stale_cursor))
+        .await
+        .expect("subscribe 2");
     let first = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
         .await
         .expect("frame in time")
@@ -309,7 +335,10 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
     let SubscriptionItem::Reset { epoch, .. } = &first else {
         panic!("stale epoch must be answered with Reset, got {first:?}");
     };
-    assert_ne!(*epoch, stale_cursor.epoch, "epoch changed across engine restart");
+    assert_ne!(
+        *epoch, stale_cursor.epoch,
+        "epoch changed across engine restart"
+    );
 
     let mut t2 = Transcript::new();
     let mut rx_records = 0usize;
@@ -333,9 +362,13 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
     }
     assert!(rx_records > 0);
     assert_eq!(t2.closed.as_deref(), Some("interrupted"));
-    assert!(t2.rows.iter().any(
-        |r| matches!(r, Row::Tool { status: ToolStatus::Interrupted, .. })
-    ));
+    assert!(t2.rows.iter().any(|r| matches!(
+        r,
+        Row::Tool {
+            status: ToolStatus::Interrupted,
+            ..
+        }
+    )));
     assert!(t2
         .rows
         .iter()
@@ -413,10 +446,15 @@ async fn undelivered_send_renders_distinct_from_sent() {
     loop {
         assert!(Instant::now() < end);
         drain_records(&mut rx, &mut t, 1, Duration::from_secs(15)).await;
-        if t.rows
-            .iter()
-            .any(|r| matches!(r, Row::User { delivery: Delivery::Delivered, .. }))
-        {
+        if t.rows.iter().any(|r| {
+            matches!(
+                r,
+                Row::User {
+                    delivery: Delivery::Delivered,
+                    ..
+                }
+            )
+        }) {
             break;
         }
     }
@@ -454,10 +492,12 @@ async fn undelivered_send_renders_distinct_from_sent() {
     loop {
         assert!(Instant::now() < end);
         drain_records(&mut rx, &mut t, 1, Duration::from_secs(15)).await;
-        if t.rows.iter().any(|r| matches!(
-            r,
-            Row::User { text, delivery: Delivery::Pending } if text == "lost words"
-        )) {
+        if t.rows.iter().any(|r| {
+            matches!(
+                r,
+                Row::User { text, delivery: Delivery::Pending } if text == "lost words"
+            )
+        }) {
             break;
         }
     }
@@ -589,9 +629,12 @@ async fn deltas_fold_into_120ms_frames() {
 
     // Steady state: skip the leading edge (replay + turn start), measure
     // consecutive delta-only frames.
-    let steady: Vec<&(Instant, usize, bool)> =
-        frames.iter().skip(3).filter(|f| f.2).collect();
-    assert!(steady.len() >= 6, "expected a steady delta stream, got {}", steady.len());
+    let steady: Vec<&(Instant, usize, bool)> = frames.iter().skip(3).filter(|f| f.2).collect();
+    assert!(
+        steady.len() >= 6,
+        "expected a steady delta stream, got {}",
+        steady.len()
+    );
     let mut folded = 0;
     for pair in steady.windows(2) {
         let gap = pair[1].0.duration_since(pair[0].0);

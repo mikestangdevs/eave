@@ -77,9 +77,7 @@ impl ClaudeCodeSession {
     /// Spawn one CLI process in its own process group with sanitized env and
     /// piped stdio (spec 01 §Spawn). Returns the session handle and its
     /// event stream; `SessionEvent::Exited` is always the final event.
-    pub fn spawn(
-        cfg: &SpawnConfig,
-    ) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
+    pub fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         let mut cmd = Command::new(&cfg.program);
         cmd.current_dir(&cfg.cwd)
             .args([
@@ -190,7 +188,10 @@ impl ClaudeCodeSession {
                     // Slice K amendment 1: the posture is verified, never
                     // assumed. A CLI that reports a mode which does not ask
                     // is refused here, at the first frame it sends.
-                    if let SessionEvent::Init { permission_mode, .. } = &event {
+                    if let SessionEvent::Init {
+                        permission_mode, ..
+                    } = &event
+                    {
                         reader_shared.saw_init.store(true, Ordering::SeqCst);
                         if let Some(refusal) = posture_refusal(permission_mode.as_deref()) {
                             let _ = reader_tx.send(event).await;
@@ -464,7 +465,9 @@ impl AgentSession for ClaudeCodeSession {
                 stragglers_killed: stragglers,
             })
         } else {
-            Err(SessionError::KillUnproven { remaining: stragglers })
+            Err(SessionError::KillUnproven {
+                remaining: stragglers,
+            })
         }
     }
 }

@@ -32,8 +32,8 @@
 use serde::{Deserialize, Serialize};
 
 use eave_core::journal::{Header, Record};
-use eave_core::session::AgentConfig;
 use eave_core::proc::ProcIdentity;
+use eave_core::session::AgentConfig;
 
 pub use eave_core::attention::{AttentionSnapshot, WaitReason};
 
@@ -59,7 +59,9 @@ pub struct RequestEnvelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
-    Hello { proto: u32 },
+    Hello {
+        proto: u32,
+    },
     /// All sessions the engine knows (on disk or live).
     List,
     /// Create a session (fresh id if `None`) or load an existing one.
@@ -95,9 +97,14 @@ pub enum Request {
     /// engine fully journals and attempts delivery of one send before the
     /// next — the order-paired delivery state depends on this (spec 02
     /// §Delivery state; do NOT pipeline).
-    Send { session_id: String, text: String },
+    Send {
+        session_id: String,
+        text: String,
+    },
     /// Kill the session's live process (verified kill ladder, spec 01).
-    Kill { session_id: String },
+    Kill {
+        session_id: String,
+    },
     /// Observe the session SET (spec 05 §Watch): items flow on this
     /// request's id as `Sessions` snapshots — one immediately, one on
     /// every session-set / state / attention change. This is the only
@@ -111,7 +118,19 @@ pub enum Request {
     /// one after every engine-side git poll. Strictly per-session: file
     /// data for session A never flows on any other session's files id,
     /// and never on watch (isolation invariant, enforced by test).
-    Files { session_id: String },
+    Files {
+        session_id: String,
+        /// Which basis the snapshot is measured against (Slice AA).
+        /// `#[serde(default)]` = `WorkingTree`, so every client predating
+        /// this field asks for exactly what it always got.
+        ///
+        /// Scope is fixed for the life of the subscription: the engine
+        /// only pays for a turn-scoped scan while somebody is subscribed
+        /// at that scope (it costs a full working-tree hash pass), so a
+        /// client that wants the other scope unsubscribes and asks again.
+        #[serde(default, skip_serializing_if = "FileScope::is_default")]
+        scope: FileScope,
+    },
     /// One file's diff content (Slice B2), computed by the engine from
     /// `git diff` in the session cwd at request time — unary, not a
     /// subscription. There is deliberately no engine-held diff state to
@@ -119,7 +138,10 @@ pub enum Request {
     /// [`FilesSnapshot`] means "re-request any diff you are showing").
     /// Every failure shape is a stated fact inside [`FileDiff`], never a
     /// hang — and every underlying git call is timeout-bounded.
-    Diff { session_id: String, path: String },
+    Diff {
+        session_id: String,
+        path: String,
+    },
     /// Cancel a streaming request (`subscribe` / `watch` / `files`) by its
     /// envelope id, on this connection (Slice I1). The engine stops the
     /// stream's task and releases any subscriber-scoped resource it held
@@ -128,7 +150,9 @@ pub enum Request {
     /// disconnect or a stream the engine ended on its own. Without this, a
     /// client that switches sessions leaks the old stream for the
     /// connection's whole life; connection close remains the backstop.
-    Unsubscribe { id: u64 },
+    Unsubscribe {
+        id: u64,
+    },
     /// Move a session into its own git worktree (Slice I2). Allowed only
     /// while nothing has ever spawned (state `new`, no records) — after
     /// the first send the provider has seen the cwd and it is fixed for
@@ -138,7 +162,9 @@ pub enum Request {
     /// session's cwd to it. Isolation is the operator's choice, never
     /// automatic (Slice I2 decision 1): detection of a shared checkout is
     /// stated on `watch`; this method is the opt-in.
-    Isolate { session_id: String },
+    Isolate {
+        session_id: String,
+    },
     /// Delete a session's eave-created worktree (Slice I2). The engine
     /// re-checks state freshly at call time: a LIVE session refuses (kill
     /// first); uncommitted files or commits unreachable from any other
@@ -146,7 +172,28 @@ pub enum Request {
     /// operator confirms against facts, not a stale rail row (decision 2:
     /// eave never deletes dirty work without the operator meaning it).
     /// Clean removal also prunes and deletes the `eave/` branch.
-    RemoveWorktree { session_id: String, force: bool },
+    RemoveWorktree {
+        session_id: String,
+        force: bool,
+    },
+    /// Set (or clear, with `None`) a session's operator title (Stage AB).
+    /// Normalized and length-capped engine-side
+    /// (`eave_core::store::normalize_title`) and persisted in `meta.json`,
+    /// so it survives a restart.
+    ///
+    /// **Operator-authored, never engine-derived.** The rail needs to say
+    /// which session a row is, and the obvious source — the session's
+    /// first `UserSent` — is transcript content, which may not cross
+    /// `watch` (spec 05 §Watch). So the title arrives the only way a
+    /// session fact legitimately can: someone typed it *as* the label.
+    /// The engine never reads a journal to fill it; see
+    /// `watch.rs::the_engine_never_mines_a_title_out_of_the_transcript`.
+    Rename {
+        session_id: String,
+        /// `None` clears the title back to unstated. So does any string
+        /// that normalizes to empty — a title of spaces is not a title.
+        title: Option<String>,
+    },
     /// Answer one open permission question (Slice K). The agent is parked
     /// until this arrives and there is no other way out — eave never
     /// auto-approves, never auto-denies, and never times out into either.
@@ -191,7 +238,9 @@ pub enum ResponseBody {
     /// Unary success. Payload shape depends on the request (`HelloOk`,
     /// `ListOk`, `OpenOk`, `SendOk`, `KillOk`) — loose on purpose.
     Ok(serde_json::Value),
-    Err { message: String },
+    Err {
+        message: String,
+    },
     /// One subscription frame; carries the `Subscribe` request's id.
     Item(SubscriptionItem),
 }
@@ -261,6 +310,27 @@ pub struct HelloOk {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
+    /// The operator's own name for this session (Stage AB). `None` = never
+    /// named, which is the honest default and renders as no line at all —
+    /// eave does not invent a title.
+    ///
+    /// **Read this before making it automatic.** The natural implementation
+    /// is to derive it from the session's first `UserSent`, capped. That is
+    /// forbidden here, and the reason is the isolation invariant (spec 05
+    /// §Watch): `watch` is the ONE cross-session broadcast, and it may
+    /// carry facts ABOUT a session and never a byte of any session's
+    /// transcript. A prompt's first words are the transcript. The raw-byte
+    /// canary in `eave-engine/tests/watch.rs` proves the rule holds, and it
+    /// plants its marker at the head of the first prompt — so a
+    /// leading-words title does not merely violate the invariant in
+    /// principle, it fails that test by name.
+    ///
+    /// The distinction this field keeps is the same one
+    /// [`SessionInfo::pending_approvals`] keeps: a COUNT of open questions
+    /// may cross, the tool and path may not. Here, a label the operator
+    /// chose may cross, the words the agent was given may not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub provider: String,
     /// The model this session is configured to run (Slice P2), verbatim as
     /// it will be passed to the CLI. `None` = the provider's own default,
@@ -276,6 +346,21 @@ pub struct SessionInfo {
     pub model: Option<String>,
     pub cwd: String,
     pub created_ts_ms: u64,
+    /// When this session's reported [`state`](SessionInfo::state) last
+    /// moved (Stage AB), for the rail's ordering. `None` = it has not moved
+    /// since the engine loaded the session — sort on `created_ts_ms`
+    /// instead, never on a fabricated zero, which would sort every
+    /// never-started session to 1970.
+    ///
+    /// **Stamped only where `state`/`live` change, and nowhere else.** That
+    /// is what keeps it inside the isolation invariant rather than beside
+    /// it: a timestamp that advanced per journal record would turn `watch`
+    /// into a side channel reporting the *rate* of a session's transcript
+    /// to every client — content inferred rather than sent. Stamping
+    /// exactly the transitions `state` already announces adds no
+    /// observation a watcher did not already have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<u64>,
     /// Current state name (spec 01 §States; "new" before any spawn).
     pub state: String,
     /// A live agent process is attached right now.
@@ -381,10 +466,71 @@ pub struct FilesSnapshot {
     /// isn't would lie by omission).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub watching: bool,
+    /// What this list is measured AGAINST (Slice AA). The default —
+    /// and every engine predating the field — is [`DiffBasis::WorkingTree`],
+    /// which is exactly what those engines produced.
+    ///
+    /// The whole point of the field is that "this turn changed nothing"
+    /// and "there is no turn to measure against" are different answers
+    /// and must not share a rendering. A turn-scoped list whose basis is
+    /// gone carries [`DiffBasis::Unavailable`] with git's or the engine's
+    /// own words, and `files` is empty because there is nothing to say —
+    /// never because nothing changed.
+    #[serde(default, skip_serializing_if = "DiffBasis::is_default")]
+    pub basis: DiffBasis,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// Which basis a `files` subscription asks the engine to measure against
+/// (Slice AA, spec 05 §Files).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileScope {
+    /// Everything uncommitted: the working tree against `HEAD`. The
+    /// original Slice B behaviour and still the default.
+    #[default]
+    WorkingTree,
+    /// Only what changed since the most recent turn was dispatched —
+    /// "what did THIS turn do", separated from whatever was already
+    /// dirty and from whatever the operator edited between turns.
+    LatestTurn,
+}
+
+impl FileScope {
+    fn is_default(&self) -> bool {
+        matches!(self, FileScope::WorkingTree)
+    }
+}
+
+/// What a [`FilesSnapshot`] is measured against — a stated fact on every
+/// frame, because the two ways a turn-scoped list can be empty mean
+/// opposite things.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiffBasis {
+    /// `HEAD` plus the index — everything uncommitted.
+    #[default]
+    WorkingTree,
+    /// The tree captured when the current turn was dispatched. `at` is
+    /// the capture time (ms since epoch), so a surface can say WHICH turn
+    /// it is showing rather than just "the last one".
+    Turn { at: u64 },
+    /// A turn basis was asked for and there is none to answer with. The
+    /// reason is the engine's or git's own words and is meant to be
+    /// rendered verbatim: no turn has been dispatched since this engine
+    /// started (a restart drops it — it is memory, not history), the
+    /// capture failed, or the base tree was pruned out of the object
+    /// store by a `git gc` while the turn ran.
+    Unavailable { reason: String },
+}
+
+impl DiffBasis {
+    fn is_default(&self) -> bool {
+        matches!(self, DiffBasis::WorkingTree)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -524,6 +670,14 @@ pub struct OpenOk {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendOk {
+    /// Why the write did not reach the agent, when `delivered` is false.
+    ///
+    /// `#[serde(default)]` so a pre-existing engine's reply still parses.
+    /// This exists because "delivered: false" with no cause is a dead end:
+    /// the reason was discarded at the source for the life of the project
+    /// and no test that hit it could report anything but the assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The pipe write reached the agent's stdin. `false` means the message
     /// is journaled-but-undelivered — the `UserSent` record will never gain
     /// a `UserDelivered` pair, and no surface may render it as sent
@@ -552,6 +706,16 @@ pub struct UnsubscribeOk {
 /// replies carrying git's or the engine's stated reason.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IsolateOk {
+    pub info: SessionInfo,
+}
+
+/// Reply to [`Request::Rename`] (Stage AB): the session as it now stands,
+/// so the caller reads back the NORMALIZED title rather than the string it
+/// sent. Those differ whenever the engine trimmed, folded a newline, or hit
+/// the length cap — and a caller that assumed its own string landed would
+/// render a title the engine does not hold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenameOk {
     pub info: SessionInfo,
 }
 
@@ -663,10 +827,12 @@ mod tests {
             body: ResponseBody::Item(SubscriptionItem::Sessions {
                 sessions: vec![SessionInfo {
                     session_id: "s1".into(),
+                    title: Some("ship the rail".into()),
                     provider: "claude-code".into(),
                     model: None,
                     cwd: "/tmp".into(),
                     created_ts_ms: 1,
+                    last_activity_ms: Some(1_700),
                     state: "running".into(),
                     live: true,
                     epoch: 9,
@@ -697,12 +863,28 @@ mod tests {
             id: 5,
             request: Request::Files {
                 session_id: "s1".into(),
+                scope: FileScope::WorkingTree,
             },
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains("\"method\":\"files\""), "{line}");
+        // The default basis is not written: an engine predating Slice AA
+        // must see the exact frame it always saw.
+        assert!(!line.contains("scope"), "{line}");
         let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back, req);
+
+        let turn = RequestEnvelope {
+            id: 5,
+            request: Request::Files {
+                session_id: "s1".into(),
+                scope: FileScope::LatestTurn,
+            },
+        };
+        let line = serde_json::to_string(&turn).unwrap();
+        assert!(line.contains("\"scope\":\"latest_turn\""), "{line}");
+        let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, turn);
 
         for state in [
             GitState::Ok,
@@ -727,6 +909,7 @@ mod tests {
                         }],
                         omitted: 0,
                         watching: true,
+                        basis: DiffBasis::WorkingTree,
                     },
                 }),
             };
@@ -734,6 +917,37 @@ mod tests {
             assert!(line.contains("\"snapshot\""), "{line}");
             let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
             assert_eq!(back, resp);
+        }
+    }
+
+    /// Slice AA: every basis a snapshot can state survives the wire, and
+    /// the two empty-list cases stay distinguishable after a round trip —
+    /// which is the only reason the field exists.
+    #[test]
+    fn a_files_snapshot_states_its_basis() {
+        for basis in [
+            DiffBasis::WorkingTree,
+            DiffBasis::Turn { at: 1_755_000_000 },
+            DiffBasis::Unavailable {
+                reason: "no turn has started since this engine did".into(),
+            },
+        ] {
+            let snap = FilesSnapshot {
+                state: GitState::Ok,
+                files: Vec::new(),
+                omitted: 0,
+                watching: true,
+                basis: basis.clone(),
+            };
+            let line = serde_json::to_string(&snap).unwrap();
+            // The default stays off the wire; anything else is stated.
+            assert_eq!(
+                line.contains("basis"),
+                !matches!(basis, DiffBasis::WorkingTree),
+                "{line}"
+            );
+            let back: FilesSnapshot = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, snap);
         }
     }
 
@@ -756,20 +970,38 @@ mod tests {
                 hunks: vec![DiffHunk {
                     header: "@@ -1,2 +1,3 @@".into(),
                     lines: vec![
-                        DiffLine { op: DiffOp::Ctx, text: "one".into() },
-                        DiffLine { op: DiffOp::Del, text: "two".into() },
-                        DiffLine { op: DiffOp::Add, text: "TWO".into() },
+                        DiffLine {
+                            op: DiffOp::Ctx,
+                            text: "one".into(),
+                        },
+                        DiffLine {
+                            op: DiffOp::Del,
+                            text: "two".into(),
+                        },
+                        DiffLine {
+                            op: DiffOp::Add,
+                            text: "TWO".into(),
+                        },
                     ],
                 }],
                 truncated: true,
             },
             DiffKind::Binary,
-            DiffKind::Submodule { detail: "abc1234 → def5678 (dirty)".into() },
-            DiffKind::Symlink { target: "../elsewhere".into() },
-            DiffKind::Error { message: "git diff timed out".into() },
+            DiffKind::Submodule {
+                detail: "abc1234 → def5678 (dirty)".into(),
+            },
+            DiffKind::Symlink {
+                target: "../elsewhere".into(),
+            },
+            DiffKind::Error {
+                message: "git diff timed out".into(),
+            },
         ] {
             let ok = DiffOk {
-                diff: FileDiff { path: "src/lib.rs".into(), kind },
+                diff: FileDiff {
+                    path: "src/lib.rs".into(),
+                    kind,
+                },
             };
             let v = serde_json::to_value(&ok).unwrap();
             let back: DiffOk = serde_json::from_value(v).unwrap();
@@ -789,6 +1021,48 @@ mod tests {
         // Absent `watching` = the polling fallback — exactly what a B1
         // engine's list is.
         assert!(!snap.watching);
+        // Absent `basis` = the working tree, which is the only thing such
+        // an engine could ever have measured.
+        assert_eq!(snap.basis, DiffBasis::WorkingTree);
+    }
+
+    /// Stage AB. Two shapes, one test: naming a session and un-naming it
+    /// are the same method, which is what stops "clear the title" from
+    /// becoming a second verb that can disagree with the first.
+    #[test]
+    fn rename_round_trips_in_both_directions() {
+        for title in [Some("ship the rail".to_string()), None] {
+            let req = RequestEnvelope {
+                id: 21,
+                request: Request::Rename {
+                    session_id: "s1".into(),
+                    title: title.clone(),
+                },
+            };
+            let line = serde_json::to_string(&req).unwrap();
+            assert!(line.contains("\"method\":\"rename\""), "{line}");
+            let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, req);
+        }
+    }
+
+    /// Wire-compat: a pre-Stage-AB engine's `SessionInfo` still parses —
+    /// unnamed, and with no activity stamp. Both degrade to the honest
+    /// reading (nobody named it; sort it by creation), which is exactly
+    /// what such an engine means.
+    #[test]
+    fn pre_stage_ab_session_info_still_parses() {
+        let line = r#"{"session_id":"s1","provider":"claude-code","cwd":"/tmp",
+            "created_ts_ms":7,"state":"new","live":false,"epoch":1,"last_seq":0}"#;
+        let info: SessionInfo = serde_json::from_str(line).unwrap();
+        assert_eq!(info.title, None);
+        assert_eq!(info.last_activity_ms, None);
+        // And the absence is absence on the way out too: an unnamed
+        // session must not put an empty string on the wire for a rail to
+        // render as a blank line.
+        let back = serde_json::to_string(&info).unwrap();
+        assert!(!back.contains("title"), "{back}");
+        assert!(!back.contains("last_activity_ms"), "{back}");
     }
 
     #[test]

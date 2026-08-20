@@ -38,8 +38,12 @@ mod launcher;
 /// consumer yet at all.
 mod overlay;
 
+/// The macOS menu bar (Slice Y). Private: it is wiring, not part of the
+/// headless surface the acceptance runs use.
+mod app_menus;
 pub mod display;
 pub mod fixture;
 pub mod markdown;
 pub mod theme;
+
 pub mod ui;

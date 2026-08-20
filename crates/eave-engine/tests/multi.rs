@@ -288,7 +288,10 @@ async fn n_sessions_stream_concurrently_and_switching_disturbs_nothing() {
     }
 
     // First tour: all four are streaming; read each mid-stream.
-    let mut seen_seq = vec![0u64; N];
+    let mut seen_seq = [0u64; N];
+    // `i` names the SESSION ("s{i}"), not just the slot it indexes,
+    // so the range loop is the form that says what this is.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..N {
         let sid = format!("s{i}");
         let (sub_id, mut rx) = c.subscribe_with_id(&sid, None).await.expect("subscribe");
@@ -312,6 +315,9 @@ async fn n_sessions_stream_concurrently_and_switching_disturbs_nothing() {
     // and its log must have advanced well past where we left it, with the
     // turn still open — switching stopped, paused, and dropped nothing.
     tokio::time::sleep(Duration::from_millis(700)).await;
+    // `i` names the SESSION ("s{i}"), not just the slot it indexes,
+    // so the range loop is the form that says what this is.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..N {
         let sid = format!("s{i}");
         let (sub_id, mut rx) = c.subscribe_with_id(&sid, None).await.expect("resubscribe");
@@ -396,7 +402,10 @@ async fn unsubscribe_stops_a_record_stream_dead() {
     let end = Instant::now() + Duration::from_secs(15);
     let mut saw_second = false;
     while !saw_second {
-        assert!(Instant::now() < end, "fresh subscribe never replayed turn 2");
+        assert!(
+            Instant::now() < end,
+            "fresh subscribe never replayed turn 2"
+        );
         let line = raw.next("fresh replay", Duration::from_secs(15)).await;
         assert_eq!(frame_id(&line), 30, "only id 30 may flow now: {line}");
         saw_second = line.contains("second turn");
@@ -447,7 +456,10 @@ async fn unsubscribe_releases_the_files_watcher() {
     std::fs::write(cwd.join("marker.txt"), "seen by the live watcher\n").unwrap();
     let end = Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(Instant::now() < end, "live watcher never scanned marker.txt");
+        assert!(
+            Instant::now() < end,
+            "live watcher never scanned marker.txt"
+        );
         let line = raw.next("marker frame", Duration::from_secs(15)).await;
         assert_eq!(frame_id(&line), 20);
         if line.contains("marker.txt") {
@@ -503,7 +515,9 @@ async fn unsubscribe_releases_the_files_watcher() {
             Instant::now() < end,
             "no startup scan after resubscribe — the watcher refcount never dropped to zero"
         );
-        let line = raw.next("startup-scan frame", Duration::from_secs(15)).await;
+        let line = raw
+            .next("startup-scan frame", Duration::from_secs(15))
+            .await;
         assert_eq!(frame_id(&line), 40);
         if line.contains("orphan.txt") {
             break;
@@ -573,8 +587,8 @@ async fn killing_one_session_leaves_the_others_streaming() {
                 .unwrap()
         };
         if state("s0") == ("killed".to_string(), false) {
-            assert_eq!(state("s1").1, true, "s1 still live");
-            assert_eq!(state("s2").1, true, "s2 still live");
+            assert!(state("s1").1, "s1 still live");
+            assert!(state("s2").1, "s2 still live");
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -604,7 +618,10 @@ async fn engine_restart_with_n_live_sessions_recovers_all_honestly() {
     // demonstrably reached disk, or repair has nothing to conclude from.
     let end = Instant::now() + Duration::from_secs(15);
     for i in 0..N {
-        let jpath = dir.join("sessions").join(format!("s{i}")).join("journal.jsonl");
+        let jpath = dir
+            .join("sessions")
+            .join(format!("s{i}"))
+            .join("journal.jsonl");
         loop {
             let text = std::fs::read_to_string(&jpath).unwrap_or_default();
             if text.contains("user_delivered") && text.contains("tick") {
@@ -631,7 +648,9 @@ async fn engine_restart_with_n_live_sessions_recovers_all_honestly() {
     let engine2 = EngineProc::spawn(&dir, "slow-stream");
     for id in &identities {
         assert!(
-            proc::identity_of(id.pid).map(|now| now != *id).unwrap_or(true),
+            proc::identity_of(id.pid)
+                .map(|now| now != *id)
+                .unwrap_or(true),
             "orphaned agent pid {} survived the restart reap",
             id.pid
         );
@@ -640,7 +659,11 @@ async fn engine_restart_with_n_live_sessions_recovers_all_honestly() {
     let sessions = c2.list().await.expect("list");
     assert_eq!(sessions.len(), N);
     for s in &sessions {
-        assert!(!s.live, "{} must not report live after restart", s.session_id);
+        assert!(
+            !s.live,
+            "{} must not report live after restart",
+            s.session_id
+        );
         assert_eq!(
             s.state, "interrupted",
             "{} was killed mid-turn with the engine — repair must conclude interrupted",
@@ -700,7 +723,10 @@ async fn background_attention_reaches_watch_while_subscribed_elsewhere() {
             break;
         }
     }
-    assert!(saw_quiet, "quiet precedes unresponsive on the watch channel");
+    assert!(
+        saw_quiet,
+        "quiet precedes unresponsive on the watch channel"
+    );
 
     drop(engine);
 }
@@ -835,8 +861,14 @@ async fn no_content_crosses_sessions_on_any_channel_at_n() {
         own_text |= id == 3 && line.contains(TEXT[1]);
         own_file |= id == 4 && line.contains(FILE[1]);
     }
-    assert!(own_text, "positive control: s1's text canary on its subscribe id");
-    assert!(own_file, "positive control: s1's file canary on its files id");
+    assert!(
+        own_text,
+        "positive control: s1's text canary on its subscribe id"
+    );
+    assert!(
+        own_file,
+        "positive control: s1's file canary on its files id"
+    );
 
     drop(engine);
 }

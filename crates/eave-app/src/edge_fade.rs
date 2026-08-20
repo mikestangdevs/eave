@@ -20,8 +20,8 @@
 //! and the only real work happens in `paint`.
 
 use gpui::{
-    AnyElement, App, Bounds, EdgeFade, Element, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, Pixels, ScrollHandle, Window, px,
+    px, AnyElement, App, Bounds, EdgeFade, Element, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, Pixels, ScrollHandle, Window,
 };
 
 /// Fade the child's content at its own top/bottom edges. `band` is the

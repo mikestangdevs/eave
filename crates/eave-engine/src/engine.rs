@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,9 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 
 use eave_core::attention::{probe_failure, AttentionSnapshot, Classifier, ProbeFacts};
 use eave_core::claude::ClaudeCodeSession;
-use eave_core::journal::{self, now_ms, Header, JournalEvent, JournalWriter, Record, FORMAT_VERSION};
+use eave_core::journal::{
+    self, now_ms, Header, JournalEvent, JournalWriter, Record, FORMAT_VERSION,
+};
 use eave_core::proc::{self, PidState, ProcIdentity};
 use eave_core::process;
 use eave_core::recorder::{record_session, send_and_journal};
@@ -27,13 +30,13 @@ use eave_core::session::{
     conflicts_with_eave_flags, posture_is_verified, AgentConfig, AgentSession, ApprovalDecision,
     SessionWatch, SpawnConfig, POSTURE_VERIFIED_PROVIDERS,
 };
-use eave_core::store::{EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
+use eave_core::store::{normalize_title, EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, ChangedFile, Cursor, DecideOk, Decision, DiffOk, FileStatus, FilesSnapshot,
-    HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, Request, RequestEnvelope,
-    ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, UnsubscribeOk,
-    PROTO_VERSION,
+    socket_path, ChangedFile, Cursor, DecideOk, Decision, DiffBasis, DiffOk, FileScope, FileStatus,
+    FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk, RenameOk, Request,
+    RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem,
+    UnsubscribeOk, PROTO_VERSION,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -83,7 +86,11 @@ impl EngineConfig {
         // Slice K: the posture the fake agent will announce, so the
         // acceptance tests can drive the refusal paths through the real
         // spawn/verify path rather than around it.
-        for key in ["FAKE_PERMISSION_MODE", "FAKE_APPROVAL_TOOL", "FAKE_APPROVAL_PATH"] {
+        for key in [
+            "FAKE_PERMISSION_MODE",
+            "FAKE_APPROVAL_TOOL",
+            "FAKE_APPROVAL_PATH",
+        ] {
             if let Ok(v) = std::env::var(format!("EAVE_{key}")) {
                 agent_env.push((key.to_string(), v));
             }
@@ -140,6 +147,29 @@ struct Shared {
     /// task; `None` when no process is attached. Transient — never
     /// journaled.
     attention: Option<AttentionSnapshot>,
+    /// The operator's name for this session (Stage AB), mirroring
+    /// `meta.json`. Never derived from `records` — see
+    /// [`eave_wire::SessionInfo::title`].
+    title: Option<String>,
+    /// When [`Shared::reported_state`] last changed (Stage AB). `None`
+    /// until it moves; the rail falls back to `created_ts_ms`.
+    last_activity_ms: Option<u64>,
+}
+
+impl Shared {
+    /// The state name a watcher reads — the attention overlay while a
+    /// process is attached, the journal's terminal truth otherwise. Split
+    /// out of `info()` because [`SessionHandle::settle_state`] has to
+    /// compare it before and after a mutation, and two copies of this rule
+    /// would eventually disagree about what "the state" is.
+    fn reported_state(&self) -> String {
+        match (&self.attention, self.live) {
+            (Some(a), true) if !matches!(a, AttentionSnapshot::Running) => {
+                a.state_name().to_string()
+            }
+            _ => self.state.clone(),
+        }
+    }
 }
 
 /// What the per-session broadcast fans out: seq'd journal records, plus
@@ -178,6 +208,25 @@ pub struct SessionHandle {
     files_tx: broadcast::Sender<()>,
     /// Serializes git scans so overlapping triggers can't interleave.
     files_gate: TokioMutex<()>,
+    /// The turn-scoped view of the same cwd (Slice AA), cached beside the
+    /// working-tree one and refreshed by the same poll. Kept separate
+    /// rather than recomputed per subscriber because a turn scan costs a
+    /// full working-tree hash pass; it is only computed while somebody is
+    /// subscribed at that scope (`turn_subs`).
+    files_turn: StdMutex<Option<FilesSnapshot>>,
+    /// How many live `files` subscriptions asked for `latest_turn`. The
+    /// turn scan runs only while this is non-zero — the same
+    /// "nobody is looking, don't pay for it" rule the FS watcher follows.
+    turn_subs: AtomicUsize,
+    /// The tree captured at the last turn dispatch (Slice AA).
+    ///
+    /// **In memory only, and deliberately so.** It is not history — it is
+    /// a measurement basis for one live turn, and an engine restart
+    /// legitimately loses it. That loss is a stated fact
+    /// (`DiffBasis::Unavailable`), never an error and never an empty
+    /// list, which is the whole reason [`TurnBasis`] has a `None` variant
+    /// carrying words instead of being an `Option`.
+    turn_basis: StdMutex<TurnBasis>,
     /// FS-event invalidation (B2): subscriber refcount plus the stop
     /// handle of the watcher task serving them. The watcher runs only
     /// while a `files` subscription is live; `active` gates the
@@ -201,6 +250,43 @@ pub struct SessionHandle {
     /// list`, never engine memory); presence and dirty count stamped by
     /// scans.
     worktree: StdMutex<Option<WorktreeState>>,
+}
+
+/// What the engine has to measure "this turn" from (Slice AA).
+///
+/// Every variant is something to SAY. There is no `Option` here because
+/// the two ways to have no basis — no turn has run, and the basis we had
+/// is gone — are different sentences, and a rail that renders either as
+/// an empty file list is lying about what it knows.
+#[derive(Debug, Clone)]
+enum TurnBasis {
+    /// Nothing has been dispatched since this engine started. Covers a
+    /// never-used session and, identically, every session after an engine
+    /// restart — which is exactly right: the basis was memory, the
+    /// memory is gone, and the sentence is the same either way.
+    None,
+    /// A capture succeeded: the tree sha and when it was taken.
+    Tree { sha: String, at_ms: u64 },
+    /// A capture was attempted at dispatch and git refused. Held so the
+    /// refusal reaches the rail in git's own words instead of silently
+    /// reading as "no turn has started".
+    Failed { reason: String },
+}
+
+impl TurnBasis {
+    /// The words for a basis that cannot be measured from — `None` when
+    /// there IS one to measure from.
+    fn unavailable_reason(&self) -> Option<String> {
+        match self {
+            TurnBasis::None => Some(
+                "no turn has started since this engine did — the turn basis is live memory, \
+                 so an engine restart drops it. The next turn collects a new one."
+                    .into(),
+            ),
+            TurnBasis::Failed { reason } => Some(reason.clone()),
+            TurnBasis::Tree { .. } => None,
+        }
+    }
 }
 
 /// Live permission facts for one session (Slice K). Identity and counts
@@ -248,7 +334,10 @@ fn load_worktree_meta(session_dir: &Path) -> Option<WorktreeMeta> {
 
 fn save_worktree_meta(session_dir: &Path, meta: &WorktreeMeta) -> io::Result<()> {
     let tmp = session_dir.join("worktree.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(meta).expect("worktree meta serializes"))?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(meta).expect("worktree meta serializes"),
+    )?;
     std::fs::rename(&tmp, worktree_meta_path(session_dir))
 }
 
@@ -269,14 +358,15 @@ impl SessionHandle {
         // While live, the attention overlay is the reported state
         // (spec 01 §States: quiet/unresponsive/failed are what the badge
         // shows); terminal names still come from the journal's truth.
-        let state = match (&s.attention, s.live) {
-            (Some(a), true) if !matches!(a, AttentionSnapshot::Running) => {
-                a.state_name().to_string()
-            }
-            _ => s.state.clone(),
-        };
+        let state = s.reported_state();
         SessionInfo {
             session_id: self.session_id.clone(),
+            // Stage AB. Read straight from the operator-set field — there
+            // is deliberately no fallback that reaches into `s.records`.
+            // The rail would love a title derived from the first prompt;
+            // the isolation invariant (spec 05 §Watch) forbids it, and
+            // `watch.rs` proves the forbidding on raw bytes.
+            title: s.title.clone(),
             provider: s.header.provider.clone(),
             // Slice P2. A configured model is a fact ABOUT the session, in
             // the same class as `provider` and `cwd` — not transcript
@@ -286,6 +376,7 @@ impl SessionHandle {
             model: s.header.agent.model.clone(),
             cwd: s.header.cwd.clone(),
             created_ts_ms: s.header.created_ts_ms,
+            last_activity_ms: s.last_activity_ms,
             state,
             live: s.live,
             epoch: s.epoch,
@@ -310,14 +401,17 @@ impl SessionHandle {
             // value would freeze on an idle session, which is exactly the
             // session whose cost the operator has stopped thinking about.
             rss_bytes: s.pid.and_then(proc::resident_bytes),
-            worktree: self.worktree.lock().unwrap().as_ref().map(|w| {
-                eave_wire::WorktreeInfo {
+            worktree: self
+                .worktree
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|w| eave_wire::WorktreeInfo {
                     base: w.base.display().to_string(),
                     branch: w.branch.clone(),
                     present: w.present,
                     dirty_files: w.dirty_files,
-                }
-            }),
+                }),
         }
     }
 
@@ -342,8 +436,12 @@ impl SessionHandle {
         });
         let (mut items, floor) = match cursor {
             Some(c) if c.epoch == s.epoch && c.seq <= last_seq => {
-                let tail: Vec<Record> =
-                    s.records.iter().filter(|r| r.seq > c.seq).cloned().collect();
+                let tail: Vec<Record> = s
+                    .records
+                    .iter()
+                    .filter(|r| r.seq > c.seq)
+                    .cloned()
+                    .collect();
                 let mut items = Vec::new();
                 if !tail.is_empty() {
                     items.push(SubscriptionItem::Events {
@@ -382,9 +480,32 @@ impl SessionHandle {
     /// broadcast for live ones. Attention is part of the reported state
     /// name, so watchers are poked too.
     fn set_attention(&self, snap: AttentionSnapshot) {
-        self.shared.lock().unwrap().attention = Some(snap.clone());
+        {
+            let mut s = self.shared.lock().unwrap();
+            let was = s.reported_state();
+            s.attention = Some(snap.clone());
+            Self::settle_state(&mut s, &was);
+        }
         let _ = self.bcast.send(Fanout::Attention(snap));
         self.poke_watch();
+    }
+
+    /// Stamp `last_activity_ms` iff the state name a watcher reads actually
+    /// moved (Stage AB). Called under `shared`'s lock by every mutation
+    /// that could move it, with the name taken *before* the mutation.
+    ///
+    /// The equality check is the whole design, not an optimization. The
+    /// attention monitor re-publishes its snapshot on evidence updates as
+    /// well as on transitions, so an unconditional stamp here would tick
+    /// the clock on the monitor's cadence — and a timestamp that advances
+    /// while a session streams is a report of that session's transcript
+    /// activity, on the one channel that may not carry it. Stamping only
+    /// on a change makes the field a strictly redundant encoding of
+    /// something `state` already told every watcher.
+    fn settle_state(s: &mut Shared, was: &str) {
+        if s.reported_state() != was {
+            s.last_activity_ms = Some(now_ms());
+        }
     }
 
     /// Something a watcher can see changed (session appeared, process
@@ -399,11 +520,7 @@ impl SessionHandle {
     /// turn-boundary poll stands down while this is true (B2: events
     /// replace polling; polling is the fallback, not a duplicate).
     fn watcher_active(&self) -> bool {
-        self.fs_watch
-            .lock()
-            .unwrap()
-            .active
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.fs_watch.lock().unwrap().active.load(Ordering::Relaxed)
     }
 }
 
@@ -412,7 +529,11 @@ impl SessionHandle {
 fn fs_watch_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EAVE_NO_FSWATCH").map(|v| v != "1").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("EAVE_NO_FSWATCH")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
 }
 
 /// RAII refcount of one `files` subscription: the first subscriber
@@ -420,9 +541,15 @@ fn fs_watch_enabled() -> bool {
 /// subscription tasks are aborted on disconnect — drop still runs).
 struct FilesSubGuard {
     handle: Arc<SessionHandle>,
+    /// Slice AA: a turn-scoped subscription also holds the refcount that
+    /// makes the poll compute the turn list at all.
+    scope: FileScope,
 }
 
-fn files_subscriber(handle: &Arc<SessionHandle>) -> FilesSubGuard {
+fn files_subscriber(handle: &Arc<SessionHandle>, scope: FileScope) -> FilesSubGuard {
+    if scope == FileScope::LatestTurn {
+        handle.turn_subs.fetch_add(1, Ordering::Relaxed);
+    }
     let mut ctl = handle.fs_watch.lock().unwrap();
     ctl.subscribers += 1;
     if ctl.subscribers == 1 && fs_watch_enabled() {
@@ -434,19 +561,22 @@ fn files_subscriber(handle: &Arc<SessionHandle>) -> FilesSubGuard {
     }
     FilesSubGuard {
         handle: Arc::clone(handle),
+        scope,
     }
 }
 
 impl Drop for FilesSubGuard {
     fn drop(&mut self) {
+        if self.scope == FileScope::LatestTurn {
+            self.handle.turn_subs.fetch_sub(1, Ordering::Relaxed);
+        }
         let mut ctl = self.handle.fs_watch.lock().unwrap();
         ctl.subscribers = ctl.subscribers.saturating_sub(1);
         if ctl.subscribers == 0 {
             if let Some(stop) = ctl.stop.take() {
                 let _ = stop.send(());
             }
-            ctl.active
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            ctl.active.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -481,10 +611,7 @@ impl Engine {
     /// asked for a model and would otherwise get another, which is the kind
     /// of quiet substitution this codebase states instead of doing.
     /// Re-opening with the same config, or with none, is fine.
-    fn reject_config_change(
-        have: &AgentConfig,
-        want: Option<&AgentConfig>,
-    ) -> Result<(), String> {
+    fn reject_config_change(have: &AgentConfig, want: Option<&AgentConfig>) -> Result<(), String> {
         match want {
             Some(w) if w != have => Err(format!(
                 "session already exists with a different agent config (has {have:?}, asked for \
@@ -577,8 +704,7 @@ impl Engine {
             // (fake-agent, other CLIs) accept any id; generated ids are
             // always UUIDs and pass. Existing journals are exempt: their
             // history is real and loadable regardless.
-            if self.cfg.agent_program == Path::new("claude")
-                && uuid::Uuid::parse_str(&id).is_err()
+            if self.cfg.agent_program == Path::new("claude") && uuid::Uuid::parse_str(&id).is_err()
             {
                 return Err(format!(
                     "session id {id:?} is not a UUID — the claude CLI rejects non-UUID session ids"
@@ -614,6 +740,8 @@ impl Engine {
                 session_id: id.clone(),
                 state: "new".into(),
                 child: None,
+                // Stage AB: nobody has named it yet, and eave will not.
+                title: None,
             };
             meta.save(&dir).map_err(|e| format!("save meta: {e}"))?;
             let (bcast, _) = broadcast::channel(BROADCAST_CAP);
@@ -629,6 +757,13 @@ impl Engine {
                     live: false,
                     pid: None,
                     attention: None,
+                    // Stage AB: unnamed, and no state has moved yet — the
+                    // rail sorts this one on `created_ts_ms`. Seeding the
+                    // stamp with `now` here would be a lie of the useful
+                    // kind (it happens to equal creation today) that stops
+                    // being true the moment creation and open diverge.
+                    title: None,
+                    last_activity_ms: None,
                 }),
                 bcast,
                 live: TokioMutex::new(None),
@@ -636,6 +771,9 @@ impl Engine {
                 files: StdMutex::new(None),
                 files_tx,
                 files_gate: TokioMutex::new(()),
+                files_turn: StdMutex::new(None),
+                turn_subs: AtomicUsize::new(0),
+                turn_basis: StdMutex::new(TurnBasis::None),
                 fs_watch: StdMutex::new(FsWatchCtl::default()),
                 checkout: StdMutex::new(None),
                 approvals: StdMutex::new(ApprovalState::default()),
@@ -672,13 +810,23 @@ impl Engine {
             })
             .unwrap_or_else(|| "new".into());
         // Keep meta in step with what repair concluded.
+        let mut title = None;
         if let Ok(mut meta) = Meta::load(&dir) {
+            // Stage AB: the operator's name for this session is durable —
+            // it is read back here and nowhere else. A meta that fails to
+            // load leaves the session unnamed rather than guessing one.
+            title = meta.title.clone();
             if meta.state != state || meta.child.is_some() {
                 meta.state = state.clone();
                 meta.child = None;
                 let _ = meta.save(&dir);
             }
         }
+        // Stage AB: the last time this session's state provably moved is
+        // the `Closed` that ended its last process segment — durable, and
+        // therefore identical before and after an engine restart. Nothing
+        // ever ran ⇒ `None`, and the rail falls back to creation order.
+        let last_activity_ms = last_state_change_ms(&loaded.records);
         let last_mode = last_permission_mode(&loaded.records);
         let (bcast, _) = broadcast::channel(BROADCAST_CAP);
         let (files_tx, _) = broadcast::channel(FILES_CAP);
@@ -703,6 +851,8 @@ impl Engine {
                 live: false,
                 pid: None,
                 attention: None,
+                title,
+                last_activity_ms,
             }),
             bcast,
             live: TokioMutex::new(None),
@@ -713,6 +863,12 @@ impl Engine {
             files: StdMutex::new(None),
             files_tx,
             files_gate: TokioMutex::new(()),
+            files_turn: StdMutex::new(None),
+            // A restart is exactly where the in-memory basis goes: a
+            // loaded session starts with nothing to measure from, and
+            // says so.
+            turn_subs: AtomicUsize::new(0),
+            turn_basis: StdMutex::new(TurnBasis::None),
             fs_watch: StdMutex::new(FsWatchCtl::default()),
             checkout: StdMutex::new(None),
             // The last posture this session ran under is history: read it
@@ -736,9 +892,16 @@ impl Engine {
 
     /// Send one user message, spawning the agent first if the session is
     /// not live. Returns delivery per spec 02 §Delivery state.
-    async fn send(self: &Arc<Self>, id: &str, text: &str) -> Result<bool, String> {
+    async fn send(self: &Arc<Self>, id: &str, text: &str) -> Result<Option<String>, String> {
         let handle = self.session(id)?;
         let mut live = handle.live.lock().await;
+        // Slice AA: the turn's basis is collected HERE — inside the send
+        // lock, before the agent has been spawned and long before it can
+        // be told to do anything. One line later and the base could
+        // already contain the turn's own first write. This costs a
+        // working-tree hash pass on the send path, which is the price of
+        // the question being answerable at all.
+        capture_turn_basis(&handle).await;
         // A returned recorder drops its `extra` receiver, so a closed
         // channel is proof the attached process segment is over even if the
         // completion task hasn't cleared the slot yet — respawn (with
@@ -804,7 +967,11 @@ impl Engine {
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cfg.agent_program.clone());
-        let mut cfg = SpawnConfig::new(program, PathBuf::from(&header.cwd), handle.session_id.clone());
+        let mut cfg = SpawnConfig::new(
+            program,
+            PathBuf::from(&header.cwd),
+            handle.session_id.clone(),
+        );
         cfg.resume = resume;
         cfg.extra_env = self.cfg.agent_env.clone();
         cfg.model = agent.model.clone();
@@ -817,21 +984,27 @@ impl Engine {
         let (session, events) =
             ClaudeCodeSession::spawn(&cfg).map_err(|e| format!("spawn agent: {e}"))?;
 
-        let meta = Meta {
+        let mut meta = Meta {
             format_version: META_FORMAT_VERSION,
             provider: header.provider.clone(),
             cwd: header.cwd.clone(),
             session_id: handle.session_id.clone(),
             state: "running".into(),
             child: Some(session.identity()),
+            // Stage AB: overwritten by `save_keeping_title` from what is
+            // on disk — `rename` is the only writer of this field.
+            title: None,
         };
-        meta.save(&handle.dir).map_err(|e| format!("save meta: {e}"))?;
+        meta.save_keeping_title(&handle.dir)
+            .map_err(|e| format!("save meta: {e}"))?;
 
         {
             let mut s = handle.shared.lock().unwrap();
+            let was = s.reported_state();
             s.live = true;
             s.pid = Some(session.identity().pid);
             s.state = "running".into();
+            SessionHandle::settle_state(&mut s, &was);
         }
         handle.poke_watch();
 
@@ -913,18 +1086,22 @@ impl Engine {
             };
             {
                 let mut s = done_handle.shared.lock().unwrap();
+                let was = s.reported_state();
                 s.live = false;
                 s.pid = None;
                 s.state = state;
                 // The overlay is per-process; the journal's terminal truth
                 // governs now. Broadcast the clear so a live notice drops.
                 s.attention = None;
+                SessionHandle::settle_state(&mut s, &was);
             }
             // The process that asked the questions is gone; nothing can be
             // answered now (Slice K). The mode it ran under stays — that is
             // history the rail keeps stating.
             done_handle.approvals.lock().unwrap().pending.clear();
-            let _ = done_handle.bcast.send(Fanout::Attention(AttentionSnapshot::Running));
+            let _ = done_handle
+                .bcast
+                .send(Fanout::Attention(AttentionSnapshot::Running));
             done_handle.poke_watch();
             *done_handle.live.lock().await = None;
         });
@@ -1151,8 +1328,8 @@ impl Engine {
             Some(0) // the directory is gone; no files left to protect
         };
         let unmerged_commits = crate::git::unmerged_count(&wt.base, &wt.branch).await;
-        let protectable = dirty_files.map_or(true, |n| n > 0)
-            || unmerged_commits.map_or(true, |n| n > 0);
+        let protectable =
+            dirty_files.is_none_or(|n| n > 0) || unmerged_commits.is_none_or(|n| n > 0);
         if protectable && !force {
             // A refusal carrying its facts, not an error. Stamp the fresh
             // count so the rail states what the reply states.
@@ -1199,9 +1376,41 @@ impl Engine {
         let sessions = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = sessions.values().map(|h| h.info()).collect();
         drop(sessions);
-        infos.sort_by(|a, b| a.created_ts_ms.cmp(&b.created_ts_ms));
+        infos.sort_by_key(|a| a.created_ts_ms);
         fill_sharing(&mut infos);
         ListOk { sessions: infos }
+    }
+
+    /// Name a session, or clear its name with `None` (Stage AB).
+    ///
+    /// The **only** writer of `Meta::title`, in either direction. Every
+    /// other meta write goes through `save_keeping_title` and preserves
+    /// whatever this wrote; that single-writer rule is what keeps a rename
+    /// from being erased by the next state transition.
+    ///
+    /// Allowed in every state, including while live. There is nothing to
+    /// serialize against — the title touches no process, no journal and no
+    /// provider-side cursor — so refusing during a turn would be ceremony
+    /// with no fact behind it.
+    fn rename(&self, id: &str, title: Option<String>) -> Result<SessionInfo, String> {
+        let handle = self.session(id)?;
+        let title = title.as_deref().and_then(normalize_title);
+        let mut meta = Meta::load(&handle.dir).map_err(|e| {
+            format!(
+                "cannot rename {id}: its meta.json is unreadable ({e}) — refusing to \
+                 write a reconstructed one over it"
+            )
+        })?;
+        meta.title = title.clone();
+        meta.save(&handle.dir)
+            .map_err(|e| format!("save meta: {e}"))?;
+        handle.shared.lock().unwrap().title = title;
+        // A rail row's label changed — watchers re-snapshot. Deliberately
+        // NOT a `settle_state` stamp: naming a session is not the session
+        // doing anything, and sorting the rail by "most recently renamed"
+        // would be a lie about which agent is working.
+        handle.poke_watch();
+        self.info_with_sharing(id)
     }
 
     /// One session's info with the cross-session sharing fact filled —
@@ -1262,10 +1471,31 @@ fn write_unclaimed_report(path: &Path, root: &Path, found: &[PathBuf]) {
 fn last_permission_mode(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|r| match &r.event {
         JournalEvent::Provider {
-            event: eave_core::events::SessionEvent::Init { permission_mode, .. },
+            event:
+                eave_core::events::SessionEvent::Init {
+                    permission_mode, ..
+                },
         } => permission_mode.clone(),
         _ => None,
     })
+}
+
+/// When a loaded session's state last provably moved (Stage AB): the
+/// `Closed` that ended its most recent process segment.
+///
+/// Only `Closed` counts, and that is the point. Every other record is
+/// transcript — reading a `UserSent`'s or a tool result's timestamp would
+/// make `last_activity_ms` a measure of how much the agent said, which is
+/// the fact `watch` is not allowed to carry. `Closed` is a state change and
+/// nothing else, and `journal::load` guarantees one exists for any segment
+/// that ever ran (crash-tail repair appends the interrupted closer), so
+/// `None` here means genuinely nothing has ever run.
+fn last_state_change_ms(records: &[Record]) -> Option<u64> {
+    records
+        .iter()
+        .rev()
+        .find(|r| matches!(r.event, JournalEvent::Closed { .. }))
+        .map(|r| r.ts_ms)
 }
 
 fn fill_sharing(infos: &mut [SessionInfo]) {
@@ -1279,8 +1509,12 @@ fn fill_sharing(infos: &mut [SessionInfo]) {
         }
     }
     for s in infos.iter_mut() {
-        let Some(root) = &s.checkout_root else { continue };
-        let Some(ids) = by_root.get(root) else { continue };
+        let Some(root) = &s.checkout_root else {
+            continue;
+        };
+        let Some(ids) = by_root.get(root) else {
+            continue;
+        };
         s.shared_with = ids
             .iter()
             .filter(|id| **id != s.session_id)
@@ -1298,7 +1532,9 @@ fn track_approvals(handle: &Arc<SessionHandle>, rec: &Record) -> bool {
     let mut a = handle.approvals.lock().unwrap();
     match &rec.event {
         JournalEvent::Provider { event } => match event {
-            E::Init { permission_mode, .. } => {
+            E::Init {
+                permission_mode, ..
+            } => {
                 let changed = a.mode != *permission_mode;
                 a.mode = permission_mode.clone();
                 changed
@@ -1372,7 +1608,9 @@ async fn verify_worktree(handle: Arc<SessionHandle>) {
     let Some(wt) = handle.worktree.lock().unwrap().clone() else {
         return;
     };
-    let listed = crate::git::worktree_list(&wt.base).await.unwrap_or_default();
+    let listed = crate::git::worktree_list(&wt.base)
+        .await
+        .unwrap_or_default();
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let target = canon(&wt.path);
     let present = wt.path.exists() && listed.iter().any(|p| canon(p) == target);
@@ -1427,7 +1665,11 @@ pub async fn serve(cfg: EngineConfig) -> Result<(), ServeError> {
     serve_locked(cfg, store, lock).await
 }
 
-async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Result<(), ServeError> {
+async fn serve_locked(
+    cfg: EngineConfig,
+    store: Store,
+    _lock: EngineLock,
+) -> Result<(), ServeError> {
     let identity = proc::identity_of(std::process::id() as i32).unwrap_or(ProcIdentity {
         pid: std::process::id() as i32,
         start_tvsec: 0,
@@ -1456,7 +1698,11 @@ async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Res
         }
         match engine.load_from_disk(&id) {
             Ok(handle) => {
-                engine.sessions.lock().unwrap().insert(id, Arc::clone(&handle));
+                engine
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .insert(id, Arc::clone(&handle));
                 // Slice I2: checkout-root probe for the sharing fact, and
                 // worktree re-detection for sessions that claim one —
                 // verified against `git worktree list`, never memory, and
@@ -1491,7 +1737,9 @@ async fn serve_locked(cfg: EngineConfig, store: Store, _lock: EngineLock) -> Res
             let mut found: Vec<PathBuf> = Vec::new();
             if let Ok(repos) = std::fs::read_dir(&root) {
                 for repo in repos.flatten().filter(|e| e.path().is_dir()) {
-                    let Ok(trees) = std::fs::read_dir(repo.path()) else { continue };
+                    let Ok(trees) = std::fs::read_dir(repo.path()) else {
+                        continue;
+                    };
                     for tree in trees.flatten().filter(|e| e.path().is_dir()) {
                         let path = canon(&tree.path());
                         if !claimed.contains(&path) {
@@ -1590,7 +1838,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Err(message) => ResponseBody::Err { message },
             },
             Request::Send { session_id, text } => match engine.send(&session_id, &text).await {
-                Ok(delivered) => ok_value(&SendOk { delivered }),
+                Ok(reason) => ok_value(&SendOk {
+                    delivered: reason.is_none(),
+                    reason,
+                }),
                 Err(message) => ResponseBody::Err { message },
             },
             Request::Kill { session_id } => match engine.kill(&session_id).await {
@@ -1610,10 +1861,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 subs.insert(id, tokio::spawn(run_watch(Arc::clone(&engine), w, id)));
                 continue; // snapshots flow on this id; no unary reply
             }
-            Request::Files { session_id } => match engine.session(&session_id) {
+            Request::Files { session_id, scope } => match engine.session(&session_id) {
                 Ok(handle) => {
                     let w = Arc::clone(&w);
-                    subs.insert(id, tokio::spawn(run_files(handle, w, id)));
+                    subs.insert(id, tokio::spawn(run_files(handle, w, id, scope)));
                     continue; // snapshots flow on this id; no unary reply
                 }
                 Err(message) => ResponseBody::Err { message },
@@ -1660,6 +1911,12 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 });
                 continue;
             }
+            // Stage AB. Unary and on the connection loop: it is two small
+            // file operations, unlike `isolate`, which shells out to git.
+            Request::Rename { session_id, title } => match engine.rename(&session_id, title) {
+                Ok(info) => ok_value(&RenameOk { info }),
+                Err(message) => ResponseBody::Err { message },
+            },
             Request::Decide {
                 session_id,
                 request_id,
@@ -1689,7 +1946,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 ok_value(&UnsubscribeOk { stopped })
             }
         };
-        if write_frame(&w, &ResponseEnvelope { id, body }).await.is_err() {
+        if write_frame(&w, &ResponseEnvelope { id, body })
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -1964,6 +2224,98 @@ async fn run_watch(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: 
 /// so a pathological repo slows its own snapshot but never the event
 /// loop; sessions keep streaming while git runs (build-directive
 /// constraint). Never journaled: git is the store of record.
+/// Where a session's throwaway git indexes live (Slice AA): inside the
+/// session's own directory in eave's data dir.
+///
+/// Never `/tmp` (somebody else's to delete, and a stale one there
+/// outlives the engine) and — the one that actually bites — never inside
+/// the repository: `git add -A` would sweep the index and its lock file
+/// into the tree it is capturing. Two names because the dispatch capture
+/// and the scan capture can run at the same moment; each is reused across
+/// calls so git's stat cache survives and captures after the first are
+/// cheap.
+fn turn_index_path(session_dir: &Path, which: &str) -> PathBuf {
+    session_dir.join(format!("turn-{which}.index"))
+}
+
+/// Collect the turn's measurement basis (Slice AA), called at dispatch.
+///
+/// Every outcome is a sentence: a non-git cwd and a git refusal both land
+/// in `TurnBasis::Failed` so the rail states them, and neither is allowed
+/// to fail the send — the operator asked to talk to an agent, not to take
+/// a diff.
+async fn capture_turn_basis(handle: &Arc<SessionHandle>) {
+    let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+    // The checkout probe already asked git whether this is a repo (Slice
+    // I2). Believing it here keeps a non-git session from paying for a
+    // `git add` that can only fail. `None` = the probe has not landed;
+    // try anyway rather than guess.
+    let known_non_repo = matches!(
+        handle.checkout.lock().unwrap().as_ref(),
+        Some(probe) if !probe.is_repo
+    );
+    let basis = if known_non_repo {
+        TurnBasis::Failed {
+            reason: "not a git repository — there is no tree to measure a turn against".into(),
+        }
+    } else {
+        let index = turn_index_path(&handle.dir, "base");
+        match crate::git::snapshot_tree(&cwd, &index).await {
+            Ok(sha) => TurnBasis::Tree {
+                sha,
+                at_ms: now_ms(),
+            },
+            Err(eave_wire::GitState::NotARepo) => TurnBasis::Failed {
+                reason: "not a git repository — there is no tree to measure a turn against".into(),
+            },
+            Err(eave_wire::GitState::Error { message }) => TurnBasis::Failed { reason: message },
+            Err(eave_wire::GitState::Ok) => TurnBasis::Failed {
+                reason: "git gave no answer when capturing the turn's base tree".into(),
+            },
+        }
+    };
+    *handle.turn_basis.lock().unwrap() = basis;
+    // The previous turn's list is about a basis that no longer applies —
+    // drop it rather than let one stale frame render as this turn's work.
+    *handle.files_turn.lock().unwrap() = None;
+    if handle.turn_subs.load(Ordering::Relaxed) > 0 {
+        tokio::spawn(refresh_files(Arc::clone(handle)));
+    }
+}
+
+/// The turn-scoped half of a poll (Slice AA): the basis, then git.
+///
+/// Returns a snapshot in every case. `Unavailable` carries words and an
+/// empty list, and the two are not interchangeable — the rail renders the
+/// words, never "no changes".
+async fn turn_scan(handle: &Arc<SessionHandle>, cwd: &Path) -> FilesSnapshot {
+    let unavailable = |reason: String| FilesSnapshot {
+        state: eave_wire::GitState::Ok,
+        files: Vec::new(),
+        omitted: 0,
+        watching: false,
+        basis: DiffBasis::Unavailable { reason },
+    };
+    let basis = handle.turn_basis.lock().unwrap().clone();
+    if let Some(reason) = basis.unavailable_reason() {
+        return unavailable(reason);
+    }
+    let TurnBasis::Tree { sha, at_ms } = basis else {
+        unreachable!("unavailable_reason covers every non-Tree variant");
+    };
+    let index = turn_index_path(&handle.dir, "scan");
+    match crate::git::scan_against(cwd, &sha, &index).await {
+        // The base was collected out from under us (a `git gc --prune=now`
+        // can do it: the base tree is unreachable by construction). A
+        // stated fact, not a crash and not an empty list.
+        Err(reason) => unavailable(reason),
+        Ok(mut snapshot) => {
+            snapshot.basis = DiffBasis::Turn { at: at_ms };
+            snapshot
+        }
+    }
+}
+
 async fn refresh_files(handle: Arc<SessionHandle>) {
     let _gate = handle.files_gate.lock().await;
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
@@ -1976,9 +2328,7 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
         match slot.as_mut() {
             Some(w) => {
                 let dirty = match snapshot.state {
-                    eave_wire::GitState::Ok => {
-                        Some(snapshot.files.len() as u64 + snapshot.omitted)
-                    }
+                    eave_wire::GitState::Ok => Some(snapshot.files.len() as u64 + snapshot.omitted),
                     // Failed scan = unknown, never a fake zero.
                     _ => None,
                 };
@@ -1992,6 +2342,14 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
         }
     };
     *handle.files.lock().unwrap() = Some(snapshot);
+    // Slice AA: the turn-scoped list refreshes on the same triggers as
+    // the working-tree one and under the same gate — but only while
+    // somebody is subscribed at that scope, because it costs a second
+    // full hash pass over the work tree.
+    if handle.turn_subs.load(Ordering::Relaxed) > 0 {
+        let turn = turn_scan(&handle, &cwd).await;
+        *handle.files_turn.lock().unwrap() = Some(turn);
+    }
     let _ = handle.files_tx.send(());
     if wt_changed {
         handle.poke_watch();
@@ -2005,12 +2363,26 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
 /// task holds one session's handle and can serialize nothing but that
 /// session's [`FilesSnapshot`]; the raw-byte leak test in
 /// `tests/files.rs` enforces it end-to-end.
-async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+async fn run_files(
+    handle: Arc<SessionHandle>,
+    w: Arc<TokioMutex<OwnedWriteHalf>>,
+    id: u64,
+    scope: FileScope,
+) {
     // B2: the first live subscriber starts the session's FS watcher; the
     // last one's drop (including task abort on disconnect) stops it.
-    let _guard = files_subscriber(&handle);
+    // Slice AA: the same guard counts turn-scoped subscribers, which is
+    // what turns the second (expensive) scan on and off.
+    let _guard = files_subscriber(&handle, scope);
     let mut rx = handle.files_tx.subscribe();
-    let current = handle.files.lock().unwrap().clone();
+    // Which cache this subscription reads is fixed at subscribe time —
+    // a client that wants the other basis unsubscribes and asks again,
+    // so a scope can never change under a frame in flight.
+    let cache = |h: &SessionHandle| match scope {
+        FileScope::WorkingTree => h.files.lock().unwrap().clone(),
+        FileScope::LatestTurn => h.files_turn.lock().unwrap().clone(),
+    };
+    let current = cache(&handle);
     match current {
         Some(mut snapshot) => {
             // The refresh mode is stamped per FRAME, not per scan: it
@@ -2040,7 +2412,7 @@ async fn run_files(handle: Arc<SessionHandle>, w: Arc<TokioMutex<OwnedWriteHalf>
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
-        let Some(mut snapshot) = handle.files.lock().unwrap().clone() else {
+        let Some(mut snapshot) = cache(&handle) else {
             continue;
         };
         snapshot.watching = handle.watcher_active();
@@ -2114,17 +2486,15 @@ async fn watch_session_files(
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) {
     use notify::Watcher;
-    use std::sync::atomic::Ordering;
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), ()>>();
-    let mut watcher = match notify::recommended_watcher(
-        move |res: Result<notify::Event, notify::Error>| {
+    let mut watcher =
+        match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             let _ = tx.send(res.map(|_| ()).map_err(|_| ()));
-        },
-    ) {
-        Ok(w) => w,
-        Err(_) => return, // polling fallback stands
-    };
+        }) {
+            Ok(w) => w,
+            Err(_) => return, // polling fallback stands
+        };
     if watcher
         .watch(&cwd, notify::RecursiveMode::Recursive)
         .is_err()

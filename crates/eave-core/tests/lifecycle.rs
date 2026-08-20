@@ -87,9 +87,13 @@ async fn normal_turn_streams_events_and_exits_cleanly() {
     assert!(events
         .iter()
         .any(|e| matches!(e, SessionEvent::AssistantText { text } if text.contains("hello"))));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::TurnCompleted { is_error: false, .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        SessionEvent::TurnCompleted {
+            is_error: false,
+            ..
+        }
+    )));
     assert!(matches!(
         events.last().unwrap(),
         SessionEvent::Exited { code: Some(0), .. }
@@ -106,11 +110,14 @@ async fn malformed_lines_surface_without_breaking_the_parser() {
         .iter()
         .filter(|e| matches!(e, SessionEvent::Malformed { .. }))
         .count();
-    assert!(malformed >= 2, "expected ≥2 malformed events, saw {malformed}");
+    assert!(
+        malformed >= 2,
+        "expected ≥2 malformed events, saw {malformed}"
+    );
     // Parsing continued past the garbage: later valid events still arrived.
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::AssistantText { text } if text.contains("still alive"))));
+    assert!(events.iter().any(
+        |e| matches!(e, SessionEvent::AssistantText { text } if text.contains("still alive"))
+    ));
     assert!(events
         .iter()
         .any(|e| matches!(e, SessionEvent::TurnCompleted { .. })));
@@ -137,7 +144,10 @@ async fn an_open_question_and_an_in_flight_tool_are_separate_counts() {
     let (mut session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
     recv_until(&mut rx, |e| matches!(e, SessionEvent::Init { .. })).await;
     session.send_user_message("go").await.unwrap();
-    recv_until(&mut rx, |e| matches!(e, SessionEvent::ApprovalRequested { .. })).await;
+    recv_until(&mut rx, |e| {
+        matches!(e, SessionEvent::ApprovalRequested { .. })
+    })
+    .await;
 
     assert_eq!(
         session.pending_approvals(),
@@ -173,7 +183,10 @@ async fn tool_use_tracking_counts_in_flight_tools() {
     let cfg = fake_cfg("tool-cycle", &[]);
     let (session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
 
-    recv_until(&mut rx, |e| matches!(e, SessionEvent::ToolUseStarted { .. })).await;
+    recv_until(&mut rx, |e| {
+        matches!(e, SessionEvent::ToolUseStarted { .. })
+    })
+    .await;
     assert_eq!(session.in_flight_tools(), 1);
 
     let events = recv_until(&mut rx, |e| {
@@ -208,7 +221,10 @@ async fn graceful_kill_is_verified_without_escalation() {
     let events = collect_until_exit(&mut rx).await;
     assert!(matches!(
         events.last().unwrap(),
-        SessionEvent::Exited { signal: Some(libc::SIGTERM), .. }
+        SessionEvent::Exited {
+            signal: Some(libc::SIGTERM),
+            ..
+        }
     ));
 }
 
@@ -222,7 +238,10 @@ async fn stubborn_group_is_escalated_and_leaves_no_survivors() {
     let pgid = session.identity().pid;
 
     let report = session.kill().await.expect("kill must be provable");
-    assert!(report.escalated, "SIGTERM was ignored; SIGKILL was required");
+    assert!(
+        report.escalated,
+        "SIGTERM was ignored; SIGKILL was required"
+    );
 
     // Independent verification: no process anywhere still claims this pgid.
     assert!(!process::group_alive(pgid));
@@ -255,9 +274,10 @@ async fn crash_surfaces_exit_code_and_stderr_tail() {
 async fn protocol_lines_after_kill_initiation_are_dropped() {
     let cfg = fake_cfg("chatty-term", &[]);
     let (mut session, mut rx) = ClaudeCodeSession::spawn(&cfg).unwrap();
-    recv_until(&mut rx, |e| {
-        matches!(e, SessionEvent::AssistantText { text } if text.contains("alive before term"))
-    })
+    recv_until(
+        &mut rx,
+        |e| matches!(e, SessionEvent::AssistantText { text } if text.contains("alive before term")),
+    )
     .await;
 
     // On SIGTERM the fake prints protocol lines, then exits. Those lines are
@@ -268,7 +288,10 @@ async fn protocol_lines_after_kill_initiation_are_dropped() {
         matches!(e, SessionEvent::AssistantText { text } | SessionEvent::TextDelta { text }
             if text.contains("POST_TERM_MARKER"))
     });
-    assert!(!leaked, "stale post-kill protocol lines surfaced: {events:?}");
+    assert!(
+        !leaked,
+        "stale post-kill protocol lines surfaced: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -278,7 +301,10 @@ async fn identity_guard_stops_matching_after_exit() {
     recv_until(&mut rx, |e| matches!(e, SessionEvent::Init { .. })).await;
 
     let id = session.identity();
-    assert!(proc::identity_matches(&id), "live child must match its identity");
+    assert!(
+        proc::identity_matches(&id),
+        "live child must match its identity"
+    );
 
     // kill() returns only after the child is reaped, so the pid is free (or
     // reusable) — the guard must refuse it from now on.

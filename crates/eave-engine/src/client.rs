@@ -193,7 +193,11 @@ impl Client {
             pending.lock().unwrap().clear();
         });
 
-        let hello: HelloOk = client.request(Request::Hello { proto: PROTO_VERSION }).await?;
+        let hello: HelloOk = client
+            .request(Request::Hello {
+                proto: PROTO_VERSION,
+            })
+            .await?;
         if hello.proto != PROTO_VERSION {
             return Err(ClientError::Protocol(format!(
                 "engine speaks proto {}, we speak {PROTO_VERSION}",
@@ -272,13 +276,22 @@ impl Client {
     /// Sequential sends only — the delivery state is order-paired
     /// (spec 02 §Delivery state). Await each send before the next.
     pub async fn send(&self, session_id: &str, text: &str) -> Result<bool, ClientError> {
-        Ok(self
-            .request::<SendOk>(Request::Send {
-                session_id: session_id.into(),
-                text: text.into(),
-            })
-            .await?
-            .delivered)
+        Ok(self.send_detailed(session_id, text).await?.delivered)
+    }
+
+    /// [`send`](Self::send) keeping the engine's reason for a refusal.
+    ///
+    /// Exists so a FAILING test can say why. `send`'s bool is the delivery
+    /// contract and stays the common path; an assertion on it alone reports
+    /// that something did not arrive and nothing about what happened, which
+    /// is precisely how an undelivered send stayed unexplained across
+    /// several slices.
+    pub async fn send_detailed(&self, session_id: &str, text: &str) -> Result<SendOk, ClientError> {
+        self.request::<SendOk>(Request::Send {
+            session_id: session_id.into(),
+            text: text.into(),
+        })
+        .await
     }
 
     pub async fn kill(&self, session_id: &str) -> Result<KillOk, ClientError> {
@@ -310,9 +323,7 @@ impl Client {
     /// Watch the session set (spec 05 §Watch): yields `Sessions` snapshot
     /// frames — one immediately, one on every session-set/state change.
     /// Fold by replacement. Carries no transcript content, ever.
-    pub async fn watch(
-        &self,
-    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+    pub async fn watch(&self) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
@@ -333,7 +344,10 @@ impl Client {
         &self,
         session_id: &str,
     ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
-        Ok(self.files_with_id(session_id).await?.1)
+        Ok(self
+            .files_with_id_scoped(session_id, eave_wire::FileScope::default())
+            .await?
+            .1)
     }
 
     /// Like [`files`](Self::files), but also returns the stream's request
@@ -345,6 +359,24 @@ impl Client {
         &self,
         session_id: &str,
     ) -> Result<(u64, mpsc::UnboundedReceiver<SubscriptionItem>), ClientError> {
+        self.files_with_id_scoped(session_id, eave_wire::FileScope::default())
+            .await
+    }
+
+    /// [`files_with_id`](Self::files_with_id) against a chosen basis
+    /// (Slice AA): the whole working tree, or only what the current turn
+    /// changed. The scope is fixed for the subscription's life — changing
+    /// basis means `unsubscribe` and ask again, which is also what keeps
+    /// the engine from paying for a turn scan nobody is reading.
+    ///
+    /// An engine predating the field ignores it and streams the working
+    /// tree; the snapshot's own `basis` says which one arrived, so a
+    /// client never has to assume it got what it asked for.
+    pub async fn files_with_id_scoped(
+        &self,
+        session_id: &str,
+        scope: eave_wire::FileScope,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<SubscriptionItem>), ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
@@ -352,6 +384,7 @@ impl Client {
             id,
             request: Request::Files {
                 session_id: session_id.into(),
+                scope,
             },
         })
         .await?;
@@ -398,6 +431,25 @@ impl Client {
         Ok(self
             .request::<eave_wire::IsolateOk>(Request::Isolate {
                 session_id: session_id.into(),
+            })
+            .await?
+            .info)
+    }
+
+    /// Name a session, or clear its name with `None` (Stage AB).
+    ///
+    /// Returns the session as the engine now holds it, so the caller reads
+    /// back the NORMALIZED title — trimmed, folded to one line, capped —
+    /// rather than assuming the string it sent is the one that landed.
+    pub async fn rename(
+        &self,
+        session_id: &str,
+        title: Option<&str>,
+    ) -> Result<SessionInfo, ClientError> {
+        Ok(self
+            .request::<eave_wire::RenameOk>(Request::Rename {
+                session_id: session_id.into(),
+                title: title.map(str::to_string),
             })
             .await?
             .info)

@@ -23,11 +23,15 @@ use crate::thresholds::JOURNAL_FLUSH_INTERVAL;
 /// the send stays journaled as undelivered, which is exactly the state
 /// the UI must distinguish from sent (spec 02 §Delivery state). `Err`
 /// only if the recorder is gone (nothing can be journaled at all).
+/// Journal the send, attempt it, and journal the delivery.
+///
+/// `Ok(None)` = delivered. `Ok(Some(reason))` = journaled but NOT delivered,
+/// and `reason` is the agent's own words about why.
 pub async fn send_and_journal<S: AgentSession + ?Sized>(
     session: &mut S,
     extra: &mpsc::Sender<JournalEvent>,
     text: &str,
-) -> io::Result<bool> {
+) -> io::Result<Option<String>> {
     let gone = |_| io::Error::new(io::ErrorKind::BrokenPipe, "recorder is gone");
     extra
         .send(JournalEvent::UserSent { text: text.into() })
@@ -35,10 +39,25 @@ pub async fn send_and_journal<S: AgentSession + ?Sized>(
         .map_err(gone)?;
     match session.send_user_message(text).await {
         Ok(()) => {
-            extra.send(JournalEvent::UserDelivered {}).await.map_err(gone)?;
-            Ok(true)
+            extra
+                .send(JournalEvent::UserDelivered {})
+                .await
+                .map_err(gone)?;
+            Ok(None)
         }
-        Err(_) => Ok(false),
+        // The reason is KEPT. It used to be `Err(_) => Ok(false)`, and that
+        // single underscore is why an undelivered send has been
+        // undiagnosable: the delivery contract is a bool by design (spec 02
+        // §Delivery state), but discarding the cause meant the only
+        // observable was "false", with nothing anywhere saying why. A test
+        // that fails on it can report the assertion and never the fault,
+        // which is how `files_channel_never_crosses_sessions` has been an
+        // open flake across several slices — not hard to fix, impossible to
+        // even look at.
+        //
+        // Still `Ok`: a refused write is a fact about the agent, not an
+        // error in the engine, and the caller's contract is unchanged.
+        Err(e) => Ok(Some(e.to_string())),
     }
 }
 
@@ -89,13 +108,17 @@ pub async fn record_session(
                         tap_send(rec);
                         meta.state = outcome.state_name().into();
                         meta.child = None;
-                        meta.save(&session_dir)?;
+                        // Stage AB: this task holds a `Meta` snapshot taken
+                        // at spawn, so a rename that landed mid-turn is not
+                        // in it. Preserve the on-disk title rather than
+                        // writing back a stale one.
+                        meta.save_keeping_title(&session_dir)?;
                         return Ok(outcome);
                     }
                     ev => {
                         if let SessionEvent::Init { session_id, .. } = &ev {
                             meta.session_id = session_id.clone();
-                            meta.save(&session_dir)?;
+                            meta.save_keeping_title(&session_dir)?;
                         }
                         let terminal = matches!(ev, SessionEvent::TurnCompleted { .. });
                         let rec = writer.append(JournalEvent::Provider { event: ev })?;

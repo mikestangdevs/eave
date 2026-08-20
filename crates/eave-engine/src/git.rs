@@ -20,7 +20,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use eave_wire::{ChangedFile, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff, FileStatus, FilesSnapshot, GitState};
+use eave_wire::{
+    ChangedFile, DiffBasis, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff, FileStatus,
+    FilesSnapshot, GitState,
+};
 
 /// Bound on every git call. Generous — a cold `status` on a large repo
 /// legitimately takes seconds — but hard: past it the child is killed
@@ -57,34 +60,68 @@ pub async fn scan(cwd: &Path) -> FilesSnapshot {
 /// [`scan`] with the git binary and timeout injectable (tests: a fake
 /// git that hangs proves the timeout, at test-scale duration).
 pub async fn scan_with(git: &Path, cwd: &Path, timeout: Duration) -> FilesSnapshot {
-    let status_bytes = match run(git, cwd, timeout, &["status", "--porcelain=v2", "-z", "--untracked-files=all"]).await {
+    let status_bytes = match run(
+        git,
+        cwd,
+        timeout,
+        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+    )
+    .await
+    {
         Ok(bytes) => bytes,
-        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+        Err(state) => return stated_snapshot(state),
     };
     let mut files = parse_status_v2(&status_bytes);
     if files.is_empty() {
-        return FilesSnapshot { state: GitState::Ok, files, omitted: 0, watching: false };
+        return FilesSnapshot {
+            state: GitState::Ok,
+            files,
+            omitted: 0,
+            watching: false,
+            basis: DiffBasis::WorkingTree,
+        };
     }
 
     // Line counts for tracked changes: one numstat against HEAD covers
     // staged + unstaged as a single per-file delta. A repo with no
     // commits has no HEAD — diff against its own empty tree instead
     // (hash-object, so SHA-1 and SHA-256 repos both answer).
-    let numstat = match run(git, cwd, timeout, &["diff", "--numstat", "-z", "-M", "HEAD", "--"]).await {
+    let numstat = match run(
+        git,
+        cwd,
+        timeout,
+        &["diff", "--numstat", "-z", "-M", "HEAD", "--"],
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(GitState::Error { .. }) => {
-            match run(git, cwd, timeout, &["hash-object", "-t", "tree", "/dev/null"]).await {
+            match run(
+                git,
+                cwd,
+                timeout,
+                &["hash-object", "-t", "tree", "/dev/null"],
+            )
+            .await
+            {
                 Ok(tree) => {
                     let tree = String::from_utf8_lossy(&tree).trim().to_string();
-                    match run(git, cwd, timeout, &["diff", "--numstat", "-z", "-M", &tree, "--"]).await {
+                    match run(
+                        git,
+                        cwd,
+                        timeout,
+                        &["diff", "--numstat", "-z", "-M", &tree, "--"],
+                    )
+                    .await
+                    {
                         Ok(bytes) => bytes,
-                        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+                        Err(state) => return stated_snapshot(state),
                     }
                 }
-                Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+                Err(state) => return stated_snapshot(state),
             }
         }
-        Err(state) => return FilesSnapshot { state, files: Vec::new(), omitted: 0, watching: false },
+        Err(state) => return stated_snapshot(state),
     };
     let counts = parse_numstat(&numstat);
     for f in &mut files {
@@ -114,13 +151,56 @@ pub async fn scan_with(git: &Path, cwd: &Path, timeout: Duration) -> FilesSnapsh
             }
         }
     }
-    FilesSnapshot { state: GitState::Ok, files, omitted, watching: false }
+    FilesSnapshot {
+        state: GitState::Ok,
+        files,
+        omitted,
+        watching: false,
+        basis: DiffBasis::WorkingTree,
+    }
+}
+
+/// A snapshot that carries nothing but the reason it carries nothing.
+/// Every scan bail-out lands here so "git could not answer" is one shape
+/// with one meaning, whichever call failed.
+fn stated_snapshot(state: GitState) -> FilesSnapshot {
+    FilesSnapshot {
+        state,
+        files: Vec::new(),
+        omitted: 0,
+        watching: false,
+        basis: DiffBasis::WorkingTree,
+    }
 }
 
 /// Run one git command; classify failure as a stated fact. The child is
 /// killed on timeout (`kill_on_drop`).
-async fn run(git: &Path, cwd: &Path, timeout: Duration, args: &[&str]) -> Result<Vec<u8>, GitState> {
-    let child = Command::new(git)
+async fn run(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    args: &[&str],
+) -> Result<Vec<u8>, GitState> {
+    run_env(git, cwd, timeout, args, None).await
+}
+
+/// [`run`] with one extra environment variable — the seat `GIT_INDEX_FILE`
+/// sits in (Slice AA). Kept as a separate parameter rather than a general
+/// env map because there is exactly one variable eave ever overrides here
+/// and it is the one that decides whether a git call touches the
+/// operator's real index.
+async fn run_env(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    args: &[&str],
+    extra_env: Option<(&str, &Path)>,
+) -> Result<Vec<u8>, GitState> {
+    let mut cmd = Command::new(git);
+    if let Some((k, v)) = extra_env {
+        cmd.env(k, v);
+    }
+    let child = cmd
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -294,6 +374,281 @@ async fn count_lines(path: &Path) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Turn-scoped changes (Slice AA)
+//
+// "What did THIS turn change" is a different question from "what is
+// uncommitted", and git has no name for the answer — so eave makes one:
+// at every turn dispatch it writes the working tree (tracked AND
+// untracked-unignored) into the object store as a tree, and the
+// turn-scoped scan is that tree against a fresh one.
+//
+// Two properties are load-bearing and neither is obvious:
+//
+// 1. **The throwaway index must live OUTSIDE the repository.** `git add
+//    -A` under a `GIT_INDEX_FILE` in eave's data dir leaves `git status
+//    --porcelain` byte-identical (asserted by test). Put the same file
+//    inside the work tree and `add -A` sweeps up the index — and its lock
+//    file — into the very tree it is capturing. That was observed on a
+//    scratch repo, not reasoned about.
+// 2. **Both sides of the diff carry untracked files**, which is why the
+//    turn scan needs none of the untracked synthesis the working-tree
+//    scan does. A file that was already untracked when the turn started
+//    is in the base tree, so a turn that edits it reports MODIFIED.
+//    Synthesize instead and the same file reads as entirely new — the
+//    turn gets credited with every line the operator wrote before it
+//    started.
+
+/// Capture the current working tree — tracked and untracked-unignored —
+/// as a tree object, via a throwaway index at `index`.
+///
+/// `index` is a parameter, not a temp file this function invents, for one
+/// reason: the caller is responsible for putting it in eave's data dir.
+/// Inside the repo it corrupts the capture (see above); in `/tmp` it is
+/// somebody else's to delete. Reusing the same path across calls is
+/// deliberate — a fresh index has no stat cache, so every capture would
+/// otherwise re-hash the whole work tree. On failure the file is removed
+/// so a corrupt index heals itself on the next attempt instead of failing
+/// forever.
+///
+/// The real index is never named and never touched: the only mutation is
+/// to `index`, and the operator's staged state is exactly as it was.
+pub async fn snapshot_tree(cwd: &Path, index: &Path) -> Result<String, GitState> {
+    snapshot_tree_with(Path::new("git"), cwd, GIT_TIMEOUT, index).await
+}
+
+/// [`snapshot_tree`] with the git binary and timeout injectable.
+pub async fn snapshot_tree_with(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    index: &Path,
+) -> Result<String, GitState> {
+    if let Some(parent) = index.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(GitState::Error {
+                message: format!("turn index dir {}: {e}", parent.display()),
+            });
+        }
+    }
+    // No pathspec: `add -A` with one would scope the capture to the cwd,
+    // and a session cwd is allowed to be a subdirectory of its checkout.
+    // The working-tree scan states root-relative paths, so the turn scan
+    // must cover the same tree or the two scopes would disagree about
+    // what a path even means.
+    let env = Some(("GIT_INDEX_FILE", index));
+    if let Err(state) = run_env(git, cwd, timeout, &["add", "-A", "--ignore-errors"], env).await {
+        let _ = tokio::fs::remove_file(index).await;
+        return Err(state);
+    }
+    match run_env(git, cwd, timeout, &["write-tree"], env).await {
+        Ok(out) => {
+            let sha = String::from_utf8_lossy(&out).trim().to_string();
+            if sha.is_empty() {
+                let _ = tokio::fs::remove_file(index).await;
+                return Err(GitState::Error {
+                    message: "git write-tree printed nothing".into(),
+                });
+            }
+            Ok(sha)
+        }
+        Err(state) => {
+            let _ = tokio::fs::remove_file(index).await;
+            Err(state)
+        }
+    }
+}
+
+/// The turn-scoped scan: `base_tree` against a fresh capture of the
+/// working tree.
+///
+/// `Err(reason)` means the BASIS is unusable — the caller states it as
+/// `DiffBasis::Unavailable` rather than as a git failure, because the
+/// repository is fine and only the thing we wanted to measure from is
+/// gone. `Ok` may still carry a [`GitState::Error`]: that is a scan
+/// failure, which is the existing shape.
+pub async fn scan_against(
+    cwd: &Path,
+    base_tree: &str,
+    index: &Path,
+) -> Result<FilesSnapshot, String> {
+    scan_against_with(Path::new("git"), cwd, GIT_TIMEOUT, base_tree, index).await
+}
+
+/// [`scan_against`] with the git binary and timeout injectable.
+pub async fn scan_against_with(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    base_tree: &str,
+    index: &Path,
+) -> Result<FilesSnapshot, String> {
+    // Ask before diffing, rather than pattern-matching git's stderr
+    // afterwards. The base is an UNREACHABLE object — nothing references
+    // it — so an agent that runs `git gc --prune=now` mid-turn is
+    // entitled to collect it, and eave has to be able to say so in words
+    // instead of reporting a git failure the operator cannot act on.
+    match run(git, cwd, timeout, &["cat-file", "-t", base_tree]).await {
+        Ok(out) if String::from_utf8_lossy(&out).trim() == "tree" => {}
+        _ => {
+            return Err(format!(
+                "the turn's base tree {} is no longer in the object store — a `git gc` \
+                 can prune it while the turn runs. The next turn starts a fresh base.",
+                short_sha(base_tree)
+            ))
+        }
+    }
+
+    let current = match snapshot_tree_with(git, cwd, timeout, index).await {
+        Ok(sha) => sha,
+        Err(state) => return Ok(stated_snapshot(state)),
+    };
+
+    let names = match run(
+        git,
+        cwd,
+        timeout,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            base_tree,
+            &current,
+            "--",
+        ],
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(state) => return Ok(stated_snapshot(state)),
+    };
+    let mut files = parse_name_status(&names);
+    if files.is_empty() {
+        return Ok(FilesSnapshot {
+            state: GitState::Ok,
+            files,
+            omitted: 0,
+            watching: false,
+            basis: DiffBasis::WorkingTree,
+        });
+    }
+
+    // Both sides are trees, so numstat covers every entry — including the
+    // untracked ones the working-tree scan has to count by hand.
+    let numstat = match run(
+        git,
+        cwd,
+        timeout,
+        &["diff", "--numstat", "-z", "-M", base_tree, &current, "--"],
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(state) => return Ok(stated_snapshot(state)),
+    };
+    let counts = parse_numstat(&numstat);
+    for f in &mut files {
+        if let Some((adds, dels)) = counts.get(&f.path) {
+            f.adds = *adds;
+            f.dels = *dels;
+        }
+    }
+
+    // `untracked` describes the WORKING TREE, not this diff — it is what
+    // tells the diff request to read the file's own bytes instead of
+    // asking `git diff HEAD` about a path git has never heard of. The
+    // turn scan changes the basis of the LIST; the per-file diff stays
+    // working-tree-scoped, so the flag has to stay working-tree truth.
+    if let Ok(bytes) = run(
+        git,
+        cwd,
+        timeout,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await
+    {
+        let others: std::collections::HashSet<&str> = bytes
+            .split(|b| *b == 0)
+            .filter(|c| !c.is_empty())
+            .filter_map(|c| std::str::from_utf8(c).ok())
+            .collect();
+        for f in &mut files {
+            f.untracked = others.contains(f.path.as_str());
+        }
+    }
+
+    let omitted = files.len().saturating_sub(MAX_FILES) as u64;
+    files.truncate(MAX_FILES);
+    Ok(FilesSnapshot {
+        state: GitState::Ok,
+        files,
+        omitted,
+        watching: false,
+        basis: DiffBasis::WorkingTree,
+    })
+}
+
+/// Enough of a sha to identify it in a sentence, without pretending the
+/// operator is going to type it.
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
+}
+
+/// `diff --name-status -z`: status and path are SEPARATE NUL-terminated
+/// fields (unlike the newline format), and a rename/copy score is
+/// followed by two path fields — old, then new.
+fn parse_name_status(bytes: &[u8]) -> Vec<ChangedFile> {
+    let mut files = Vec::new();
+    let mut chunks = bytes
+        .split(|b| *b == 0)
+        .filter(|c| !c.is_empty())
+        .map(|c| String::from_utf8_lossy(c).into_owned());
+    while let Some(code) = chunks.next() {
+        let letter = code.as_bytes()[0];
+        let (status, orig_path) = match letter {
+            b'A' => (FileStatus::Added, None),
+            b'D' => (FileStatus::Deleted, None),
+            b'R' | b'C' => {
+                let Some(old) = chunks.next() else { break };
+                // A copy's destination is a path that did not exist
+                // before, and its source is unchanged and listed nowhere
+                // — "added" is the fact, and naming a rename source that
+                // is still sitting there would be a lie.
+                if letter == b'R' {
+                    (FileStatus::Renamed, Some(old))
+                } else {
+                    (FileStatus::Added, None)
+                }
+            }
+            // `T` is a type change (file ↔ symlink ↔ submodule); `M` is
+            // content or mode. Both are "this path is different now".
+            b'M' | b'T' => (FileStatus::Modified, None),
+            b'U' => (FileStatus::Conflicted, None),
+            // `X` is git's own "unknown, probably a bug" marker. Skipping
+            // the code alone would desynchronise the path stream, so its
+            // path is consumed with it.
+            _ => {
+                let _ = chunks.next();
+                continue;
+            }
+        };
+        let Some(path) = chunks.next() else { break };
+        if path.is_empty() {
+            continue;
+        }
+        files.push(ChangedFile {
+            path,
+            status,
+            adds: None,
+            dels: None,
+            orig_path,
+            untracked: false,
+        });
+    }
+    files
+}
+
+// ---------------------------------------------------------------------------
 // Worktree plumbing (Slice I2)
 //
 // Same discipline as the scanner: every call is a timeout-bounded child
@@ -315,18 +670,34 @@ pub struct CheckoutProbe {
 
 pub async fn checkout_root(cwd: &Path) -> CheckoutProbe {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    match run(Path::new("git"), cwd, GIT_TIMEOUT, &["rev-parse", "--show-toplevel"]).await {
+    match run(
+        Path::new("git"),
+        cwd,
+        GIT_TIMEOUT,
+        &["rev-parse", "--show-toplevel"],
+    )
+    .await
+    {
         Ok(out) => {
             let top = String::from_utf8_lossy(&out).trim().to_string();
             if top.is_empty() {
                 // Inside a bare repo / .git dir: no worktree. Fall back
                 // to the directory itself.
-                CheckoutProbe { root: canon(cwd), is_repo: false }
+                CheckoutProbe {
+                    root: canon(cwd),
+                    is_repo: false,
+                }
             } else {
-                CheckoutProbe { root: canon(Path::new(&top)), is_repo: true }
+                CheckoutProbe {
+                    root: canon(Path::new(&top)),
+                    is_repo: true,
+                }
             }
         }
-        Err(_) => CheckoutProbe { root: canon(cwd), is_repo: false },
+        Err(_) => CheckoutProbe {
+            root: canon(cwd),
+            is_repo: false,
+        },
     }
 }
 
@@ -399,10 +770,15 @@ pub async fn worktree_prune(base: &Path) -> Result<(), String> {
 /// `git branch -D` — the engine only ever calls this for `eave/`
 /// branches it created (the guard lives at the call site).
 pub async fn branch_delete(base: &Path, branch: &str) -> Result<(), String> {
-    run(Path::new("git"), base, GIT_TIMEOUT, &["branch", "-D", "--", branch])
-        .await
-        .map(drop)
-        .map_err(stated)
+    run(
+        Path::new("git"),
+        base,
+        GIT_TIMEOUT,
+        &["branch", "-D", "--", branch],
+    )
+    .await
+    .map(drop)
+    .map_err(stated)
 }
 
 /// Worktree paths registered in the base repo (`git worktree list
@@ -441,7 +817,14 @@ pub async fn unmerged_count(repo: &Path, branch: &str) -> Option<u64> {
         repo,
         GIT_TIMEOUT,
         &[
-            "rev-list", "--count", branch, "--not", &exclude, "--branches", "--tags", "--remotes",
+            "rev-list",
+            "--count",
+            branch,
+            "--not",
+            &exclude,
+            "--branches",
+            "--tags",
+            "--remotes",
         ],
     )
     .await
@@ -496,7 +879,14 @@ async fn tracked_kind(git: &Path, cwd: &Path, timeout: Duration, file: &ChangedF
         Err(GitState::Error { .. }) => {
             // No HEAD yet? Diff against the repo's own empty tree
             // (hash-object, so SHA-1 and SHA-256 repos both answer).
-            let tree = match run(git, cwd, timeout, &["hash-object", "-t", "tree", "/dev/null"]).await {
+            let tree = match run(
+                git,
+                cwd,
+                timeout,
+                &["hash-object", "-t", "tree", "/dev/null"],
+            )
+            .await
+            {
                 Ok(t) => String::from_utf8_lossy(&t).trim().to_string(),
                 Err(state) => return state_to_kind(state),
             };
@@ -585,7 +975,10 @@ async fn run_capped(
             // Enough: kill the child (drop does) and state the cut.
             drop(child);
             bytes.truncate(cap);
-            return Ok(CappedOutput { bytes, truncated: true });
+            return Ok(CappedOutput {
+                bytes,
+                truncated: true,
+            });
         }
     }
     let status = match tokio::time::timeout_at(deadline, child.wait()).await {
@@ -598,7 +991,10 @@ async fn run_capped(
         Err(_elapsed) => return Err(timed_out()),
     };
     if status.success() {
-        return Ok(CappedOutput { bytes, truncated: false });
+        return Ok(CappedOutput {
+            bytes,
+            truncated: false,
+        });
     }
     let mut stderr_bytes = Vec::new();
     if let Some(mut se) = child.stderr.take() {
@@ -655,7 +1051,9 @@ fn parse_diff(bytes: &[u8], byte_truncated: bool) -> DiffKind {
         }
         // File-header lines (diff --git, index, ---/+++, mode) precede
         // the first hunk; skip anything not inside one.
-        let Some(hunk) = hunks.last_mut() else { continue };
+        let Some(hunk) = hunks.last_mut() else {
+            continue;
+        };
         let (op, content) = match line.as_bytes().first() {
             Some(b'+') => (DiffOp::Add, &line[1..]),
             Some(b'-') => (DiffOp::Del, &line[1..]),
@@ -947,7 +1345,10 @@ mod tests {
 
     fn text_hunks(kind: &DiffKind) -> &Vec<DiffHunk> {
         match kind {
-            DiffKind::Text { hunks, truncated: false } => hunks,
+            DiffKind::Text {
+                hunks,
+                truncated: false,
+            } => hunks,
             other => panic!("expected untruncated text diff, got {other:?}"),
         }
     }
@@ -1085,7 +1486,11 @@ mod tests {
             .current_dir(&dir)
             .output()
             .expect("submodule add");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         git(&dir, &["commit", "-qm", "add sub"]);
         // Move the submodule's checked-out commit: the outer repo now
         // sees a pointer change.
@@ -1173,7 +1578,9 @@ mod tests {
         std::fs::write(dir.join("wide.txt"), body).unwrap();
         let d = scan_and_diff(&dir, "wide.txt").await;
         match d.kind {
-            DiffKind::Text { truncated, .. } => assert!(truncated, "byte cap must state truncation"),
+            DiffKind::Text { truncated, .. } => {
+                assert!(truncated, "byte cap must state truncation")
+            }
             other => panic!("expected truncated text, got {other:?}"),
         }
     }
@@ -1226,7 +1633,11 @@ mod tests {
 
         let wt_snap = scan(&wt).await;
         assert_eq!(wt_snap.state, GitState::Ok);
-        assert!(wt_snap.files.is_empty(), "worktree starts clean: {:?}", wt_snap.files);
+        assert!(
+            wt_snap.files.is_empty(),
+            "worktree starts clean: {:?}",
+            wt_snap.files
+        );
 
         let base_snap = scan(&base).await;
         assert_eq!(base_snap.files.len(), 1, "base keeps its dirty edit");

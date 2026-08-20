@@ -16,7 +16,10 @@ use eave_wire::SubscriptionItem;
 fn fixture_steps() -> Vec<fixture::Step> {
     let path = fixture::default_path();
     let steps = fixture::load(&path).unwrap_or_else(|e| {
-        panic!("fixture {} unreadable: {e} — run tests from the workspace", path.display())
+        panic!(
+            "fixture {} unreadable: {e} — run tests from the workspace",
+            path.display()
+        )
     });
     assert!(!steps.is_empty(), "fixture is empty");
     steps
@@ -30,12 +33,7 @@ fn replay(mut check: impl FnMut(usize, &eave_app::display::DiffOps, usize, usize
     let open_fences = |d: &DisplayList| -> usize {
         d.rows()
             .iter()
-            .filter(|r| {
-                matches!(
-                    d.block(r.id),
-                    Some(Block::Fence { closed: false, .. })
-                )
-            })
+            .filter(|r| matches!(d.block(r.id), Some(Block::Fence { closed: false, .. })))
             .count()
     };
     for (ix, step) in fixture_steps().into_iter().enumerate() {
@@ -68,7 +66,10 @@ fn fixture_applies_with_minimal_splices_and_no_resets() {
     let mut max_splice = 0usize;
     replay(|_, ops, _, _, list| {
         bursts += 1;
-        assert!(!ops.reset, "mid-stream reset must never happen on the live path");
+        assert!(
+            !ops.reset,
+            "mid-stream reset must never happen on the live path"
+        );
         if let Some((range, count)) = &ops.splice {
             splices += 1;
             let touched = range.len().max(*count);
@@ -81,7 +82,10 @@ fn fixture_applies_with_minimal_splices_and_no_resets() {
             );
         }
     });
-    assert!(bursts > 50, "fixture should contain a real stream, got {bursts} bursts");
+    assert!(
+        bursts > 50,
+        "fixture should contain a real stream, got {bursts} bursts"
+    );
     // The overwhelming majority of streaming bursts must be pure
     // remeasure/no-op; splices only when the block count changes.
     assert!(
@@ -137,9 +141,16 @@ fn incremental_fold_equals_batch_rebuild() {
     let a: &[DisplayRow] = incremental.rows();
     let b: &[DisplayRow] = batch.rows();
     assert_eq!(a, b, "incremental fold diverged from batch rebuild");
-    assert!(transcript.closed.is_some(), "fixture ends with a Closed record");
+    assert!(
+        transcript.closed.is_some(),
+        "fixture ends with a Closed record"
+    );
     // Sanity on content: the real stream produced tools and fences.
-    assert!(a.len() > 30, "expected a rich display list, got {} rows", a.len());
+    assert!(
+        a.len() > 30,
+        "expected a rich display list, got {} rows",
+        a.len()
+    );
 }
 
 /// Per-thread CPU time — the fold is single-threaded pure compute, so
@@ -201,7 +212,11 @@ fn update_cost_stays_flat_on_a_10k_row_transcript() {
     let mut worst = std::time::Duration::ZERO;
     for i in 0..200 {
         if let Some(eave_wire::model::Row::Assistant { text, .. }) = transcript.rows.last_mut() {
-            text.push_str(if i % 17 == 0 { "\n\nnew para " } else { "more words " });
+            text.push_str(if i % 17 == 0 {
+                "\n\nnew para "
+            } else {
+                "more words "
+            });
         }
         transcript.touch(live_ix);
         let t = thread_cpu();
@@ -209,7 +224,9 @@ fn update_cost_stays_flat_on_a_10k_row_transcript() {
         worst = worst.max(thread_cpu() - t);
         assert!(!ops.reset);
     }
-    eprintln!("10k-row fold: cold build {cold:?} (wall), worst streaming burst {worst:?} (thread CPU)");
+    eprintln!(
+        "10k-row fold: cold build {cold:?} (wall), worst streaming burst {worst:?} (thread CPU)"
+    );
     assert!(
         worst < std::time::Duration::from_millis(4),
         "per-burst fold cost {worst:?} eats the 16 ms frame budget"

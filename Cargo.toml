@@ -7,6 +7,14 @@ members = [
     "crates/eave-app",
 ]
 
+[workspace.package]
+# The single source of truth for the shipped version. `scripts/package-macos.sh`
+# reads it, and `.github/workflows/release.yml` refuses to publish when the
+# pushed tag disagrees — a build that lies about its own version is worse than
+# no build, because every bug report after it points at the wrong commit.
+version = "0.1.0"
+edition = "2021"
+
 # gpui is unusably slow unoptimized; optimize deps even in dev (zed's own
 # approach, mirrored in comet's workspace manifest).
 [profile.dev.package."*"]

@@ -110,7 +110,10 @@ async fn start(
 ) {
     let client = Client::connect(dir).await.expect("connect");
     let info = client.open(None, None).await.expect("open");
-    let rx = client.subscribe(&info.session_id, None).await.expect("subscribe");
+    let rx = client
+        .subscribe(&info.session_id, None)
+        .await
+        .expect("subscribe");
     let delivered = client.send(&info.session_id, "go").await.expect("send");
     assert!(delivered, "fake accepted the message");
     (client, info.session_id, rx)

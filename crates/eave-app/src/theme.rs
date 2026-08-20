@@ -12,7 +12,6 @@
 //! was deleted 2026-08-19. The waku lineage of the TYPE and hairlines
 //! stands; the surfaces are all washes now.)
 
-
 use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
@@ -49,7 +48,6 @@ use gpui::{hsla, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Pixels};
 //     keeps the pre-blended opaque plate: any alpha there ghosts the
 //     log through it, and no blur will save it.
 
-
 // The wash primitives. Private, and still worth keeping separate from the
 // public tokens above: they are the values the elevation tests compose
 // directly, so a rung can be checked without going through its semantic
@@ -74,14 +72,10 @@ fn wash_raised() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.044)
 }
 fn wash_panel() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.067)
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.080)
 }
 fn wash_modal() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.097)
-}
-/// Sunken = black wash: 26.4·(1−0.205) = 21 = opaque inset over black.
-fn wash_inset() -> Hsla {
-    hsla(0.0, 0.0, 0.0, 0.205)
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.116)
 }
 /// Attention plates: single-color equivalents of (L2 wash, then state
 /// wash) stacked, so over a black backdrop they equal the opaque plates.
@@ -183,8 +177,31 @@ pub fn content_plate() -> Hsla {
 }
 
 /// Sunken panels: code blocks.
+/// A sunken plate's fill. Transparent on purpose.
+///
+/// This was a black wash (`wash_inset`, α 0.205) and it could not work: the
+/// glass ground is already near-black (`#080808` over a black desktop), so
+/// darkening it moves the pixel **2/255** — at or under the perceptual
+/// threshold — and even doubling the alpha to 0.45 only buys 3.6/255 at the
+/// worst backdrop. There is no room below the ground to sink into.
+///
+/// So a sunken plate is read from its **edge** instead, which is where every
+/// consumer was already carrying a border. comet hit the same wall from the
+/// other direction and reached the same conclusion — their `theme.rs:937-955`
+/// records three rejected drop-shadow recipes and the reason ("drop shadows
+/// are filled rects painted BEHIND the element, and behind a 5% fill they
+/// showed straight through as an opaque dark plate").
+///
+/// A per-edge rim light — a brighter hairline on the top edge only — is the
+/// next refinement and is deliberately not in this slice.
 pub fn inset() -> Hsla {
-    wash_inset()
+    gpui::transparent_black()
+}
+
+/// The rim that carries a sunken plate now that its fill does not. One step
+/// up from [`border`], because it is doing the whole job alone.
+pub fn border_inset() -> Hsla {
+    border_strong()
 }
 
 /// The resting end of a hover wash on an unfilled control (Slice N2) —
@@ -205,7 +222,7 @@ pub fn wash_rest() -> Hsla {
 /// Hover/selection wash composited over any surface (waku's idiom: no
 /// per-surface hover tokens, just a white wash).
 pub fn overlay() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.05)
+    hsla(220.0 / 360.0, 0.10, 0.90, 0.08)
 }
 pub fn overlay_strong() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.09)
@@ -285,14 +302,20 @@ pub fn text() -> Hsla {
     rgb(0xe2e2e2).into()
 }
 pub fn text_secondary() -> Hsla {
-    rgb(0xa3a3a3).into()
+    rgb(0xa8a8a8).into()
 }
+/// Placeholders, disabled, structural hints — the quietest tier that is
+/// still allowed to carry a fact.
+///
+/// There used to be a fourth tier below this one, `text_ghost` (`#575757`),
+/// and it was the single least readable thing eave drew: **1.55:1** against
+/// the glass ground at the bright end of the backdrop sweep, on ~25 call
+/// sites including diff context lines and the "no sessions" empty state. It
+/// was retired rather than raised, because the value that would clear the
+/// floor (`#858585`) is this tier — two names for one colour is not a
+/// hierarchy. Three tiers, each of which clears [`TEXT_CONTRAST_FLOOR`].
 pub fn text_tertiary() -> Hsla {
-    rgb(0x7d7d7d).into()
-}
-/// Placeholders, disabled, structural hints.
-pub fn text_ghost() -> Hsla {
-    rgb(0x575757).into()
+    rgb(0x858585).into()
 }
 
 /// Primary-action fill (the send button when armed) and the text on it.
@@ -679,6 +702,27 @@ pub const RAIL_W: f32 = 248.0;
 /// Ground margin around the floating content card (and the air the rails
 /// keep from the window edges).
 pub const PLATE_MARGIN: f32 = SPACE_3;
+
+/// The rail's one left edge, and the rule that goes with it.
+///
+/// **Every direct child of a rail — the header label, a row's TEXT, the
+/// empty state, the footer line — starts on this edge. A row's CARD bleeds
+/// [`RAIL_CARD_BLEED`] outside it on both sides, and the header's trailing
+/// control shares the card's RIGHT edge.**
+///
+/// Written down because it was not, and a spacing scale cannot supply it: a
+/// scale tells you the SIZE of a gap and says nothing about which edge
+/// things line up on. Every value in the rails was already a legal
+/// `SPACE_*` and the result still had four different left edges — header
+/// label 24, row card 20, row text 28, footer 24 — with the row card
+/// overhanging the header's `+ new` button by 4 px. Both rails had it, the
+/// same way, because one was copied from the other.
+pub const RAIL_GUTTER: f32 = SPACE_3;
+
+/// How far a row's card extends outside [`RAIL_GUTTER`] on each side. The
+/// card is a highlight around text, so it must bleed past the text it
+/// highlights or the selection looks clipped.
+pub const RAIL_CARD_BLEED: f32 = SPACE_3;
 /// Provider identity chip: self-drawn monochrome initials on a bordered
 /// rounded square. Deliberately never a third-party mark — one uniform,
 /// self-drawn set for every provider (Slice A directive).
@@ -800,7 +844,68 @@ pub const MENU_SCREEN_MARGIN: f32 = SPACE_2;
 /// It is deliberately NOT a text tier — a disabled control dims *whole*,
 /// glyph and wash and trailing state together, which is what says "this
 /// control is off" rather than "this text is less important".
+/// How many lines of a FAILED tool's reply the transcript states before it
+/// says how many more there are.
+///
+/// Chosen, not derived, and deliberately small: this block lives inside a
+/// virtualized list, so its height is a row height, and a row whose height
+/// grows with an agent's verbosity is how a transcript stops being able to
+/// promise anything about scrolling. Six lines is enough for a compiler
+/// error's first message or a failed assertion; anything longer is a thing
+/// to open, not a thing to glance at. comet caps its equivalent at 24 and
+/// pays for it with a fold and a measured height, which is the next slice.
+pub const TOOL_ERROR_MAX_LINES: usize = 6;
+
+/// How many lines of one code fence the transcript draws before it states
+/// the remainder.
+///
+/// A fence is ONE row in a virtualized list, so an uncapped fence is a row
+/// whose height is whatever the agent felt like emitting — and the list's
+/// whole promise is that a row's height is knowable. 200 lines is well past
+/// any fence in the capture corpus and still bounded. The copy button takes
+/// the WHOLE fence, not the drawn part, so the cap costs reading and never
+/// costs data.
+pub const FENCE_MAX_LINES: usize = 200;
+
+/// How many lines of an OPENED tool card's body the transcript draws.
+///
+/// Larger than [`TOOL_ERROR_MAX_LINES`] because opening a card is a
+/// deliberate act — the reader asked — and smaller than
+/// [`FENCE_MAX_LINES`] because the card is still a row in a virtualized
+/// list and the payload behind it is already bounded at 8 KiB by
+/// `eave_core::events::TOOL_PAYLOAD_CAP`. The remainder is stated, as
+/// everywhere else that caps.
+pub const TOOL_BODY_MAX_LINES: usize = 40;
+
+/// WCAG 2.1 AA for normal-size text. Cited, not chosen: SC 1.4.3.
+pub const TEXT_CONTRAST_FLOOR: f32 = 4.5;
+/// WCAG 2.1 AA for large text (SC 1.4.3), used here as the floor for the
+/// quiet tier — a deliberate, stated relaxation for text that is structural
+/// rather than primary, not a claim that the tier is WCAG-conforming at the
+/// sizes eave draws it.
+pub const TEXT_QUIET_CONTRAST_FLOOR: f32 = 3.0;
+/// The smallest surface step this design is willing to call a step, in 8-bit
+/// channel units over the darkest ground. **Chosen, not derived** — it is the
+/// magnitude the elevation ladder had never constrained, and it is set at the
+/// level the existing `raised` rung already clears so that pinning it is a
+/// regression guard rather than a redesign. Revisit by eye, not by argument.
+pub const SURFACE_STEP_FLOOR: f32 = 6.0;
+/// A state change the eye can find: hover, selection, an armed edge. Same
+/// units and the same standing as [`SURFACE_STEP_FLOOR`].
+pub const STATE_DELTA_FLOOR: f32 = 8.0;
+
+/// Retired. A container-wide `.opacity()` cannot express "disabled" on this
+/// ground: composited over the glass canvas, **pure white at 0.35 lands at
+/// `#5e5e5e`, 3.11:1** — so the mechanism's own ceiling is barely at the
+/// quiet floor, and any real token multiplied through it is far below.
+/// Disabled controls pick a dimmed token directly; see [`text_disabled`].
 pub const DISABLED_OPACITY: f32 = 0.35;
+
+/// A disabled control's label. A token, not an opacity — see the note on
+/// [`DISABLED_OPACITY`] for why the multiply could never work.
+pub fn text_disabled() -> Hsla {
+    text_tertiary()
+}
 
 // ---------------------------------------------------------------------------
 // Scroll-edge fades (Slice M) — the fork's per-primitive `EdgeFade`, the
@@ -892,6 +997,161 @@ mod tests {
         (c.0 + c.1 + c.2) / 3.0
     }
 
+    /// sRGB relative luminance (WCAG 2.1 §relative luminance). NOT `luma`:
+    /// that is a channel mean, which is why nothing below was expressible
+    /// before — a mean cannot answer "can this be read".
+    fn relative_luminance(c: (f32, f32, f32)) -> f32 {
+        fn lin(u: f32) -> f32 {
+            if u <= 0.04045 {
+                u / 12.92
+            } else {
+                ((u + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * lin(c.0) + 0.7152 * lin(c.1) + 0.0722 * lin(c.2)
+    }
+
+    /// WCAG 2.1 contrast ratio, 1.0..=21.0.
+    fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    /// Every glass ground the app can actually have: the canvas composited
+    /// over each backdrop brightness. The same sweep the elevation ladder
+    /// has always used — the point of this slice is that the OTHER systems
+    /// were never swept.
+    fn grounds() -> Vec<(f32, f32, f32)> {
+        (0..=255)
+            .step_by(5)
+            .map(|b| {
+                let v = b as f32 / 255.0;
+                over(glass_canvas(), (v, v, v))
+            })
+            .collect()
+    }
+
+    /// 8-bit channel units, the unit every step floor is quoted in.
+    fn units(c: (f32, f32, f32)) -> f32 {
+        c.0 * 255.0
+    }
+
+    /// Every tier that carries a fact clears its floor on EVERY backdrop.
+    ///
+    /// The bright end is the hard end: the glass ground lightens from
+    /// `#080808` to `#3b3b3b` as the desktop behind it brightens, and light
+    /// text loses contrast as it goes. Measuring on a black desktop only —
+    /// which is what a screenshot on this machine shows — reports `text` at
+    /// 15.46:1 when its real worst case is 8.65:1.
+    #[test]
+    fn every_text_tier_is_readable_on_any_backdrop() {
+        for g in grounds() {
+            for (name, tier, floor) in [
+                ("text", text(), TEXT_CONTRAST_FLOOR),
+                ("text_secondary", text_secondary(), TEXT_CONTRAST_FLOOR),
+                ("text_tertiary", text_tertiary(), TEXT_QUIET_CONTRAST_FLOOR),
+            ] {
+                let c: Rgba = tier.into();
+                let r = contrast_ratio((c.r, c.g, c.b), g);
+                assert!(
+                    r >= floor,
+                    "{name} is {r:.2}:1 on ground {:.3}, floor {floor}",
+                    g.0
+                );
+            }
+        }
+    }
+
+    /// A disabled control is still a control.
+    ///
+    /// This is the assertion that retired `DISABLED_OPACITY`. It does not
+    /// test a value, it tests the MECHANISM: composited over the darkest
+    /// ground, pure white at that opacity reaches 3.11:1 — so the multiply's
+    /// own ceiling barely touches the quiet floor, and every real token put
+    /// through it lands far below (`text_tertiary` did: 1.54:1). No choice of
+    /// tier could have fixed it.
+    #[test]
+    fn a_container_opacity_cannot_express_disabled() {
+        let ground = grounds()[0];
+        let ceiling = over(hsla(0.0, 0.0, 1.0, DISABLED_OPACITY), ground);
+        let r = contrast_ratio(ceiling, ground);
+        assert!(
+            r < TEXT_CONTRAST_FLOOR,
+            "white at DISABLED_OPACITY reaches {r:.2}:1 — if this ever clears \
+             the normal floor the mechanism is viable again and text_disabled \
+             can go back to being an opacity"
+        );
+
+        // ...and the token that replaced it does clear the quiet floor.
+        let c: Rgba = text_disabled().into();
+        for g in grounds() {
+            let r = contrast_ratio((c.r, c.g, c.b), g);
+            assert!(r >= TEXT_QUIET_CONTRAST_FLOOR, "text_disabled {r:.2}:1");
+        }
+    }
+
+    /// Every rung is a step you can SEE, not merely a step in the right
+    /// direction. `glass_ladder_never_inverts_on_any_backdrop` asserts the
+    /// ordering and no magnitude, so a ladder whose rungs differed by 1/255
+    /// passed it. `raised -> panel` was 3.9/255.
+    #[test]
+    fn every_rung_is_a_step_you_can_see() {
+        for g in grounds() {
+            let raised = over(wash_raised(), g);
+            let panel = over(wash_panel(), g);
+            let modal = over(wash_modal(), g);
+            for (name, lo, hi) in [
+                ("ground->raised", units(g), units(raised)),
+                ("raised->panel", units(raised), units(panel)),
+                ("panel->modal", units(panel), units(modal)),
+            ] {
+                assert!(
+                    hi - lo >= SURFACE_STEP_FLOOR,
+                    "{name} is {:.1}/255 on ground {:.1}, floor {SURFACE_STEP_FLOOR}",
+                    hi - lo,
+                    units(g)
+                );
+            }
+        }
+    }
+
+    /// A sunken plate carries no fill, so its rim must carry it alone.
+    #[test]
+    fn a_sunken_plate_is_read_from_its_rim() {
+        let fill: Rgba = inset().into();
+        assert_eq!(fill.a, 0.0, "inset regained a fill it cannot afford");
+        for g in grounds() {
+            let rim = over(border_inset(), g);
+            assert!(
+                units(rim) - units(g) >= STATE_DELTA_FLOOR,
+                "the inset rim is {:.1}/255 and it is the only thing drawing \
+                 the plate",
+                units(rim) - units(g)
+            );
+        }
+    }
+
+    /// A hovered or selected thing looks hovered or selected. Both were an
+    /// 8.4/255 wash at the bright end of the sweep — the N2 hover machinery
+    /// fading perfectly between two indistinguishable states.
+    #[test]
+    fn a_state_change_is_one_you_can_find() {
+        for g in grounds() {
+            for (name, w) in [
+                ("overlay", overlay()),
+                ("overlay_strong", overlay_strong()),
+                ("border_strong", border_strong()),
+            ] {
+                let d = units(over(w, g)) - units(g);
+                assert!(
+                    d >= STATE_DELTA_FLOOR,
+                    "{name} moves {d:.1}/255 on ground {:.1}, floor {STATE_DELTA_FLOOR}",
+                    units(g)
+                );
+            }
+        }
+    }
+
     /// The glass ground is comet-parity near-black (2026-08-17 ruling):
     /// over a black backdrop it lands at `#080808`, adding almost no
     /// gray of its own, so the desktop's hue carries the surface instead
@@ -909,7 +1169,10 @@ mod tests {
             let v = b as f32 / 255.0;
             let g = over(glass_canvas(), (v, v, v));
             assert!(luma(over(wash_content(), g)) < luma(g), "backdrop {b}");
-            assert!(luma(over(wash_warning_plate(), g)) > luma(g), "backdrop {b}");
+            assert!(
+                luma(over(wash_warning_plate(), g)) > luma(g),
+                "backdrop {b}"
+            );
             assert!(luma(over(wash_danger_plate(), g)) > luma(g), "backdrop {b}");
         }
     }
@@ -938,9 +1201,19 @@ mod tests {
                 );
             }
         }
-        let opaque = (0x1a as f32 / 255.0, 0x1a as f32 / 255.0, 0x1a as f32 / 255.0);
-        close(over(success().opacity(DIFF_WASH_ALPHA), opaque), rgb(0x212c25).into());
-        close(over(danger().opacity(DIFF_WASH_ALPHA), opaque), rgb(0x2e2322).into());
+        let opaque = (
+            0x1a as f32 / 255.0,
+            0x1a as f32 / 255.0,
+            0x1a as f32 / 255.0,
+        );
+        close(
+            over(success().opacity(DIFF_WASH_ALPHA), opaque),
+            rgb(0x212c25).into(),
+        );
+        close(
+            over(danger().opacity(DIFF_WASH_ALPHA), opaque),
+            rgb(0x2e2322).into(),
+        );
     }
 
     /// The reason rungs are washes, not plates: over EVERY backdrop
@@ -953,13 +1226,17 @@ mod tests {
             let v = b as f32 / 255.0;
             let ground = over(glass_canvas(), (v, v, v));
             let g = luma(ground);
-            let inset = luma(over(wash_inset(), ground));
             let raised = luma(over(wash_raised(), ground));
             let panel = luma(over(wash_panel(), ground));
             let modal = luma(over(wash_modal(), ground));
+            // `inset` left this ladder when it stopped being a fill: a plate
+            // that darkens a near-black ground moves 2/255 and reads as
+            // nothing. It is asserted by `a_sunken_plate_is_read_from_its_rim`
+            // instead. Ordering is still the invariant here; magnitude is
+            // `every_rung_is_a_step_you_can_see`.
             assert!(
-                inset < g && g < raised && raised < panel && panel < modal,
-                "backdrop {b}: inset {inset} ground {g} raised {raised} panel {panel} modal {modal}"
+                g < raised && raised < panel && panel < modal,
+                "backdrop {b}: ground {g} raised {raised} panel {panel} modal {modal}"
             );
         }
     }

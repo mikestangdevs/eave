@@ -192,9 +192,13 @@ async fn an_approval_asks_waits_and_then_acts_on_the_answer() {
     assert!(c.send("s1", "write the file").await.expect("send"));
 
     let mut t = Transcript::new();
-    fold_until(&mut rx, &mut t, "the question", Duration::from_secs(15), |t| {
-        approval_row(t).is_some()
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the question",
+        Duration::from_secs(15),
+        |t| approval_row(t).is_some(),
+    )
     .await;
 
     let (rid, status) = approval_row(&t).unwrap();
@@ -225,19 +229,35 @@ async fn an_approval_asks_waits_and_then_acts_on_the_answer() {
         c.decide("s1", &rid, Decision::Allow).await.expect("decide"),
         "an open question must accept its answer"
     );
-    fold_until(&mut rx, &mut t, "the tool to run", Duration::from_secs(15), |t| {
-        matches!(approval_row(t), Some((_, ApprovalStatus::Approved)))
-            && tool_result_text(t).iter().any(|s| s.contains("did the thing"))
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the tool to run",
+        Duration::from_secs(15),
+        |t| {
+            matches!(approval_row(t), Some((_, ApprovalStatus::Approved)))
+                && tool_result_text(t)
+                    .iter()
+                    .any(|s| s.contains("did the thing"))
+        },
+    )
     .await;
 
     // The decision is journaled — the audit trail that makes "eave never
     // auto-approves" checkable rather than merely asserted.
-    let decided = t.rows.iter().any(|r| matches!(r, Row::Approval { status: ApprovalStatus::Approved, .. }));
+    let decided = t.rows.iter().any(|r| {
+        matches!(
+            r,
+            Row::Approval {
+                status: ApprovalStatus::Approved,
+                ..
+            }
+        )
+    });
     assert!(decided);
-    let journal = std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap();
+    let journal = journal_awaiting(&dir, "\"kind\":\"approval_decided\"").await;
     assert!(
-        journal.contains("\"kind\":\"approval_decided\"") && journal.contains("\"allowed\":true"),
+        journal.contains("\"allowed\":true"),
         "the decision must be durable history"
     );
 }
@@ -254,9 +274,13 @@ async fn a_denial_hands_the_operators_words_to_the_agent() {
     assert!(c.send("s1", "write the file").await.expect("send"));
 
     let mut t = Transcript::new();
-    fold_until(&mut rx, &mut t, "the question", Duration::from_secs(15), |t| {
-        approval_row(t).is_some()
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the question",
+        Duration::from_secs(15),
+        |t| approval_row(t).is_some(),
+    )
     .await;
     let (rid, _) = approval_row(&t).unwrap();
     c.decide(
@@ -269,10 +293,16 @@ async fn a_denial_hands_the_operators_words_to_the_agent() {
     .await
     .expect("decide");
 
-    fold_until(&mut rx, &mut t, "the refusal to land", Duration::from_secs(15), |t| {
-        matches!(approval_row(t), Some((_, ApprovalStatus::Denied { .. })))
-            && tool_result_text(t).iter().any(|s| s.contains("stood down"))
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the refusal to land",
+        Duration::from_secs(15),
+        |t| {
+            matches!(approval_row(t), Some((_, ApprovalStatus::Denied { .. })))
+                && tool_result_text(t).iter().any(|s| s.contains("stood down"))
+        },
+    )
     .await;
     match approval_row(&t).unwrap().1 {
         ApprovalStatus::Denied { message } => {
@@ -280,8 +310,45 @@ async fn a_denial_hands_the_operators_words_to_the_agent() {
         }
         other => panic!("expected a denial, got {other:?}"),
     }
-    let journal = std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap();
+    let journal = journal_awaiting(&dir, "commit first, then ask again").await;
     assert!(journal.contains("commit first, then ask again"));
+}
+
+/// Read a session's journal, waiting for `needle` to reach the FILE.
+///
+/// The journal is write-behind: records live in memory and hit the OS on a
+/// ~120 ms coalesce tick (`journal.rs`). The wire tap runs ahead of that, so
+/// a test that saw a fact on the wire and then read the file can read it
+/// before the fact is there — which on a loaded machine is ordinary, not
+/// exotic. This is the same rule §Traps already states for crash-tail
+/// repair; it applies to every file read, not only those after a kill.
+async fn journal_awaiting(dir: &std::path::Path, needle: &str) -> String {
+    let path = dir.join("sessions/s1/journal.jsonl");
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for {needle:?} to reach {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Read a session's journal once the write-behind window has provably
+/// passed, for assertions about what is NOT there.
+///
+/// An absence asserted immediately is the worse bug of the two: it passes
+/// whether or not the record was going to arrive, so the test cannot fail
+/// for the reason it exists. Waiting past the coalesce tick is what gives
+/// the negative any force.
+async fn journal_settled(dir: &std::path::Path) -> String {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap_or_default()
 }
 
 /// THE Slice K clock test (directive: "the riskiest hour"). A session held
@@ -306,7 +373,9 @@ async fn a_session_parked_on_a_question_is_never_reported_quiet_or_unresponsive(
             Ok(Some(SubscriptionItem::Attention { attention, .. })) => {
                 seen.push(attention.state_name().to_string());
                 match attention {
-                    AttentionSnapshot::AwaitingApproval { pending, ref tool, .. } => {
+                    AttentionSnapshot::AwaitingApproval {
+                        pending, ref tool, ..
+                    } => {
                         assert_eq!(pending, 1);
                         assert_eq!(tool, "Write");
                         saw_awaiting = true;
@@ -326,7 +395,10 @@ async fn a_session_parked_on_a_question_is_never_reported_quiet_or_unresponsive(
             Err(_) => {}
         }
     }
-    assert!(saw_awaiting, "attention never said it was waiting on me; saw {seen:?}");
+    assert!(
+        saw_awaiting,
+        "attention never said it was waiting on me; saw {seen:?}"
+    );
 
     // And the rail sees it without subscribing: state + count only.
     let infos = c.list().await.expect("list");
@@ -349,26 +421,37 @@ async fn a_question_left_open_settles_when_the_process_goes() {
     assert!(c.send("s1", "write the file").await.expect("send"));
 
     let mut t = Transcript::new();
-    fold_until(&mut rx, &mut t, "the question", Duration::from_secs(15), |t| {
-        approval_row(t).is_some()
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the question",
+        Duration::from_secs(15),
+        |t| approval_row(t).is_some(),
+    )
     .await;
     let (rid, _) = approval_row(&t).unwrap();
 
     c.kill("s1").await.expect("kill");
-    fold_until(&mut rx, &mut t, "the question to settle", Duration::from_secs(15), |t| {
-        matches!(approval_row(t), Some((_, ApprovalStatus::Withdrawn { .. })))
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the question to settle",
+        Duration::from_secs(15),
+        |t| matches!(approval_row(t), Some((_, ApprovalStatus::Withdrawn { .. }))),
+    )
     .await;
 
     // The late click: a stated fact, never an error and never journaled
     // as if it had landed.
     let err = c.decide("s1", &rid, Decision::Allow).await;
+    // Both arms are the point: either outcome is a stated fact, and an
+    // `if let` would hide that the Err branch is equally correct.
+    #[allow(clippy::single_match)]
     match err {
         Ok(answered) => assert!(!answered, "a dead session cannot have been answered"),
         Err(_) => {} // "session is not live" — equally stated
     }
-    let journal = std::fs::read_to_string(dir.join("sessions/s1/journal.jsonl")).unwrap();
+    let journal = journal_settled(&dir).await;
     assert!(
         !journal.contains("approval_decided"),
         "no decision ever reached the agent, so none may be recorded"
@@ -381,11 +464,8 @@ async fn a_question_left_open_settles_when_the_process_goes() {
 async fn a_posture_that_never_asks_refuses_to_run() {
     for mode in ["acceptEdits", "bypassPermissions", "none"] {
         let dir = scratch();
-        let _engine = EngineProc::spawn_with(
-            &dir,
-            "hang-silent",
-            &[("EAVE_FAKE_PERMISSION_MODE", mode)],
-        );
+        let _engine =
+            EngineProc::spawn_with(&dir, "hang-silent", &[("EAVE_FAKE_PERMISSION_MODE", mode)]);
         let c = Client::connect(&dir).await.expect("connect");
         c.open(Some("s1".into()), None).await.expect("open");
         let mut rx = c.subscribe("s1", None).await.expect("subscribe");
@@ -406,13 +486,18 @@ async fn a_posture_that_never_asks_refuses_to_run() {
         .await;
         // Refused loudly AND stopped: never left alive in a posture
         // nobody reviewed.
-        fold_until(&mut rx, &mut t, "the session to end", Duration::from_secs(20), |t| {
-            t.closed.is_some()
-        })
+        fold_until(
+            &mut rx,
+            &mut t,
+            "the session to end",
+            Duration::from_secs(20),
+            |t| t.closed.is_some(),
+        )
         .await;
         let said = tool_result_text(&t);
         assert!(
-            said.iter().any(|s| s.contains(mode) || s.contains("unstated")),
+            said.iter()
+                .any(|s| s.contains(mode) || s.contains("unstated")),
             "the refusal must name the posture it refused; said {said:?}"
         );
     }
@@ -430,11 +515,17 @@ async fn a_cli_that_rejects_the_permission_flag_states_why() {
     let _ = c.send("s1", "go").await;
 
     let mut t = Transcript::new();
-    fold_until(&mut rx, &mut t, "the stated refusal", Duration::from_secs(20), |t| {
-        tool_result_text(t)
-            .iter()
-            .any(|s| s.contains("rejected --permission-prompt-tool"))
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the stated refusal",
+        Duration::from_secs(20),
+        |t| {
+            tool_result_text(t)
+                .iter()
+                .any(|s| s.contains("rejected --permission-prompt-tool"))
+        },
+    )
     .await;
     assert!(tool_result_text(&t)
         .iter()
@@ -506,7 +597,9 @@ async fn the_watch_channel_never_carries_a_tool_name_or_a_path() {
         .await
         .unwrap();
     lines.next_line().await.unwrap().expect("hello reply");
-    w.write_all(b"{\"id\":2,\"method\":\"watch\"}\n").await.unwrap();
+    w.write_all(b"{\"id\":2,\"method\":\"watch\"}\n")
+        .await
+        .unwrap();
 
     let c = Client::connect(&dir).await.expect("connect");
     c.open(Some("s1".into()), None).await.expect("open");
@@ -517,9 +610,13 @@ async fn the_watch_channel_never_carries_a_tool_name_or_a_path() {
     // session's OWN stream, so their absence on watch is isolation and
     // not vacuity.
     let mut t = Transcript::new();
-    fold_until(&mut rx, &mut t, "the question", Duration::from_secs(15), |t| {
-        matches!(approval_row(t), Some((_, ApprovalStatus::Pending)))
-    })
+    fold_until(
+        &mut rx,
+        &mut t,
+        "the question",
+        Duration::from_secs(15),
+        |t| matches!(approval_row(t), Some((_, ApprovalStatus::Pending))),
+    )
     .await;
     match t.rows.iter().find(|r| matches!(r, Row::Approval { .. })) {
         Some(Row::Approval { tool, path, .. }) => {

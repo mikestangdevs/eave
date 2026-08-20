@@ -19,17 +19,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use gpui::Animation;
+use gpui::AnimationExt as _;
 use gpui::{
     actions, div, list, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent, Context,
     Corners, Element, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
     MouseDownEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString,
-    StrikethroughStyle, StyledText,
-    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowHandle, WindowOptions,
+    StrikethroughStyle, StyledText, TextRun, TitlebarOptions, UnderlineStyle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
 };
-use gpui::Animation;
-use gpui::AnimationExt as _;
 use gpui_platform::application;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -37,17 +36,18 @@ use eave_core::session::AgentConfig;
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
 use eave_wire::{
-    AttentionSnapshot, ChangedFile, Cursor, DiffHunk, DiffKind, DiffLine, DiffOp, FileDiff,
-    FileStatus, FilesSnapshot, GitState, SessionInfo, SubscriptionItem, WaitReason,
+    AttentionSnapshot, ChangedFile, Cursor, DiffBasis, DiffHunk, DiffKind, DiffLine, DiffOp,
+    FileDiff, FileScope, FileStatus, FilesSnapshot, GitState, SessionInfo, SubscriptionItem,
+    WaitReason,
 };
 
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
 use crate::icons;
+use crate::launcher::{self, PROVIDERS};
 use crate::loaders;
 use crate::markdown::{inline_runs, Block, InlineRun};
 use crate::motion::{self, HoverFade as _};
-use crate::launcher::{self, PROVIDERS};
 use crate::overlay::{self, MenuItem, Popup};
 use crate::theme;
 
@@ -65,12 +65,20 @@ const APPROVAL_INPUT_CAP: usize = 1200;
 #[derive(Debug, Clone)]
 enum ConnEvent {
     Connecting,
-    Connected { engine_pid: i32 },
-    Reconnecting { attempt: u32 },
+    Connected {
+        engine_pid: i32,
+    },
+    Reconnecting {
+        attempt: u32,
+    },
     /// Contended start: another engine holds the data dir (spec 02
     /// §Contended start). `None` = "holder unknown" — still actionable.
-    Busy { holder_pid: Option<i32> },
-    Failed { message: String },
+    Busy {
+        holder_pid: Option<i32>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// Feed frames are tagged with the session they belong to: a selection
@@ -79,7 +87,9 @@ enum ConnEvent {
 /// current session (no event bleed between sessions).
 #[derive(Debug)]
 enum FeedEvent {
-    Session { id: String },
+    Session {
+        id: String,
+    },
     /// Nothing is selected and nothing will be opened for you — the
     /// launcher's state (Slice Q2). Distinct from "the selected session's
     /// journal is empty": this says there is no session at all.
@@ -87,7 +97,9 @@ enum FeedEvent {
     /// `error` carries the engine's own words when a launch was refused —
     /// the posture gate's message, verbatim. Silence there would be the
     /// worst of both: a button that does nothing and says nothing.
-    NoSession { error: Option<String> },
+    NoSession {
+        error: Option<String>,
+    },
     Reset {
         id: String,
     },
@@ -161,6 +173,12 @@ enum Command {
         /// passing an empty one (`AgentConfig::model`).
         model: Option<String>,
     },
+    /// Files-rail basis toggle (Slice AA): re-open the `files`
+    /// subscription against the other basis. It is a resubscribe, not a
+    /// filter — the engine only computes the turn-scoped list while
+    /// somebody is subscribed to it, so "which one is on screen" and
+    /// "which one is being computed" are deliberately the same fact.
+    FilesScope(FileScope),
     /// Files-rail row click (B2): fetch one file's diff. Unary and
     /// re-issued on every fresh snapshot while the row stays expanded —
     /// the files channel is the invalidation signal.
@@ -173,7 +191,10 @@ enum Command {
     /// the engine refuses with fresh counts if anything would be lost,
     /// which arms the affordance; the second click sends `force: true`
     /// (decision 2's two-step).
-    RemoveWorktree { id: String, force: bool },
+    RemoveWorktree {
+        id: String,
+        force: bool,
+    },
     /// Answer one open permission question (Slice K). `message` is the
     /// operator's own words on a deny — the provider hands them to the
     /// model verbatim, so "denied, commit first" is a different
@@ -261,7 +282,9 @@ async fn feed_loop(
     // inside its 250 ms backoff and quietly change what agent sessions
     // spawn. With the gate set, the human relaunching their engine
     // always wins.
-    let no_spawn = std::env::var("EAVE_NO_SPAWN").map(|v| v == "1").unwrap_or(false);
+    let no_spawn = std::env::var("EAVE_NO_SPAWN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let mut attempt: u32 = 0;
     let mut cursor: Option<Cursor> = None;
     let mut selected: Option<String> = None;
@@ -271,6 +294,10 @@ async fn feed_loop(
     // new session and being handed the old one is the bug this flag
     // exists to prevent, not a corner case.
     let mut at_launcher = false;
+    // Slice AA: the basis the files rail is asking for. Loop-level, above
+    // both labels, because it is an operator preference — it must survive
+    // a session switch and a reconnect, not be reset by them.
+    let mut files_scope = FileScope::WorkingTree;
     'conn: loop {
         plumbing.push_conn(if attempt == 0 {
             ConnEvent::Connecting
@@ -318,7 +345,11 @@ async fn feed_loop(
         'session: loop {
             // Validate the held selection against the engine's set; a
             // vanished session (fresh data dir, changed disk) degrades to
-            // the most recent session.
+            // the most recently ACTIVE session (Stage AB — it used to be
+            // the most recently created, which after a restart is rarely
+            // the one you were working in). Sessions that never ran fall
+            // back to creation order, so the old behaviour is the floor
+            // rather than a special case.
             let sessions = match client.list().await {
                 Ok(s) => s,
                 Err(_) => continue 'conn,
@@ -337,7 +368,7 @@ async fn feed_loop(
                     .or_else(|| {
                         sessions
                             .iter()
-                            .max_by_key(|s| s.created_ts_ms)
+                            .max_by_key(|s| activity_key(s))
                             .map(|s| s.session_id.clone())
                     })
             };
@@ -392,6 +423,12 @@ async fn feed_loop(
                             }
                             // Already here.
                             Some(Command::NewSession) => {}
+                            // No subscription to re-open here, but the
+                            // preference must still be the one the next
+                            // session subscribes with — dropping it would
+                            // make the rail's label and the engine's
+                            // basis disagree the moment a session opens.
+                            Some(Command::FilesScope(scope)) => files_scope = scope,
                             Some(Command::Isolate(id)) => {
                                 let _ = client.isolate(&id).await;
                             }
@@ -428,10 +465,11 @@ async fn feed_loop(
             // The selected session's changed-file overview rides its own
             // per-session subscription (spec 05 §Files); a switch drops
             // it with the loop. `None` after open = transport gone.
-            let (files_id, mut files_rx) = match client.files_with_id(&session_id).await {
-                Ok((id, rx)) => (id, Some(rx)),
-                Err(_) => continue 'conn,
-            };
+            let (mut files_id, mut files_rx) =
+                match client.files_with_id_scoped(&session_id, files_scope).await {
+                    Ok((id, rx)) => (id, Some(rx)),
+                    Err(_) => continue 'conn,
+                };
             // Why the loop breaks with a reason instead of continuing its
             // labels directly: a switch must first unsubscribe the old
             // streams (Slice I1) — without that the engine keeps streaming
@@ -560,6 +598,28 @@ async fn feed_loop(
                                 let _ = client.decide(&sid, &request_id, decision).await;
                             });
                         }
+                        Some(Command::FilesScope(scope)) => {
+                            // Handled in place rather than through
+                            // StreamEnd::Switch: a basis toggle has
+                            // nothing to do with the transcript, and
+                            // tearing that subscription down would make
+                            // the whole conversation re-replay to answer
+                            // a question about files.
+                            if scope != files_scope {
+                                files_scope = scope;
+                                let _ = client.unsubscribe(files_id).await;
+                                match client
+                                    .files_with_id_scoped(&session_id, files_scope)
+                                    .await
+                                {
+                                    Ok((id, rx)) => {
+                                        files_id = id;
+                                        files_rx = Some(rx);
+                                    }
+                                    Err(_) => break StreamEnd::Conn,
+                                }
+                            }
+                        }
                         Some(Command::Resubscribe) => {
                             cursor = None;
                             break StreamEnd::Switch;
@@ -623,16 +683,23 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         }
     };
     plumbing.push_conn(ConnEvent::Connected { engine_pid: 0 });
-    let sid = format!("replay:{}", path.file_name().unwrap_or_default().to_string_lossy());
+    let sid = format!(
+        "replay:{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
     plumbing.push_feed(FeedEvent::Session { id: sid.clone() });
     // A synthetic rail snapshot so harness runs (replay assert, captures)
     // exercise the real constrained-width layout with the rail present.
     plumbing.push_rail(vec![SessionInfo {
         session_id: sid.clone(),
+        // Unnamed on purpose: the replay rig should measure the row shape
+        // an ordinary session actually has, which is the fallback label.
+        title: None,
         provider: "replay".into(),
         model: None,
         cwd: path.display().to_string(),
         created_ts_ms: 0,
+        last_activity_ms: None,
         state: "running".into(),
         live: true,
         epoch: 0,
@@ -753,6 +820,7 @@ fn synthetic_files_snapshot() -> FilesSnapshot {
         // The harness plays a live-looking rail; the mode line should
         // state the live mode too.
         watching: true,
+        basis: DiffBasis::WorkingTree,
     }
 }
 
@@ -763,7 +831,11 @@ fn synthetic_files_snapshot() -> FilesSnapshot {
 fn synthetic_long_diff() -> FileDiff {
     let hunks = (0..40)
         .map(|h| DiffHunk {
-            header: format!("@@ -{},50 +{},50 @@ fn section_{h}()", h * 60 + 1, h * 60 + 1),
+            header: format!(
+                "@@ -{},50 +{},50 @@ fn section_{h}()",
+                h * 60 + 1,
+                h * 60 + 1
+            ),
             lines: (0..50)
                 .map(|i| DiffLine {
                     op: match i % 5 {
@@ -801,6 +873,9 @@ struct ConnectionState {
 /// here — it is `TranscriptState::session_id`, i.e. whatever the feed
 /// task actually subscribed; the rail highlights that fact.
 struct SessionsState {
+    /// The rail's rows, **in the order they are drawn** (Stage AB). Facts
+    /// still fold by replacement from every watch snapshot; only the order
+    /// is the app's own — see [`fold_rail`].
     sessions: Vec<SessionInfo>,
     collapsed: bool,
     attention: Option<(String, AttentionSnapshot)>,
@@ -824,6 +899,13 @@ impl SessionsState {
 struct FilesState {
     snapshot: Option<FilesEvent>,
     collapsed: bool,
+    /// Which basis the rail is asking for (Slice AA). This is the
+    /// REQUEST, not the answer — what actually arrived is stated by the
+    /// snapshot's own `basis`, and the two disagree for the moment
+    /// between a toggle and its first frame. The toggle clears
+    /// `snapshot`, so that moment renders as the skeleton rather than as
+    /// the other basis's list wearing this basis's label.
+    scope: FileScope,
     /// The one expanded diff (B2), session-tagged like everything else
     /// in this rail: a switch clears it, a snapshot that no longer lists
     /// its file closes it, and a fresh snapshot re-requests it (the
@@ -892,7 +974,7 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
         div()
             .text_size(px(theme::DETAIL_SIZE))
             .line_height(px(theme::DETAIL_LINE))
-            .text_color(theme::text_ghost())
+            .text_color(theme::text_tertiary())
             .child(SharedString::from(text))
             .into_any_element()
     };
@@ -904,13 +986,11 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
         // Slice N3: the diff is on its way. Skeleton lines in the pane's
         // own line rhythm, so the arriving hunks land where the skeleton
         // already was.
-        DiffFetch::Loading => {
-            children.push(
-                loaders::skeleton(theme::SKELETON_ROWS, phase)
-                    .debug_selector(|| "diff-skeleton".into())
-                    .into_any_element(),
-            )
-        }
+        DiffFetch::Loading => children.push(
+            loaders::skeleton(theme::SKELETON_ROWS, phase)
+                .debug_selector(|| "diff-skeleton".into())
+                .into_any_element(),
+        ),
         DiffFetch::Failed(message) => children.push(fact(format!("diff unavailable: {message}"))),
         DiffFetch::Ready(diff) => match &diff.kind {
             DiffKind::Binary => children.push(fact("binary file — no text diff".into())),
@@ -944,7 +1024,7 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .truncate()
                             .child(SharedString::from(hunk.header.clone()))
                             .into_any_element(),
@@ -968,7 +1048,7 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                                 DiffOp::Del => styled
                                     .bg(theme::diff_del_bg())
                                     .text_color(theme::text_secondary()),
-                                DiffOp::Ctx => styled.text_color(theme::text_ghost()),
+                                DiffOp::Ctx => styled.text_color(theme::text_tertiary()),
                             }
                             .into_any_element(),
                         );
@@ -1066,7 +1146,7 @@ fn state_color(state: &str) -> Hsla {
         // but not a fault, so warning and never danger.
         "quiet" | "awaiting_approval" => theme::warning(),
         "unresponsive" | "failed" => theme::danger(),
-        _ => theme::text_ghost(),
+        _ => theme::text_tertiary(),
     }
 }
 
@@ -1141,7 +1221,10 @@ const AGENT_MEMORY_WARN_FRACTION: f64 = 0.5;
 /// only, so tool children are uncounted, and resident sizes double-count
 /// shared pages, so the sum is an upper bound. Provider rate contention —
 /// the other thing that bites at high N — is not measurable here at all.
-fn resource_line(sessions: &[eave_wire::SessionInfo], physical: Option<u64>) -> Option<(String, bool)> {
+fn resource_line(
+    sessions: &[eave_wire::SessionInfo],
+    physical: Option<u64>,
+) -> Option<(String, bool)> {
     let reporting: Vec<u64> = sessions
         .iter()
         .filter(|s| s.live)
@@ -1207,12 +1290,130 @@ fn worktree_line(w: &eave_wire::WorktreeInfo) -> String {
     }
 }
 
+/// Where a row sorts: when this session's state last moved, or when it was
+/// created if it never has (Stage AB).
+fn activity_key(s: &SessionInfo) -> u64 {
+    s.last_activity_ms.unwrap_or(s.created_ts_ms)
+}
+
+/// Fold a watch snapshot into the rail's rows, keeping the ORDER of rows
+/// that were already there (Stage AB).
+///
+/// Facts still fold by replacement — every surviving row takes the
+/// snapshot's `SessionInfo` wholesale, so nothing is merged and nothing
+/// goes stale. What is preserved is position, which is not an engine fact
+/// at all: `watch` sends a set, and where a row sits in that set is the
+/// app's decision.
+///
+/// **Activity decides position exactly once, when a row arrives.** After
+/// that the row stays put for as long as the session exists. Re-sorting
+/// live is the bug comet shipped: it ordered the rail by attention, so
+/// merely opening a session changed that session's state, which re-sorted
+/// the rail, which slid the row out from under the pointer that had just
+/// clicked it. A list you cannot click is worse than a list in a stale
+/// order — and the order is not even stale, because the thing an operator
+/// tracks a session by is where they last saw it.
+fn fold_rail(rows: &mut Vec<SessionInfo>, snapshot: Vec<SessionInfo>) {
+    let mut incoming: std::collections::HashMap<String, SessionInfo> = snapshot
+        .into_iter()
+        .map(|s| (s.session_id.clone(), s))
+        .collect();
+    // Surviving rows, in the order they already had, refreshed. A row
+    // whose session is gone from the snapshot is simply dropped.
+    let kept: Vec<SessionInfo> = rows
+        .drain(..)
+        .filter_map(|old| incoming.remove(&old.session_id))
+        .collect();
+    // Everything still in `incoming` has no row yet.
+    let mut arrivals: Vec<SessionInfo> = incoming.into_values().collect();
+    arrivals.sort_by(|a, b| {
+        activity_key(b)
+            .cmp(&activity_key(a))
+            // Two sessions opened in the same millisecond must still land
+            // in a defined order, or the rail flickers between snapshots.
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    arrivals.extend(kept);
+    *rows = arrivals;
+}
+
+/// The row's primary label: the operator's title when there is one, the
+/// provider label otherwise (Stage AB).
+///
+/// A fallback rather than a second line, because a session nobody has named
+/// must render no title at all — an empty line with a title's weight is a
+/// blank the operator reads as a bug. The provider identity is not lost
+/// when a title takes the slot: the chip beside it is drawn from the same
+/// `provider_identity` call.
+fn row_label(info: &SessionInfo, provider_label: &str) -> String {
+    info.title
+        .clone()
+        .unwrap_or_else(|| provider_label.to_string())
+}
+
+/// The rail's meta line: which session, and where it works (Stage AB).
+///
+/// The 8-char id is here because it is the ONLY thing that tells two
+/// untitled sessions in one repo apart without an operator naming them —
+/// and because it is pure identity, the one class of fact `watch` has
+/// always been allowed to carry. It is dropped when the cwd already ends
+/// in it, which is every isolated session (`isolate` puts the sid8 at the
+/// end of the worktree path), where repeating it would say the same thing
+/// twice on one line.
+fn rail_meta_line(info: &SessionInfo, home: Option<&str>) -> String {
+    let cwd = short_cwd(&info.cwd, home);
+    let sid8: String = info.session_id.chars().take(8).collect();
+    if sid8.is_empty() || cwd.ends_with(&sid8) {
+        return cwd;
+    }
+    format!("{sid8} · {cwd}")
+}
+
 /// Home-relative cwd for the rail's meta line.
 fn short_cwd(cwd: &str, home: Option<&str>) -> String {
     match home {
         Some(h) if !h.is_empty() && cwd.starts_with(h) => format!("~{}", &cwd[h.len()..]),
         _ => cwd.to_string(),
     }
+}
+
+/// Bound one block of tool payload for display, stating the remainder.
+///
+/// Same rule as [`fence_view`] and the diff pane: a row inside a
+/// virtualized list may not have a height the agent chooses.
+fn tool_body_view(text: &str, max: usize) -> String {
+    let total = text.lines().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let mut out = text.lines().take(max).collect::<Vec<_>>().join("\n");
+    out.push_str(&format!("\n… {} more lines", total - max));
+    out
+}
+
+/// What a fence DRAWS, which is not always what it holds.
+///
+/// A fence is one row in a virtualized list, so its height is a promise the
+/// list makes. An agent that emits a 4,000-line file would otherwise make
+/// one row 80,000 px tall. Past [`theme::FENCE_MAX_LINES`] the view stops
+/// and states the remainder — and states that copy is unaffected, because
+/// the honest failure mode of a cap is someone believing it truncated their
+/// data.
+fn fence_view(code: &str) -> String {
+    let total = code.lines().count();
+    if total <= theme::FENCE_MAX_LINES {
+        return code.to_string();
+    }
+    let mut out = code
+        .lines()
+        .take(theme::FENCE_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push_str(&format!(
+        "\n… {} more lines — copy takes all {total}",
+        total - theme::FENCE_MAX_LINES
+    ));
+    out
 }
 
 /// Open a path with the system handler (macOS `open`). Both call sites —
@@ -1234,7 +1435,7 @@ fn open_in_system(path: &std::path::Path) {
 thread_local! {
     /// Every path the UI asked the system to open, in order (test-only).
     static OPENED: std::cell::RefCell<Vec<PathBuf>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn fmt_elapsed(ms: u64) -> String {
@@ -1256,7 +1457,9 @@ enum ScrollMode {
     Follow,
     /// Pin the given transcript row's first display row to the viewport
     /// top, re-asserted on every update.
-    Pinned { msg: u32 },
+    Pinned {
+        msg: u32,
+    },
     /// Waiting for our just-sent message's row to appear in the feed.
     PinOnNextUserRow,
     Free,
@@ -1309,6 +1512,19 @@ struct TranscriptState {
     /// The composer, read at deny time for the operator's reason and
     /// cleared once it has been spent (see [`Shell::deny_reason`]).
     composer: Option<Entity<ComposerState>>,
+    /// A weak handle back to the shell, for the same reason `composer` is
+    /// here (Slice K): the rows are built by STATIC fns with no `Context`,
+    /// and the fence copy button has to state that it copied. Weak so the
+    /// shell owning this state does not own a cycle back to itself.
+    shell: Option<gpui::WeakEntity<Shell>>,
+    /// Tool rows the reader has opened, by tool id.
+    ///
+    /// Deliberately NOT cleared by `reset()`: a resubscribe replays the
+    /// same conversation, and a reader who opened a card to study it
+    /// should not have it shut by the engine reconnecting. It IS dropped
+    /// on a real session switch, with everything else that belongs to the
+    /// session that left.
+    open_tools: std::collections::HashSet<String>,
     /// Slice N3 — the live-turn clock behind the working trailer.
     ///
     /// A signed BALANCE, never a bool. The recorder's two input channels
@@ -1346,6 +1562,8 @@ impl TranscriptState {
             assert_replay: None,
             commands: None,
             composer: None,
+            shell: None,
+            open_tools: std::collections::HashSet::new(),
             turn_balance: 0,
             turn_started_ms: None,
         }
@@ -1361,16 +1579,25 @@ impl TranscriptState {
     }
 
     fn live_len(&self) -> Option<(u32, usize)> {
-        self.transcript.rows.iter().enumerate().rev().find_map(|(ix, r)| match r {
-            Row::Assistant { text, live: true } => Some((ix as u32, text.len())),
-            _ => None,
-        })
+        self.transcript
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, r)| match r {
+                Row::Assistant { text, live: true } => Some((ix as u32, text.len())),
+                _ => None,
+            })
     }
 
     /// Fold one record batch and mirror the change into the `ListState`
     /// with minimal ops (splice for structure, remeasure for in-place
     /// growth/settle — spec 03 §Rendering).
-    fn apply_records(&mut self, epoch: u64, records: &[eave_core::journal::Record]) -> Result<(), ()> {
+    fn apply_records(
+        &mut self,
+        epoch: u64,
+        records: &[eave_core::journal::Record],
+    ) -> Result<(), ()> {
         let before_live = self.live_len();
         let user_rows_before = self.transcript.rows.len();
         if self.transcript.apply(epoch, records).is_err() {
@@ -1429,10 +1656,8 @@ impl TranscriptState {
                         self.ema_ms = 0.8 * self.ema_ms + 0.2 * dt;
                     }
                     self.last_growth = Some(now);
-                    let duration =
-                        Duration::from_millis(self.ema_ms.clamp(120.0, 400.0) as u64);
-                    let generation =
-                        self.veil.as_ref().map(|v| v.generation + 1).unwrap_or(1);
+                    let duration = Duration::from_millis(self.ema_ms.clamp(120.0, 400.0) as u64);
+                    let generation = self.veil.as_ref().map(|v| v.generation + 1).unwrap_or(1);
                     self.veil = Some(Veil {
                         msg,
                         from_byte: old_len,
@@ -1509,6 +1734,28 @@ impl TranscriptState {
     /// Re-assert the scroll intent after content changed (spec 03: the
     /// pin is "re-asserted each layout"; follow-tail is the list's own
     /// mode).
+    /// Re-measure the display row carrying `tool_id`.
+    ///
+    /// Opening a card changes its HEIGHT, and `ListState` caches heights.
+    /// The display fold's own remeasure path cannot help here: it keys off
+    /// the row's content fingerprint, and open-ness is view state that
+    /// deliberately does not live on the `Row` — a fold over journal
+    /// records has no business knowing what the reader has expanded. So
+    /// the toggle re-measures the one row it changed, which is the same
+    /// remeasure-never-splice rule the fold follows (`display::diff`),
+    /// applied from the other side.
+    fn remeasure_tool(&mut self, tool_id: &str) {
+        let msg = self
+            .transcript
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Tool { id, .. } if id == tool_id));
+        let Some(msg) = msg else { return };
+        if let Some(ix) = self.display.first_row_of_msg(msg as u32) {
+            self.list.remeasure_items(ix..ix + 1);
+        }
+    }
+
     fn assert_scroll(&mut self) {
         match self.scroll {
             ScrollMode::Follow => {
@@ -1618,7 +1865,11 @@ impl VeiledBlock {
             if run.style.code {
                 font.family = theme::MONO.into();
             }
-            let color = if run.style.code { self.code_color } else { self.color };
+            let color = if run.style.code {
+                self.code_color
+            } else {
+                self.color
+            };
             let underline = run.style.link.then(|| UnderlineStyle {
                 thickness: px(theme::HAIRLINE),
                 color: None,
@@ -1631,7 +1882,7 @@ impl VeiledBlock {
                 font: font.clone(),
                 color: color.opacity(alpha * color.a),
                 background_color: None,
-                underline: underline.clone(),
+                underline,
                 strikethrough: None::<StrikethroughStyle>,
             };
             if seen + chars <= self.settled_chars {
@@ -1917,6 +2168,18 @@ impl Shell {
             Ok(()) => format!("logged {}", &stamp[11..]),
             Err(e) => format!("log failed: {e}"),
         };
+        self.transient_note(note, cx);
+    }
+
+    /// State one fact in the footer for [`FRICTION_NOTE_TTL`], then take it
+    /// back.
+    ///
+    /// Extracted from `friction_log`, which was its only writer until the
+    /// fence copy button needed the same shape. The generation counter is
+    /// the load-bearing part: two notes in quick succession each arm their
+    /// own timer, and without it the FIRST timer would clear the SECOND
+    /// note early — the note would vanish while it was still true.
+    fn transient_note(&mut self, note: String, cx: &mut Context<Self>) {
         self.friction_gen += 1;
         let gen = self.friction_gen;
         self.friction = Some((gen, note));
@@ -2045,7 +2308,8 @@ impl Shell {
         // that blinked through them would be flashing at someone who is
         // actively using the composer.
         let struck = cx.background_executor().now();
-        self.composer.update(cx, |c, _| c.caret_anchor = Some(struck));
+        self.composer
+            .update(cx, |c, _| c.caret_anchor = Some(struck));
         match ks.key.as_str() {
             "enter" => self.send_current(cx),
             "backspace" => {
@@ -2125,7 +2389,7 @@ impl Shell {
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         // User scroll breaks follow/pin; wheel back to the end restores
         // follow (spec 03 §Scroll). Work is deferred out of the scroll
-    	// handler (known ListState borrow papercut, spec 03 §No-fork
+        // handler (known ListState borrow papercut, spec 03 §No-fork
         // consequences).
         let up = ev.delta.pixel_delta(window.line_height()).y > px(0.);
         if std::env::var("EAVE_DEBUG_SCROLL").is_ok() {
@@ -2147,9 +2411,7 @@ impl Shell {
                     t.assert_scroll();
                     cx.notify();
                 }
-            } else if t.scroll == ScrollMode::Free
-                && t.list.is_scrolled_to_end().unwrap_or(false)
-            {
+            } else if t.scroll == ScrollMode::Free && t.list.is_scrolled_to_end().unwrap_or(false) {
                 t.scroll = ScrollMode::Follow;
                 t.assert_scroll();
                 cx.notify();
@@ -2234,7 +2496,7 @@ impl Shell {
                 div()
                     .ml_2()
                     .text_size(px(theme::SMALL_SIZE))
-                    .text_color(theme::text_ghost())
+                    .text_color(theme::text_tertiary())
                     .child(s)
             }))
             .child(div().flex_1())
@@ -2272,8 +2534,9 @@ impl Shell {
     /// subscription (`TranscriptState::session_id`); clicking only
     /// *requests* a switch.
     fn rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
-        let mut sessions = self.sessions.read(cx).sessions.clone();
-        sessions.sort_by(|a, b| b.created_ts_ms.cmp(&a.created_ts_ms));
+        // Already in draw order: `fold_rail` decided it when each row
+        // arrived, and deliberately does not re-decide it here (Stage AB).
+        let sessions = self.sessions.read(cx).sessions.clone();
         let selected = self.transcript.read(cx).session_id.clone();
         let wt_notes = self.sessions.read(cx).wt_notes.clone();
         let home = std::env::var("HOME").ok();
@@ -2285,7 +2548,8 @@ impl Shell {
             .into_iter()
             .map(|info| {
                 let is_sel = selected.as_deref() == Some(info.session_id.as_str());
-                let (glyph, label) = provider_identity(&info.provider);
+                let (glyph, provider_label) = provider_identity(&info.provider);
+                let label = row_label(&info, &provider_label);
                 let dot = state_color(&info.state);
                 // Slice K: the badge counts the open questions when there
                 // is more than one — "waiting on you (3)" is a different
@@ -2347,7 +2611,7 @@ impl Shell {
                 div()
                     .id(SharedString::from(format!("rail-{}", info.session_id)))
                     .debug_selector(|| format!("rail-{}", info.session_id))
-                    .px(px(theme::SPACE_2))
+                    .px(px(theme::RAIL_CARD_BLEED))
                     .py(px(theme::SPACE_2))
                     .rounded(px(theme::RADIUS_BUTTON))
                     // A newly-arrived row fades in (§1.4). Opacity only, and
@@ -2409,7 +2673,14 @@ impl Shell {
                                     .child(SharedString::from(glyph)),
                             )
                             .child(
+                                // Stage AB: `min_w(0)` is what makes
+                                // `truncate` bite inside a flex row — a
+                                // flex item's default minimum is its
+                                // content, so without it a long title
+                                // grows the row and pushes the badge off
+                                // the end instead of clipping itself.
                                 div()
+                                    .debug_selector(|| format!("label-{}", info.session_id))
                                     .flex_1()
                                     .min_w(px(0.))
                                     .truncate()
@@ -2441,8 +2712,8 @@ impl Shell {
                             .truncate()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_ghost())
-                            .child(SharedString::from(short_cwd(&info.cwd, home.as_deref()))),
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(rail_meta_line(&info, home.as_deref()))),
                     )
                     // Slice K amendment 3: the posture the CLI reported at
                     // init, stated as a rail fact. Full width and wrapping
@@ -2460,7 +2731,7 @@ impl Shell {
                                 theme::WEIGHT_STRONG
                             })
                             .text_color(if posture_asks {
-                                theme::text_ghost()
+                                theme::text_tertiary()
                             } else {
                                 theme::danger()
                             })
@@ -2479,7 +2750,7 @@ impl Shell {
                             .pl(px(meta_indent))
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .child(SharedString::from(line))
                     }))
                     // Slice I2: worktree fact line, also full width.
@@ -2491,7 +2762,7 @@ impl Shell {
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
                             .text_color(if wt_present {
-                                theme::text_ghost()
+                                theme::text_tertiary()
                             } else {
                                 theme::warning()
                             })
@@ -2635,13 +2906,16 @@ impl Shell {
         // pixels above it, and restating a visible button is noise.
         let rows: Vec<AnyElement> = if rows.is_empty() {
             vec![div()
-                .debug_selector(|| "rail-empty".into())
-                .px(px(theme::SPACE_2))
+                .px(px(theme::RAIL_GUTTER))
                 .py(px(theme::SPACE_1))
-                .text_size(px(theme::SMALL_SIZE))
-                .line_height(px(theme::SMALL_LINE))
-                .text_color(theme::text_ghost())
-                .child("no sessions")
+                .child(
+                    div()
+                        .debug_selector(|| "rail-empty".into())
+                        .text_size(px(theme::SMALL_SIZE))
+                        .line_height(px(theme::SMALL_LINE))
+                        .text_color(theme::text_tertiary())
+                        .child("no sessions"),
+                )
                 .into_any_element()]
         } else {
             rows
@@ -2659,7 +2933,7 @@ impl Shell {
             .flex_col()
             .child(
                 div()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pt(px(theme::SPACE_3))
                     .pb(px(theme::SPACE_2))
                     .flex()
@@ -2671,6 +2945,7 @@ impl Shell {
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
+                            .debug_selector(|| "rail-title".into())
                             .text_color(theme::text_tertiary())
                             .child("sessions"),
                     )
@@ -2723,7 +2998,7 @@ impl Shell {
                         .min_h(px(0.))
                         .overflow_y_scroll()
                         .track_scroll(&self.rail_scroll)
-                        .px(px(theme::SPACE_2))
+                        .pr(px(theme::RAIL_CARD_BLEED))
                         .pb(px(theme::SPACE_2))
                         .flex()
                         .flex_col()
@@ -2738,16 +3013,27 @@ impl Shell {
             // surprise. Absent entirely when nothing live reports memory.
             .children(resource.map(|(line, over)| {
                 div()
-                    .debug_selector(|| "rail-resource".into())
                     .flex_none()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pb(px(theme::SPACE_3))
                     .pt(px(theme::SPACE_1))
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
-                    .font_weight(if over { theme::WEIGHT_LABEL } else { theme::WEIGHT_BODY })
-                    .text_color(if over { theme::warning() } else { theme::text_ghost() })
-                    .child(SharedString::from(line))
+                    .child(
+                        div()
+                            .debug_selector(|| "rail-resource".into())
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .font_weight(if over {
+                                theme::WEIGHT_LABEL
+                            } else {
+                                theme::WEIGHT_BODY
+                            })
+                            .text_color(if over {
+                                theme::warning()
+                            } else {
+                                theme::text_tertiary()
+                            })
+                            .child(SharedString::from(line)),
+                    )
             }))
             .into_any_element()
     }
@@ -2783,7 +3069,7 @@ impl Shell {
                 .px(px(theme::SPACE_2))
                 .text_size(px(theme::DETAIL_SIZE))
                 .line_height(px(theme::DETAIL_LINE))
-                .text_color(theme::text_ghost())
+                .text_color(theme::text_tertiary())
                 .child(SharedString::from(text.to_string()))
                 .into_any_element()
         };
@@ -2803,6 +3089,17 @@ impl Shell {
                     .into_any_element(),
             ),
             Some(None) => (None, fact("file status unavailable — engine predates it")),
+            // Slice AA: a basis we cannot measure from outranks anything
+            // the scan says, because the scan says nothing. Rendering
+            // this as `GitState::Ok` with an empty list would put "this
+            // turn changed nothing" on screen when the truth is "there is
+            // no turn to compare against" — the one confusion this whole
+            // slice exists to prevent. No count either: zero would be a
+            // claim.
+            Some(Some(FilesSnapshot {
+                basis: DiffBasis::Unavailable { reason },
+                ..
+            })) => (None, fact(reason)),
             Some(Some(snap)) => match &snap.state {
                 GitState::NotARepo => (None, fact("not a git repository")),
                 GitState::Error { message } => (
@@ -2815,12 +3112,20 @@ impl Shell {
                         .child(SharedString::from(format!("git failed: {message}")))
                         .into_any_element(),
                 ),
-                GitState::Ok if snap.files.is_empty() => (Some("0".into()), fact("no changes")),
+                // An empty list under a basis we DO have is a real zero,
+                // and it says which zero it is: nothing uncommitted at
+                // all, or a turn that has not written anything yet.
+                GitState::Ok if snap.files.is_empty() => (
+                    Some("0".into()),
+                    fact(match &snap.basis {
+                        DiffBasis::Turn { .. } => "this turn has changed nothing yet",
+                        _ => "no changes",
+                    }),
+                ),
                 GitState::Ok => {
                     let mut rows: Vec<AnyElement> = Vec::new();
                     for f in &snap.files {
-                        let expanded =
-                            matches!(&diff_slot, Some((p, _)) if p.as_str() == f.path);
+                        let expanded = matches!(&diff_slot, Some((p, _)) if p.as_str() == f.path);
                         rows.push(self.file_row(f, expanded, cx));
                         if expanded {
                             if let Some((_, fetch)) = &diff_slot {
@@ -2833,7 +3138,11 @@ impl Shell {
                         rows.push(fact(&format!("… and {} more files", snap.omitted)));
                     }
                     let label = if snap.omitted > 0 {
-                        format!("{} of {}", snap.files.len(), snap.files.len() as u64 + snap.omitted)
+                        format!(
+                            "{} of {}",
+                            snap.files.len(),
+                            snap.files.len() as u64 + snap.omitted
+                        )
                     } else {
                         snap.files.len().to_string()
                     };
@@ -2848,12 +3157,32 @@ impl Shell {
         // watcher degrades silently — a rail that looks live while
         // polling would lie by omission). Only stated when there is a
         // scanned repo to keep fresh; quiet ghost text, not an alarm.
+        // Slice AA: silent while the basis is unavailable — the body is
+        // already explaining why there is nothing, and "watching file
+        // events" underneath it would describe machinery, not the answer.
+        let scope = self.files.read(cx).scope;
         let mode: Option<&'static str> = match &current {
-            Some(Some(snap)) if matches!(snap.state, GitState::Ok) => Some(if snap.watching {
-                "watching file events"
-            } else {
-                "refreshes at turn end"
-            }),
+            // An engine predating Slice AA ignores the `scope` field and
+            // streams the working tree regardless — serde drops unknown
+            // params rather than refusing them. The toggle would then read
+            // as a lie, so the disagreement is stated: the snapshot's own
+            // basis is the authority on what arrived, never the request.
+            Some(Some(snap))
+                if scope == FileScope::LatestTurn
+                    && matches!(snap.basis, DiffBasis::WorkingTree) =>
+            {
+                Some("engine predates turn scope — showing the whole working tree")
+            }
+            Some(Some(snap))
+                if matches!(snap.state, GitState::Ok)
+                    && !matches!(snap.basis, DiffBasis::Unavailable { .. }) =>
+            {
+                Some(if snap.watching {
+                    "watching file events"
+                } else {
+                    "refreshes at turn end"
+                })
+            }
             _ => None,
         };
         // Rows on the bare glass ground, mirroring rail() — no plate.
@@ -2866,7 +3195,7 @@ impl Shell {
             .flex_col()
             .child(
                 div()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pt(px(theme::SPACE_3))
                     .pb(px(theme::SPACE_2))
                     .flex()
@@ -2878,17 +3207,34 @@ impl Shell {
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
+                            .debug_selector(|| "files-title".into())
                             .text_color(theme::text_tertiary())
                             .child("changes"),
                     )
                     .children(count_label.map(|n| {
                         div()
+                            .debug_selector(|| "files-count".into())
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_family(theme::MONO)
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .child(SharedString::from(n.to_string()))
                     })),
+            )
+            // Slice AA: the basis toggle. Its own row rather than a third
+            // item in the header — the labels are words, not glyphs, and
+            // squeezing them beside the title and the count is what
+            // produced the overlapping menu rows in R1.
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(theme::RAIL_GUTTER))
+                    .pb(px(theme::SPACE_2))
+                    .flex()
+                    .flex_row()
+                    .gap(px(theme::SPACE_1))
+                    .child(self.scope_segment(FileScope::WorkingTree, "all", scope, cx))
+                    .child(self.scope_segment(FileScope::LatestTurn, "this turn", scope, cx)),
             )
             // Slice M: same edge fade as the session rail, same reason.
             .child(
@@ -2903,7 +3249,7 @@ impl Shell {
                         .min_h(px(0.))
                         .overflow_y_scroll()
                         .track_scroll(&self.files_scroll)
-                        .px(px(theme::SPACE_2))
+                        .pr(px(theme::RAIL_CARD_BLEED))
                         .pb(px(theme::SPACE_2))
                         .child(body),
                 )
@@ -2911,14 +3257,17 @@ impl Shell {
             )
             .children(mode.map(|text| {
                 div()
-                    .debug_selector(|| "files-mode".into())
                     .flex_none()
-                    .px(px(theme::SPACE_3))
+                    .px(px(theme::RAIL_GUTTER))
                     .pb(px(theme::SPACE_2))
-                    .text_size(px(theme::DETAIL_SIZE))
-                    .line_height(px(theme::DETAIL_LINE))
-                    .text_color(theme::text_ghost())
-                    .child(text)
+                    .child(
+                        div()
+                            .debug_selector(|| "files-mode".into())
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::DETAIL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(text),
+                    )
             }))
             .into_any_element()
     }
@@ -2942,7 +3291,7 @@ impl Shell {
         div()
             .id(SharedString::from(format!("file-{}", f.path)))
             .debug_selector(|| format!("file-{}", f.path))
-            .px(px(theme::SPACE_2))
+            .px(px(theme::RAIL_CARD_BLEED))
             .py(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_BUTTON))
             // §1.4: a file that has just appeared in the rail fades in.
@@ -2956,7 +3305,11 @@ impl Shell {
             // is the same colour — rest == hovered, no flicker on expand.
             .hover_fade(
                 format!("file-{}", f.path),
-                if expanded { theme::overlay() } else { theme::wash_rest() },
+                if expanded {
+                    theme::overlay()
+                } else {
+                    theme::wash_rest()
+                },
                 theme::overlay(),
             )
             .cursor_pointer()
@@ -3007,7 +3360,7 @@ impl Shell {
                             div()
                                 .min_w(px(0.))
                                 .truncate()
-                                .text_color(theme::text_ghost())
+                                .text_color(theme::text_tertiary())
                                 .child(SharedString::from(dir)),
                         )
                     })
@@ -3027,8 +3380,16 @@ impl Shell {
                     .font_family(theme::MONO)
                     .text_size(px(theme::SMALL_SIZE))
                     .line_height(px(theme::SMALL_LINE))
-                    .child(div().text_color(theme::success()).child(SharedString::from(adds)))
-                    .child(div().text_color(theme::danger()).child(SharedString::from(dels)))
+                    .child(
+                        div()
+                            .text_color(theme::success())
+                            .child(SharedString::from(adds)),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme::danger())
+                            .child(SharedString::from(dels)),
+                    )
                     .into_any_element(),
                 // Unknowable (binary / oversized): one honest dash.
                 None => div()
@@ -3036,7 +3397,7 @@ impl Shell {
                     .font_family(theme::MONO)
                     .text_size(px(theme::SMALL_SIZE))
                     .line_height(px(theme::SMALL_LINE))
-                    .text_color(theme::text_ghost())
+                    .text_color(theme::text_tertiary())
                     .child("—")
                     .into_any_element(),
             })
@@ -3073,6 +3434,77 @@ impl Shell {
         }
     }
 
+    /// Switch the files rail's basis (Slice AA).
+    ///
+    /// The held snapshot is dropped, not kept as a placeholder: it
+    /// describes the OTHER basis, and leaving it on screen under the new
+    /// label would be the one lie this slice is about. The skeleton says
+    /// "a list is coming" and is the honest picture for the round trip.
+    /// The expanded diff goes with it — a row that may not exist in the
+    /// new list cannot keep a pane open under it.
+    fn set_files_scope(&self, scope: FileScope, cx: &mut Context<Self>) {
+        if self.files.read(cx).scope == scope {
+            return;
+        }
+        self.files.update(cx, |state, cx| {
+            state.scope = scope;
+            state.snapshot = None;
+            state.diff = None;
+            cx.notify();
+        });
+        let _ = self.commands.send(Command::FilesScope(scope));
+    }
+
+    /// One segment of the files rail's basis toggle (Slice AA).
+    fn scope_segment(
+        &self,
+        scope: FileScope,
+        label: &'static str,
+        selected: FileScope,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let is_sel = scope == selected;
+        let name = match scope {
+            FileScope::WorkingTree => "working-tree",
+            FileScope::LatestTurn => "latest-turn",
+        };
+        div()
+            .id(SharedString::from(format!("files-scope-{name}")))
+            .debug_selector(move || format!("files-scope-{name}"))
+            .flex_1()
+            .min_w(px(0.))
+            .px(px(theme::SPACE_1))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_CHIP))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(theme::SMALL_SIZE))
+            .line_height(px(theme::SMALL_LINE))
+            // One wash, two roles: the selected segment RESTS at
+            // `overlay()`, the other rests invisible and fades up to it.
+            // So hovering an unselected segment previews exactly what
+            // selecting it will look like, and selection needs no second
+            // pigment of its own.
+            .hover_fade(
+                format!("files-scope-{name}"),
+                if is_sel {
+                    theme::overlay()
+                } else {
+                    theme::wash_rest()
+                },
+                theme::overlay(),
+            )
+            .when(is_sel, |d| {
+                d.font_weight(theme::WEIGHT_LABEL).text_color(theme::text())
+            })
+            .when(!is_sel, |d| d.text_color(theme::text_tertiary()))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.set_files_scope(scope, cx)))
+            .child(label)
+            .into_any_element()
+    }
+
     /// The selected session's cwd, for resolving a repo-relative path to
     /// something the system `open` can take.
     fn selected_cwd(&self, cx: &Context<Self>) -> Option<PathBuf> {
@@ -3094,9 +3526,10 @@ impl Shell {
             ConnEvent::Connected { engine_pid } => {
                 (theme::success(), format!("engine {engine_pid}"))
             }
-            ConnEvent::Reconnecting { attempt } => {
-                (theme::warning(), format!("reconnecting (attempt {attempt})…"))
-            }
+            ConnEvent::Reconnecting { attempt } => (
+                theme::warning(),
+                format!("reconnecting (attempt {attempt})…"),
+            ),
             ConnEvent::Busy { .. } => (theme::danger(), "engine busy".into()),
             ConnEvent::Failed { .. } => (theme::danger(), "engine unreachable".into()),
         };
@@ -3108,8 +3541,7 @@ impl Shell {
             .border_color(theme::border())
             .pt(px(theme::SPACE_1))
             .pb(px(theme::SPACE_3))
-            .child(
-            Self::column(
+            .child(Self::column(
                 div()
                     .w_full()
                     .flex()
@@ -3125,24 +3557,16 @@ impl Shell {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .size(px(theme::STATE_DOT))
-                                    .rounded_full()
-                                    .bg(dot),
-                            )
+                            .child(div().size(px(theme::STATE_DOT)).rounded_full().bg(dot))
                             .child(label)
                             .children(self.friction.as_ref().map(|(_, note)| {
                                 div()
-                                    .text_color(theme::text_ghost())
+                                    .text_color(theme::text_tertiary())
                                     .child(SharedString::from(note.clone()))
                             })),
                     )
-                    .children(session.map(|s| {
-                        div().text_color(theme::text_ghost()).child(s)
-                    })),
-            ),
-        )
+                    .children(session.map(|s| div().text_color(theme::text_tertiary()).child(s))),
+            ))
     }
 
     /// Loud connection states get a real panel above the composer with the
@@ -3403,7 +3827,10 @@ impl Shell {
             } => panel(theme::danger_ring(), theme::danger_plate_glass())
                 .child(label(
                     theme::danger(),
-                    format!("unresponsive for {}", fmt_elapsed(now.saturating_sub(since_ms))),
+                    format!(
+                        "unresponsive for {}",
+                        fmt_elapsed(now.saturating_sub(since_ms))
+                    ),
                     true,
                 ))
                 .child(format!(
@@ -3579,16 +4006,74 @@ impl Shell {
                     _ => wrap.into_any_element(),
                 }
             }
-            Row::Tool { id: _, name, status } => {
+            Row::Tool {
+                id: tool_id,
+                name,
+                status,
+                input,
+                result,
+                is_error,
+            } => {
+                // Slice Z: a tool with anything to show can be opened, and
+                // a FAILED one shows its reason without being opened —
+                // Slice V's rule stands, this only adds the other half.
+                let has_body = !input.trim().is_empty() || !result.trim().is_empty();
+                let open = state.open_tools.contains(tool_id);
                 let (label, dot) = match status {
                     ToolStatus::Running => ("running…", theme::live()),
-                    ToolStatus::Finished => ("done", theme::text_ghost()),
+                    ToolStatus::Finished if *is_error => ("failed", theme::danger()),
+                    ToolStatus::Finished => ("done", theme::text_tertiary()),
                     ToolStatus::Interrupted => ("interrupted", theme::danger()),
                 };
-                div()
-                    .pt(px(theme::SPACE_2))
-                    .pb(px(theme::SPACE_1))
-                    .pl(px(theme::TOOL_INDENT))
+                // What the tool was ASKED to do. Until this slice a row was
+                // the tool's name and a status word, so an agent running
+                // `cargo test --workspace` rendered "Bash  done" — the one
+                // fact an operator is watching for was the one eave threw
+                // away (`stream.rs` kept the id and dropped the input).
+                let detail = eave_wire::model::tool_detail(name, input);
+                // A failed tool states why. A successful one does not: its
+                // output is usually long, usually uninteresting, and always
+                // a row height inside a virtualized list.
+                let failure = (*is_error && !open && !result.trim().is_empty()).then(|| {
+                    let total = result.lines().count();
+                    let mut text = result
+                        .lines()
+                        .take(theme::TOOL_ERROR_MAX_LINES)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if total > theme::TOOL_ERROR_MAX_LINES {
+                        // State the remainder rather than trailing off, the
+                        // way the diff pane states its own cap.
+                        text.push_str(&format!(
+                            "\n… {} more lines",
+                            total - theme::TOOL_ERROR_MAX_LINES
+                        ));
+                    }
+                    text
+                });
+                let head = div()
+                    .id(SharedString::from(format!("tool-{tool_id}")))
+                    .when(has_body, |d| {
+                        let tid = tool_id.clone();
+                        let shell = state.shell.clone();
+                        d.cursor_pointer()
+                            .debug_selector(|| "tool-head".into())
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                                    let tid = tid.clone();
+                                    shell.update(cx, |shell, cx| {
+                                        shell.transcript.update(cx, |t, cx| {
+                                            if !t.open_tools.remove(&tid) {
+                                                t.open_tools.insert(tid.clone());
+                                            }
+                                            t.remeasure_tool(&tid);
+                                            cx.notify();
+                                        });
+                                    });
+                                }
+                            })
+                    })
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3609,13 +4094,105 @@ impl Shell {
                             .text_color(theme::text_secondary())
                             .child(SharedString::from(name.clone())),
                     )
+                    .children(detail.map(|d| {
+                        div()
+                            .debug_selector(|| "tool-detail".into())
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::TOOL_NAME_SIZE))
+                            .line_height(px(theme::TOOL_NAME_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(d))
+                    }))
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(if *is_error {
+                                theme::danger()
+                            } else {
+                                theme::text_tertiary()
+                            })
                             .child(label),
-                    )
+                    );
+                div()
+                    .debug_selector(|| "tool-row".into())
+                    .pt(px(theme::SPACE_2))
+                    .pb(px(theme::SPACE_1))
+                    .pl(px(theme::TOOL_INDENT))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACE_1))
+                    .child(head)
+                    .children(open.then(|| {
+                        // Opened: what it was asked, and what came back.
+                        // Both verbatim, both bounded, each labelled —
+                        // an unlabelled pair of blobs would make the
+                        // reader guess which is which.
+                        let mut parts: Vec<(&str, String)> = Vec::new();
+                        if !input.trim().is_empty() {
+                            parts
+                                .push(("input", tool_body_view(input, theme::TOOL_BODY_MAX_LINES)));
+                        }
+                        if !result.trim().is_empty() {
+                            parts.push((
+                                if *is_error { "error" } else { "result" },
+                                tool_body_view(result, theme::TOOL_BODY_MAX_LINES),
+                            ));
+                        }
+                        div()
+                            .debug_selector(|| "tool-body".into())
+                            .ml(px(theme::TOOL_INDENT))
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .children(parts.into_iter().map(|(label, body)| {
+                                div()
+                                    .rounded(px(theme::RADIUS_CODE))
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .bg(theme::inset())
+                                    .px(px(theme::SPACE_2))
+                                    .py(px(theme::SPACE_1))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_1))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .font_weight(theme::WEIGHT_LABEL)
+                                            .text_color(theme::text_tertiary())
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(theme::MONO)
+                                            .text_size(px(theme::DETAIL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .child(SharedString::from(body)),
+                                    )
+                            }))
+                    }))
+                    .children(failure.map(|f| {
+                        div()
+                            .ml(px(theme::TOOL_INDENT))
+                            .rounded(px(theme::RADIUS_CODE))
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::inset())
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(f))
+                    }))
                     .into_any_element()
             }
             // Slice K: the question itself. Every fact an operator needs
@@ -3630,7 +4207,13 @@ impl Shell {
                 input_json,
                 status,
             } => Self::render_approval(
-                state, request_id, tool, description, path, input_json, status,
+                state,
+                request_id,
+                tool,
+                description,
+                path,
+                input_json,
+                status,
             ),
             Row::Marker { text } => div()
                 .py(px(theme::SPACE_3))
@@ -3650,7 +4233,10 @@ impl Shell {
                         .child(SharedString::from(text.clone())),
                 )
                 .into_any_element(),
-            Row::Assistant { text: msg_text, live } => {
+            Row::Assistant {
+                text: msg_text,
+                live,
+            } => {
                 let Some(block) = state.display.block(id) else {
                     // Placeholder row of an empty live message. Slice N3
                     // replaced the static `▌` here: a caret that never
@@ -3752,7 +4338,7 @@ impl Shell {
                             .child(SharedString::from(if pending {
                                 format!("{tool} — needs your approval")
                             } else {
-                                format!("{tool}")
+                                tool.to_string()
                             })),
                     )
                     .child(
@@ -3783,12 +4369,10 @@ impl Shell {
             card = card.child(line(theme::text(), description.to_string()));
         }
         if let Some(p) = path {
-            card = card.child(
-                mono(p.clone()).debug_selector({
-                    let rid = rid.clone();
-                    move || format!("approval-path-{rid}")
-                }),
-            );
+            card = card.child(mono(p.clone()).debug_selector({
+                let rid = rid.clone();
+                move || format!("approval-path-{rid}")
+            }));
         }
         // The full input, stated. Truncation is stated too — a silently
         // shortened input is the same lie as a silently shortened fact
@@ -3830,8 +4414,20 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap_2()
-                        .child(Self::decision_button(state, &rid, true, "approve", theme::live()))
-                        .child(Self::decision_button(state, &rid, false, "deny", theme::danger())),
+                        .child(Self::decision_button(
+                            state,
+                            &rid,
+                            true,
+                            "approve",
+                            theme::live(),
+                        ))
+                        .child(Self::decision_button(
+                            state,
+                            &rid,
+                            false,
+                            "deny",
+                            theme::danger(),
+                        )),
                 )
                 .child(line(
                     theme::text_tertiary(),
@@ -3906,7 +4502,10 @@ impl Shell {
     ) -> AnyElement {
         let is_tail = state
             .display
-            .block(RowId { msg: id.msg, block: id.block + 1 })
+            .block(RowId {
+                msg: id.msg,
+                block: id.block + 1,
+            })
             .is_none();
         match block {
             // Mending for fences is structural: `split_blocks` yields the
@@ -3933,10 +4532,55 @@ impl Shell {
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::MICRO_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
-                            .text_color(theme::text_ghost())
-                            .child(SharedString::from(label.to_string())),
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(label.to_string()))
+                            // The strip's remaining width, so the button
+                            // sits at the far edge without a spacer div.
+                            .child(div().flex_1())
+                            .child({
+                                let whole = code.trim_end().to_string();
+                                let lines = whole.lines().count();
+                                let shell = state.shell.clone();
+                                div()
+                                    .id(("fence-copy", id.block))
+                                    .debug_selector(|| "fence-copy".into())
+                                    .cursor_pointer()
+                                    .px(px(theme::SPACE_1))
+                                    .text_color(theme::text_tertiary())
+                                    .child(icons::icon(
+                                        icons::COPY,
+                                        theme::ICON_SM,
+                                        theme::text_tertiary(),
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            whole.clone(),
+                                        ));
+                                        // The WHOLE fence, not the drawn
+                                        // part: a cap is a reading limit,
+                                        // and a copy that silently gave you
+                                        // the first 200 lines of a 500-line
+                                        // block would be the worst kind of
+                                        // quiet failure.
+                                        if let Some(shell) =
+                                            shell.as_ref().and_then(|s| s.upgrade())
+                                        {
+                                            shell.update(cx, |shell, cx| {
+                                                shell.transient_note(
+                                                    format!(
+                                                        "copied {lines} line{}",
+                                                        if lines == 1 { "" } else { "s" }
+                                                    ),
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    })
+                            }),
                     )
-                    .child(
+                    .child({
+                        let drawn = fence_view(code.trim_end());
                         div()
                             .px(px(theme::SPACE_3))
                             .py(px(theme::SPACE_2))
@@ -3944,8 +4588,8 @@ impl Shell {
                             .text_size(px(theme::CODE_SIZE))
                             .line_height(px(theme::CODE_LINE))
                             .text_color(theme::code_block_text())
-                            .child(SharedString::from(code.trim_end().to_string())),
-                    )
+                            .child(SharedString::from(drawn))
+                    })
                     .into_any_element()
             }
             Block::Heading { level, text } => {
@@ -3970,9 +4614,10 @@ impl Shell {
                 let total_chars = flat.chars().count();
                 // Paint-only veil on the growing tail block of the live
                 // message (spec 03 §Rendering).
-                let veil = state.veil.as_ref().filter(|v| {
-                    live && is_tail && v.msg == id.msg && v.from_byte < msg_text.len()
-                });
+                let veil = state
+                    .veil
+                    .as_ref()
+                    .filter(|v| live && is_tail && v.msg == id.msg && v.from_byte < msg_text.len());
                 let block_el = VeiledBlock {
                     text: SharedString::from(flat),
                     runs,
@@ -4000,7 +4645,10 @@ impl Shell {
                             // the element-id PATH and replays from t=0 on
                             // remount, so a veil whose id did not change
                             // per burst would restart on every re-render.
-                            ("veil", ((id.msg as u64) << 32) | (v.generation & 0xffff_ffff)),
+                            (
+                                "veil",
+                                ((id.msg as u64) << 32) | (v.generation & 0xffff_ffff),
+                            ),
                             // Slice M (§1.21): the curve, not the
                             // multi-chunk rewrite. `Animation::new`
                             // defaults to LINEAR, which put the fade's
@@ -4399,15 +5047,13 @@ impl Shell {
                                         theme::overlay(),
                                     )
                                     .cursor_pointer()
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, window, cx| {
-                                            let at = window.mouse_position();
-                                            this.open_model_menu(
-                                                point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
-                                                cx,
-                                            );
-                                        },
-                                    ))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        let at = window.mouse_position();
+                                        this.open_model_menu(
+                                            point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
+                                            cx,
+                                        );
+                                    }))
                                     .child(format!("{model}  ⌄")),
                             )
                             .child(
@@ -4483,16 +5129,14 @@ impl Render for Shell {
                     // frame deltas on a vsync-locked display sit at the
                     // refresh period when healthy — a frame that blew the
                     // budget shows up as a missed vsync (≥2 periods).
-                    let mut t: Vec<Duration> =
-                        perf.frame_times.iter().skip(10).copied().collect();
+                    let mut t: Vec<Duration> = perf.frame_times.iter().skip(10).copied().collect();
                     t.sort();
                     let p = |q: f64| t[((t.len() - 1) as f64 * q) as usize];
                     let missed = t
                         .iter()
                         .filter(|d| **d > Duration::from_micros(25_000))
                         .count();
-                    let mut c: Vec<Duration> =
-                        perf.cpu_times.iter().skip(10).copied().collect();
+                    let mut c: Vec<Duration> = perf.cpu_times.iter().skip(10).copied().collect();
                     // Where did the worst CPU frame land? Deterministic
                     // position across runs = content-driven (e.g. first-use
                     // font shaping); wandering position = load noise.
@@ -4506,7 +5150,10 @@ impl Render for Shell {
                         .unwrap_or(0);
                     c.sort();
                     let pc = |q: f64| c[((c.len() - 1) as f64 * q) as usize];
-                    println!("PERF cpu_max_at_frame={max_at} (~row {})", max_at * PERF_ROWS_PER_FRAME);
+                    println!(
+                        "PERF cpu_max_at_frame={max_at} (~row {})",
+                        max_at * PERF_ROWS_PER_FRAME
+                    );
                     println!(
                         "PERF frames={} rows={} wall[p50={:?} p95={:?} p99={:?} max={:?} missed_vsync={}] cpu[p50={:?} p95={:?} p99={:?} max={:?}]",
                         t.len(),
@@ -4655,7 +5302,7 @@ impl Render for Shell {
                                 .child(div().text_color(theme::text()).child("▏"))
                                 .child(
                                     div()
-                                        .text_color(theme::text_ghost())
+                                        .text_color(theme::text_tertiary())
                                         .child("Message eave…"),
                                 )
                                 .into_any_element()
@@ -4674,7 +5321,7 @@ impl Render for Shell {
                                 .text_color(if pending_here > 0 {
                                     theme::warning()
                                 } else {
-                                    theme::text_ghost()
+                                    theme::text_tertiary()
                                 })
                                 // Slice K, capture N (2026-08-18): the CLI
                                 // swallows a user message sent while a
@@ -4719,8 +5366,16 @@ impl Render for Shell {
                                 // at once and only the hover progress is smooth.
                                 .hover_fade(
                                     "send",
-                                    if has_draft { theme::inverse() } else { theme::overlay_strong() },
-                                    if has_draft { theme::inverse_hover() } else { theme::overlay_strongest() },
+                                    if has_draft {
+                                        theme::inverse()
+                                    } else {
+                                        theme::overlay_strong()
+                                    },
+                                    if has_draft {
+                                        theme::inverse_hover()
+                                    } else {
+                                        theme::overlay_strongest()
+                                    },
                                 )
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -4732,7 +5387,7 @@ impl Render for Shell {
                                     if has_draft {
                                         theme::on_inverse()
                                     } else {
-                                        theme::text_ghost()
+                                        theme::text_tertiary()
                                     },
                                     "send-glyph",
                                 )),
@@ -4778,12 +5433,8 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key))
             // Slice K: answering is a real action with a real binding, not
             // a character the composer happens not to want.
-            .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| {
-                this.decide_oldest(true, cx)
-            }))
-            .on_action(cx.listener(|this, _: &DenyOldest, _, cx| {
-                this.decide_oldest(false, cx)
-            }))
+            .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| this.decide_oldest(true, cx)))
+            .on_action(cx.listener(|this, _: &DenyOldest, _, cx| this.decide_oldest(false, cx)))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             .child(self.titlebar(cx))
             .child(
@@ -4864,10 +5515,8 @@ impl Render for Shell {
                                         // above the composer's clearance)
                                         // and `relative()` would destroy
                                         // that positioning outright.
-                                        let t = motion::entrance_t(
-                                            "in:empty-note",
-                                            motion::FADE_IN,
-                                        );
+                                        let t =
+                                            motion::entrance_t("in:empty-note", motion::FADE_IN);
                                         div()
                                             .debug_selector(|| "transcript-empty".into())
                                             .absolute()
@@ -4880,7 +5529,7 @@ impl Render for Shell {
                                             .justify_center()
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_ghost())
+                                            .text_color(theme::text_tertiary())
                                             .child(
                                                 div()
                                                     .opacity(t)
@@ -5128,45 +5777,56 @@ pub fn run(data_dir: PathBuf) -> ! {
             .unwrap_or(1.0);
         (PathBuf::from(p), speed)
     });
-    let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
+    let perf_10k = std::env::var("EAVE_PERF")
+        .map(|v| v == "10k")
+        .unwrap_or(false);
 
     // Slice P3: the one place an `Application` is built, so the one place
     // the icon set can be registered. `bootstrap` cannot do it — assets are
     // an `Application`-level concern and gpui exposes no `App` setter — which
     // is why the harness renders every glyph as empty coverage (icons.rs).
-    application().with_assets(icons::Icons).run(move |cx: &mut App| {
-        let queues = Arc::new(Queues::default());
-        let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
-        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
+    application()
+        .with_assets(icons::Icons)
+        .run(move |cx: &mut App| {
+            let queues = Arc::new(Queues::default());
+            let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
+            let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
 
-        // Feed source: live engine, or fixture replay (Stage D acceptance
-        // harness) — the pump and entities cannot tell the difference.
-        {
-            let plumbing = Plumbing {
-                queues: Arc::clone(&queues),
-                wake: wake_tx,
-            };
-            match replay.clone() {
-                Some((path, speed)) => {
-                    std::thread::spawn(move || replay_loop(path, speed, plumbing));
-                    drop(cmd_rx);
-                }
-                None if perf_10k => drop(cmd_rx), // no feed at all
-                None => {
-                    let data_dir = data_dir.clone();
-                    std::thread::spawn(move || {
-                        tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("tokio runtime")
-                            .block_on(feed_loop(data_dir, plumbing, cmd_rx));
-                    });
+            // Feed source: live engine, or fixture replay (Stage D acceptance
+            // harness) — the pump and entities cannot tell the difference.
+            {
+                let plumbing = Plumbing {
+                    queues: Arc::clone(&queues),
+                    wake: wake_tx,
+                };
+                match replay.clone() {
+                    Some((path, speed)) => {
+                        std::thread::spawn(move || replay_loop(path, speed, plumbing));
+                        drop(cmd_rx);
+                    }
+                    None if perf_10k => drop(cmd_rx), // no feed at all
+                    None => {
+                        let data_dir = data_dir.clone();
+                        std::thread::spawn(move || {
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("tokio runtime")
+                                .block_on(feed_loop(data_dir, plumbing, cmd_rx));
+                        });
+                    }
                 }
             }
-        }
 
-        bootstrap(cx, Feed { queues, wake_rx, cmd_tx });
-    });
+            bootstrap(
+                cx,
+                Feed {
+                    queues,
+                    wake_rx,
+                    cmd_tx,
+                },
+            );
+        });
     std::process::exit(0);
 }
 
@@ -5201,7 +5861,8 @@ struct Feed {
 /// papered over with a polling timer — a polling timer is exactly the
 /// per-frame machinery this slice does not build.
 fn reduce_motion_preference() -> bool {
-    if let Some(forced) = reduce_motion_override(std::env::var("EAVE_REDUCE_MOTION").ok().as_deref())
+    if let Some(forced) =
+        reduce_motion_override(std::env::var("EAVE_REDUCE_MOTION").ok().as_deref())
     {
         return forced;
     }
@@ -5257,13 +5918,7 @@ fn macos_reduce_motion() -> Option<bool> {
     // pointer outlives this function.
     unsafe {
         let mk = |s: &str| -> CFTypeRef {
-            CFStringCreateWithBytes(
-                std::ptr::null(),
-                s.as_ptr(),
-                s.len() as isize,
-                UTF8,
-                0,
-            )
+            CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as isize, UTF8, 0)
         };
         let key = mk("reduceMotion");
         let domain = mk("com.apple.universalaccess");
@@ -5282,7 +5937,8 @@ fn macos_reduce_motion() -> Option<bool> {
         if value.is_null() {
             return None;
         }
-        let out = (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
+        let out =
+            (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
         CFRelease(value);
         out
     }
@@ -5297,7 +5953,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         mut wake_rx,
         cmd_tx,
     } = feed;
-    let perf_10k = std::env::var("EAVE_PERF").map(|v| v == "10k").unwrap_or(false);
+    let perf_10k = std::env::var("EAVE_PERF")
+        .map(|v| v == "10k")
+        .unwrap_or(false);
 
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
@@ -5305,8 +5963,21 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // bindings rather than living only inside the key handler.
         KeyBinding::new("cmd-shift-a", ApproveOldest, None),
         KeyBinding::new("cmd-shift-d", DenyOldest, None),
+        // Slice Y: the three a macOS user reaches for without thinking.
+        // Bound here rather than expressed as `OsAction`s because eave's
+        // gpui pin has no Minimize/Close variants (see `app_menus`).
+        KeyBinding::new("cmd-w", crate::app_menus::CloseWindow, None),
+        KeyBinding::new("cmd-m", crate::app_menus::Minimize, None),
+        KeyBinding::new("cmd-h", crate::app_menus::Hide, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+    // The menu bar. Registered HERE rather than in `main` so the harness
+    // boots the same wiring the app does — and note this is not what makes
+    // ⌘Q work (the binding above already did, and always has). It is what
+    // makes the bar exist at all: gpui calls `setMainMenu_` only from
+    // `set_menus`, so without this `NSApp.mainMenu` is nil and the
+    // auto-hidden system bar has nothing to reveal.
+    crate::app_menus::init(cx); // handlers only — the bar goes in last
 
     // Slice M (§1.22): honoured for the one animation eave has. gpui
     // applies this inside `with_animation` itself — a oneshot renders its
@@ -5330,9 +6001,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // measured layout includes a populated files rail — and (B2)
         // a cap-size expanded diff, so the long-diff render path is
         // measured at its worst, not at a friendly size.
-        snapshot: perf_10k
-            .then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
+        snapshot: perf_10k.then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
         collapsed: false,
+        scope: FileScope::WorkingTree,
         diff: perf_10k.then(|| DiffSlot {
             session: "perf:10k".into(),
             path: "crates/eave-app/src/ui.rs".into(),
@@ -5361,9 +6032,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let sessions = sessions.clone();
         let transcript = transcript.clone();
         cx.spawn(async move |cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_secs(1))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(1)).await;
             if sessions.read_with(cx, |s, _| s.notice_standing()) {
                 sessions.update(cx, |_, cx| cx.notify());
             }
@@ -5391,29 +6060,25 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let cmd_tx = cmd_tx.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
-                let conn_events: Vec<ConnEvent> =
-                    queues.conn.lock().unwrap().drain(..).collect();
+                let conn_events: Vec<ConnEvent> = queues.conn.lock().unwrap().drain(..).collect();
                 if let Some(last) = conn_events.into_iter().last() {
-                    let _ = conn.update(cx, |state, cx| {
+                    conn.update(cx, |state, cx| {
                         state.status = last;
                         cx.notify();
                     });
                 }
                 // Attention is current-state, not a log: the last
                 // frame of the burst wins.
-                let attn_events: Vec<AttnEvent> =
-                    queues.attn.lock().unwrap().drain(..).collect();
-                let rail_events: Vec<RailEvent> =
-                    queues.rail.lock().unwrap().drain(..).collect();
+                let attn_events: Vec<AttnEvent> = queues.attn.lock().unwrap().drain(..).collect();
+                let rail_events: Vec<RailEvent> = queues.rail.lock().unwrap().drain(..).collect();
                 // Files snapshots fold by replacement — last of the
                 // burst wins; the render filters by session tag.
                 let files_events: Vec<FilesEvent> =
                     queues.files.lock().unwrap().drain(..).collect();
-                let diff_events: Vec<DiffEvent> =
-                    queues.diffs.lock().unwrap().drain(..).collect();
+                let diff_events: Vec<DiffEvent> = queues.diffs.lock().unwrap().drain(..).collect();
                 if !files_events.is_empty() || !diff_events.is_empty() {
                     let cmd_tx = cmd_tx.clone();
-                    let _ = files.update(cx, |state, cx| {
+                    files.update(cx, |state, cx| {
                         if let Some((sid, snap)) = files_events.into_iter().last() {
                             // A fresh snapshot is the diff's
                             // invalidation signal (B2): re-request
@@ -5428,8 +6093,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                             && s.files.iter().any(|f| f.path == slot.path)
                                     });
                                     if listed {
-                                        let _ =
-                                            cmd_tx.send(Command::Diff(slot.path.clone()));
+                                        let _ = cmd_tx.send(Command::Diff(slot.path.clone()));
                                     } else {
                                         state.diff = None;
                                     }
@@ -5455,17 +6119,19 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 }
                 let last_attn = attn_events.into_iter().last();
                 let last_rail = rail_events.into_iter().last();
-                let wt_events: Vec<WtEvent> =
-                    queues.wt.lock().unwrap().drain(..).collect();
+                let wt_events: Vec<WtEvent> = queues.wt.lock().unwrap().drain(..).collect();
                 if last_attn.is_some() || last_rail.is_some() || !wt_events.is_empty() {
-                    let _ = sessions.update(cx, |state, cx| {
+                    sessions.update(cx, |state, cx| {
                         if let Some(tagged) = last_attn {
                             state.attention = Some(tagged);
                         }
                         // Watch snapshots fold by replacement — the
-                        // engine's set is the truth, never merged.
+                        // engine's set is the truth, never merged. Row
+                        // ORDER is the one thing carried across (Stage AB):
+                        // it is not an engine fact, and re-deciding it on
+                        // every state change moves rows under the pointer.
                         if let Some(snapshot) = last_rail {
-                            state.sessions = snapshot;
+                            fold_rail(&mut state.sessions, snapshot);
                         }
                         // Worktree notes fold by replacement per
                         // session; a settled action clears its note.
@@ -5482,12 +6148,11 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         cx.notify();
                     });
                 }
-                let feed_events: Vec<FeedEvent> =
-                    queues.feed.lock().unwrap().drain(..).collect();
+                let feed_events: Vec<FeedEvent> = queues.feed.lock().unwrap().drain(..).collect();
                 if !feed_events.is_empty() {
                     let cmd_tx = cmd_tx.clone();
                     let mut switched = false;
-                    let _ = transcript.update(cx, |state, cx| {
+                    transcript.update(cx, |state, cx| {
                         for ev in feed_events {
                             match ev {
                                 FeedEvent::Session { id } => {
@@ -5537,7 +6202,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     // A real selection switch closes the diff pane:
                     // it belongs to the session that just left.
                     if switched {
-                        let _ = files.update(cx, |state, cx| {
+                        files.update(cx, |state, cx| {
                             if state.diff.take().is_some() {
                                 cx.notify();
                             }
@@ -5567,11 +6232,16 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         let moved = transcript.update(cx, |state, _| {
                             state.scroll = ScrollMode::Follow;
                             state.assert_scroll();
+                            // ...and the open tool cards go with it. They
+                            // are keyed by tool id, and a tool id from the
+                            // session that left can collide with one in the
+                            // session arriving.
+                            state.open_tools.clear();
                             let key = state.session_id.clone().unwrap_or_default();
                             state.composer.clone().map(|c| (c, key))
                         });
                         if let Some((composer, key)) = moved {
-                            let _ = composer.update(cx, |c, cx| {
+                            composer.update(cx, |c, cx| {
                                 c.switch_to(key);
                                 cx.notify();
                             });
@@ -5584,96 +6254,103 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     }
 
     let bounds = Bounds::centered(None, size(px(theme::WINDOW_W), px(theme::WINDOW_H)), cx);
-    let handle = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
-            // Glass is the only look (ruled 2026-08-17, opaque path deleted
-            // 2026-08-19). theme.rs owns the tints this blur sits under.
-            window_background: WindowBackgroundAppearance::Blurred,
-            titlebar: Some(TitlebarOptions {
-                title: Some("eave".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
-            }),
-            ..Default::default()
-        },
-        |window, cx| {
-            let shell = cx.new(|cx| {
-                let composer = cx.new(|_| ComposerState {
-                    text: String::new(),
-                    key: String::new(),
-                    drafts: HashMap::new(),
-                    caret_anchor: None,
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
+                // Glass is the only look (ruled 2026-08-17, opaque path deleted
+                // 2026-08-19). theme.rs owns the tints this blur sits under.
+                window_background: WindowBackgroundAppearance::Blurred,
+                titlebar: Some(TitlebarOptions {
+                    title: Some("eave".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let shell = cx.new(|cx| {
+                    let composer = cx.new(|_| ComposerState {
+                        text: String::new(),
+                        key: String::new(),
+                        drafts: HashMap::new(),
+                        caret_anchor: None,
+                    });
+                    // Slice K: the approval card's buttons are built by a
+                    // static row fn with no `Context`, so give the transcript
+                    // state the two handles they need — the shell's own
+                    // command channel and the composer they read the deny
+                    // reason from.
+                    let weak_shell = cx.weak_entity();
+                    transcript.update(cx, |t, _| {
+                        t.commands = Some(cmd_tx.clone());
+                        t.composer = Some(composer.clone());
+                        t.shell = Some(weak_shell);
+                    });
+                    cx.observe(&conn, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&files, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+                    Shell {
+                        focus: cx.focus_handle(),
+                        demo: DemoOverlay::default(),
+                        launcher: LauncherUi::default(),
+                        conn: conn.clone(),
+                        sessions: sessions.clone(),
+                        files: files.clone(),
+                        transcript: transcript.clone(),
+                        composer,
+                        commands: cmd_tx.clone(),
+                        perf: perf_10k.then(|| PerfProbe {
+                            frame_times: Vec::new(),
+                            cpu_times: Vec::new(),
+                            last_cpu: None,
+                            last_frame: None,
+                            item_ix: 0,
+                            done: false,
+                        }),
+                        friction: None,
+                        friction_gen: 0,
+                        friction_path_stated: false,
+                        rail_scroll: ScrollHandle::new(),
+                        files_scroll: ScrollHandle::new(),
+                    }
                 });
-                // Slice K: the approval card's buttons are built by a
-                // static row fn with no `Context`, so give the transcript
-                // state the two handles they need — the shell's own
-                // command channel and the composer they read the deny
-                // reason from.
-                transcript.update(cx, |t, _| {
-                    t.commands = Some(cmd_tx.clone());
-                    t.composer = Some(composer.clone());
-                });
-                cx.observe(&conn, |_, _, cx| cx.notify()).detach();
-                cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
-                cx.observe(&files, |_, _, cx| cx.notify()).detach();
-                cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
-                cx.observe(&composer, |_, _, cx| cx.notify()).detach();
-                Shell {
-                    focus: cx.focus_handle(),
-                    demo: DemoOverlay::default(),
-                    launcher: LauncherUi::default(),
-                    conn: conn.clone(),
-                    sessions: sessions.clone(),
-                    files: files.clone(),
-                    transcript: transcript.clone(),
-                    composer,
-                    commands: cmd_tx.clone(),
-                    perf: perf_10k.then(|| PerfProbe {
-                        frame_times: Vec::new(),
-                        cpu_times: Vec::new(),
-                        last_cpu: None,
-                        last_frame: None,
-                        item_ix: 0,
-                        done: false,
-                    }),
-                    friction: None,
-                    friction_gen: 0,
-                    friction_path_stated: false,
-                    rail_scroll: ScrollHandle::new(),
-                    files_scroll: ScrollHandle::new(),
+                let handle = shell.read(cx).focus.clone();
+                window.focus(&handle, cx);
+                // Slice P1: `EAVE_OVERLAY_DEMO=open` opens the menu on the
+                // first frame, so the surface can be looked at rather than
+                // only asserted. A fixed anchor rather than the pointer's,
+                // because there is no pointer yet.
+                if overlay::demo_opens_at_boot() {
+                    shell.update(cx, |s, cx| s.open_demo_menu(point(px(240.), px(180.)), cx));
                 }
-            });
-            let handle = shell.read(cx).focus.clone();
-            window.focus(&handle, cx);
-            // Slice P1: `EAVE_OVERLAY_DEMO=open` opens the menu on the
-            // first frame, so the surface can be looked at rather than
-            // only asserted. A fixed anchor rather than the pointer's,
-            // because there is no pointer yet.
-            if overlay::demo_opens_at_boot() {
-                shell.update(cx, |s, cx| {
-                    s.open_demo_menu(point(px(240.), px(180.)), cx)
-                });
-            }
-            // Slice Q2: `EAVE_LAUNCH_AT_BOOT=1` presses the launcher's own
-            // start button on the first frame.
-            //
-            // This exists because the launcher's HALF that a capture can
-            // prove is the half that does nothing: a shot shows eave
-            // resting instead of auto-opening, and cannot show a click
-            // producing a session. The harness cannot cover it either —
-            // it replaces the connection loop with plumbing, so
-            // `Command::Launch` reaching a real `open_with_agent` is
-            // exercised by no test in the suite. Same shape and same
-            // reason as P1's `EAVE_OVERLAY_DEMO`.
-            if std::env::var("EAVE_LAUNCH_AT_BOOT").map(|v| v == "1").unwrap_or(false) {
-                shell.update(cx, |s, cx| s.launch(cx));
-            }
-            shell
-        },
-    )
-    .expect("open window");
+                // Slice Q2: `EAVE_LAUNCH_AT_BOOT=1` presses the launcher's own
+                // start button on the first frame.
+                //
+                // This exists because the launcher's HALF that a capture can
+                // prove is the half that does nothing: a shot shows eave
+                // resting instead of auto-opening, and cannot show a click
+                // producing a session. The harness cannot cover it either —
+                // it replaces the connection loop with plumbing, so
+                // `Command::Launch` reaching a real `open_with_agent` is
+                // exercised by no test in the suite. Same shape and same
+                // reason as P1's `EAVE_OVERLAY_DEMO`.
+                if std::env::var("EAVE_LAUNCH_AT_BOOT")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    shell.update(cx, |s, cx| s.launch(cx));
+                }
+                shell
+            },
+        )
+        .expect("open window");
+    // The bar, last: a `setMainMenu_` issued before the window exists and
+    // before activation does not stick (see `app_menus::install`).
+    crate::app_menus::install(cx);
     cx.activate(true);
     handle
 }
@@ -5721,6 +6398,35 @@ mod harness;
 
 #[cfg(test)]
 mod tests {
+    /// A fence under the cap is drawn verbatim; over it, the view stops and
+    /// says so — including that copy is unaffected, because the failure this
+    /// notice prevents is someone believing eave truncated their data.
+    #[test]
+    fn a_long_fence_states_what_it_is_not_drawing() {
+        let short = "let x = 1;\nlet y = 2;";
+        assert_eq!(fence_view(short), short, "under the cap, verbatim");
+
+        let long: String = (0..theme::FENCE_MAX_LINES + 40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = fence_view(&long);
+        assert_eq!(
+            view.lines().count(),
+            theme::FENCE_MAX_LINES + 1,
+            "the drawn fence is the cap plus its own one-line notice"
+        );
+        assert!(view.contains("40 more lines"), "the remainder is stated");
+        assert!(
+            view.contains(&format!("copy takes all {}", theme::FENCE_MAX_LINES + 40)),
+            "a cap that does not say copy is unaffected reads as data loss"
+        );
+        assert!(
+            view.starts_with("line 0"),
+            "the cap drops the TAIL, not the head"
+        );
+    }
+
     use super::*;
 
     /// Slice M (§1.21). The veil's curve is an ease-OUT: it must reach
@@ -5838,5 +6544,131 @@ mod tests {
         assert_eq!(short_cwd("/Users/x/proj", Some("/Users/x")), "~/proj");
         assert_eq!(short_cwd("/opt/proj", Some("/Users/x")), "/opt/proj");
         assert_eq!(short_cwd("/opt/proj", None), "/opt/proj");
+    }
+
+    fn info(id: &str, created: u64, activity: Option<u64>) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            title: None,
+            provider: "claude-code".into(),
+            model: None,
+            cwd: "/tmp/repo".into(),
+            created_ts_ms: created,
+            last_activity_ms: activity,
+            state: "idle".into(),
+            live: false,
+            epoch: 1,
+            last_seq: 0,
+            checkout_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            pending_approvals: 0,
+            permission_mode: None,
+            rss_bytes: None,
+        }
+    }
+
+    /// Stage AB. Activity decides where a row LANDS; it never decides
+    /// again. Both halves are asserted here because either alone is the
+    /// wrong product: sort-always is comet's moving-target rail, and
+    /// sort-never means the session you were last working in can be
+    /// anywhere after a restart.
+    #[test]
+    fn activity_places_a_row_once_and_then_leaves_it_alone() {
+        let mut rows = Vec::new();
+
+        // Cold start: everything is an arrival, so everything sorts.
+        // `b` was created first but acted most recently — activity wins,
+        // which is the whole reason the field exists.
+        fold_rail(
+            &mut rows,
+            vec![
+                info("a", 100, None),
+                info("b", 10, Some(900)),
+                info("c", 300, None),
+            ],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["b", "c", "a"]);
+
+        // The same sessions again, with `a` now the most recently active
+        // by a wide margin. Nothing moves.
+        fold_rail(
+            &mut rows,
+            vec![
+                info("a", 100, Some(99_999)),
+                info("b", 10, Some(900)),
+                info("c", 300, None),
+            ],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["b", "c", "a"],
+            "a state change re-sorted the rail — that is the bug that moves \
+             a row out from under a click"
+        );
+        // ...but the FACTS did fold by replacement.
+        assert_eq!(rows[2].last_activity_ms, Some(99_999));
+
+        // A genuinely new session is an arrival, so it does place itself,
+        // and a session that is gone from the snapshot loses its row.
+        fold_rail(
+            &mut rows,
+            vec![
+                info("a", 100, Some(99_999)),
+                info("c", 300, None),
+                info("d", 400, None),
+            ],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["d", "c", "a"], "arrivals place, survivors hold");
+    }
+
+    /// Two sessions opened inside the same millisecond still need a
+    /// defined order, or the rail reshuffles itself between snapshots.
+    #[test]
+    fn a_tie_in_activity_is_broken_by_identity() {
+        let mut rows = Vec::new();
+        fold_rail(
+            &mut rows,
+            vec![info("bbbb", 5, None), info("aaaa", 5, None)],
+        );
+        let ids: Vec<&str> = rows.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["aaaa", "bbbb"]);
+    }
+
+    /// Stage AB: the row's primary label. A named session says its name; an
+    /// unnamed one says its provider — never an empty string, which is what
+    /// would draw the blank line this slice is not allowed to produce.
+    #[test]
+    fn an_unnamed_row_falls_back_to_the_provider_rather_than_to_nothing() {
+        let mut s = info("aaaa1111", 1, None);
+        assert_eq!(row_label(&s, "claude code"), "claude code");
+        s.title = Some("review the parser".into());
+        assert_eq!(row_label(&s, "claude code"), "review the parser");
+    }
+
+    /// The meta line is what tells two untitled sessions in one repo apart,
+    /// so the identity has to be on it — except where it would be said
+    /// twice.
+    #[test]
+    fn the_meta_line_names_the_session_unless_the_path_already_does() {
+        let mut s = info("aaaa1111", 1, None);
+        s.cwd = "/Users/x/proj".into();
+        assert_eq!(rail_meta_line(&s, Some("/Users/x")), "aaaa1111 · ~/proj");
+
+        let mut other = s.clone();
+        other.session_id = "bbbb2222".into();
+        assert_ne!(
+            rail_meta_line(&s, Some("/Users/x")),
+            rail_meta_line(&other, Some("/Users/x")),
+            "same repo, same provider — the meta line is the only thing \
+             left to tell them apart"
+        );
+
+        // An isolated session's cwd already ends in its own sid8.
+        s.cwd = "/Users/x/wt/proj/aaaa1111".into();
+        assert_eq!(rail_meta_line(&s, Some("/Users/x")), "~/wt/proj/aaaa1111");
     }
 }

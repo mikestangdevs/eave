@@ -27,7 +27,9 @@ fn show(t0: Instant, event: &SessionEvent) {
 async fn main() {
     let session_id = uuid::Uuid::new_v4().to_string();
     let cwd = std::env::temp_dir();
-    println!("chosen session id: {session_id}\n=== phase 1: plant codeword, watch stream, kill ===");
+    println!(
+        "chosen session id: {session_id}\n=== phase 1: plant codeword, watch stream, kill ==="
+    );
 
     let cfg = SpawnConfig::new("claude", &cwd, session_id.clone());
     let (mut session, mut rx) = ClaudeCodeSession::spawn(&cfg).expect("spawn");
@@ -55,11 +57,17 @@ async fn main() {
     );
 
     let id = session.identity();
-    println!("identity_matches before kill: {}", proc::identity_matches(&id));
+    println!(
+        "identity_matches before kill: {}",
+        proc::identity_matches(&id)
+    );
     let report = session.kill().await.expect("kill must be provable");
     println!("kill report: {report:?}");
     println!("group_alive after kill: {}", process::group_alive(id.pid));
-    println!("identity_matches after kill: {}", proc::identity_matches(&id));
+    println!(
+        "identity_matches after kill: {}",
+        proc::identity_matches(&id)
+    );
     while let Some(event) = rx.recv().await {
         show(t0, &event);
     }

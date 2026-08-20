@@ -36,11 +36,15 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     /// The operator's words, handed to the model verbatim.
-    Denied { message: String },
+    Denied {
+        message: String,
+    },
     /// Nobody answered and the question is gone — the provider withdrew
     /// it, or the process ended under it. It can never be answered now,
     /// and a card that pretends otherwise is a lie.
-    Withdrawn { reason: String },
+    Withdrawn {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,13 +54,75 @@ pub enum ToolStatus {
     Interrupted,
 }
 
+/// The one line a tool row states about what it was asked to do.
+///
+/// Every tool's `input` is an object with a different shape, and exactly one
+/// of its keys is the thing an operator wants to read: the command for a
+/// shell, the path for a file op, the pattern for a search. This maps a tool
+/// name to that key and returns nothing when it does not know one — a row
+/// that states the tool alone is honest, and inventing a summary from an
+/// arbitrary key would not be.
+///
+/// The keys are the ones the real CLI sends, read off the capture corpus at
+/// `docs/research/approvals-capture-2026-08-18/` (Bash → `command`, Read and
+/// Write → `file_path`); the rest follow the same tool's documented input
+/// and are marked where they are unverified against a capture.
+pub fn tool_detail(name: &str, input: &str) -> Option<String> {
+    if input.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    // Verified against captures: Bash, Read, Write.
+    // Unverified (documented shapes, no capture yet): the rest.
+    let key = match name {
+        "Bash" | "BashOutput" => "command",
+        "Read" | "Write" | "NotebookEdit" => "file_path",
+        "Edit" | "MultiEdit" => "file_path",
+        "Glob" | "Grep" => "pattern",
+        "WebFetch" => "url",
+        "WebSearch" => "query",
+        "Task" => "description",
+        _ => return None,
+    };
+    let raw = v.get(key)?.as_str()?;
+    // One line: a heredoc or a multi-line command states its first line and
+    // says so, rather than making one row as tall as a script.
+    let mut lines = raw.lines();
+    let first = lines.next()?.trim_end();
+    if first.is_empty() {
+        return None;
+    }
+    Some(if lines.next().is_some() {
+        format!("{first} …")
+    } else {
+        first.to_string()
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    User { text: String, delivery: Delivery },
+    User {
+        text: String,
+        delivery: Delivery,
+    },
     /// Assistant text; `live` while streaming deltas, settled by the
     /// snapshot or a turn end.
-    Assistant { text: String, live: bool },
-    Tool { id: String, name: String, status: ToolStatus },
+    Assistant {
+        text: String,
+        live: bool,
+    },
+    /// A tool call. `input` is the provider's request object as compact
+    /// JSON and `result` its reply as text — both already bounded by
+    /// `eave_core::events::TOOL_PAYLOAD_CAP` before they reach here, so a
+    /// row is never the thing that has to defend the render budget.
+    Tool {
+        id: String,
+        name: String,
+        status: ToolStatus,
+        input: String,
+        result: String,
+        is_error: bool,
+    },
     /// The agent is asking to run one tool (Slice K). Every fact an
     /// operator needs to decide is on the row: an approval given without
     /// knowing what was approved is the failure the slice exists to
@@ -71,7 +137,9 @@ pub enum Row {
     },
     /// Non-content markers rendered inline: session start, turn ends,
     /// interruptions, terminal outcome.
-    Marker { text: String },
+    Marker {
+        text: String,
+    },
 }
 
 /// One session's projected transcript plus its resume cursor.
@@ -232,13 +300,20 @@ impl Transcript {
                     live: false,
                 }),
             },
-            SessionEvent::ToolUseStarted { id, name } => self.push_row(Row::Tool {
+            SessionEvent::ToolUseStarted { id, name, input } => self.push_row(Row::Tool {
                 id: id.clone(),
                 name: name.clone(),
                 status: ToolStatus::Running,
+                input: input.clone(),
+                result: String::new(),
+                is_error: false,
             }),
-            SessionEvent::ToolUseFinished { id } => {
-                self.set_tool_status(id, ToolStatus::Finished);
+            SessionEvent::ToolUseFinished {
+                id,
+                result,
+                is_error,
+            } => {
+                self.finish_tool(id, result, *is_error);
             }
             // The CLI's echo of our own message — the `UserSent` row already
             // renders it; a duplicate row would be merge-by-accident.
@@ -331,10 +406,14 @@ impl Transcript {
     }
 
     fn last_live_assistant_ix(&self) -> Option<usize> {
-        self.rows.iter().enumerate().rev().find_map(|(ix, row)| match row {
-            Row::Assistant { live, .. } if *live => Some(ix),
-            _ => None,
-        })
+        self.rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, row)| match row {
+                Row::Assistant { live, .. } if *live => Some(ix),
+                _ => None,
+            })
     }
 
     fn settle_live_rows(&mut self) {
@@ -379,9 +458,37 @@ impl Transcript {
         }
     }
 
+    /// Resolve a tool row: its status, its reply and the provider's error
+    /// flag land together, because they are one fact arriving at one moment
+    /// and a row that took them separately could render "done" with the
+    /// previous call's output.
+    fn finish_tool(&mut self, id: &str, result: &str, is_error: bool) {
+        for ix in 0..self.rows.len() {
+            if let Row::Tool {
+                id: rid,
+                status,
+                result: r,
+                is_error: e,
+                ..
+            } = &mut self.rows[ix]
+            {
+                if rid == id {
+                    *status = ToolStatus::Finished;
+                    *r = result.to_string();
+                    *e = is_error;
+                    self.touch(ix);
+                    return;
+                }
+            }
+        }
+    }
+
     fn set_tool_status(&mut self, id: &str, status: ToolStatus) {
         for ix in 0..self.rows.len() {
-            if let Row::Tool { id: rid, status: s, .. } = &mut self.rows[ix] {
+            if let Row::Tool {
+                id: rid, status: s, ..
+            } = &mut self.rows[ix]
+            {
                 if rid == id {
                     *s = status;
                     self.touch(ix);
@@ -412,6 +519,41 @@ impl std::error::Error for SeqGap {}
 
 #[cfg(test)]
 mod tests {
+
+    /// The inputs here are copied from the real capture corpus
+    /// (`docs/research/approvals-capture-2026-08-18/`), not invented, because
+    /// a summariser tested against its own author's guess about the wire is
+    /// testing nothing.
+    #[test]
+    fn a_tool_row_states_what_it_was_asked_to_do() {
+        assert_eq!(
+            tool_detail(
+                "Bash",
+                r#"{"command":"echo hello-from-bash > out.txt","description":"Write \"hello-from-bash\" to out.txt"}"#
+            )
+            .as_deref(),
+            Some("echo hello-from-bash > out.txt")
+        );
+        assert_eq!(
+            tool_detail("Write", r#"{"file_path":"/tmp/x/out.txt","content":"one"}"#).as_deref(),
+            Some("/tmp/x/out.txt")
+        );
+        // A tool whose summary key we do not know states its name alone.
+        assert_eq!(tool_detail("SomeMcpTool", r#"{"whatever":1}"#), None);
+        // ...and so does one whose input never arrived (a pre-slice journal).
+        assert_eq!(tool_detail("Bash", ""), None);
+        // Malformed input is not a panic and not a lie.
+        assert_eq!(tool_detail("Bash", "{not json"), None);
+    }
+
+    /// A row is one line tall however long the command is.
+    #[test]
+    fn a_multi_line_command_states_its_first_line_and_says_so() {
+        let d = tool_detail("Bash", r#"{"command":"cat <<EOF\nline two\nEOF"}"#).unwrap();
+        assert_eq!(d, "cat <<EOF …");
+        assert!(!d.contains('\n'), "a tool detail must never be multi-line");
+    }
+
     use super::*;
 
     fn rec(seq: u64, event: JournalEvent) -> Record {
@@ -430,7 +572,12 @@ mod tests {
             &[
                 rec(1, JournalEvent::UserSent { text: "hi".into() }),
                 rec(2, JournalEvent::UserDelivered {}),
-                rec(3, JournalEvent::UserSent { text: "lost".into() }),
+                rec(
+                    3,
+                    JournalEvent::UserSent {
+                        text: "lost".into(),
+                    },
+                ),
                 rec(
                     4,
                     JournalEvent::Closed {
@@ -468,6 +615,7 @@ mod tests {
                         event: SessionEvent::ToolUseStarted {
                             id: "toolu_1".into(),
                             name: "Bash".into(),
+                            input: String::new(),
                         },
                     },
                 ),
