@@ -13,6 +13,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::events::SessionEvent;
 use crate::journal::{classify_exit, JournalEvent, JournalWriter, Outcome, Record};
+use crate::proc;
 use crate::session::AgentSession;
 use crate::store::Meta;
 use crate::thresholds::JOURNAL_FLUSH_INTERVAL;
@@ -57,7 +58,36 @@ pub async fn send_and_journal<S: AgentSession + ?Sized>(
         //
         // Still `Ok`: a refused write is a fact about the agent, not an
         // error in the engine, and the caller's contract is unchanged.
-        Err(e) => Ok(Some(e.to_string())),
+        //
+        // Slice AE: keeping the io error was not enough either. Every
+        // failure of this write reads `Broken pipe (os error 32)`, and one
+        // string covers two states a reader must not confuse:
+        //
+        //   - the agent is alive and refused the write — a fact about the
+        //     agent, which is what the bool was designed to say;
+        //   - the agent was already DEAD when we wrote — a session that
+        //     never started, or has since exited, where "the agent refused
+        //     your message" is simply untrue.
+        //
+        // Reproduced deterministically 2026-08-20: an agent that exits at
+        // spawn yields exactly `delivered = false` with reason `io error:
+        // Broken pipe (os error 32)`, indistinguishable until now from a
+        // live agent refusing. Liveness is answered from the OS rather
+        // than from a flag a supervisor task still has to set: the (pid,
+        // start_time) guard is an immediate fact and cannot race the exit
+        // it reports on.
+        Err(e) => {
+            let id = session.identity();
+            if proc::identity_matches(&id) {
+                Ok(Some(e.to_string()))
+            } else {
+                Ok(Some(format!(
+                    "the agent process (pid {}) was already gone when the message was \
+                     written, so nothing refused it — the session is dead, not busy ({e})",
+                    id.pid
+                )))
+            }
+        }
     }
 }
 
