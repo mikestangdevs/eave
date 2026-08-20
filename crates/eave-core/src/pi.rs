@@ -1702,23 +1702,20 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the real `pi` CLI on PATH"]
     async fn live_pi_without_the_gate_registers_no_approval_surface() {
-        let out = tokio::process::Command::new("pi")
+        let mut child = tokio::process::Command::new("pi")
             .args(["--mode", "rpc", "--no-session", "-ne"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .and_then(|mut c| {
-                let mut stdin = c.stdin.take().expect("stdin");
-                tokio::spawn(async move {
-                    let _ = stdin
-                        .write_all(b"{\"id\":\"g\",\"type\":\"get_commands\"}\n")
-                        .await;
-                });
-                Ok(c)
-            })
             .expect("pi must spawn");
-        let output = tokio::time::timeout(Duration::from_secs(30), out.wait_with_output())
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        tokio::spawn(async move {
+            let _ = stdin
+                .write_all(b"{\"id\":\"g\",\"type\":\"get_commands\"}\n")
+                .await;
+        });
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
             .await
             .expect("pi must answer")
             .expect("output");
