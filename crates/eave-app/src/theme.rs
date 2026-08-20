@@ -71,23 +71,6 @@ fn wash_content() -> Hsla {
 fn wash_raised() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.044)
 }
-fn wash_panel() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.080)
-}
-fn wash_modal() -> Hsla {
-    hsla(220.0 / 360.0, 0.10, 0.90, 0.116)
-}
-/// Attention plates: single-color equivalents of (L2 wash, then state
-/// wash) stacked, so over a black backdrop they equal the opaque plates.
-fn wash_warning_plate() -> Hsla {
-    rgba(0xe3cfb11d).into()
-}
-fn wash_warning_plate_strong() -> Hsla {
-    rgba(0xe1c4932e).into()
-}
-fn wash_danger_plate() -> Hsla {
-    rgba(0xe3adab1f).into()
-}
 
 // ---------------------------------------------------------------------------
 // Surfaces — all washes over the glass ground (see above)
@@ -97,16 +80,18 @@ pub fn canvas() -> Hsla {
     glass_canvas()
 }
 /// Raised blocks: user directive blocks, pills, cards.
+///
+/// **The only rung of the old five-rung ladder that anything paints.**
+/// `panel()`, `composer()` and `surface_modal()` were retired in Slice AG
+/// with zero call sites each — `surface_modal`'s own doc had said so out
+/// loud ("L3 surface — reserved; no modal exists yet") while
+/// `every_rung_is_a_step_you_can_see` and
+/// `glass_ladder_never_inverts_on_any_backdrop` spent a 52-backdrop sweep
+/// constraining all three. Both tests now measure the two ladders eave
+/// actually paints: `canvas → content_plate → raised` in the reading column
+/// and `chrome_glass → menu_glass` in the floating chrome.
 pub fn raised() -> Hsla {
     wash_raised()
-}
-/// L2 chrome plate: in-flow cards above the log (rail, composer, panels).
-pub fn panel() -> Hsla {
-    wash_panel()
-}
-/// The composer card plate — L2 chrome, same rung as [`panel`].
-pub fn composer() -> Hsla {
-    panel()
 }
 
 // ---------------------------------------------------------------------------
@@ -194,14 +179,16 @@ pub fn content_plate() -> Hsla {
 ///
 /// A per-edge rim light — a brighter hairline on the top edge only — is the
 /// next refinement and is deliberately not in this slice.
+///
+/// Slice AG: the rim in question is [`border`]. `border_inset` — the token
+/// Slice U introduced for this job and `a_sunken_plate_is_read_from_its_rim`
+/// measured — had **zero call sites**: all four sunken plates
+/// (`ui.rs` fence body, tool payload, approval payload, quote block) draw
+/// `.border_color(theme::border())`. It was retired and the test re-pointed
+/// at what is painted; `border()` rises 11.8→15.3/255 across the sweep and
+/// clears the floor everywhere, so nothing moved on screen.
 pub fn inset() -> Hsla {
     gpui::transparent_black()
-}
-
-/// The rim that carries a sunken plate now that its fill does not. One step
-/// up from [`border`], because it is doing the whole job alone.
-pub fn border_inset() -> Hsla {
-    border_strong()
 }
 
 /// The resting end of a hover wash on an unfilled control (Slice N2) —
@@ -265,10 +252,6 @@ pub fn overlay_strongest() -> Hsla {
 //                   (composer, floating pills)     shadow
 //   L3     #2E2E2E  modal layer (reserved)         hairline α.20 + accent
 //
-// `canvas`/`raised`/`composer`/`panel`/`inset` below are the semantic
-// names for these rungs; `border`/`border_strong`/`edge_modal` are the
-// hairline ladder.
-//
 // **Those hexes are REFERENCE VALUES, not a code path** (2026-08-19). eave
 // shipped an opaque build alongside the glass one until then, and the
 // washes were tuned so that each rung composites to its hex over the glass
@@ -276,12 +259,16 @@ pub fn overlay_strongest() -> Hsla {
 // alpha it has. The opaque build is gone by ruling: glass is the only look,
 // `EAVE_VIBRANCY` no longer exists, and there is no fallback. The hexes stay
 // because deleting them would delete the derivation of every alpha below.
+//
+// **The L2 and L3 SURFACES are gone (Slice AG); the L3 hairline is not.**
+// `panel`, `composer` and `surface_modal` had zero call sites between them
+// while two flagship tests swept 52 backdrops over exactly those rungs. The
+// ladders eave paints are `canvas → content_plate → raised` in the reading
+// column and `chrome_glass → menu_glass` in the floating chrome; the tests
+// measure those now. `edge_modal` stays because `overlay::menu_layer`
+// genuinely draws it, which is the whole distinction being made here.
 
-/// L3 surface — reserved; no modal exists yet.
-pub fn surface_modal() -> Hsla {
-    wash_modal()
-}
-/// L3 hairline — reserved with it.
+/// L3 hairline — the popover's rim (`overlay::menu_layer`).
 pub fn edge_modal() -> Hsla {
     hsla(220.0 / 360.0, 0.10, 0.90, 0.20)
 }
@@ -310,12 +297,43 @@ pub fn border_strong() -> Hsla {
 
 // ---------------------------------------------------------------------------
 // Text tiers
+//
+// **An ink is chosen for the SURFACE it lands on, not for the tier it
+// belongs to** (Slice AG). Slice U solved these two greys against the bare
+// glass ground and stopped there, and it solved them to *fit*: at the bright
+// end of the backdrop sweep `text_secondary` measured 4.71:1 against a 4.5
+// floor and `text_tertiary` 3.04:1 against a 3.0 floor. `#a8a8a8` clears 4.5:1
+// only up to a surface of **61/255** and the bare ground's bright end is
+// **59.0/255** — two units of headroom. So *any* surface above the ground
+// broke both tiers by construction, and eighteen drawn combinations were
+// below their floor on `aac8cf4`.
+//
+// Two consequences are written into the values below:
+//
+//  1. **Clearance, not fit.** Each tier now clears its floor by ≥0.4 of ratio
+//     at the worst backdrop. The margin is derived, not chosen: Slice AF
+//     measured the token→pixel skew at 1.8/255 against a 4.0/255 tolerance
+//     (`scripts/af-state-proof.sh`), and 4/255 of surface error costs up to
+//     **0.33** of contrast ratio at these surfaces. An arithmetic claim that
+//     clears by less than the instrument's own error is not a claim about
+//     what a person sees. Both moves are 4/255 and 9/255 — smaller than that
+//     same tolerance, so the guarantee moves and the picture does not.
+//  2. **A wash needs its own rung.** See [`text_secondary_on_wash`].
+//
+// `every_ink_clears_its_floor_on_every_surface_it_lands_on` is the assertion;
+// it enumerates real `.bg(…)`/`.text_color(…)` sites, not tokens.
 
 pub fn text() -> Hsla {
     rgb(0xe2e2e2).into()
 }
+/// The secondary tier on a BARE surface — the glass ground, the content
+/// well, a plate. Was `#a8a8a8`, which cleared [`TEXT_CONTRAST_FLOOR`] by
+/// 0.21 at the bright end of the sweep; `#acacac` clears it by 0.44.
+///
+/// It is also the tier the QUIET ink resolves to wherever a state wash can
+/// land — see [`text_tertiary`].
 pub fn text_secondary() -> Hsla {
-    rgb(0xa8a8a8).into()
+    rgb(0xacacac).into()
 }
 /// Placeholders, disabled, structural hints — the quietest tier that is
 /// still allowed to carry a fact.
@@ -327,8 +345,41 @@ pub fn text_secondary() -> Hsla {
 /// was retired rather than raised, because the value that would clear the
 /// floor (`#858585`) is this tier — two names for one colour is not a
 /// hierarchy. Three tiers, each of which clears [`TEXT_CONTRAST_FLOOR`].
+///
+/// Was `#858585`, at 3.04:1 against a 3.0 floor — fit, not clearance.
+/// `#8e8e8e` reads 3.42:1.
+///
+/// **This tier may not be drawn where a state wash can land on it.** Solving
+/// a quiet ink for `overlay_strong` at the bright end gives `#ababab`, which
+/// is the secondary tier — the `text_ghost` retirement criterion, reached
+/// from the other direction. So the rule is the demotion rather than a new
+/// token: on a washable surface the quiet ink resolves to
+/// [`text_secondary`] and the secondary ink to [`text_secondary_on_wash`].
+/// The ladder shifts up one rung; it does not gain a rung at the bottom.
 pub fn text_tertiary() -> Hsla {
-    rgb(0x858585).into()
+    rgb(0x8e8e8e).into()
+}
+
+/// The secondary tier where a STATE WASH can land on it — the rail's session
+/// label and provider chip, `+ new`, a file row's basename, a diff line's
+/// text. Solved against `overlay_strong` over the brightest ground in the
+/// sweep (82.5/255, the selected rail row), where it reads **4.91:1**.
+///
+/// It exists because the state ladder leaves no room for the plain tier.
+/// At the bright end the ground is 59.0/255 and [`STATE_DELTA_FLOOR`] forces
+/// three rungs above it, so the cheapest possible ladder still lands its
+/// rungs at 67/75/83 — all above the 61/255 ceiling at which `#a8a8a8` last
+/// cleared 4.5:1. **Capping the washes cannot fix this even in principle**;
+/// it is not merely that capping them would undo Slice AF.
+///
+/// Sites that can reach the THIRD rung — a hover wash composited over a
+/// selected row's `overlay_strong`, 94.1/255 — take [`text`] instead: this
+/// rung would read 4.35:1 there. That is the rail's five row affordances
+/// (rename, archive, isolate, open, delete), and they are the affordances of
+/// the row you are managing, so primary is the right ink anyway (the same
+/// call Slice AD made for the markdown table header).
+pub fn text_secondary_on_wash() -> Hsla {
+    rgb(0xcecece).into()
 }
 
 /// Primary-action fill (the send button when armed) and the text on it.
@@ -363,22 +414,18 @@ pub fn danger() -> Hsla {
     rgb(0xe2726a).into()
 }
 
-/// Panel tints for the attention surfaces (ring = border, wash = fill).
+/// Panel rings for the attention surfaces. The matching *fills* live in the
+/// glass tints below — Slice AG retired `warning_wash`, `warning_wash_strong`
+/// and `danger_wash` along with `warning_plate`/`warning_plate_strong`/
+/// `danger_plate`, all six of which had zero call sites while
+/// `glass_ground_is_near_black_and_content_sinks` measured two of them.
 pub fn warning_ring() -> Hsla {
     warning().opacity(0.20)
-}
-pub fn warning_wash() -> Hsla {
-    warning().opacity(0.05)
-}
-pub fn warning_wash_strong() -> Hsla {
-    warning().opacity(0.12)
 }
 pub fn danger_ring() -> Hsla {
     danger().opacity(0.22)
 }
-pub fn danger_wash() -> Hsla {
-    danger().opacity(0.06)
-}
+/// The kill button's resting fill (`attn-kill`).
 pub fn danger_wash_strong() -> Hsla {
     danger().opacity(0.14)
 }
@@ -387,21 +434,6 @@ pub fn danger_wash_strong() -> Hsla {
 /// rather than the neutral wash (Slice M).
 pub fn danger_wash_hover() -> Hsla {
     danger().opacity(0.24)
-}
-
-/// Attention/connection panels sit at L2: their tint is pre-composited
-/// over [`panel`] (the wash alpha blended into `#282828`) so the panel
-/// is never darker than the chrome beneath it — a state surface must
-/// read raised, not sunken. Keep in sync with `panel()` and the wash
-/// alphas above.
-pub fn warning_plate() -> Hsla {
-    wash_warning_plate()
-}
-pub fn warning_plate_strong() -> Hsla {
-    wash_warning_plate_strong()
-}
-pub fn danger_plate() -> Hsla {
-    wash_danger_plate()
 }
 
 /// Diff line fills (Slice B2) — the only place state pigment tints a
@@ -1120,6 +1152,15 @@ mod tests {
     /// text loses contrast as it goes. Measuring on a black desktop only —
     /// which is what a screenshot on this machine shows — reports `text` at
     /// 15.46:1 when its real worst case is 8.65:1.
+    ///
+    /// **This is the BARE-GROUND case and only that.** It puts no surface
+    /// between the tier and the ground, which is how eighteen drawn
+    /// combinations sat under their floor for three slices —
+    /// `every_ink_clears_its_floor_on_every_surface_it_lands_on` is the one
+    /// that measures a tier where it is actually painted. This one is kept
+    /// because it constrains the tokens themselves: it survives a call site
+    /// being deleted, and it is what a new tier gets measured against before
+    /// anything paints it.
     #[test]
     fn every_text_tier_is_readable_on_any_backdrop() {
         for g in grounds() {
@@ -1197,6 +1238,14 @@ mod tests {
              ({worst:.2}:1 at worst) — the comment in `render_table` \
              explaining why the header cannot use it is stale"
         );
+        // Slice AG made this a narrower claim than it looks. `text_secondary`
+        // still cannot carry a header on its own wash (3.97:1 at the bright
+        // end after the tier's clearance nudge), but
+        // `text_secondary_on_wash` could — 5.30:1 there. AD's ruling that the
+        // header and its body cells both take the PRIMARY tier stands on its
+        // own reason ("a table is not a caption") and was not re-litigated;
+        // what changed is that "the quiet tier does not survive its own wash"
+        // is now a fact about `text_secondary`, not about every ink.
         // The checkmark inside a ticked task box, against its own fill.
         // Opaque, so no ground sweep applies.
         let tick: Rgba = on_inverse().into();
@@ -1241,25 +1290,64 @@ mod tests {
     /// direction. `glass_ladder_never_inverts_on_any_backdrop` asserts the
     /// ordering and no magnitude, so a ladder whose rungs differed by 1/255
     /// passed it. `raised -> panel` was 3.9/255.
+    ///
+    /// **Slice AG re-pointed this at the ladder eave paints.** It used to
+    /// sweep 52 backdrops over `wash_raised`/`wash_panel`/`wash_modal`, and
+    /// `panel()`, `composer()` and `surface_modal()` had **zero call sites**
+    /// between them — one rung of the five was painted. The reading column's
+    /// real ladder is `canvas → content_plate → raised`: the well is an inset
+    /// card that SINKS below the frost, and a directive block rises inside
+    /// it.
+    ///
+    /// The first step is the same shape as `inset` and the composer, and gets
+    /// the same ruling (2026-08-20, `floating_chrome_is_always_carried_by_
+    /// something`): **the fill alone cannot carry it, so the rim does.** The
+    /// well's black wash drops the ground by only 2.0/255 over a black
+    /// desktop — there is no room below a near-black ground — while its
+    /// `border()` hairline rises 11.8/255 there. At the bright end the fill
+    /// is at its strongest (−14.8) and the rim at its weakest (+11.8). The
+    /// assertion is on the surface, not on either part.
+    ///
+    /// The second step needs no ruling and no fix: `well → card` measures
+    /// +8.0 to +9.7 across the whole sweep. It was measured in Slice AF and
+    /// asserted by nothing until now.
     #[test]
     fn every_rung_is_a_step_you_can_see() {
+        let mut worst_carried = f32::MAX;
         for g in grounds() {
-            let raised = over(wash_raised(), g);
-            let panel = over(wash_panel(), g);
-            let modal = over(wash_modal(), g);
-            for (name, lo, hi) in [
-                ("ground->raised", units(g), units(raised)),
-                ("raised->panel", units(raised), units(panel)),
-                ("panel->modal", units(panel), units(modal)),
-            ] {
-                assert!(
-                    hi - lo >= SURFACE_STEP_FLOOR,
-                    "{name} is {:.1}/255 on ground {:.1}, floor {SURFACE_STEP_FLOOR}",
-                    hi - lo,
-                    units(g)
-                );
-            }
+            let well = over(wash_content(), g);
+            let card = over(wash_raised(), well);
+            let rim = over(border(), g);
+
+            // canvas -> content_plate: fill sinks, rim rises, and at every
+            // backdrop at least one of them clears the floor.
+            let fill_d = (units(g) - units(well)).abs();
+            let rim_d = (units(rim) - units(g)).abs();
+            let carried = fill_d.max(rim_d);
+            worst_carried = worst_carried.min(carried);
+            assert!(
+                carried >= SURFACE_STEP_FLOOR,
+                "the content well is invisible on ground {:.1}: fill {fill_d:.1}/255, \
+                 rim {rim_d:.1}/255, floor {SURFACE_STEP_FLOOR}",
+                units(g)
+            );
+
+            // content_plate -> raised: a plain step, no rim needed.
+            let step = units(card) - units(well);
+            assert!(
+                step >= SURFACE_STEP_FLOOR,
+                "well->card is {step:.1}/255 on ground {:.1}, floor {SURFACE_STEP_FLOOR}",
+                units(g)
+            );
         }
+        // Clearance, not fit. Quoted rather than derived from the floor, so
+        // raising SURFACE_STEP_FLOOR cannot make this pass by moving the bar
+        // it is measured against.
+        assert!(
+            worst_carried >= 8.0,
+            "the worst backdrop leaves the content well at only {worst_carried:.1}/255 \
+             — that is the floor, not clearance"
+        );
     }
 
     /// A popover is lighter than the chrome it floats on. On every backdrop.
@@ -1375,19 +1463,39 @@ mod tests {
     }
 
     /// A sunken plate carries no fill, so its rim must carry it alone.
+    ///
+    /// **The rim is `border()`, not `border_inset()`** (Slice AG). Slice U
+    /// introduced `border_inset` for this job and this test measured it, and
+    /// it had **zero call sites**: all four sunken plates — the fence body,
+    /// the tool payload, the approval payload and the quote block — write
+    /// `.border_color(theme::border())`. Same defect as `panel`/`composer`/
+    /// `surface_modal`, one token smaller and easy to miss because the
+    /// unpainted token was the *stronger* of the two, so the test was harder
+    /// than reality rather than easier. `border_inset` is retired; the
+    /// painted rim rises 11.8→15.3/255 and clears the floor everywhere, so
+    /// nothing moved on screen.
     #[test]
     fn a_sunken_plate_is_read_from_its_rim() {
         let fill: Rgba = inset().into();
         assert_eq!(fill.a, 0.0, "inset regained a fill it cannot afford");
+        let mut worst = f32::MAX;
         for g in grounds() {
-            let rim = over(border_inset(), g);
+            let rim = over(border(), g);
+            let d = units(rim) - units(g);
+            worst = worst.min(d);
             assert!(
-                units(rim) - units(g) >= STATE_DELTA_FLOOR,
-                "the inset rim is {:.1}/255 and it is the only thing drawing \
-                 the plate",
-                units(rim) - units(g)
+                d >= STATE_DELTA_FLOOR,
+                "the inset rim is {d:.1}/255 and it is the only thing drawing \
+                 the plate"
             );
         }
+        // Clearance, not fit — the number is written, not derived from the
+        // floor it sits above.
+        assert!(
+            worst >= 10.0,
+            "the sunken plate's rim falls to {worst:.1}/255 at its worst \
+             backdrop — that is the floor, not clearance"
+        );
     }
 
     /// A hovered or selected thing looks hovered or selected. Both were an
@@ -1456,22 +1564,76 @@ mod tests {
     /// — and with it the retired opaque-identity invariant: glass IS the
     /// look now, so it no longer needs to impersonate the opaque ladder
     /// on a black desktop). The content well darkens below the ground;
-    /// attention plates stay above it.
+    /// attention plates are found on every backdrop.
+    ///
+    /// **The plates measured here are the PAINTED ones** (Slice AG). This
+    /// test used to assert `wash_warning_plate` and `wash_danger_plate` rose
+    /// above the ground on every backdrop — and `warning_plate()`,
+    /// `warning_plate_strong()` and `danger_plate()` had zero call sites.
+    /// What the app paints is `warning_plate_glass`,
+    /// `warning_plate_strong_glass` and `danger_plate_glass`: the same hexes
+    /// at `CHROME_GLASS_ALPHA`, which admits 28% of the backdrop.
+    ///
+    /// Re-pointing it found the third instance of the `chrome_glass` shape:
+    /// **the quiet warning plate is 7.2/255 BELOW the frost on a white
+    /// desktop, and the danger plate 5.8/255 below.** Their tints (`#312f2b`
+    /// = 49, `#332c2c` = 51) sit inside the ground's own 8→59 range, so the
+    /// delta `α·(tint − ground)` must pass through zero — no alpha closes it,
+    /// exactly as `a_popover_clears_the_chrome_it_floats_on` records for the
+    /// composer. So the assertion takes the same 2026-08-20 ruling: **leave
+    /// the fill, let the ring carry it.** These panels were always ringed
+    /// (`warning_ring`, `danger_ring`) and the ring is doing 27–35/255 at the
+    /// backdrop where the fill vanishes — an order of magnitude above the
+    /// floor. Nothing moved on screen; what changed is that it is now
+    /// asserted about the surface a person sees rather than about a token
+    /// nothing draws.
     #[test]
     fn glass_ground_is_near_black_and_content_sinks() {
         let ground = over(glass_canvas(), (0.0, 0.0, 0.0));
         close(ground, rgb(0x080808).into());
         assert!(luma(over(wash_content(), ground)) < luma(ground));
-        for b in (0..=255).step_by(15) {
-            let v = b as f32 / 255.0;
-            let g = over(glass_canvas(), (v, v, v));
-            assert!(luma(over(wash_content(), g)) < luma(g), "backdrop {b}");
+        let mut worst = (f32::MAX, 0.0f32, 0.0f32, 0.0f32);
+        for g in grounds() {
             assert!(
-                luma(over(wash_warning_plate(), g)) > luma(g),
-                "backdrop {b}"
+                luma(over(wash_content(), g)) < luma(g),
+                "the content well stopped sinking on ground {:.1}",
+                units(g)
             );
-            assert!(luma(over(wash_danger_plate(), g)) > luma(g), "backdrop {b}");
+            for (name, plate, ring) in [
+                ("warning_plate_glass", warning_plate_glass(), warning_ring()),
+                (
+                    "warning_plate_strong_glass",
+                    warning_plate_strong_glass(),
+                    warning_ring(),
+                ),
+                ("danger_plate_glass", danger_plate_glass(), danger_ring()),
+            ] {
+                let surface = over(plate, g);
+                let rim = over(ring, surface);
+                let fill_d = (units(surface) - units(g)).abs();
+                let rim_d = (units(rim) - units(g)).abs();
+                let carried = fill_d.max(rim_d);
+                if carried < worst.0 {
+                    worst = (carried, units(g), fill_d, rim_d);
+                }
+                assert!(
+                    carried >= SURFACE_STEP_FLOOR,
+                    "{name} is invisible on ground {:.1}: fill {fill_d:.1}/255, \
+                     ring {rim_d:.1}/255, floor {SURFACE_STEP_FLOOR}",
+                    units(g)
+                );
+            }
         }
+        // Clearance, not fit, and the number is written rather than derived.
+        assert!(
+            worst.0 >= 8.0,
+            "an attention plate falls to {:.1}/255 on ground {:.1} (fill {:.1}, \
+             ring {:.1}) — that is the floor, not clearance",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3
+        );
     }
 
     /// The B2 diff washes obey the same law as every glass rung: on any
@@ -1515,26 +1677,463 @@ mod tests {
 
     /// The reason rungs are washes, not plates: over EVERY backdrop
     /// brightness the elevation ordering holds — steps compress toward
-    /// white but never invert, and inset stays sunken. Independent
+    /// white but never invert, and the well stays sunken. Independent
     /// plates (opaque or translucent) over a glass ground fail this.
+    ///
+    /// **Slice AG re-pointed this at the ladder eave paints**, for the same
+    /// reason as `every_rung_is_a_step_you_can_see`: it used to order
+    /// `raised < panel < modal` and two of those three had no call site. The
+    /// reading column is `content_plate < canvas < raised` — the well sinks
+    /// below the frost and a directive block rises inside the well — and it
+    /// is the ordering that must never invert, because the rails sit on the
+    /// bare frost beside the well and the two are edge to edge.
+    ///
+    /// The floating chrome's ordering (`chrome_glass < menu_glass`) is NOT
+    /// duplicated here: `a_popover_clears_the_chrome_it_floats_on` already
+    /// asserts a magnitude on that pair, which subsumes the direction.
     #[test]
     fn glass_ladder_never_inverts_on_any_backdrop() {
         for b in (0..=255).step_by(5) {
             let v = b as f32 / 255.0;
             let ground = over(glass_canvas(), (v, v, v));
             let g = luma(ground);
-            let raised = luma(over(wash_raised(), ground));
-            let panel = luma(over(wash_panel(), ground));
-            let modal = luma(over(wash_modal(), ground));
+            let well = luma(over(wash_content(), ground));
+            let card = luma(over(wash_raised(), over(wash_content(), ground)));
             // `inset` left this ladder when it stopped being a fill: a plate
             // that darkens a near-black ground moves 2/255 and reads as
             // nothing. It is asserted by `a_sunken_plate_is_read_from_its_rim`
             // instead. Ordering is still the invariant here; magnitude is
             // `every_rung_is_a_step_you_can_see`.
+            //
+            // **`ground < card` is deliberately NOT asserted, and it is
+            // false.** A directive block inside the well is fractionally
+            // DARKER than the bare frost beside it from backdrop ≈140 up
+            // (−0.1/255 at 140, −7/255 at white): the well's black wash takes
+            // a quarter of the ground away and `wash_raised` at α 0.044 gives
+            // back less than that. Asserting it was the first way this test
+            // was written and it failed at backdrop 140. It is not a defect —
+            // the two surfaces never touch, the well's rim and its
+            // `PLATE_MARGIN` are always between them — but the retired
+            // five-rung ladder implied `canvas < raised` globally, and as
+            // painted that is only true on a dark desktop. Recorded here so
+            // it is not rediscovered as a bug.
             assert!(
-                g < raised && raised < panel && panel < modal,
-                "backdrop {b}: ground {g} raised {raised} panel {panel} modal {modal}"
+                well < g,
+                "backdrop {b}: well {well} did not sink below ground {g}"
             );
+            assert!(well < card, "backdrop {b}: well {well} card {card}");
         }
+    }
+
+    /// **Every ink clears its floor over every surface it can land on.**
+    ///
+    /// This is the third and largest instance of the session's unifying
+    /// defect: *Slice U put floors on TOKENS rather than on SURFACES, and
+    /// chose the ground as the reference every time.*
+    /// `every_text_tier_is_readable_on_any_backdrop` sweeps 52 backdrops
+    /// under each tier and never puts a surface between them, so every glyph
+    /// drawn on a hover wash, a selection wash, a diff wash or a plate was
+    /// unconstrained. On `aac8cf4` **eighteen drawn combinations were below
+    /// their floor**, the worst of them `text_tertiary` on the selected rail
+    /// row at 2.09:1 against a 3.0 floor — the row that answers "which
+    /// session am I in", with its directory line on it.
+    ///
+    /// The table below is derived from real `.bg(…)` / `.text_color(…)` call
+    /// sites, NOT from the token list, because a token list lies in both
+    /// directions: `panel()`/`composer()`/`surface_modal()` were swept across
+    /// 52 backdrops while nothing painted them, and `chrome_glass`,
+    /// `menu_glass` and every state wash carried text that nothing measured.
+    /// Each row is the stack from the glass ground UP, so a row that begins
+    /// with `wash_content()` is inside the reading column and one that does
+    /// not is on the bare frost the rails sit on.
+    ///
+    /// Two rules the table encodes, both of them forced by arithmetic rather
+    /// than chosen:
+    ///
+    ///  - **The ink is chosen for the worst surface the site can REACH**, not
+    ///    for the surface it is resting on. A rail row's directory line is on
+    ///    the bare ground at rest, under `overlay` when hovered and under
+    ///    `overlay_strong` when selected; hover is a background fade and text
+    ///    cannot fade with it, so one ink has to survive all three.
+    ///  - **Capping the washes could not have worked.** At the bright end the
+    ///    ground is 59.0/255, `#a8a8a8` last cleared 4.5:1 at a surface of
+    ///    61/255, and [`STATE_DELTA_FLOOR`] forces three rungs above the
+    ///    ground — the cheapest legal ladder lands them at 67/75/83. The old
+    ///    secondary tier fails on a ladder that does not exist yet.
+    #[test]
+    fn every_ink_clears_its_floor_on_every_surface_it_lands_on() {
+        let well = || vec![wash_content()];
+        let bare = Vec::new;
+        let plate = warning_plate_strong_glass();
+        let sites: Vec<(&str, Hsla, f32, Vec<Hsla>)> = vec![
+            // --- the session rail: rows on the BARE frost, washed by state
+            (
+                "rail label, unselected",
+                text_secondary_on_wash(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "rail label, selected",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay_strong()],
+            ),
+            (
+                "rail provider chip",
+                text_secondary_on_wash(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay_strong()],
+            ),
+            (
+                "rail cwd/posture/shares/worktree lines",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![overlay_strong()],
+            ),
+            (
+                "rail state dot on a selected row",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![overlay_strong()],
+            ),
+            (
+                "rail row affordance, hovered on a selected row",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay_strong(), overlay()],
+            ),
+            (
+                "rail row affordance, hovered on an unselected row",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "rail '+ new'",
+                text_secondary_on_wash(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "rail archived shelf toggle",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "rail 'sessions' title",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                bare(),
+            ),
+            (
+                "rail resource ceiling",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                bare(),
+            ),
+            (
+                "rail empty note",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                bare(),
+            ),
+            // --- titlebar, also on the bare frost
+            (
+                "titlebar wordmark",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                bare(),
+            ),
+            (
+                "titlebar session id",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                bare(),
+            ),
+            (
+                "titlebar rail/files toggle glyph",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            // --- the files rail and the diff, on the bare frost
+            (
+                "file row basename",
+                text_secondary_on_wash(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "file row directory prefix",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "file row status glyph",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "files rail header + facts",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                bare(),
+            ),
+            (
+                "diff basis toggle, selected",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "diff basis toggle, unselected",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![overlay()],
+            ),
+            (
+                "diff added line",
+                text_secondary_on_wash(),
+                TEXT_CONTRAST_FLOOR,
+                vec![diff_add_bg()],
+            ),
+            (
+                "diff removed line",
+                text_secondary_on_wash(),
+                TEXT_CONTRAST_FLOOR,
+                vec![diff_del_bg()],
+            ),
+            (
+                "diff context line",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                bare(),
+            ),
+            // --- the reading column: everything sits on the well
+            ("transcript prose", text(), TEXT_CONTRAST_FLOOR, well()),
+            ("inline code", code_text(), TEXT_CONTRAST_FLOOR, well()),
+            (
+                "blockquote body",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                well(),
+            ),
+            (
+                "capped-block trailer",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                well(),
+            ),
+            (
+                "user directive block",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), wash_raised()],
+            ),
+            (
+                "marker pill",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            (
+                "markdown table header",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            ("markdown table cell", text(), TEXT_CONTRAST_FLOOR, well()),
+            (
+                "tool row name and payload",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                well(),
+            ),
+            (
+                "fence body on the sunken plate",
+                code_block_text(),
+                TEXT_CONTRAST_FLOOR,
+                well(),
+            ),
+            (
+                "approval card body, pending",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), plate],
+            ),
+            (
+                "approval card quiet line, pending",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), plate],
+            ),
+            (
+                "approval card payload, pending",
+                code_block_text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), plate],
+            ),
+            (
+                "approval card body, decided",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            (
+                "approval card quiet line, decided",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            // --- floating chrome inside the well
+            (
+                "composer draft",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), chrome_glass()],
+            ),
+            (
+                "composer placeholder and hint",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), chrome_glass()],
+            ),
+            (
+                "down-to-bottom pill",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), chrome_glass_hover()],
+            ),
+            (
+                "send glyph, unarmed and hovered",
+                text_secondary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), chrome_glass(), overlay_strongest()],
+            ),
+            (
+                "attention panel body",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), warning_plate_glass()],
+            ),
+            (
+                "attention panel quiet note",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), plate],
+            ),
+            (
+                "connection panel body",
+                text_secondary(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), danger_plate_glass()],
+            ),
+            // --- the launcher, inside the well
+            (
+                "launcher tile name, live and selected",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            (
+                "launcher tile name, dead and selected",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            (
+                "launcher tile caption, selected",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            (
+                "launcher cwd line",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                well(),
+            ),
+            (
+                "launcher model button",
+                text_secondary_on_wash(),
+                TEXT_CONTRAST_FLOOR,
+                vec![wash_content(), overlay()],
+            ),
+            // --- the popover: root-mounted, so its worst ground is the bare
+            //     frost the rails sit on, not the well
+            (
+                "menu row label",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![menu_glass(), overlay()],
+            ),
+            (
+                "menu row trailing hint",
+                text_tertiary(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![menu_glass(), overlay()],
+            ),
+            (
+                "menu row disabled label",
+                text_disabled(),
+                TEXT_QUIET_CONTRAST_FLOOR,
+                vec![menu_glass()],
+            ),
+            (
+                "menu row over the composer chrome",
+                text(),
+                TEXT_CONTRAST_FLOOR,
+                vec![chrome_glass(), menu_glass()],
+            ),
+        ];
+
+        let mut tightest = (f32::MAX, "", 0.0f32, 0.0f32);
+        for (site, ink, floor, stack) in &sites {
+            let c: Rgba = (*ink).into();
+            for g in grounds() {
+                let mut surface = g;
+                for wash in stack {
+                    surface = over(*wash, surface);
+                }
+                let r = contrast_ratio((c.r, c.g, c.b), surface);
+                assert!(
+                    r >= *floor,
+                    "{site} is {r:.2}:1 on a surface of {:.1}/255 (backdrop ground \
+                     {:.1}/255), floor {floor}",
+                    units(surface),
+                    units(g)
+                );
+                if r - floor < tightest.0 {
+                    tightest = (r - floor, site, r, *floor);
+                }
+            }
+        }
+
+        // Clearance, not fit — and the margin is DERIVED, not chosen.
+        //
+        // `theme.rs` reasons in straight alpha arithmetic on a synthetic
+        // ground; the screen goes through a compositor, a glass surface
+        // sampling a real desktop, a fade, and a colour space. Slice AF
+        // measured that trip for the first time and found a skew of 1.8/255
+        // against a 4.0/255 tolerance (`scripts/af-state-proof.sh`). At the
+        // surfaces in this table, 4/255 of surface error costs up to 0.33 of
+        // contrast ratio — so a floor cleared by less than that is an
+        // arithmetic claim, not a claim about what a person sees. 0.35 is
+        // written here rather than derived from either floor, so raising a
+        // floor cannot make this pass by moving the bar it is measured
+        // against.
+        assert!(
+            tightest.0 >= 0.35,
+            "the tightest ink in the app is {} at {:.3}:1 against a floor of {:.1} \
+             — {:.3} of clearance, less than the 0.35 the token→pixel skew costs",
+            tightest.1,
+            tightest.2,
+            tightest.3,
+            tightest.0
+        );
     }
 }
