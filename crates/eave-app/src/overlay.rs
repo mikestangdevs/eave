@@ -460,7 +460,12 @@ pub fn menu_row(
         .gap(px(theme::MENU_ROW_GAP))
         .text_size(px(theme::LABEL_SIZE))
         .line_height(px(theme::LABEL_LINE))
-        .text_color(theme::text())
+        .text_color(if item.enabled {
+            theme::text()
+        } else {
+            // By token, not by opacity — see the note in `launcher::tile`.
+            theme::text_disabled()
+        })
         .child(
             div()
                 .flex_1()
@@ -487,10 +492,7 @@ pub fn menu_row(
         // it — it is here because a row is a primitive, and a primitive
         // that leaks clicks the moment it is used outside its usual
         // wrapper is a trap rather than a component.
-        body.bg(rest)
-            .opacity(theme::DISABLED_OPACITY)
-            .occlude()
-            .into_any_element()
+        body.bg(rest).occlude().into_any_element()
     }
 }
 

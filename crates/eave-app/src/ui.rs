@@ -892,7 +892,7 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
         div()
             .text_size(px(theme::DETAIL_SIZE))
             .line_height(px(theme::DETAIL_LINE))
-            .text_color(theme::text_ghost())
+            .text_color(theme::text_tertiary())
             .child(SharedString::from(text))
             .into_any_element()
     };
@@ -944,7 +944,7 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .truncate()
                             .child(SharedString::from(hunk.header.clone()))
                             .into_any_element(),
@@ -968,7 +968,7 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                                 DiffOp::Del => styled
                                     .bg(theme::diff_del_bg())
                                     .text_color(theme::text_secondary()),
-                                DiffOp::Ctx => styled.text_color(theme::text_ghost()),
+                                DiffOp::Ctx => styled.text_color(theme::text_tertiary()),
                             }
                             .into_any_element(),
                         );
@@ -1066,7 +1066,7 @@ fn state_color(state: &str) -> Hsla {
         // but not a fault, so warning and never danger.
         "quiet" | "awaiting_approval" => theme::warning(),
         "unresponsive" | "failed" => theme::danger(),
-        _ => theme::text_ghost(),
+        _ => theme::text_tertiary(),
     }
 }
 
@@ -2277,7 +2277,7 @@ impl Shell {
                 div()
                     .ml_2()
                     .text_size(px(theme::SMALL_SIZE))
-                    .text_color(theme::text_ghost())
+                    .text_color(theme::text_tertiary())
                     .child(s)
             }))
             .child(div().flex_1())
@@ -2484,7 +2484,7 @@ impl Shell {
                             .truncate()
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .child(SharedString::from(short_cwd(&info.cwd, home.as_deref()))),
                     )
                     // Slice K amendment 3: the posture the CLI reported at
@@ -2503,7 +2503,7 @@ impl Shell {
                                 theme::WEIGHT_STRONG
                             })
                             .text_color(if posture_asks {
-                                theme::text_ghost()
+                                theme::text_tertiary()
                             } else {
                                 theme::danger()
                             })
@@ -2522,7 +2522,7 @@ impl Shell {
                             .pl(px(meta_indent))
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .child(SharedString::from(line))
                     }))
                     // Slice I2: worktree fact line, also full width.
@@ -2534,7 +2534,7 @@ impl Shell {
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
                             .text_color(if wt_present {
-                                theme::text_ghost()
+                                theme::text_tertiary()
                             } else {
                                 theme::warning()
                             })
@@ -2685,7 +2685,7 @@ impl Shell {
                         .debug_selector(|| "rail-empty".into())
                         .text_size(px(theme::SMALL_SIZE))
                         .line_height(px(theme::SMALL_LINE))
-                        .text_color(theme::text_ghost())
+                        .text_color(theme::text_tertiary())
                         .child("no sessions"),
                 )
                 .into_any_element()]
@@ -2799,7 +2799,7 @@ impl Shell {
                             } else {
                                 theme::WEIGHT_BODY
                             })
-                            .text_color(if over { theme::warning() } else { theme::text_ghost() })
+                            .text_color(if over { theme::warning() } else { theme::text_tertiary() })
                             .child(SharedString::from(line)),
                     )
             }))
@@ -2837,7 +2837,7 @@ impl Shell {
                 .px(px(theme::SPACE_2))
                 .text_size(px(theme::DETAIL_SIZE))
                 .line_height(px(theme::DETAIL_LINE))
-                .text_color(theme::text_ghost())
+                .text_color(theme::text_tertiary())
                 .child(SharedString::from(text.to_string()))
                 .into_any_element()
         };
@@ -2942,7 +2942,7 @@ impl Shell {
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_family(theme::MONO)
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .child(SharedString::from(n.to_string()))
                     })),
             )
@@ -2975,7 +2975,7 @@ impl Shell {
                             .debug_selector(|| "files-mode".into())
                             .text_size(px(theme::DETAIL_SIZE))
                             .line_height(px(theme::DETAIL_LINE))
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .child(text),
                     )
             }))
@@ -3066,7 +3066,7 @@ impl Shell {
                             div()
                                 .min_w(px(0.))
                                 .truncate()
-                                .text_color(theme::text_ghost())
+                                .text_color(theme::text_tertiary())
                                 .child(SharedString::from(dir)),
                         )
                     })
@@ -3095,7 +3095,7 @@ impl Shell {
                     .font_family(theme::MONO)
                     .text_size(px(theme::SMALL_SIZE))
                     .line_height(px(theme::SMALL_LINE))
-                    .text_color(theme::text_ghost())
+                    .text_color(theme::text_tertiary())
                     .child("—")
                     .into_any_element(),
             })
@@ -3193,12 +3193,12 @@ impl Shell {
                             .child(label)
                             .children(self.friction.as_ref().map(|(_, note)| {
                                 div()
-                                    .text_color(theme::text_ghost())
+                                    .text_color(theme::text_tertiary())
                                     .child(SharedString::from(note.clone()))
                             })),
                     )
                     .children(session.map(|s| {
-                        div().text_color(theme::text_ghost()).child(s)
+                        div().text_color(theme::text_tertiary()).child(s)
                     })),
             ),
         )
@@ -3649,7 +3649,7 @@ impl Shell {
                 let (label, dot) = match status {
                     ToolStatus::Running => ("running…", theme::live()),
                     ToolStatus::Finished if *is_error => ("failed", theme::danger()),
-                    ToolStatus::Finished => ("done", theme::text_ghost()),
+                    ToolStatus::Finished => ("done", theme::text_tertiary()),
                     ToolStatus::Interrupted => ("interrupted", theme::danger()),
                 };
                 // What the tool was ASKED to do. Until this slice a row was
@@ -4063,7 +4063,7 @@ impl Shell {
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::MICRO_LINE))
                             .font_weight(theme::WEIGHT_LABEL)
-                            .text_color(theme::text_ghost())
+                            .text_color(theme::text_tertiary())
                             .child(SharedString::from(label.to_string()))
                             // The strip's remaining width, so the button
                             // sits at the far edge without a spacer div.
@@ -4829,7 +4829,7 @@ impl Render for Shell {
                                 .child(div().text_color(theme::text()).child("▏"))
                                 .child(
                                     div()
-                                        .text_color(theme::text_ghost())
+                                        .text_color(theme::text_tertiary())
                                         .child("Message eave…"),
                                 )
                                 .into_any_element()
@@ -4848,7 +4848,7 @@ impl Render for Shell {
                                 .text_color(if pending_here > 0 {
                                     theme::warning()
                                 } else {
-                                    theme::text_ghost()
+                                    theme::text_tertiary()
                                 })
                                 // Slice K, capture N (2026-08-18): the CLI
                                 // swallows a user message sent while a
@@ -4906,7 +4906,7 @@ impl Render for Shell {
                                     if has_draft {
                                         theme::on_inverse()
                                     } else {
-                                        theme::text_ghost()
+                                        theme::text_tertiary()
                                     },
                                     "send-glyph",
                                 )),
@@ -5054,7 +5054,7 @@ impl Render for Shell {
                                             .justify_center()
                                             .text_size(px(theme::SMALL_SIZE))
                                             .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_ghost())
+                                            .text_color(theme::text_tertiary())
                                             .child(
                                                 div()
                                                     .opacity(t)

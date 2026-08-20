@@ -169,7 +169,7 @@ pub fn tile(
     // not cascade text colour into an SVG, so a tile that forgets this
     // lays out a perfectly correct 28px box and paints nothing.
     let mark_color = if !live {
-        theme::text_ghost()
+        theme::text_tertiary()
     } else if p.id == "claude-code" {
         // The one mark with a sourced brand colour. The other five render
         // in eave's own text colour rather than a hex I invented.
@@ -215,17 +215,27 @@ pub fn tile(
             div()
                 .text_size(px(theme::MICRO_SIZE))
                 .line_height(px(theme::MICRO_LINE))
-                .text_color(theme::text_ghost())
+                .text_color(theme::text_tertiary())
                 .child(if live { "ready" } else { "no adapter yet" }),
         );
 
     if live {
         body.cursor_pointer().on_click(on_click).into_any_element()
     } else {
-        // No handler, and dimmed as a whole rather than per-child: one
-        // opacity on the container keeps the mark, the name and the note
-        // in the same relationship they have when live.
-        body.opacity(theme::DISABLED_OPACITY).into_any_element()
+        // No handler, and dimmed by TOKEN rather than by opacity. The
+        // container multiply used to live here and it could not work: over
+        // the glass ground it took the tile's name from 2.72:1 to **1.54:1**
+        // and its caption to 1.28:1, on the six tiles that are the first
+        // thing anyone sees. It was not a bad constant — pure white through
+        // the same multiply only reaches 3.11:1, so no tier could have
+        // survived it (`a_container_opacity_cannot_express_disabled`).
+        //
+        // The relationship the old comment wanted is kept by the tokens
+        // themselves: a dead tile already picks `text_tertiary` for its
+        // name and its mark where a live one picks `text`, which is the
+        // whole distinction, and it still has no pointer and still says
+        // "no adapter yet".
+        body.into_any_element()
     }
 }
 
