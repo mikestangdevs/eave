@@ -42,15 +42,24 @@ sandbox = ["cef/sandbox"]
 [dependencies]
 cef = { version = "151", features = ["build-util"] }
 
-# The in-process arm (`EAVE_CEF_GPUI=1`) puts CEF and gpui in one binary.
-# gpui comes from `../zed-fork` — a local checkout of the pinned rev with the
-# BGRA surface change applied, because the stock renderer asserts NV12 on the
-# surface primitive. That change is now fork commit `8521fc1` (see
-# crates/eave-app/Cargo.toml) and the patch file it used to live in has been
-# retired; this probe keeps its own checkout because it is a throwaway with
-# its own `[workspace]`.
-gpui = { path = "../zed-fork/crates/gpui" }
-gpui_platform = { path = "../zed-fork/crates/gpui_platform", features = [
+# The in-process arm (`EAVE_CEF_GPUI=1`) puts CEF and gpui in one binary, and
+# needs the BGRA surface change because the stock renderer asserts NV12 on the
+# surface primitive.
+#
+# This used to be `path = "../zed-fork"` — a local, gitignored checkout with a
+# patch applied by hand. That made this probe unbuildable for anyone but the
+# machine it was written on, which is what C2 discovered when it tried to give
+# the bundle a CI job (`53b1a08`: "the CEF CI job cannot build, and now says
+# why"), and it stayed unbuildable through C1 as well: `boot-smoke --cef`
+# failed here with a missing-file error from cargo that reads as a broken
+# checkout rather than as "publish the fork".
+#
+# Slice C3 published the fork, so it is now the same git url and the same
+# immutable rev the product uses — `8521fc1`, documented commit-by-commit in
+# crates/eave-app/Cargo.toml. Sharing the pin is the point: this probe is only
+# a useful control if it is measuring the renderer eave actually ships.
+gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27" }
+gpui_platform = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
     "font-kit",
     "runtime_shaders",
 ] }
