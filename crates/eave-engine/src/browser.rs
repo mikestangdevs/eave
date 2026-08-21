@@ -330,7 +330,10 @@ impl Browser {
                 // typeahead worse the more the address bar is used.
                 let answered_a_request = {
                     let s = self.store.lock().unwrap();
-                    s.tabs.tabs.get(&tab_id).is_some_and(|t| t.pending.is_some())
+                    s.tabs
+                        .tabs
+                        .get(&tab_id)
+                        .is_some_and(|t| t.pending.is_some())
                 };
                 let changed = self.tab(TabEvent::Navigated {
                     id: tab_id,
@@ -456,7 +459,10 @@ impl Browser {
     }
 
     pub fn group_move(&self, group_id: GroupId, index: usize) -> Result<bool, String> {
-        self.tab(TabEvent::GroupMoved { id: group_id, index })
+        self.tab(TabEvent::GroupMoved {
+            id: group_id,
+            index,
+        })
     }
 
     pub fn group_close(&self, group_id: GroupId) -> Result<bool, String> {

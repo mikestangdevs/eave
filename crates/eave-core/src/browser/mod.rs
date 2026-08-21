@@ -247,7 +247,10 @@ mod tests {
         let dir = scratch();
         {
             let (mut store, report) = BrowserStore::open(&dir).unwrap();
-            assert!(report.stated().is_empty(), "a fresh store had something to say");
+            assert!(
+                report.stated().is_empty(),
+                "a fresh store had something to say"
+            );
             open_tab(&mut store, "t", "https://x/");
             // In-memory only — the one mutation that bypasses the log.
             store.tabs.tabs.get_mut("t").unwrap().load = LoadState::Loading;

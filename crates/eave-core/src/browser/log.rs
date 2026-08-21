@@ -124,7 +124,10 @@ impl LoadReport {
             ));
         }
         if self.seq_breaks > 0 {
-            parts.push(format!("{} gap(s) in the record numbering", self.seq_breaks));
+            parts.push(format!(
+                "{} gap(s) in the record numbering",
+                self.seq_breaks
+            ));
         }
         Some(parts.join("; "))
     }
@@ -527,7 +530,11 @@ mod tests {
         fs::write(&path, lines.join("\n") + "\n").unwrap();
 
         let (_log, events, report) = EventLog::<Ev>::open(&path, "test").unwrap();
-        assert_eq!(events, vec![Ev { n: 1 }, Ev { n: 3 }], "the good lines survived");
+        assert_eq!(
+            events,
+            vec![Ev { n: 1 }, Ev { n: 3 }],
+            "the good lines survived"
+        );
         assert_eq!(report.skipped_lines, vec![3]);
         assert!(!report.is_clean());
         let said = report.stated().expect("a skipped line must be stated");
@@ -568,11 +575,23 @@ mod tests {
 
         let (mut log, events, report) = EventLog::<Ev>::open(&path, "test").unwrap();
         assert!(log.sealed());
-        assert!(events.is_empty(), "a sealed log must not hand back a partial read");
+        assert!(
+            events.is_empty(),
+            "a sealed log must not hand back a partial read"
+        );
         assert_eq!(report.unknown_format_version, Some(99));
-        assert!(report.quarantined.is_none(), "a future file must not be renamed");
-        assert!(log.append(&Ev { n: 4 }).is_err(), "a sealed log accepted a write");
-        assert!(log.compact(&[]).is_err(), "a sealed log accepted a compaction");
+        assert!(
+            report.quarantined.is_none(),
+            "a future file must not be renamed"
+        );
+        assert!(
+            log.append(&Ev { n: 4 }).is_err(),
+            "a sealed log accepted a write"
+        );
+        assert!(
+            log.compact(&[]).is_err(),
+            "a sealed log accepted a compaction"
+        );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             bumped,
@@ -592,7 +611,10 @@ mod tests {
         let (mut log, events, report) = EventLog::<Ev>::open(&path, "test").unwrap();
         assert!(events.is_empty());
         let quarantined = report.quarantined.clone().expect("must be renamed aside");
-        assert!(quarantined.exists(), "the original was destroyed, not moved");
+        assert!(
+            quarantined.exists(),
+            "the original was destroyed, not moved"
+        );
         assert!(report.stated().unwrap().contains("moved to"));
         // The fresh log works.
         log.append(&Ev { n: 1 }).unwrap();
@@ -615,7 +637,10 @@ mod tests {
         log.sync().unwrap();
 
         let raw = fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("\"n\":1"), "compaction left the dropped event behind: {raw}");
+        assert!(
+            !raw.contains("\"n\":1"),
+            "compaction left the dropped event behind: {raw}"
+        );
         let (_log, events, report) = EventLog::<Ev>::open(&path, "test").unwrap();
         assert_eq!(events, vec![Ev { n: 3 }, Ev { n: 4 }]);
         assert!(

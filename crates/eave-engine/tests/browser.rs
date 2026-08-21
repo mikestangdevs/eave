@@ -205,7 +205,10 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
         })
         .await
         .unwrap();
-    let loose = client.tab_open(Some("https://example.com/"), true).await.unwrap();
+    let loose = client
+        .tab_open(Some("https://example.com/"), true)
+        .await
+        .unwrap();
     let grouped = client
         .browser_create(Request::TabOpen {
             url: Some("https://docs.rs/serde".into()),
@@ -262,14 +265,33 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
     let after = next_tabs(&mut rx).await;
 
     assert_eq!(after.tabs.len(), 2, "both tabs came back");
-    let by_id = |id: &str| after.tabs.iter().find(|t| t.id == id).expect("tab present").clone();
+    let by_id = |id: &str| {
+        after
+            .tabs
+            .iter()
+            .find(|t| t.id == id)
+            .expect("tab present")
+            .clone()
+    };
     let l = by_id(&loose);
     let g = by_id(&grouped);
     assert_eq!(l.url.as_deref(), Some("https://example.com/"));
     assert!(l.pinned, "the pin is durable");
-    assert_eq!(g.group.as_deref(), Some(group.as_str()), "group membership is durable");
-    assert_eq!(g.title.as_deref(), Some("serde — Rust"), "the title is durable");
-    assert_eq!(after.active.as_deref(), Some(loose.as_str()), "the active tab is durable");
+    assert_eq!(
+        g.group.as_deref(),
+        Some(group.as_str()),
+        "group membership is durable"
+    );
+    assert_eq!(
+        g.title.as_deref(),
+        Some("serde — Rust"),
+        "the title is durable"
+    );
+    assert_eq!(
+        after.active.as_deref(),
+        Some(loose.as_str()),
+        "the active tab is durable"
+    );
     assert_eq!(after.groups.len(), 1);
     assert_eq!(after.groups[0].title.as_deref(), Some("work"));
     assert_eq!(
@@ -288,8 +310,16 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
     // it is first, and the ungrouped tab sits after it. Two orderings —
     // one for groups, one for loose tabs — could not express this.
     assert_eq!(after.order.len(), 2, "{:#?}", after.order);
-    assert!(matches!(&after.order[0], Slot::Group { id } if id == &group), "{:#?}", after.order);
-    assert!(matches!(&after.order[1], Slot::Tab { id } if id == &loose), "{:#?}", after.order);
+    assert!(
+        matches!(&after.order[0], Slot::Group { id } if id == &group),
+        "{:#?}",
+        after.order
+    );
+    assert!(
+        matches!(&after.order[1], Slot::Tab { id } if id == &loose),
+        "{:#?}",
+        after.order
+    );
     assert_eq!(after.group_tabs.len(), 1);
     assert_eq!(after.group_tabs[0].1, vec![grouped.clone()]);
 }
@@ -306,13 +336,20 @@ async fn closing_a_tab_that_views_a_session_does_not_touch_the_session() {
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let session = client.open(None, Some(dir.display().to_string())).await.unwrap();
+    let session = client
+        .open(None, Some(dir.display().to_string()))
+        .await
+        .unwrap();
     let sid = session.session_id.clone();
     let tab = client.tab_open_session(&sid, None).await.unwrap();
 
     let mut rx = client.watch_tabs().await.unwrap();
     let snap = next_tabs(&mut rx).await;
-    let viewing = snap.tabs.iter().find(|t| t.id == tab).expect("the session tab");
+    let viewing = snap
+        .tabs
+        .iter()
+        .find(|t| t.id == tab)
+        .expect("the session tab");
     assert_eq!(
         viewing.content,
         TabContent::Session {
@@ -322,7 +359,10 @@ async fn closing_a_tab_that_views_a_session_does_not_touch_the_session() {
     );
     assert_eq!(viewing.url, None, "a session tab is not at a url");
 
-    assert!(client.browser_do(Request::TabClose { tab_id: tab }).await.unwrap());
+    assert!(client
+        .browser_do(Request::TabClose { tab_id: tab })
+        .await
+        .unwrap());
     let after = tabs_until(&mut rx, "the tab gone", |s| s.tabs.is_empty()).await;
     assert!(after.tabs.is_empty());
 
@@ -335,7 +375,11 @@ async fn closing_a_tab_that_views_a_session_does_not_touch_the_session() {
     assert_eq!(still.state, session.state);
     assert!(!still.archived, "closing a tab archived a session");
     // And its own directory is still on disk.
-    assert!(dir.join("sessions").join(&sid).join("journal.jsonl").exists());
+    assert!(dir
+        .join("sessions")
+        .join(&sid)
+        .join("journal.jsonl")
+        .exists());
 }
 
 /// Closing a whole GROUP takes its tabs with it — and still does not touch
@@ -348,7 +392,10 @@ async fn closing_a_group_takes_its_tabs_and_leaves_its_sessions() {
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let session = client.open(None, Some(dir.display().to_string())).await.unwrap();
+    let session = client
+        .open(None, Some(dir.display().to_string()))
+        .await
+        .unwrap();
     let group = client
         .browser_create(Request::GroupCreate {
             title: Some("eave".into()),
@@ -411,7 +458,10 @@ async fn back_and_forward_survive_a_restart_and_stay_off_the_snapshot() {
     let mut engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(Some("https://a.example/"), true).await.unwrap();
+    let tab = client
+        .tab_open(Some("https://a.example/"), true)
+        .await
+        .unwrap();
     for url in ["https://b.example/", "https://c.example/"] {
         land(&client, &tab, url).await;
     }
@@ -430,8 +480,15 @@ async fn back_and_forward_survive_a_restart_and_stay_off_the_snapshot() {
     land(&client, &tab, "https://d.example/").await;
     let nav = client.tab_nav(&tab).await.unwrap();
     assert_eq!(
-        nav.entries.iter().map(|e| e.url.as_str()).collect::<Vec<_>>(),
-        vec!["https://a.example/", "https://b.example/", "https://d.example/"],
+        nav.entries
+            .iter()
+            .map(|e| e.url.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "https://a.example/",
+            "https://b.example/",
+            "https://d.example/"
+        ],
         "navigating from mid-stack must drop the forward entries"
     );
     assert!(!nav.can_go_forward());
@@ -562,7 +619,10 @@ async fn bookmarks_are_a_hierarchy_that_survives_a_restart() {
     assert_eq!(snap.nodes[0].bookmark.id, folder, "the folder is first");
     assert_eq!(snap.nodes[0].depth, 0);
     assert_eq!(snap.nodes[0].children, 2);
-    assert_eq!(snap.nodes[1].bookmark.id, loose, "moved to index 0 inside it");
+    assert_eq!(
+        snap.nodes[1].bookmark.id, loose,
+        "moved to index 0 inside it"
+    );
     assert_eq!(snap.nodes[1].depth, 1);
     assert_eq!(snap.nodes[2].bookmark.id, link);
     assert_eq!(
@@ -595,7 +655,10 @@ async fn history_answers_typeahead_and_forgets_from_the_file_itself() {
     let mut engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(Some("https://github.com/eave"), true).await.unwrap();
+    let tab = client
+        .tab_open(Some("https://github.com/eave"), true)
+        .await
+        .unwrap();
     client
         .browser_do(Request::TabStated {
             tab_id: tab.clone(),
@@ -634,7 +697,12 @@ async fn history_answers_typeahead_and_forgets_from_the_file_itself() {
         .any(|m| m.entry.url == "https://github.com/eave"));
 
     // Nothing typed suggests nothing — not everything.
-    assert!(client.history_query("   ", None).await.unwrap().matches.is_empty());
+    assert!(client
+        .history_query("   ", None)
+        .await
+        .unwrap()
+        .matches
+        .is_empty());
 
     // Now forget one url.
     assert!(client
@@ -644,7 +712,10 @@ async fn history_answers_typeahead_and_forgets_from_the_file_itself() {
         .await
         .unwrap());
     let hits = client.history_query("secret", None).await.unwrap();
-    assert!(hits.matches.is_empty(), "forgotten url still answered a query");
+    assert!(
+        hits.matches.is_empty(),
+        "forgotten url still answered a query"
+    );
 
     // THE assertion: it is gone from the bytes on disk, before AND after a
     // restart. Read the file directly — asking the engine would only prove
@@ -656,7 +727,10 @@ async fn history_answers_typeahead_and_forgets_from_the_file_itself() {
         "a forgotten url is still in {}: {raw}",
         path.display()
     );
-    assert!(raw.contains("docs.rs"), "the forget took everything with it");
+    assert!(
+        raw.contains("docs.rs"),
+        "the forget took everything with it"
+    );
 
     drop(client);
     engine.sigkill();
@@ -669,7 +743,12 @@ async fn history_answers_typeahead_and_forgets_from_the_file_itself() {
         .matches
         .is_empty());
     assert_eq!(
-        client.history_query("git", None).await.unwrap().matches.len(),
+        client
+            .history_query("git", None)
+            .await
+            .unwrap()
+            .matches
+            .len(),
         2,
         "the rest of history survived the restart"
     );
@@ -683,7 +762,10 @@ async fn clearing_a_range_forgets_that_window_only() {
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(Some("https://alpha.example/"), true).await.unwrap();
+    let tab = client
+        .tab_open(Some("https://alpha.example/"), true)
+        .await
+        .unwrap();
     // Everything so far is "old". Take the boundary from the engine's own
     // clock rather than the test's: the engine stamps the visits, so a
     // boundary the test invented could fall on the wrong side of them.
@@ -706,12 +788,18 @@ async fn clearing_a_range_forgets_that_window_only() {
     // report.
     let kept = client.history_query("alpha", Some(50)).await.unwrap();
     assert_eq!(
-        kept.matches.iter().map(|m| m.entry.url.as_str()).collect::<Vec<_>>(),
+        kept.matches
+            .iter()
+            .map(|m| m.entry.url.as_str())
+            .collect::<Vec<_>>(),
         vec!["https://alpha.example/"],
         "the clear took a visit from before its window"
     );
     let gone = client.history_query("beta", Some(50)).await.unwrap();
-    assert!(gone.matches.is_empty(), "the clear missed its own window: {gone:?}");
+    assert!(
+        gone.matches.is_empty(),
+        "the clear missed its own window: {gone:?}"
+    );
     let raw = std::fs::read_to_string(dir.join("browser").join("history.jsonl")).unwrap();
     assert!(!raw.contains("beta.example"), "{raw}");
     assert!(raw.contains("alpha.example"), "{raw}");
@@ -730,7 +818,10 @@ async fn the_strip_is_a_snapshot_and_a_no_op_is_not_one() {
     let first = next_tabs(&mut rx).await;
     assert!(first.tabs.is_empty(), "a fresh engine has no tabs");
 
-    let tab = client.tab_open(Some("https://example.com/"), true).await.unwrap();
+    let tab = client
+        .tab_open(Some("https://example.com/"), true)
+        .await
+        .unwrap();
     tabs_until(&mut rx, "the new tab", |s| s.tabs.len() == 1).await;
 
     // Pin it, then pin it again. The second is a no-op: it must report
@@ -810,7 +901,11 @@ async fn a_group_update_can_leave_alone_set_and_clear() {
     })
     .await;
     let g = &snap.groups[0];
-    assert_eq!(g.color.as_deref(), Some("blue"), "an absent field was not left alone");
+    assert_eq!(
+        g.color.as_deref(),
+        Some("blue"),
+        "an absent field was not left alone"
+    );
     assert_eq!(g.workspace, None, "clear did not clear");
     assert!(g.collapsed);
 }
@@ -832,7 +927,9 @@ async fn the_tabs_channel_never_carries_transcript_content() {
     let _engine = EngineProc::spawn(&dir);
 
     // Raw socket: hello, then watch_tabs, then collect every byte.
-    let stream = tokio::net::UnixStream::connect(socket_path(&dir)).await.unwrap();
+    let stream = tokio::net::UnixStream::connect(socket_path(&dir))
+        .await
+        .unwrap();
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     w.write_all(b"{\"id\":1,\"method\":\"hello\",\"params\":{\"proto\":1}}\n")
@@ -854,13 +951,22 @@ async fn the_tabs_channel_never_carries_transcript_content() {
 
     // Meanwhile: a session gets a canary-marked prompt, and a tab views it.
     let client = Client::connect(&dir).await.unwrap();
-    let session = client.open(None, Some(dir.display().to_string())).await.unwrap();
+    let session = client
+        .open(None, Some(dir.display().to_string()))
+        .await
+        .unwrap();
     let sid = session.session_id.clone();
     client.tab_open_session(&sid, None).await.unwrap();
-    client.send(&sid, &format!("{CANARY} please do nothing")).await.unwrap();
+    client
+        .send(&sid, &format!("{CANARY} please do nothing"))
+        .await
+        .unwrap();
     // Let the turn stream and the strip re-broadcast several times.
     for _ in 0..3 {
-        client.tab_open(Some("https://example.com/"), false).await.unwrap();
+        client
+            .tab_open(Some("https://example.com/"), false)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -888,7 +994,10 @@ async fn the_tabs_channel_never_carries_transcript_content() {
         seen.contains("\"type\":\"tabs\""),
         "no tabs frames were collected at all: {seen}"
     );
-    assert!(seen.contains(&sid), "the session tab should name its session by id");
+    assert!(
+        seen.contains(&sid),
+        "the session tab should name its session by id"
+    );
 
     // THE assertion.
     assert!(
@@ -905,7 +1014,9 @@ async fn the_tabs_channel_never_carries_transcript_content() {
 async fn an_unknown_browser_method_errors_on_its_own_id() {
     let dir = scratch();
     let _engine = EngineProc::spawn(&dir);
-    let stream = tokio::net::UnixStream::connect(socket_path(&dir)).await.unwrap();
+    let stream = tokio::net::UnixStream::connect(socket_path(&dir))
+        .await
+        .unwrap();
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     w.write_all(b"{\"id\":1,\"method\":\"hello\",\"params\":{\"proto\":1}}\n")
@@ -1006,8 +1117,14 @@ async fn a_navigation_is_a_request_until_a_page_says_otherwise() {
     // And history recorded ONE visit, at the url that actually landed.
     let hits = client.history_query("landed", Some(50)).await.unwrap();
     assert_eq!(hits.matches.len(), 1, "{hits:?}");
-    assert_eq!(hits.total_entries, 1, "the ask and the commit both journaled");
-    let asked_for = client.history_query("asked.example", Some(50)).await.unwrap();
+    assert_eq!(
+        hits.total_entries, 1,
+        "the ask and the commit both journaled"
+    );
+    let asked_for = client
+        .history_query("asked.example", Some(50))
+        .await
+        .unwrap();
     assert!(
         asked_for.matches.is_empty(),
         "history recorded an address that was never reached: {asked_for:?}"

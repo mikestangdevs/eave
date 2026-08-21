@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use eave_app::ui;
+use eave_app::{ui, web};
 
 fn main() {
     let mut engine = false;
@@ -27,8 +27,20 @@ fn main() {
         std::process::exit(1);
     }
     if engine {
+        // The engine is headless and stays that way: it owns the tab model
+        // and knows nothing about Chromium. Starting a browser here would
+        // put a renderer in a process with no window to draw into.
         eave_engine::engine::run_blocking(data_dir)
     } else {
+        // Slice C1, and the ORDER here is the whole point: the `NSApp`
+        // subclass must be installed BEFORE gpui asks for `NSApp`, because
+        // `+sharedApplication` decides that object's class once and there is
+        // no second chance. `ui::run` is the first thing that asks.
+        //
+        // Only on this branch. The engine has no window, and Chromium's own
+        // child processes are a separate executable (`eave-web-helper`), so
+        // this is the one process in the tree that needs it.
+        web::install_nsapp();
         ui::run(data_dir)
     }
 }

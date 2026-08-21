@@ -38,12 +38,9 @@ use eave_core::session::AgentConfig;
 pub use eave_core::attention::{AttentionSnapshot, WaitReason};
 pub use eave_core::browser::bookmarks::{Bookmark, BookmarkId, BookmarkKind};
 pub use eave_core::browser::history::{HistoryEntry, HistoryMatch, MatchKind, Transition};
-pub use eave_core::browser::snapshot::{
-    BookmarkNode, BookmarksSnapshot, TabInfo, TabsSnapshot,
-};
+pub use eave_core::browser::snapshot::{BookmarkNode, BookmarksSnapshot, TabInfo, TabsSnapshot};
 pub use eave_core::browser::tabs::{
-    GroupId, LoadState, NavEntry, NavStack, PendingNav, Setting, Slot, TabContent, TabGroup,
-    TabId,
+    GroupId, LoadState, NavEntry, NavStack, PendingNav, Setting, Slot, TabContent, TabGroup, TabId,
 };
 
 pub const PROTO_VERSION: u32 = 1;
@@ -1597,7 +1594,6 @@ mod tests {
         assert!(info.shared_with.is_empty());
         assert_eq!(info.worktree, None);
     }
-
 
     // -----------------------------------------------------------------
     // Slice B1 — the compatibility contract for browser state.

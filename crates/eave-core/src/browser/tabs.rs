@@ -124,7 +124,9 @@ pub enum LoadState {
     Loading,
     Complete,
     /// The engine's own words. Rendered verbatim; eave adds nothing.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 impl LoadState {
@@ -695,10 +697,7 @@ impl TabsState {
                 };
                 let before = g.clone();
                 if let Some(s) = title.clone() {
-                    g.title = s
-                        .into_option()
-                        .as_deref()
-                        .and_then(normalize_tab_title);
+                    g.title = s.into_option().as_deref().and_then(normalize_tab_title);
                 }
                 if let Some(s) = color.clone() {
                     g.color = s.into_option();
@@ -812,7 +811,9 @@ impl TabsState {
         let mut out: Vec<&Tab> = self
             .tabs
             .values()
-            .filter(|t| matches!(&t.content, TabContent::Session { session_id: s } if s == session_id))
+            .filter(
+                |t| matches!(&t.content, TabContent::Session { session_id: s } if s == session_id),
+            )
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
@@ -1023,7 +1024,9 @@ mod tests {
         });
         assert_eq!(s.group_order["g"], vec!["loose".to_string()]);
         assert!(
-            !s.order.iter().any(|x| matches!(x, Slot::Tab { id } if id == "loose")),
+            !s.order
+                .iter()
+                .any(|x| matches!(x, Slot::Tab { id } if id == "loose")),
             "the tab is in the group AND at the top level"
         );
 
@@ -1082,7 +1085,10 @@ mod tests {
         assert!(s.tabs.is_empty());
         assert!(s.groups.is_empty());
         assert!(s.order.is_empty());
-        assert_eq!(s.active, None, "active pointed at a tab that no longer exists");
+        assert_eq!(
+            s.active, None,
+            "active pointed at a tab that no longer exists"
+        );
         assert!(s.ordered_tabs().is_empty());
     }
 
@@ -1274,7 +1280,11 @@ mod tests {
         }));
         let g = &s.groups["g"];
         assert_eq!(g.title.as_deref(), Some("two"));
-        assert_eq!(g.color.as_deref(), Some("blue"), "an absent field was touched");
+        assert_eq!(
+            g.color.as_deref(),
+            Some("blue"),
+            "an absent field was touched"
+        );
         assert_eq!(g.workspace, None);
         assert!(!g.collapsed);
         // An update that changes nothing reports nothing.

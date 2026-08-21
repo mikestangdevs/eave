@@ -526,7 +526,9 @@ impl Client {
 
     /// Watch the whole tab strip: `Tabs` snapshot frames, one immediately
     /// and one on every change. Fold by replacement.
-    pub async fn watch_tabs(&self) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+    pub async fn watch_tabs(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
         self.stream(Request::WatchTabs).await
     }
 
@@ -538,11 +540,7 @@ impl Client {
     }
 
     /// Open a tab; returns the id the engine minted.
-    pub async fn tab_open(
-        &self,
-        url: Option<&str>,
-        activate: bool,
-    ) -> Result<String, ClientError> {
+    pub async fn tab_open(&self, url: Option<&str>, activate: bool) -> Result<String, ClientError> {
         Ok(self
             .request::<eave_wire::CreatedOk>(Request::TabOpen {
                 url: url.map(str::to_string),
@@ -580,10 +578,7 @@ impl Client {
 
     /// Any browser mutation that answers `changed`.
     pub async fn browser_do(&self, request: Request) -> Result<bool, ClientError> {
-        Ok(self
-            .request::<eave_wire::ChangedOk>(request)
-            .await?
-            .changed)
+        Ok(self.request::<eave_wire::ChangedOk>(request).await?.changed)
     }
 
     /// Any browser creation that answers with a minted id.

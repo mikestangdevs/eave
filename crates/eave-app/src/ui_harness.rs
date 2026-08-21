@@ -339,6 +339,7 @@ fn the_friction_log_follows_the_data_dir_not_a_desk() {
 #[gpui::test]
 fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
 
     // Arithmetic first, on the function itself.
     let mut live_a = session("aaaa1111");
@@ -360,25 +361,26 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
         dead.clone(),
         unprobed.clone(),
     ];
-    let (line, over) = resource_line(&all, Some(32 * GB)).expect("two live agents report");
-    assert_eq!(line, "2 agents · 0.5 GB of 32.0 GB");
+    let (lines, over) = resource_line(&all, Some(32 * GB), None).expect("two live agents report");
+    assert_eq!(lines, ["2 agents · 0.5 GB of 32.0 GB"]);
     assert!(!over, "half a gig of thirty-two is not a warning");
 
-    let (one, _) = resource_line(&[live_a.clone()], Some(32 * GB)).unwrap();
+    let (one, _) = resource_line(&[live_a.clone()], Some(32 * GB), None).unwrap();
     assert_eq!(
-        one, "1 agent · 0.2 GB of 32.0 GB",
+        one,
+        ["1 agent · 0.2 GB of 32.0 GB"],
         "singular reads as singular"
     );
 
     let mut hog = session("eeee5555");
     hog.live = true;
     hog.rss_bytes = Some(24 * GB);
-    let (_, over) = resource_line(&[hog.clone()], Some(32 * GB)).unwrap();
+    let (_, over) = resource_line(&[hog.clone()], Some(32 * GB), None).unwrap();
     assert!(over, "three quarters of the machine is the warning case");
 
     // No denominator is stated as absence, never invented.
-    let (bare, over) = resource_line(&all, None).unwrap();
-    assert_eq!(bare, "2 agents · 0.5 GB resident");
+    let (bare, over) = resource_line(&all, None, None).unwrap();
+    assert_eq!(bare, ["2 agents · 0.5 GB resident"]);
     assert!(
         !over,
         "without a machine size there is no ratio to warn about"
@@ -386,8 +388,38 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
 
     // Nothing live that reports memory ⇒ no line at all. A "0.0 GB" over
     // a running agent would be a lie; silence is the honest shape.
-    assert!(resource_line(&[dead.clone(), unprobed.clone()], Some(32 * GB)).is_none());
-    assert!(resource_line(&[], Some(32 * GB)).is_none());
+    assert!(resource_line(&[dead.clone(), unprobed.clone()], Some(32 * GB), None).is_none());
+    assert!(resource_line(&[], Some(32 * GB), None).is_none());
+
+    // Slice C1: web memory is stated ALONGSIDE agent memory, not folded
+    // into it. Closing a tab and stopping an agent are different acts, and
+    // one number would say neither which to do nor that there was a choice.
+    // Two ROWS, not one longer line: both clauses side by side measured
+    // 283 px against the 188 px the rail gives, so it would have truncated.
+    let (both, over) = resource_line(&all, Some(32 * GB), Some((6, 490 * MB))).unwrap();
+    assert_eq!(both, ["2 agents · 0.5 GB of 32.0 GB", "web · 0.5 GB in 6"]);
+    assert!(!over);
+
+    // A browser with no agents still reports. The rail's memory line is
+    // about what eave is holding, and a page is the larger half of it.
+    let (web_only, _) = resource_line(
+        &[dead.clone(), unprobed.clone()],
+        Some(32 * GB),
+        Some((6, 490 * MB)),
+    )
+    .expect("a browser holding half a gig is a fact worth stating");
+    assert_eq!(web_only, ["web · 0.5 GB in 6"]);
+
+    // The ceiling is over EVERYTHING eave holds. A browser that pushed the
+    // machine into paging did so whether or not an agent helped.
+    let (_, over) = resource_line(&[], Some(32 * GB), Some((6, 24 * GB))).unwrap();
+    assert!(
+        over,
+        "three quarters of the machine held by pages is still three quarters"
+    );
+
+    // And absence is still absence: no agents, no browser, no line.
+    assert!(resource_line(&[dead.clone()], Some(32 * GB), None).is_none());
 
     // Now through the shell.
     let (h, vcx) = boot(cx);
@@ -419,9 +451,17 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
             s
         })
         .collect();
-    let (widest, _) = resource_line(&fleet, Some(512 * GB)).unwrap();
-    assert_eq!(widest, "30 agents · 120.0 GB of 512.0 GB");
-    for line in [widest, "2 agents · 0.5 GB of 32.0 GB".to_string()] {
+    let (widest, _) = resource_line(&fleet, Some(512 * GB), None).unwrap();
+    assert_eq!(widest, ["30 agents · 120.0 GB of 512.0 GB"]);
+    // Slice C1 made the line longer: a browser adds a second clause. The
+    // worst case is now agents AND web at their widest, and it is the one
+    // that has to clear the rail.
+    let (widest_web, _) = resource_line(&fleet, Some(512 * GB), Some((6, 12 * GB))).unwrap();
+    for line in widest
+        .into_iter()
+        .chain(widest_web)
+        .chain(["2 agents · 0.5 GB of 32.0 GB".to_string()])
+    {
         let w = real_text_width(&line, ".SystemUIFont", theme::MICRO_SIZE);
         assert!(
             w <= room,

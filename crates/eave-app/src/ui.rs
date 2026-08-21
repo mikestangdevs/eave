@@ -250,6 +250,17 @@ struct Queues {
     files: Mutex<VecDeque<FilesEvent>>,
     diffs: Mutex<VecDeque<DiffEvent>>,
     notes: Mutex<VecDeque<RowNoteEvent>>,
+    /// Slice C1. The tab strip, engine-wide like the session watch.
+    tabs: Mutex<VecDeque<eave_wire::TabsSnapshot>>,
+}
+
+/// Slice C1: the tab strip, as this shell holds it.
+///
+/// One snapshot, folded by replacement — the same contract as the session
+/// watch and the files rail, and for the same reason: there are no deltas,
+/// so there is nothing to go stale and nothing to resync.
+struct WebTabsState {
+    snapshot: eave_wire::TabsSnapshot,
 }
 
 #[derive(Clone)]
@@ -277,6 +288,12 @@ impl Plumbing {
     }
     fn push_files(&self, ev: FilesEvent) {
         self.queues.files.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
+    /// Slice C1: the whole tab strip, folded by replacement like every
+    /// other snapshot on this shell.
+    fn push_tabs(&self, ev: eave_wire::TabsSnapshot) {
+        self.queues.tabs.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
     fn push_diff(&self, ev: DiffEvent) {
@@ -373,6 +390,52 @@ async fn feed_loop(
             Ok(rx) => rx,
             Err(_) => continue 'conn,
         };
+
+        // Slice C1: the tab strip, and the page facts going the other way.
+        //
+        // Its own task rather than another arm in the two select!s below,
+        // for one reason: the browser is ENGINE-WIDE, like `watch`. It has
+        // nothing to do with which session is selected, so threading it
+        // through a loop whose entire job is to manage that selection would
+        // couple two things that are independent — and those loops are the
+        // most delicate code in this file. The task dies with the
+        // connection because it holds a clone of the client.
+        {
+            let client = Arc::clone(&client);
+            let plumbing = plumbing.clone();
+            let (fact_tx, mut fact_rx) = tokio_mpsc::unbounded_channel::<crate::web::Fact>();
+            crate::web::install_fact_sink(fact_tx);
+            tokio::spawn(async move {
+                let Ok(mut rx) = client.watch_tabs().await else {
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        item = rx.recv() => match item {
+                            Some(SubscriptionItem::Tabs { snapshot }) => {
+                                plumbing.push_tabs(snapshot);
+                            }
+                            // Nothing else rides this id.
+                            Some(_) => {}
+                            None => return,
+                        },
+                        // What a page observed, on its way to the engine.
+                        // `tab_stated` and not `tab_navigate`: these are
+                        // reports, not requests, and sending them as
+                        // requests is precisely the double-journal Slice
+                        // B1 warned about.
+                        fact = fact_rx.recv() => match fact {
+                            Some((tab_id, fact)) => {
+                                let _ = client
+                                    .browser_do(eave_wire::Request::TabStated { tab_id, fact })
+                                    .await;
+                            }
+                            None => return,
+                        },
+                    }
+                }
+            });
+        }
         plumbing.push_conn(ConnEvent::Connected {
             engine_pid: client.engine.pid,
         });
@@ -1485,30 +1548,56 @@ const AGENT_MEMORY_WARN_FRACTION: f64 = 0.5;
 fn resource_line(
     sessions: &[eave_wire::SessionInfo],
     physical: Option<u64>,
-) -> Option<(String, bool)> {
+    web: Option<(usize, u64)>,
+) -> Option<(Vec<String>, bool)> {
     let reporting: Vec<u64> = sessions
         .iter()
         .filter(|s| s.live)
         .filter_map(|s| s.rss_bytes)
         .collect();
-    if reporting.is_empty() {
+    let agents: u64 = reporting.iter().sum();
+    let mut lines = Vec::new();
+    if !reporting.is_empty() {
+        let n = reporting.len();
+        let noun = if n == 1 { "agent" } else { "agents" };
+        lines.push(match physical {
+            Some(phys) if phys > 0 => format!("{n} {noun} · {} of {}", gib(agents), gib(phys)),
+            // No denominator rather than an invented one: the sum alone is
+            // still a true fact, and a fabricated machine size would not be.
+            _ => format!("{n} {noun} · {} resident", gib(agents)),
+        });
+    }
+    // Slice C1. A browser is the other half of what eave holds, and on
+    // measured numbers it is the LARGER half — ~490 MB across six processes
+    // for ONE tab, against 200–310 MB for one agent. A line that counted
+    // only agents while eave held Chromium would understate the very thing
+    // it exists to state.
+    //
+    // A SECOND LINE, not a longer one, and that is not a stylistic choice:
+    // both clauses on one row measured 283 px against the 188 px the rail
+    // gives, so it would have truncated. A ceiling stated half way is not
+    // stated. It is also the truer shape — closing a tab and stopping an
+    // agent are different acts, and one figure would tell the operator
+    // neither which to do nor that there was a choice.
+    //
+    // "web" and not "tab": the figure is the process tree, and it is one
+    // tree however many tabs render through it.
+    if let Some((procs, bytes)) = web {
+        lines.push(format!("web · {} in {procs}", gib(bytes)));
+    }
+    // Absence is stated by rendering nothing. A "0.0 GB" over a running
+    // agent, or over a running browser, would be a lie about it.
+    if lines.is_empty() {
         return None;
     }
-    let total: u64 = reporting.iter().sum();
-    let n = reporting.len();
-    let noun = if n == 1 { "agent" } else { "agents" };
-    match physical {
-        Some(phys) if phys > 0 => {
-            let frac = total as f64 / phys as f64;
-            Some((
-                format!("{n} {noun} · {} of {}", gib(total), gib(phys)),
-                frac >= AGENT_MEMORY_WARN_FRACTION,
-            ))
-        }
-        // No denominator rather than an invented one: the sum alone is
-        // still a true fact, and a fabricated machine size would not be.
-        _ => Some((format!("{n} {noun} · {} resident", gib(total)), false)),
-    }
+    // The ceiling is over EVERYTHING eave is holding: a browser that pushed
+    // the machine into paging did so whether or not an agent helped.
+    let total = agents + web.map_or(0, |(_, b)| b);
+    let over = match physical {
+        Some(phys) if phys > 0 => total as f64 / phys as f64 >= AGENT_MEMORY_WARN_FRACTION,
+        _ => false,
+    };
+    Some((lines, over))
 }
 
 /// The machine's physical memory, read once. It does not change while
@@ -2703,6 +2792,8 @@ struct Shell {
     files: Entity<FilesState>,
     transcript: Entity<TranscriptState>,
     composer: Entity<ComposerState>,
+    /// Slice C1: the browser's tab strip.
+    web_tabs: Entity<WebTabsState>,
     commands: tokio_mpsc::UnboundedSender<Command>,
     perf: Option<PerfProbe>,
     /// Transient ⌘L confirmation shown in the footer ("logged 14:52:03"
@@ -4336,7 +4427,7 @@ impl Shell {
         // dropping it out of the total the moment the row is hidden would
         // make the ceiling quietly optimistic — the one thing a ceiling
         // may not be.
-        let resource = resource_line(&all, physical_memory_cached());
+        let resource = resource_line(&all, physical_memory_cached(), crate::web::web_memory());
         let sessions: Vec<SessionInfo> = all
             .into_iter()
             .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
@@ -5141,15 +5232,32 @@ impl Shell {
             // aggregates and outside the scroller — a ceiling the
             // operator has to scroll to find is a ceiling they meet by
             // surprise. Absent entirely when nothing live reports memory.
-            .children(resource.map(|(line, over)| {
+            .children(resource.map(|(lines, over)| {
+                // Slice C1: one row per fact — agent memory, then web
+                // memory. They share the group's spacing and the warning
+                // weight, because the ceiling they are measured against is
+                // one ceiling; they are two lines only because neither
+                // fits beside the other at the rail's width.
                 div()
                     .flex_none()
                     .px(px(theme::RAIL_GUTTER))
                     .pb(px(theme::SPACE_3))
                     .pt(px(theme::SPACE_1))
-                    .child(
+                    .flex()
+                    .flex_col()
+                    .children(lines.into_iter().enumerate().map(|(i, line)| {
                         div()
-                            .debug_selector(|| "rail-resource".into())
+                            // The FIRST row keeps the selector: it is the
+                            // one every existing assertion measures, and
+                            // renaming it would be a test edit pretending
+                            // to be a product change.
+                            .debug_selector(move || {
+                                if i == 0 {
+                                    "rail-resource".into()
+                                } else {
+                                    "rail-resource-web".into()
+                                }
+                            })
                             .text_size(px(theme::SMALL_SIZE))
                             .line_height(px(theme::SMALL_LINE))
                             .font_weight(if over {
@@ -5162,8 +5270,8 @@ impl Shell {
                             } else {
                                 theme::text_tertiary()
                             })
-                            .child(SharedString::from(line)),
-                    )
+                            .child(SharedString::from(line))
+                    }))
             }))
             .into_any_element()
     }
@@ -8403,6 +8511,16 @@ impl Render for Shell {
             None
         };
 
+        // Slice C1: the page, when the active tab is one and it has a live
+        // browser. `None` in a build without the feature, and `None` for a
+        // tab whose browser has not been created yet — in both cases the
+        // transcript renders, which is what was there before.
+        let page_el = {
+            let active = self.web_tabs.read(cx).snapshot.active.clone();
+            active.and_then(|id| crate::web::page_element(&id, cx))
+        };
+        let showing_page = page_el.is_some();
+
         let transcript_el = list(list_state, move |ix, _window, cx| {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
         })
@@ -8757,19 +8875,40 @@ impl Render for Shell {
                                     // outside the scope — the pill and the
                                     // composer must not fade along with
                                     // the content they occlude.
-                                    .child(
-                                        edge_faded(
-                                            theme::TRANSCRIPT_FADE_BAND_TOP,
-                                            true,
-                                            true,
-                                            div()
-                                                .size_full()
-                                                .pt(px(theme::LOG_TOP_PAD))
-                                                .child(transcript_el),
+                                    // Slice C1: the page takes the well's
+                                    // reading column when a web tab is
+                                    // active, and everything below in this
+                                    // stack — the composer, the pill, the
+                                    // notice — stays exactly where it is,
+                                    // floating OVER it. That is the whole
+                                    // payoff of off-screen rendering: the
+                                    // page is an ordinary scene primitive,
+                                    // so `BackdropBlur` samples it like any
+                                    // other pixels and the frost is real
+                                    // rather than a hole.
+                                    //
+                                    // No `edge_faded` wrapper on the page:
+                                    // the fade exists to dissolve a
+                                    // SCROLLING LOG into the well's edges,
+                                    // and a page scrolls itself. Fading its
+                                    // top and bottom would dim content the
+                                    // page believes is fully visible.
+                                    .children(page_el)
+                                    .when(!showing_page, |d| {
+                                        d.child(
+                                            edge_faded(
+                                                theme::TRANSCRIPT_FADE_BAND_TOP,
+                                                true,
+                                                true,
+                                                div()
+                                                    .size_full()
+                                                    .pt(px(theme::LOG_TOP_PAD))
+                                                    .child(transcript_el),
+                                            )
+                                            .band_top(theme::TRANSCRIPT_FADE_BAND_TOP)
+                                            .band_bottom(theme::TRANSCRIPT_FADE_BAND_BOTTOM),
                                         )
-                                        .band_top(theme::TRANSCRIPT_FADE_BAND_TOP)
-                                        .band_bottom(theme::TRANSCRIPT_FADE_BAND_BOTTOM),
-                                    )
+                                    })
                                     // Slice M (§3.2): an overlay, so it is
                                     // outside both the fade scope and the
                                     // virtualized list and can never touch
@@ -9073,7 +9212,15 @@ pub fn run(data_dir: PathBuf) -> ! {
                 }
             }
 
-            bootstrap(
+            // Slice C1: start the page engine, if this build has one.
+            //
+            // AFTER `application().run` has begun, because CEF's own
+            // initialisation touches `NSApp` and expects the one the
+            // subclass installed; BEFORE the window exists, because the
+            // first tab snapshot can arrive as soon as the feed connects.
+            let web = crate::web::initialize();
+
+            let shell = bootstrap(
                 cx,
                 Feed {
                     queues,
@@ -9081,6 +9228,24 @@ pub fn run(data_dir: PathBuf) -> ! {
                     cmd_tx,
                 },
             );
+
+            if web {
+                // How a CEF callback wakes the window. The pump calls this
+                // ONLY when a frame actually arrived — never on vsync — so
+                // an idle page (1 frame in 9 seconds, measured) costs no
+                // redraws at all.
+                crate::web::set_repaint_handle(cx.to_async());
+                // A windowless browser makes `CefShutdown` block forever,
+                // so the browsers have to go first. `on_app_quit` runs
+                // while the app still exists, which `std::process::exit`
+                // below emphatically does not.
+                cx.on_app_quit(|_| {
+                    crate::web::shutdown();
+                    async {}
+                })
+                .detach();
+            }
+            let _ = shell;
         });
     std::process::exit(0);
 }
@@ -9279,6 +9444,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             fetch: DiffFetch::Ready(Arc::new(synthetic_long_diff())),
         }),
     });
+    let web_tabs = cx.new(|_| WebTabsState {
+        snapshot: eave_wire::TabsSnapshot::default(),
+    });
     let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
     let transcript = cx.new(|_| {
         let mut t = TranscriptState::new();
@@ -9337,6 +9505,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let files = files.clone();
         let transcript = transcript.clone();
         let cmd_tx = cmd_tx.clone();
+        let web_tabs = web_tabs.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
                 let conn_events: Vec<ConnEvent> = queues.conn.lock().unwrap().drain(..).collect();
@@ -9425,6 +9594,23 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                 }
                             }
                         }
+                        cx.notify();
+                    });
+                }
+                // Slice C1. Fold by replacement, last of the burst wins,
+                // then hand the result to the page engine.
+                //
+                // `web::drive` runs HERE — on the pump, on the main thread —
+                // rather than in the subscription task, because creating a
+                // browser and telling one to navigate are CEF UI-thread
+                // calls. It is also the only place that knows the fold has
+                // finished, so a burst reconciles once rather than per frame.
+                let tab_snapshots: Vec<eave_wire::TabsSnapshot> =
+                    queues.tabs.lock().unwrap().drain(..).collect();
+                if let Some(snapshot) = tab_snapshots.into_iter().last() {
+                    crate::web::drive(&snapshot);
+                    web_tabs.update(cx, |state, cx| {
+                        state.snapshot = snapshot;
                         cx.notify();
                     });
                 }
@@ -9573,6 +9759,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();
                     cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&web_tabs, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
                         demo: DemoOverlay::default(),
@@ -9585,6 +9772,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         files: files.clone(),
                         transcript: transcript.clone(),
                         composer,
+                        web_tabs: web_tabs.clone(),
                         commands: cmd_tx.clone(),
                         perf: perf_10k.then(|| PerfProbe {
                             frame_times: Vec::new(),

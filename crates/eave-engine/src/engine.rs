@@ -2651,9 +2651,7 @@ async fn run_bookmarks(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, 
             return;
         }
         match rx.recv().await {
-            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                while rx.try_recv().is_ok() {}
-            }
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => while rx.try_recv().is_ok() {},
             Err(broadcast::error::RecvError::Closed) => return,
         }
     }

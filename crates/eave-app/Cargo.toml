@@ -9,10 +9,59 @@ edition.workspace = true
 name = "eave"
 path = "src/main.rs"
 
+# The CEF helper process. CEF's macOS layout requires a SEPARATE executable
+# for the renderer/GPU/plugin children — the main binary cannot be reused,
+# because those children must not be a gpui app. It is tiny (`execute_process`
+# and nothing else) and only built with the `web` feature.
+[[bin]]
+name = "eave-web-helper"
+path = "src/bin/web_helper.rs"
+required-features = ["web"]
+
+[features]
+default = []
+# Slice C1: Chromium/CEF off-screen rendering, so a page is a scene
+# primitive. OFF by default, and the reason is not timidity:
+#
+#   - `cargo build` alone stops producing a runnable artifact. CEF needs a
+#     323 MB framework inside an assembled `.app` and five helper bundles
+#     beside it, so the binary only runs from inside one.
+#   - the first build downloads ~343 MB.
+#
+# Neither belongs in the path of `cargo test`. The suite must be runnable
+# on a machine that has never fetched Chromium, so nothing under `web`
+# is reachable from a test — see `src/web/mod.rs`, which compiles to a set
+# of honest no-ops when the feature is off.
+web = [
+    "dep:cef",
+    "dep:core-video",
+    "dep:core-foundation",
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-io-surface",
+]
+
 [dependencies]
 eave-core = { path = "../eave-core" }
 eave-wire = { path = "../eave-wire" }
 eave-engine = { path = "../eave-engine" }
+
+# --- the `web` feature's graph ------------------------------------------
+cef = { version = "151", features = ["build-util"], optional = true }
+core-video = { version = "0.5.2", features = ["metal"], optional = true }
+core-foundation = { version = "0.10", optional = true }
+# Deliberately NOT cef's own `accelerated_osr`: that feature imports the
+# shared texture into **wgpu**, dragging wgpu + ash + windows into the graph
+# to reach one `newTextureWithDescriptor:iosurface:plane:` call. gpui renders
+# through raw metal-rs. We write that call ourselves; it is 20 lines.
+#
+# objc2 0.6 here, while gpui carries 0.5. Both majors coexist in the graph
+# without complaint — but objc2's typed `ClassBuilder` cannot bridge them
+# (`MethodImplementation` will not resolve across two majors), so anything
+# at a gpui/CEF type seam uses the raw C runtime instead. See `web/host.rs`.
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"], optional = true }
+objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef"], optional = true }
 
 # gpui — the wingleeio/zed fork (comet's), pinned to the FIXED rev comet
 # ships: upstream base f14fea9 (our previous no-fork pin) + a 17-commit
@@ -104,3 +153,14 @@ gpui = { git = "file:///Users/michaelstang/Desktop/eave/gpui-fork.git", rev = "8
 # path data is malformed; this will not. Same version => cargo unifies it
 # with gpui's copy, so it costs no extra compile.
 usvg = { version = "0.46.0", default-features = false }
+
+# CEF's macOS bundle layout: which executable becomes the five nested
+# helper `.app`s, and where the .icns/.strings live.
+#
+# KNOWN DEFECT, carried from the spike and not fixed here: the bundler gives
+# all five helpers the SAME CFBundleIdentifier as the main app. Helpers need
+# distinct ones, and this must be fixed before anything is signed or
+# notarized. See docs/reports/stage-c1-osr.md.
+[package.metadata.cef.bundle]
+helper_name = "eave-web-helper"
+resources_path = "resources/cef"

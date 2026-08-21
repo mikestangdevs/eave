@@ -142,14 +142,9 @@ pub enum HistoryEvent {
     },
     /// A title that arrived after its visit committed — the ordinary case,
     /// since a page states its title once it has parsed.
-    Titled {
-        url: String,
-        title: String,
-    },
+    Titled { url: String, title: String },
     /// Forget one url. Triggers a compaction; see the module docs.
-    Forgotten {
-        url: String,
-    },
+    Forgotten { url: String },
     /// Forget a time range. `since_ms`/`before_ms` are both optional, so
     /// "everything" is `Cleared { since_ms: None, before_ms: None }` and
     /// "the last hour" is a `since_ms`. Triggers a compaction.
@@ -372,7 +367,8 @@ impl HistoryIndex {
         self.entry_title_at = Vec::with_capacity(entries.len() + 1);
 
         for (i, entry) in entries.iter().enumerate() {
-            self.entry_address_at.push(self.entry_address_keys.len() as u32);
+            self.entry_address_at
+                .push(self.entry_address_keys.len() as u32);
             self.entry_title_at.push(self.entry_title_keys.len() as u32);
             for (key, kind) in match_keys(entry) {
                 let boxed: Box<str> = key.into_boxed_str();
@@ -388,7 +384,8 @@ impl HistoryIndex {
                 }
             }
         }
-        self.entry_address_at.push(self.entry_address_keys.len() as u32);
+        self.entry_address_at
+            .push(self.entry_address_keys.len() as u32);
         self.entry_title_at.push(self.entry_title_keys.len() as u32);
         self.address_keys.sort();
         self.title_keys.sort();
@@ -902,7 +899,11 @@ mod tests {
         assert_eq!(typing_form("http://x.test"), "x.test");
         // `www.` is stripped, so the stored url is reachable without it.
         let one = history_of(vec![visit("https://www.github.com/anthropics", None, DAY)]);
-        assert_eq!(one.index().query("github", 5).len(), 1, "www. was not stripped");
+        assert_eq!(
+            one.index().query("github", 5).len(),
+            1,
+            "www. was not stripped"
+        );
         // ...and typing the full url, scheme and all, still matches.
         assert_eq!(one.index().query("https://www.github.com/anth", 5).len(), 1);
 
@@ -975,7 +976,12 @@ mod tests {
                 .collect()
         };
 
-        for (prefix, limit) in [("common", 8), ("common", 25), ("common0001", 8), ("rare", 8)] {
+        for (prefix, limit) in [
+            ("common", 8),
+            ("common", 25),
+            ("common0001", 8),
+            ("rare", 8),
+        ] {
             let got: Vec<String> = idx
                 .query(prefix, limit)
                 .into_iter()
@@ -1046,7 +1052,15 @@ mod tests {
 
         // Every shape of query: a one-character prefix (the widest range),
         // a whole-word title term, a narrowing address, and a miss.
-        let probes = ["s", "si", "site0", "site01234", "https://site00042", "page", "zzzz"];
+        let probes = [
+            "s",
+            "si",
+            "site0",
+            "site01234",
+            "https://site00042",
+            "page",
+            "zzzz",
+        ];
         let mut worst = std::time::Duration::ZERO;
         let mut worst_probe = "";
         for probe in probes {
@@ -1089,7 +1103,10 @@ mod tests {
         }));
         let raw = serde_json::to_string(h.retained()).unwrap();
         assert!(!raw.contains("secret"), "a tombstone kept the url: {raw}");
-        assert!(!raw.contains("private"), "the title survived the forget: {raw}");
+        assert!(
+            !raw.contains("private"),
+            "the title survived the forget: {raw}"
+        );
         assert!(raw.contains("keep"));
         assert!(h.index().get("https://secret/").is_none());
         // Forgetting something that was never there is a no-op, not an
@@ -1117,7 +1134,10 @@ mod tests {
             before_ms: Some(5 * DAY),
         }));
         let raw = serde_json::to_string(h.retained()).unwrap();
-        assert!(!raw.contains("old"), "the cleared window left traces: {raw}");
+        assert!(
+            !raw.contains("old"),
+            "the cleared window left traces: {raw}"
+        );
         assert!(raw.contains("new"));
         assert_eq!(h.index().len(), 1);
 

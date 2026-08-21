@@ -54,3 +54,7 @@ pub mod markdown;
 pub mod theme;
 
 pub mod ui;
+
+/// Slice C1: the page engine (Chromium/CEF, off-screen). Behind
+/// `--features web`; a set of honest no-ops without it.
+pub mod web;

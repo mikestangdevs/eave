@@ -11,6 +11,10 @@ use std::mem;
 /// `proc_bsdinfo.pbi_status` value for a zombie (SZOMB in sys/proc.h).
 const SZOMB: u32 = 5;
 
+/// `PROC_ALL_PIDS` from `<sys/proc_info.h>`. Declared here because the
+/// `libc` crate binds `proc_listpids` but not its selector constants.
+const PROC_ALL_PIDS: u32 = 1;
+
 /// The identity recorded at spawn. Signals are only ever sent to a pid
 /// whose live start_time still matches this record. Serialized into
 /// `meta.json` as the orphan-detection breadcrumb (spec 02 §Layout).
@@ -185,6 +189,51 @@ pub fn resident_bytes(pid: i32) -> Option<u64> {
         return None;
     }
     Some(info.pti_resident_size)
+}
+
+/// The direct children of a pid.
+///
+/// Added for Slice C1, where the thing being measured is a *tree*: CEF
+/// spawns five or six helper processes and the page's real cost is spread
+/// across them, so the leader-only rule [`resident_bytes`] states for agents
+/// would report a browser as nearly free.
+///
+/// Direct children only, one level deep. Chromium's helpers are all direct
+/// children of the process that initialised CEF, so one level is the whole
+/// tree *for this caller* — it is not a general descendant walk, and the
+/// note on [`resident_bytes`] about unbounded walks still stands for the
+/// agent case.
+///
+/// `None` if the kernel would not say; an empty vector means it said, and
+/// the answer was none.
+pub fn child_pids(of: u32) -> Option<Vec<i32>> {
+    // Ask for the size first: the process table changes between calls, so a
+    // fixed buffer would silently truncate on a busy machine.
+    let needed = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return None;
+    }
+    // Headroom for processes started between the two calls.
+    let capacity = (needed as usize / mem::size_of::<i32>()) + 64;
+    let mut pids = vec![0i32; capacity];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (capacity * mem::size_of::<i32>()) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return None;
+    }
+    pids.truncate(bytes as usize / mem::size_of::<i32>());
+    Some(
+        pids.into_iter()
+            .filter(|pid| *pid > 0)
+            .filter(|pid| inspect(*pid).is_some_and(|i| i.ppid == of as i32))
+            .collect(),
+    )
 }
 
 /// Physical memory installed in the machine, in bytes — the denominator

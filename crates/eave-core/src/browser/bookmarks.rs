@@ -27,9 +27,7 @@ pub type BookmarkId = String;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BookmarkKind {
     Folder,
-    Link {
-        url: String,
-    },
+    Link { url: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,9 +84,7 @@ pub enum BookmarkEvent {
     /// Remove a node. A folder takes its whole subtree with it — the fold
     /// derives that rather than the log enumerating it, so the log stays
     /// one line per operator action and the semantics live in one place.
-    Removed {
-        id: BookmarkId,
-    },
+    Removed { id: BookmarkId },
     Moved {
         id: BookmarkId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,10 +101,7 @@ pub enum BookmarkEvent {
     /// [`BookmarkEvent::Renamed`] because a title and an address are
     /// different things to get wrong, and an edit box that changed both at
     /// once has no way to say which one the operator meant.
-    Retargeted {
-        id: BookmarkId,
-        url: String,
-    },
+    Retargeted { id: BookmarkId, url: String },
 }
 
 /// The whole hierarchy. The fold is total: an event naming an unknown id is
@@ -489,10 +482,7 @@ mod tests {
             .into_iter()
             .map(|(d, b)| (d, b.id.as_str()))
             .collect();
-        assert_eq!(
-            order,
-            vec![(0, "f1"), (1, "f1a"), (1, "f1b"), (0, "top")]
-        );
+        assert_eq!(order, vec![(0, "f1"), (1, "f1a"), (1, "f1b"), (0, "top")]);
     }
 
     /// "Is this page bookmarked?" — the query a star button asks.
@@ -503,7 +493,11 @@ mod tests {
         add(&mut t, "deep", Some("f"), Some("https://x/"));
         add(&mut t, "shallow", None, Some("https://x/"));
         add(&mut t, "other", None, Some("https://y/"));
-        let hits: Vec<&str> = t.links_to("https://x/").iter().map(|b| b.id.as_str()).collect();
+        let hits: Vec<&str> = t
+            .links_to("https://x/")
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect();
         assert_eq!(hits, vec!["deep", "shallow"]);
         assert!(t.links_to("https://nope/").is_empty());
     }
