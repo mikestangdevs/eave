@@ -3511,6 +3511,145 @@ fn the_turn_clock_nets_the_delivery_pair_in_either_order(cx: &mut TestAppContext
     );
 }
 
+/// Agent prose, stamped at a caller-chosen journal time — the trailer's
+/// settle clock reads `ts_ms` against the wall clock, so a test that wants
+/// work to look LIVE has to say so.
+fn agent_text_record(seq: u64, ts_ms: u64, text: &str) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::TextDelta { text: text.into() },
+        },
+    }
+}
+
+/// **The two facts an operator must be able to tell apart** (Slice CF).
+///
+/// Before this slice the second one had no picture at all: a turn only ever
+/// opened on `UserDelivered`, which is eave's own event, so an agent working
+/// on its own — a background subagent finishing, a background shell
+/// reporting — rendered as a session with nothing happening.
+///
+/// They must not render identically, and this asserts it from both sides so
+/// neither sentence can quietly become the other.
+#[gpui::test]
+fn a_prompted_turn_and_a_self_started_one_say_different_things(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+    assert!(shown(vcx, "work-trailer"), "a turn in flight must say so");
+    assert!(
+        shown(vcx, "work-trailer-asked"),
+        "the operator asked for this one"
+    );
+    assert!(
+        !shown(vcx, "work-trailer-self"),
+        "a turn the operator asked for was captioned as the agent's own"
+    );
+
+    // Now the same shell, with agent work and no prompt anywhere. Stamped
+    // NOW so the quiet clock has not run.
+    let now = eave_core::journal::now_ms();
+    ask(
+        &h,
+        vcx,
+        vec![agent_text_record(1, now, "background task finished")],
+    );
+    assert!(
+        shown(vcx, "work-trailer"),
+        "the agent working on its own showed nothing at all"
+    );
+    assert!(
+        shown(vcx, "work-trailer-self"),
+        "self-started work must say it was self-started"
+    );
+    assert!(
+        !shown(vcx, "work-trailer-asked"),
+        "work nobody asked for was captioned as the operator's"
+    );
+}
+
+/// A self-started turn has no terminal frame coming, so quiescence is its
+/// only settle path — and the reader runs that rule itself, on the second it
+/// already ticks for the elapsed clock. Without it the trailer would report
+/// "working on its own" forever, which is Slice AQ's `working for 99h 49m`
+/// arriving from the other direction.
+#[gpui::test]
+fn a_self_started_turn_settles_when_it_goes_quiet(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // Stamped at the epoch: by the wall clock this work went quiet decades
+    // ago, so the very first heartbeat must retire it.
+    ask(
+        &h,
+        vcx,
+        vec![agent_text_record(1, 1, "woke up, did a thing")],
+    );
+    assert!(shown(vcx, "work-trailer-self"), "it never opened");
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "work-trailer"),
+        "a self-started turn that went quiet is still captioned as working"
+    );
+}
+
+/// The opposite contract, on the same clock: a turn the operator asked for
+/// waits for the provider's frame and **never** times out. `user_record`
+/// stamps at `seq * 10`, so by the wall clock this one is decades stale too
+/// — and it must still be up.
+#[gpui::test]
+fn a_prompted_turn_is_never_quiesced_away(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+    for _ in 0..5 {
+        vcx.executor().advance_clock(Duration::from_secs(1));
+        vcx.run_until_parked();
+    }
+    assert!(
+        shown(vcx, "work-trailer-asked"),
+        "eave invented a terminal frame the provider still owes"
+    );
+}
+
+/// **The arithmetic bug, from the app's side.**
+///
+/// claude's background-subagent wake is a whole second turn on the same
+/// session: a second `system/init` under the known `session_id`, and a
+/// second `result` (`docs/research/turn-start-evidence.md` §1, verified
+/// against `fixtures/claude-background-subagent-2.1.228.jsonl`). One prompt,
+/// two `TurnCompleted`s.
+///
+/// The old balance ran +1, −1, −1 → floored at −1, so the operator's NEXT
+/// delivery landed at 0 and `in_turn()` was false: no trailer, on a turn
+/// that was genuinely running. Counting the wake turn nets it.
+#[gpui::test]
+fn a_background_subagent_wake_does_not_swallow_the_next_turn(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(
+        &h,
+        vcx,
+        vec![
+            // `init_record` carries session `aaaa1111` — the SAME id both
+            // times, which is what makes the second one an announcement
+            // rather than another session on the same stream.
+            init_record(1, &[]),
+            user_record(2, "launch a background subagent"),
+            delivered_record(3),
+            turn_completed_record(4),
+            // The wake: the CLI announces itself again, works, and settles.
+            init_record(5, &[]),
+            turn_completed_record(6),
+            // And the operator asks the next thing.
+            user_record(7, "now what?"),
+            delivered_record(8),
+        ],
+    );
+    assert!(
+        shown(vcx, "work-trailer-asked"),
+        "an unpaired wake `result` swallowed the operator's next turn"
+    );
+}
+
 /// **The structural assertion the trailer exists to survive.** It sits
 /// near the tail of a bottom-anchored virtualized list, which is exactly
 /// where a new row would shove every other row up by its own height. It
@@ -7953,6 +8092,10 @@ fn draft_of(h: &Harness, vcx: &mut VisualTestContext) -> String {
 /// One `system/init` record, the way the engine journals it — the frame
 /// the agent CLI writes before the model is invoked, carrying its own
 /// complete list of the `/name`s it will accept (Slice AR2).
+///
+/// It carries a fixed `session_id`, which is load-bearing for Slice CF: a
+/// SECOND one of these under the same id is claude announcing a turn it
+/// started itself (`docs/research/turn-start-evidence.md` §1).
 fn init_record(seq: u64, slash_commands: &[&str]) -> eave_core::journal::Record {
     eave_core::journal::Record {
         seq,

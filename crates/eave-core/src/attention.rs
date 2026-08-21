@@ -18,9 +18,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::events::SessionEvent;
-use crate::journal::{JournalEvent, Record};
+use crate::journal::Record;
 use crate::thresholds::AttentionThresholds;
+use crate::turn::{Fold, TurnLedger, TurnSettle, TurnStart};
 
 /// What a `quiet` session is waiting on — the three cases the UI must keep
 /// distinguishable (build directive 2026-08-16).
@@ -122,7 +122,14 @@ pub struct ProbeFacts {
     pub parent_ok: bool,
     /// The CLI's stdout reached EOF while the process is not exited.
     pub stdout_eof: bool,
-    pub in_turn: bool,
+    /// The open turn and how it began, or `None` between turns.
+    ///
+    /// Slice CF: a bool here said "mid-turn" for three turn shapes whose
+    /// losses are different facts — a prompted turn dies with a frame still
+    /// owed to the operator, an announced one with a frame owed to nobody,
+    /// unannounced work with none ever coming — and this cause string is the
+    /// only place an operator ever reads any of them.
+    pub in_turn: Option<TurnStart>,
 }
 
 /// Classify one tick's facts into a provable-death cause, or `None`.
@@ -144,10 +151,15 @@ pub fn probe_failure(f: &ProbeFacts) -> Option<String> {
         return Some("broken parent link (child reparented away from the engine)".into());
     }
     if f.stdout_eof {
-        return Some(if f.in_turn {
-            "stdout closed mid-turn while the process is alive".into()
-        } else {
-            "stdout closed while the process is alive".into()
+        return Some(match f.in_turn {
+            Some(TurnStart::Prompted) => "stdout closed mid-turn while the process is alive".into(),
+            Some(TurnStart::Announced) => {
+                "stdout closed during an agent-started turn, before its terminal frame".into()
+            }
+            Some(TurnStart::Unannounced) => {
+                "stdout closed during unannounced agent work while the process is alive".into()
+            }
+            None => "stdout closed while the process is alive".into(),
         });
     }
     None
@@ -159,24 +171,11 @@ pub fn probe_failure(f: &ProbeFacts) -> Option<String> {
 #[derive(Debug)]
 pub struct Classifier {
     th: AttentionThresholds,
-    /// Open-turn balance: `UserDelivered` = +1, `TurnCompleted` = −1; a
-    /// turn is open while > 0 — the only window in which any clock runs.
-    /// A signed balance (floored at −1, capped at 8) instead of a bool
-    /// because the recorder's two input channels are unordered: a fast CLI
-    /// can get its `TurnCompleted` journaled *before* the `UserDelivered`
-    /// that opened the turn, and a bool would leave a phantom turn open
-    /// forever (real flake, caught by the idle-between-turns acceptance
-    /// test). With the balance, the pair nets to closed in either order.
-    turn_balance: i32,
-    /// Outstanding tool calls, oldest first: (id, name, since_ms).
-    outstanding: Vec<(String, String, u64)>,
-    /// `status: requesting` seen; cleared by any assistant output.
-    api_since: Option<u64>,
-    /// Permission questions the operator has not answered, oldest first:
-    /// (request_id, tool, since_ms). While this is non-empty the session
-    /// is parked on a human and no clock runs (Slice K).
-    pending_approvals: Vec<(String, String, u64)>,
-    last_activity_ms: u64,
+    /// The turn model, shared verbatim with the app (`crate::turn`). It
+    /// carries the open turn's settle contract, everything wire-marked in
+    /// flight inside it, and the silence clock — so the engine and the UI
+    /// cannot drift into disagreeing about whether a session is working.
+    turn: TurnLedger,
     state: AttentionSnapshot,
     zero_streak: u32,
 }
@@ -185,11 +184,7 @@ impl Classifier {
     pub fn new(th: AttentionThresholds, now_ms: u64) -> Self {
         Self {
             th,
-            turn_balance: 0,
-            outstanding: Vec::new(),
-            api_since: None,
-            pending_approvals: Vec::new(),
-            last_activity_ms: now_ms,
+            turn: TurnLedger::new(now_ms),
             state: AttentionSnapshot::Running,
             zero_streak: 0,
         }
@@ -199,8 +194,10 @@ impl Classifier {
         self.state.clone()
     }
 
-    pub fn in_turn(&self) -> bool {
-        self.turn_balance > 0
+    /// The open turn and how it began — handed to the OS probe so a death
+    /// mid-turn can name the shape of what was lost.
+    pub fn open_turn(&self) -> Option<TurnStart> {
+        self.turn.open()
     }
 
     /// CPU sampling is armed only where it is the tiebreaker: quiet with
@@ -210,7 +207,7 @@ impl Classifier {
         // Never while parked on the operator (Slice K): a process waiting
         // on a person burns no CPU by design, so sampling it would prove
         // nothing and could only mislead.
-        if !self.pending_approvals.is_empty() {
+        if !self.turn.approvals().is_empty() {
             return false;
         }
         matches!(
@@ -222,18 +219,21 @@ impl Classifier {
         )
     }
 
-    /// Any byte/state-change from the CLI: reset the clock; a live notice
-    /// clears back to running (spec 01 transition table). `Failed` is
-    /// sticky — provable death is not undone by a stale descendant line.
+    /// A byte/state-change from the CLI cleared a live notice back to
+    /// running (spec 01 transition table). `Failed` is sticky — provable
+    /// death is not undone by a stale descendant line.
+    ///
+    /// The silence CLOCK it used to reset lives on the ledger now
+    /// (`TurnLedger::last_activity_ms`), reset by the same fold that
+    /// reported this — one clock, one owner, both readers.
     ///
     /// Slice K: while questions are open, activity does NOT clear the
     /// notice — the agent chatting on does not mean the operator answered.
     /// The parked state is owned by the pending set, and
     /// [`Self::settle_approvals`] is the only thing that leaves it.
-    fn activity(&mut self, now_ms: u64) -> Option<AttentionSnapshot> {
-        self.last_activity_ms = now_ms;
+    fn activity(&mut self) -> Option<AttentionSnapshot> {
         self.zero_streak = 0;
-        if !self.pending_approvals.is_empty() {
+        if !self.turn.approvals().is_empty() {
             return None;
         }
         match self.state {
@@ -251,11 +251,11 @@ impl Classifier {
     /// now, so an approval that took an hour does not instantly trip
     /// `QUIET_AFTER` on the way out.
     fn settle_approvals(&mut self, now_ms: u64) -> Option<AttentionSnapshot> {
-        match self.pending_approvals.first() {
+        match self.turn.approvals().first() {
             Some((_, tool, since_ms)) => {
                 let want = AttentionSnapshot::AwaitingApproval {
                     since_ms: *since_ms,
-                    pending: self.pending_approvals.len() as u64,
+                    pending: self.turn.approvals().len() as u64,
                     tool: tool.clone(),
                 };
                 if self.state == want {
@@ -266,7 +266,7 @@ impl Classifier {
             }
             None => {
                 if matches!(self.state, AttentionSnapshot::AwaitingApproval { .. }) {
-                    self.last_activity_ms = now_ms;
+                    self.turn.touch(now_ms);
                     self.zero_streak = 0;
                     self.state = AttentionSnapshot::Running;
                     Some(self.state.clone())
@@ -278,99 +278,23 @@ impl Classifier {
     }
 
     /// Fold one journal record. Returns a snapshot when the state changed.
+    ///
+    /// The record match itself lives in [`TurnLedger::on_record`] — the
+    /// classifier only reacts to what folding it MEANT, so the engine and
+    /// the app cannot fold the same byte two different ways.
     pub fn on_record(&mut self, rec: &Record, now_ms: u64) -> Option<AttentionSnapshot> {
-        match &rec.event {
-            // Engine-side attempt: not a CLI byte; the clock starts at the
-            // delivery confirmation below.
-            JournalEvent::UserSent { .. } => None,
-            JournalEvent::UserDelivered {} => {
-                self.turn_balance = (self.turn_balance + 1).min(8);
-                self.activity(now_ms)
-            }
-            JournalEvent::Provider { event } => match event {
-                SessionEvent::TurnCompleted { .. } => {
-                    // May precede its own UserDelivered (channel race, see
-                    // `turn_balance`) — going to −1 pre-cancels it.
-                    self.turn_balance = (self.turn_balance - 1).max(-1);
-                    self.outstanding.clear();
-                    self.api_since = None;
-                    // A turn cannot end with a question still open; if the
-                    // provider says it did, believe the provider.
-                    self.pending_approvals.clear();
-                    self.activity(now_ms);
-                    self.settle_approvals(now_ms)
-                }
-                SessionEvent::ToolUseStarted { id, name, .. } => {
-                    // Keyed by id, not appended blindly: an adapter may
-                    // restate a start once its arguments arrive (the
-                    // Claude CLI announces a `tool_use` with an empty
-                    // `input` and fills it in a line later), and one tool
-                    // counted twice would hold `QUIET_AFTER` off forever.
-                    // The FIRST sighting keeps its clock — that is when
-                    // the tool actually began.
-                    if !self.outstanding.iter().any(|(tid, _, _)| tid == id) {
-                        self.outstanding.push((id.clone(), name.clone(), now_ms));
-                    }
-                    // A tool call is response output: any pending request
-                    // has been answered.
-                    self.api_since = None;
-                    self.activity(now_ms)
-                }
-                SessionEvent::ToolUseFinished { id, .. } => {
-                    self.outstanding.retain(|(tid, _, _)| tid != id);
-                    self.activity(now_ms)
-                }
-                SessionEvent::ApprovalRequested {
-                    request_id, tool, ..
-                } => {
-                    self.api_since = None;
-                    self.activity(now_ms);
-                    if !self
-                        .pending_approvals
-                        .iter()
-                        .any(|(id, _, _)| id == request_id)
-                    {
-                        self.pending_approvals
-                            .push((request_id.clone(), tool.clone(), now_ms));
-                    }
-                    self.settle_approvals(now_ms)
-                }
-                SessionEvent::ApprovalWithdrawn { request_id, .. } => {
-                    self.pending_approvals.retain(|(id, _, _)| id != request_id);
-                    self.activity(now_ms);
-                    self.settle_approvals(now_ms)
-                }
-                SessionEvent::TextDelta { .. } | SessionEvent::AssistantText { .. } => {
-                    self.api_since = None;
-                    self.activity(now_ms)
-                }
-                SessionEvent::System { subtype, raw } => {
-                    if subtype == "status" && status_is_requesting(raw) {
-                        self.api_since = Some(now_ms);
-                    }
-                    self.activity(now_ms)
-                }
-                // Init, UserEcho, Malformed, Unknown, (Exited never lands
-                // here — the recorder folds it into Closed): all bytes.
-                _ => self.activity(now_ms),
-            },
-            // Repair/terminal records only appear in replay, which the
-            // monitor never classifies over; settle everything anyway.
-            JournalEvent::ApprovalDecided { request_id, .. } => {
-                self.pending_approvals.retain(|(id, _, _)| id != request_id);
-                self.activity(now_ms);
-                self.settle_approvals(now_ms)
-            }
-            JournalEvent::ToolInterrupted { id } => {
-                self.outstanding.retain(|(tid, _, _)| tid != id);
-                None
-            }
-            JournalEvent::TurnInterrupted { .. } | JournalEvent::Closed { .. } => {
-                self.turn_balance = 0;
-                self.outstanding.clear();
-                self.api_since = None;
-                self.pending_approvals.clear();
-                None
+        match self.turn.on_record(rec, now_ms) {
+            Fold::Silent => None,
+            Fold::Activity => self.activity(),
+            // **Both results, not just the second.** This used to be
+            // `self.activity(..); self.settle_approvals(..)`, discarding
+            // activity's snapshot — so a `TurnCompleted` arriving on a
+            // session already classified `quiet` moved the state to
+            // `Running` and told nobody, leaving the operator's rail
+            // reporting "quiet for 2m" about a turn that had finished.
+            Fold::Approvals => {
+                let cleared = self.activity();
+                self.settle_approvals(now_ms).or(cleared)
             }
         }
     }
@@ -381,36 +305,49 @@ impl Classifier {
         if matches!(self.state, AttentionSnapshot::Failed { .. }) {
             return None;
         }
+        // Settle FIRST (Slice CF). An unpromised turn reaching quiet-idle
+        // closes rather than classifying: nobody is owed a terminal frame,
+        // so silence there means finished, not ambiguous. Classifying it
+        // would report the agent's own background work as a stuck session —
+        // which is the stuck-Working incident comet answered with a second
+        // watchdog and two env knobs. This costs neither: it consumes the
+        // measurement `on_tick` was already making.
+        self.turn.settle(now_ms, self.th.quiet_after_ms);
         // Idle between turns is NORMAL — the CLI lingers on stdin after
         // turn_completed (claude-stream-notes.md). No open turn, no clock.
-        if self.turn_balance <= 0 {
-            return None;
-        }
+        let open = self.turn.open()?;
         // Slice K: a pending human approval holds BOTH clocks (spec 01
         // §Attention clocks). This is the carve-out that keeps a session
         // held across someone's lunch break from being reported as
         // ambiguous and offered a kill.
-        if !self.pending_approvals.is_empty() {
+        if !self.turn.approvals().is_empty() {
             return None;
         }
-        let desired: Option<WaitReason> = if let Some((_, name, since)) = self
-            .outstanding
-            .first()
-            .filter(|(_, _, since)| now_ms.saturating_sub(*since) >= self.th.tool_exec_after_ms)
+        let desired: Option<WaitReason> = if let Some((name, since)) = self
+            .turn
+            .oldest_tool()
+            .filter(|(_, since)| now_ms.saturating_sub(*since) >= self.th.tool_exec_after_ms)
         {
             Some(WaitReason::Tool {
-                name: name.clone(),
-                since_ms: *since,
+                name: name.to_string(),
+                since_ms: since,
             })
-        } else if self.outstanding.is_empty()
-            && now_ms.saturating_sub(self.last_activity_ms) >= self.th.quiet_after_ms
+        } else if !self.turn.tools_outstanding()
+            && now_ms.saturating_sub(self.turn.last_activity_ms()) >= self.th.quiet_after_ms
         {
             // While a tool is outstanding (but under its own threshold) the
-            // quiet clock does NOT run (spec 01) — hence the is_empty gate.
-            Some(match self.api_since {
-                Some(since_ms) => WaitReason::Api { since_ms },
-                None => WaitReason::Idle,
-            })
+            // quiet clock does NOT run (spec 01) — hence the gate above.
+            match self.turn.api_since() {
+                Some(since_ms) => Some(WaitReason::Api { since_ms }),
+                // An unpromised turn cannot reach `Idle`: that premise IS
+                // its settle condition, and `settle` above consumed it. The
+                // match is exhaustive so a third turn shape has to say what
+                // silence means for it rather than inheriting an answer.
+                None => match open.settle() {
+                    TurnSettle::Promised => Some(WaitReason::Idle),
+                    TurnSettle::Unpromised => None,
+                },
+            }
         } else {
             None
         };
@@ -502,21 +439,11 @@ impl Classifier {
     }
 }
 
-/// `{"type":"system","subtype":"status","status":"requesting"}` — the wire
-/// mark for "API request in flight" (claude-stream-notes.md).
-fn status_is_requesting(raw: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .ok()
-        .and_then(|v| {
-            v.get("status")
-                .and_then(|s| s.as_str().map(|s| s == "requesting"))
-        })
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::SessionEvent;
+    use crate::journal::JournalEvent;
 
     const TH: AttentionThresholds = AttentionThresholds {
         quiet_after_ms: 120_000,
@@ -580,13 +507,13 @@ mod tests {
         c.on_record(&provider(SessionEvent::TextDelta { text: "r".into() }), 10);
         completed(&mut c, 20); // journaled first (channel race)
         delivered(&mut c, 30); // its own delivery confirmation lands late
-        assert!(!c.in_turn(), "reordered pair must net to closed");
+        assert_eq!(c.open_turn(), None, "reordered pair must net to closed");
         for t in (1_000..7_200_000).step_by(60_000) {
             assert_eq!(c.on_tick(t), None, "tick at {t} must not classify");
         }
         // And the next real turn still opens/classifies normally.
         delivered(&mut c, 7_200_000);
-        assert!(c.in_turn());
+        assert_eq!(c.open_turn(), Some(TurnStart::Prompted));
         assert!(matches!(
             c.on_tick(7_200_000 + TH.quiet_after_ms),
             Some(AttentionSnapshot::Quiet { .. })
@@ -922,6 +849,104 @@ mod tests {
         assert_eq!(c.on_tick(3_600_000), None);
     }
 
+    /// **The shape eave had backwards.** A turn the agent starts on its own
+    /// — a background wake, a background shell reporting, a subagent
+    /// finishing — never opened a turn at all before this slice, because
+    /// the only opener was `UserDelivered`, an EAVE-side event. So the work
+    /// was invisible while it ran.
+    ///
+    /// Making it visible is only half of it: the other half is that it must
+    /// never be reported as ambiguous when it stops. Nobody owes this turn
+    /// a terminal frame, so silence IS the settle — and that is the whole
+    /// of the stuck-Working incident comet answered with a second watchdog
+    /// (`sessions.rs:1391`) and a second env knob.
+    #[test]
+    fn an_unannounced_turn_settles_on_quiet_instead_of_classifying() {
+        let mut c = Classifier::new(TH, 0);
+        // No prompt anywhere: the agent woke itself up.
+        c.on_record(
+            &provider(SessionEvent::TextDelta {
+                text: "background task finished".into(),
+            }),
+            1_000,
+        );
+        assert_eq!(
+            c.open_turn(),
+            Some(TurnStart::Unannounced),
+            "agent-initiated work must open a turn"
+        );
+        assert_eq!(c.on_tick(1_000 + TH.quiet_after_ms - 1), None);
+        assert_eq!(
+            c.on_tick(1_000 + TH.quiet_after_ms),
+            None,
+            "an unpromised turn must settle, never escalate to a notice"
+        );
+        assert_eq!(c.open_turn(), None, "the unannounced turn never settled");
+        assert_eq!(c.snapshot(), AttentionSnapshot::Running);
+        // `unresponsive` is therefore unreachable from this turn shape: it
+        // is only ever hardened out of quiet/idle, which this never enters.
+        assert!(!c.wants_cpu_sampling());
+        // And hours of the CLI lingering afterwards stay silent.
+        for t in (2_000..7_200_000).step_by(60_000) {
+            assert_eq!(c.on_tick(t), None, "tick at {t} must not classify");
+        }
+    }
+
+    /// A tool running inside an agent-initiated turn is still worth a
+    /// notice at its own threshold — the settle is only ever the idle
+    /// premise, never a blanket exemption for the turn shape.
+    #[test]
+    fn an_unannounced_turn_still_reports_a_tool_past_its_threshold() {
+        let mut c = Classifier::new(TH, 0);
+        c.on_record(
+            &provider(SessionEvent::ToolUseStarted {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: String::new(),
+                call: None,
+            }),
+            1_000,
+        );
+        assert_eq!(c.open_turn(), Some(TurnStart::Unannounced));
+        match c.on_tick(1_000 + TH.tool_exec_after_ms) {
+            Some(AttentionSnapshot::Quiet {
+                reason: WaitReason::Tool { ref name, .. },
+                ..
+            }) if name == "Bash" => {}
+            other => panic!("expected quiet/tool, got {other:?}"),
+        }
+        assert_eq!(c.open_turn(), Some(TurnStart::Unannounced));
+    }
+
+    /// A turn that finishes AFTER the session was classified `quiet` has to
+    /// broadcast the clear.
+    ///
+    /// The `TurnCompleted` arm used to call `activity()` and throw its
+    /// snapshot away, keeping only `settle_approvals()`'s — which is `None`
+    /// whenever no question was open. So the classifier moved itself to
+    /// `Running` and told nobody, and the rail went on reporting "quiet for
+    /// 2m" about a turn whose result line had already landed.
+    #[test]
+    fn a_completion_landing_on_a_quiet_session_broadcasts_the_clear() {
+        let mut c = Classifier::new(TH, 0);
+        delivered(&mut c, 0);
+        assert!(matches!(
+            c.on_tick(TH.quiet_after_ms),
+            Some(AttentionSnapshot::Quiet { .. })
+        ));
+        assert_eq!(
+            c.on_record(
+                &provider(SessionEvent::TurnCompleted {
+                    subtype: "success".into(),
+                    is_error: false,
+                }),
+                TH.quiet_after_ms + 1,
+            ),
+            Some(AttentionSnapshot::Running),
+            "the quiet notice outlived the turn it was reporting"
+        );
+    }
+
     #[test]
     fn probe_failure_branches() {
         let base = ProbeFacts {
@@ -930,7 +955,7 @@ mod tests {
             zombie: false,
             parent_ok: true,
             stdout_eof: false,
-            in_turn: true,
+            in_turn: Some(TurnStart::Prompted),
         };
         assert_eq!(probe_failure(&base), None);
         assert_eq!(
@@ -965,13 +990,30 @@ mod tests {
         })
         .unwrap()
         .contains("mid-turn"));
+        // Slice CF: three turn shapes, three causes. A bool here reported
+        // the agent's own background work dying as "mid-turn", which names
+        // a frame that was never owed.
         assert!(probe_failure(&ProbeFacts {
             stdout_eof: true,
-            in_turn: false,
+            in_turn: Some(TurnStart::Unannounced),
             ..base
         })
         .unwrap()
-        .contains("stdout closed"));
+        .contains("unannounced agent work"));
+        assert!(probe_failure(&ProbeFacts {
+            stdout_eof: true,
+            in_turn: Some(TurnStart::Announced),
+            ..base
+        })
+        .unwrap()
+        .contains("agent-started turn"));
+        assert!(probe_failure(&ProbeFacts {
+            stdout_eof: true,
+            in_turn: None,
+            ..base
+        })
+        .unwrap()
+        .contains("stdout closed while"));
     }
 
     #[test]

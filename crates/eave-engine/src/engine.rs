@@ -2258,7 +2258,7 @@ async fn monitor_session(
             },
             _ = tick.tick() => {
                 // Provable death first — immediate, no timer (spec 01).
-                let facts = probe_facts(&watch, engine_pid, cls.in_turn());
+                let facts = probe_facts(&watch, engine_pid, cls.open_turn());
                 match probe_failure(&facts) {
                     Some(cause) if pending_cause.as_deref() == Some(cause.as_str()) => {
                         if let Some(snap) = cls.fail(cause, now_ms()) {
@@ -2295,7 +2295,11 @@ async fn monitor_session(
 /// Assemble one tick's OS facts (spec 01 `failed` inputs) from the pid
 /// probe + the adapter's flags. Once the exit waiter has facts, the normal
 /// `Exited → Closed` path owns everything — report nothing.
-fn probe_facts(watch: &SessionWatch, engine_pid: i32, in_turn: bool) -> ProbeFacts {
+fn probe_facts(
+    watch: &SessionWatch,
+    engine_pid: i32,
+    in_turn: Option<eave_core::turn::TurnStart>,
+) -> ProbeFacts {
     let exited = watch.exited();
     let (vanished, zombie, parent_ok) = if exited {
         (false, false, true)
