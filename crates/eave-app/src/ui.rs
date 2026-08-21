@@ -2029,20 +2029,23 @@ struct TranscriptState {
     open_tools: std::collections::HashSet<String>,
     /// Slice N3 — the live-turn clock behind the working trailer.
     ///
-    /// A signed BALANCE, never a bool. The recorder's two input channels
-    /// are unordered relative to each other, so a fast CLI's
-    /// `TurnCompleted` can be journaled BEFORE the `UserDelivered` that
-    /// opened its turn (progress.md trap; `attention::Classifier`'s
-    /// `turn_balance` is the engine-side twin of this field, and a bool
-    /// there was a ~40% flake). Floored at −1 so the pair nets to closed
-    /// in either arrival order — the failure a bool buys here is a
-    /// phantom turn whose trailer never goes away.
-    turn_balance: i32,
-    /// When the operator asked, in journal ms: the `UserSent` timestamp.
-    /// From the journal rather than from when this process happened to
-    /// attach, so a session opened mid-turn reports the turn's real age
-    /// and not the age of the subscription.
-    turn_started_ms: Option<u64>,
+    /// **Slice CF made this the engine's own state machine rather than a
+    /// copy of it.** It used to be a hand-written `turn_balance: i32` plus a
+    /// `turn_started_ms`, folded by a second `match` over `JournalEvent` a
+    /// few lines below — the same arithmetic as `attention::Classifier`'s,
+    /// written twice. Two copies of a state machine that disagree is worse
+    /// than one that is wrong, and these two had already drifted: the
+    /// engine's cleared its pending approvals on a `TurnCompleted` and this
+    /// one did not. Now both own an `eave_core::turn::TurnLedger` and fold
+    /// the identical records through the identical code.
+    turn: eave_core::turn::TurnLedger,
+    /// The attention clocks, read from the same `EAVE_THRESH_*` environment
+    /// the engine reads. The app needs them because an UNANNOUNCED turn has
+    /// no terminal frame coming and quiescence is its only settle path — so
+    /// the reader has to run that rule too, or its trailer would outlive the
+    /// engine's turn. No constant of this slice's own: `QUIET_AFTER` is the
+    /// clock eave already keeps.
+    th: eave_core::thresholds::AttentionThresholds,
 }
 
 impl TranscriptState {
@@ -2066,18 +2069,30 @@ impl TranscriptState {
             composer: None,
             shell: None,
             open_tools: std::collections::HashSet::new(),
-            turn_balance: 0,
-            turn_started_ms: None,
+            turn: eave_core::turn::TurnLedger::new(eave_core::journal::now_ms()),
+            th: eave_core::thresholds::AttentionThresholds::from_env(),
         }
     }
 
     /// Is a turn in flight right now? (Slice N3.) The engine's own
     /// `SessionInfo.state` cannot answer this: the real CLI **lingers**
     /// after `turn_completed` waiting for more stdin, so it still reads
-    /// `running` between turns (progress.md). The turn boundary on the
-    /// wire is `TurnCompleted`, which is what the balance counts.
+    /// `running` between turns (progress.md).
     fn in_turn(&self) -> bool {
-        self.turn_balance > 0
+        self.turn.in_turn()
+    }
+
+    /// Close an UNANNOUNCED turn that has gone quiet (Slice CF).
+    ///
+    /// The reader has to run this rule itself. An unannounced turn is closed
+    /// by nothing on the wire — that is what makes it unannounced — so if
+    /// the app waited to be told, its trailer would report the agent working
+    /// on its own until the next record arrived, which is the `working for
+    /// 99h 49m` shape from the other direction. A prompted or announced turn
+    /// is untouched here: those wait for their frame, forever.
+    fn settle_turn(&mut self) -> bool {
+        self.turn
+            .settle(eave_core::journal::now_ms(), self.th.quiet_after_ms)
     }
 
     fn live_len(&self) -> Option<(u32, usize)> {
@@ -2107,25 +2122,14 @@ impl TranscriptState {
         }
         // Slice N3: the live-turn clock, folded from the same batch. After
         // the apply, so a batch rejected for a sequence gap never moves it.
+        //
+        // Slice CF: `rec.ts_ms` is the ledger's "now" here, not the wall
+        // clock. A reader is replaying history — a session opened mid-turn
+        // must report the turn's real age and not the age of the
+        // subscription — and both are epoch ms, so the clocks this feeds
+        // still read correctly against `now_ms()`.
         for rec in records {
-            match &rec.event {
-                eave_core::journal::JournalEvent::UserSent { .. } => {
-                    self.turn_started_ms = Some(rec.ts_ms);
-                }
-                eave_core::journal::JournalEvent::UserDelivered {} => {
-                    self.turn_balance = (self.turn_balance + 1).min(8);
-                }
-                // A segment ended: whatever was open died with the process.
-                eave_core::journal::JournalEvent::Closed { .. } => {
-                    self.turn_balance = 0;
-                }
-                eave_core::journal::JournalEvent::Provider {
-                    event: eave_core::events::SessionEvent::TurnCompleted { .. },
-                } => {
-                    self.turn_balance = (self.turn_balance - 1).max(-1);
-                }
-                _ => {}
-            }
+            self.turn.on_record(rec, rec.ts_ms);
         }
         let ops = self.display.update(&self.transcript);
         // List item count is always display rows + 1: the trailing
@@ -2286,8 +2290,7 @@ impl TranscriptState {
         // Slice N3: the turn clock is a projection like everything else
         // here — a replay re-derives it, and a switch must not carry the
         // old session's open turn into the new one's trailer.
-        self.turn_balance = 0;
-        self.turn_started_ms = None;
+        self.turn = eave_core::turn::TurnLedger::new(eave_core::journal::now_ms());
     }
 }
 
@@ -5976,9 +5979,7 @@ impl Shell {
     /// else (report §7.1 on the two voices).
     fn work_trailer(&self, phase: Option<f32>, cx: &Context<Self>) -> Option<AnyElement> {
         let state = self.transcript.read(cx);
-        if !state.in_turn() {
-            return None;
-        }
+        let start = state.turn.open()?;
         // **Slice AQ — found by eye, in `docs/shots/aq-before-approval.png`.**
         // A session parked on a permission question was captioned `working
         // for 99h 49m`, with a running work bar beside it, in the slot
@@ -6004,12 +6005,48 @@ impl Shell {
         if state.transcript.pending_approvals().next().is_some() {
             return None;
         }
-        // No `UserSent` seen means no honest clock to report; the
-        // indicator alone still states that something is running. Never
-        // invent a start time from when this process attached.
+        // No start seen means no honest clock to report; the indicator
+        // alone still states that something is running. Never invent a
+        // start time from when this process attached.
         let elapsed = state
-            .turn_started_ms
+            .turn
+            .started_ms()
             .map(|started| fmt_elapsed(eave_core::journal::now_ms().saturating_sub(started)));
+        // **Slice CF: "the agent is working because you asked" and "the
+        // agent is working on its own" are different facts, and an operator
+        // has no other way to learn the second one.** Before this slice the
+        // second had no picture at all — no turn ever opened for it, because
+        // the only opener was `UserDelivered`, which is eave's own event.
+        //
+        // Two of the three turn shapes render the same sentence, and that is
+        // a decision rather than an oversight: `Announced` and `Unannounced`
+        // differ only in whether a terminal frame is owed, which is machinery
+        // the operator cannot act on. What they can act on is *who started
+        // this*, and on that the two agree.
+        //
+        // The bar keeps `live()` in both. eave's saturated pigments name
+        // STATES, and both of these are the same state — live activity right
+        // now. A second pigment here would claim a state distinction that
+        // does not exist. The sentence carries the fact instead, one ink rung
+        // brighter, because it is the surprising one.
+        let (selector, words, ink) = match start {
+            eave_core::turn::TurnStart::Prompted => (
+                "work-trailer-asked",
+                match &elapsed {
+                    Some(e) => format!("working for {e}"),
+                    None => "working".to_string(),
+                },
+                theme::text_tertiary(),
+            ),
+            eave_core::turn::TurnStart::Announced | eave_core::turn::TurnStart::Unannounced => (
+                "work-trailer-self",
+                match &elapsed {
+                    Some(e) => format!("working on its own for {e}"),
+                    None => "working on its own".to_string(),
+                },
+                theme::text_secondary(),
+            ),
+        };
         Some(
             Self::column(
                 div()
@@ -6022,12 +6059,13 @@ impl Shell {
                     .pb(px(theme::SPACE_2))
                     .text_size(px(theme::SMALL_SIZE))
                     .line_height(px(theme::SMALL_LINE))
-                    .text_color(theme::text_tertiary())
+                    .text_color(ink)
                     .child(loaders::work_bar(theme::live(), phase))
-                    .child(SharedString::from(match elapsed {
-                        Some(e) => format!("working for {e}"),
-                        None => "working".to_string(),
-                    })),
+                    .child(
+                        div()
+                            .debug_selector(move || selector.into())
+                            .child(SharedString::from(words)),
+                    ),
             )
             .into_any_element(),
         )
@@ -9240,8 +9278,18 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             // exists, so a trailer driven only by the loader would freeze
             // its clock for exactly the people who asked for less motion.
             // This second is the trailer's only guaranteed heartbeat.
+            //
+            // Slice CF: this second is also the UNANNOUNCED turn's only
+            // settle path. Nothing on the wire closes one, so if the reader
+            // waited to be told, its trailer would keep reporting "working
+            // on its own" until the next record happened to arrive. A
+            // prompted or announced turn is untouched — `settle_turn` waits
+            // for their frame, forever.
             if transcript.read_with(cx, |t, _| t.in_turn()) {
-                transcript.update(cx, |_, cx| cx.notify());
+                transcript.update(cx, |t, cx| {
+                    t.settle_turn();
+                    cx.notify()
+                });
             }
         })
         .detach();
