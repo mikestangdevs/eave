@@ -8502,6 +8502,33 @@ impl Render for Shell {
         };
         let showing_page = page_el.is_some();
 
+        // ── THE RULE FOR EVERY FLOATING SURFACE, PRESENT AND FUTURE ──
+        //
+        // Every surface that floats over the content well must answer one
+        // question at the moment it is written: **suppressed, or shown over
+        // a page?** There is no third answer and there is no default, and
+        // `showing_page` is how you say which — see the `.when(!showing_page,
+        // …)` and `.filter(|_| !showing_page)` sites below.
+        //
+        // This is not a style preference, it is a defect class. Every
+        // floating surface in this file was written when the well could only
+        // hold a transcript, so each one silently assumes the thing beneath
+        // it is ours to draw over. The launcher proved it: it drew straight
+        // through a loaded example.com in the first screenshot of Slice C1,
+        // because "no session yet" had always implied "nothing to obscure",
+        // and a page made that false without changing a line of its code.
+        //
+        // The webview spike inventoried TEN window-owned floating surfaces.
+        // The launcher was the first to meet a page. The other nine — and
+        // anything added after this — inherit exactly the same stale
+        // assumption, and it fails silently and looks like a rendering bug
+        // in Chromium rather than a layering bug in eave.
+        //
+        // Suppressing is the right default (the connection panel is the
+        // deliberate exception: it is about the ENGINE, so it is true on any
+        // tab and shows over a page). But an explicit "shown over a page,
+        // because X" is a fine answer too. The unacceptable answer is not
+        // having considered it.
         let caret_lit = self.caret_lit(cx);
         // Slice N3: ONE ask for the whole window, here in the root
         // render pass. The shell decides once whether anything is

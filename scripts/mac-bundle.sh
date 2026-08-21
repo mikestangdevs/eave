@@ -184,6 +184,23 @@ cef_check_pin() {
 # (and Electron's, and Chrome's) is that a helper's identifier is the app's
 # with a role appended, so five processes are five distinct identities that
 # still read as belonging to one app.
+#
+# THESE SUFFIXES ARE EFFECTIVELY PERMANENT — the same rule the app's own
+# `CFBundleIdentifier` carries in dist/macos/Info.plist, and for the same
+# reason, but it needs saying HERE because these strings are generated and
+# the app's is hand-written, so nobody reading a plist will find this note.
+#
+# macOS keys TCC grants (camera, microphone, screen recording — all things a
+# browser asks for, and the RENDERER is what asks), LaunchServices records
+# and notarization tickets off the identifier. Change one later and every
+# machine that ran an older build keeps the old grants against an identity
+# nothing claims any more: the user is re-prompted for permissions they
+# already gave, and the stale entries are invisible in System Settings
+# because no installed app matches them. It is not a thing you can fix in
+# an update — `tccutil reset` per-identifier is the only cure and it is a
+# support burden, not a migration.
+#
+# So: adding a SIXTH helper is fine, and renaming any of these five is not.
 CEF_HELPERS=(
   "Helper|helper"
   "Helper (GPU)|helper.gpu"
