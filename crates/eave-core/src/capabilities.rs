@@ -355,6 +355,21 @@ pub fn forget() {
         map.clear();
     }
 }
+/// May eave spawn this provider's CLI to ask it a question?
+///
+/// **Extracted as a predicate so it can be tested.** It used to be an
+/// inline `if` inside [`begin`], and [`begin`] early-returns unless the
+/// process is armed — which only `ui::run` does — so no test could reach
+/// the gate at all. Mutation-checked 2026-08-21: deleting the inline
+/// version broke **zero** tests. The neighbouring test
+/// `a_provider_eave_would_not_spawn_is_not_probed_either` looked like
+/// cover and was not; it exercises [`freshness`], the *display* path.
+///
+/// A gate on a security boundary that no test can reach is a gate that
+/// will be deleted by someone tidying up.
+fn may_probe(id: &str) -> bool {
+    crate::session::posture_is_verified(id)
+}
 
 /// Ask this provider's CLI what it can run, **without waiting for the
 /// answer**. Returns immediately, every time.
@@ -378,7 +393,7 @@ pub fn begin(provider_id: &str) {
         return;
     };
     // The gate, not a bypass of it. See the module doc.
-    if !crate::session::posture_is_verified(id) {
+    if !may_probe(id) {
         return;
     }
     let Some(entry) = crate::provider::catalog(id) else {
@@ -1097,5 +1112,38 @@ mod tests {
         for e in crate::provider::CATALOG {
             eprintln!("{}: {:?} {:?}", e.id, freshness(e.id), reported(e.id));
         }
+    }
+
+    /// **The gate itself, not the picker that reports it.**
+    ///
+    /// The test above asserts an unproven provider *reads* as refused.
+    /// This asserts eave will not *spawn* it — a different claim, and the
+    /// one that matters, since the first stays true even if the spawn
+    /// gate is deleted. Verified by mutation: removing the gate leaves
+    /// this failing and every other test in the module green.
+    ///
+    /// Written against the predicate rather than by arming the process,
+    /// because a test that proves the gate by spawning the CLI when the
+    /// gate is broken is a test that runs a refused CLI on regression.
+    #[test]
+    fn eave_will_not_spawn_a_cli_it_refuses_to_drive() {
+        let mut checked = 0;
+        for e in crate::provider::CATALOG {
+            if crate::session::posture_is_verified(e.id) {
+                assert!(may_probe(e.id), "{} is drivable, so it is askable", e.id);
+            } else {
+                assert!(
+                    !may_probe(e.id),
+                    "{} has no proven posture: a discovery spawn is that same \
+                     spawn with a friendlier name",
+                    e.id,
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no unproven provider in the catalog — this test would pass vacuously"
+        );
     }
 }
