@@ -123,6 +123,15 @@ fn msg_content_hash(row: &Row) -> u64 {
             input,
             result,
             is_error,
+            // Deliberately not hashed, on two independent grounds. The
+            // typed call only ever changes together with the `input` it
+            // was decoded from — both are written from one event — and
+            // that write goes through `Transcript::touch`, so the row's
+            // REVISION has already changed and this fingerprint is not
+            // what the cache consults. Hashing it anyway would cost an
+            // allocation per row inside the fold, and the 10k-row gate
+            // builds every row cold.
+            call: _,
         } => {
             let tag: u8 = match status {
                 ToolStatus::Running => 1,

@@ -20,3 +20,4 @@ pub mod session;
 pub mod store;
 pub mod stream;
 pub mod thresholds;
+pub mod tool;

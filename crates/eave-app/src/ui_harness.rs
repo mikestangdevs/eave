@@ -847,7 +847,29 @@ fn user_record(seq: u64, text: &str) -> eave_core::journal::Record {
     }
 }
 
+/// A journalled Claude tool start, decoded the way the Claude adapter
+/// decodes it — the harness must exercise the real record shape, not a
+/// hand-built one that skips the field the row renders from.
 fn tool_started(seq: u64, id: &str, name: &str, input: &str) -> eave_core::journal::Record {
+    let parsed = serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    tool_started_typed(
+        seq,
+        id,
+        name,
+        input,
+        Some(eave_core::stream::decode_tool(name, &parsed)),
+    )
+}
+
+/// A tool start from any provider, with the typed call stated outright.
+/// `call: None` is a record written before adapters decoded anything.
+fn tool_started_typed(
+    seq: u64,
+    id: &str,
+    name: &str,
+    input: &str,
+    call: Option<eave_core::tool::ToolCall>,
+) -> eave_core::journal::Record {
     eave_core::journal::Record {
         seq,
         ts_ms: seq * 10,
@@ -856,6 +878,7 @@ fn tool_started(seq: u64, id: &str, name: &str, input: &str) -> eave_core::journ
                 id: id.into(),
                 name: name.into(),
                 input: input.into(),
+                call,
             },
         },
     }
@@ -1136,6 +1159,42 @@ fn an_unknown_tool_states_no_detail(cx: &mut TestAppContext) {
     assert!(
         vcx.debug_bounds("tool-detail").is_none(),
         "a detail was invented for a tool with no known summary key"
+    );
+}
+
+/// A NON-Claude tool row states its argument.
+///
+/// The row's detail used to come from a table keyed on Claude's tool
+/// names, so a Codex `commandExecution` — the same shell command, from a
+/// provider eave ships — rendered as a name and a status word. The typed
+/// call is the fix, and this is the assertion that it reaches the screen
+/// rather than stopping at the wire crate.
+#[gpui::test]
+fn a_codex_tool_row_states_its_command(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started_typed(
+            1,
+            "item_1",
+            "commandExecution",
+            r#"{"command":"cargo test --workspace","cwd":"/repo"}"#,
+            Some(eave_core::tool::ToolCall::Run {
+                command: "cargo test --workspace".into(),
+            }),
+        )],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-detail").is_some(),
+        "a Codex tool row states its command"
     );
 }
 

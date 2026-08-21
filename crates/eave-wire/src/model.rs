@@ -11,6 +11,7 @@
 
 use eave_core::events::SessionEvent;
 use eave_core::journal::{JournalEvent, Outcome, Record};
+use eave_core::tool::ToolCall;
 
 use crate::Cursor;
 
@@ -56,18 +57,27 @@ pub enum ToolStatus {
 
 /// The one line a tool row states about what it was asked to do.
 ///
-/// Every tool's `input` is an object with a different shape, and exactly one
-/// of its keys is the thing an operator wants to read: the command for a
-/// shell, the path for a file op, the pattern for a search. This maps a tool
-/// name to that key and returns nothing when it does not know one — a row
-/// that states the tool alone is honest, and inventing a summary from an
-/// arbitrary key would not be.
+/// **The typed call is the answer whenever there is one.** The adapter that
+/// received the tool call decoded it against the provider's own schema
+/// (`eave_core::tool`), so it knows a Codex `commandExecution` and a Pi
+/// `bash` are both a command in a way this function never could.
+///
+/// `None` for `call` is not "no detail" — it is a record written **before**
+/// adapters decoded anything, and every one of those is a Claude record,
+/// because Claude was the only provider eave had. So the fallback below is
+/// exactly what it always was: a map from a Claude tool name to the one key
+/// an operator wants to read. It is kept, unchanged, so a journal from
+/// before this slice still renders the way it did — deleting it would have
+/// silently downgraded every old transcript.
 ///
 /// The keys are the ones the real CLI sends, read off the capture corpus at
 /// `docs/research/approvals-capture-2026-08-18/` (Bash → `command`, Read and
 /// Write → `file_path`); the rest follow the same tool's documented input
 /// and are marked where they are unverified against a capture.
-pub fn tool_detail(name: &str, input: &str) -> Option<String> {
+pub fn tool_detail(call: Option<&ToolCall>, name: &str, input: &str) -> Option<String> {
+    if let Some(call) = call {
+        return call.detail();
+    }
     if input.is_empty() {
         return None;
     }
@@ -115,6 +125,10 @@ pub enum Row {
     /// JSON and `result` its reply as text — both already bounded by
     /// `eave_core::events::TOOL_PAYLOAD_CAP` before they reach here, so a
     /// row is never the thing that has to defend the render budget.
+    ///
+    /// `call` is the adapter's decode of that same input, and `None` means
+    /// the record predates adapters decoding anything — see
+    /// [`tool_detail`], which is where the two are reconciled.
     Tool {
         id: String,
         name: String,
@@ -122,6 +136,7 @@ pub enum Row {
         input: String,
         result: String,
         is_error: bool,
+        call: Option<ToolCall>,
     },
     /// The agent is asking to run one tool (Slice K). Every fact an
     /// operator needs to decide is on the row: an approval given without
@@ -334,14 +349,47 @@ impl Transcript {
                     live: false,
                 }),
             },
-            SessionEvent::ToolUseStarted { id, name, input } => self.push_row(Row::Tool {
-                id: id.clone(),
-                name: name.clone(),
-                status: ToolStatus::Running,
-                input: input.clone(),
-                result: String::new(),
-                is_error: false,
-            }),
+            // Keyed by id, not appended: an adapter may restate a start
+            // once the arguments it did not have at announcement time
+            // arrive (the Claude CLI announces a `tool_use` with an empty
+            // `input` and fills it a line later). A second row for one
+            // tool would be a lie about how many ran, so the restatement
+            // updates the row in place — which is also what makes the
+            // chip's argument appear mid-flight rather than never.
+            SessionEvent::ToolUseStarted {
+                id,
+                name,
+                input,
+                call,
+            } => match self
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Tool { id: rid, .. } if rid == id))
+            {
+                Some(ix) => {
+                    if let Row::Tool {
+                        name: n,
+                        input: i,
+                        call: c,
+                        ..
+                    } = &mut self.rows[ix]
+                    {
+                        n.clone_from(name);
+                        i.clone_from(input);
+                        c.clone_from(call);
+                    }
+                    self.touch(ix);
+                }
+                None => self.push_row(Row::Tool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    status: ToolStatus::Running,
+                    input: input.clone(),
+                    result: String::new(),
+                    is_error: false,
+                    call: call.clone(),
+                }),
+            },
             SessionEvent::ToolUseFinished {
                 id,
                 result,
@@ -554,14 +602,19 @@ impl std::error::Error for SeqGap {}
 #[cfg(test)]
 mod tests {
 
+    /// The name-keyed fallback, exercised the way it is actually reached:
+    /// a record with no typed call, which only a journal written before
+    /// this slice can be.
+    ///
     /// The inputs here are copied from the real capture corpus
     /// (`docs/research/approvals-capture-2026-08-18/`), not invented, because
     /// a summariser tested against its own author's guess about the wire is
     /// testing nothing.
     #[test]
-    fn a_tool_row_states_what_it_was_asked_to_do() {
+    fn a_pre_typing_tool_row_still_states_what_it_was_asked_to_do() {
         assert_eq!(
             tool_detail(
+                None,
                 "Bash",
                 r#"{"command":"echo hello-from-bash > out.txt","description":"Write \"hello-from-bash\" to out.txt"}"#
             )
@@ -569,21 +622,65 @@ mod tests {
             Some("echo hello-from-bash > out.txt")
         );
         assert_eq!(
-            tool_detail("Write", r#"{"file_path":"/tmp/x/out.txt","content":"one"}"#).as_deref(),
+            tool_detail(
+                None,
+                "Write",
+                r#"{"file_path":"/tmp/x/out.txt","content":"one"}"#
+            )
+            .as_deref(),
             Some("/tmp/x/out.txt")
         );
         // A tool whose summary key we do not know states its name alone.
-        assert_eq!(tool_detail("SomeMcpTool", r#"{"whatever":1}"#), None);
+        assert_eq!(tool_detail(None, "SomeMcpTool", r#"{"whatever":1}"#), None);
         // ...and so does one whose input never arrived (a pre-slice journal).
-        assert_eq!(tool_detail("Bash", ""), None);
+        assert_eq!(tool_detail(None, "Bash", ""), None);
         // Malformed input is not a panic and not a lie.
-        assert_eq!(tool_detail("Bash", "{not json"), None);
+        assert_eq!(tool_detail(None, "Bash", "{not json"), None);
+    }
+
+    /// The typed call wins outright, and it is the only thing that CAN
+    /// answer for a provider whose tool is not called `Bash`: the
+    /// name-keyed fallback has never heard of Codex's `commandExecution`,
+    /// and the raw input it would have to guess from is not even the same
+    /// shape.
+    #[test]
+    fn a_typed_call_answers_where_the_name_keyed_guess_cannot() {
+        let codex = ToolCall::Run {
+            command: "cargo test --workspace".into(),
+        };
+        assert_eq!(
+            tool_detail(
+                Some(&codex),
+                "commandExecution",
+                r#"{"command":"cargo test --workspace","cwd":"/repo"}"#
+            )
+            .as_deref(),
+            Some("cargo test --workspace")
+        );
+        assert_eq!(
+            tool_detail(None, "commandExecution", r#"{"command":"cargo test"}"#),
+            None,
+            "this is the defect the typed call closes; if it ever answers, \
+             the fallback learned a name and this test should say so"
+        );
+        // An adapter that looked and did not recognise the tool says so,
+        // and does not fall back to guessing.
+        assert_eq!(
+            tool_detail(
+                Some(&ToolCall::Unknown {
+                    name: "Bash".into()
+                }),
+                "Bash",
+                r#"{"command":"ls"}"#
+            ),
+            None
+        );
     }
 
     /// A row is one line tall however long the command is.
     #[test]
     fn a_multi_line_command_states_its_first_line_and_says_so() {
-        let d = tool_detail("Bash", r#"{"command":"cat <<EOF\nline two\nEOF"}"#).unwrap();
+        let d = tool_detail(None, "Bash", r#"{"command":"cat <<EOF\nline two\nEOF"}"#).unwrap();
         assert_eq!(d, "cat <<EOF …");
         assert!(!d.contains('\n'), "a tool detail must never be multi-line");
     }
@@ -702,6 +799,7 @@ mod tests {
                             id: "toolu_1".into(),
                             name: "Bash".into(),
                             input: String::new(),
+                            call: None,
                         },
                     },
                 ),
@@ -790,5 +888,67 @@ mod tests {
                 live: false
             }]
         );
+    }
+
+    /// A restated start is the SAME tool: one row, updated in place.
+    ///
+    /// The Claude CLI announces a `tool_use` with an empty `input` and
+    /// sends the arguments a line later, so the adapter emits the start
+    /// twice for one tool. A second row would be a lie about how many ran,
+    /// and it is also how the chip's argument reaches the screen at all.
+    #[test]
+    fn a_restated_tool_start_updates_its_row_rather_than_adding_one() {
+        let started = |input: &str, call: Option<ToolCall>| SessionEvent::ToolUseStarted {
+            id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: input.into(),
+            call,
+        };
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    JournalEvent::Provider {
+                        event: started(
+                            "{}",
+                            Some(ToolCall::Run {
+                                command: String::new(),
+                            }),
+                        ),
+                    },
+                ),
+                rec(
+                    2,
+                    JournalEvent::Provider {
+                        event: started(
+                            r#"{"command":"cargo test"}"#,
+                            Some(ToolCall::Run {
+                                command: "cargo test".into(),
+                            }),
+                        ),
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(t.rows.len(), 1, "one tool ran, not two: {:?}", t.rows);
+        match &t.rows[0] {
+            Row::Tool {
+                status,
+                call,
+                input,
+                ..
+            } => {
+                assert_eq!(*status, ToolStatus::Running, "still running, not restarted");
+                assert_eq!(
+                    call.as_ref().and_then(ToolCall::detail).as_deref(),
+                    Some("cargo test")
+                );
+                assert!(input.contains("cargo test"));
+            }
+            other => panic!("expected a tool row, got {other:?}"),
+        }
     }
 }

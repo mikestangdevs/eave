@@ -11,12 +11,25 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::events::SessionEvent;
+use crate::tool::{self, TodoItem, ToolCall};
 
 const MALFORMED_LINE_CAP: usize = 512;
 
 #[derive(Default)]
 pub struct ClaudeStream {
     outstanding: HashSet<String>,
+    /// Tool ids whose arguments have actually been seen.
+    ///
+    /// Separate from `outstanding` because the CLI announces a tool call
+    /// **before** it has any arguments: under
+    /// `--include-partial-messages` the `content_block_start` for a
+    /// `tool_use` carries `"input": {}` and the real object arrives one
+    /// line later on the assistant snapshot (verified against
+    /// docs/research/approvals-capture-2026-08-18/capE-bash.jsonl, lines
+    /// 21 and 26). Deduplicating on `outstanding` alone therefore emitted
+    /// the empty announcement and dropped the arguments on the floor —
+    /// which is why every Claude tool row said `Bash` and nothing else.
+    tool_input_seen: HashSet<String>,
     session_id: Option<String>,
     /// Permission requests the CLI is parked on right now (Slice K). Held
     /// here so the adapter can answer a still-open question and ignore a
@@ -319,34 +332,110 @@ impl ClaudeStream {
         out
     }
 
-    /// Register a tool_use block; emits `ToolUseStarted` only on first sight
-    /// (the same id arrives via both `content_block_start` and the complete
-    /// assistant snapshot).
+    /// Register a tool_use block.
+    ///
+    /// Emits on first sight of an id — the row must appear while the tool
+    /// is running, not after — and again, once, when the arguments finally
+    /// arrive. The second emission carries the same id, so every consumer
+    /// treats it as the same tool: the transcript fold updates that row in
+    /// place, the journal's in-flight set is a set, and `outstanding` here
+    /// is unchanged. Nothing else repeats: once the arguments are recorded
+    /// the id never emits again.
     fn note_tool_use(&mut self, block: &Value) -> Option<SessionEvent> {
         let id = block.get("id").and_then(Value::as_str)?;
-        if self.outstanding.insert(id.to_string()) {
-            Some(SessionEvent::ToolUseStarted {
-                id: id.to_string(),
-                name: block
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                // Re-serialised compactly rather than kept verbatim: the
-                // provider's whitespace is not a fact about the tool call,
-                // and a compact form is what the cap is measured against.
-                // A missing `input` is an empty string, not `"null"` — the
-                // row then states the tool and nothing more, which is
-                // accurate.
-                input: block
-                    .get("input")
-                    .filter(|v| !v.is_null())
-                    .map(|v| crate::events::cap_payload(&v.to_string()))
-                    .unwrap_or_default(),
-            })
-        } else {
-            None
+        let first_sight = self.outstanding.insert(id.to_string());
+        let input = block.get("input").filter(|v| !v.is_null());
+        // `{}` is the CLI's placeholder, not an argument list.
+        let has_args = input.is_some_and(|v| v.as_object().is_none_or(|o| !o.is_empty()));
+        if has_args {
+            // False = already recorded; a third sighting says nothing new.
+            if !self.tool_input_seen.insert(id.to_string()) {
+                return None;
+            }
+        } else if !first_sight {
+            return None;
         }
+        let name = block
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Some(SessionEvent::ToolUseStarted {
+            id: id.to_string(),
+            call: Some(decode_tool(&name, input.unwrap_or(&Value::Null))),
+            name,
+            // Re-serialised compactly rather than kept verbatim: the
+            // provider's whitespace is not a fact about the tool call,
+            // and a compact form is what the cap is measured against.
+            // A missing `input` is an empty string, not `"null"` — the
+            // row then states the tool and nothing more, which is
+            // accurate.
+            input: input
+                .map(|v| crate::events::cap_payload(&v.to_string()))
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// Decode one Claude `tool_use` block into a typed [`ToolCall`].
+///
+/// The names are the CLI's own and the keys are the ones it actually
+/// sends: `Bash`→`command`, `Read`/`Write`→`file_path` come off the
+/// capture corpus at `docs/research/approvals-capture-2026-08-18/`; the
+/// rest follow the same tool's documented input.
+///
+/// Everything not listed — `BashOutput`, `KillShell`, `ExitPlanMode`, an
+/// `mcp__server__tool`, a skill, anything a later CLI adds — is
+/// [`ToolCall::Unknown`] under its own name. That includes MCP, which
+/// comet gives a variant of its own: eave's row already renders
+/// `mcp__playwright__browser_click` in the name column, so a typed
+/// `Mcp{server, tool}` would put the same fact on screen twice.
+pub fn decode_tool(name: &str, input: &Value) -> ToolCall {
+    let text = |key: &str| tool::text(input, key).unwrap_or_default();
+    match name {
+        "Bash" => ToolCall::Run {
+            command: text("command"),
+        },
+        "Read" => ToolCall::Read {
+            path: text("file_path"),
+        },
+        "Write" => ToolCall::Write {
+            path: text("file_path"),
+        },
+        // `NotebookEdit` names its file `notebook_path`; a key set rather
+        // than a second arm so neither spelling can go missing.
+        "Edit" | "MultiEdit" | "NotebookEdit" => ToolCall::Edit {
+            path: tool::text_any(input, &["file_path", "notebook_path"]).unwrap_or_default(),
+        },
+        "Grep" => ToolCall::Grep {
+            pattern: text("pattern"),
+        },
+        "Glob" => ToolCall::Glob {
+            pattern: text("pattern"),
+        },
+        "WebFetch" => ToolCall::Fetch { url: text("url") },
+        "WebSearch" => ToolCall::WebSearch {
+            query: text("query"),
+        },
+        "TodoWrite" => ToolCall::Todo {
+            items: input
+                .get("todos")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .map(|t| TodoItem {
+                    text: tool::text(t, "content").unwrap_or_default(),
+                    // The CLI's own word. `in_progress` is not done.
+                    done: t.get("status").and_then(Value::as_str) == Some("completed"),
+                })
+                .collect(),
+        },
+        // The CLI has spelled its subagent spawn both ways across versions.
+        "Task" | "Agent" => ToolCall::Task {
+            description: text("description"),
+        },
+        _ => ToolCall::Unknown { name: name.into() },
     }
 }
 
@@ -580,5 +669,132 @@ mod tests {
         let mut s = ClaudeStream::new();
         let echo = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"allow"}}}"#;
         assert!(s.parse_line(echo).is_empty());
+    }
+
+    /// **The bug this slice found.** Under `--include-partial-messages`
+    /// the CLI announces a `tool_use` with `"input": {}` and sends the real
+    /// arguments a line later on the assistant snapshot. Deduplicating on
+    /// the tool id alone emitted the empty announcement and dropped the
+    /// arguments, so EVERY Claude tool row in eave rendered as a name and a
+    /// status word — the exact defect the tool detail exists to prevent.
+    ///
+    /// Both lines are taken from
+    /// `docs/research/approvals-capture-2026-08-18/capE-bash.jsonl`
+    /// (lines 21 and 26), in the order the CLI sends them.
+    #[test]
+    fn a_tool_announced_before_its_arguments_states_them_when_they_arrive() {
+        let mut s = ClaudeStream::new();
+        let announced = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01S","name":"Bash","input":{}}}}"#;
+        match s.parse_line(announced).as_slice() {
+            [SessionEvent::ToolUseStarted { id, name, call, .. }] => {
+                assert_eq!(id, "toolu_01S");
+                assert_eq!(name, "Bash");
+                assert_eq!(
+                    call.as_ref(),
+                    Some(&ToolCall::Run {
+                        command: String::new()
+                    }),
+                    "the tool IS recognised; it just has no arguments yet"
+                );
+            }
+            other => panic!("expected an announcement, got {other:?}"),
+        }
+        assert_eq!(s.in_flight(), 1);
+
+        let snapshot = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01S","name":"Bash","input":{"command":"echo hello-from-bash > out.txt","description":"Write to out.txt"}}]}}"#;
+        match s.parse_line(snapshot).as_slice() {
+            [SessionEvent::ToolUseStarted {
+                id, call, input, ..
+            }] => {
+                assert_eq!(
+                    id, "toolu_01S",
+                    "the same tool, restated — not a second one"
+                );
+                assert_eq!(
+                    call.as_ref(),
+                    Some(&ToolCall::Run {
+                        command: "echo hello-from-bash > out.txt".into()
+                    })
+                );
+                assert!(
+                    input.contains("hello-from-bash"),
+                    "the raw fact of record too"
+                );
+            }
+            other => panic!("expected the arguments to arrive, got {other:?}"),
+        }
+        assert_eq!(s.in_flight(), 1, "one tool ran, not two");
+
+        // A third sighting of the same arguments says nothing new.
+        assert!(
+            s.parse_line(snapshot).is_empty(),
+            "the arguments were already recorded"
+        );
+        assert_eq!(s.in_flight(), 1);
+    }
+
+    /// Every tool the Claude CLI ships that eave can name, decoded from the
+    /// key the CLI actually sends. An unlisted tool is named, never guessed.
+    #[test]
+    fn claude_tools_decode_to_their_one_argument() {
+        let d = |name: &str, input: serde_json::Value| decode_tool(name, &input);
+        assert_eq!(
+            d("Read", serde_json::json!({"file_path": "/src/lib.rs"})),
+            ToolCall::Read {
+                path: "/src/lib.rs".into()
+            }
+        );
+        assert_eq!(
+            d(
+                "NotebookEdit",
+                serde_json::json!({"notebook_path": "/nb.ipynb"})
+            ),
+            ToolCall::Edit {
+                path: "/nb.ipynb".into()
+            },
+            "NotebookEdit spells its file differently and must not be lost"
+        );
+        assert_eq!(
+            d(
+                "Grep",
+                serde_json::json!({"pattern": "TODO", "path": "/src"})
+            ),
+            ToolCall::Grep {
+                pattern: "TODO".into()
+            }
+        );
+        assert_eq!(
+            d(
+                "TodoWrite",
+                serde_json::json!({"todos": [
+                    {"content": "read the brief", "status": "completed"},
+                    {"content": "fix the parser", "status": "in_progress"}
+                ]})
+            )
+            .detail()
+            .as_deref(),
+            Some("1/2 · fix the parser"),
+            "`in_progress` is not `completed`"
+        );
+        assert_eq!(
+            d(
+                "Task",
+                serde_json::json!({"description": "survey comet", "prompt": "…"})
+            ),
+            ToolCall::Task {
+                description: "survey comet".into()
+            }
+        );
+        // MCP, and anything else: named under the CLI's own name, which is
+        // what the row's name column already renders.
+        assert_eq!(
+            d(
+                "mcp__playwright__browser_click",
+                serde_json::json!({"ref": "e12"})
+            ),
+            ToolCall::Unknown {
+                name: "mcp__playwright__browser_click".into()
+            }
+        );
     }
 }

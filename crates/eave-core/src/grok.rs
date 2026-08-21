@@ -73,6 +73,7 @@ use crate::session::{
     AgentSession, ApprovalDecision, KillReport, SessionError, SessionWatch, SpawnConfig,
 };
 use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
+use crate::tool::{self, ToolCall};
 
 const STDERR_RING_CAP: usize = 4096;
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -983,6 +984,7 @@ impl GrokProto {
         let input = update.get("rawInput").cloned().unwrap_or(Value::Null);
         out.push(SessionEvent::ToolUseStarted {
             id: id.to_string(),
+            call: Some(decode_tool(update, &name)),
             name,
             input: cap_payload(&input.to_string()),
         });
@@ -1094,6 +1096,57 @@ fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
                      asks before it writes, so eave cannot prove its writes are reviewable"
                 .into(),
         }),
+    }
+}
+
+/// Decode a Grok `tool_call` update into a typed [`ToolCall`].
+///
+/// **Grok's `tool_call` updates carry no ACP `kind`.** Its
+/// `session/request_permission` payloads do (`kind: "edit"`,
+/// docs/reports/stage-av-grok-adapter.md line 178), but the streaming
+/// update that opens a tool row does not — it carries `title`, `rawInput`
+/// and `_meta["x.ai/tool"]` and nothing else (the `TOOL_CALL` capture in
+/// this file's tests). So the shared ACP decoder, which matches on `kind`,
+/// cannot be the whole answer here the way it is for Hermes.
+///
+/// What Grok always sends instead is its own tool name on `_meta`
+/// (`x.ai/tool.name`, verified live at 1.0.4), which is also what this
+/// adapter already puts in `ToolUseStarted.name`. So the name drives the
+/// decode, against a table of names eave has actually **captured**:
+///
+/// | name | evidence |
+/// | --- | --- |
+/// | `write` | the `TOOL_CALL` capture below, and stage-av line 180 |
+/// | `spawn_subagent` | comet, verified live at 1.0.4 (`comet/crates/harness/src/acp/normalize.rs:273`) |
+///
+/// Everything else falls through to [`crate::tool::from_acp_update`],
+/// which answers when Grok did send a `kind` and otherwise returns
+/// [`ToolCall::Unknown`] under Grok's own name. **That is the intended
+/// outcome, not a gap to paper over**: the row still states the tool Grok
+/// named, and inferring `Run` from a `rawInput` that merely happens to
+/// have a `command` key would be the guess this whole module refuses to
+/// make. The table grows when a capture does.
+fn decode_tool(update: &Value, name: &str) -> ToolCall {
+    let raw = update.get("rawInput").filter(|v| !v.is_null());
+    match name {
+        // eave has no subagent UI, so unlike comet — which names the chip
+        // `Agent: {description}` because that string also names the tab it
+        // opens — this is a plain [`ToolCall::Task`] and nothing keys off
+        // it.
+        "spawn_subagent" => ToolCall::Task {
+            description: raw
+                .and_then(|r| tool::text(r, "description"))
+                .unwrap_or_default(),
+        },
+        "write" => ToolCall::Write {
+            path: raw
+                .and_then(|r| tool::text_any(r, &["file_path", "path", "filePath"]))
+                .unwrap_or_default(),
+        },
+        _ => match tool::from_acp_update(update) {
+            ToolCall::Unknown { .. } => ToolCall::Unknown { name: name.into() },
+            typed => typed,
+        },
     }
 }
 
@@ -1540,11 +1593,25 @@ mod tests {
         h.feed(SESSIONS_ASKS);
         let (events, _) = h.feed(TOOL_CALL);
         match events.as_slice() {
-            [SessionEvent::ToolUseStarted { id, name, input }] => {
+            [SessionEvent::ToolUseStarted {
+                id,
+                name,
+                input,
+                call,
+            }] => {
                 assert_eq!(id, "call-adbc8e1b-54ac-438e-b439-1b75e3de6766-0");
                 // The vendor's own tool name, not the display title.
                 assert_eq!(name, "write");
                 assert!(input.contains("hello.txt"));
+                // ACP kind `edit` + a rawInput carrying whole content is a
+                // write, and the row states the file rather than "write".
+                // Grok sends no ACP `kind` on a tool_call update, so the
+                // decode keys off its own tool name — the fact it always
+                // does send.
+                assert!(
+                    matches!(call, Some(ToolCall::Write { path }) if path.ends_with("hello.txt")),
+                    "expected a typed write, got {call:?}"
+                );
             }
             other => panic!("expected ToolUseStarted, got {other:?}"),
         }

@@ -373,6 +373,15 @@ impl AcpStream {
                 }
                 vec![SessionEvent::ToolUseStarted {
                     id: id.to_string(),
+                    // Hermes sends no `rawInput` for `terminal`,
+                    // `read_file`, `write_file` or `patch` — the four that
+                    // matter — so the shared ACP decoder has to fall
+                    // through `rawInput` → `locations` → the human
+                    // `title`. That last step shows Hermes' own summary
+                    // verbatim (`terminal: cargo test`); it does NOT parse
+                    // it, so §3.3's rule that eave never invents a tool
+                    // NAME from that string is untouched.
+                    call: Some(crate::tool::from_acp_update(update)),
                     // `name` is ACP's `kind`, NOT the Hermes tool name.
                     //
                     // The tool name is not on the wire at all: for the

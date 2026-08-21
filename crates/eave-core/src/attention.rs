@@ -301,7 +301,16 @@ impl Classifier {
                     self.settle_approvals(now_ms)
                 }
                 SessionEvent::ToolUseStarted { id, name, .. } => {
-                    self.outstanding.push((id.clone(), name.clone(), now_ms));
+                    // Keyed by id, not appended blindly: an adapter may
+                    // restate a start once its arguments arrive (the
+                    // Claude CLI announces a `tool_use` with an empty
+                    // `input` and fills it in a line later), and one tool
+                    // counted twice would hold `QUIET_AFTER` off forever.
+                    // The FIRST sighting keeps its clock — that is when
+                    // the tool actually began.
+                    if !self.outstanding.iter().any(|(tid, _, _)| tid == id) {
+                        self.outstanding.push((id.clone(), name.clone(), now_ms));
+                    }
                     // A tool call is response output: any pending request
                     // has been answered.
                     self.api_since = None;
@@ -639,6 +648,7 @@ mod tests {
                 id: "t1".into(),
                 name: "Bash".into(),
                 input: String::new(),
+                call: None,
             }),
             1_000,
         );
@@ -781,6 +791,7 @@ mod tests {
                 id: "toolu_1".into(),
                 name: "Write".into(),
                 input: String::new(),
+                call: None,
             }),
             1_000,
         );

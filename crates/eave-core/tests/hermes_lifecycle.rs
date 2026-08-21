@@ -307,10 +307,25 @@ async fn a_tool_call_round_trip_reports_both_ends() {
     assert!(
         matches!(
             started.last().unwrap(),
-            SessionEvent::ToolUseStarted { id, name, input }
+            SessionEvent::ToolUseStarted { id, name, input, .. }
                 if id == "call-1" && name == "execute" && input.contains("cargo test")
         ),
         "the ACP kind is the name and the title survives in the input: {:?}",
+        started.last()
+    );
+    // Hermes sends no `rawInput` for `terminal`, so the typed call falls
+    // through to its own one-line summary — VERBATIM. §3.3's rule that
+    // eave never invents a tool NAME by splitting that string stands: this
+    // does not split it. A row that says `execute` and nothing else is the
+    // readability regression that rule accepted; this pays it back without
+    // guessing anything.
+    assert!(
+        matches!(
+            started.last().unwrap(),
+            SessionEvent::ToolUseStarted { call: Some(eave_core::tool::ToolCall::Run { command }), .. }
+                if command == "terminal: cargo test"
+        ),
+        "expected Hermes' own summary, uncut: {:?}",
         started.last()
     );
     let done = recv_until(&mut rx, |e| {

@@ -93,11 +93,26 @@ pub enum SessionEvent {
     /// every journal written before this field existed lacks it: those
     /// records still load, and their rows state the tool without stating
     /// what it was asked to do, which is exactly what they knew.
+    ///
+    /// `call` is the adapter's decode of that same input into
+    /// [`crate::tool::ToolCall`] — a lens ADDED over the fact of record,
+    /// never a replacement for it. `name` and `input` stay verbatim above,
+    /// so nothing this build fails to recognise is lost.
+    ///
+    /// **`None` and `Some(ToolCall::Unknown{..})` are different facts and
+    /// both happen.** `None` = the record was written before adapters
+    /// decoded anything, and a reader must fall back to guessing from
+    /// `name` (`eave_wire::model::tool_detail` does exactly that).
+    /// `Some(Unknown)` = an adapter looked and did not recognise the tool.
+    /// Collapsing the two would make every old record claim it had been
+    /// examined.
     ToolUseStarted {
         id: String,
         name: String,
         #[serde(default)]
         input: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<crate::tool::ToolCall>,
     },
     /// A previously outstanding tool call resolved.
     ///
@@ -240,6 +255,21 @@ mod tests {
                 id: "toolu_1".into(),
                 name: "Bash".into(),
                 input: String::new(),
+                call: None,
+            }
+        );
+
+        // The record one slice later — payload but no typed call. It must
+        // still load, and it must NOT claim to have been decoded.
+        let untyped = r#"{"kind":"tool_use_started","id":"toolu_2","name":"Bash","input":"{\"command\":\"ls\"}"}"#;
+        let ev: SessionEvent = serde_json::from_str(untyped).expect("untyped record must load");
+        assert_eq!(
+            ev,
+            SessionEvent::ToolUseStarted {
+                id: "toolu_2".into(),
+                name: "Bash".into(),
+                input: r#"{"command":"ls"}"#.into(),
+                call: None,
             }
         );
 
@@ -253,5 +283,42 @@ mod tests {
                 is_error: false,
             }
         );
+    }
+    /// A record with no typed call must not grow one on disk.
+    ///
+    /// `None` is the pre-typing fact, and it is written by leaving the key
+    /// out — so a journal replayed and rewritten does not gain a byte, and
+    /// so `null` never becomes a third state nobody meant.
+    #[test]
+    fn an_untyped_record_writes_no_call_key_and_a_typed_one_round_trips() {
+        let untyped = SessionEvent::ToolUseStarted {
+            id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+            call: None,
+        };
+        let line = serde_json::to_string(&untyped).unwrap();
+        assert!(
+            !line.contains("call"),
+            "an absent typed call must be absent on disk too: {line}"
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionEvent>(&line).unwrap(),
+            untyped
+        );
+
+        let typed = SessionEvent::ToolUseStarted {
+            id: "toolu_2".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+            call: Some(crate::tool::ToolCall::Run {
+                command: "ls".into(),
+            }),
+        };
+        let line = serde_json::to_string(&typed).unwrap();
+        assert_eq!(serde_json::from_str::<SessionEvent>(&line).unwrap(), typed);
+        // The raw input is still the fact of record beside it: typing adds
+        // a lens, it never replaces what the provider said.
+        assert!(line.contains(r#""input":"{\"command\":\"ls\"}""#), "{line}");
     }
 }
