@@ -1404,12 +1404,29 @@ pub const TAB_CHROME_W: f32 = SPACE_2 * 2.0 + STATE_DOT + SPACE_1 + PROVIDER_CHI
 /// the same repo looking alike. 108.8 up to the 4 px unit is **112**.
 ///
 /// **The ceiling is the rail.** The rail gives a name 158 px; a tab gives
-/// it 112, which is 71 % of it. A four-word title (`chase the rail flake`,
+/// it 92, which is 58 % of it. A four-word title (`chase the rail flake`,
 /// 118.5 px) therefore reads whole in the rail and clipped on a tab, and
 /// that is the intended difference rather than a shortfall — a strip that
 /// showed as much as a row would need the room the rail needed, and then
 /// collapsing the rail would have bought nothing.
-pub const TAB_NAME_W: f32 = 112.0;
+///
+/// **Slice C5 took 20 px off this, from 112, and it is a real loss stated
+/// rather than absorbed.** The close affordance costs a tab
+/// [`TAB_CLOSE_W`] = 22 px, and five tabs have to fit the strip at the
+/// default window size (`five_sessions_fit_the_strip_without_scrolling`) —
+/// which caps a tab at 168 px. Something had to give and this is what gave.
+///
+/// What it costs: the **three-word operator title** this slot was sized for
+/// (`package the dmg` at 108.8 px, `fix the send race` at 104.8) now
+/// clips. What it keeps: the widest **provider fallback**, which is what an
+/// unnamed session paints and which Slice AO's caveat 5 records as the
+/// normal case in this operator's own configuration — `cursor agent` at
+/// **80.2 px**, `claude code` at 76.5. Those must never ellipsis and they
+/// still do not, by 11.8 px.
+///
+/// The rail is where a full title reads. That was already the stated
+/// difference between the two surfaces; C5 widened it.
+pub const TAB_NAME_W: f32 = 92.0;
 
 /// A tab's width — fixed, and the same for every tab.
 ///
@@ -1418,7 +1435,7 @@ pub const TAB_NAME_W: f32 = 112.0;
 /// happens to want has no rhythm, and the tab you are aiming for moves
 /// when an unrelated session is renamed. It is also what makes
 /// [`TAB_NAME_W`] a slot a test can measure a real name against.
-pub const TAB_W: f32 = TAB_CHROME_W + TAB_NAME_W;
+pub const TAB_W: f32 = TAB_CHROME_W + TAB_NAME_W + TAB_CLOSE_W;
 
 /// The gap between tabs. One unit — enough that two selection rims do not
 /// touch, small enough that the strip reads as one control.
@@ -1796,6 +1813,65 @@ pub const VEIL_EASE_EXPONENT: f32 = 1.6;
 pub fn veil_ease(t: f32) -> f32 {
     1.0 - (1.0 - t).powf(VEIL_EASE_EXPONENT)
 }
+
+// ---------------------------------------------------------------------------
+// Slice C5 — the tab strip's close affordance, and the omnibox.
+//
+// Appended rather than filed beside their neighbours on purpose: a peer
+// branch is mid-rewrite of the middle of this file, and a new token in the
+// contested region is a merge conflict for no design reason. Move them up
+// when that lands.
+
+/// The close × on a tab: the glyph's box, which is also its hit target.
+///
+/// [`ICON_SM`] would be a 14 px target, under every pointer-target floor
+/// worth naming; this is the glyph at `ICON_SM` inside an 18 px box, which
+/// is the same size the provider plate takes on the other end of the tab.
+/// A tab is therefore symmetrical, which is the reason the number is this
+/// one rather than the smallest thing that could be hit.
+pub const TAB_CLOSE: f32 = PROVIDER_CHIP;
+
+/// What the close costs a tab: the box plus the gap off the name.
+///
+/// Counted into [`TAB_W`] rather than taken out of [`TAB_NAME_W`], because
+/// the name slot is a measured decision (see `TAB_NAME_W`'s note on
+/// `cursor agent` at 80.2 px and a three-word title at 108.8) and spending
+/// 22 of its 112 px on an affordance would have made the widest provider
+/// fallback ellipsis.
+pub const TAB_CLOSE_W: f32 = TAB_CLOSE + SPACE_1;
+
+/// A group's head chip on the strip.
+///
+/// Not a tab: it carries a colour and a name, has no close of its own, and
+/// is `flex_none` at its content width rather than at [`TAB_W`]. Groups are
+/// few and named short; a fixed-width group head would either clip `eave`
+/// or reserve a tab's worth of room for four characters.
+pub const GROUP_HEAD_H: f32 = TAB_H;
+/// The colour swatch on a group head.
+pub const GROUP_DOT: f32 = STATE_DOT;
+
+/// The omnibox's width.
+///
+/// Wider than [`CONTENT_MAX_W`] would give it and narrower than the window:
+/// an address bar has to hold a real url legibly, and a surface that spans a
+/// 1600 px window puts the caret a long way from the tab it belongs to.
+/// Clamped by `max_w` against the window, so a narrow window shrinks it
+/// rather than overflowing.
+pub const OMNIBOX_W: f32 = 560.0;
+
+/// The omnibox's own line box: the input, not the dropdown.
+pub const OMNIBOX_H: f32 = 44.0;
+
+/// One suggestion row.
+pub const OMNIBOX_ROW_H: f32 = 40.0;
+
+/// How far the omnibox floats below the top of the content well.
+///
+/// It hangs from the well's top edge rather than from the window's, because
+/// the well is what the page fills and the omnibox is about the page. A
+/// surface anchored to the window would sit over the titlebar's traffic
+/// lights on a short window.
+pub const OMNIBOX_TOP: f32 = SPACE_3;
 
 #[cfg(test)]
 mod tests {
