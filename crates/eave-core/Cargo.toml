@@ -23,5 +23,9 @@ name = "fake-hermes"
 path = "src/bin/fake_hermes.rs"
 
 [[bin]]
+name = "fake-codex"
+path = "src/bin/fake_codex.rs"
+
+[[bin]]
 name = "engine-stub"
 path = "src/bin/engine_stub.rs"

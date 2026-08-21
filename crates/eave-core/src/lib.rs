@@ -6,6 +6,7 @@
 
 pub mod attention;
 pub mod claude;
+pub mod codex;
 pub mod events;
 pub mod grok;
 pub mod hermes;
