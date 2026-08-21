@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template for eave.app/Contents/Info.plist. `scripts/package-macos.sh`
-     substitutes __VERSION__ from the workspace version before copying it in.
+<!-- Template for eave.app/Contents/Info.plist. `scripts/bundle-app.sh`
+     substitutes __VERSION__ from the workspace version before copying it in
+     (`package-macos.sh` calls that script rather than assembling anything).
 
      CFBundleIdentifier is load-bearing and effectively permanent: macOS keys
      preferences, Keychain items, TCC grants (accessibility, screen capture)
@@ -39,6 +40,29 @@
     <!-- gpui at our pin targets Metal 3 features available from Ventura. -->
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <!-- TCC PURPOSE STRINGS. Required because eave is a browser now: any page
+         may call getUserMedia or the Geolocation API, and macOS does not fail
+         those politely. A process that triggers a TCC prompt with no matching
+         usage description is KILLED — not denied, killed — so the absence of
+         these keys is a crash on an arbitrary page rather than a missing
+         feature. `scripts/verify-cef-bundle.sh` checks for the camera key and
+         refused to pass the first bundle built with --features web, which is
+         how this was caught rather than shipped.
+
+         They live on the APP and not on the helpers. The renderer is what
+         actually asks, but after the identifier fix TCC names the bundle it
+         prompts for, and that is the app — which is also the honest thing to
+         show a person, since "eave" is what they launched.
+
+         Written from the user's point of view. eave itself has no interest in
+         a camera; a page does, and the prompt should say so rather than
+         implying the app is the one asking. -->
+    <key>NSCameraUsageDescription</key>
+    <string>A website you are visiting is asking to use the camera.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>A website you are visiting is asking to use the microphone.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>A website you are visiting is asking for your location.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
