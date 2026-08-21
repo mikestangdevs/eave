@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>heavy</title>
+<style>
+  html,body{margin:0;background:#0b0d10;color:#dfe6ee;font:14px/1.5 -apple-system,system-ui,sans-serif}
+  #sky{position:fixed;inset:0;z-index:0}
+  #doc{position:relative;z-index:1;padding:24px;max-width:900px;margin:0 auto}
+  .card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.09);
+        border-radius:10px;padding:14px 16px;margin:10px 0;
+        box-shadow:0 8px 24px rgba(0,0,0,.35);backdrop-filter:blur(6px)}
+  .bar{height:8px;border-radius:4px;background:linear-gradient(90deg,#4f8cff,#b46cff,#ff6c8c)}
+  h2{margin:.2em 0}
+</style>
+<canvas id="sky"></canvas>
+<div id="doc"></div>
+<script>
+// A page that never stops changing: a full-viewport canvas repainting every
+// frame plus 400 composited, blurred cards to scroll through. The point is to
+// keep Chromium producing frames continuously, so the probe measures a busy
+// page rather than a static one.
+const c = document.getElementById('sky'), g = c.getContext('2d');
+function size(){ c.width = innerWidth*devicePixelRatio; c.height = innerHeight*devicePixelRatio; }
+addEventListener('resize', size); size();
+const N = 220, pts = [];
+for (let i=0;i<N;i++) pts.push({x:Math.random(),y:Math.random(),
+  vx:(Math.random()-.5)*.0015, vy:(Math.random()-.5)*.0015, r:Math.random()*3+1});
+function frame(t){
+  g.clearRect(0,0,c.width,c.height);
+  g.globalAlpha = .8;
+  for (const p of pts){
+    p.x += p.vx; p.y += p.vy;
+    if (p.x<0||p.x>1) p.vx*=-1;
+    if (p.y<0||p.y>1) p.vy*=-1;
+    const x=p.x*c.width, y=p.y*c.height, r=p.r*devicePixelRatio;
+    const hue = (t*0.02 + p.x*300) % 360;
+    g.fillStyle = `hsl(${hue} 80% 60%)`;
+    g.beginPath(); g.arc(x,y,r,0,6.284); g.fill();
+  }
+  g.globalAlpha = .25; g.strokeStyle = '#8ab4ff'; g.lineWidth = devicePixelRatio;
+  for (let i=0;i<N;i+=2){
+    const a=pts[i], b=pts[(i+7)%N];
+    const dx=(a.x-b.x)*c.width, dy=(a.y-b.y)*c.height;
+    if (dx*dx+dy*dy < (160*devicePixelRatio)**2){
+      g.beginPath(); g.moveTo(a.x*c.width,a.y*c.height); g.lineTo(b.x*c.width,b.y*c.height); g.stroke();
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+const doc = document.getElementById('doc');
+let html = '';
+for (let i=0;i<400;i++){
+  html += `<div class="card"><h2>Row ${i}</h2>
+    <div class="bar" style="width:${20+(i*7)%80}%"></div>
+    <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Row ${i} of a long
+    composited document, with a blurred backdrop so the compositor has real work
+    to do while scrolling.</p></div>`;
+}
+doc.innerHTML = html;
+
+// Something the probe can read back to prove input actually landed.
+let clicks = 0, keys = 0;
+addEventListener('click', () => { clicks++; document.title = `heavy c=${clicks} k=${keys}`; });
+addEventListener('keydown', () => { keys++; document.title = `heavy c=${clicks} k=${keys}`; });
+addEventListener('scroll', () => {
+  document.title = `heavy y=${Math.round(scrollY)} c=${clicks} k=${keys}`;
+}, {passive:true});
+</script>

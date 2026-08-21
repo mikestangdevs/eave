@@ -4,3 +4,5 @@
 
 # Agent scratch: worktrees and session state, never part of the tree.
 .claude/
+target/
+*.app/
