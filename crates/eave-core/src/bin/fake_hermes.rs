@@ -317,6 +317,22 @@ fn serve_acp() -> ! {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| env("FAKE_HERMES_SESSION_ID", "hermes-session-1"));
+                // A REAL `session/load` replays the conversation as
+                // ordinary `session/update` notifications BEFORE it
+                // answers. That is what eave's replay gate exists to
+                // absorb, so the fake has to do it too — a gate proved
+                // only against a fake that never replays proves nothing.
+                if method == "session/load" && env("FAKE_HERMES_REPLAY", "0") != "0" {
+                    for text in ["replayed one", "replayed two"] {
+                        emit(&json!({
+                            "jsonrpc": "2.0", "method": "session/update",
+                            "params": { "sessionId": acp.session_id, "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": text },
+                            }},
+                        }));
+                    }
+                }
                 let mut result = json!({ "modes": { "currentModeId": acp.session_mode,
                                                     "availableModes": [] }});
                 if method == "session/new" {

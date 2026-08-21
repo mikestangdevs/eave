@@ -283,6 +283,13 @@ impl HermesStream {
     /// A `session/update` notification's payload.
     fn parse_session_update(&mut self, params: &Value, line: &str) -> Vec<SessionEvent> {
         let update = &params["update"];
+        // Above the match: `session/load` replays the conversation as
+        // ordinary updates before it answers, and a replayed
+        // `current_mode_update` would re-run the posture check on a
+        // session that has not opened yet.
+        if self.stream.replay_absorbs() {
+            return Vec::new();
+        }
         match acp::update::kind_of(update) {
             // The posture can change under eave's feet: ACP lets a client
             // switch modes and the agent announce it. eave never sends
@@ -785,6 +792,12 @@ impl Reader {
                 // goes the other way: the id eave holds is the one
                 // `session/load` is asked for.
                 let cwd = self.cwd.display().to_string();
+                // A RELOAD replays the conversation as live updates before
+                // it answers; a fresh `session/new` replays nothing and
+                // must not be gated (that would swallow the first turn).
+                if self.resume.is_some() {
+                    self.shared.stream.lock().unwrap().stream.begin_replay();
+                }
                 self.send(wire::session_frame(self.resume.as_deref(), &cwd))
                     .await;
             }
@@ -860,6 +873,12 @@ impl Reader {
     /// `session/new` or `session/load` answered: verify the posture from
     /// two independent facts before letting the session do anything.
     async fn session_opened(&self, v: &Value, line: &str) {
+        // Down in every case. A gate left armed on a failed load would
+        // silently swallow whatever the agent said on its way out.
+        let absorbed = self.shared.stream.lock().unwrap().stream.end_replay();
+        if let Some(absorbed) = absorbed {
+            self.emit(absorbed).await;
+        }
         if let Some(err) = v.get("error") {
             return self
                 .refuse(format!(

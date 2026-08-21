@@ -490,6 +490,13 @@ impl GrokProto {
                     );
                 }
                 // Handshake accepted: open (or reload) the session.
+                // A RELOAD replays the conversation as live updates before
+                // it answers, so the gate goes up here and comes down at
+                // the response below. A fresh `session/new` replays
+                // nothing and must not be gated.
+                if resume_id.is_some() {
+                    self.stream.begin_replay();
+                }
                 (Vec::new(), vec![wire::session_frame(resume_id, cwd)])
             }
             Some(wire::RPC_SESSION) => {
@@ -507,6 +514,10 @@ impl GrokProto {
                         None => format!("grok could not open a session: {err}"),
                     };
                     ready.refuse(reason);
+                    // Disarm even here. A refused load leaves the session
+                    // dead, but a gate left armed would silently swallow
+                    // anything the agent said on its way out.
+                    self.stream.end_replay();
                     return (
                         vec![SessionEvent::System {
                             subtype: "grok_session_failed".into(),
@@ -524,6 +535,7 @@ impl GrokProto {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .or_else(|| resume_id.map(str::to_string));
+                let absorbed = self.stream.end_replay();
                 match session_id {
                     Some(id) => {
                         self.session_id = Some(id.clone());
@@ -535,7 +547,7 @@ impl GrokProto {
                         return (vec![wire::malformed(line, reason)], Vec::new());
                     }
                 }
-                (Vec::new(), Vec::new())
+                (absorbed.into_iter().collect(), Vec::new())
             }
             // A prompt turn's response. `turn_completed` already reported
             // the OUTCOME, so this is the bookend for that — but it is not
@@ -685,6 +697,12 @@ impl GrokProto {
     }
 
     fn handle_update(&mut self, update: &Value, line: &str) -> Vec<SessionEvent> {
+        // Above the match, not inside it: a replayed `turn_completed` is
+        // as wrong as a replayed message chunk, and would settle a turn
+        // that has not started.
+        if self.stream.replay_absorbs() {
+            return Vec::new();
+        }
         match crate::acp::update::kind_of(update) {
             // Grok reports the end of a turn on the wire rather than in the
             // prompt's RPC reply.
@@ -1401,5 +1419,105 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The `session/load` replay gate.
+
+    /// **A resumed session must not journal its history twice.**
+    ///
+    /// `session/load` answers by re-sending the whole conversation as
+    /// ordinary `session/update` notifications, which arrive BEFORE the
+    /// load response and are indistinguishable from live traffic by
+    /// shape. Without a gate, resuming a session appends everything the
+    /// agent has ever said to the journal a second time.
+    ///
+    /// This became reachable with slice CD. Before it, the engine resumed
+    /// under eave's own uuid — an id Grok never issued — so `session/load`
+    /// always errored and no replay was ever received. Fixing resume is
+    /// what made this live, which is the reason it is tested here rather
+    /// than left as a note.
+    #[test]
+    fn a_resumed_session_absorbs_the_replay_instead_of_journaling_it_twice() {
+        let mut h = Harness::new();
+        let id = "01a020c5-af30-7fb3-b886-bcaa75a72299";
+        // Handshake, resuming: the reply asks for `session/load`.
+        h.feed_resuming(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#,
+            id,
+        );
+
+        // Grok now replays the conversation. Every one of these would be a
+        // duplicate record.
+        for replayed in [
+            MSG_CHUNK,
+            TOOL_CALL,
+            TOOL_DONE,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"01a020c5-af30-7fb3-b886-bcaa75a72299","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}}}"#,
+        ] {
+            let (events, _) = h.feed_resuming(replayed, id);
+            assert!(
+                events.is_empty(),
+                "replayed update must be absorbed, got {events:?}"
+            );
+        }
+
+        // The load settles. The absorption is STATED, not silent: a silent
+        // drop is indistinguishable from a provider that replayed nothing,
+        // which is also what a broken `session/load` looks like.
+        let (events, _) = h.feed_resuming(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"models":{"currentModelId":"grok-4.6"}}}"#,
+            id,
+        );
+        match events.as_slice() {
+            [SessionEvent::System { subtype, raw }] => {
+                assert_eq!(subtype, "acp_replay_absorbed");
+                assert!(raw.contains(r#""absorbed":4"#), "{raw}");
+            }
+            other => panic!("expected the absorption record, got {other:?}"),
+        }
+
+        // And the gate is DOWN: live traffic after the load is decoded.
+        let (events, _) = h.feed_resuming(MSG_CHUNK, id);
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::TextDelta { .. }]),
+            "post-load traffic is live, got {events:?}"
+        );
+    }
+
+    /// A FRESH session replays nothing, so the gate must never arm for one
+    /// — arming it would swallow the first live turn.
+    #[test]
+    fn a_fresh_session_is_never_gated() {
+        let mut h = Harness::new();
+        h.feed(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#);
+        h.feed(SESSION_NEW);
+        let (events, _) = h.feed(MSG_CHUNK);
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::TextDelta { .. }]),
+            "a fresh session's first words are live, got {events:?}"
+        );
+    }
+
+    /// A load that FAILS must still lower the gate. The session is dead
+    /// either way, but an armed gate would silently swallow whatever the
+    /// agent said on its way out — including a refusal an operator needs.
+    #[test]
+    fn a_failed_load_lowers_the_gate() {
+        let mut h = Harness::new();
+        let id = "01a020c5-af30-7fb3-b886-bcaa75a72299";
+        h.feed_resuming(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#,
+            id,
+        );
+        h.feed_resuming(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"FS_NOT_FOUND"}}"#,
+            id,
+        );
+        let (events, _) = h.feed_resuming(MSG_CHUNK, id);
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::TextDelta { .. }]),
+            "a lowered gate lets the agent's last words through, got {events:?}"
+        );
     }
 }

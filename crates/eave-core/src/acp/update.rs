@@ -81,9 +81,71 @@ pub struct UpdateSpec {
 pub struct AcpStream {
     outstanding: Vec<String>,
     turn_text: String,
+    /// How many replayed `session/update`s have been absorbed since
+    /// `session/load` went out, or `None` when nothing is being replayed.
+    ///
+    /// **Why a gate is needed at all.** ACP's `session/load` answers by
+    /// re-sending the conversation as ordinary `session/update`
+    /// notifications, which arrive BEFORE the load response. They are
+    /// indistinguishable from live traffic by shape — the same
+    /// `agent_message_chunk`, `tool_call`, `turn_completed` — so without a
+    /// gate a resumed session appends its entire history to the journal a
+    /// second time, as if the agent had just said all of it again.
+    ///
+    /// comet drops them too, for a stated reason that is worth repeating
+    /// because eave's is the same: *"the doc already holds the history"*
+    /// (`comet/crates/harness/src/acp/mod.rs`, `request_draining`). eave's
+    /// journal holds it, and the journal is what replays on cold start.
+    ///
+    /// This was unreachable until slice CD. Before it, the engine resumed
+    /// under eave's own uuid — an id neither agent ever issued — so
+    /// `session/load` always errored and no replay was ever received.
+    /// Fixing resume is what made this live.
+    replaying: Option<u32>,
 }
 
 impl AcpStream {
+    /// Arm the replay gate. Called when `session/load` goes out — and only
+    /// then: a fresh `session/new` replays nothing, so arming it there
+    /// would swallow the first live turn.
+    pub fn begin_replay(&mut self) {
+        self.replaying = Some(0);
+    }
+
+    /// Should this update be absorbed as replay rather than decoded?
+    ///
+    /// Counts as it absorbs, so the session can state how much history it
+    /// skipped instead of skipping it silently.
+    pub fn replay_absorbs(&mut self) -> bool {
+        match &mut self.replaying {
+            Some(n) => {
+                *n += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Disarm the gate at the `session/load` response, and say what was
+    /// absorbed.
+    ///
+    /// The count is journaled rather than discarded because "eave dropped
+    /// 412 replayed updates here" is a fact about the resume, and a silent
+    /// drop is indistinguishable from a provider that replayed nothing —
+    /// which is what a broken `session/load` also looks like.
+    pub fn end_replay(&mut self) -> Option<SessionEvent> {
+        let absorbed = self.replaying.take()?;
+        Some(SessionEvent::System {
+            subtype: "acp_replay_absorbed".into(),
+            raw: serde_json::json!({
+                "absorbed": absorbed,
+                "why": "session/load re-sends the conversation as live updates; \
+                        the journal already holds it",
+            })
+            .to_string(),
+        })
+    }
+
     pub fn in_flight(&self) -> usize {
         self.outstanding.len()
     }

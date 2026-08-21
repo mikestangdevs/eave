@@ -1025,3 +1025,40 @@ async fn a_turn_with_no_usage_on_the_wire_reports_no_tokens() {
         "silence is the honest answer: {events:?}"
     );
 }
+
+/// **A resumed Hermes session must not journal its history twice.**
+///
+/// `session/load` answers by re-sending the conversation as ordinary
+/// `session/update` notifications, which arrive BEFORE the load response
+/// and are indistinguishable from live traffic by shape. The fake replays
+/// two message chunks here; without the gate they would reach the journal
+/// as things Hermes had just said.
+///
+/// Unreachable before slice CD: the engine resumed under eave's own uuid,
+/// which Hermes never issued, so `session/load` errored and no replay was
+/// ever received. Fixing resume is what made this live.
+#[tokio::test]
+async fn a_resumed_session_absorbs_the_replay_instead_of_journaling_it_twice() {
+    let mut cfg = fake_cfg(&[("FAKE_HERMES_REPLAY", "1")]);
+    cfg.resume = Some("acp-minted-42".into());
+    let (_session, mut rx) = spawn_hermes(&cfg).unwrap();
+    let events = recv_until(&mut rx, is_init).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::TextDelta { text } if text.starts_with("replayed"))),
+        "replayed history must be absorbed, not journaled: {events:?}"
+    );
+    match events.iter().find(
+        |e| matches!(e, SessionEvent::System { subtype, .. } if subtype == "acp_replay_absorbed"),
+    ) {
+        Some(SessionEvent::System { raw, .. }) => assert!(
+            raw.contains(r#""absorbed":2"#),
+            "the absorption must state its count: {raw}"
+        ),
+        _ => panic!(
+            "a silent drop is indistinguishable from a load that replayed nothing: {events:?}"
+        ),
+    }
+}
