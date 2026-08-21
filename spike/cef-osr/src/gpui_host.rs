@@ -175,6 +175,11 @@ unsafe extern "C" {
 // ---------------------------------------------------------------------------
 
 thread_local! {
+    /// Where the page element was laid out, so window-space input can be
+    /// turned into page-space input.
+    pub static PAGE_ORIGIN: RefCell<gpui::Point<Pixels>> =
+        const { RefCell::new(gpui::Point { x: px(0.), y: px(0.) }) };
+
     /// The latest completed frame, as an IOSurface-backed BGRA CVPixelBuffer
     /// that WE own — CEF's own surface may not outlive its callback.
     pub static PAGE: RefCell<Option<CVPixelBuffer>> = const { RefCell::new(None) };
@@ -241,6 +246,20 @@ impl Element for PageSurface {
         window: &mut Window,
         _: &mut App,
     ) {
+        // The page is exactly the size of the space it was given. Publishing
+        // the laid-out bounds here is also what makes input coordinates
+        // exact: page space and this element's space become the same space.
+        PAGE_ORIGIN.with(|o| *o.borrow_mut() = bounds.origin);
+        let w = f32::from(bounds.size.width).round() as i32;
+        let h = f32::from(bounds.size.height).round() as i32;
+        if crate::osr::set_view_size(w, h) {
+            crate::osr::with_browser(|b| {
+                if let Some(host) = b.host() {
+                    host.was_resized();
+                }
+            });
+        }
+
         PAGE.with(|p| {
             if let Some(buffer) = p.borrow().as_ref() {
                 window.paint_surface(bounds, buffer.clone());
@@ -249,7 +268,9 @@ impl Element for PageSurface {
     }
 }
 
-struct Shell;
+struct Shell {
+    focus: gpui::FocusHandle,
+}
 
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -284,10 +305,66 @@ impl Render for Shell {
             .into_any_element()
         };
 
+        let to_page = |p: gpui::Point<Pixels>| {
+            let origin = PAGE_ORIGIN.with(|o| *o.borrow());
+            gpui::Point {
+                x: p.x - origin.x,
+                y: p.y - origin.y,
+            }
+        };
+
         div()
             .size_full()
             .relative()
             .bg(gpui::hsla(0., 0., 0.06, 1.0))
+            .track_focus(&self.focus)
+            .on_mouse_move(move |e: &gpui::MouseMoveEvent, _, _| {
+                let held = e.pressed_button == Some(gpui::MouseButton::Left);
+                crate::osr::with_browser(|b| {
+                    crate::input::mouse_move(b, to_page(e.position), &e.modifiers, held, false)
+                });
+            })
+            .on_mouse_down(gpui::MouseButton::Left, move |e: &gpui::MouseDownEvent, _, _| {
+                crate::osr::with_browser(|b| {
+                    crate::input::focus(b, true);
+                    crate::input::mouse_button(
+                        b,
+                        to_page(e.position),
+                        &e.modifiers,
+                        crate::input::left(),
+                        false,
+                        e.click_count as i32,
+                    )
+                });
+            })
+            .on_mouse_up(gpui::MouseButton::Left, move |e: &gpui::MouseUpEvent, _, _| {
+                crate::osr::with_browser(|b| {
+                    crate::input::mouse_button(
+                        b,
+                        to_page(e.position),
+                        &e.modifiers,
+                        crate::input::left(),
+                        true,
+                        e.click_count as i32,
+                    )
+                });
+            })
+            .on_scroll_wheel(move |e: &gpui::ScrollWheelEvent, _, _| {
+                // gpui hands over either lines or pixels; CEF wants pixels.
+                let delta = e.delta.pixel_delta(px(20.));
+                crate::osr::with_browser(|b| {
+                    crate::input::wheel(
+                        b,
+                        to_page(e.position),
+                        &e.modifiers,
+                        f32::from(delta.x) as i32,
+                        f32::from(delta.y) as i32,
+                    )
+                });
+            })
+            .on_key_down(move |e: &gpui::KeyDownEvent, _, _| {
+                crate::osr::with_browser(|b| crate::input::key(b, &e.keystroke));
+            })
             .child(div().absolute().inset_0().child(PageSurface))
             .child(
                 div()
@@ -404,7 +481,13 @@ pub fn run(main_args: &MainArgs, cmd_line: &CommandLine, sandbox_info: *mut u8) 
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Shell),
+            |window, cx| {
+                cx.new(|cx| {
+                    let focus = cx.focus_handle();
+                    window.focus(&focus, cx);
+                    Shell { focus }
+                })
+            },
         )
         .unwrap();
         cx.activate(true);

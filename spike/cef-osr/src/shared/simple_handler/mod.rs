@@ -61,6 +61,18 @@ impl SimpleHandler {
     fn on_title_change(&mut self, browser: Option<&mut Browser>, title: Option<&CefString>) {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
+        // The probe's readback channel: the input page mirrors its whole
+        // observable state into document.title, so watching titles costs no
+        // IPC of our own and proves the page actually reacted.
+        if crate::gpui_host::gpui_mode() {
+            if let Some(title) = title {
+                let title = title.to_string();
+                if title.starts_with("IN ") {
+                    println!("[page] {title}");
+                }
+            }
+        }
+
         let mut browser = browser.cloned();
         if let Some(browser_view) = browser_view_get_for_browser(browser.as_mut()) {
             if let Some(window) = browser_view.window() {
@@ -274,7 +286,13 @@ wrap_life_span_handler! {
             inner.on_after_created(browser);
             if crate::osr::osr_enabled() {
                 crate::osr::remember_browser(browser_for_osr.as_mut());
-                crate::osr::start_driver();
+                // The synthetic scroll driver exists to keep a page busy for
+                // the standalone measurement. In the gpui arm the input comes
+                // from the operator, and a driver fighting it would prove
+                // nothing.
+                if !crate::gpui_host::gpui_mode() {
+                    crate::osr::start_driver();
+                }
             }
         }
 

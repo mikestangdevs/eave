@@ -113,8 +113,40 @@ pub fn shared_texture() -> bool {
 
 /// Logical size of the off-screen view. Device pixels are this times
 /// [`scale`], which is what actually gets copied.
+///
+/// Live rather than fixed: in the gpui arm the surface element publishes the
+/// bounds it was laid out at, so the page is exactly the size of the space it
+/// occupies and input coordinates need no fudge factor.
+static VIEW_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static VIEW_H: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 pub fn view_size() -> (i32, i32) {
-    (env_num("EAVE_CEF_W", 1600), env_num("EAVE_CEF_H", 1000))
+    use std::sync::atomic::Ordering;
+    let w = VIEW_W.load(Ordering::Relaxed);
+    let h = VIEW_H.load(Ordering::Relaxed);
+    if w > 0 && h > 0 {
+        (w, h)
+    } else {
+        (env_num("EAVE_CEF_W", 1600), env_num("EAVE_CEF_H", 1000))
+    }
+}
+
+/// Returns true if this actually changed the size, so the caller knows when
+/// to tell CEF the view was resized.
+pub fn set_view_size(w: i32, h: i32) -> bool {
+    use std::sync::atomic::Ordering;
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let old_w = VIEW_W.swap(w, Ordering::Relaxed);
+    let old_h = VIEW_H.swap(h, Ordering::Relaxed);
+    old_w != w || old_h != h
+}
+
+/// The live browser, for the input path. Same thread as everything else in
+/// the gpui arm — CEF's UI thread *is* the main thread when the host pumps it.
+pub fn with_browser<R>(f: impl FnOnce(&Browser) -> R) -> Option<R> {
+    BROWSER.with(|b| b.borrow().as_ref().map(f))
 }
 
 pub fn scale() -> f32 {

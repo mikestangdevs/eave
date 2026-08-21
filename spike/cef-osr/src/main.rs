@@ -4,6 +4,7 @@
 )]
 
 pub mod gpui_host;
+pub mod input;
 pub mod osr;
 pub mod shared;
 
