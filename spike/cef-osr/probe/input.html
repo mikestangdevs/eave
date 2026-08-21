@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8"><title>input</title>
+<style>
+ body{margin:0;background:#0f1216;color:#e6edf3;font:16px/1.6 system-ui;padding:28px}
+ .row{margin:18px 0}
+ input,select,textarea{font:16px system-ui;padding:8px 10px;border-radius:8px;
+   border:1px solid #3a4450;background:#171c22;color:#e6edf3}
+ #log{white-space:pre;background:#0a0d10;border:1px solid #232a32;border-radius:8px;
+   padding:12px;min-height:120px;font:13px ui-monospace,monospace}
+ #sel{background:#1b2330;padding:14px;border-radius:8px}
+ a{color:#7fb2ff}
+</style>
+<h2>OSR input probe</h2>
+<div class="row"><label>text field: <input id="t" autofocus placeholder="type here"></label></div>
+<div class="row"><label>native select:
+  <select id="s"><option>alpha</option><option>beta</option><option>gamma</option></select>
+</label></div>
+<div class="row" id="sel">Selectable paragraph: drag across THIS SENTENCE to select it.</div>
+<div class="row"><a id="lnk" href="#one" target="_blank">a link (cmd-click me)</a></div>
+<div class="row" id="log"></div>
+<script>
+// Everything observable is mirrored into document.title, because the host can
+// read titles through CefDisplayHandler::OnTitleChange without any IPC of its
+// own — the cheapest possible readback for a probe.
+const log = document.getElementById('log');
+const state = {clicks:0, keys:0, text:'', sel:'', scroll:0, change:'', mods:''};
+function push(msg){ log.textContent = (msg + "\n" + log.textContent).split("\n").slice(0,8).join("\n"); sync(); }
+function sync(){
+  document.title = `IN c=${state.clicks} k=${state.keys} t="${state.text}" sel=${state.sel.length} y=${state.scroll} pick=${state.change} mods=${state.mods}`;
+}
+addEventListener('mousedown', e => { state.clicks++; state.mods = [e.metaKey&&'cmd',e.shiftKey&&'shift',e.altKey&&'alt'].filter(Boolean).join('+')||'none'; push(`mousedown ${e.clientX},${e.clientY} mods=${state.mods}`); });
+addEventListener('keydown', e => { state.keys++; push(`keydown key=${e.key} code=${e.code} which=${e.which}`); });
+document.getElementById('t').addEventListener('input', e => { state.text = e.target.value; push(`input "${e.target.value}"`); });
+document.getElementById('s').addEventListener('change', e => { state.change = e.target.value; push(`select -> ${e.target.value}`); });
+document.addEventListener('selectionchange', () => { state.sel = String(getSelection()); sync(); });
+addEventListener('scroll', () => { state.scroll = Math.round(scrollY); sync(); }, {passive:true});
+document.getElementById('lnk').addEventListener('click', e => { push(`link click meta=${e.metaKey}`); e.preventDefault(); });
+document.body.style.minHeight = '2200px';
+sync();
+</script>

@@ -1,0 +1,79 @@
+# Throwaway probe for the CEF compositing spike — see
+# `docs/research/cef-spike.md`. NOT a workspace member, NOT integrated, and
+# not intended to be merged: it exists to produce numbers.
+#
+# Build it explicitly:
+#     export CEF_PATH="$HOME/.local/share/cef"
+#     cargo build --manifest-path spike/cef-osr/Cargo.toml
+#
+# `src/` starts as `tauri-apps/cef-rs`'s own `cefsimple` example, vendored
+# (BSD-3-Clause, itself a port of the upstream CEF sample), and is then bent
+# toward off-screen rendering. Vendored rather than depended on because the
+# question is what one of these costs *inside our tree*.
+# Standalone on purpose: this is a throwaway probe, not a workspace member.
+[workspace]
+
+[package]
+name = "cef-osr-spike"
+version = "0.1.0"
+# cef-rs's own example is edition 2024; our pinned 1.97.1 builds it.
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "cef-osr-spike"
+path = "src/main.rs"
+
+# macOS CEF is multi-process and the renderer/utility processes must live in
+# their OWN `.app` bundles with their own `Info.plist` — one binary cannot be
+# both. This second target is that structural cost, made concrete.
+[[bin]]
+name = "cef-osr-spike-helper"
+path = "src/bin/helper.rs"
+
+[features]
+# Off by default, unlike cef-rs's example. The sandbox needs its own
+# entitlements and a `cef_sandbox_initialize` handshake, and this spike is
+# measuring whether CEF can live in a GPUI process at all — one moving part
+# at a time.
+default = []
+sandbox = ["cef/sandbox"]
+
+[dependencies]
+cef = { version = "151", features = ["build-util"] }
+
+# The in-process arm (`EAVE_CEF_GPUI=1`) puts CEF and gpui in one binary.
+# gpui comes from `../zed-fork` — the pinned wingleeio/zed rev with the BGRA
+# surface patch applied (`../gpui-bgra-surface.patch`), because the stock
+# renderer asserts NV12 on the surface primitive.
+gpui = { path = "../zed-fork/crates/gpui" }
+gpui_platform = { path = "../zed-fork/crates/gpui_platform", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
+core-video = { version = "0.5.2", features = ["metal"] }
+core-foundation = "0.10"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+# The OSR arm opens CEF's IOSurface as an MTLTexture and blits out of it.
+# Deliberately NOT cef's own `accelerated_osr` feature: that one imports into
+# **wgpu**, and dragging wgpu + ash + windows into the graph to reach one
+# `newTextureWithDescriptor:iosurface:plane:` call would misrepresent the cost
+# of the thing being measured. gpui renders through raw metal-rs, not wgpu.
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"] }
+objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSEvent",
+    "NSResponder",
+    "NSUserInterfaceValidation",
+    "NSView",
+    "NSWindow",
+] }
+
+[package.metadata.cef.bundle]
+helper_name = "cef-osr-spike-helper"
+resources_path = "resources"

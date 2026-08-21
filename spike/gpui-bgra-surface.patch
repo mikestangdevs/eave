@@ -1,0 +1,154 @@
+diff --git a/crates/gpui_macos/src/metal_renderer.rs b/crates/gpui_macos/src/metal_renderer.rs
+index c93a383c38..79b6288590 100644
+--- a/crates/gpui_macos/src/metal_renderer.rs
++++ b/crates/gpui_macos/src/metal_renderer.rs
+@@ -17,7 +17,7 @@ use image::RgbaImage;
+ use core_foundation::base::TCFType;
+ use core_video::{
+     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
++    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
+ };
+ use foreign_types::{ForeignType, ForeignTypeRef};
+ use metal::{
+@@ -176,6 +176,9 @@ pub(crate) struct MetalRenderer {
+     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
+     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+     surfaces_pipeline_state: metal::RenderPipelineState,
++    /// SPIKE: single-plane BGRA surfaces (a browser frame), as opposed to the
++    /// two-plane YCbCr surfaces the video path delivers.
++    surfaces_bgra_pipeline_state: metal::RenderPipelineState,
+     unit_vertices: metal::Buffer,
+     #[allow(clippy::arc_with_non_send_sync)]
+     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+@@ -392,6 +395,15 @@ impl MetalRenderer {
+             MTLPixelFormat::BGRA8Unorm,
+         );
+ 
++        let surfaces_bgra_pipeline_state = build_pipeline_state(
++            &device,
++            &library,
++            "surfaces_bgra",
++            "surface_vertex",
++            "surface_bgra_fragment",
++            MTLPixelFormat::BGRA8Unorm,
++        );
++
+         let command_queue = device.new_command_queue();
+         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
+         let core_video_texture_cache =
+@@ -420,6 +432,7 @@ impl MetalRenderer {
+             monochrome_sprites_pipeline_state,
+             polychrome_sprites_pipeline_state,
+             surfaces_pipeline_state,
++            surfaces_bgra_pipeline_state,
+             unit_vertices,
+             instance_buffer_pool,
+             sprite_atlas,
+@@ -1895,7 +1908,6 @@ impl MetalRenderer {
+         viewport_size: Size<DevicePixels>,
+         command_encoder: &metal::RenderCommandEncoderRef,
+     ) -> bool {
+-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+         command_encoder.set_vertex_buffer(
+             SurfaceInputIndex::Vertices as u64,
+             Some(&self.unit_vertices),
+@@ -1913,10 +1925,72 @@ impl MetalRenderer {
+                 DevicePixels::from(surface.image_buffer.get_height() as i32),
+             );
+ 
+-            assert_eq!(
+-                surface.image_buffer.get_pixel_format(),
+-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++            // SPIKE: was an assert_eq! on NV12. A browser frame arrives as a
++            // single BGRA plane, so the format now selects the pipeline
++            // instead of terminating the process.
++            let pixel_format = surface.image_buffer.get_pixel_format();
++            let is_bgra = pixel_format == kCVPixelFormatType_32BGRA;
++            assert!(
++                is_bgra || pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
++                "unsupported surface pixel format {pixel_format:?}"
+             );
++            command_encoder.set_render_pipeline_state(if is_bgra {
++                &self.surfaces_bgra_pipeline_state
++            } else {
++                &self.surfaces_pipeline_state
++            });
++
++            if is_bgra {
++                let bgra_texture = self
++                    .core_video_texture_cache
++                    .create_texture_from_image(
++                        surface.image_buffer.as_concrete_TypeRef(),
++                        None,
++                        MTLPixelFormat::BGRA8Unorm,
++                        surface.image_buffer.get_width() as usize,
++                        surface.image_buffer.get_height() as usize,
++                        0,
++                    )
++                    .unwrap();
++
++                align_offset(instance_offset);
++                let next_offset = *instance_offset + mem::size_of::<Surface>();
++                if next_offset > instance_buffer.size {
++                    return false;
++                }
++
++                command_encoder.set_vertex_buffer(
++                    SurfaceInputIndex::Surfaces as u64,
++                    Some(&instance_buffer.metal_buffer),
++                    *instance_offset as u64,
++                );
++                command_encoder.set_vertex_bytes(
++                    SurfaceInputIndex::TextureSize as u64,
++                    mem::size_of_val(&texture_size) as u64,
++                    &texture_size as *const Size<DevicePixels> as *const _,
++                );
++                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
++                    let texture = CVMetalTextureGetTexture(bgra_texture.as_concrete_TypeRef());
++                    Some(metal::TextureRef::from_ptr(texture as *mut _))
++                });
++
++                unsafe {
++                    let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
++                        .add(*instance_offset)
++                        as *mut SurfaceBounds;
++                    ptr::write(
++                        buffer_contents,
++                        SurfaceBounds {
++                            bounds: surface.bounds,
++                            content_mask: surface.content_mask,
++                        },
++                    );
++                }
++
++                command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
++                *instance_offset = next_offset;
++                continue;
++            }
+ 
+             let y_texture = self
+                 .core_video_texture_cache
+diff --git a/crates/gpui_macos/src/shaders.metal b/crates/gpui_macos/src/shaders.metal
+index 97bad184dc..9f042d0df2 100644
+--- a/crates/gpui_macos/src/shaders.metal
++++ b/crates/gpui_macos/src/shaders.metal
+@@ -907,6 +907,18 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+   return ycbcrToRGBTransform * ycbcr;
+ }
+ 
++// SPIKE (cef-spike.md): the existing surface path is a *video* path — two
++// planes, YCbCr, written for livekit. A browser hands over a single BGRA
++// IOSurface, so it needs its own fragment function. Everything else about
++// the surface primitive (vertex stage, clipping, ordering) is unchanged,
++// which is the point: the page becomes an ordinary scene primitive.
++fragment float4 surface_bgra_fragment(SurfaceFragmentInput input [[stage_in]],
++                                      texture2d<float> bgra_texture
++                                      [[texture(SurfaceInputIndex_YTexture)]]) {
++  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
++  return bgra_texture.sample(texture_sampler, input.texture_position);
++}
++
+ float4 hsla_to_rgba(Hsla hsla) {
+   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
+   float s = hsla.s;

@@ -4,3 +4,10 @@
 
 # Agent scratch: worktrees and session state, never part of the tree.
 .claude/
+target/
+*.app/
+
+# The spike copies the pinned gpui fork here to patch it locally. The COPY is
+# not committed — `spike/gpui-bgra-surface.patch` is the artefact that matters,
+# and it applies to rev 5d1f83d9f27a19bec1fb241dc33b42238af9cf8d.
+spike/zed-fork/

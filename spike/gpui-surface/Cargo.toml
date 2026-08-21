@@ -1,0 +1,28 @@
+# Throwaway probe for the CEF compositing spike — see
+# `docs/research/cef-spike.md`. Standalone, never a workspace member.
+#
+# The question this crate answers is narrow and load-bearing: if a browser
+# frame arrives as a BGRA IOSurface, can it become an ORDINARY gpui scene
+# primitive — z-ordered with everything else, and visible to `BackdropBlur`?
+# gpui already has a surface primitive, but its renderer asserts NV12 YCbCr
+# because it was written for video. `../zed-fork` is the pinned fork with a
+# single-plane BGRA path added; this crate is what proves the change works.
+[workspace]
+
+[package]
+name = "gpui-surface-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gpui = { path = "../zed-fork/crates/gpui" }
+gpui_platform = { path = "../zed-fork/crates/gpui_platform", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
+core-video = { version = "0.5.2", features = ["metal"] }
+core-foundation = "0.10"
+
+[profile.dev.package."*"]
+opt-level = 2
