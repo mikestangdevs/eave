@@ -8,6 +8,7 @@ pub mod attention;
 pub mod claude;
 pub mod events;
 pub mod grok;
+pub mod hermes;
 pub mod journal;
 pub mod proc;
 pub mod process;

@@ -19,5 +19,9 @@ name = "fake-agent"
 path = "src/bin/fake_agent.rs"
 
 [[bin]]
+name = "fake-hermes"
+path = "src/bin/fake_hermes.rs"
+
+[[bin]]
 name = "engine-stub"
 path = "src/bin/engine_stub.rs"
