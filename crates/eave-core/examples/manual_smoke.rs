@@ -74,7 +74,7 @@ async fn main() {
 
     println!("\n=== phase 2: cold resume via --resume {session_id} ===");
     let mut cfg2 = SpawnConfig::new("claude", &cwd, session_id.clone());
-    cfg2.resume = true;
+    cfg2.resume = Some(session_id.clone());
     let (mut session2, mut rx2) = ClaudeCodeSession::spawn(&cfg2).expect("spawn resume");
     let t1 = Instant::now();
     session2

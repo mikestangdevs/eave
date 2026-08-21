@@ -794,7 +794,9 @@ impl HermesSession {
             stdin: Arc::clone(&stdin),
             cwd: cfg.cwd.clone(),
             preflight: tokio::sync::Mutex::new(Some(preflight_task)),
-            resume: cfg.resume.then(|| cfg.session_id.clone()),
+            // Hermes mints the id at `session/new`; only that id can be
+            // handed back to `session/load`.
+            resume: cfg.resume.clone(),
         };
         let reader_eof = Arc::clone(&stdout_eof);
         let stdout_task = tokio::spawn(async move {

@@ -216,13 +216,19 @@ async fn a_fresh_thread_id_is_discovered_rather_than_supplied() {
 }
 
 /// A resume names the thread on `thread/resume`, and the resumed thread
-/// keeps that id. This is the one path where `SpawnConfig::session_id`
-/// must already BE the Codex thread id.
+/// keeps that id.
+///
+/// This test used to carry the comment "this is the one path where
+/// `SpawnConfig::session_id` must already BE the Codex thread id" — a
+/// requirement stated in a comment that nothing in the engine ever
+/// satisfied, because the engine passes eave's own uuid. The requirement
+/// now lives in the type (`resume: Option<String>`) instead, and the two
+/// ids are set to different values so that reading the wrong one fails.
 #[tokio::test]
 async fn a_resume_names_the_thread_it_is_continuing() {
     let mut cfg = fake_cfg("handshake-report", &[]);
-    cfg.resume = true;
-    cfg.session_id = "01a020c6-2222-7000-8000-resumeme".into();
+    cfg.session_id = "eave-side-id-that-codex-never-issued".into();
+    cfg.resume = Some("01a020c6-2222-7000-8000-resumeme".into());
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
     session.send_user_message("go").await.unwrap();
     let events = collect_until_exit(&mut rx).await;
@@ -379,7 +385,7 @@ async fn an_initialize_the_server_refuses_is_a_posture_refusal() {
 #[tokio::test]
 async fn a_thread_that_cannot_be_opened_is_a_posture_refusal() {
     let mut cfg = fake_cfg("thread-error", &[]);
-    cfg.resume = true;
+    cfg.resume = Some("01a020c6-3333-7000-8000-goneaway".into());
     let (_session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
     let events = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::PostureRefused { .. })

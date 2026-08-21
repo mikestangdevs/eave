@@ -255,7 +255,8 @@ impl CodexSession {
         let opening = Opening {
             cwd: cfg.cwd.to_string_lossy().into_owned(),
             model: cfg.model.clone(),
-            resume_thread: cfg.resume.then(|| cfg.session_id.clone()),
+            // The thread id is Codex's, minted at thread creation.
+            resume_thread: cfg.resume.clone(),
         };
 
         let reader_shared = Arc::clone(&shared);

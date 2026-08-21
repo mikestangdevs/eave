@@ -248,7 +248,10 @@ impl GrokSession {
 
         // Open the ACP handshake. Everything else is driven by what comes
         // back, in the reader task.
-        let resume_id = cfg.resume.then(|| cfg.session_id.clone());
+        // Grok names its own sessions at `session/new` and ACP offers no
+        // way to propose one, so the ONLY id that can resume a Grok session
+        // is the one Grok issued. `cfg.session_id` is not it.
+        let resume_id = cfg.resume.clone();
         let session_cwd = cfg.cwd.display().to_string();
         let handshake_stdin = Arc::clone(&stdin);
         tokio::spawn(async move {

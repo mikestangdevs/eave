@@ -185,13 +185,20 @@ async fn a_new_session_discovers_the_id_hermes_minted() {
     );
 }
 
-/// A resume asks `session/load` for the id eave is holding, and that id is
-/// the session's cursor — the direction reverses from the new-session case.
+/// A resume asks `session/load` for **Hermes'** id — the cursor Hermes
+/// minted last time and eave journalled — not for eave's own.
+///
+/// The test above (`…must not pretend its own was honoured`) already
+/// established that ACP has no caller-chosen id. This is the other half of
+/// that fact: if eave's id cannot be imposed at `session/new`, it cannot
+/// be used at `session/load` either. The cursor and `cfg.session_id` are
+/// set to different values so that reading the wrong one fails.
 #[tokio::test]
-async fn a_resume_loads_the_id_eave_already_holds() {
+async fn a_resume_loads_the_providers_id_not_eaves() {
     let mut cfg = fake_cfg(&[]);
-    cfg.resume = true;
-    let wanted = cfg.session_id.clone();
+    let wanted = "acp-minted-42".to_string();
+    cfg.session_id = "eave-side-id-that-hermes-never-issued".into();
+    cfg.resume = Some(wanted.clone());
     let (_session, mut rx) = spawn_hermes(&cfg).unwrap();
     let events = recv_until(&mut rx, is_init).await;
 
@@ -872,7 +879,7 @@ async fn live_hermes_acp_opens_a_session_in_the_asking_mode() {
         std::env::temp_dir(),
         format!("live-{}", uuid::Uuid::new_v4()),
     );
-    cfg.resume = false;
+    cfg.resume = None;
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     let events = recv_until(&mut rx, |e| {
         matches!(
