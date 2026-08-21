@@ -3500,7 +3500,7 @@ struct Shell {
     web_tabs: Entity<WebTabsState>,
     commands: tokio_mpsc::UnboundedSender<Command>,
     perf: Option<PerfProbe>,
-    /// Transient ⌘L confirmation shown in the footer ("logged 14:52:03"
+    /// Transient ⌘⇧L confirmation shown in the footer ("logged 14:52:03"
     /// or the write error), cleared after a few seconds. The generation
     /// counter keeps a stale clear-timer from eating a newer note.
     friction: Option<(u64, String)>,
@@ -3789,7 +3789,7 @@ pub fn default_data_dir() -> PathBuf {
     PathBuf::from(home).join("Library/Application Support/eave")
 }
 
-/// Where ⌘L appends its stamp (Stage L — this used to hardcode one
+/// Where ⌘⇧L appends its stamp (Stage L — this used to hardcode one
 /// person's desk, `~/Desktop/eave/docs/dogfood-log.md`, which existed on
 /// exactly one machine and silently failed to write on any other):
 ///
@@ -3867,7 +3867,7 @@ fn local_timestamp() -> String {
     }
 }
 
-/// How long the ⌘L footer confirmation stands.
+/// How long the ⌘⇧L footer confirmation stands.
 const FRICTION_NOTE_TTL: Duration = Duration::from_secs(4);
 
 impl Shell {
@@ -4326,7 +4326,8 @@ impl Shell {
         .detach();
     }
 
-    /// ⌘L: append one timestamped context line — selected session id and
+    /// ⌘⇧L (⌘L until Slice C5 gave that chord to the omnibox): append one
+    /// timestamped context line — selected session id and
     /// its reported state — to the dogfood friction log, and confirm (or
     /// state the failure) in the footer. Deliberately nothing more: the
     /// keystroke's job is to make the moment findable; the note is

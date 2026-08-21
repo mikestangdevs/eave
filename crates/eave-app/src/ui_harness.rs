@@ -295,7 +295,8 @@ fn real_name_width(text: &str) -> Pixels {
 // them pass vacuously — which is the exact failure this amendment
 // exists to prevent.
 
-/// Stage L: ⌘L's destination. It used to be
+/// Stage L: the friction log's destination (⌘⇧L since Slice C5, ⌘L before
+/// it). It used to be
 /// `~/Desktop/eave/docs/dogfood-log.md` — one person's desk, hardcoded,
 /// which on any other machine meant the keystroke wrote into a directory
 /// that did not exist and reported a failure the operator had no way to
