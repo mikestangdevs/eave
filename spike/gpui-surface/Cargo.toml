@@ -5,8 +5,15 @@
 # frame arrives as a BGRA IOSurface, can it become an ORDINARY gpui scene
 # primitive — z-ordered with everything else, and visible to `BackdropBlur`?
 # gpui already has a surface primitive, but its renderer asserts NV12 YCbCr
-# because it was written for video. `../zed-fork` is the pinned fork with a
-# single-plane BGRA path added; this crate is what proves the change works.
+# because it was written for video. The fork adds a single-plane BGRA path;
+# this crate is what proves the change works.
+#
+# It pointed at `path = "../zed-fork"` — a gitignored local checkout — which
+# made it unbuildable for anyone but the machine it was written on. Slice C3
+# published the fork, so it uses the same git url and the same immutable rev
+# as the product (`8521fc1`). Its sibling `spike/cef-osr` had the identical
+# defect and it was NOT theoretical there: it silently killed the CEF stage
+# of `boot-smoke.sh`.
 [workspace]
 
 [package]
@@ -16,8 +23,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-gpui = { path = "../zed-fork/crates/gpui" }
-gpui_platform = { path = "../zed-fork/crates/gpui_platform", features = [
+gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27" }
+gpui_platform = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
     "font-kit",
     "runtime_shaders",
 ] }
