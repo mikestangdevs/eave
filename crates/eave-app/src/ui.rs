@@ -51,6 +51,7 @@ use crate::loaders;
 use crate::markdown::{self, inline_runs, Align, Block, InlineRun, Marker};
 use crate::motion::{self, HoverFade as _};
 use crate::overlay::{self, MenuItem, Popup};
+use crate::slash::{self, SlashEntry};
 use crate::theme;
 
 actions!(eave, [Quit, ApproveOldest, DenyOldest]);
@@ -817,9 +818,21 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         // an ordinary session actually has, which is the fallback label.
         title: None,
         archived: false,
-        provider: "replay".into(),
+        // Slice AR: `EAVE_REPLAY_PROVIDER` alongside `EAVE_REPLAY_CWD`
+        // below — a capture of anything provider-dependent (the `/`
+        // palette reads `slash::roots(provider, …)`) needs this row to
+        // name a real agent rather than the rig. Defaults to `replay`, so
+        // every existing capture is unchanged and the rail still says out
+        // loud that nothing real is attached.
+        provider: std::env::var("EAVE_REPLAY_PROVIDER").unwrap_or_else(|_| "replay".into()),
         model: None,
-        cwd: path.display().to_string(),
+        // Slice AR: `EAVE_REPLAY_CWD` overrides this for captures that
+        // need the cwd to be a real DIRECTORY rather than the fixture
+        // file — the `/` palette reads `<cwd>/.claude/skills`, and a path
+        // ending in `.tap.jsonl` has nothing under it. Same rig, same
+        // reason as the synthetic rail and files snapshot above: so a
+        // capture exercises the real path instead of a special one.
+        cwd: std::env::var("EAVE_REPLAY_CWD").unwrap_or_else(|_| path.display().to_string()),
         created_ts_ms: 0,
         last_activity_ms: None,
         state: "running".into(),
@@ -2747,7 +2760,107 @@ struct Shell {
     /// — the same choice `motion::pulse_now` makes and for the same
     /// reason.
     files_wait_since: Cell<Option<(String, Instant)>>,
+    /// Slice AR — the `/` palette.
+    slash: SlashPalette,
 }
+
+/// Slice AR. The composer's `/` palette: the operator's own skills and
+/// slash commands, filtered as they type.
+///
+/// **There is no "is it open" bit here, and that is the design.** The
+/// palette is a *projection of the composer's text*: it is up exactly when
+/// `slash::palette_query` says the text is a bare `/`-prefixed word. A
+/// second source of truth for one fact would disagree the first moment a
+/// draft was restored by a session switch — which is a thing Slice T made
+/// happen on purpose. [`Self::popup`] holds the animation and the keyboard
+/// highlight, never the open/closed decision.
+#[derive(Default)]
+struct SlashPalette {
+    /// P1's state machine, for the entrance, the exit and the highlight.
+    /// `T` is `()` — this palette's position is decided by flex layout, so
+    /// unlike every other popup in the app it has no anchor to carry.
+    popup: Popup<()>,
+    /// What the palette is offering, and what it was built FROM. Keyed on
+    /// `(provider, cwd)` because both change what is on disk: a different
+    /// session is a different project root, and a different agent is a
+    /// different set of roots entirely (`slash::roots`).
+    ///
+    /// `None` = never built for this pair. The palette shows [`READING`]
+    /// rather than an empty menu, because "no skills" and "have not looked
+    /// yet" are different facts and only one of them is ever true here.
+    cache: Option<SlashCache>,
+    /// A scan is in flight. Guards against spawning a second one for the
+    /// same pair while the first is still running — an operator holding a
+    /// key down would otherwise start one per keystroke.
+    loading: bool,
+    /// The operator pressed escape. Suppresses the palette until the text
+    /// changes again.
+    ///
+    /// Not a second source of truth for "is it open": the text still
+    /// decides that. This is the operator's *refusal*, which is a separate
+    /// fact and one the text cannot carry — escape must not have to clear
+    /// a draft to close a menu.
+    dismissed: bool,
+}
+
+/// Slice AR2. The palette's rows, and the two different sources they come
+/// from.
+///
+/// **The CLI decides which rows exist; the disk decides what they say.**
+/// `inventory` is the `slash_commands` array out of that session's own
+/// `system/init` frame — the CLI's own account of every `/name` it will
+/// accept — and `scanned` is the filesystem read Slice AR built. Neither
+/// can do the other's job: the frame carries no descriptions, and the scan
+/// cannot see the 47 commands bundled inside the `claude` executable.
+struct SlashCache {
+    provider: String,
+    cwd: String,
+    /// The inventory this offering was built against.
+    ///
+    /// `None` = the session has never announced one, and there are two
+    /// ways to get there: a session that has never been started, and one
+    /// whose replay has not yet reached its first `Init`. **Both fall back
+    /// to the scan**, which is the same palette Slice AR shipped — fewer
+    /// rows than the CLI has, and zero rows the CLI lacks.
+    ///
+    /// An announcement of ZERO names falls back too, and that is a
+    /// judgement rather than a reading. `slash_commands` is
+    /// `#[serde(default)]` on the wire, so an agent CLI that predates the
+    /// field and one that genuinely has no commands both arrive as an
+    /// empty list. Taking the empty list literally would blank the palette
+    /// for the first case, which is the more likely one; the scan is the
+    /// better answer for both.
+    inventory: Option<Vec<String>>,
+    /// The disk scan, kept verbatim so an inventory that lands later can
+    /// be described without reading the disk a second time.
+    scanned: Vec<SlashEntry>,
+    /// What the palette actually offers — [`SlashCache::rebuild`]'s output,
+    /// and the only list the rows are drawn from.
+    offered: Vec<SlashEntry>,
+}
+
+impl SlashCache {
+    /// Fold the two sources into the offering.
+    ///
+    /// Cheap on purpose (a hash map over ~21 scanned entries and one clone
+    /// per offered row), because it runs on the keystroke path rather than
+    /// behind a channel: the alternative is a subscription that has to be
+    /// woken when the inventory lands, and this is a menu.
+    fn rebuild(&mut self) {
+        self.offered = match self.inventory.as_deref() {
+            Some(names) if !names.is_empty() => slash::offer(names, &self.scanned),
+            _ => self.scanned.clone(),
+        };
+    }
+}
+
+/// What the palette says while the first scan of a directory is in flight.
+///
+/// It says something rather than nothing because an empty menu is a claim
+/// — "you have no skills" — and at that moment eave has not looked. The
+/// distinction is the same one the transcript's empty state draws between
+/// "nothing sent yet" and a replay still arriving (Slice M).
+const READING: &str = "reading skills…";
 
 /// One open rail rename (Stage AC).
 ///
@@ -2835,6 +2948,23 @@ fn resolve_friction_log(override_path: Option<String>, data_dir: Option<PathBuf>
     }
 }
 
+/// `EAVE_SLASH_DEMO=1` — put a `/` in the composer at boot so the palette
+/// can be photographed. See the call site.
+fn slash_demo_at_boot() -> bool {
+    std::env::var("EAVE_SLASH_DEMO").is_ok_and(|v| v.trim() != "0" && !v.trim().is_empty())
+}
+
+/// The operator's home directory.
+///
+/// `$HOME`, like every other home lookup in this file — not a crate, and
+/// not `current_dir`. An unset `HOME` gives an empty path, which makes
+/// every user-scope root a relative path that does not exist, which makes
+/// the scan return nothing. That is the right failure: a palette with no
+/// user skills in it, rather than a panic in a menu.
+fn home_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+}
+
 /// A path with `$HOME` collapsed to `~`, for stating a location in
 /// chrome without spending half the footer on it.
 fn tilde(path: &Path) -> String {
@@ -2886,6 +3016,443 @@ impl Shell {
             });
             let _ = self.commands.send(Command::Send(text));
         }
+        // The composer is empty now, so the projection says closed. Said
+        // here as well as derived at the two read sites, so the popup does
+        // not sit mounted-but-invisible until the next keystroke.
+        self.sync_slash_palette(cx);
+    }
+
+    // -----------------------------------------------------------------
+    // Slice AR — the `/` palette
+
+    /// The selected session's provider and cwd.
+    ///
+    /// **`info.cwd`, and never `std::env::current_dir()`.** eave is one
+    /// binary in two roles: this process spawned `eave --engine` as a
+    /// child, and the ENGINE is the one holding a session's working
+    /// directory. The app's own cwd is wherever the bundle was launched
+    /// from — `/` when it is opened from Finder. Slice AI shipped a
+    /// launcher that printed one while opening in the other, and the whole
+    /// of the fix is to key everything to the value the engine stamped and
+    /// already sends for the rail.
+    fn slash_context(&self, cx: &Context<Self>) -> Option<(String, String)> {
+        let sid = self.transcript.read(cx).session_id.clone()?;
+        self.sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .find(|s| s.session_id == sid)
+            .map(|s| (s.provider.clone(), s.cwd.clone()))
+    }
+
+    /// Every `/name` the selected session's CLI said it would accept
+    /// (Slice AR2), or `None` when it has never said.
+    ///
+    /// **This is the app being TOLD, not the app finding out.** eave is one
+    /// binary in two roles and the ENGINE is the half that runs the agent
+    /// and reads its frames; the inventory reaches this process the way
+    /// every other transcript fact does — journaled by the engine, replayed
+    /// on `subscribe`, folded by `eave_wire::model::Transcript`. So it needs
+    /// no request type, no watch field and no cache invalidation: a session
+    /// that has ever run replays its own inventory on every later open,
+    /// with nothing live and nothing spawned.
+    fn slash_inventory(&self, cx: &Context<Self>) -> Option<Vec<String>> {
+        self.transcript.read(cx).transcript.inventory.clone()
+    }
+
+    /// Is the palette actually on screen and taking input?
+    ///
+    /// **The projection, evaluated — and the only thing allowed to answer
+    /// this question.** `popup.is_open()` alone is not enough: the popup
+    /// is state, and state can go stale behind a text change that did not
+    /// come from a keystroke. Switching sessions swaps the whole draft
+    /// (Slice T) from inside a subscription callback that has no `Shell`
+    /// to notify, so the popup can legitimately still say "open" over a
+    /// draft that no longer begins with a slash.
+    ///
+    /// Rather than hunt every writer of the text, both readers that matter
+    /// — the key gate and the render — ask *this*, which re-derives the
+    /// answer from the text every time. A stale popup is then harmless by
+    /// construction instead of harmless by vigilance.
+    fn slash_palette_live(&self, cx: &Context<Self>) -> bool {
+        self.slash.popup.is_open()
+            && !self.slash.dismissed
+            && slash::palette_query(&self.composer.read(cx).text).is_some()
+    }
+
+    /// The rows the palette is currently offering, or `None` while the
+    /// first scan of this directory is still out.
+    fn slash_matches(&self, query: &str) -> Option<Vec<&SlashEntry>> {
+        let cache = self.slash.cache.as_ref()?;
+        Some(slash::filter(&cache.offered, query))
+    }
+
+    /// Bring the palette into line with the composer's text.
+    ///
+    /// Called from every place the text changes and from nowhere else,
+    /// which is what keeps the projection honest. It never reads the disk
+    /// itself — it decides whether a read is needed and hands it to the
+    /// background executor.
+    fn sync_slash_palette(&mut self, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).text.clone();
+        let now = cx.background_executor().now();
+        let query = slash::palette_query(&text);
+
+        let Some(query) = query.filter(|_| !self.slash.dismissed) else {
+            self.close_slash_palette(cx);
+            return;
+        };
+        let Some((provider, cwd)) = self.slash_context(cx) else {
+            // No session, no project root. The composer is not even
+            // mounted at the launcher, so this is unreachable in practice
+            // and is a refusal rather than a guess.
+            self.close_slash_palette(cx);
+            return;
+        };
+
+        let inventory = self.slash_inventory(cx);
+        let fresh = self
+            .slash
+            .cache
+            .as_ref()
+            .is_some_and(|c| c.provider == provider && c.cwd == cwd);
+        if !fresh && !self.slash.loading {
+            self.begin_slash_scan(provider, cwd, cx);
+        } else if let Some(cache) = self.slash.cache.as_mut() {
+            // The scan is keyed on the directory, but the INVENTORY arrives
+            // on the session's own stream and can land after it — a replay
+            // reaching its first `Init`, or a session being started for the
+            // first time. Re-fold rather than re-read: the disk has not
+            // changed, only what eave has been told about it.
+            if cache.inventory != inventory {
+                cache.inventory = inventory;
+                cache.rebuild();
+            }
+        }
+
+        // The row count the popup navigates over: the matches, or the one
+        // `READING` row, which is never selectable.
+        let enabled = match self.slash_matches(query) {
+            Some(hits) => vec![true; hits.len()],
+            None => vec![false],
+        };
+        if self.slash.popup.is_open() {
+            self.slash.popup.resize(enabled);
+        } else {
+            self.slash.popup.open((), enabled, now);
+        }
+        cx.notify();
+    }
+
+    /// Read the disk, **off the UI thread**.
+    ///
+    /// The house rule is that a settled window schedules no frames, so
+    /// this must not become a poll — and it is not one: the only thing
+    /// that starts a scan is a keystroke that opens the palette over a
+    /// directory it has not read yet. A window nobody is typing at does
+    /// nothing at all.
+    ///
+    /// The cache lives for the process, per `(provider, cwd)`. **A skill
+    /// added while eave is running is not picked up** until the palette is
+    /// pointed at a different session and back, and that is a stated
+    /// limitation rather than an oversight: the alternatives are a watcher
+    /// (a thread and a wake-up per file event, for a menu) or a re-scan
+    /// per keystroke (disk I/O on the typing path). Neither is worth it
+    /// for a directory that changes when a person edits a file by hand.
+    fn begin_slash_scan(&mut self, provider: String, cwd: String, cx: &mut Context<Self>) {
+        self.slash.loading = true;
+        cx.spawn(async move |view, cx| {
+            let (p, c) = (provider.clone(), cwd.clone());
+            let entries = cx
+                .background_executor()
+                .spawn(async move { slash::discover(&p, Path::new(&c), &home_dir()) })
+                .await;
+            let _ = view.update(cx, |shell, cx| {
+                shell.slash.loading = false;
+                // Read the inventory HERE rather than passing it in: the
+                // scan is asynchronous, and a session's `Init` can replay
+                // while it is out.
+                let mut cache = SlashCache {
+                    provider,
+                    cwd,
+                    inventory: shell.slash_inventory(cx),
+                    scanned: entries,
+                    offered: Vec::new(),
+                };
+                cache.rebuild();
+                shell.slash.cache = Some(cache);
+                // The row set only existed as `READING` until now, so the
+                // popup is navigating over one dead row. Re-point it at
+                // what actually arrived.
+                let text = shell.composer.read(cx).text.clone();
+                if let Some(q) = slash::palette_query(&text) {
+                    if let Some(hits) = shell.slash_matches(q) {
+                        shell.slash.popup.resize(vec![true; hits.len()]);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn close_slash_palette(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.slash.popup.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, move |shell, _| {
+                shell.slash.popup.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Put the chosen command in the composer, and stop there.
+    ///
+    /// **It does not send.** Choosing a row is choosing a command, not
+    /// deciding to run it — several of these take an argument
+    /// (`/model sonnet`), and a palette that fired on selection would make
+    /// the argument unreachable. The text is left with the caret after it
+    /// and a space, which is exactly the state the operator is in if they
+    /// had typed it, and Return then does what Return has always done.
+    fn choose_slash(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).text.clone();
+        let Some(query) = slash::palette_query(&text) else {
+            return;
+        };
+        let Some(insertion) = self
+            .slash_matches(query)
+            .and_then(|hits| hits.get(ix).map(|e| e.insertion()))
+        else {
+            return;
+        };
+        self.composer.update(cx, |c, cx| {
+            c.text = format!("{insertion} ");
+            cx.notify();
+        });
+        // The trailing space closes the palette through the projection
+        // itself — `palette_query` returns `None` on whitespace — so this
+        // needs no separate dismissal, and the two cannot disagree.
+        self.sync_slash_palette(cx);
+    }
+
+    /// The palette's surface, or `None` when it is not up.
+    ///
+    /// **Mounted as an ordinary sibling of the composer in the bottom
+    /// stack, not through `overlay::menu_layer`.** That is the one
+    /// structural decision in this function and it is worth defending.
+    ///
+    /// `menu_layer` exists for menus that float at a POINTER: it needs
+    /// `anchored` + `deferred` + a full-window click catcher precisely
+    /// because a click is what opened it and a click somewhere else must
+    /// dismiss it without also hitting what was underneath. None of that
+    /// applies here. This palette opens because somebody typed, it has no
+    /// pointer position to anchor to, and it is not modal — it is a
+    /// projection of the composer's text and it leaves when the text does.
+    ///
+    /// What it gains by being a sibling is that flex layout puts it
+    /// exactly above the composer and exactly as wide as the composer,
+    /// with no coordinates computed anywhere. The bottom stack is already
+    /// `.absolute().bottom_0()` with a `flex_col`, so a child added above
+    /// the composer grows the stack upward and **cannot** disturb the
+    /// transcript's layout — which is the hazard `menu_layer`'s own doc
+    /// warns about (the virtualized list caches row heights).
+    ///
+    /// The surface itself is still P1's: [`overlay::menu_surface`], the
+    /// same rim, fill, shadow and radius the pointer menus use, and
+    /// [`overlay::menu_row`] for every row. One menu system, two mountings.
+    fn slash_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.slash_palette_live(cx) {
+            return None;
+        }
+        let now = cx.background_executor().now();
+        let (opacity, dy) = self.slash.popup.motion_at(now, cx.reduce_motion())?;
+        if self.slash.popup.in_flight(now, cx.reduce_motion()) {
+            // Same contract as `menu_layer`: the claim has to be raised
+            // from the root render pass, which is where this is called.
+            motion::mark_active();
+        }
+        let text = self.composer.read(cx).text.clone();
+        let query = slash::palette_query(&text)?;
+        let highlighted = self.slash.popup.highlighted();
+
+        // **Three states, not two — and the photograph is what found the
+        // third.** `docs/shots/ar-palette.png` (the first capture) shows
+        // this palette saying "no skill or command matches /" over a
+        // directory that had a skill and a command in it. The session's
+        // provider was `replay`, `slash::roots` has no table for it, and
+        // the scan returned nothing — so a true statement ("nothing
+        // matched") stood in for the fact that mattered ("eave does not
+        // know where this agent keeps its skills").
+        //
+        // Same distinction as [`READING`], and the same one Slice M drew
+        // in the transcript's empty state. Absence of results has three
+        // causes here and the operator can act on only one of them.
+        //
+        // Slice AR2 narrowed the condition. "eave does not know where this
+        // agent keeps its skills" is only true when eave has NEITHER a
+        // roots table for the provider NOR an inventory from it. Today only
+        // Claude produces an inventory, so nothing on this machine can hit
+        // the second half — but a provider that announced 68 names while
+        // being told eave did not know where its skills were would be the
+        // same wrong sentence, one adapter from now.
+        let unknown_provider = self.slash_inventory(cx).is_none_or(|i| i.is_empty())
+            && self
+                .slash_context(cx)
+                .is_some_and(|(p, cwd)| slash::roots(&p, Path::new(&cwd), &home_dir()).is_empty());
+
+        let rows: Vec<AnyElement> = match self.slash_matches(query) {
+            _ if unknown_provider => {
+                let (provider, _) = self.slash_context(cx)?;
+                vec![overlay::menu_row(
+                    0,
+                    &MenuItem::new(format!(
+                        "eave does not know where {provider} keeps its skills"
+                    ))
+                    .disabled(),
+                    false,
+                    false,
+                    |_, _, _| {},
+                )]
+            }
+            // Still reading. One dead row that says so, rather than an
+            // empty menu — an empty menu is the claim "you have none", and
+            // at this instant eave has not looked.
+            None => vec![overlay::menu_row(
+                0,
+                &MenuItem::new(READING).disabled(),
+                false,
+                false,
+                |_, _, _| {},
+            )],
+            Some(hits) if hits.is_empty() => vec![overlay::menu_row(
+                0,
+                // The query is in the sentence because "no matches" over a
+                // menu the operator cannot see the input of is a puzzle;
+                // `/xyzzy` in it makes the typo obvious.
+                &MenuItem::new(format!("no skill or command matches /{query}")).disabled(),
+                false,
+                false,
+                |_, _, _| {},
+            )],
+            Some(hits) => hits
+                .iter()
+                .take(theme::SLASH_MAX_ROWS)
+                .enumerate()
+                .map(|(ix, e)| {
+                    let mut item = MenuItem::new(e.insertion());
+                    if let Some(d) = e.description() {
+                        item = item.detail(d.to_string());
+                    }
+                    // The trailing slot says WHICH KIND, not which scope.
+                    // Scope is already legible where it is ambiguous — a
+                    // plugin's entries carry their plugin in the name
+                    // (`/craft-skills:seams`) — whereas skill-vs-command is
+                    // invisible in the name and is the thing that explains
+                    // why two rows behave differently.
+                    //
+                    // `operator_only` earns the word "only": the author
+                    // declared the model may never reach for it, so the
+                    // palette is the sole way in. That is exactly what a
+                    // row in this menu is for.
+                    //
+                    // Slice AR2 added the fourth case, and it is the one
+                    // the slice exists for. A row with no `kind` is a name
+                    // the CLI announced that no file under any root eave
+                    // scans backs — `/context`, `/compact`, `/dataviz`.
+                    // `find ~/.claude /opt/homebrew/lib/node_modules -name
+                    // dataviz` returns nothing while `/dataviz` is live in
+                    // the CLI: they are compiled into the executable. So
+                    // the row carries a name, no description, and the one
+                    // word that explains why there is no description.
+                    item = item.trailing(match (e.kind(), e.operator_only()) {
+                        (Some(slash::Kind::Skill), true) => "skill · only here",
+                        (Some(slash::Kind::Skill), false) => "skill",
+                        (Some(slash::Kind::Command), true) => "command · only here",
+                        (Some(slash::Kind::Command), false) => "command",
+                        (None, _) => "built in",
+                    });
+                    overlay::menu_row(
+                        ix,
+                        &item,
+                        highlighted == Some(ix),
+                        true,
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.choose_slash(ix, cx)),
+                    )
+                })
+                .collect(),
+        };
+
+        Some(
+            // **The composer's material, not the popover's, and behind a
+            // real backdrop blur.** The first capture
+            // (`docs/shots/ar-palette.png`, superseded) shipped this with
+            // `menu_glass` and no `frost`, and the transcript read
+            // straight through all six rows — a user message and two lines
+            // of assistant prose competing with the descriptions on top of
+            // them.
+            //
+            // The fix is not "make it darker"; it is to ask the question
+            // this project keeps re-asking. A pointer menu floats over the
+            // CHROME, and `menu_glass` was measured there. This floats over
+            // the TRANSCRIPT, which is the ground the composer and the
+            // ↓-bottom pill occlude — so it takes what they take, which is
+            // `chrome_glass` behind `frost`'s backdrop blur. Slice M's note
+            // on the pill says the occlusion IS the job.
+            //
+            // `Self::column` for the same reason: the palette is a sibling
+            // of the composer and has to be exactly as wide as it. The
+            // first capture used `w_full` and overhung the composer by the
+            // gutter on both sides, which is visible in it.
+            Self::column(frost(
+                theme::RADIUS_MENU,
+                overlay::menu_surface("slash-palette", opacity, dy)
+                    .w_full()
+                    .border_color(theme::border_strong())
+                    .shadow(theme::shadow_panel())
+                    .bg(theme::chrome_glass())
+                    .max_h(px(theme::SLASH_MAX_H))
+                    .overflow_y_hidden()
+                    .children(rows),
+            ))
+            .mb(px(theme::SPACE_2))
+            .into_any_element(),
+        )
+    }
+
+    /// Type the `/` for the camera (`EAVE_SLASH_DEMO=1`).
+    ///
+    /// Waits for a session, because the palette is keyed to a session's
+    /// cwd and there is none on the first frame. A bounded poll rather
+    /// than a subscription: it is a capture rig, it runs a fixed number of
+    /// times and then stops forever, and it is behind an environment
+    /// variable the shipped app never sets. **It is not a frame loop** —
+    /// the timer is the background executor's, and the window is only
+    /// notified on the one tick that seeds the text.
+    fn seed_slash_demo(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |view, cx| {
+            for _ in 0..60 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let seeded = view
+                    .update(cx, |shell, cx| {
+                        if shell.transcript.read(cx).session_id.is_none() {
+                            return false;
+                        }
+                        shell.composer.update(cx, |c, cx| {
+                            c.text = "/".into();
+                            cx.notify();
+                        });
+                        shell.sync_slash_palette(cx);
+                        true
+                    })
+                    .unwrap_or(true);
+                if seeded {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// ⌘L: append one timestamped context line — selected session id and
@@ -3121,13 +3688,73 @@ impl Shell {
         let struck = cx.background_executor().now();
         self.composer
             .update(cx, |c, _| c.caret_anchor = Some(struck));
+        // Slice AR — the `/` palette takes FOUR keys and no others.
+        //
+        // Deliberately unlike the overlay gates above, which swallow the
+        // whole keyboard. Those are menus the operator opened *instead of*
+        // typing; this one is up **because** they are typing, and a
+        // palette that ate the next letter would make the composer
+        // unusable the moment a message began with a slash. So every
+        // printable character still falls through to the composer below,
+        // and the palette re-filters underneath it.
+        //
+        // The four are the ones with nowhere else to go while a menu is on
+        // screen: escape refuses it, the arrows move its highlight, and
+        // tab completes. **Return is not one of them** — see the `enter`
+        // arm.
+        if self.slash_palette_live(cx) {
+            match ks.key.as_str() {
+                "escape" => {
+                    // Refusal, not a text edit: the draft is left exactly
+                    // as typed. Escape must never be the only way to close
+                    // a menu AND a way to lose what you wrote.
+                    self.slash.dismissed = true;
+                    self.close_slash_palette(cx);
+                    return;
+                }
+                "down" => {
+                    self.slash.popup.highlight_next();
+                    cx.notify();
+                    return;
+                }
+                "up" => {
+                    self.slash.popup.highlight_prev();
+                    cx.notify();
+                    return;
+                }
+                "tab" => {
+                    // Complete to the top match — the classic gesture, and
+                    // the one that does not require the operator to press
+                    // down first just to accept what is already highlighted
+                    // in front of them.
+                    self.choose_slash(self.slash.popup.highlighted().unwrap_or(0), cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Any key that reaches here and changes the text is the operator
+        // typing again, which retracts an escape.
+        self.slash.dismissed = false;
         match ks.key.as_str() {
-            "enter" => self.send_current(cx),
+            // **Return still sends, exactly as it did before this slice**,
+            // unless the operator has explicitly moved the highlight onto
+            // a row. That ordering is the whole compatibility story: `/`
+            // messages already reached the CLI verbatim
+            // (`send_current` trims and forwards), so an operator who
+            // types `/framer` and hits Return must get what they have
+            // always got. Firing the top match instead would change the
+            // meaning of Return for every slash message ever typed.
+            "enter" => match self.slash.popup.highlighted() {
+                Some(ix) if self.slash_palette_live(cx) => self.choose_slash(ix, cx),
+                _ => self.send_current(cx),
+            },
             "backspace" => {
                 self.composer.update(cx, |c, cx| {
                     c.text.pop();
                     cx.notify();
                 });
+                self.sync_slash_palette(cx);
             }
             // ctrl-k: kill the live session (dev affordance; real kill UI
             // is later stage work).
@@ -3145,6 +3772,7 @@ impl Shell {
                         c.text.push_str(&text);
                         cx.notify();
                     });
+                    self.sync_slash_palette(cx);
                 }
             }
             _ => {
@@ -3155,6 +3783,7 @@ impl Shell {
                             c.text.push_str(&ch);
                             cx.notify();
                         });
+                        self.sync_slash_palette(cx);
                     }
                 }
             }
@@ -7888,6 +8517,10 @@ impl Render for Shell {
         // chain below has neither `self` nor `cx` to spare.
         let empty_el = empty_state.map(Self::transcript_empty_view);
         let launcher_menu = self.launcher_menu_layer(cx);
+        // Built here for the same reason the launcher and its menu are:
+        // it needs `self` and `cx`, and the element chain below has
+        // neither to spare.
+        let slash_layer = self.slash_layer(cx);
 
         // Opaque window by default, custom titlebar — locked decision
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
@@ -8079,6 +8712,12 @@ impl Render for Shell {
                                             .children(self.conn_panel(cx))
                                             .children(notice)
                                             .children(trailer)
+                                            // Slice AR — the `/` palette,
+                                            // an ordinary sibling directly
+                                            // above the composer. See
+                                            // `Shell::slash_layer` for why
+                                            // this is not `menu_layer`.
+                                            .children(slash_layer)
                                             // Slice Q2: no session, no
                                             // composer. A draft typed at
                                             // the launcher has nothing to
@@ -8769,6 +9408,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         rename: None,
                         launcher: LauncherUi::default(),
                         files_wait_since: Cell::new(None),
+                        slash: SlashPalette::default(),
                         conn: conn.clone(),
                         sessions: sessions.clone(),
                         files: files.clone(),
@@ -8818,6 +9458,27 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 // environment read is not.
                 if launch_at_boot_requested() {
                     shell.update(cx, |s, cx| s.launch_at_boot(cx));
+                }
+                // Slice AR: `EAVE_SLASH_DEMO=1` types the `/` for the
+                // camera.
+                //
+                // Third instance of the same shape, and the same reason as
+                // both of the others. The palette's only door is the
+                // keyboard, and progress.md records that **synthetic
+                // keyboard events do not reach this gpui app at all** —
+                // gpui derives `key_char` from the NSEvent's `characters`,
+                // which a synthesised event has none of. So a capture that
+                // tried to type would be photographing a failure, and
+                // without this the rows would ship on arithmetic and a
+                // headless harness alone.
+                //
+                // What it seeds is the composer's TEXT, not the popup: the
+                // palette is a projection, so putting a `/` in the buffer
+                // and running the same `sync_slash_palette` a keystroke
+                // runs is the whole of it. Nothing here is a second way to
+                // open the menu.
+                if slash_demo_at_boot() {
+                    shell.update(cx, |s, cx| s.seed_slash_demo(cx));
                 }
                 shell
             },

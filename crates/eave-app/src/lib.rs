@@ -38,6 +38,13 @@ mod launcher;
 /// consumer yet at all.
 mod overlay;
 
+/// The `/` palette's discovery half (Slice AR): which of the operator's
+/// Claude Code skills and slash commands exist, and what each one does.
+/// **Public, unlike its render-path neighbours** — it is pure logic over
+/// paths handed in, with no gpui in it, so it is exactly the kind of thing
+/// the headless runs can exercise.
+pub mod slash;
+
 /// The macOS menu bar (Slice Y). Private: it is wiring, not part of the
 /// headless surface the acceptance runs use.
 mod app_menus;

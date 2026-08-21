@@ -86,6 +86,29 @@ impl ClaudeStream {
                                     .get("permissionMode")
                                     .and_then(Value::as_str)
                                     .map(str::to_string),
+                                // Slice AR2: the CLI's own complete list of
+                                // the `/name`s it will accept, announced
+                                // before the model is invoked. Kept rather
+                                // than dropped — a filesystem scan finds
+                                // roughly a third of these, because the rest
+                                // are bundled inside the executable.
+                                //
+                                // Non-strings are skipped rather than
+                                // failing the frame: this array is somebody
+                                // else's shape, and an `init` that could not
+                                // be parsed would take `session_id` and
+                                // `permissionMode` down with it — the two
+                                // facts the session cannot start without.
+                                slash_commands: v
+                                    .get("slash_commands")
+                                    .and_then(Value::as_array)
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_string)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
                             }]
                         }
                         None => vec![malformed(line, "init without session_id".into())],
@@ -473,6 +496,7 @@ mod tests {
             [SessionEvent::Init {
                 session_id,
                 permission_mode,
+                ..
             }] => {
                 assert_eq!(session_id, "abc");
                 assert_eq!(permission_mode.as_deref(), Some("default"));
@@ -486,6 +510,65 @@ mod tests {
                 permission_mode, ..
             }] => assert!(permission_mode.is_none()),
             other => panic!("got {other:?}"),
+        }
+    }
+
+    /// **Slice AR2.** The CLI announces its own complete inventory in the
+    /// very first frame it writes, and this parser used to throw it away.
+    ///
+    /// The line below is a cut-down copy of a real one, captured
+    /// 2026-08-20 by spawning `claude` with eave's exact headless argv from
+    /// `/tmp` and reading the first stdout line. The real frame carried 68
+    /// names; three of them are here, including the plugin-namespaced shape
+    /// and the one name in the operator's inventory that begins with an
+    /// underscore.
+    #[test]
+    fn init_carries_the_clis_own_slash_command_inventory() {
+        let mut s = ClaudeStream::new();
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default","slash_commands":["context","craft-skills:seams","__remote-workflow"],"skills":["craft-skills:seams"],"tools":["Bash"]}"#;
+        match s.parse_line(line).as_slice() {
+            [SessionEvent::Init { slash_commands, .. }] => {
+                assert_eq!(
+                    slash_commands,
+                    &["context", "craft-skills:seams", "__remote-workflow"],
+                    "the frame's own order and its own names, unedited"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A CLI that does not announce an inventory has announced nothing, and
+    /// an empty list is exactly that fact. The two facts eave cannot start
+    /// a session without — the id and the posture — must survive a frame
+    /// whose `slash_commands` is missing, empty, or the wrong shape
+    /// entirely.
+    #[test]
+    fn an_init_without_a_usable_inventory_still_carries_the_id_and_the_posture() {
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default"}"#,
+            r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default","slash_commands":[]}"#,
+            r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default","slash_commands":"context"}"#,
+            r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default","slash_commands":[{"name":"context"},"model"]}"#,
+        ] {
+            match ClaudeStream::new().parse_line(line).as_slice() {
+                [SessionEvent::Init {
+                    session_id,
+                    permission_mode,
+                    slash_commands,
+                }] => {
+                    assert_eq!(session_id, "abc");
+                    assert_eq!(permission_mode.as_deref(), Some("default"));
+                    // The object in the last case is skipped; the string
+                    // beside it is kept. Partial is better than nothing and
+                    // far better than a malformed `init`.
+                    assert!(
+                        slash_commands.iter().all(|c| c == "model"),
+                        "non-strings must be skipped, not guessed at: {slash_commands:?}"
+                    );
+                }
+                other => panic!("{line} gave {other:?}"),
+            }
         }
     }
 

@@ -125,6 +125,7 @@ fn journal_round_trips_records() {
         w.append(provider(SessionEvent::Init {
             session_id: "s1".into(),
             permission_mode: Some("default".into()),
+            slash_commands: Vec::new(),
         }))
         .unwrap(),
         w.append(JournalEvent::UserSent { text: "hi".into() })
@@ -369,6 +370,7 @@ fn crash_tail_repair_settles_open_turn_as_interrupted() {
     w.append(provider(SessionEvent::Init {
         session_id: "s1".into(),
         permission_mode: Some("default".into()),
+        slash_commands: Vec::new(),
     }))
     .unwrap();
     w.append(JournalEvent::UserSent {
@@ -1084,4 +1086,95 @@ fn a_configured_header_round_trips_through_the_journal() {
     JournalWriter::create(&path, &header).expect("create");
     let loaded = eave_core::journal::load(&path).expect("load");
     assert_eq!(loaded.header.agent, agent);
+}
+
+/// **Slice AR2.** The CLI's own command inventory survives the journal,
+/// which is the whole reason it needs no channel of its own: a session that
+/// has ever run replays its inventory on every later open, with nothing
+/// live and nothing spawned.
+///
+/// The compatibility half is the point of `#[serde(default)]`: every
+/// journal written before this field existed carries no `slash_commands`
+/// key, and those records must still load. They do, as an empty list —
+/// which is exactly what those runs knew.
+#[test]
+fn an_init_carries_its_command_inventory_through_the_journal_and_an_old_one_still_loads() {
+    let dir = scratch();
+    let path = dir.join("journal.jsonl");
+    let mut w = JournalWriter::create(&path, &test_header("s1")).unwrap();
+    w.append(provider(SessionEvent::Init {
+        session_id: "s1".into(),
+        permission_mode: Some("default".into()),
+        slash_commands: vec!["context".into(), "craft-skills:seams".into()],
+    }))
+    .unwrap();
+    w.append(JournalEvent::Closed {
+        outcome: Outcome::Done,
+    })
+    .unwrap();
+    w.sync().unwrap();
+
+    let loaded = eave_core::journal::load(&path).expect("load");
+    match &loaded.records[0].event {
+        JournalEvent::Provider {
+            event: SessionEvent::Init { slash_commands, .. },
+        } => assert_eq!(slash_commands, &["context", "craft-skills:seams"]),
+        other => panic!("got {other:?}"),
+    }
+
+    // ...and the shape a pre-AR2 build wrote is what a session that
+    // announced nothing writes TODAY: `skip_serializing_if` keeps the key
+    // off the line entirely, so an older build reading a newer journal
+    // sees exactly the bytes it has always seen.
+    let quiet = serde_json::to_string(&eave_core::journal::Record {
+        seq: 1,
+        ts_ms: 1,
+        event: provider(SessionEvent::Init {
+            session_id: "s1".into(),
+            permission_mode: Some("default".into()),
+            slash_commands: Vec::new(),
+        }),
+    })
+    .unwrap();
+    assert!(
+        !quiet.contains("slash_commands"),
+        "an init that announced nothing must write the old record shape: {quiet}"
+    );
+
+    // The other direction: that line, loaded by THIS build.
+    let old_path = dir.join("old.jsonl");
+    std::fs::write(
+        &old_path,
+        format!(
+            "{}\n{quiet}\n{}\n",
+            serde_json::to_string(&test_header("s1")).unwrap(),
+            serde_json::to_string(&eave_core::journal::Record {
+                seq: 2,
+                ts_ms: 2,
+                event: JournalEvent::Closed {
+                    outcome: Outcome::Done
+                },
+            })
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let old = eave_core::journal::load(&old_path).expect("an old journal must still load");
+    match &old.records[0].event {
+        JournalEvent::Provider {
+            event:
+                SessionEvent::Init {
+                    slash_commands,
+                    permission_mode,
+                    ..
+                },
+        } => {
+            assert!(
+                slash_commands.is_empty(),
+                "a run that announced nothing must read as nothing, never as a guess"
+            );
+            assert_eq!(permission_mode.as_deref(), Some("default"));
+        }
+        other => panic!("got {other:?}"),
+    }
 }

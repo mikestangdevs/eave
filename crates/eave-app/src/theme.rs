@@ -1556,6 +1556,34 @@ pub const MENU_ANCHOR_GAP: f32 = SPACE_1;
 /// in. `anchored()` does the pushing; this is the margin it keeps.
 pub const MENU_SCREEN_MARGIN: f32 = SPACE_2;
 
+/// The largest share of the window the `/` palette may occupy (Slice AR).
+///
+/// A menu that opens at a pointer can be as tall as it likes — it is over
+/// content the operator was not reading. The composer palette is different:
+/// it grows UPWARD out of the composer, over the transcript, while the
+/// operator is mid-sentence. A third is the point at which it still leaves
+/// the majority of the log visible behind it.
+pub const SLASH_PALETTE_WINDOW_SHARE: f32 = 1.0 / 3.0;
+
+/// How many rows the `/` palette shows before it stops growing.
+///
+/// **Derived, not chosen.** It is the most rows that fit in
+/// [`SLASH_PALETTE_WINDOW_SHARE`] of [`WINDOW_MIN_H`] — the SMALLEST window
+/// eave allows, because a cap that only holds on a large window is not a
+/// cap. At 520 px that is 173.3 px, less the surface's own
+/// [`MENU_PAD_Y`] top and bottom, over a [`MENU_ROW_H`] of 25: **6**.
+///
+/// Six is not a limit on what is reachable. The list is ranked and the
+/// query filters it, so row seven is reached by typing one more letter —
+/// which is the gesture the palette is for.
+pub const SLASH_MAX_ROWS: usize =
+    ((WINDOW_MIN_H * SLASH_PALETTE_WINDOW_SHARE - MENU_PAD_Y * 2.0) / MENU_ROW_H) as usize;
+
+/// The palette's height ceiling, in px — [`SLASH_MAX_ROWS`] rows plus the
+/// surface's own vertical padding. Derived from the row metric so the two
+/// cannot drift apart: a taller row makes a shorter menu, automatically.
+pub const SLASH_MAX_H: f32 = MENU_ROW_H * SLASH_MAX_ROWS as f32 + MENU_PAD_Y * 2.0;
+
 /// Disabled treatment (polish-inventory §2.6): comet's ported web recipe
 /// is `disabled:opacity-35` plus no pointer events, and this is the 0.35.
 /// It is deliberately NOT a text tier — a disabled control dims *whole*,

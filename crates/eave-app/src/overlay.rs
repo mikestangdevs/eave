@@ -166,6 +166,31 @@ impl<T> Popup<T> {
         });
     }
 
+    /// Replace the row set of an ALREADY-open popup, keeping its entrance
+    /// where it is.
+    ///
+    /// Slice AR. Every popup before it had a fixed row set for its whole
+    /// life, so `open` could own the row count. The `/` palette's rows are
+    /// the result of a filter over what the operator is typing, so the set
+    /// changes on nearly every keystroke — and re-calling [`open`](Self::open)
+    /// for that would restart the entrance animation on each letter,
+    /// which reads as a menu flickering under the typist.
+    ///
+    /// **The highlight is cleared, always.** An index means "the third
+    /// row", and after a filter the third row is a different command.
+    /// Carrying it over would let Return fire something the operator never
+    /// looked at; clearing it means the next Return does what Return did
+    /// before the palette existed, which is send.
+    ///
+    /// A no-op on a closed or closing popup: a row set arriving for
+    /// something already leaving has nothing to describe.
+    pub fn resize(&mut self, enabled: Vec<bool>) {
+        if let Phase::Open(live) = &mut self.phase {
+            live.enabled = enabled;
+            live.highlighted = None;
+        }
+    }
+
     /// Start the exit. Returns whether the popup is still mounted and so
     /// still needs reaping — `false` under reduced motion, where there is
     /// no exit to play and the popup closes outright.
@@ -382,6 +407,20 @@ pub fn reap<V: 'static>(
 #[derive(Clone, Debug, PartialEq)]
 pub struct MenuItem {
     pub label: SharedString,
+    /// What the row is FOR — a one-line description, shown beside the
+    /// label at the same type size in the quiet ink (Slice AR).
+    ///
+    /// Distinct from [`trailing`](MenuItem::trailing) because the two
+    /// behave oppositely under pressure: a keycap must never shrink (a
+    /// half-drawn `⌘C` is a lie about a keybinding), and a description
+    /// must always shrink (it is prose, and prose truncates). So this slot
+    /// takes the row's free width and ellipsises, and the keycap keeps its
+    /// intrinsic size — which is the only reason they are not one field.
+    ///
+    /// **Same size as the label, by AQ's ruling**: the rank between a name
+    /// and its description is real and is carried by INK
+    /// (`text` against `text_tertiary`). One channel, spent once.
+    pub detail: Option<SharedString>,
     /// Trailing state — a keybinding, a count, a checkmark. Optional
     /// because most rows are just a label, and a row that reserves the
     /// slot when it has nothing to put in it pads every menu for nothing.
@@ -393,9 +432,15 @@ impl MenuItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
             label: label.into(),
+            detail: None,
             trailing: None,
             enabled: true,
         }
+    }
+
+    pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 
     pub fn trailing(mut self, trailing: impl Into<SharedString>) -> Self {
@@ -466,7 +511,30 @@ pub fn menu_row(
             // By token, not by opacity — see the note in `launcher::tile`.
             theme::text_disabled()
         })
-        .child(div().flex_1().min_w(px(0.)).child(item.label.clone()))
+        // The label takes the free width when it is alone, and only its own
+        // width when a description is beside it — otherwise `flex_1` on
+        // both would split the row down the middle and give a four-letter
+        // name half a menu.
+        .child(
+            div()
+                .when(item.detail.is_none(), |d| d.flex_1())
+                .flex_none()
+                .min_w(px(0.))
+                .child(item.label.clone()),
+        )
+        .children(item.detail.clone().map(|d| {
+            // Slice AR. No `text_size` here for the same reason the
+            // trailing slot has none — see the note below. Ink carries the
+            // rank; `flex_1` + `min_w(0)` + `truncate` is what makes it the
+            // slot that gives way, which is the whole difference between a
+            // description and a keycap.
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(theme::text_tertiary())
+                .child(d)
+        }))
         .children(item.trailing.clone().map(|t| {
             // **Slice AQ: no `text_size` here.** The trailing state used to
             // be `DETAIL_SIZE` against the row's `LABEL_SIZE` — 12.0 against
@@ -503,6 +571,60 @@ pub fn menu_row(
 
 // ---------------------------------------------------------------------------
 // The surface
+
+/// The menu SURFACE — rim, fill, shadow, radius, padding, and the
+/// entrance's opacity and rise. No width and no mounting strategy.
+///
+/// Split out of [`menu_layer`] in Slice AR, which needed the same surface
+/// mounted a different way. eave now has two kinds of menu and they differ
+/// only in how they are placed:
+///
+///   - a **pointer menu** ([`menu_layer`]) floats at a click, so it needs
+///     `anchored` + `deferred` + a full-window click catcher, and it is
+///     bounded by `MENU_MIN_W`/`MENU_MAX_W` because nothing else decides
+///     how wide it should be;
+///   - the **composer palette** (Slice AR) is a sibling of the composer in
+///     the bottom stack. Ordinary flex layout puts it exactly above the
+///     composer and exactly as wide, with no coordinates at all, and it
+///     needs no catcher because it is not modal — it is a projection of
+///     the composer's text and it goes away when the text does.
+///
+/// One surface definition, two mountings, rather than a second menu.
+///
+/// **This is the geometry and the motion. It is deliberately NOT the
+/// MATERIAL** — no fill, no rim, no shadow. The caller supplies those, and
+/// the reason is the question this project keeps re-asking: *above what,
+/// and does anything paint it?* A menu's material is a function of the
+/// ground it floats on, not of the fact that it is a menu:
+///
+///   - a pointer menu opens over the **chrome**, and `menu_glass` +
+///     `edge_modal` + `shadow_modal` is the pair Slice AQ measured there;
+///   - the composer palette opens over the **transcript**, which is the
+///     ground the composer and the ↓-bottom pill float on — so it takes
+///     *their* material (`chrome_glass` behind a real backdrop blur),
+///     because that is what was measured to occlude a scrolling log.
+///
+/// Shipping the palette with the popover's material is exactly what
+/// happened first, and `docs/shots/ar-palette.png`'s first version shows
+/// the transcript reading straight through six rows of menu.
+///
+/// `opacity` and `dy` come from [`Popup::motion_at`]. The rise is a
+/// **relative inset, never a margin** — taffy resolves relative insets
+/// after layout, so it moves the surface the way a CSS transform would
+/// (motion.rs, `ENTRANCE_RISE`) instead of pushing its neighbours around.
+pub fn menu_surface(id: &'static str, opacity: f32, dy: f32) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .opacity(opacity)
+        .relative()
+        .top(px(dy))
+        .py(px(theme::MENU_PAD_Y))
+        .rounded(px(theme::RADIUS_MENU))
+        .border_1()
+        .flex()
+        .flex_col()
+}
 
 /// The anchored, occluding overlay surface — mount it at the **root**,
 /// and nowhere else.
@@ -557,32 +679,22 @@ pub fn menu_layer<T>(
                         .position(anchor)
                         .snap_to_window_with_margin(px(theme::MENU_SCREEN_MARGIN))
                         .child(
-                            div()
-                                .id("overlay-menu")
-                                .debug_selector(|| "overlay-menu".into())
+                            menu_surface("overlay-menu", opacity, dy)
+                                // The pointer menu's MATERIAL, measured
+                                // against the chrome it opens over
+                                // (Slice AQ §4). Set here rather than in
+                                // `menu_surface` because the material
+                                // belongs to the ground, not to the shape.
+                                .border_color(theme::edge_modal())
+                                .shadow(theme::shadow_modal())
+                                .bg(theme::menu_glass())
                                 // Occludes for its whole mounted life,
                                 // exit included: a click during the 100 ms
                                 // exit must do nothing, not hit what the
                                 // menu was covering.
                                 .occlude()
-                                .opacity(opacity)
-                                // Relative inset, never a margin — taffy
-                                // resolves relative insets after layout,
-                                // so the rise moves the surface the way a
-                                // CSS transform would (motion.rs,
-                                // `ENTRANCE_RISE`).
-                                .relative()
-                                .top(px(dy))
                                 .min_w(px(theme::MENU_MIN_W))
                                 .max_w(px(theme::MENU_MAX_W))
-                                .py(px(theme::MENU_PAD_Y))
-                                .rounded(px(theme::RADIUS_MENU))
-                                .border_1()
-                                .border_color(theme::edge_modal())
-                                .shadow(theme::shadow_modal())
-                                .bg(theme::menu_glass())
-                                .flex()
-                                .flex_col()
                                 .children(rows),
                         ),
                 ),
