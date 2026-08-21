@@ -4604,6 +4604,46 @@ fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
     }
 }
 
+/// **Slice CK: the staleness line is painted, not merely computed.**
+///
+/// `launcher::model_source_note` returning a sentence is worth nothing if
+/// no element carries it — the "above what, and does anything paint it?"
+/// test. So this asserts the box exists on the resting launcher (where the
+/// list is eave's own, because the harness never arms probes) and that it
+/// goes away once the CLI has answered.
+#[gpui::test]
+fn the_launcher_says_whose_model_list_it_is_showing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    eave_core::capabilities::forget();
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "launcher-model-source"),
+        "the launcher offered a model list with nothing saying where it came from",
+    );
+
+    // The CLI answers. eave's disclaimer retires with it.
+    eave_core::capabilities::record("claude-code", vec!["sonnet".into()]);
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "launcher-model-source"),
+        "eave kept apologising for a list the CLI had already given it",
+    );
+
+    // And the menu it opens is the CLI's list, not the hand-written one.
+    click(vcx, "launcher-model");
+    vcx.run_until_parked();
+    click(vcx, "menu-row-1");
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
+            .unwrap(),
+        Some("sonnet"),
+        "the picker offered a model the CLI never named",
+    );
+    eave_core::capabilities::forget();
+}
+
 /// **A model alias belongs to one CLI's vocabulary.** Switching provider
 /// clears it rather than carrying `opus` to a vendor that has never heard
 /// of it — eave does not validate models (P2 caveat 5), so the flag would

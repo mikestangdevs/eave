@@ -68,6 +68,22 @@
 //! typing, not a claim about what the CLI will accept, and picking
 //! [`MODEL_DEFAULT`] sends **no `--model` flag at all** — which is not the
 //! same as sending an empty one.
+//!
+//! # Slice CK: the aliases stopped being eave's to choose
+//!
+//! Everything above stays true and one thing under it changed. A list
+//! typed by hand can only rot, and by 2026-08-21 all four of them had:
+//! `PI_MODELS` named six models this machine's Pi cannot run, Claude's
+//! named none of the two the CLI had gained, and Codex's and Grok's were
+//! empty while both CLIs answer a list in under three seconds.
+//!
+//! So the launcher now asks. [`eave_core::capabilities`] holds one row per
+//! provider saying how — a flag, a JSON-RPC method on the CLI's own
+//! stdio wire, or **nothing, said out loud**. [`model_choices`] prefers
+//! the CLI's answer over the arrays here whenever one has landed, and
+//! [`model_source_note`] states which of the two is on screen, because a
+//! probe is never allowed to hold a frame and so a frame has to be able
+//! to admit it is showing yesterday's answer.
 
 use gpui::{
     div, px, AnyElement, App, ClickEvent, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -106,6 +122,13 @@ pub struct Provider {
     pub mark: &'static str,
     /// Well-known `--model` aliases for the picker; when non-empty the
     /// first entry is always [`MODEL_DEFAULT`].
+    ///
+    /// **Slice CK: this is what eave shows before the CLI answers, not
+    /// what it shows instead.** Once
+    /// [`eave_core::capabilities::reported`] has a list for this provider,
+    /// [`model_choices`] ignores this field entirely — including when the
+    /// CLI's answer is *no models at all*, which is a fact about the
+    /// operator's credentials and beats anything typed here.
     ///
     /// **Empty is legal and means "this CLI's own default only"** — see
     /// [`model_choices`]. An adapter can land without anybody knowing
@@ -253,12 +276,67 @@ pub fn default_provider() -> usize {
 /// aliases, and "let the CLI decide" is a real, correct choice for every
 /// agent — so the picker is never empty and never has to be special-cased
 /// by the caller.
-pub fn model_choices(p: &Provider) -> &'static [&'static str] {
+///
+/// # Slice CK: the installed CLI outranks [`Provider::models`]
+///
+/// If the CLI on this machine has said what it can run, **that is the
+/// list**, and the hand-written one is not consulted at all. The static
+/// arrays above stay because they are what eave shows before the answer
+/// arrives, on a machine where the CLI cannot be asked, and in the app's
+/// first frame — never as a second opinion once the CLI has spoken.
+///
+/// Asking is a side effect of being asked for the choices, and it costs
+/// this frame nothing: [`eave_core::capabilities::begin`] starts a thread
+/// and returns, and under `cargo test` it does not even do that (the
+/// harness never calls `run`, so probes are never armed). That is the only
+/// arrangement in which no render path can forget to ask — the defect
+/// Slice CD paid for was a method every adapter implemented and nobody
+/// called.
+pub fn model_choices(p: &Provider) -> Vec<&'static str> {
+    eave_core::capabilities::begin(p.id);
+    if let Some(reported) = eave_core::capabilities::reported(p.id) {
+        // The CLI's own list, in the CLI's own order, behind eave's
+        // "send no flag" entry — which stays first because it is the one
+        // choice no CLI can offer, being the absence of a choice.
+        return std::iter::once(MODEL_DEFAULT)
+            .chain(reported.iter().copied())
+            .collect();
+    }
     if p.models.is_empty() {
-        const JUST_THE_DEFAULT: &[&str] = &[MODEL_DEFAULT];
-        JUST_THE_DEFAULT
+        vec![MODEL_DEFAULT]
     } else {
-        p.models
+        p.models.to_vec()
+    }
+}
+
+/// **Who said what the picker is showing** — the sentence that sits under
+/// the model button so a stale list can never pass for a fresh one.
+///
+/// `None` means there is nothing to say: the CLI answered, so the list is
+/// simply the CLI's. Every other state is a claim eave is making on its
+/// own account, and says so.
+///
+/// This is the half of "non-blocking" that is not about threads. comet's
+/// rule is that discovery never stalls a frame
+/// (`docs/research/acp.md` §"Managed adapter installs": a cold `npx`
+/// "could also stall a first chat for minutes"), and the price of that
+/// rule is that a frame can be wrong. It is only an acceptable price if
+/// the frame admits it.
+pub fn model_source_note(p: &Provider) -> Option<String> {
+    use eave_core::capabilities::Freshness;
+    match eave_core::capabilities::freshness(p.id) {
+        Freshness::Reported { named: 0 } => {
+            Some(format!("{} reports no models for this account.", p.name))
+        }
+        Freshness::Reported { .. } => None,
+        Freshness::Asking => Some(format!("eave's own list — asking {}…", p.name)),
+        Freshness::Silent => Some(format!("eave's own list — {} did not answer.", p.name)),
+        Freshness::Unaskable(why) => Some(format!("eave's own list — {why}")),
+        Freshness::Refused => Some(format!(
+            "eave's own list — eave will not spawn {} to ask.",
+            p.name,
+        )),
+        Freshness::Unasked => Some("eave's own list.".to_string()),
     }
 }
 
@@ -603,6 +681,148 @@ mod tests {
             "a tile eave cannot drive AT ALL and one it refuses to TRUST read identically, so \
              the caption cannot tell a person which of the two they are looking at"
         );
+    }
+
+    /// **The defect Slice CK exists to fix.** Measured on this machine
+    /// 2026-08-21: `claude` 2.1.x answers its own `list_models` control
+    /// request with `claude-fable-5[1m]` and `opus[1m]`, neither of which
+    /// the hand-written array above had ever heard of. When the CLI has
+    /// spoken, the picker shows what it said — not what somebody typed
+    /// here months ago.
+    ///
+    /// Uses `record` rather than a live probe on purpose: this asserts the
+    /// plumbing, and a test that needed the operator's auth would be a
+    /// test that fails on a machine that has not logged in.
+    #[test]
+    fn the_picker_shows_what_the_installed_cli_reported() {
+        let _turn = cache_turn();
+        eave_core::capabilities::forget();
+        let claude = &PROVIDERS[0];
+        assert_eq!(claude.id, "claude-code");
+        // Before: eave's own guess, and it does not contain Fable.
+        assert!(
+            !model_choices(claude).contains(&"claude-fable-5[1m]"),
+            "the static list is not supposed to know about Fable",
+        );
+        eave_core::capabilities::record(
+            "claude-code",
+            vec!["claude-fable-5[1m]".into(), "sonnet".into()],
+        );
+        let offered = model_choices(claude);
+        assert_eq!(
+            offered,
+            vec![MODEL_DEFAULT, "claude-fable-5[1m]", "sonnet"],
+            "the CLI's answer, behind eave's send-no-flag entry",
+        );
+        assert!(
+            !offered.contains(&"opus"),
+            "a hand-written alias survived the CLI's own answer",
+        );
+        eave_core::capabilities::forget();
+    }
+
+    /// A provider whose static list is empty is exactly where discovery
+    /// pays: Codex and Grok offered nothing but "CLI default" until the
+    /// CLI was asked. Verified live 2026-08-21 — `grok models` names
+    /// `grok-4.6` and `grok-4.5`, `codex app-server`'s `model/list` names
+    /// five.
+    #[test]
+    fn a_provider_with_no_static_list_still_gets_the_cli_s() {
+        let _turn = cache_turn();
+        eave_core::capabilities::forget();
+        let grok = PROVIDERS
+            .iter()
+            .find(|p| p.id == "grok")
+            .expect("grok tile");
+        assert!(grok.models.is_empty(), "grok has no hand-written list");
+        assert_eq!(model_choices(grok), vec![MODEL_DEFAULT]);
+        eave_core::capabilities::record("grok", vec!["grok-4.6".into(), "grok-4.5".into()]);
+        assert_eq!(
+            model_choices(grok),
+            vec![MODEL_DEFAULT, "grok-4.6", "grok-4.5"],
+        );
+        eave_core::capabilities::forget();
+    }
+
+    /// **A CLI reporting nothing outranks eave's guess.** Live on this
+    /// machine 2026-08-21 `pi --list-models` answered *"No models
+    /// available"* while `PI_MODELS` offered six `provider/id` pairs —
+    /// every one of them a flag this operator's Pi would reject. The
+    /// picker keeps the one choice that always works and says who said so.
+    #[test]
+    fn a_cli_that_reports_no_models_retires_eaves_guess() {
+        let _turn = cache_turn();
+        eave_core::capabilities::forget();
+        let pi = PROVIDERS.iter().find(|p| p.id == "pi").expect("pi tile");
+        assert!(model_choices(pi).len() > 1, "pi has a hand-written list");
+        eave_core::capabilities::record("pi", vec![]);
+        assert_eq!(
+            model_choices(pi),
+            vec![MODEL_DEFAULT],
+            "eave kept offering models the CLI says this operator does not have",
+        );
+        let note = model_source_note(pi).expect("naming zero models is worth a sentence");
+        assert!(note.contains("no models"), "{note:?}");
+        eave_core::capabilities::forget();
+    }
+
+    /// **A stale list must announce itself.** The note is absent only when
+    /// the CLI answered and named something; in every other state the
+    /// picker is showing eave's own guess and says whose guess it is.
+    #[test]
+    fn a_list_eave_invented_says_so_and_one_the_cli_gave_does_not() {
+        let _turn = cache_turn();
+        eave_core::capabilities::forget();
+        let claude = &PROVIDERS[0];
+        let before = model_source_note(claude).expect("an unasked list is eave's own");
+        assert!(
+            before.contains("eave's own list"),
+            "a guess must be labelled a guess: {before:?}",
+        );
+        eave_core::capabilities::record("claude-code", vec!["sonnet".into()]);
+        assert_eq!(
+            model_source_note(claude),
+            None,
+            "the CLI's own list needs no disclaimer",
+        );
+        // "The CLI has none" is an answer, and a different sentence from
+        // "eave has not asked".
+        eave_core::capabilities::forget();
+        eave_core::capabilities::record("claude-code", vec![]);
+        let none = model_source_note(claude).expect("no models is still worth stating");
+        assert!(
+            !none.contains("eave's own list"),
+            "reporting zero models is the CLI's answer, not eave's guess: {none:?}",
+        );
+        eave_core::capabilities::forget();
+    }
+
+    /// Hermes is the provider that cannot be asked, and its note says why
+    /// rather than leaving the operator to wonder whether eave is still
+    /// loading. Silence is the honest answer, not a placeholder.
+    #[test]
+    fn a_provider_that_cannot_be_asked_says_so_instead_of_pending() {
+        let _turn = cache_turn();
+        eave_core::capabilities::forget();
+        let hermes = PROVIDERS
+            .iter()
+            .find(|p| p.id == "hermes")
+            .expect("hermes tile");
+        let note = model_source_note(hermes).expect("an unaskable provider owes a reason");
+        assert!(
+            note.contains("picker"),
+            "hermes' note must name the reason `hermes model` cannot be read: {note:?}",
+        );
+        assert!(!note.contains("asking"), "nothing is being asked: {note:?}");
+        eave_core::capabilities::forget();
+    }
+
+    /// The capability cache is process-global and these tests clear it, so
+    /// they take turns. Same reason `eave_core::capabilities::tests` has
+    /// its own guard.
+    fn cache_turn() -> std::sync::MutexGuard<'static, ()> {
+        static CACHE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        CACHE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Every mark resolves. `icons` already proves each registered path
