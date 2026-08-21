@@ -98,9 +98,33 @@ jobs:
             echo "cache miss — the build will download ~343 MB"
           fi
 
+      # THE BUNDLE STEP CANNOT RUN ON A FRESH CHECKOUT YET, and it is better
+      # to say so than to fail inside cargo with a missing-path error.
+      #
+      # spike/cef-osr/Cargo.toml depends on `../zed-fork/crates/gpui` — the
+      # pinned gpui fork with the 91-line BGRA surface patch applied. That
+      # checkout is gitignored (`spike/zed-fork`) because the PATCH is the
+      # artefact, not the copy. There is no published fork to fetch: the
+      # commit lives in a bare repo on one machine, because nobody here has
+      # push access to wingleeio/zed and no fork of our own exists yet
+      # (docs/progress.md, Slice C1, "Open"). Until that fork is published
+      # this job checks the pin and stops, which is a real check that runs
+      # rather than a fake one that is red for a reason nobody reads.
+      - name: gpui fork available?
+        id: gpui
+        run: |
+          if [ -d spike/zed-fork/crates/gpui ]; then
+            echo "have=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::spike/zed-fork is absent — the CEF bundle cannot be built here."
+            echo "::notice::Blocked on publishing the gpui fork; see docs/progress.md (Slice C1, Open)."
+          fi
+
       # bundle-app.sh runs cargo itself and calls verify-cef-bundle.sh at the
       # end, so this single step is build + assemble + assert.
       - name: bundle and verify
+        if: steps.gpui.outputs.have == '1'
         run: scripts/bundle-app.sh cef-osr-spike
 
       # NOT run here: the boot smoke. A GitHub macOS runner has no real GPU,
@@ -109,4 +133,8 @@ jobs:
       # "no GPU", which is not information. `scripts/boot-smoke.sh --cef`
       # covers it on a real machine.
       - name: state what was not run
-        run: echo "boot smoke not run on CI — no GPU on the runner; use scripts/boot-smoke.sh --cef"
+        run: |
+          echo "boot smoke not run on CI — no GPU on the runner; use scripts/boot-smoke.sh --cef"
+          if [ "${{ steps.gpui.outputs.have }}" != "1" ]; then
+            echo "bundle not built either — no gpui fork to build against"
+          fi
