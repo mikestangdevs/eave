@@ -45,6 +45,20 @@ mod overlay;
 /// the headless runs can exercise.
 pub mod slash;
 
+/// The omnibox's decision half (Slice C5): what one typed line means —
+/// address or search — and the rows the dropdown offers. **Public, like
+/// `slash` and for the same reason**: it is pure logic with no gpui in it,
+/// so the url-versus-search ladder can be exercised without a window. The
+/// half that draws lives in `ui`.
+pub mod omnibox;
+
+/// The tab strip's model half (Slice C5): B1's `TabsState` flattened into
+/// the one line the strip draws, with page tabs and session tabs in it.
+/// Public for the same reason `omnibox` is — the ordering, the labels and
+/// the group runs are decidable without a window, and that is where the
+/// behaviour worth asserting lives.
+pub mod strip;
+
 /// The macOS menu bar (Slice Y). Private: it is wiring, not part of the
 /// headless surface the acceptance runs use.
 mod app_menus;
