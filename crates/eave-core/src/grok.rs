@@ -497,7 +497,11 @@ impl GrokProto {
                 if resume_id.is_some() {
                     self.stream.begin_replay();
                 }
-                (Vec::new(), vec![wire::session_frame(resume_id, cwd)])
+                // Record what grok said it can do before moving on. This
+                // arm used to return `Vec::new()` and drop the whole
+                // result — see `acp::Advertisement` for what that cost.
+                let advert = acp::advertisement(v.get("result")).record();
+                (vec![advert], vec![wire::session_frame(resume_id, cwd)])
             }
             Some(wire::RPC_SESSION) => {
                 if let Some(err) = error {
@@ -909,8 +913,23 @@ mod tests {
         let mut h = Harness::new();
         // A successful `initialize` produces exactly one outbound frame:
         // the request to open a session.
-        let (events, frames) = h.feed(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#);
-        assert!(events.is_empty(), "the handshake is not transcript");
+        let (events, frames) = h.feed(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}}}}"#,
+        );
+        // The handshake is still not TRANSCRIPT — nothing here is anything
+        // grok said to the operator. But it is no longer silent either:
+        // slice CL records the capability advertisement, because dropping
+        // the whole `initialize` result is how eave ended up unable to
+        // answer which session methods its own agents implement.
+        match events.as_slice() {
+            [SessionEvent::System { subtype, raw }] if subtype == "acp_capabilities" => {
+                assert!(
+                    raw.contains(r#""sessionCapabilities":["close","list","resume"]"#),
+                    "{raw}"
+                );
+            }
+            other => panic!("the handshake records capabilities and nothing else: {other:?}"),
+        }
         assert_eq!(frames.len(), 1);
         let sent = &frames[0];
         assert_eq!(sent["method"], "session/new");

@@ -1062,3 +1062,38 @@ async fn a_resumed_session_absorbs_the_replay_instead_of_journaling_it_twice() {
         ),
     }
 }
+
+/// The Hermes half of `the_handshake_records_what_grok_said_it_could_do`.
+///
+/// The fake advertises Hermes 0.20.4's real capability set, captured live
+/// on 2026-08-21: `fork`/`list`/`resume`, and **no `close`** — Hermes'
+/// `acp_adapter/server.py` has no `close_session` handler at all. Grok
+/// advertises the mirror image. That disagreement is the whole reason
+/// slice CL shipped no lifecycle method: there is nothing beyond
+/// `session/load` that both agents would answer.
+#[tokio::test]
+async fn the_handshake_records_what_hermes_said_it_could_do() {
+    let cfg = fake_cfg(&[]);
+    let (_session, mut rx) = spawn_hermes(&cfg).unwrap();
+
+    let events = recv_until(&mut rx, is_init).await;
+    let raw = events
+        .iter()
+        .find_map(|e| match e {
+            SessionEvent::System { subtype, raw } if subtype == "acp_capabilities" => Some(raw),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("the initialize reply must reach the journal, not be dropped: {events:?}")
+        });
+
+    assert!(raw.contains(r#""agent":"fake-hermes/0.0.0""#), "{raw}");
+    assert!(
+        raw.contains(r#""sessionCapabilities":["fork","list","resume"]"#),
+        "Hermes' advertisement must be recorded verbatim as facts: {raw}"
+    );
+    assert!(
+        !raw.contains("close"),
+        "Hermes does not implement session/close; recording it would invent a capability: {raw}"
+    );
+}

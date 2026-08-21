@@ -365,3 +365,56 @@ async fn a_send_on_a_dead_session_reports_instead_of_hanging() {
         "sending into a dead session must fail loudly, got {err:?}"
     );
 }
+
+/// The handshake's own answer reaches the journal.
+///
+/// Before slice CL both ACP adapters matched `RPC_INITIALIZE`, checked it
+/// for an `error`, and returned no events at all — the richest frame of
+/// the session, dropped without a record. It is the same silent drop
+/// slice CI had just fixed on the notification channel one commit
+/// earlier, and it had a concrete cost: slice CL had to answer "which
+/// session methods does each agent actually implement?" and eave's own
+/// journal could not say, so it was settled by live probes instead.
+///
+/// The fake advertises grok 1.0.5's real capability set, captured live on
+/// 2026-08-21: `list`/`resume`/`close`, and **no `fork`** — the real grok
+/// answers `-32601 Method not found` to `session/fork`.
+#[tokio::test]
+async fn the_handshake_records_what_grok_said_it_could_do() {
+    let cfg = fake_cfg("acp-asks", &[]);
+    let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
+
+    session.send_user_message("ping").await.expect("send");
+    let events = drain_until(&mut rx, |e| matches!(e, SessionEvent::TurnCompleted { .. })).await;
+    let raw = events
+        .iter()
+        .find_map(|e| match e {
+            SessionEvent::System { subtype, raw } if subtype == "acp_capabilities" => Some(raw),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("the initialize reply must reach the journal, not be dropped: {events:?}")
+        });
+
+    assert!(raw.contains(r#""loadSession":true"#), "{raw}");
+    assert!(
+        raw.contains(r#""sessionCapabilities":["close","list","resume"]"#),
+        "grok's advertisement must be recorded verbatim as facts: {raw}"
+    );
+    // The capability record must arrive BEFORE the session is named:
+    // anything deciding what to send on the wire has to read it first.
+    let caps_at = events
+        .iter()
+        .position(
+            |e| matches!(e, SessionEvent::System { subtype, .. } if subtype == "acp_capabilities"),
+        )
+        .expect("present");
+    let init_at = events
+        .iter()
+        .position(|e| matches!(e, SessionEvent::Init { .. }))
+        .expect("present");
+    assert!(
+        caps_at < init_at,
+        "capabilities are negotiated before a session exists: {events:?}"
+    );
+}

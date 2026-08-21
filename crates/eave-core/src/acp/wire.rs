@@ -23,9 +23,15 @@ pub const RPC_INITIALIZE: i64 = 1;
 /// JSON-RPC id of the `session/new` (or `session/load`) request.
 pub const RPC_SESSION: i64 = 2;
 
-/// Longest malformed line eave repeats back into the journal. A CLI that
-/// prints a megabyte of garbage should not put a megabyte in the record.
-const MALFORMED_LINE_CAP: usize = 512;
+/// Longest wire-sourced string eave repeats back into the journal. A CLI
+/// that prints a megabyte of garbage should not put a megabyte in the
+/// record.
+///
+/// Used for malformed lines and, with the same reasoning and the same
+/// number, for the agent label in [`crate::acp::handshake::Advertisement`]
+/// — both are strings the AGENT chose, copied into eave's permanent
+/// record.
+pub const MALFORMED_LINE_CAP: usize = 512;
 
 /// Shared because more than one writer exists on every ACP session: the
 /// engine sending a prompt or answering an approval, and the reader task

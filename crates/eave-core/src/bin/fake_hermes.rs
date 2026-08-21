@@ -305,7 +305,16 @@ fn serve_acp() -> ! {
                 "jsonrpc": "2.0", "id": id, "result": {
                     "protocolVersion": 1,
                     "agentInfo": { "name": "fake-hermes", "version": "0.0.0" },
-                    "agentCapabilities": { "loadSession": true },
+                    // Hermes 0.20.4's real advertisement, captured live
+                    // 2026-08-21: fork/list/resume and NO close. Hermes'
+                    // `acp_adapter/server.py` has no `close_session`
+                    // handler at all.
+                    "agentCapabilities": {
+                        "loadSession": true,
+                        "sessionCapabilities": {
+                            "fork": {}, "list": {}, "resume": {},
+                        },
+                    },
                 },
             })),
             "session/new" | "session/load" => {
