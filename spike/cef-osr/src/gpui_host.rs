@@ -313,10 +313,20 @@ impl Render for Shell {
             }
         };
 
+        // In the native-view arm the page is a SIBLING BELOW gpui's view, so
+        // it is only visible where gpui paints nothing at all. An opaque root
+        // background is not a detail here — it is the whole difference
+        // between seeing a page and seeing black.
+        let root_bg = if crate::native_view::enabled() {
+            gpui::hsla(0., 0., 0., 0.)
+        } else {
+            gpui::hsla(0., 0., 0.06, 1.0)
+        };
+
         div()
             .size_full()
             .relative()
-            .bg(gpui::hsla(0., 0., 0.06, 1.0))
+            .bg(root_bg)
             .track_focus(&self.focus)
             .on_mouse_move(move |e: &gpui::MouseMoveEvent, _, _| {
                 let held = e.pressed_button == Some(gpui::MouseButton::Left);
@@ -479,6 +489,11 @@ pub fn run(main_args: &MainArgs, cmd_line: &CommandLine, sandbox_info: *mut u8) 
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_background: if crate::native_view::enabled() {
+                    gpui::WindowBackgroundAppearance::Transparent
+                } else {
+                    gpui::WindowBackgroundAppearance::Opaque
+                },
                 ..Default::default()
             },
             |window, cx| {
@@ -491,6 +506,26 @@ pub fn run(main_args: &MainArgs, cmd_line: &CommandLine, sandbox_info: *mut u8) 
         )
         .unwrap();
         cx.activate(true);
+
+        if crate::native_view::enabled() {
+            // The fallback arm. Wait for the window to exist, then hand its
+            // NSView to CEF as `parent_view` and run the punchout checks.
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(600))
+                    .await;
+                let _ = cx.update(|cx| {
+                    let handles = cx.windows();
+                    let Some(handle) = handles.first().copied() else {
+                        return;
+                    };
+                    let _ = handle.update(cx, |_, window, _| {
+                        crate::native_view::create_windowed_browser(window);
+                    });
+                });
+            })
+            .detach();
+        }
 
         // Pump CEF from gpui's own loop. A timer rather than
         // OnScheduleMessagePumpWork: for a probe, "is it alive" beats "is it

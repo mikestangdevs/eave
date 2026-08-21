@@ -195,6 +195,10 @@ wrap_browser_process_handler! {
                     initial_show_state,
                 );
                 window_create_top_level(Some(&mut delegate));
+            } else if crate::native_view::enabled() {
+                // Nothing to do yet: a windowed browser needs a parent NSView,
+                // and gpui has not opened its window at context-init time.
+                // The gpui side creates the browser once it has one.
             } else if crate::osr::osr_enabled() {
                 // Windowless. `set_as_windowless` also forces Alloy style —
                 // OSR and the Chrome runtime style are mutually exclusive,

@@ -5,6 +5,7 @@
 
 pub mod gpui_host;
 pub mod input;
+pub mod native_view;
 pub mod osr;
 pub mod shared;
 

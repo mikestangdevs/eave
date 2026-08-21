@@ -102,7 +102,8 @@ fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// `EAVE_CEF_OSR=1` selects the windowless arm.
 pub fn osr_enabled() -> bool {
-    env_flag("EAVE_CEF_OSR", false) || crate::gpui_host::gpui_mode()
+    env_flag("EAVE_CEF_OSR", false)
+        || (crate::gpui_host::gpui_mode() && !crate::native_view::enabled())
 }
 
 /// `EAVE_CEF_SHARED=0` forces the CPU `OnPaint` path so the two upload

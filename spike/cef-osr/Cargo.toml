@@ -53,6 +53,7 @@ gpui_platform = { path = "../zed-fork/crates/gpui_platform", features = [
 ] }
 core-video = { version = "0.5.2", features = ["metal"] }
 core-foundation = "0.10"
+raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
