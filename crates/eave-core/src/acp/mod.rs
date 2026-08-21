@@ -46,6 +46,55 @@
 //! `Incoming` channel, so a response can overtake the notifications that
 //! preceded it on the pipe.
 //!
+//! # The session lifecycle eave does NOT implement (slice CL, 2026-08-21)
+//!
+//! ACP v0.11 exposes six session methods. eave implements two — `new` and
+//! `load` — and refused the other four after checking each against three
+//! questions: does the wire support it *per agent*, does eave have a
+//! caller, and does it fight something eave already decided.
+//!
+//! The capability matrix, captured live from the installed binaries on
+//! 2026-08-21 (see [`handshake::Advertisement`]):
+//!
+//! | method | grok 1.0.5 | Hermes 0.20.4 | verdict |
+//! | --- | --- | --- | --- |
+//! | `session/list` | advertised | advertised | refused: no caller |
+//! | `session/fork` | **absent** | advertised | refused: no wire, no caller |
+//! | `session/resume` | advertised | advertised | refused: no gain over `load` |
+//! | `session/close` | advertised | **absent** | refused: no measurable effect |
+//!
+//! - **`list` and `fork` fight the journal.** eave's inventory of sessions
+//!   is its journal (spec 02), not the agent's store. `session/list`
+//!   returns grok's own `~/.grok/sessions` — sessions eave never created,
+//!   missing sessions eave has. `fork` would mint an agent-side session
+//!   whose copied history exists only inside the agent, inverting "the
+//!   journal is the history of record". Neither has a caller today, and
+//!   grok answers `-32601 Method not found` to `session/fork` outright.
+//! - **`resume` buys nothing.** Grok's own build strings gloss it as
+//!   "Skipping session replay (session/resume, or a noReplay load)" — it
+//!   is `load` without the replay. eave already discards that replay
+//!   (`begin_replay`/`end_replay`, because the journal holds it), so the
+//!   only effect would be to swap a spec-stable method for one the ACP
+//!   schema marks **UNSTABLE** on the single path slice CD had just
+//!   repaired. Probed side by side against the same session id, `load` and
+//!   `resume` returned the same result and the same four notifications.
+//! - **`close` does not close anything eave can observe.** Probed live: it
+//!   answers in ~80 ms with `{"x.ai/closeOutcome":"closed"}` and **the
+//!   process stays alive**, so it can never stand in for the kill. An A/B
+//!   over eave's exact argv (`grok agent --no-leader stdio`) found the
+//!   on-disk session identical with and without it, nothing registered in
+//!   `active_sessions.json` to leak, and SIGTERM alone sufficient (rc 143,
+//!   no SIGKILL) — while close left a stray `relocations/<id>.lock` that a
+//!   plain kill does not. Hermes does not implement it at all: its
+//!   `acp_adapter/server.py` has no `close_session` handler. So the kill
+//!   contract (spec 01 §Kill & verify) is untouched — SIGTERM → SIGKILL →
+//!   bounded straggler scan → `KillReport`, with `KillUnproven` reachable
+//!   exactly as before.
+//!
+//! What the slice DID fix is that eave could not answer the first question
+//! from its own records: both adapters dropped the entire `initialize`
+//! result. See [`handshake::Advertisement`].
+//!
 //! **eave has one ordered reader per session.** Responses, notifications
 //! and server requests are decoded from the same `stdout` line stream, in
 //! stdout order, and every resulting event goes down one `mpsc` channel in
@@ -64,7 +113,7 @@ pub mod usage;
 pub mod wire;
 
 pub use child::{AcpChild, AcpLines, ChildContext, ChildEnv, ChildSpec, EVENT_CHANNEL_CAP};
-pub use handshake::{Handshake, HandshakeError, HandshakeGate};
+pub use handshake::{advertisement, Advertisement, Handshake, HandshakeError, HandshakeGate};
 pub use permission::{PendingApprovals, PendingPermission};
 pub use update::{AcpStream, Thoughts, ToolInput, ToolNaming, UpdateSpec};
 

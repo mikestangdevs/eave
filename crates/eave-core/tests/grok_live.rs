@@ -203,3 +203,57 @@ fn tempdir() -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
+
+/// The capability matrix slice CL refused four methods on, re-checked
+/// against whatever `grok` is installed today.
+///
+/// Slice CL settled "does the wire actually support `session/list`,
+/// `fork`, `resume`, `close`?" with live probes, because eave's journal
+/// could not answer it. The answer for grok 1.0.5 on 2026-08-21 was
+/// `list`/`resume`/`close` and **no `fork`** — and asking it to fork
+/// anyway answered `-32601 Method not found`, so the advertisement is
+/// truthful rather than decorative.
+///
+/// This test is the tripwire on that finding. If a future grok starts
+/// advertising `fork`, or stops advertising `close`, the refusals in
+/// `acp::Advertisement` are out of date and this says so. It asserts the
+/// SHAPE of the answer, never a fixed set, so a grok that gains a
+/// capability fails loudly instead of silently disagreeing with a
+/// hard-coded list.
+#[tokio::test]
+#[ignore = "spawns the real grok CLI; needs xAI auth and network"]
+async fn real_grok_still_advertises_the_capabilities_slice_cl_measured() {
+    let dir = tempdir();
+    let cfg = live_cfg(&dir);
+    let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn real grok");
+
+    session
+        .send_user_message("Reply with just the word ok. Do not use any tools.")
+        .await
+        .expect("send");
+    let events = drain_until(&mut rx, |e| matches!(e, SessionEvent::Init { .. })).await;
+
+    let raw = events
+        .iter()
+        .find_map(|e| match e {
+            SessionEvent::System { subtype, raw } if subtype == "acp_capabilities" => Some(raw),
+            _ => None,
+        })
+        .expect("a live handshake must record what grok advertised");
+    println!("live grok advertisement: {raw}");
+
+    assert!(
+        raw.contains(r#""loadSession":true"#),
+        "eave sends session/load on every resume; grok must still support it: {raw}"
+    );
+    assert!(
+        !raw.contains(r#""fork""#),
+        "grok answered -32601 to session/fork on 2026-08-21. If it advertises fork now, \
+         re-open the slice CL refusal rather than trusting this: {raw}"
+    );
+    assert!(
+        raw.contains(r#""close""#),
+        "grok advertised session/close on 2026-08-21. If that is gone, the note in \
+         acp::Advertisement is stale: {raw}"
+    );
+}

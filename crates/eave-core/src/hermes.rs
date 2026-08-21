@@ -792,6 +792,11 @@ impl Reader {
                 // goes the other way: the id eave holds is the one
                 // `session/load` is asked for.
                 let cwd = self.cwd.display().to_string();
+                // Record what Hermes said it can do before moving on. This
+                // arm used to emit nothing and drop the whole result — see
+                // `acp::Advertisement` for what that cost.
+                self.emit(acp::advertisement(v.get("result")).record())
+                    .await;
                 // A RELOAD replays the conversation as live updates before
                 // it answers; a fresh `session/new` replays nothing and
                 // must not be gated (that would swallow the first turn).

@@ -198,7 +198,16 @@ fn run_acp(mode: &str) {
                 &id,
                 json!({
                     "protocolVersion": 1,
-                    "agentCapabilities": { "loadSession": true },
+                    "agentInfo": { "name": "fake-grok", "version": "1.0.5" },
+                    // Grok 1.0.5's real advertisement, captured live
+                    // 2026-08-21: list/resume/close and NO fork. Asking
+                    // the real grok to fork answers -32601.
+                    "agentCapabilities": {
+                        "loadSession": true,
+                        "sessionCapabilities": {
+                            "list": {}, "resume": {}, "close": {},
+                        },
+                    },
                 }),
             ),
             Some("session/new") => {
