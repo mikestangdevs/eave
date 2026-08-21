@@ -1,0 +1,112 @@
+name: cef
+
+# The CEF bundle gate. Deliberately NOT part of ci.yml.
+#
+# ci.yml is the merge gate and must stay fast; nothing in the workspace links
+# CEF yet, so the workspace suite has no opinion about any of this. What this
+# workflow protects is the ARTEFACT — the thing that stops working silently.
+# A bundle with the wrong helper identifiers, a framework one build off the
+# pin, or a signature that was applied and then invalidated all look exactly
+# like a working bundle in Finder and on a `ls -R`.
+#
+# The 343 MB is the whole design problem. It is cached on the pinned version,
+# so a run that does not move the pin never downloads anything, and a run that
+# does moves the cache key with it and cannot silently reuse the old one.
+
+on:
+  push:
+    branches: [main]
+    # GitHub Actions does not expand YAML anchors, so this list is
+    # written twice on purpose. Keep the two copies identical.
+    paths:
+      - 'spike/cef-osr/**'
+      - 'dist/cef/**'
+      - 'dist/macos/**'
+      - 'scripts/mac-bundle.sh'
+      - 'scripts/bundle-app.sh'
+      - 'scripts/verify-cef-bundle.sh'
+      - 'scripts/check-cef-pin.sh'
+      - '.github/workflows/cef.yml'
+  pull_request:
+    paths:
+      - 'spike/cef-osr/**'
+      - 'dist/cef/**'
+      - 'dist/macos/**'
+      - 'scripts/mac-bundle.sh'
+      - 'scripts/bundle-app.sh'
+      - 'scripts/verify-cef-bundle.sh'
+      - 'scripts/check-cef-pin.sh'
+      - '.github/workflows/cef.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: cef-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    # macos-latest is arm64, which is the only platform dist/cef/pin.env pins
+    # an archive hash for. On an Intel runner the version is still checked and
+    # the hash check states that it was skipped.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The cache key comes out of the pin file, so bumping the pin bumps the
+      # key. There is no path where a stale 343 MB framework is reused under a
+      # new version number.
+      - name: read the pin
+        id: pin
+        run: |
+          set -euo pipefail
+          source dist/cef/pin.env
+          echo "version=$CEF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "crate=$CEF_CRATE" >> "$GITHUB_OUTPUT"
+          echo "CEF_PATH=$HOME/.local/share/cef" >> "$GITHUB_ENV"
+
+      - name: cache CEF ${{ steps.pin.outputs.version }}
+        id: cef-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cef
+          # No restore-keys, on purpose. A near-miss restore would hand the
+          # build a DIFFERENT CEF version and cef-dll-sys would accept it:
+          # its own check is `archive <= crate` (download-cef src/lib.rs:100),
+          # so anything older passes in silence. A cache miss costs six
+          # minutes; a wrong-version hit costs a debugging session.
+          key: cef-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.version }}
+
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spike/cef-osr
+
+      # Costs milliseconds and needs no framework. Runs before the build so a
+      # crate/framework mismatch is reported in seconds rather than after a
+      # download and a compile.
+      - name: pin consistency (lockfile)
+        run: scripts/check-cef-pin.sh
+
+      - name: report the cache
+        run: |
+          if [ "${{ steps.cef-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "CEF ${{ steps.pin.outputs.version }} restored from cache ($(du -sh ~/.local/share/cef | cut -f1))"
+          else
+            echo "cache miss — the build will download ~343 MB"
+          fi
+
+      # bundle-app.sh runs cargo itself and calls verify-cef-bundle.sh at the
+      # end, so this single step is build + assemble + assert.
+      - name: bundle and verify
+        run: scripts/bundle-app.sh cef-osr-spike
+
+      # NOT run here: the boot smoke. A GitHub macOS runner has no real GPU,
+      # and the thing the smoke asserts is that Chromium delivered an
+      # IOSurface through OnAcceleratedPaint. A red result there would mean
+      # "no GPU", which is not information. `scripts/boot-smoke.sh --cef`
+      # covers it on a real machine.
+      - name: state what was not run
+        run: echo "boot smoke not run on CI — no GPU on the runner; use scripts/boot-smoke.sh --cef"

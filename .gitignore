@@ -4,14 +4,22 @@
 
 # Agent scratch: worktrees and session state, never part of the tree.
 .claude/
-target/
+# No trailing slash on purpose. A pattern that ends in `/` matches only
+# DIRECTORIES, so a symlink named `target` — which is how a worktree borrows
+# another worktree's build output — sails straight past it and turns up as an
+# untracked path next to 300 MB of things it points at. Slice C2, 2026-08-21.
+target
 *.app/
 
 # The spike's local copy of the pinned gpui fork. Never committed; the fork
 # change it carried is now a real commit (8521fc1, see eave-app/Cargo.toml)
-# and `spike/gpui-bgra-surface.patch` has been retired.
-spike/zed-fork/
+# and `spike/gpui-bgra-surface.patch` has been retired. No trailing slash,
+# for the reason given above — this is one of the two paths that bit us.
+spike/zed-fork
 
-# Generated at package time by `scripts/package-web.sh` — a blank placeholder
-# until eave has real app-icon artwork, and a derived file either way.
+# A derived app icon, if anything ever writes one into the source tree.
+# Nothing does today: `scripts/bundle-app.sh` synthesises the iconset inside
+# the bundle it is assembling and never touches `crates/`. Kept as a guard,
+# because the script that DID write here (`package-web.sh`, Slice C1) was
+# deleted in C3 and a stray .icns is not worth a commit.
 crates/eave-app/resources/mac/eave.icns

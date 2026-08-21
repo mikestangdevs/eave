@@ -8,6 +8,7 @@
 #
 # Usage: scripts/package-macos.sh
 # Env:   CODESIGN_IDENTITY="Developer ID Application: …"  sign the bundle.
+#          Signing happens inside scripts/bundle-app.sh, inside-out, once.
 #        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store
 #          Connect API key (.p8) for notarization. All three set → notarize
 #          and staple both the app and the dmg, which removes the Gatekeeper
@@ -38,44 +39,22 @@ DMG="$OUT_DIR/eave-$VERSION-macos-$ARCH.dmg"
 APP_TARBALL="$OUT_DIR/eave-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
-cargo build --release -p eave-app
 
-rm -rf "$APP" "$DMG" "$APP_TARBALL"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-install -m 755 "$ROOT/target/release/eave" "$APP/Contents/MacOS/eave"
-sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
+# ONE ASSEMBLER. This used to build, lay out the bundle, write the plist,
+# make the icns and sign — all inline, which meant the artefact a release
+# shipped was assembled by different code from the one boot-smoke ran and the
+# one a developer launched. scripts/bundle-app.sh is now the only thing that
+# builds a .app in this repo; it runs cargo itself, so this is still one
+# command from a clean tree.
+#
+# It also signs, and it is the LAST thing to touch the bundle. Nothing below
+# this line may write inside "$APP" — see mac_sign_bundle for what a stale
+# seal costs. That is why the icon moved into the bundler rather than staying
+# here: it was a write into an already-signed bundle waiting to happen.
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}" \
+  "$ROOT/scripts/bundle-app.sh" --release --out "$OUT_DIR" eave
 
-# Icon. Unlike comet's, this step is OPTIONAL: eave has no app-icon artwork
-# yet (Slice Q1 drew the in-app glyph family, not a 1024 px app mark), and a
-# missing icon must not be the thing that stops us shipping. Drop a pre-masked
-# dist/macos/icon-1024.png in — squircle, margins and shadow baked, because
-# sips cannot alpha-mask — and this starts producing a real icns with no
-# other change. Until then the bundle carries the generic app icon and
-# CFBundleIconFile simply names a file that isn't there, which is benign.
-if [[ -f "$ROOT/dist/macos/icon-1024.png" ]]; then
-  ICONSET="$OUT_DIR/eave.iconset"
-  rm -rf "$ICONSET" && mkdir -p "$ICONSET"
-  for size in 16 32 128 256 512; do
-    sips -z "$size" "$size" "$ROOT/dist/macos/icon-1024.png" \
-      --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-    retina=$((size * 2))
-    sips -z "$retina" "$retina" "$ROOT/dist/macos/icon-1024.png" \
-      --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-  done
-  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/eave.icns"
-  rm -rf "$ICONSET"
-else
-  echo "package-macos: no dist/macos/icon-1024.png — bundling without an icon"
-fi
-
-if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  # Hardened runtime + secure timestamp are both notarization requirements.
-  # No --deep: Apple deprecated it, and the bundle is a single Mach-O anyway.
-  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
-else
-  # Ad-hoc signature so the app launches at all on Apple silicon.
-  codesign --force --sign - "$APP"
-fi
+rm -f "$DMG" "$APP_TARBALL"
 
 # notarize <path>: submit to Apple and wait for the verdict. A rejection can
 # still exit 0 depending on the notarytool version — the `stapler staple`

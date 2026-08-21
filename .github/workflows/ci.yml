@@ -24,6 +24,14 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
 
+      # Costs milliseconds, downloads nothing, and catches the one drift
+      # cargo cannot: the CEF framework's version lives in a crate's BUILD
+      # METADATA, which cargo ignores in version requirements, and
+      # cef-dll-sys's own check accepts any framework older than the crate.
+      # The full CEF bundle gate is .github/workflows/cef.yml.
+      - name: cef pin consistency
+        run: scripts/check-cef-pin.sh
+
       - name: fmt
         run: cargo fmt --all --check
 
