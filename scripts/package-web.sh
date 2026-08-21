@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Assemble eave.app with Chromium inside it (Slice C1).
 #
+# SUPERSEDED, and should be deleted rather than maintained. `slice-c2` landed
+# `scripts/bundle-app.sh` as the one bundler in the tree, and it does this
+# properly — six distinct helper identifiers, a real version pin, entitlements.
+# This exists only because that branch was not on this one when a bundle was
+# needed to verify against. The one thing here worth moving across is the
+# CARGO shim below. See docs/reports/stage-c1-osr.md, caveat 4.
+#
 # `cargo build` alone does not produce a runnable artifact once CEF is in the
 # build: the binary only runs from inside an assembled `.app`, beside a
 # 323 MB framework and five nested helper bundles. This is that step.
@@ -82,13 +89,11 @@ cat <<'NOTE'
 
 Bundled: ./eave.app
 
-Two things to know before touching it:
-
-  - DO NOT `codesign --force -s -` this bundle. It leaves it in a state
-    where it launches and exits immediately, printing nothing ("code has no
-    resources but signature indicates they must be present"). Anything that
-    rewrites a binary in place must RE-BUNDLE, not re-sign.
   - A rebuild does not update the bundle. `bundle-cef-app` COPIES the binary
     in, so `cargo build` followed by running the .app silently runs the old
     one. Re-run this script.
+  - The spike's "never re-sign this bundle" warning USED TO BE HERE and was
+    wrong: slice-c2 re-signed five variants and all ran. The scary
+    `codesign -v` message comes from the downloaded CEF framework, which
+    fails verification out of the tarball, so every bundle inherits it.
 NOTE
