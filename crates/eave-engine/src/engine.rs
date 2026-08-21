@@ -33,11 +33,13 @@ use eave_core::session::{
 use eave_core::store::{normalize_title, EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
-    socket_path, ArchiveOk, ChangedFile, Cursor, DecideOk, Decision, DiffBasis, DiffOk, FileScope,
-    FileStatus, FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk, OpenOk, RemoveWorktreeOk,
-    RenameOk, Request, RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo,
-    SubscriptionItem, UnsubscribeOk, PROTO_VERSION,
+    socket_path, ArchiveOk, ChangedFile, ChangedOk, CreatedOk, Cursor, DecideOk, Decision,
+    DiffBasis, DiffOk, FileScope, FileStatus, FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk,
+    OpenOk, RemoveWorktreeOk, RenameOk, Request, RequestEnvelope, ResponseBody, ResponseEnvelope,
+    SendOk, SessionInfo, SubscriptionItem, TabNavOk, UnsubscribeOk, PROTO_VERSION,
 };
+
+use crate::browser::Browser;
 
 const BROADCAST_CAP: usize = 4096;
 /// Watch pokes carry no payload (snapshots are taken at emission), so the
@@ -601,6 +603,16 @@ pub struct Engine {
     /// Engine-wide watch poke channel (spec 05 §Watch). Held here so it
     /// outlives every session; handles carry clones.
     watch_tx: broadcast::Sender<()>,
+    /// Tabs, groups, bookmarks and history (Slice B1).
+    ///
+    /// Beside `sessions`, not inside it. There is one browser and there
+    /// are many sessions, and the two are separate durable concerns with
+    /// exactly one join: a tab may NAME a session
+    /// (`TabContent::Session`). Nothing here reads a session's journal and
+    /// nothing in the session path reads this — which is what makes
+    /// "closing a tab does not end a session" a structural fact rather
+    /// than a rule somebody has to remember.
+    browser: Arc<Browser>,
 }
 
 impl Engine {
@@ -1738,12 +1750,20 @@ async fn serve_locked(
         start_tvusec: 0,
     });
     let (watch_tx, _) = broadcast::channel(WATCH_CAP);
+    let browser = Browser::open(&cfg.data_dir)?;
+    // Say what opening the logs found. A skipped line or a sealed file is
+    // data the operator has lost or cannot write, and it must not be
+    // discovered later by its absence.
+    for line in browser.open_report().stated() {
+        eprintln!("engine: browser {line}");
+    }
     let engine = Arc::new(Engine {
         cfg,
         store,
         identity,
         sessions: StdMutex::new(HashMap::new()),
         watch_tx,
+        browser,
     });
 
     // Startup scan (spec 02 §Resume contract): reap orphans from the meta
@@ -1998,6 +2018,104 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Ok(ok) => ok_value(&ok),
                 Err(message) => ResponseBody::Err { message },
             },
+            // ---------------------------------------------------------
+            // Browser state (Slice B1)
+            Request::WatchTabs => {
+                let w = Arc::clone(&w);
+                subs.insert(id, tokio::spawn(run_tabs(Arc::clone(&engine), w, id)));
+                continue; // snapshots flow on this id; no unary reply
+            }
+            Request::WatchBookmarks => {
+                let w = Arc::clone(&w);
+                subs.insert(id, tokio::spawn(run_bookmarks(Arc::clone(&engine), w, id)));
+                continue;
+            }
+            Request::TabNav { tab_id } => match engine.browser.tab_nav(&tab_id) {
+                Ok(nav) => ok_value(&TabNavOk { tab_id, nav }),
+                Err(message) => ResponseBody::Err { message },
+            },
+            Request::HistoryQuery { typed, limit } => {
+                ok_value(&engine.browser.history_query(&typed, limit))
+            }
+            Request::TabOpen {
+                url,
+                group,
+                index,
+                content,
+                opener,
+                activate,
+            } => match engine
+                .browser
+                .tab_open(url, group, index, content, opener, activate)
+            {
+                Ok(id) => ok_value(&CreatedOk { id }),
+                Err(message) => ResponseBody::Err { message },
+            },
+            Request::TabClose { tab_id } => changed(engine.browser.tab_close(tab_id)),
+            Request::TabActivate { tab_id } => changed(engine.browser.tab_activate(tab_id)),
+            Request::TabMove {
+                tab_id,
+                group,
+                index,
+            } => changed(engine.browser.tab_move(tab_id, group, index)),
+            Request::TabPin { tab_id, pinned } => changed(engine.browser.tab_pin(tab_id, pinned)),
+            Request::TabGo { tab_id, delta } => changed(engine.browser.tab_go(tab_id, delta)),
+            Request::TabNavigate { tab_id, url } => {
+                changed(engine.browser.tab_navigate(tab_id, url))
+            }
+            Request::TabStated { tab_id, fact } => changed(engine.browser.tab_stated(tab_id, fact)),
+            Request::GroupCreate {
+                title,
+                color,
+                workspace,
+                index,
+            } => match engine.browser.group_create(title, color, workspace, index) {
+                Ok(id) => ok_value(&CreatedOk { id }),
+                Err(message) => ResponseBody::Err { message },
+            },
+            Request::GroupUpdate {
+                group_id,
+                title,
+                color,
+                workspace,
+                collapsed,
+            } => changed(
+                engine
+                    .browser
+                    .group_update(group_id, title, color, workspace, collapsed),
+            ),
+            Request::GroupMove { group_id, index } => {
+                changed(engine.browser.group_move(group_id, index))
+            }
+            Request::GroupClose { group_id } => changed(engine.browser.group_close(group_id)),
+            Request::BookmarkAdd {
+                parent,
+                index,
+                title,
+                url,
+            } => match engine.browser.bookmark_add(parent, index, title, url) {
+                Ok(id) => ok_value(&CreatedOk { id }),
+                Err(message) => ResponseBody::Err { message },
+            },
+            Request::BookmarkRemove { bookmark_id } => {
+                changed(engine.browser.bookmark_remove(bookmark_id))
+            }
+            Request::BookmarkMove {
+                bookmark_id,
+                parent,
+                index,
+            } => changed(engine.browser.bookmark_move(bookmark_id, parent, index)),
+            Request::BookmarkRename { bookmark_id, title } => {
+                changed(engine.browser.bookmark_rename(bookmark_id, title))
+            }
+            Request::BookmarkRetarget { bookmark_id, url } => {
+                changed(engine.browser.bookmark_retarget(bookmark_id, url))
+            }
+            Request::HistoryForget { url } => changed(engine.browser.history_forget(url)),
+            Request::HistoryClear {
+                since_ms,
+                before_ms,
+            } => changed(engine.browser.history_clear(since_ms, before_ms)),
             Request::Unsubscribe { id: target } => {
                 // Stop the named stream and release what it held (the
                 // files stream's watcher refcount drops via guard drop).
@@ -2271,6 +2389,62 @@ async fn run_subscription(
 /// the next snapshot covers more changes at once. This task never touches
 /// a session's record log — the only thing it can serialize is
 /// `SessionInfo` (isolation invariant, enforced by test).
+/// Fold a browser mutation's result into a reply.
+///
+/// `changed: false` rides the OK path, not the error path, because it is
+/// not a failure — pinning an already-pinned tab did exactly what was
+/// asked. Only a write that could not happen is an error.
+fn changed(r: Result<bool, String>) -> ResponseBody {
+    match r {
+        Ok(changed) => ok_value(&ChangedOk { changed }),
+        Err(message) => ResponseBody::Err { message },
+    }
+}
+
+/// The tab-strip subscription (Slice B1): a full snapshot now, and another
+/// after every change. Identical in shape to [`run_watch`] — snapshot,
+/// send, wait, coalesce — because it makes the identical promise: fold by
+/// replacement, no deltas, nothing to go stale.
+async fn run_tabs(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+    let mut rx = engine.browser.subscribe_tabs();
+    loop {
+        let item = SubscriptionItem::Tabs {
+            snapshot: engine.browser.tabs_snapshot(),
+        };
+        if send_item(&w, id, item).await.is_err() {
+            return;
+        }
+        match rx.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                // A burst of pokes collapses into one snapshot. Lag is
+                // harmless for the same reason: the next snapshot is
+                // complete, so nothing was missed by not sending the
+                // intermediate ones.
+                while rx.try_recv().is_ok() {}
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+async fn run_bookmarks(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+    let mut rx = engine.browser.subscribe_bookmarks();
+    loop {
+        let item = SubscriptionItem::Bookmarks {
+            snapshot: engine.browser.bookmarks_snapshot(),
+        };
+        if send_item(&w, id, item).await.is_err() {
+            return;
+        }
+        match rx.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                while rx.try_recv().is_ok() {}
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 async fn run_watch(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
     let mut rx = engine.watch_tx.subscribe();
     loop {

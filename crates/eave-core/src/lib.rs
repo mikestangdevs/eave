@@ -5,6 +5,7 @@
 //! crash-tail repair, cold resume. No UI, no wire protocol.
 
 pub mod attention;
+pub mod browser;
 pub mod claude;
 pub mod events;
 pub mod journal;

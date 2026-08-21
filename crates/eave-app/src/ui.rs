@@ -594,9 +594,14 @@ async fn feed_loop(
                             plumbing.push_attn((sid, attention));
                         }
                         // Never on this id: sessions ride watch, files
-                        // ride the files subscription.
+                        // ride the files subscription, and the browser's
+                        // tab and bookmark snapshots (Slice B1) ride
+                        // theirs. This shell subscribes to none of the
+                        // browser channels and draws none of that state.
                         Some(SubscriptionItem::Sessions { .. })
-                        | Some(SubscriptionItem::Files { .. }) => {}
+                        | Some(SubscriptionItem::Files { .. })
+                        | Some(SubscriptionItem::Tabs { .. })
+                        | Some(SubscriptionItem::Bookmarks { .. }) => {}
                         None => break StreamEnd::Conn, // connection gone → reconnect
                     },
                     cmd = commands.recv() => match cmd {
@@ -892,7 +897,10 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
                 SubscriptionItem::Attention { attention, .. } => {
                     plumbing.push_attn((sid.clone(), attention.clone()));
                 }
-                SubscriptionItem::Sessions { .. } | SubscriptionItem::Files { .. } => {}
+                SubscriptionItem::Sessions { .. }
+                | SubscriptionItem::Files { .. }
+                | SubscriptionItem::Tabs { .. }
+                | SubscriptionItem::Bookmarks { .. } => {}
             }
         }
     }

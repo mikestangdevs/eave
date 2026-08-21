@@ -152,6 +152,13 @@ async fn drain_records(
             SubscriptionItem::Attention { .. }
             | SubscriptionItem::Sessions { .. }
             | SubscriptionItem::Files { .. } => {}
+            // Slice B1: browser frames flow on their own subscription
+            // ids and are demultiplexed by the client, so one arriving
+            // here would mean the demux itself broke. Say so loudly
+            // rather than drop it into the ignore arm above.
+            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+                panic!("a browser frame arrived on a session subscription")
+            }
         }
     }
     got
@@ -358,6 +365,13 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
             SubscriptionItem::Attention { .. }
             | SubscriptionItem::Sessions { .. }
             | SubscriptionItem::Files { .. } => {}
+            // Slice B1: browser frames flow on their own subscription
+            // ids and are demultiplexed by the client, so one arriving
+            // here would mean the demux itself broke. Say so loudly
+            // rather than drop it into the ignore arm above.
+            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+                panic!("a browser frame arrived on a session subscription")
+            }
         }
     }
     assert!(rx_records > 0);
@@ -641,6 +655,13 @@ async fn deltas_fold_into_120ms_frames() {
             SubscriptionItem::Attention { .. }
             | SubscriptionItem::Sessions { .. }
             | SubscriptionItem::Files { .. } => {}
+            // Slice B1: browser frames flow on their own subscription
+            // ids and are demultiplexed by the client, so one arriving
+            // here would mean the demux itself broke. Say so loudly
+            // rather than drop it into the ignore arm above.
+            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+                panic!("a browser frame arrived on a session subscription")
+            }
             SubscriptionItem::Events { epoch, records, .. } => {
                 t.apply(epoch, &records).expect("no seq gaps");
                 let all_deltas = records.iter().all(|r| {

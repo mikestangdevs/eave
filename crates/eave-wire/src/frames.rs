@@ -36,6 +36,14 @@ use eave_core::proc::ProcIdentity;
 use eave_core::session::AgentConfig;
 
 pub use eave_core::attention::{AttentionSnapshot, WaitReason};
+pub use eave_core::browser::bookmarks::{Bookmark, BookmarkId, BookmarkKind};
+pub use eave_core::browser::history::{HistoryEntry, HistoryMatch, MatchKind, Transition};
+pub use eave_core::browser::snapshot::{
+    BookmarkNode, BookmarksSnapshot, TabInfo, TabsSnapshot,
+};
+pub use eave_core::browser::tabs::{
+    GroupId, LoadState, NavEntry, NavStack, Setting, Slot, TabContent, TabGroup, TabId,
+};
 
 pub const PROTO_VERSION: u32 = 1;
 
@@ -242,6 +250,235 @@ pub enum Request {
         #[serde(flatten)]
         decision: Decision,
     },
+
+    // -----------------------------------------------------------------
+    // Browser state (Slice B1). Data only — none of these render
+    // anything, and none of them know which page engine is attached.
+    //
+    // Every variant below is either an OPERATOR intent (open this, move
+    // that) or an ENGINE fact (this navigation committed, this page
+    // finished loading). Keeping the two vocabularies in one enum but
+    // distinct in name is deliberate: `tab_navigate` is a request that
+    // may not land, `tab_stated` is a report of what did.
+    /// Observe the whole tab strip (Slice B1): items flow on this
+    /// request's id as [`SubscriptionItem::Tabs`] snapshots — one
+    /// immediately, one on every change. Fold by REPLACEMENT.
+    ///
+    /// Engine-wide, like `watch`, and carrying no session's transcript:
+    /// a tab that views a session names it by id and nothing else.
+    WatchTabs,
+    /// Observe the bookmark hierarchy. Same contract as
+    /// [`Request::WatchTabs`].
+    WatchBookmarks,
+    /// One tab's full back/forward stack — unary, deliberately not on the
+    /// snapshot. See `eave_core::browser::snapshot`'s module docs.
+    TabNav {
+        tab_id: TabId,
+    },
+    /// Ask history what to suggest for what has been typed so far.
+    /// Unary and stateless: the omnibox asks again on every keystroke,
+    /// so there is nothing to hold and nothing to invalidate.
+    HistoryQuery {
+        typed: String,
+        /// `#[serde(default)]` so a client that sends none gets the
+        /// engine's own page size rather than zero results.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+
+    /// Open a tab. The engine mints the id and returns it.
+    TabOpen {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<GroupId>,
+        /// Where in its container it lands; past the end appends, and
+        /// `None` appends. Not a bare `usize` defaulting to 0, because
+        /// that would silently make every new tab open first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// What the tab shows. Defaults to an ordinary page, so a client
+        /// that has never heard of session tabs sends no key at all.
+        #[serde(default, skip_serializing_if = "TabContent::is_default_content")]
+        content: TabContent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opener: Option<TabId>,
+        /// Make it the active tab. Defaults to false so the field's
+        /// absence means the least surprising thing — a background tab
+        /// does not steal focus.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        activate: bool,
+    },
+    /// Close a tab. **A tab that views a session does not end that
+    /// session** — see [`TabContent::Session`]. Closing a view is not
+    /// closing the work.
+    TabClose {
+        tab_id: TabId,
+    },
+    TabActivate {
+        tab_id: TabId,
+    },
+    /// Move a tab. `group: None` means the top level, which is why this
+    /// is a plain `Option` and not a [`Setting`]: a move always names its
+    /// destination, so there is no "leave it alone" to express.
+    TabMove {
+        tab_id: TabId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<GroupId>,
+        #[serde(default)]
+        index: usize,
+    },
+    TabPin {
+        tab_id: TabId,
+        pinned: bool,
+    },
+    /// Walk the back/forward stack. `-1` is back, `+1` forward; a move
+    /// past either end is clamped and lands as a no-op rather than an
+    /// error, because the operator may have raced a navigation.
+    TabGo {
+        tab_id: TabId,
+        delta: i32,
+    },
+    /// Ask a tab to navigate. The engine records the intent as a
+    /// committed navigation in this slice, because no page engine is
+    /// attached yet to say otherwise — the caveat is stated in
+    /// `docs/reports/stage-b1-browser-state.md`.
+    TabNavigate {
+        tab_id: TabId,
+        url: String,
+    },
+    /// **The page-engine seam.** Whatever renders pages states what it
+    /// observed here, and this is the only door those facts come through.
+    /// It is one method rather than five so that adding a fact later does
+    /// not add a method — [`PageFact`] carries its own tag.
+    TabStated {
+        tab_id: TabId,
+        #[serde(flatten)]
+        fact: PageFact,
+    },
+
+    GroupCreate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        /// The checkout this group is about, when it is about one. Stated
+        /// only; nothing in the engine acts on it (Slice B1 decision).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+    },
+    /// Change a group's operator-set fields. Each is a [`Setting`] inside
+    /// an `Option`, because three states are needed and two would not do:
+    /// absent means leave alone, `{"set":"clear"}` means clear it, and
+    /// `{"set":"value",…}` sets it.
+    GroupUpdate {
+        group_id: GroupId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<Setting<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Setting<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<Setting<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collapsed: Option<bool>,
+    },
+    GroupMove {
+        group_id: GroupId,
+        #[serde(default)]
+        index: usize,
+    },
+    /// Close a group and every tab in it. Tabs in the group that view
+    /// sessions still do not end those sessions.
+    GroupClose {
+        group_id: GroupId,
+    },
+
+    /// Add a bookmark. `url` present makes a link, absent makes a folder
+    /// — one field rather than a kind tag, because "a bookmark with a
+    /// url" is what every caller actually has in hand.
+    BookmarkAdd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<BookmarkId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// Remove a bookmark. A folder takes its subtree with it.
+    BookmarkRemove {
+        bookmark_id: BookmarkId,
+    },
+    BookmarkMove {
+        bookmark_id: BookmarkId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<BookmarkId>,
+        #[serde(default)]
+        index: usize,
+    },
+    BookmarkRename {
+        bookmark_id: BookmarkId,
+        /// `None` clears the name, exactly as [`Request::Rename`] does
+        /// for a session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Point an existing link somewhere else. Separate from a rename
+    /// because a title and an address are different things to get wrong.
+    BookmarkRetarget {
+        bookmark_id: BookmarkId,
+        url: String,
+    },
+
+    /// Forget one url. The visits are physically removed from the log,
+    /// not tombstoned — see `eave_core::browser::history`.
+    HistoryForget {
+        url: String,
+    },
+    /// Forget a time range. Both bounds absent means everything.
+    HistoryClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_ms: Option<u64>,
+    },
+}
+
+/// Something a page engine observed and is reporting.
+///
+/// These are facts, not requests. `Committed` in particular is the url
+/// that actually landed — after redirects — which is why a navigation
+/// request and a navigation commit are different frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "fact", rename_all = "snake_case")]
+pub enum PageFact {
+    /// A navigation committed. Pushes a back/forward entry.
+    Committed {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// The page stated its title (usually after the commit, once it has
+    /// parsed). `None` clears it back to unstated.
+    Titled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Where the favicon lives. The bytes are the engine's cache, not
+    /// eave's business.
+    Favicon {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        favicon_url: Option<String>,
+    },
+    /// Loading state. **Never journaled** — a restored tab is
+    /// [`LoadState::Unloaded`], because that is what it is.
+    Load {
+        #[serde(flatten)]
+        load: LoadState,
+    },
 }
 
 /// The two answers, and only two (Slice K). `Deny` carries the operator's
@@ -327,6 +564,16 @@ pub enum SubscriptionItem {
         session_id: String,
         snapshot: FilesSnapshot,
     },
+    /// Tab-strip frame (Slice B1): the whole strip, taken at emission
+    /// time. Fold by REPLACEMENT, like every other snapshot here.
+    ///
+    /// Engine-wide. It carries tab ids, urls, page titles and — for a tab
+    /// that views a session — that session's id. It carries **no
+    /// session's transcript**, which is the same rule `watch` keeps and
+    /// for the same reason: this is a broadcast every client sees.
+    Tabs { snapshot: TabsSnapshot },
+    /// Bookmark-hierarchy frame (Slice B1). Same contract.
+    Bookmarks { snapshot: BookmarksSnapshot },
 }
 
 /// Unary reply to [`Request::Decide`].
@@ -872,6 +1119,61 @@ pub struct RemoveWorktreeOk {
 /// it lost the instance lock: the holder from `engine.lock`, so the UI can
 /// render Busy with a pid even though it never got a socket to talk to
 /// (spec 02 §Contended start).
+/// Reply to [`Request::TabOpen`] and [`Request::GroupCreate`]: the id the
+/// engine minted. The caller reads its own new object's identity back
+/// rather than guessing it, exactly as [`RenameOk`] returns the normalized
+/// title instead of letting the caller assume its string landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedOk {
+    pub id: String,
+}
+
+/// Reply to every browser mutation that does not create something.
+///
+/// `changed: false` is a FACT, not a failure: pinning an already-pinned
+/// tab, moving a tab to where it already is, or renaming a bookmark to the
+/// name it has all land here. The engine neither journals nor broadcasts a
+/// no-op — a click that changed nothing must not re-send the whole strip to
+/// every client — and the caller is entitled to know that is what happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedOk {
+    pub changed: bool,
+}
+
+/// Reply to [`Request::TabNav`]: one tab's whole back/forward stack, which
+/// is deliberately absent from the strip snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabNavOk {
+    pub tab_id: TabId,
+    #[serde(flatten)]
+    pub nav: NavStack,
+}
+
+/// Reply to [`Request::HistoryQuery`]: what to suggest, best first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryQueryOk {
+    pub matches: Vec<HistoryMatch>,
+    /// How many distinct urls history holds. A count may cross a channel
+    /// the urls themselves do not — and an omnibox showing nothing wants
+    /// to distinguish "no history" from "no match".
+    #[serde(default, skip_serializing_if = "is_zero_usize_wire")]
+    pub total_entries: usize,
+    /// How long the engine took to answer, in microseconds. Stated rather
+    /// than assumed: this path has a frame budget, and a surface that can
+    /// see the number can prove it is being met on the operator's own
+    /// history rather than on a benchmark's.
+    #[serde(default, skip_serializing_if = "is_zero_u64_wire")]
+    pub took_us: u64,
+}
+
+fn is_zero_usize_wire(n: &usize) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64_wire(n: &u64) -> bool {
+    *n == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BusyReport {
     pub busy: BusyHolder,
@@ -1293,6 +1595,268 @@ mod tests {
         assert_eq!(info.checkout_root, None);
         assert!(info.shared_with.is_empty());
         assert_eq!(info.worktree, None);
+    }
+
+
+    // -----------------------------------------------------------------
+    // Slice B1 — the compatibility contract for browser state.
+    //
+    // The rule these keep is the one Slice P2 established for agent
+    // config, applied to a much bigger surface: **an engine or client that
+    // predates a field must still parse the frame**, and the ordinary case
+    // must put no key on the wire at all. Every assertion below is one
+    // half of that, written against literal JSON rather than a round trip,
+    // because a round trip only proves this build agrees with itself.
+
+    #[test]
+    fn browser_methods_round_trip() {
+        for request in [
+            Request::WatchTabs,
+            Request::WatchBookmarks,
+            Request::TabNav {
+                tab_id: "t1".into(),
+            },
+            Request::HistoryQuery {
+                typed: "gith".into(),
+                limit: Some(8),
+            },
+            Request::TabOpen {
+                url: Some("https://x/".into()),
+                group: Some("g1".into()),
+                index: Some(2),
+                content: TabContent::Session {
+                    session_id: "s1".into(),
+                },
+                opener: Some("t0".into()),
+                activate: true,
+            },
+            Request::TabGo {
+                tab_id: "t1".into(),
+                delta: -1,
+            },
+            Request::TabStated {
+                tab_id: "t1".into(),
+                fact: PageFact::Committed {
+                    url: "https://x/".into(),
+                    title: Some("X".into()),
+                },
+            },
+            Request::TabStated {
+                tab_id: "t1".into(),
+                fact: PageFact::Load {
+                    load: LoadState::Failed {
+                        reason: "net::ERR_NAME_NOT_RESOLVED".into(),
+                    },
+                },
+            },
+            Request::GroupUpdate {
+                group_id: "g1".into(),
+                title: Some(Setting::Value {
+                    value: "work".into(),
+                }),
+                color: None,
+                workspace: Some(Setting::Clear),
+                collapsed: Some(true),
+            },
+            Request::BookmarkAdd {
+                parent: None,
+                index: None,
+                title: Some("f".into()),
+                url: None,
+            },
+            Request::BookmarkRetarget {
+                bookmark_id: "b1".into(),
+                url: "https://y/".into(),
+            },
+            Request::HistoryClear {
+                since_ms: Some(1),
+                before_ms: None,
+            },
+        ] {
+            let env = RequestEnvelope { id: 3, request };
+            let line = serde_json::to_string(&env).unwrap();
+            let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, env, "{line}");
+        }
+    }
+
+    /// The plain cases write no keys. A tab opened at a url, with no group,
+    /// no opener and no index, must produce a frame an engine predating
+    /// every one of those fields would accept unchanged.
+    #[test]
+    fn an_ordinary_browser_frame_carries_no_optional_keys() {
+        let line = serde_json::to_string(&Request::TabOpen {
+            url: Some("https://x/".into()),
+            group: None,
+            index: None,
+            content: TabContent::Page,
+            opener: None,
+            activate: false,
+        })
+        .unwrap();
+        for key in ["group", "index", "content", "opener", "activate"] {
+            assert!(!line.contains(key), "a plain tab_open wrote {key}: {line}");
+        }
+
+        let snap = TabsSnapshot::default();
+        let line = serde_json::to_string(&snap).unwrap();
+        assert!(!line.contains("active"), "{line}");
+        assert!(!line.contains("read_only"), "{line}");
+    }
+
+    /// An older ENGINE's frames must parse here: every field this build
+    /// added since is absent, and each has to land on the value those
+    /// engines actually produced.
+    #[test]
+    fn an_older_engines_browser_frames_still_parse() {
+        // A tabs snapshot with only the fields that must always exist.
+        let raw = r#"{"tabs":[{"id":"t1","created_ts_ms":5}],
+                      "groups":[],"order":[],"group_tabs":[]}"#;
+        let snap: TabsSnapshot = serde_json::from_str(raw).unwrap();
+        let t = &snap.tabs[0];
+        assert_eq!(t.url, None, "an absent url must not become an empty string");
+        assert_eq!(
+            t.load,
+            LoadState::Unloaded,
+            "an absent load state must read as unloaded — any other default \
+             makes an old engine's tabs claim to be busy"
+        );
+        assert!(!t.pinned);
+        assert!(!t.can_go_back && !t.can_go_forward);
+        assert_eq!(t.history_len, 0);
+        assert_eq!(t.content, TabContent::Page, "an absent content is a page");
+        assert!(!snap.read_only, "an absent read_only must not lock the UI");
+
+        // A bookmark node from before `children` was counted.
+        let raw = r#"{"id":"b1","kind":"folder","created_ts_ms":1,"depth":0}"#;
+        let node: BookmarkNode = serde_json::from_str(raw).unwrap();
+        assert_eq!(node.children, 0);
+        assert_eq!(node.bookmark.title, None);
+        assert!(node.bookmark.is_folder());
+
+        // A history reply from before it timed itself.
+        let raw = r#"{"matches":[]}"#;
+        let ok: HistoryQueryOk = serde_json::from_str(raw).unwrap();
+        assert_eq!(ok.total_entries, 0);
+        assert_eq!(ok.took_us, 0);
+    }
+
+    /// An older CLIENT's frames must parse at the engine: a `tab_open` with
+    /// nothing but a url, a `group_update` naming one field, a `tab_move`
+    /// with no group.
+    #[test]
+    fn an_older_clients_browser_frames_still_parse() {
+        let raw = r#"{"id":1,"method":"tab_open","params":{"url":"https://x/"}}"#;
+        let env: RequestEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            env.request,
+            Request::TabOpen {
+                url: Some("https://x/".into()),
+                group: None,
+                index: None,
+                content: TabContent::Page,
+                opener: None,
+                activate: false,
+            }
+        );
+
+        let raw = r#"{"id":2,"method":"group_update","params":{"group_id":"g","collapsed":true}}"#;
+        let env: RequestEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            env.request,
+            Request::GroupUpdate {
+                group_id: "g".into(),
+                title: None,
+                color: None,
+                workspace: None,
+                collapsed: Some(true),
+            },
+            "an absent field must mean LEAVE ALONE, never clear"
+        );
+
+        let raw = r#"{"id":3,"method":"tab_move","params":{"tab_id":"t"}}"#;
+        let env: RequestEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            env.request,
+            Request::TabMove {
+                tab_id: "t".into(),
+                group: None,
+                index: 0,
+            }
+        );
+
+        let raw = r#"{"id":4,"method":"history_query","params":{"typed":"g"}}"#;
+        let env: RequestEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            env.request,
+            Request::HistoryQuery {
+                typed: "g".into(),
+                limit: None,
+            },
+            "an absent limit must mean the engine's default, not zero results"
+        );
+    }
+
+    /// `Setting` is three states, and the wire has to show all three
+    /// distinctly. Two would collapse "leave it alone" into "clear it",
+    /// which is how a rename box wipes a colour nobody touched.
+    #[test]
+    fn a_setting_distinguishes_absent_from_clear_from_value() {
+        let clear = serde_json::to_string(&Setting::<String>::Clear).unwrap();
+        assert_eq!(clear, r#"{"set":"clear"}"#);
+        let value = serde_json::to_string(&Setting::Value {
+            value: "blue".to_string(),
+        })
+        .unwrap();
+        assert!(value.contains(r#""set":"value""#), "{value}");
+        assert_ne!(clear, value);
+        let back: Setting<String> = serde_json::from_str(&clear).unwrap();
+        assert_eq!(back, Setting::Clear);
+    }
+
+    /// The browser subscription frames are tagged like every other one, so
+    /// a client demultiplexing on `type` keeps working.
+    #[test]
+    fn browser_subscription_frames_round_trip() {
+        for item in [
+            SubscriptionItem::Tabs {
+                snapshot: TabsSnapshot::default(),
+            },
+            SubscriptionItem::Bookmarks {
+                snapshot: BookmarksSnapshot::default(),
+            },
+        ] {
+            let env = ResponseEnvelope {
+                id: 4,
+                body: ResponseBody::Item(item.clone()),
+            };
+            let line = serde_json::to_string(&env).unwrap();
+            let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, env, "{line}");
+        }
+        let line = serde_json::to_string(&SubscriptionItem::Tabs {
+            snapshot: TabsSnapshot::default(),
+        })
+        .unwrap();
+        assert!(line.contains(r#""type":"tabs""#), "{line}");
+    }
+
+    /// `changed: false` is a fact on the OK path, not an error. A caller
+    /// that treated it as a failure would show a dialog for a click that
+    /// did exactly what was asked.
+    #[test]
+    fn a_no_op_browser_reply_is_a_fact_not_a_failure() {
+        let body = ResponseBody::Ok(serde_json::to_value(ChangedOk { changed: false }).unwrap());
+        let line = serde_json::to_string(&body).unwrap();
+        assert_eq!(line, r#"{"ok":{"changed":false}}"#);
+        let back: ResponseBody = serde_json::from_str(&line).unwrap();
+        match back {
+            ResponseBody::Ok(v) => {
+                let ok: ChangedOk = serde_json::from_value(v).unwrap();
+                assert!(!ok.changed);
+            }
+            other => panic!("a no-op landed on the error path: {other:?}"),
+        }
     }
 
     #[test]

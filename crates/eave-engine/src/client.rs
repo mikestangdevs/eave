@@ -519,6 +519,117 @@ impl Client {
         Ok(self.subscribe_with_id(session_id, cursor).await?.1)
     }
 
+    // -----------------------------------------------------------------
+    // Browser state (Slice B1). Thin pass-throughs: every rule lives in
+    // `eave_core::browser` and every decision in the engine, so a second
+    // client can be written without re-deriving any of it.
+
+    /// Watch the whole tab strip: `Tabs` snapshot frames, one immediately
+    /// and one on every change. Fold by replacement.
+    pub async fn watch_tabs(&self) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        self.stream(Request::WatchTabs).await
+    }
+
+    /// Watch the bookmark hierarchy. Same contract.
+    pub async fn watch_bookmarks(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        self.stream(Request::WatchBookmarks).await
+    }
+
+    /// Open a tab; returns the id the engine minted.
+    pub async fn tab_open(
+        &self,
+        url: Option<&str>,
+        activate: bool,
+    ) -> Result<String, ClientError> {
+        Ok(self
+            .request::<eave_wire::CreatedOk>(Request::TabOpen {
+                url: url.map(str::to_string),
+                group: None,
+                index: None,
+                content: eave_wire::TabContent::Page,
+                opener: None,
+                activate,
+            })
+            .await?
+            .id)
+    }
+
+    /// Open a tab that VIEWS a session. The session is named, not owned:
+    /// closing this tab does not touch it.
+    pub async fn tab_open_session(
+        &self,
+        session_id: &str,
+        group: Option<&str>,
+    ) -> Result<String, ClientError> {
+        Ok(self
+            .request::<eave_wire::CreatedOk>(Request::TabOpen {
+                url: None,
+                group: group.map(str::to_string),
+                index: None,
+                content: eave_wire::TabContent::Session {
+                    session_id: session_id.into(),
+                },
+                opener: None,
+                activate: false,
+            })
+            .await?
+            .id)
+    }
+
+    /// Any browser mutation that answers `changed`.
+    pub async fn browser_do(&self, request: Request) -> Result<bool, ClientError> {
+        Ok(self
+            .request::<eave_wire::ChangedOk>(request)
+            .await?
+            .changed)
+    }
+
+    /// Any browser creation that answers with a minted id.
+    pub async fn browser_create(&self, request: Request) -> Result<String, ClientError> {
+        Ok(self.request::<eave_wire::CreatedOk>(request).await?.id)
+    }
+
+    /// One tab's whole back/forward stack — deliberately not on the strip
+    /// snapshot.
+    pub async fn tab_nav(&self, tab_id: &str) -> Result<eave_wire::NavStack, ClientError> {
+        Ok(self
+            .request::<eave_wire::TabNavOk>(Request::TabNav {
+                tab_id: tab_id.into(),
+            })
+            .await?
+            .nav)
+    }
+
+    /// Ask history what to suggest for what has been typed.
+    pub async fn history_query(
+        &self,
+        typed: &str,
+        limit: Option<usize>,
+    ) -> Result<eave_wire::HistoryQueryOk, ClientError> {
+        self.request::<eave_wire::HistoryQueryOk>(Request::HistoryQuery {
+            typed: typed.into(),
+            limit,
+        })
+        .await
+    }
+
+    /// Register a streaming request and hand back its receiver. The shape
+    /// every subscription here shares, factored out so a new one cannot
+    /// get the registration order wrong (the pending entry must exist
+    /// before the write, or a fast engine's first frame is dropped).
+    async fn stream(
+        &self,
+        request: Request,
+    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
+        self.write(&RequestEnvelope { id, request }).await?;
+        Ok(rx)
+    }
+
     /// Like [`subscribe`](Self::subscribe), but also returns the stream's
     /// request id for [`unsubscribe`](Self::unsubscribe) — see
     /// [`files_with_id`](Self::files_with_id) for why switchers need it.
