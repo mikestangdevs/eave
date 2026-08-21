@@ -53,7 +53,7 @@ mod page;
 mod tabs;
 
 #[cfg(feature = "web")]
-pub use host::{initialize, install_nsapp, shutdown, start_pump};
+pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 #[cfg(feature = "web")]
 pub use page::page_element;
 #[cfg(feature = "web")]
@@ -94,6 +94,13 @@ pub fn initialize(_data_dir: &std::path::Path) -> bool {
 /// Stop CEF.
 #[cfg(not(feature = "web"))]
 pub fn shutdown() {}
+
+/// Ask eave to quit the orderly way. No page engine here, so the caller
+/// should quit normally — which is what `false` says.
+#[cfg(not(feature = "web"))]
+pub fn request_quit() -> bool {
+    false
+}
 
 /// Start pumping CEF on gpui's executor. Nothing to pump here.
 #[cfg(not(feature = "web"))]

@@ -9916,7 +9916,22 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         KeyBinding::new("cmd-m", crate::app_menus::Minimize, None),
         KeyBinding::new("cmd-h", crate::app_menus::Hide, None),
     ]);
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| {
+        // **The page engine has to stop BEFORE gpui terminates, and it can
+        // only stop on the pump's stack.** `cx.quit()` defers
+        // `[NSApp terminate:]` to a fresh main-queue turn, and the quit
+        // observer then runs inside that `terminate:` — where `CefShutdown`
+        // blocks forever (Slice C7 measured it hanging with settle periods of
+        // 0, 300 and 1000 ms). So a build with a live page engine hands the
+        // quit to `web::request_quit`, which raises a flag the pump acts on:
+        // stop CEF on a clean stack, then quit gpui the ordinary way.
+        //
+        // `false` means there is no page engine to stop, and the ordinary
+        // path is correct — which is every build without `--features web`.
+        if !crate::web::request_quit() {
+            cx.quit();
+        }
+    });
     // The menu bar. Registered HERE rather than in `main` so the harness
     // boots the same wiring the app does — and note this is not what makes
     // ⌘Q work (the binding above already did, and always has). It is what

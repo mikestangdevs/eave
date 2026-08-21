@@ -232,6 +232,18 @@ static ACTIVE_UNTIL: AtomicU64 = AtomicU64::new(0);
 const BUSY_TAIL_MS: u64 = 400;
 /// The pump interval while a page is doing something.
 const BUSY_MS: u64 = 8;
+/// The pump interval while CEF is up but no browser is live.
+///
+/// **This used to be a park, and the park is what made `kill` hang.** With
+/// nothing to pump for, the loop waited on the request channel forever —
+/// and Chromium answers a signal by posting a shutdown task onto the UI
+/// thread, which only ever runs if something pumps. So SIGTERM on an eave
+/// with no page open did nothing at all and the process had to be SIGKILLed
+/// (Slice C6). Four wakeups a second is the price of a process that can be
+/// asked to stop; it is 60× cheaper than the spike's 4 ms timer, and nothing
+/// repaints on it.
+const IDLE_MS: u64 = 250;
+
 /// The pump interval while a page is live but quiet. A page that is merely
 /// open still needs its timers and its network callbacks run, so this cannot
 /// be zero — but it is 12× cheaper than the busy rate, and NOTHING repaints
@@ -240,55 +252,151 @@ const QUIET_MS: u64 = 100;
 
 /// Run CEF's pending work on gpui's foreground executor, forever.
 ///
+/// # The rule this obeys
+/// **A foreign event loop is lent every borrow you hold.**
+/// `CefDoMessageLoopWork` runs arbitrary Chromium tasks, and those tasks call
+/// back into this process *synchronously*. So this loop enters CEF with **no
+/// gpui borrow held**: pumping and repainting are two separate steps, and only
+/// the repaint takes [`gpui::AsyncApp::update`].
+///
+/// Slice C6 measured what the previous shape cost. It was `cx.update(pump)` —
+/// the borrow held across the CEF call — and on a signal Chromium posts
+/// `-[NSApplication terminate:]`, AppKit fires `WillTerminate`
+/// **synchronously**, and gpui's observer reaches for the app `RefCell` that
+/// the pump is still holding. `already borrowed`, then abort because the panic
+/// cannot unwind back through the Objective-C frames. **48 runs out of 48.**
+/// gpui states the same invariant from the other side: `MacPlatform::quit`
+/// defers `terminate:` to a fresh main-queue turn *precisely* so that no
+/// borrow is on the stack when the app goes down. Pumping inside `cx.update`
+/// handed Chromium a way around that, and [`watch_for_signals`] is how the
+/// decision is taken back.
+///
 /// # Why there is a heartbeat at all
-/// The intent was to replace the spike's fixed 4 ms timer with pure
-/// `OnScheduleMessagePumpWork`, and that is wired and honoured. It is not
-/// sufficient: **CEF calls it exactly once, ever.** Measured, not inferred —
-/// with every schedule and every pump logged, a full run from launch to a
-/// loaded page produces `schedule #0` and nothing more, and a host that pumps
-/// only on request stops after two pumps with the browser created and its
-/// page never loaded.
+/// `OnScheduleMessagePumpWork` is wired and honoured, and it is **not
+/// sufficient on its own** — but not for the reason this comment used to
+/// give. It claimed CEF "calls it exactly once, ever. Measured, not
+/// inferred", and that was the whole justification for the timer. C6
+/// re-measured: a thirty-second run logs `schedule #0` through `#24`, which
+/// is the trace's own cap, so the true count is *at least* 25. The once-ever
+/// number was an artefact of the bug it was recorded alongside — the `App`
+/// object was being dropped after `initialize`, taking the handler with it,
+/// which is fixed and documented above.
 ///
-/// So requests are honoured *and* a heartbeat runs underneath them, which is
-/// what cefclient's own external pump does for the same reason. Two things
-/// keep this from being the 4 ms timer wearing a hat:
+/// What IS true, and what the heartbeat is actually for, is the next
+/// paragraph's problem: **CEF suppresses `OnScheduleMessagePumpWork` for the
+/// duration of a `CefDoMessageLoopWork` call**, so work queued while we are
+/// inside one raises no request. [`pump_cef`] re-posts on the way out, and
+/// the heartbeat is the backstop for anything that slips between the two.
 ///
-///   - it only runs while a browser is live, and parks completely otherwise;
-///   - it decays to [`QUIET_MS`] when nothing is happening.
+/// C7 re-measured that too rather than inheriting it. With
+/// `EAVE_WEB_NO_HEARTBEAT=1` the loop waits on requests alone, and a run that
+/// normally logs 25 pumps and paints twice instead **logs 2–4 pumps and never
+/// paints at all**. So the heartbeat stays — and the knob stays with it,
+/// deliberately, because the reason this comment was wrong for two slices is
+/// that re-checking it required an edit. Two things keep it from being the
+/// spike's 4 ms timer wearing a hat: it decays to [`QUIET_MS`] when nothing
+/// is happening, and it drops to [`IDLE_MS`] when no browser is live.
 ///
-/// And the property the spike actually measured is untouched: the pump does
-/// not repaint. [`pump`] refreshes the window only when the frame counter
-/// moved, so an idle page still costs zero redraws however often it is
-/// pumped.
+/// And the property the spike measured is untouched: the pump does not
+/// repaint. [`refresh_if_painted`] asks gpui to redraw only when the frame
+/// counter moved, so an idle page still costs zero redraws however often it
+/// is pumped.
 pub fn start_pump(cx: &mut gpui::App) {
     let Some(mut rx) = PUMP_RX.lock().unwrap().take() else {
         return;
     };
+    watch_for_signals();
     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
         // One unconditional pump before waiting on anything: whatever CEF
         // asked for during initialisation is satisfied here.
-        cx.update(pump);
+        pump_cef();
+        refresh_if_painted(cx);
         loop {
-            if super::tabs::any_browser() {
+            let ms = if super::tabs::any_browser() {
                 let quiet = now_ms() >= ACTIVE_UNTIL.load(Ordering::Relaxed);
-                let ms = if quiet { QUIET_MS } else { BUSY_MS };
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(ms))
-                    .await;
-                while rx.try_recv().is_ok() {}
+                if quiet { QUIET_MS } else { BUSY_MS }
             } else {
-                // Nothing to pump for. Park until something asks — a browser
-                // being created, or CEF's one request.
+                IDLE_MS
+            };
+            // Whichever comes first: the heartbeat, or somebody asking. The
+            // request side is what keeps browser creation prompt now that
+            // the idle case is a slow tick rather than a park.
+            if no_heartbeat() {
+                // Measurement mode only (see the heartbeat note above): wait
+                // on requests alone, so "is `OnScheduleMessagePumpWork`
+                // sufficient by itself?" can be answered by running it rather
+                // than argued about.
                 if rx.recv().await.is_none() {
                     return;
                 }
-                while rx.try_recv().is_ok() {}
+            } else {
+                let timer = cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(ms));
+                futures::future::select(std::pin::pin!(timer), std::pin::pin!(rx.recv())).await;
             }
-            cx.update(pump);
+            while rx.try_recv().is_ok() {}
+
+            if quit_requested() {
+                if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                    eprintln!("[web] quit requested — stopping the page engine");
+                }
+                // **The page engine is stopped HERE, on the pump's own
+                // stack.** Not in the quit observer: that runs inside
+                // `[NSApp terminate:]`, and `CefShutdown` called from inside
+                // the `WillTerminate` notification blocks forever — measured,
+                // with settle periods of 0, 300 and 1000 ms, all three
+                // hanging. Here there is no borrow held, no `terminate:`
+                // above us and no `CefDoMessageLoopWork` around us, which is
+                // the only stack CEF will shut down on.
+                stop_cef(true);
+                // gpui's quit is DEFERRED to a fresh main-queue turn, and
+                // that is exactly what is wanted: `will_terminate` then runs
+                // with no borrow held and outside `CefDoMessageLoopWork`, so
+                // the quit observer can close browsers and call `CefShutdown`
+                // legally. Keep pumping afterwards — the deferred block is
+                // main-queue work like any other and still has to be run.
+                let _ = cx.update(|app| app.quit());
+            }
+            pump_cef();
+            refresh_if_painted(cx);
         }
     })
     .detach();
 }
+
+/// Signals, answered by eave rather than by Chromium.
+///
+/// Chromium installs its own `SIGTERM`/`SIGINT`/`SIGHUP` handlers during
+/// `CefInitialize` and answers them by posting `-[NSApplication terminate:]`
+/// onto the UI thread — which is to say, from inside whatever
+/// `CefDoMessageLoopWork` call happens to run it. That is the stack Slice C6
+/// found under 48 of 48 aborts.
+///
+/// Taking the signal ourselves moves the decision somewhere we control. The
+/// handler does nothing but set a flag — one atomic store, which is all that
+/// is async-signal-safe — and the pump turns that flag into gpui's own
+/// deferred quit on its next turn. Installed AFTER `CefInitialize` so that
+/// ours is the handler that sticks.
+fn watch_for_signals() {
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_quit_signal as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+extern "C" fn on_quit_signal(_sig: i32) {
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// True exactly once, on the first turn after a quit signal arrives.
+fn quit_requested() -> bool {
+    QUIT_REQUESTED.load(Ordering::SeqCst) && !QUIT_STARTED.swap(true, Ordering::SeqCst)
+}
+
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static QUIT_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// True while inside `do_message_loop_work`.
 ///
@@ -303,17 +411,11 @@ pub fn start_pump(cx: &mut gpui::App) {
 static IN_PUMP: AtomicBool = AtomicBool::new(false);
 static REQUESTED_DURING_PUMP: AtomicBool = AtomicBool::new(false);
 
-/// One pump. Runs CEF's pending work, then — and only then — asks gpui to
-/// redraw if a frame actually arrived.
-///
-/// Takes `&mut App` rather than reaching for an `AsyncApp` it stored
-/// earlier, and that is not a tidiness point: this runs INSIDE a
-/// `cx.update`, which already holds gpui's app borrow, so calling
-/// `AsyncApp::refresh` here takes the same `RefCell` twice and aborts the
-/// process on `already borrowed`. The handle we already have is the only
-/// one that is safe to use.
-fn pump(app: &mut gpui::App) {
-    if std::env::var("EAVE_WEB_TRACE").is_ok() {
+/// One pump, with **no gpui borrow held**. See [`start_pump`] for why that
+/// is the entire point of this function existing separately from
+/// [`refresh_if_painted`].
+fn pump_cef() {
+    if traced() {
         let n = PUMPS.fetch_add(1, Ordering::Relaxed);
         if n < 25 {
             eprintln!("[web] pump #{n}");
@@ -325,23 +427,45 @@ fn pump(app: &mut gpui::App) {
     IN_PUMP.store(false, Ordering::SeqCst);
     // Anything Chromium queued while we were inside raised no request, so
     // ask for one more pass. This is what keeps the chain alive; without it
-    // the loop parks forever with work outstanding.
+    // the loop runs on the heartbeat alone with work outstanding.
     if REQUESTED_DURING_PUMP.swap(false, Ordering::SeqCst) {
         if let Some(tx) = PUMP.get() {
             let _ = tx.send(0);
         }
     }
-    // **Render on delivered frames, never on vsync.** The spike measured an
-    // idle page at 1 frame in 9 seconds; a tab that repainted the window at
-    // 60 Hz regardless would throw that away and burn a GPU on a page that
-    // is not moving. `refresh` is called only when the frame counter moved.
+}
+
+/// Ask gpui to redraw — and **only** if a frame actually arrived.
+///
+/// **Render on delivered frames, never on vsync.** The spike measured an idle
+/// page at 1 frame in 9 seconds; a tab that repainted the window at 60 Hz
+/// regardless would throw that away and burn a GPU on a page that is not
+/// moving.
+///
+/// This is the one part of the pump that takes gpui's borrow, and it takes it
+/// **after** `CefDoMessageLoopWork` has returned. Do not fold it back into the
+/// pump: that shape is what Slice C6 removed.
+fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
     let seen = super::osr::frames_delivered();
-    if seen != LAST_REFRESHED.load(Ordering::Relaxed) {
-        LAST_REFRESHED.store(seen, Ordering::Relaxed);
-        // A page that is painting is a page that is doing something.
-        note_activity();
-        app.refresh_windows();
+    if seen == LAST_REFRESHED.load(Ordering::Relaxed) {
+        return;
     }
+    LAST_REFRESHED.store(seen, Ordering::Relaxed);
+    // A page that is painting is a page that is doing something.
+    note_activity();
+    let _ = cx.update(|app| app.refresh_windows());
+}
+
+/// `EAVE_WEB_TRACE`, read once. The pump asks on every turn and the shutdown
+/// loop runs it a thousand times, so an `env::var` per call is a real cost.
+fn no_heartbeat() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("EAVE_WEB_NO_HEARTBEAT").is_ok())
+}
+
+fn traced() -> bool {
+    static TRACED: OnceLock<bool> = OnceLock::new();
+    *TRACED.get_or_init(|| std::env::var("EAVE_WEB_TRACE").is_ok())
 }
 
 static LAST_REFRESHED: AtomicU64 = AtomicU64::new(0);
@@ -363,8 +487,10 @@ wrap_browser_process_handler! {
         /// May be called from any thread, which is the whole reason this is
         /// a channel send and not the work itself.
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
-            if std::env::var("EAVE_WEB_TRACE").is_ok() {
-                let n = SCHEDULES.fetch_add(1, Ordering::Relaxed);
+            // Counted unconditionally, not just under trace: this counter is
+            // the predicate `stop_cef` shuts down on. See there.
+            let n = SCHEDULES.fetch_add(1, Ordering::Relaxed);
+            if traced() {
                 if n < 25 {
                     eprintln!("[web] schedule #{n} delay={delay_ms} in_pump={}",
                         IN_PUMP.load(Ordering::SeqCst));
@@ -496,8 +622,139 @@ pub fn initialize(data_dir: &std::path::Path) -> bool {
 /// than a process that exits with Chromium still mapped. `tabs::close_all`
 /// runs first; this is the second half.
 pub fn shutdown() {
-    if RUNNING.swap(false, Ordering::SeqCst) {
-        super::tabs::close_all();
-        cef::shutdown();
+    stop_cef(false);
+}
+
+/// Close every browser and, when it is safe to, shut CEF down.
+///
+/// `from_pump` is the whole safety argument. `CefShutdown` is only called on
+/// the pump's stack — no gpui borrow held, no `[NSApp terminate:]` above us,
+/// no `CefDoMessageLoopWork` around us. Reached any other way (a system
+/// logout, an `NSApplication terminate:` eave did not initiate) the browsers
+/// are still closed and the handles still released, but CEF is left mapped
+/// and the process exits anyway, because **a quit that hangs is worse than a
+/// process that exits with Chromium still mapped** — this module's rule since
+/// C1, and now with a measurement behind it.
+fn stop_cef(from_pump: bool) {
+    if !RUNNING.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let trace = std::env::var("EAVE_WEB_TRACE").is_ok();
+    if trace {
+        eprintln!("[web] shutdown: closing browsers (from_pump={from_pump})");
+    }
+    super::tabs::close_all();
+
+    // Closing is work CEF has to be PUMPED to do. `on_before_close` is what
+    // removes a browser from the map, so an empty map is one readiness
+    // signal — but not a sufficient one: the handler fires SYNCHRONOUSLY
+    // inside `close_browser`, so the map is empty before Chromium has torn
+    // anything down. Hence pumping for a settle period as well.
+    // **Pump generously, then shut down behind a watchdog.**
+    //
+    // `CefShutdown` does not pump, and it deadlocks — not delays, deadlocks —
+    // if browser teardown still has UI-thread work outstanding. Two things
+    // were tried before this and both are recorded because they look right:
+    //
+    //   * A wall-clock settle. 300 ms hung 4 runs in 6; 1000 ms hung 4 in 6 at
+    //     one pump per 10 ms and 0 in 6 at one per 1 ms. The clock was never
+    //     the variable — the number of pumps was.
+    //   * A floor of 1000 pumps on top of the drain below. That made it
+    //     STRICTLY WORSE: `CefShutdown` returned in 5 of 10 runs on the drain
+    //     alone and in **0 of ~90** with the floor, while adding a second to
+    //     every quit. Pumping through a teardown appears to generate more of
+    //     it. The floor was removed on that measurement; it is recorded here
+    //     because "pump harder" is the obvious next idea and it is wrong.
+    //
+    // So: pump until Chromium stops asking, capped by a deadline, and let the
+    // watchdog below bound what is left. `CefShutdown` still fails to return
+    // about half the time — that is a real, open defect, not a solved one.
+    let mut quiet = 0u32;
+    let mut pumps = 0u32;
+    let mut waited = 0;
+    while waited < SHUTDOWN_WAIT_MS && quiet < SHUTDOWN_QUIET_ROUNDS {
+        let before = SCHEDULES.load(Ordering::Relaxed);
+        pump_cef();
+        pumps += 1;
+        if SCHEDULES.load(Ordering::Relaxed) == before && !super::tabs::any_browser() {
+            quiet += 1;
+        } else {
+            quiet = 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(SHUTDOWN_STEP_MS));
+        waited += SHUTDOWN_STEP_MS;
+    }
+    if trace {
+        eprintln!("[web] shutdown: {pumps} pumps in {waited} ms, quiet={quiet}");
+    }
+    super::tabs::forget_all();
+
+    if !from_pump {
+        eprintln!(
+            "eave: exiting without CefShutdown — the quit did not come through \
+             the pump, and CefShutdown blocks if called from inside terminate:"
+        );
+        return;
+    }
+    if trace {
+        eprintln!("[web] shutdown: calling CefShutdown");
+    }
+    // **A watchdog, because `CefShutdown` cannot be time-bounded from the
+    // thread that calls it.** The pumping above makes a deadlock unlikely; it
+    // cannot make it impossible, and this module's standing rule is that a
+    // quit which hangs is worse than a process that exits with Chromium still
+    // mapped. So the deadline is enforced from outside: `_exit` rather than
+    // `exit`, because we are racing a thread that holds Chromium's locks and
+    // running atexit handlers against it is how a clean exit becomes a crash.
+    let returned = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let returned = returned.clone();
+        std::thread::spawn(move || {
+            let mut left = SHUTDOWN_DEADLINE_MS;
+            while left > 0 {
+                if returned.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                left = left.saturating_sub(20);
+            }
+            eprintln!(
+                "eave: CefShutdown did not return in {SHUTDOWN_DEADLINE_MS} ms — \
+                 exiting with Chromium still mapped"
+            );
+            unsafe { libc::_exit(0) };
+        });
+    }
+    cef::shutdown();
+    returned.store(true, Ordering::SeqCst);
+    if trace {
+        eprintln!("[web] CefShutdown returned — page engine is down");
     }
 }
+
+/// Ask eave to quit, the orderly way: the page engine is stopped on the
+/// pump's stack and only then does gpui terminate.
+///
+/// Returns whether it took ownership of the quit. `false` means there is no
+/// page engine running and the caller should just quit normally.
+pub fn request_quit() -> bool {
+    if !running() {
+        return false;
+    }
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+    request_pump();
+    true
+}
+
+/// How long [`shutdown`] pumps waiting for the browsers to report closed
+/// before giving up and exiting without `CefShutdown`.
+const SHUTDOWN_WAIT_MS: u64 = 3000;
+/// How long each pump-and-check step waits. One millisecond: the point is to
+/// pump often, not to wait.
+const SHUTDOWN_STEP_MS: u64 = 1;
+/// How many consecutive pumps must raise no schedule request before the
+/// queue counts as drained.
+const SHUTDOWN_QUIET_ROUNDS: u32 = 50;
+/// How long `CefShutdown` gets before the watchdog exits the process anyway.
+const SHUTDOWN_DEADLINE_MS: u64 = 1500;
+

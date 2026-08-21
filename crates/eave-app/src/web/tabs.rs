@@ -79,8 +79,27 @@ pub fn has_browser(tab_id: &str) -> bool {
 }
 
 /// Do something with a tab's browser, if it has one.
+///
+/// **The borrow ends BEFORE `f` runs, and that is the whole point of the
+/// clone.** `f` is routinely a call into CEF — `close_browser`, `load_url`,
+/// `send_key_event` — and under an external message pump CEF runs its
+/// handlers *synchronously*, on this stack. `close_browser` calls
+/// `on_before_close`, which takes `BROWSERS.borrow_mut()`. The obvious
+/// one-liner (`b.borrow().get(tab_id).map(f)`) keeps the shared borrow alive
+/// across `f` and therefore aborts the app on `already borrowed` every time
+/// a browser is closed: Slice C6 measured ⌘Q doing it on `main` and C5's
+/// departed-tab reaper doing it on ⌘W.
+///
+/// This is the general rule the whole `web` module is written to now: **a
+/// foreign event loop is lent every borrow you hold.** Nine call sites route
+/// through here, so the discipline belongs in the helper — fixing it at a
+/// call site fixes that call site and nothing else.
+///
+/// `Browser` is a refcounted CEF handle, so `cloned()` is a retain and not a
+/// copy of the browser.
 pub fn with_browser<R>(tab_id: &str, f: impl FnOnce(&Browser) -> R) -> Option<R> {
-    BROWSERS.with(|b| b.borrow().get(tab_id).map(f))
+    let browser = BROWSERS.with(|b| b.borrow().get(tab_id).cloned())?;
+    Some(f(&browser))
 }
 
 /// Reconcile the page engine against the tab strip.
@@ -213,7 +232,23 @@ pub fn close_all() {
             }
         });
     }
-    BROWSERS.with(|b| b.borrow_mut().clear());
+    // **Deliberately does NOT clear the map.** Closing is asynchronous even
+    // when forced: `close_browser(1)` only asks, and `on_before_close` — which
+    // is what removes the entry — runs on a later pump. Clearing here would
+    // make `any_browser()` report "all closed" the instant we asked, which is
+    // precisely the lie that made `CefShutdown` hang: the caller believed the
+    // browsers were gone and called it while Chromium still had one live.
+    // An empty map is the readiness signal; see `host::shutdown`.
+}
+
+/// Drop every browser handle we still hold, with **no borrow held** — each
+/// drop is a CEF release, and a release is a call into CEF like any other.
+///
+/// The last-resort partner to [`close_all`], for the case where a browser
+/// never reported itself closed.
+pub fn forget_all() {
+    let taken = BROWSERS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    drop(taken);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,11 +316,17 @@ wrap_life_span_handler! {
                 // Explicit, not inherited. CEF's default here is 30.
                 host.set_windowless_frame_rate(FRAME_RATE);
             }
-            BROWSERS.with(|b| b.borrow_mut().insert(self.tab_id.clone(), browser));
+            // `insert` returns whatever it evicted; dropping that here
+            // rather than inside the closure keeps the CEF release off a
+            // stack that holds the borrow.
+            let evicted = BROWSERS.with(|b| b.borrow_mut().insert(self.tab_id.clone(), browser));
+            drop(evicted);
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
-            BROWSERS.with(|b| { b.borrow_mut().remove(&self.tab_id); });
+            // Removed, then dropped outside the borrow — see `with_browser`.
+            let gone = BROWSERS.with(|b| b.borrow_mut().remove(&self.tab_id));
+            drop(gone);
             super::osr::forget(&self.tab_id);
         }
     }
