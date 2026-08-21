@@ -6,6 +6,7 @@
 
 pub mod acp;
 pub mod attention;
+pub mod browser;
 pub mod capabilities;
 pub mod claude;
 pub mod codex;

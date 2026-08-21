@@ -146,6 +146,13 @@ async fn drain_records(
             SubscriptionItem::Attention { .. }
             | SubscriptionItem::Sessions { .. }
             | SubscriptionItem::Files { .. } => {}
+            // Slice B1: browser frames flow on their own subscription
+            // ids and are demultiplexed by the client, so one arriving
+            // here would mean the demux itself broke. Say so loudly
+            // rather than drop it into the ignore arm above.
+            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+                panic!("a browser frame arrived on a session subscription")
+            }
         }
     }
     got
