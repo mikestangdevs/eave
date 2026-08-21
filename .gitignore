@@ -7,7 +7,11 @@
 target/
 *.app/
 
-# The spike copies the pinned gpui fork here to patch it locally. The COPY is
-# not committed — `spike/gpui-bgra-surface.patch` is the artefact that matters,
-# and it applies to rev 5d1f83d9f27a19bec1fb241dc33b42238af9cf8d.
+# The spike's local copy of the pinned gpui fork. Never committed; the fork
+# change it carried is now a real commit (8521fc1, see eave-app/Cargo.toml)
+# and `spike/gpui-bgra-surface.patch` has been retired.
 spike/zed-fork/
+
+# Generated at package time by `scripts/package-web.sh` — a blank placeholder
+# until eave has real app-icon artwork, and a derived file either way.
+crates/eave-app/resources/mac/eave.icns

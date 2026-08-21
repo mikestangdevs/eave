@@ -331,6 +331,13 @@ wrap_render_handler! {
             info: Option<&AcceleratedPaintInfo>,
         ) {
             let Some(info) = info else { return };
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                let n = FRAMES.load(Ordering::Relaxed);
+                if n < 4 || n.is_multiple_of(200) {
+                    eprintln!("[web] accel_paint #{n} type={:?} {}x{}", type_,
+                        info.extra.coded_size.width, info.extra.coded_size.height);
+                }
+            }
             // A `<select>` dropdown is a SECOND surface with its own
             // geometry. Compositing and hit-testing it is the next slice;
             // dropping it here is deliberate and visible (the widget simply
@@ -355,6 +362,9 @@ wrap_render_handler! {
             _width: i32,
             _height: i32,
         ) {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] cpu on_paint {_width}x{_height}");
+            }
             if type_ == PaintElementType::POPUP {
                 return;
             }

@@ -163,4 +163,4 @@ usvg = { version = "0.46.0", default-features = false }
 # notarized. See docs/reports/stage-c1-osr.md.
 [package.metadata.cef.bundle]
 helper_name = "eave-web-helper"
-resources_path = "resources/cef"
+resources_path = "resources"

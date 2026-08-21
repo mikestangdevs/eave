@@ -236,6 +236,26 @@ pub fn child_pids(of: u32) -> Option<Vec<i32>> {
     )
 }
 
+/// The executable a pid is running, as an absolute path.
+///
+/// Needed because "child of this process" is not specific enough to name a
+/// cost: eave's own engine is a child of the app, so a naive walk bills the
+/// agent's memory to the browser. The path is what tells a Chromium helper
+/// apart from an engine.
+///
+/// `None` if the process is gone or the kernel will not say.
+pub fn exe_path(pid: i32) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE is 4 * MAXPATHLEN (1024).
+    let mut buf = vec![0u8; 4 * 1024];
+    let n =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
+}
+
 /// Physical memory installed in the machine, in bytes — the denominator
 /// of the aggregate resource fact (Stage L). `None` if the sysctl fails,
 /// in which case the fact states the sum alone and no ratio: a made-up

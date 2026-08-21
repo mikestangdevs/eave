@@ -68,6 +68,11 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+/// Whether any tab has a live browser. The pump parks when this is false.
+pub fn any_browser() -> bool {
+    BROWSERS.with(|b| !b.borrow().is_empty())
+}
+
 /// Whether a tab has a live browser.
 pub fn has_browser(tab_id: &str) -> bool {
     BROWSERS.with(|b| b.borrow().contains_key(tab_id))
@@ -84,6 +89,15 @@ pub fn with_browser<R>(tab_id: &str, f: impl FnOnce(&Browser) -> R) -> Option<R>
 /// common case, because the strip's 120 ms fold means this is not called at
 /// spinner rate.
 pub fn drive(snapshot: &TabsSnapshot) {
+    if std::env::var("EAVE_WEB_TRACE").is_ok() {
+        eprintln!(
+            "[web] drive running={} tabs={} active={:?} pending={:?}",
+            super::host::running(),
+            snapshot.tabs.len(),
+            snapshot.active,
+            snapshot.tabs.first().and_then(|t| t.pending.clone()),
+        );
+    }
     if !super::host::running() {
         return;
     }
@@ -102,21 +116,53 @@ pub fn drive(snapshot: &TabsSnapshot) {
     };
 
     if !has_browser(&tab.id) {
-        create(&tab.id, tab.url.as_deref());
+        // The pending request is the start url, not a load to issue after
+        // creation. `browser_host_create_browser` is ASYNC — the browser
+        // does not exist until `on_after_created` — so creating and then
+        // immediately calling `load_url` finds nothing to call it on, and
+        // the request is lost with no error anywhere. (It cost a launch to
+        // find: the tab opened, the strip showed it, and the page stayed
+        // blank because the load had been dropped into a `None`.)
+        let start = tab
+            .pending
+            .as_ref()
+            .map(|p| p.url.as_str())
+            .or(tab.url.as_deref());
+        create(&tab.id, start);
+        // Creating a browser is work CEF has to be pumped to finish.
+        super::host::request_pump();
+        super::host::note_activity();
+        if let Some(pending) = tab.pending.as_ref() {
+            // Marked as acted because the browser IS starting there.
+            ACTED.with(|a| {
+                a.borrow_mut().insert(tab.id.clone(), pending.seq);
+            });
+        }
+        return;
     }
 
     // A navigation the operator asked for and nothing has answered.
     if let Some(pending) = tab.pending.as_ref() {
         let already = ACTED.with(|a| a.borrow().get(&tab.id).copied());
         if already != Some(pending.seq) {
-            ACTED.with(|a| {
-                a.borrow_mut().insert(tab.id.clone(), pending.seq);
-            });
-            with_browser(&tab.id, |b| {
-                if let Some(frame) = b.main_frame() {
+            // Recorded only if it actually issued. Marking first and
+            // failing second is what loses a navigation permanently: the
+            // request would never be retried, because nothing about the
+            // tab changes to prompt one.
+            let issued = with_browser(&tab.id, |b| match b.main_frame() {
+                Some(frame) => {
                     frame.load_url(Some(&CefString::from(pending.url.as_str())));
+                    true
                 }
+                None => false,
             });
+            if issued == Some(true) {
+                ACTED.with(|a| {
+                    a.borrow_mut().insert(tab.id.clone(), pending.seq);
+                });
+                super::host::request_pump();
+                super::host::note_activity();
+            }
         }
     }
 }
@@ -141,6 +187,9 @@ fn create(tab_id: &str, url: Option<&str>) {
         ..Default::default()
     };
 
+    if std::env::var("EAVE_WEB_TRACE").is_ok() {
+        eprintln!("[web] creating browser for {tab_id} at {url:?}");
+    }
     let mut client = PageClient::new(tab_id.to_string());
     let start = CefString::from(url.unwrap_or("about:blank"));
     browser_host_create_browser(
@@ -173,17 +222,24 @@ pub fn close_all() {
 
 /// Resident bytes across the CEF process tree, and how many processes.
 ///
-/// **What this counts and does not**: the helper processes CEF spawned as
-/// children of this one — renderer, GPU, network, and the rest. It does NOT
-/// count this process, because this process is also eave: gpui, the rail,
-/// the transcript. Attributing all of it to "web" would inflate the number
-/// with the app itself, and there is no honest way to split one address
-/// space. So the figure is the page's own processes, and it is an
-/// UNDERCOUNT by whatever Chromium holds in ours.
+/// **What this counts and does not**: the helper processes CEF spawned —
+/// renderer, GPU, network, and the rest.
 ///
-/// The same two limits the agent line already states apply here too:
-/// resident sizes double-count shared pages, so a sum across processes is
-/// an upper bound per process and a lower bound overall.
+/// It does NOT count this process, because this process is also eave: gpui,
+/// the rail, the transcript. Attributing all of it to "web" would bill the
+/// app to the browser, and there is no honest way to split one address
+/// space. So the figure is the page's own processes, and it is an
+/// **undercount** by whatever Chromium holds in ours — measured at ~141 MB
+/// for the combined app-and-browser process against ~322 MB of helpers.
+///
+/// It also does not count **eave's own engine**, which is a child of this
+/// process too. Filtering on "is a child" alone billed the agent engine to
+/// the browser and made the rail say six processes where five were the
+/// page's — caught by taking a census rather than trusting the line. The
+/// executable path is what tells them apart.
+///
+/// The same limit the agent line states applies here: resident sizes
+/// double-count shared pages, so a sum across processes is an upper bound.
 pub fn web_memory() -> Option<(usize, u64)> {
     if !super::host::running() {
         return None;
@@ -192,6 +248,12 @@ pub fn web_memory() -> Option<(usize, u64)> {
     let mut n = 0;
     let mut total = 0u64;
     for pid in children {
+        // CEF's helpers are the nested `<name> Helper*.app` bundles the
+        // packaging step creates; nothing else in eave's tree is one.
+        let is_helper = eave_core::proc::exe_path(pid).is_some_and(|p| p.contains("Helper"));
+        if !is_helper {
+            continue;
+        }
         if let Some(bytes) = eave_core::proc::resident_bytes(pid) {
             n += 1;
             total += bytes;
@@ -211,6 +273,9 @@ wrap_life_span_handler! {
 
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] browser created for {}", self.tab_id);
+            }
             let Some(browser) = browser.cloned() else { return };
             if let Some(host) = browser.host() {
                 // Explicit, not inherited. CEF's default here is 30.
@@ -241,6 +306,11 @@ wrap_load_handler! {
             frame: Option<&mut Frame>,
             _transition_type: TransitionType,
         ) {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] on_load_start is_main={:?} url={:?}",
+                    frame.as_ref().map(|f| f.is_main()),
+                    frame.as_ref().map(|f| CefString::from(&f.url()).to_string()));
+            }
             let Some(frame) = frame else { return };
             // Sub-frames load constantly and are not the tab's address. An
             // iframe's url in the omnibox is the classic version of this bug.
@@ -261,6 +331,9 @@ wrap_load_handler! {
             frame: Option<&mut Frame>,
             _http_status_code: i32,
         ) {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] on_load_end status={_http_status_code}");
+            }
             if frame.map(|f| f.is_main()) != Some(1) {
                 return;
             }
@@ -275,6 +348,9 @@ wrap_load_handler! {
             error_text: Option<&CefString>,
             _failed_url: Option<&CefString>,
         ) {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] on_load_error {:?}", error_text.map(|t| t.to_string()));
+            }
             if frame.map(|f| f.is_main()) != Some(1) {
                 return;
             }
@@ -293,6 +369,9 @@ wrap_display_handler! {
 
     impl DisplayHandler {
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] on_title_change {:?}", title.map(|t| t.to_string()));
+            }
             let title = title.map(|t| t.to_string()).filter(|t| !t.is_empty());
             report(&self.tab_id, PageFact::Titled { title });
         }

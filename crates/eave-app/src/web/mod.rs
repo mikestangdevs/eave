@@ -24,6 +24,15 @@
 //! happened back through `tab_stated` frames. Nothing here writes tab state
 //! directly, and nothing in the engine knows Chromium exists.
 //!
+//! # Diagnostics
+//! `EAVE_WEB_TRACE=1` narrates the page engine's lifecycle on stderr: every
+//! reconciliation, every browser created, the load callbacks, the pump, and
+//! the first frames. It is here because three of this slice's four real
+//! defects were invisible without it — a pump that stopped after two calls,
+//! a navigation dropped into a browser that did not exist yet, and an app
+//! object whose drop took CEF's only callback with it. None of them
+//! produced an error; all of them produced a blank page.
+//!
 //! # Feature gate
 //! Everything real is behind `--features web`. With the feature off this
 //! module is a set of no-ops with the same signatures, so the shell has one
@@ -44,7 +53,7 @@ mod page;
 mod tabs;
 
 #[cfg(feature = "web")]
-pub use host::{initialize, install_nsapp, set_repaint_handle, shutdown};
+pub use host::{initialize, install_nsapp, shutdown, start_pump};
 #[cfg(feature = "web")]
 pub use page::page_element;
 #[cfg(feature = "web")]
@@ -86,9 +95,9 @@ pub fn initialize() -> bool {
 #[cfg(not(feature = "web"))]
 pub fn shutdown() {}
 
-/// Hand the page engine a way to wake the window when a frame arrives.
+/// Start pumping CEF on gpui's executor. Nothing to pump here.
 #[cfg(not(feature = "web"))]
-pub fn set_repaint_handle(_cx: gpui::AsyncApp) {}
+pub fn start_pump(_cx: &mut gpui::App) {}
 
 /// Reconcile the browser against the tab strip: open what is missing, and
 /// send whatever tab is asking to navigate where it asked to go.

@@ -94,6 +94,8 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                     );
                     input::focus(b, true);
                 });
+                super::host::note_activity();
+                super::host::request_pump();
             })
             .on_mouse_up(gpui::MouseButton::Left, move |ev, _window, _cx| {
                 super::tabs::with_browser(&up_id, |b| {
@@ -106,6 +108,8 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                         ev.click_count as i32,
                     );
                 });
+                super::host::note_activity();
+                super::host::request_pump();
             })
             .on_mouse_move(move |ev, _window, _cx| {
                 super::tabs::with_browser(&move_id, |b| {
@@ -134,11 +138,15 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                         f32::from(d.y) as i32,
                     );
                 });
+                super::host::note_activity();
+                super::host::request_pump();
             })
             .on_key_down(move |ev, _window, _cx| {
                 super::tabs::with_browser(&key_id, |b| {
                     input::key(b, &ev.keystroke);
                 });
+                super::host::note_activity();
+                super::host::request_pump();
             })
             .child(PageSurface { tab_id: id })
             .into_any_element(),

@@ -409,7 +409,56 @@ async fn feed_loop(
                 let Ok(mut rx) = client.watch_tabs().await else {
                     return;
                 };
+                // `EAVE_WEB_AT_BOOT=<url>` opens one page tab and asks it to
+                // navigate, once, on the first snapshot that shows no page
+                // tab already open.
+                //
+                // The same shape as `EAVE_LAUNCH_AT_BOOT`, and for the same
+                // reason: eave has no tab strip and no omnibox yet, so
+                // without this there is no way to reach a page at all — and
+                // a capture of a browser that cannot be told where to go is
+                // not a capture of anything. It is also what makes the
+                // screenshot in the slice report reproducible.
+                let mut boot_url = std::env::var("EAVE_WEB_AT_BOOT").ok();
                 loop {
+                    if let Some(url) = boot_url.clone() {
+                        // Only once, and only if nothing is there: a
+                        // reconnect must not open a second tab.
+                        let snapshot = rx.recv().await;
+                        let Some(SubscriptionItem::Tabs { snapshot }) = snapshot else {
+                            return;
+                        };
+                        let existing = snapshot
+                            .tabs
+                            .iter()
+                            .find(|t| t.content == eave_wire::TabContent::Page)
+                            .map(|t| t.id.clone());
+                        let tab = match existing {
+                            Some(id) => id,
+                            None => {
+                                match client
+                                    .browser_create(eave_wire::Request::TabOpen {
+                                        url: None,
+                                        group: None,
+                                        index: None,
+                                        content: eave_wire::TabContent::Page,
+                                        opener: None,
+                                        activate: true,
+                                    })
+                                    .await
+                                {
+                                    Ok(id) => id,
+                                    Err(_) => return,
+                                }
+                            }
+                        };
+                        let _ = client
+                            .browser_do(eave_wire::Request::TabNavigate { tab_id: tab, url })
+                            .await;
+                        boot_url = None;
+                        plumbing.push_tabs(snapshot);
+                        continue;
+                    }
                     tokio::select! {
                         item = rx.recv() => match item {
                             Some(SubscriptionItem::Tabs { snapshot }) => {
@@ -8437,6 +8486,22 @@ impl Render for Shell {
         }
 
         // Before the immutable reads below: this one takes a pulse lease.
+        // **Slice C1: a page is a TAB, not a window.** eave is one
+        // application — a browser and an IDE — so a web page takes the
+        // content well exactly as a transcript does, and which one is
+        // showing is decided by the active tab's `TabContent`. That is what
+        // B1's model already says: one strip, one `active`, two kinds of
+        // tab.
+        //
+        // `None` in a build without the page engine, and `None` for a tab
+        // whose browser has not been created yet; in both cases the
+        // transcript renders, which is what was there before.
+        let page_el = {
+            let active = self.web_tabs.read(cx).snapshot.active.clone();
+            active.and_then(|id| crate::web::page_element(&id, cx))
+        };
+        let showing_page = page_el.is_some();
+
         let caret_lit = self.caret_lit(cx);
         // Slice N3: ONE ask for the whole window, here in the root
         // render pass. The shell decides once whether anything is
@@ -8495,7 +8560,11 @@ impl Render for Shell {
             let t = &self.transcript.read(cx).transcript;
             usage_line(t.turn_tokens, t.context)
         };
-        let show_launcher = state.session_id.is_none();
+        // A window showing a PAGE is not at rest, so the launcher does not
+        // belong over it. This was photographed drawing straight through
+        // example.com: the launcher's occlusion assumption was written when
+        // the only thing it could ever cover was an empty transcript.
+        let show_launcher = state.session_id.is_none() && !showing_page;
         let launch_error = state.launch_error.clone();
         let empty_state: Option<EmptyState> = if !state.display.is_empty() {
             None
@@ -8510,16 +8579,6 @@ impl Render for Shell {
         } else {
             None
         };
-
-        // Slice C1: the page, when the active tab is one and it has a live
-        // browser. `None` in a build without the feature, and `None` for a
-        // tab whose browser has not been created yet — in both cases the
-        // transcript renders, which is what was there before.
-        let page_el = {
-            let active = self.web_tabs.read(cx).snapshot.active.clone();
-            active.and_then(|id| crate::web::page_element(&id, cx))
-        };
-        let showing_page = page_el.is_some();
 
         let transcript_el = list(list_state, move |ix, _window, cx| {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
@@ -8875,24 +8934,14 @@ impl Render for Shell {
                                     // outside the scope — the pill and the
                                     // composer must not fade along with
                                     // the content they occlude.
-                                    // Slice C1: the page takes the well's
-                                    // reading column when a web tab is
-                                    // active, and everything below in this
-                                    // stack — the composer, the pill, the
-                                    // notice — stays exactly where it is,
-                                    // floating OVER it. That is the whole
-                                    // payoff of off-screen rendering: the
-                                    // page is an ordinary scene primitive,
-                                    // so `BackdropBlur` samples it like any
-                                    // other pixels and the frost is real
-                                    // rather than a hole.
-                                    //
-                                    // No `edge_faded` wrapper on the page:
-                                    // the fade exists to dissolve a
-                                    // SCROLLING LOG into the well's edges,
-                                    // and a page scrolls itself. Fading its
-                                    // top and bottom would dim content the
-                                    // page believes is fully visible.
+                                    // The page takes the well when a web
+                                    // tab is active. No `edge_faded`
+                                    // wrapper on it: that fade exists to
+                                    // dissolve a SCROLLING LOG into the
+                                    // well's edges, and a page scrolls
+                                    // itself — fading its top and bottom
+                                    // would dim content the page believes
+                                    // is fully visible.
                                     .children(page_el)
                                     .when(!showing_page, |d| {
                                         d.child(
@@ -8927,7 +8976,7 @@ impl Render for Shell {
                                     // scope and the virtualized list, so
                                     // it can never touch a row height.
                                     .children(launcher_el)
-                                    .when(show_affordance, |d| {
+                                    .when(show_affordance && !showing_page, |d| {
                                         // §1.6, 180 ms. comet approximates a
                                         // `scale 0.96→1` with fade + a 2 px
                                         // rise because gpui divs have no
@@ -9005,14 +9054,27 @@ impl Render for Shell {
                                             .flex()
                                             .flex_col()
                                             .children(self.conn_panel(cx))
-                                            .children(notice)
-                                            .children(trailer)
+                                            // Everything from here down is
+                                            // AGENT chrome — a notice about
+                                            // a session, its working
+                                            // trailer, its `/` palette, its
+                                            // composer. **None of it belongs
+                                            // over a web page.** A prompt
+                                            // box floating on somebody
+                                            // else's document is not a
+                                            // browser; the agent's surfaces
+                                            // live on the agent's tab. The
+                                            // connection panel above stays:
+                                            // it is about the engine, and it
+                                            // is true whichever tab is open.
+                                            .children(notice.filter(|_| !showing_page))
+                                            .children(trailer.filter(|_| !showing_page))
                                             // Slice AR — the `/` palette,
                                             // an ordinary sibling directly
                                             // above the composer. See
                                             // `Shell::slash_layer` for why
                                             // this is not `menu_layer`.
-                                            .children(slash_layer)
+                                            .children(slash_layer.filter(|_| !showing_page))
                                             // Slice Q2: no session, no
                                             // composer. A draft typed at
                                             // the launcher has nothing to
@@ -9024,7 +9086,10 @@ impl Render for Shell {
                                             // silently eats what you type
                                             // is the one thing this must
                                             // not be.
-                                            .children((!show_launcher).then_some(composer)),
+                                            .children(
+                                                (!show_launcher && !showing_page)
+                                                    .then_some(composer),
+                                            ),
                                     ),
                             )
                             .child(self.footer(cx)),
@@ -9234,7 +9299,11 @@ pub fn run(data_dir: PathBuf) -> ! {
                 // ONLY when a frame actually arrived — never on vsync — so
                 // an idle page (1 frame in 9 seconds, measured) costs no
                 // redraws at all.
-                crate::web::set_repaint_handle(cx.to_async());
+                // CEF asks to be pumped; this is what answers. Must come
+                // after the window exists, and the requests CEF raised
+                // during `initialize` are queued waiting for it. The pump
+                // is also what asks gpui to redraw when a frame lands.
+                crate::web::start_pump(cx);
                 // A windowless browser makes `CefShutdown` block forever,
                 // so the browsers have to go first. `on_app_quit` runs
                 // while the app still exists, which `std::process::exit`
