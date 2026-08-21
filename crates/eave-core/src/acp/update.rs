@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::acp::wire::malformed;
 use crate::events::{cap_payload, SessionEvent};
+use crate::tool::{self, ToolCall};
 
 /// Where an agent puts the tool's real name.
 #[derive(Clone, Copy)]
@@ -128,9 +129,16 @@ impl AcpStream {
                 if !self.is_outstanding(&id) {
                     self.outstanding.push(id.clone());
                 }
+                // Slice CB x CA: typing happens here, once, for both ACP
+                // agents. It reads the name the spec resolved rather than
+                // re-deriving it, so Grok's `_meta["x.ai/tool"]` and
+                // Hermes' title convention each reach the decoder already
+                // settled.
+                let name = tool_name(spec.tool_naming, update);
                 vec![SessionEvent::ToolUseStarted {
+                    call: Some(decode_acp_tool(update, &name)),
                     id,
-                    name: tool_name(spec.tool_naming, update),
+                    name,
                     input: tool_input(spec.tool_input, update),
                 }]
             }
@@ -269,4 +277,44 @@ pub fn flatten_content(content: Option<&Value>) -> String {
         out.push(piece.unwrap_or_else(|| item.to_string()));
     }
     out.join("\n")
+}
+
+/// Decode an ACP `tool_call` update into a typed [`ToolCall`], keyed by
+/// the agent's own tool name first and the protocol's `kind` second.
+///
+/// The name comes first because **Grok omits `kind` on every `tool_call`
+/// update** — it sends one on `session/request_permission`, but not on the
+/// stream — so the protocol field alone would type every Grok tool as
+/// `Unknown`. Hermes does send `kind`, and falls through to
+/// [`tool::from_acp_update`] for everything not named here.
+///
+/// Both named cases are correct for either agent, which is why they live
+/// in the shared decoder rather than in a spec field: a tool called
+/// `write` writes a file whoever sent it, and only Grok has
+/// `spawn_subagent` at all.
+///
+/// A tool that types to nothing keeps the AGENT's own name on
+/// [`ToolCall::Unknown`] rather than the protocol's empty default — never
+/// a guess, and never a blank.
+fn decode_acp_tool(update: &Value, name: &str) -> ToolCall {
+    let raw = update.get("rawInput").filter(|v| !v.is_null());
+    match name {
+        // eave has no subagent UI, so unlike comet — which names the chip
+        // `Agent: {description}` because that string also names the tab it
+        // opens — this is a plain `Task` and nothing keys off it.
+        "spawn_subagent" => ToolCall::Task {
+            description: raw
+                .and_then(|r| tool::text(r, "description"))
+                .unwrap_or_default(),
+        },
+        "write" => ToolCall::Write {
+            path: raw
+                .and_then(|r| tool::text_any(r, &["file_path", "path", "filePath"]))
+                .unwrap_or_default(),
+        },
+        _ => match tool::from_acp_update(update) {
+            ToolCall::Unknown { .. } => ToolCall::Unknown { name: name.into() },
+            typed => typed,
+        },
+    }
 }

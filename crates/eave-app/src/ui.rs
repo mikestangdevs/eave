@@ -6318,6 +6318,7 @@ impl Shell {
                 input,
                 result,
                 is_error,
+                call,
             } => {
                 // Slice Z: a tool with anything to show can be opened, and
                 // a FAILED one shows its reason without being opened —
@@ -6330,12 +6331,17 @@ impl Shell {
                     ToolStatus::Finished => ("done", theme::text_tertiary()),
                     ToolStatus::Interrupted => ("interrupted", theme::danger()),
                 };
-                // What the tool was ASKED to do. Until this slice a row was
+                // What the tool was ASKED to do. Until Slice V a row was
                 // the tool's name and a status word, so an agent running
                 // `cargo test --workspace` rendered "Bash  done" — the one
                 // fact an operator is watching for was the one eave threw
-                // away (`stream.rs` kept the id and dropped the input).
-                let detail = eave_wire::model::tool_detail(name, input);
+                // away. Slice V recovered it for Claude by guessing the
+                // shape from the tool's name; the typed `call` is the
+                // adapter's own decode, which is the only thing that could
+                // ever answer for a Codex `commandExecution` or a Pi
+                // `bash`. The name-keyed guess stays behind it, for
+                // journals written before adapters decoded anything.
+                let detail = eave_wire::model::tool_detail(call.as_ref(), name, input);
                 // A failed tool states why. A successful one does not: its
                 // output is usually long, usually uninteresting, and always
                 // a row height inside a virtualized list.

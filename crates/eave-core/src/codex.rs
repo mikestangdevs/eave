@@ -81,6 +81,7 @@ use crate::session::{
     AgentSession, ApprovalDecision, KillReport, SessionError, SessionWatch, SpawnConfig,
 };
 use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
+use crate::tool::{self, ToolCall};
 
 const STDERR_RING_CAP: usize = 4096;
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -1150,6 +1151,7 @@ impl CodexProtocol {
         self.items.insert(id.to_string(), item.clone());
         Step::from_event(SessionEvent::ToolUseStarted {
             id: id.to_string(),
+            call: Some(decode_tool(kind, item, &name)),
             name,
             input: cap_payload(&tool_input(kind, item)),
         })
@@ -1289,6 +1291,52 @@ fn tool_name(kind: &str, item: &Value) -> Option<String> {
         "dynamicToolCall" => Some(format!("tool:{}", s("tool"))),
         "collabAgentToolCall" => Some(format!("agent:{}", s("tool"))),
         _ => None,
+    }
+}
+
+/// Decode a thread item into a typed [`ToolCall`].
+///
+/// `name` is whatever [`tool_name`] already decided to call this item, so
+/// an unrecognised kind keeps exactly the label the row shows rather than
+/// inventing a second one.
+fn decode_tool(kind: &str, item: &Value, name: &str) -> ToolCall {
+    match kind {
+        "commandExecution" => ToolCall::Run {
+            command: tool::text(item, "command").unwrap_or_default(),
+        },
+        // The app-server states a file operation as a list of changes
+        // (`[{path, kind: add|update|delete}]`, capture: fake_codex.rs
+        // `file-approval`), never as a tool name. One `add` is a write and
+        // one `update` an edit; a delete, or several files at once, is a
+        // patch — the same reduction comet settled on
+        // (`comet/crates/harness/src/codex/normalize.rs:100`
+        // `file_change_call`), reached from the same wire.
+        "fileChange" => {
+            let changes = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let path = |c: &Value| tool::text(c, "path").unwrap_or_default();
+            match changes {
+                [one] => match one.get("kind").and_then(Value::as_str) {
+                    Some("add") => ToolCall::Write { path: path(one) },
+                    Some("update") => ToolCall::Edit { path: path(one) },
+                    _ => ToolCall::Patch {
+                        path: tool::text(one, "path"),
+                    },
+                },
+                _ => ToolCall::Patch { path: None },
+            }
+        }
+        "webSearch" => ToolCall::WebSearch {
+            query: tool::text(item, "query").unwrap_or_default(),
+        },
+        // `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`,
+        // `imageView`, `imageGeneration`, and whatever 0.149 adds. Named,
+        // never guessed — and `tool_name` has already given them a label
+        // (`mcp:server/tool`, `tool:name`) that the row renders.
+        _ => ToolCall::Unknown { name: name.into() },
     }
 }
 

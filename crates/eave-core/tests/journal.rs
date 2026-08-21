@@ -381,6 +381,7 @@ fn crash_tail_repair_settles_open_turn_as_interrupted() {
         id: "toolu_x".into(),
         name: "Bash".into(),
         input: String::new(),
+        call: None,
     }))
     .unwrap();
     w.sync().unwrap();

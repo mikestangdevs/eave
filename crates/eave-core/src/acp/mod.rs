@@ -121,7 +121,13 @@ impl AcpSpec {
 /// to close that; when it lands, this function is the only line that
 /// moves.
 pub fn resume_cursor(cfg: &SpawnConfig) -> Option<String> {
-    cfg.resume.then(|| cfg.session_id.clone())
+    // Slice CD: the cursor IS `cfg.resume` now. Both agents here mint their
+    // own id at `session/new` and ACP offers no way to propose one, so
+    // `cfg.session_id` — the id eave would like — never reaches this wire
+    // and must never be handed to `session/load`. The old spelling,
+    // `cfg.resume.then(|| cfg.session_id.clone())`, asked these agents to
+    // load a session they had never created.
+    cfg.resume.clone()
 }
 
 /// What eave concluded about a stated permission posture.

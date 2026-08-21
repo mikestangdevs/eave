@@ -79,6 +79,7 @@ use crate::session::{
     AgentSession, ApprovalDecision, KillReport, SessionError, SessionWatch, SpawnConfig,
 };
 use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
+use crate::tool::{self, ToolCall};
 
 const STDERR_RING_CAP: usize = 4096;
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -904,13 +905,15 @@ impl PiStream {
                 if !self.outstanding.insert(id.to_string()) {
                     return Vec::new();
                 }
+                let name = v
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 vec![SessionEvent::ToolUseStarted {
                     id: id.to_string(),
-                    name: v
-                        .get("toolName")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                    call: Some(decode_tool(&name, v.get("args").unwrap_or(&Value::Null))),
+                    name,
                     input: cap_payload(&compact(v.get("args"))),
                 }]
             }
@@ -1151,6 +1154,48 @@ fn gate_refusal(reason: impl Into<String>) -> SessionEvent {
     SessionEvent::PostureRefused {
         mode: "ungated".into(),
         reason: reason.into(),
+    }
+}
+
+/// Decode a Pi `tool_execution_start` into a typed [`ToolCall`].
+///
+/// Pi speaks its own RPC rather than ACP, so there is no `kind` to lean on
+/// — the tool name IS the type. The names and argument keys below are read
+/// off Pi 0.84.2's own bundled tool schemas
+/// (`@earendil-works/pi-coding-agent/dist/core/tools/*.d.ts`), not
+/// guessed: `bash{command}`, `read{path}`, `write{path}`, `edit{path,
+/// edits[]}`, `find{pattern}`, `grep{pattern}`, `ls{path?}`.
+///
+/// Two of them have no counterpart in comet's enum, because none of
+/// comet's agents ship them:
+///
+/// - `find` is a **glob over file names** ("Find files by glob pattern"),
+///   not a content search, so it is [`ToolCall::Glob`] and not
+///   [`ToolCall::Grep`]. Reading it as a grep would put a filename pattern
+///   under a heading that says the file contents were searched.
+/// - `ls` is [`ToolCall::List`], the one variant eave added outright. Its
+///   `path` is optional — absent means the session's cwd, which the row
+///   already states, so nothing is invented to fill it.
+///
+/// Anything else — an MCP tool, an extension's tool, whatever 0.85 adds —
+/// is [`ToolCall::Unknown`] under Pi's own name.
+fn decode_tool(name: &str, args: &Value) -> ToolCall {
+    let text = |key: &str| tool::text(args, key).unwrap_or_default();
+    match name {
+        "bash" => ToolCall::Run {
+            command: text("command"),
+        },
+        "read" => ToolCall::Read { path: text("path") },
+        "write" => ToolCall::Write { path: text("path") },
+        "edit" => ToolCall::Edit { path: text("path") },
+        "find" => ToolCall::Glob {
+            pattern: text("pattern"),
+        },
+        "grep" => ToolCall::Grep {
+            pattern: text("pattern"),
+        },
+        "ls" => ToolCall::List { path: text("path") },
+        _ => ToolCall::Unknown { name: name.into() },
     }
 }
 
@@ -1416,10 +1461,23 @@ mod tests {
         let mut s = stream();
         let start = r#"{"type":"tool_execution_start","toolCallId":"call_stub_1","toolName":"bash","args":{"command":"echo hi"}}"#;
         match s.parse_line(start).as_slice() {
-            [SessionEvent::ToolUseStarted { id, name, input }] => {
+            [SessionEvent::ToolUseStarted {
+                id,
+                name,
+                input,
+                call,
+            }] => {
                 assert_eq!(id, "call_stub_1");
                 assert_eq!(name, "bash");
                 assert!(input.contains("echo hi"));
+                // The point of the typed lens: the row can read as the
+                // command, not as `bash`.
+                assert_eq!(
+                    call.as_ref(),
+                    Some(&ToolCall::Run {
+                        command: "echo hi".into()
+                    })
+                );
             }
             other => panic!("expected a tool start, got {other:?}"),
         }
@@ -1753,6 +1811,77 @@ mod tests {
         assert!(
             !text.contains(GATE_MARKER_COMMAND),
             "a bare Pi must not carry eave's gate — if it does, this test is lying to us"
+        );
+    }
+
+    /// Pi's whole tool surface, decoded from the names and argument keys
+    /// in its own bundled schemas
+    /// (`@earendil-works/pi-coding-agent/dist/core/tools/*.d.ts`, 0.84.2)
+    /// rather than from a guess at what a tool called `find` probably does.
+    #[test]
+    fn every_pi_tool_decodes_to_its_one_argument() {
+        let d = |name: &str, args: serde_json::Value| decode_tool(name, &args);
+        assert_eq!(
+            d(
+                "read",
+                serde_json::json!({"path": "/src/lib.rs", "offset": 40})
+            ),
+            ToolCall::Read {
+                path: "/src/lib.rs".into()
+            }
+        );
+        assert_eq!(
+            d(
+                "write",
+                serde_json::json!({"path": "/out.txt", "content": "hi"})
+            ),
+            ToolCall::Write {
+                path: "/out.txt".into()
+            }
+        );
+        assert_eq!(
+            d(
+                "edit",
+                serde_json::json!({"path": "/src/lib.rs", "edits": [{"oldText": "a", "newText": "b"}]})
+            ),
+            ToolCall::Edit {
+                path: "/src/lib.rs".into()
+            }
+        );
+        // `find` matches file NAMES by glob ("Find files by glob pattern",
+        // find.d.ts) — reading it as a content search would file a
+        // filename pattern under a heading that says otherwise.
+        assert_eq!(
+            d("find", serde_json::json!({"pattern": "**/*.rs"})),
+            ToolCall::Glob {
+                pattern: "**/*.rs".into()
+            }
+        );
+        assert_eq!(
+            d(
+                "grep",
+                serde_json::json!({"pattern": "TODO", "path": "/src"})
+            ),
+            ToolCall::Grep {
+                pattern: "TODO".into()
+            }
+        );
+        // `ls` is the one variant eave added outright; comet has no agent
+        // that ships a directory listing.
+        assert_eq!(
+            d("ls", serde_json::json!({"path": "/src"})),
+            ToolCall::List {
+                path: "/src".into()
+            }
+        );
+        // Its path is optional — absent means the session cwd, which the
+        // row already states, so nothing is invented to fill it.
+        assert_eq!(d("ls", serde_json::json!({})).detail(), None);
+        assert_eq!(
+            d("some_extension_tool", serde_json::json!({"whatever": 1})),
+            ToolCall::Unknown {
+                name: "some_extension_tool".into()
+            }
         );
     }
 }
