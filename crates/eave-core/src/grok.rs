@@ -66,7 +66,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
 
-use crate::events::{cap_payload, SessionEvent};
+use crate::events::{cap_payload, ContextWindow, SessionEvent, TurnTokens};
 use crate::proc::{self, ProcIdentity};
 use crate::process;
 use crate::session::{
@@ -723,9 +723,14 @@ impl GrokProto {
                 (Vec::new(), Vec::new())
             }
             // A prompt turn's response. `turn_completed` already reported
-            // the outcome as an event; this is the bookend and carries
-            // nothing new.
-            _ => (Vec::new(), Vec::new()),
+            // the outcome as an event, so the bookend carries nothing new
+            // — except, since Slice CC, the turn's token bill.
+            _ => (
+                acp_usage_from_response(v.get("result"))
+                    .into_iter()
+                    .collect(),
+                Vec::new(),
+            ),
         }
     }
 
@@ -939,6 +944,20 @@ impl GrokProto {
                     is_error,
                 }]
             }
+            // Slice CC. ACP's own context gauge: `used` is "Tokens
+            // currently in context" and `size` is "Total context window
+            // size in tokens" (`_UsageUpdate`, agent-client-protocol 1.x).
+            // Grok's serde table names the same four fields — `used`,
+            // `size`, `cost`, `_meta` — in `struct UsageUpdate with 4
+            // elements` (grok 1.0.5 binary, read offline).
+            "usage_update" => acp_context_from_update(update)
+                .map(|e| vec![e])
+                .unwrap_or_else(|| {
+                    vec![SessionEvent::System {
+                        subtype: kind.to_string(),
+                        raw: line.to_string(),
+                    }]
+                }),
             // Everything else is recorded verbatim rather than dropped, so
             // a Grok update this build has never heard of still reaches the
             // journal (same contract as the Claude adapter's `System`).
@@ -1121,6 +1140,81 @@ fn flatten_content(content: Option<&Value>) -> String {
         }
     }
     out.join("\n")
+}
+
+/// Per-turn tokens off a settled `session/prompt` response (Slice CC).
+///
+/// ACP carries a first-class `usage` on `PromptResponse` — verified in the
+/// generated schema that ships with the `acp` package (`class
+/// PromptResponse`, fields `_meta` / `stopReason` / `usage`) and in grok
+/// 1.0.5's own serde table, which names `struct PromptResponse with 4
+/// elements` over `userMessageId`, `stopReason`, `usage`, `_meta` (read
+/// offline out of the shipped binary). comet found it on `_meta` instead
+/// at grok 1.0.4 (`comet/crates/harness/src/acp/mod.rs:1665`), so both
+/// spellings are read, newest first. Absent → nothing, never a zero.
+///
+/// **`inputTokens` is the whole prompt, cache included.** Grok's bundled
+/// documentation states it outright: *"ACP `_meta.usage.inputTokens`
+/// (PromptUsage) is still the **full** prompt sum; only the headless
+/// projector subtracts cache."* So this needs none of the arithmetic
+/// `claude.rs` does.
+///
+/// **What eave does NOT claim here.** The ACP schema describes these
+/// fields as session totals ("Total input tokens across all turns", "Sum
+/// of all token types across session") while both agents eave drives put
+/// the settling turn's own numbers in them — Hermes builds it from the
+/// last model response's usage (`acp_adapter/server.py`, from
+/// `_last_turn_usage`), and grok's docs say "`usage` sums tokens for the
+/// prompt". eave records the statement and its arrival point (one settled
+/// turn) and takes no position on an aggregation window the wire
+/// contradicts itself about.
+fn acp_usage_from_response(result: Option<&Value>) -> Option<SessionEvent> {
+    let result = result?;
+    let usage = result
+        .get("usage")
+        .or_else(|| result.pointer("/_meta/usage"))
+        .or_else(|| result.get("_meta"))?;
+    let count = |keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|k| usage.get(*k))
+            .and_then(Value::as_u64)
+    };
+    let turn = TurnTokens::stated(
+        count(["inputTokens", "input_tokens"]),
+        count(["outputTokens", "output_tokens"]),
+        count(["cachedReadTokens", "cached_read_tokens"]),
+        count(["cachedWriteTokens", "cached_write_tokens"]),
+    )?;
+    Some(SessionEvent::TokenUsage {
+        turn: Some(turn),
+        context: None,
+    })
+}
+
+/// ACP's context gauge from a `usage_update` session update (Slice CC).
+///
+/// The schema names both facts precisely — `used` is "Tokens currently in
+/// context", `size` is "Total context window size in tokens" — which is
+/// why this is the one place a context level may come from. An update
+/// with no `used` is not a gauge and is journaled verbatim by the caller
+/// instead.
+///
+/// A stated `size` of zero is dropped rather than relayed: the agents
+/// themselves treat it as "unknown" (Hermes returns no update at all when
+/// its context length is `<= 0`, `acp_adapter/server.py`), and a ceiling
+/// of zero would render as a window that is both empty and full.
+fn acp_context_from_update(update: &Value) -> Option<SessionEvent> {
+    let used_tokens = update.get("used").and_then(Value::as_u64)?;
+    Some(SessionEvent::TokenUsage {
+        turn: None,
+        context: Some(ContextWindow {
+            used_tokens,
+            limit_tokens: update
+                .get("size")
+                .and_then(Value::as_u64)
+                .filter(|size| *size > 0),
+        }),
+    })
 }
 
 fn malformed(line: &str, error: String) -> SessionEvent {
@@ -1717,5 +1811,111 @@ mod tests {
         assert!(!spawn_args(&cfg)
             .iter()
             .any(|a| a.starts_with("--permission")));
+    }
+}
+
+/// **Slice CC — token accounting over ACP.**
+///
+/// eave has no live grok usage capture: the machine's grok is 1.0.5 and
+/// running a turn costs the operator money, so the wire shapes here are
+/// read out of the shipped binary instead. `strings` on
+/// `~/.grok/downloads/grok-1.0.5-macos-aarch64` exposes serde's own field
+/// tables — `struct Usage with 6 elements` over `totalTokens`,
+/// `inputTokens`, `outputTokens`, `thoughtTokens`, `cachedWriteTokens`,
+/// `cachedReadTokens`; `struct PromptResponse with 4 elements` over
+/// `userMessageId`, `stopReason`, `usage`, `_meta`; `struct UsageUpdate
+/// with 4 elements` beside the literals `used`, `size`, `cost` — plus a
+/// bundled manual that states the cache convention outright. That is
+/// weaker evidence than a live turn and it is stated as such.
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    fn events(line: &str) -> Vec<SessionEvent> {
+        let (ready, _rx) = watch::channel(None);
+        let mut p = GrokProto::new();
+        p.handle_line(line, None, "/tmp", &ready).0
+    }
+
+    /// The settled prompt response carries the turn's bill on a
+    /// first-class `usage` (ACP 1.x, grok 1.0.5).
+    #[test]
+    fn a_settled_prompt_response_states_the_turns_tokens() {
+        let line = r#"{"jsonrpc":"2.0","id":100,"result":{"stopReason":"end_turn","usage":{"totalTokens":50103,"inputTokens":48210,"outputTokens":1893,"cachedReadTokens":41000,"cachedWriteTokens":0,"thoughtTokens":412}}}"#;
+        match events(line).as_slice() {
+            [SessionEvent::TokenUsage { turn, context }] => {
+                let turn = turn.expect("stated");
+                // Taken as sent: grok's own manual says the ACP
+                // `inputTokens` is already the full prompt sum, so adding
+                // the cache buckets here would double-count 41,000.
+                assert_eq!(turn.input, Some(48_210));
+                assert_eq!(turn.output, Some(1_893));
+                assert_eq!(turn.cache_read, Some(41_000));
+                assert_eq!(turn.cache_write, Some(0));
+                assert_eq!(
+                    *context, None,
+                    "a bill is not a level; the gauge rides usage_update"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// comet found the same numbers on `_meta` at grok 1.0.4
+    /// (`comet/crates/harness/src/acp/mod.rs:1665`). Both spellings are
+    /// read so an older grok is not silently dropped.
+    #[test]
+    fn the_older_meta_spelling_comet_found_still_reads() {
+        let line = r#"{"jsonrpc":"2.0","id":100,"result":{"stopReason":"end_turn","_meta":{"inputTokens":812,"outputTokens":45}}}"#;
+        match events(line).as_slice() {
+            [SessionEvent::TokenUsage { turn, .. }] => {
+                let turn = turn.expect("stated");
+                assert_eq!(turn.input, Some(812));
+                assert_eq!(turn.output, Some(45));
+                assert_eq!(turn.cache_read, None, "1.0.4 did not say, so eave does not");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A response with no usage anywhere emits nothing at all. Silence is
+    /// the honest answer; a zeroed record would read as a free turn.
+    #[test]
+    fn a_response_without_usage_emits_nothing() {
+        let line = r#"{"jsonrpc":"2.0","id":100,"result":{"stopReason":"end_turn"}}"#;
+        assert!(events(line).is_empty());
+    }
+
+    /// `usage_update` is the context gauge and ONLY the context gauge —
+    /// the distinction comet recorded in `docs/research/acp.md` and
+    /// deliberately left unmapped. eave maps it because its event has a
+    /// separate slot for it that cannot be mistaken for a bill.
+    #[test]
+    fn a_usage_update_states_the_level_and_never_the_bill() {
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":22457,"size":1000000,"cost":{"amount":0.01,"currency":"USD"}}}}"#;
+        match events(line).as_slice() {
+            [SessionEvent::TokenUsage { turn, context }] => {
+                assert_eq!(*turn, None, "a gauge says nothing about what a turn cost");
+                let context = context.expect("stated");
+                assert_eq!(context.used_tokens, 22_457);
+                assert_eq!(context.limit_tokens, Some(1_000_000));
+                assert!((context.fraction().unwrap() - 0.022457).abs() < 1e-6);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A `usage_update` shaped differently from the schema's is journaled
+    /// verbatim, not guessed at.
+    #[test]
+    fn an_unreadable_usage_update_is_kept_verbatim() {
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","cost":{"amount":0.01,"currency":"USD"}}}}"#;
+        match events(line).as_slice() {
+            [SessionEvent::System { subtype, raw }] => {
+                assert_eq!(subtype, "usage_update");
+                assert_eq!(raw, line);
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 }

@@ -74,7 +74,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
 
-use crate::events::{cap_payload, SessionEvent};
+use crate::events::{cap_payload, ContextWindow, SessionEvent, TurnTokens};
 use crate::proc::{self, ProcIdentity};
 use crate::process;
 use crate::session::{
@@ -1109,9 +1109,23 @@ impl CodexProtocol {
                     Step::default()
                 }
             }
+            // Slice CC. Codex is the one provider that states both facts
+            // in one frame and labels them itself: `tokenUsage.last` is
+            // the turn just finished, `tokenUsage.total` is the running
+            // session sum, and `modelContextWindow` is the ceiling.
+            "thread/tokenUsage/updated" => match token_usage(params) {
+                Some(event) => Step::from_event(event),
+                // A frame shaped differently from the one this build
+                // knows still reaches the journal verbatim, same contract
+                // as everything else below.
+                None => Step::from_event(SessionEvent::System {
+                    subtype: method.to_string(),
+                    raw: line.to_string(),
+                }),
+            },
             // Everything else the server says, kept verbatim so the
             // journal records a CLI addition without a parser change —
-            // `error`, `warning`, `thread/status/changed`, token usage,
+            // `error`, `warning`, `thread/status/changed`,
             // MCP startup, and whatever 0.149 adds.
             _ => Step::from_event(SessionEvent::System {
                 subtype: method.to_string(),
@@ -1387,6 +1401,43 @@ fn method_not_found(id: &Value, method: &str) -> String {
     .to_string()
 }
 
+/// `thread/tokenUsage/updated` → the two token facts (Slice CC).
+///
+/// The Codex app-server does the separation for eave, and its own live
+/// wire proves both readings. From comet's capture at 0.146.1
+/// (`comet/crates/harness/tests/fixtures/codex/live-0.146.1-multi-agent.jsonl`)
+/// one thread reports `total.totalTokens` 13,837 → 27,760 → 41,725 →
+/// 55,783 while `last.inputTokens` walks 13,747 → 13,858 → 13,944 →
+/// 14,037. The first is a running bill and the second is the size of the
+/// prompt actually in front of the model; only the second is occupancy,
+/// and `total` is therefore read for nothing.
+///
+/// `last.inputTokens` is the FULL prompt (`totalTokens` = `inputTokens` +
+/// `outputTokens` in every row of that capture, with `cachedInputTokens`
+/// a portion of the input), so it needs no arithmetic — unlike Claude's.
+fn token_usage(params: &Value) -> Option<SessionEvent> {
+    let usage = params
+        .get("tokenUsage")
+        .or_else(|| params.get("token_usage"))?;
+    let last = usage.get("last")?;
+    let count = |key: &str| last.get(key).and_then(Value::as_u64);
+    let input = count("inputTokens");
+    let turn = TurnTokens::stated(
+        input,
+        count("outputTokens"),
+        count("cachedInputTokens"),
+        count("cacheWriteInputTokens"),
+    );
+    let context = input.map(|used| ContextWindow {
+        used_tokens: used,
+        limit_tokens: usage.get("modelContextWindow").and_then(Value::as_u64),
+    });
+    if turn.is_none() && context.is_none() {
+        return None;
+    }
+    Some(SessionEvent::TokenUsage { turn, context })
+}
+
 fn compact(v: &Value) -> String {
     v.to_string()
 }
@@ -1542,6 +1593,87 @@ mod tests {
             "contextCompaction",
         ] {
             assert_eq!(tool_name(not_a_tool, &item), None, "{not_a_tool}");
+        }
+    }
+}
+
+/// **Slice CC — token accounting.**
+///
+/// eave has no Codex auth on this machine, so no turn has ever reached a
+/// model here and there is no eave-side capture of a usage frame. The
+/// lines below are verbatim from comet's live capture of the real binary
+/// at 0.146.1 (`comet/crates/harness/tests/fixtures/codex/live-0.146.1-multi-agent.jsonl`,
+/// lines 35 and 46) — the same wire, recorded by the sibling app that
+/// does have auth. That provenance is stated rather than hidden: these
+/// are real bytes from a real server, and they are not eave's.
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    const FIRST: &str = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"01a00fe7-c301-7d52-ae1f-41ecda48b29b","turnId":"01a00fe7-c36a-78d0-a6c4-37b2fcb27aca","tokenUsage":{"total":{"totalTokens":13837,"inputTokens":13747,"cachedInputTokens":11008,"cacheWriteInputTokens":0,"outputTokens":90,"reasoningOutputTokens":0},"last":{"totalTokens":13837,"inputTokens":13747,"cachedInputTokens":11008,"cacheWriteInputTokens":0,"outputTokens":90,"reasoningOutputTokens":0},"modelContextWindow":258400}},"emittedAtMs":1786973247805}"#;
+
+    const SECOND: &str = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"01a00fe7-c301-7d52-ae1f-41ecda48b29b","turnId":"01a00fe7-c36a-78d0-a6c4-37b2fcb27aca","tokenUsage":{"total":{"totalTokens":27760,"inputTokens":27605,"cachedInputTokens":22016,"cacheWriteInputTokens":0,"outputTokens":155,"reasoningOutputTokens":0},"last":{"totalTokens":13923,"inputTokens":13858,"cachedInputTokens":11008,"cacheWriteInputTokens":0,"outputTokens":65,"reasoningOutputTokens":0},"modelContextWindow":258400}},"emittedAtMs":1786973250476}"#;
+
+    fn usage(line: &str) -> SessionEvent {
+        let v: Value = serde_json::from_str(line).unwrap();
+        let mut proto = CodexProtocol::new();
+        match proto.parse_line(line).events.as_slice() {
+            [event] => event.clone(),
+            other => panic!("{v:?} gave {other:?}"),
+        }
+    }
+
+    /// `last` is the turn, `total` is the session, and only `last` is
+    /// read. The second frame is the proof: `total.outputTokens` has
+    /// reached 155 while the turn that just ran produced 65.
+    #[test]
+    fn the_turn_is_read_from_last_and_never_from_the_running_total() {
+        let SessionEvent::TokenUsage { turn, context } = usage(SECOND) else {
+            panic!("expected TokenUsage");
+        };
+        let turn = turn.expect("stated");
+        assert_eq!(turn.output, Some(65), "65 is the turn; 155 is the session");
+        assert_eq!(turn.input, Some(13_858));
+        assert_eq!(turn.cache_read, Some(11_008));
+        assert_eq!(turn.cache_write, Some(0), "a stated zero is a stated zero");
+        assert_eq!(
+            context,
+            Some(ContextWindow {
+                used_tokens: 13_858,
+                limit_tokens: Some(258_400),
+            })
+        );
+    }
+
+    /// Occupancy creeps; the bill doubles. Between these two frames the
+    /// running total went 13,837 → 27,760 while the window went 13,747 →
+    /// 13,858 — 111 tokens, which is what one short exchange adds.
+    #[test]
+    fn the_context_creeps_where_the_running_total_doubles() {
+        let (
+            SessionEvent::TokenUsage { context: a, .. },
+            SessionEvent::TokenUsage { context: b, .. },
+        ) = (usage(FIRST), usage(SECOND))
+        else {
+            panic!("expected TokenUsage");
+        };
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(b.used_tokens - a.used_tokens, 111);
+        assert_eq!(a.limit_tokens, b.limit_tokens);
+    }
+
+    /// A usage frame this build cannot read is journaled verbatim rather
+    /// than dropped or guessed at — the same contract every other unknown
+    /// notification gets.
+    #[test]
+    fn an_unreadable_usage_frame_is_kept_verbatim() {
+        let line = r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"outputTokens":1}}}}"#;
+        match usage(line) {
+            SessionEvent::System { subtype, raw } => {
+                assert_eq!(subtype, "thread/tokenUsage/updated");
+                assert_eq!(raw, line, "byte for byte");
+            }
+            other => panic!("got {other:?}"),
         }
     }
 }

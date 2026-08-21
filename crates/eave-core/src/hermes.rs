@@ -98,7 +98,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
 
-use crate::events::{cap_payload, SessionEvent};
+use crate::events::{cap_payload, ContextWindow, SessionEvent, TurnTokens};
 use crate::proc::{self, ProcIdentity};
 use crate::process;
 use crate::session::{
@@ -260,6 +260,87 @@ impl AcpStream {
             .map(|(id, _)| id.clone())
             .collect()
     }
+}
+
+// NOTE (Slice CC): these two are byte-identical to the pair in `grok.rs`.
+// Both agents speak the same ACP surface, and every adapter in this crate
+// already carries its own `malformed`/`payload`/`compact` rather than
+// sharing them — a shared `acp` module is slice CA's job, in flight in a
+// parallel worktree, and reaching into it from here would collide.
+
+/// Per-turn tokens off a settled `session/prompt` response (Slice CC).
+///
+/// ACP carries a first-class `usage` on `PromptResponse` — verified in the
+/// generated schema that ships with the `acp` package (`class
+/// PromptResponse`, fields `_meta` / `stopReason` / `usage`) and in grok
+/// 1.0.5's own serde table, which names `struct PromptResponse with 4
+/// elements` over `userMessageId`, `stopReason`, `usage`, `_meta` (read
+/// offline out of the shipped binary). comet found it on `_meta` instead
+/// at grok 1.0.4 (`comet/crates/harness/src/acp/mod.rs:1665`), so both
+/// spellings are read, newest first. Absent → nothing, never a zero.
+///
+/// **`inputTokens` is the whole prompt, cache included.** Grok's bundled
+/// documentation states it outright: *"ACP `_meta.usage.inputTokens`
+/// (PromptUsage) is still the **full** prompt sum; only the headless
+/// projector subtracts cache."* So this needs none of the arithmetic
+/// `claude.rs` does.
+///
+/// **What eave does NOT claim here.** The ACP schema describes these
+/// fields as session totals ("Total input tokens across all turns", "Sum
+/// of all token types across session") while both agents eave drives put
+/// the settling turn's own numbers in them — Hermes builds it from the
+/// last model response's usage (`acp_adapter/server.py`, from
+/// `_last_turn_usage`), and grok's docs say "`usage` sums tokens for the
+/// prompt". eave records the statement and its arrival point (one settled
+/// turn) and takes no position on an aggregation window the wire
+/// contradicts itself about.
+fn acp_usage_from_response(result: Option<&Value>) -> Option<SessionEvent> {
+    let result = result?;
+    let usage = result
+        .get("usage")
+        .or_else(|| result.pointer("/_meta/usage"))
+        .or_else(|| result.get("_meta"))?;
+    let count = |keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|k| usage.get(*k))
+            .and_then(Value::as_u64)
+    };
+    let turn = TurnTokens::stated(
+        count(["inputTokens", "input_tokens"]),
+        count(["outputTokens", "output_tokens"]),
+        count(["cachedReadTokens", "cached_read_tokens"]),
+        count(["cachedWriteTokens", "cached_write_tokens"]),
+    )?;
+    Some(SessionEvent::TokenUsage {
+        turn: Some(turn),
+        context: None,
+    })
+}
+
+/// ACP's context gauge from a `usage_update` session update (Slice CC).
+///
+/// The schema names both facts precisely — `used` is "Tokens currently in
+/// context", `size` is "Total context window size in tokens" — which is
+/// why this is the one place a context level may come from. An update
+/// with no `used` is not a gauge and is journaled verbatim by the caller
+/// instead.
+///
+/// A stated `size` of zero is dropped rather than relayed: the agents
+/// themselves treat it as "unknown" (Hermes returns no update at all when
+/// its context length is `<= 0`, `acp_adapter/server.py`), and a ceiling
+/// of zero would render as a window that is both empty and full.
+fn acp_context_from_update(update: &Value) -> Option<SessionEvent> {
+    let used_tokens = update.get("used").and_then(Value::as_u64)?;
+    Some(SessionEvent::TokenUsage {
+        turn: None,
+        context: Some(ContextWindow {
+            used_tokens,
+            limit_tokens: update
+                .get("size")
+                .and_then(Value::as_u64)
+                .filter(|size| *size > 0),
+        }),
+    })
 }
 
 fn malformed(line: &str, error: String) -> SessionEvent {
@@ -434,6 +515,19 @@ impl AcpStream {
                     }],
                 }
             }
+            // Slice CC: ACP's context gauge. Hermes sends one after
+            // every message, every tool result and every turn
+            // (`acp_adapter/server.py`, `_schedule_usage_update`), which
+            // makes it the only continuously-live token fact eave has for
+            // this provider.
+            "usage_update" => acp_context_from_update(update)
+                .map(|e| vec![e])
+                .unwrap_or_else(|| {
+                    vec![SessionEvent::System {
+                        subtype: kind.to_string(),
+                        raw: line.to_string(),
+                    }]
+                }),
             // Thoughts, plans, command lists and anything Hermes adds
             // later: recorded verbatim so the journal keeps them without a
             // parser change (same rationale as `SessionEvent::System`).
@@ -1255,6 +1349,10 @@ impl Reader {
                     })
                     .await;
                     return;
+                }
+                // Slice CC: the turn's token bill, before the bookend.
+                if let Some(usage) = acp_usage_from_response(v.get("result")) {
+                    self.emit(usage).await;
                 }
                 let stop = v
                     .get("result")

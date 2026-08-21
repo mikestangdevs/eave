@@ -228,6 +228,35 @@ impl Acp {
                     }},
                 }));
             }
+            // Slice CC: the two token facts, in the shapes the ACP
+            // schema defines — a `usage_update` gauge mid-turn and a
+            // first-class `usage` on the settled prompt response. The
+            // NUMBERS are this fixture's; the SHAPES are
+            // `acp/schema.py`'s `_UsageUpdate` and `Usage`.
+            "usage" => {
+                self.chunk("counting");
+                emit(&json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": { "sessionId": self.session_id, "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 21884,
+                        "size": 200000,
+                        "cost": { "amount": 0.02, "currency": "USD" },
+                    }},
+                }));
+                emit(&json!({ "jsonrpc": "2.0", "id": id, "result": {
+                    "stopReason": "end_turn",
+                    "usage": {
+                        "inputTokens": 21884,
+                        "outputTokens": 455,
+                        "cachedReadTokens": 19000,
+                        "cachedWriteTokens": 0,
+                        "thoughtTokens": 12,
+                        "totalTokens": 22339,
+                    },
+                }}));
+                return;
+            }
             _ => {}
         }
         emit(&json!({ "jsonrpc": "2.0", "id": id, "result": { "stopReason": "end_turn" }}));

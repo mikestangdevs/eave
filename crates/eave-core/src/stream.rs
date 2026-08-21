@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::events::SessionEvent;
+use crate::events::{ContextWindow, SessionEvent, TurnTokens};
 
 const MALFORMED_LINE_CAP: usize = 512;
 
@@ -18,6 +18,23 @@ const MALFORMED_LINE_CAP: usize = 512;
 pub struct ClaudeStream {
     outstanding: HashSet<String>,
     session_id: Option<String>,
+    /// The model `system/init` named, kept so the `result` line's
+    /// `modelUsage` map can be indexed by it (Slice CC). The map is keyed
+    /// by model id and holds a row for every model the turn touched —
+    /// including the little `claude-haiku-*` side calls — so "the context
+    /// window" is only answerable once you know which row is the session's.
+    model: Option<String>,
+    /// Prompt size of the most recent model request, in tokens
+    /// (Slice CC): the sum of the three disjoint stated buckets on the
+    /// last `message_start`/`message_delta` usage.
+    ///
+    /// **It cannot come from the `result` line.** `result.usage` is the
+    /// SUM over the turn's model requests — verified in
+    /// `docs/research/claude-stream-capture-tool-turn.jsonl`, where two
+    /// requests of 26,853 and 26,967 prompt tokens settle as a result
+    /// line reporting 53,820 — so reading occupancy off it would double
+    /// on every tool call and pass the window before the window filled.
+    context_used: Option<u64>,
     /// Permission requests the CLI is parked on right now (Slice K). Held
     /// here so the adapter can answer a still-open question and ignore a
     /// stale one; the durable truth is the journal.
@@ -77,6 +94,8 @@ impl ClaudeStream {
                     match v.get("session_id").and_then(Value::as_str) {
                         Some(id) => {
                             self.session_id = Some(id.to_string());
+                            // Slice CC: which `modelUsage` row is ours.
+                            self.model = v.get("model").and_then(Value::as_str).map(str::to_string);
                             vec![SessionEvent::Init {
                                 session_id: id.to_string(),
                                 // The posture the CLI says it is actually
@@ -161,14 +180,24 @@ impl ClaudeStream {
             Some("stream_event") => self.parse_stream_event(&v["event"]),
             Some("assistant") => self.parse_assistant(&v["message"]),
             Some("user") => self.parse_user(&v["message"]),
-            Some("result") => vec![SessionEvent::TurnCompleted {
-                subtype: v
-                    .get("subtype")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-            }],
+            Some("result") => {
+                let mut out = Vec::new();
+                // Slice CC: usage first, then the bookend — the cost is a
+                // fact about the turn that just ran, not about the next
+                // one. Same ordering comet settled on for codex
+                // (`comet/crates/harness/src/codex/mod.rs:965`, usage
+                // drained before `Done`).
+                out.extend(self.turn_usage(v.get("usage"), v.get("modelUsage")));
+                out.push(SessionEvent::TurnCompleted {
+                    subtype: v
+                        .get("subtype")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                });
+                out
+            }
             Some(other) => vec![SessionEvent::Unknown {
                 event_type: other.to_string(),
                 raw: line.to_string(),
@@ -235,7 +264,56 @@ impl ClaudeStream {
         }
     }
 
+    /// The `result` line's two token facts (Slice CC).
+    ///
+    /// `result.usage` is **per turn, not cumulative**: driving one process
+    /// through two prompts (`docs/research/usage-capture-2026-08-20/`)
+    /// gave `output_tokens` 5 then 4, not 5 then 9. `modelUsage` in the
+    /// same capture DID accumulate (`cacheReadInputTokens` 15,899 then
+    /// 42,294 = 15,899 + 26,395), so nothing but its constant
+    /// `contextWindow` is read from it.
+    fn turn_usage(&self, usage: Option<&Value>, model_usage: Option<&Value>) -> Vec<SessionEvent> {
+        let count = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+        let fresh = count("input_tokens");
+        let cache_read = count("cache_read_input_tokens");
+        let cache_write = count("cache_creation_input_tokens");
+        // The Messages API's `input_tokens` counts ONLY the tokens that
+        // were neither read from nor written to cache, so the whole prompt
+        // is the sum of three disjoint stated counts. Exact arithmetic on
+        // what the CLI said — the alternative is reporting 2 where the
+        // model read 26,397.
+        let input = match (fresh, cache_read, cache_write) {
+            (None, None, None) => None,
+            (a, b, c) => Some(a.unwrap_or(0) + b.unwrap_or(0) + c.unwrap_or(0)),
+        };
+        let turn = TurnTokens::stated(input, count("output_tokens"), cache_read, cache_write);
+        let context = self.context_used.map(|used| ContextWindow {
+            used_tokens: used,
+            limit_tokens: self
+                .model
+                .as_deref()
+                .and_then(|m| model_usage?.get(m)?.get("contextWindow")?.as_u64()),
+        });
+        if turn.is_none() && context.is_none() {
+            return Vec::new();
+        }
+        vec![SessionEvent::TokenUsage { turn, context }]
+    }
+
     fn parse_stream_event(&mut self, ev: &Value) -> Vec<SessionEvent> {
+        // Slice CC: every model request inside the turn restates the
+        // prompt it was sent, on `message_start` and again on
+        // `message_delta`. The last one to arrive is what is in context
+        // when the turn settles; both spellings are read because an
+        // interrupted response leaves only the `message_start`.
+        if let Some(kind) = ev.get("type").and_then(Value::as_str) {
+            if matches!(kind, "message_start" | "message_delta") {
+                let usage = ev.get("usage").or_else(|| ev.pointer("/message/usage"));
+                if let Some(used) = prompt_tokens(usage) {
+                    self.context_used = Some(used);
+                }
+            }
+        }
         match ev.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 let cb = &ev["content_block"];
@@ -369,6 +447,23 @@ fn tool_result_text(block: &Value) -> String {
         _ => String::new(),
     };
     crate::events::cap_payload(&raw)
+}
+
+/// Prompt tokens carried by one Messages-API `usage` object: the three
+/// disjoint input buckets added (Slice CC). `None` when none of them is
+/// present — an object that states no input side states no prompt size.
+fn prompt_tokens(usage: Option<&Value>) -> Option<u64> {
+    let usage = usage?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let (fresh, read, write) = (
+        count("input_tokens"),
+        count("cache_read_input_tokens"),
+        count("cache_creation_input_tokens"),
+    );
+    if fresh.is_none() && read.is_none() && write.is_none() {
+        return None;
+    }
+    Some(fresh.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0))
 }
 
 fn malformed(line: &str, error: String) -> SessionEvent {
@@ -580,5 +675,168 @@ mod tests {
         let mut s = ClaudeStream::new();
         let echo = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"allow"}}}"#;
         assert!(s.parse_line(echo).is_empty());
+    }
+}
+
+/// **Slice CC — token accounting, from the capture corpus.**
+///
+/// Every line below is verbatim from a real `claude` 2.1.226 run in eave's
+/// own spawn posture. Two captures are used because they answer two
+/// different questions and neither can answer the other's:
+///
+/// - `docs/research/usage-capture-2026-08-20/two-turn.jsonl` — ONE process,
+///   TWO prompts. It is the only thing that can settle whether
+///   `result.usage` accumulates across turns, and it says it does not.
+/// - `docs/research/claude-stream-capture-tool-turn.jsonl` — one turn with
+///   a tool in it, so TWO model requests. It is the only thing that can
+///   separate per-turn cost from context occupancy, and it says they are
+///   53,820 and 26,967 in the same turn.
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::events::{ContextWindow, TurnTokens};
+
+    /// Verbatim, `two-turn.jsonl`: the SECOND turn of a two-turn process.
+    const TURN2_DELTA: &str = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":2,"cache_creation_input_tokens":20,"cache_read_input_tokens":26395,"output_tokens":4,"output_tokens_details":{"thinking_tokens":0},"iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":26395,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":20},"type":"message"}]},"context_management":{"applied_edits":[]}},"session_id":"67bfefdc-1b4f-41f8-be19-f4c73db5aa66","parent_tool_use_id":null,"uuid":"c76f96b8-d1ae-4b5b-81a5-9338742ef531"}"#;
+
+    const TURN2_RESULT: &str = r#"{"is_error":false,"duration_api_ms":4556,"num_turns":1,"stop_reason":"end_turn","session_id":"67bfefdc-1b4f-41f8-be19-f4c73db5aa66","total_cost_usd":0.12714599999999998,"usage":{"input_tokens":2,"cache_creation_input_tokens":20,"cache_read_input_tokens":26395,"output_tokens":4,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":20,"ephemeral_5m_input_tokens":0},"inference_geo":"not_available","iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":26395,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":20},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":524,"outputTokens":14,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.000594,"contextWindow":200000,"maxOutputTokens":32000,"canonicalModel":"claude-haiku-4-5","provider":"firstParty"},"claude-opus-5[1m]":{"inputTokens":4,"outputTokens":9,"cacheReadInputTokens":42294,"cacheCreationInputTokens":10516,"webSearchRequests":0,"costUSD":0.126552,"contextWindow":1000000,"maxOutputTokens":64000,"canonicalModel":"claude-opus-5","provider":"firstParty"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subtype":"success","api_error_status":null,"result":"beta","ttft_ms":1649,"ttft_stream_ms":966,"time_to_request_ms":8,"type":"result","duration_ms":1655,"uuid":"0478c9d4-b14a-4ad0-bad8-3ef1f28ecfd9"}"#;
+
+    /// Verbatim, `two-turn.jsonl`: the `init` that names the model the
+    /// `modelUsage` map must be indexed by. Trimmed of `tools`,
+    /// `slash_commands` and `mcp_servers`, which this test does not read.
+    const INIT: &str = r#"{"type":"system","subtype":"init","cwd":"/private/tmp","session_id":"67bfefdc-1b4f-41f8-be19-f4c73db5aa66","model":"claude-opus-5[1m]","permissionMode":"default"}"#;
+
+    /// Verbatim, `claude-stream-capture-tool-turn.jsonl`: the two model
+    /// requests of a single turn that ran one tool.
+    const TOOL_TURN_DELTA_1: &str = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":2,"cache_creation_input_tokens":10924,"cache_read_input_tokens":15927,"output_tokens":108,"output_tokens_details":{"thinking_tokens":17},"iterations":[{"input_tokens":2,"output_tokens":108,"cache_read_input_tokens":15927,"cache_creation_input_tokens":10924,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10924},"type":"message"}]},"context_management":{"applied_edits":[]}},"session_id":"4731DB7E-B314-4B77-B5A4-0DA3E6B4865C","parent_tool_use_id":null,"uuid":"edbad992-6ddc-463f-8520-e8a12ca01f77"}"#;
+
+    const TOOL_TURN_DELTA_2: &str = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":2,"cache_creation_input_tokens":114,"cache_read_input_tokens":26851,"output_tokens":4,"output_tokens_details":{"thinking_tokens":0},"iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":26851,"cache_creation_input_tokens":114,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":114},"type":"message"}]},"context_management":{"applied_edits":[]}},"session_id":"4731DB7E-B314-4B77-B5A4-0DA3E6B4865C","parent_tool_use_id":null,"uuid":"e0aadb36-b417-43d1-bc8d-e906469ffff8"}"#;
+
+    /// Verbatim from the same capture, with only the `result` prose (a 12 KB
+    /// markdown answer this test does not read) removed.
+    const TOOL_TURN_RESULT: &str = r#"{"is_error":false,"duration_api_ms":5780,"num_turns":2,"stop_reason":"end_turn","session_id":"4731DB7E-B314-4B77-B5A4-0DA3E6B4865C","total_cost_usd":0.269784,"usage":{"input_tokens":4,"cache_creation_input_tokens":11038,"cache_read_input_tokens":42778,"output_tokens":112,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":11038,"ephemeral_5m_input_tokens":0},"inference_geo":"not_available","iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":26851,"cache_creation_input_tokens":114,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":114},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":536,"outputTokens":14,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.000606,"contextWindow":200000,"maxOutputTokens":32000,"canonicalModel":"claude-haiku-4-5","provider":"firstParty"},"claude-fable-5":{"inputTokens":4,"outputTokens":112,"cacheReadInputTokens":42778,"cacheCreationInputTokens":11038,"webSearchRequests":0,"costUSD":0.26917800000000003,"contextWindow":1000000,"maxOutputTokens":64000,"canonicalModel":"claude-fable-5","provider":"firstParty"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subtype":"success","api_error_status":null,"ttft_ms":2247,"ttft_stream_ms":2066,"time_to_request_ms":17,"type":"result","duration_ms":13430,"uuid":"3767bd82-f187-4c5d-823b-0b9f8d032241"}"#;
+
+    fn usage_of(events: &[SessionEvent]) -> (Option<TurnTokens>, Option<ContextWindow>) {
+        match events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::TokenUsage { .. }))
+        {
+            Some(SessionEvent::TokenUsage { turn, context }) => (*turn, *context),
+            _ => panic!("no TokenUsage in {events:?}"),
+        }
+    }
+
+    /// The turn's cost is stated in full: the whole prompt, not the
+    /// uncached remainder the API's `input_tokens` field names.
+    #[test]
+    fn a_settled_turn_states_the_whole_prompt_not_the_uncached_remainder() {
+        let mut s = ClaudeStream::new();
+        s.parse_line(INIT);
+        s.parse_line(TURN2_DELTA);
+        let events = s.parse_line(TURN2_RESULT);
+        let (turn, context) = usage_of(&events);
+        let turn = turn.expect("the result line stated usage");
+        // 2 fresh + 20 written + 26,395 read. Reporting the bare
+        // `input_tokens` here would say the model read two tokens.
+        assert_eq!(turn.input, Some(26_417));
+        assert_eq!(turn.output, Some(4));
+        assert_eq!(turn.cache_read, Some(26_395));
+        assert_eq!(turn.cache_write, Some(20));
+        // The ceiling comes off the `modelUsage` row for the model `init`
+        // named — NOT the haiku row beside it, which advertises 200,000.
+        assert_eq!(
+            context,
+            Some(ContextWindow {
+                used_tokens: 26_417,
+                limit_tokens: Some(1_000_000),
+            })
+        );
+        // Usage lands before the bookend.
+        assert!(matches!(
+            events.last(),
+            Some(SessionEvent::TurnCompleted { .. })
+        ));
+    }
+
+    /// **The whole point of the slice.** One turn, two model requests: the
+    /// bill is 53,820 input tokens and the context holds 26,967. A build
+    /// that read occupancy off the result line would report the window
+    /// twice as full as it is, and would do so more the more tools ran.
+    #[test]
+    fn a_turn_with_a_tool_bills_the_prompt_twice_and_the_context_holds_it_once() {
+        let mut s = ClaudeStream::new();
+        s.parse_line(r#"{"type":"system","subtype":"init","session_id":"4731DB7E","model":"claude-fable-5","permissionMode":"default"}"#);
+        s.parse_line(TOOL_TURN_DELTA_1);
+        s.parse_line(TOOL_TURN_DELTA_2);
+        let events = s.parse_line(TOOL_TURN_RESULT);
+        let (turn, context) = usage_of(&events);
+        let turn = turn.expect("stated");
+        assert_eq!(turn.input, Some(53_820), "4 + 11,038 + 42,778 — the bill");
+        let context = context.expect("stated");
+        assert_eq!(
+            context.used_tokens, 26_967,
+            "2 + 114 + 26,851 — the LAST request's prompt, which is what is in the window"
+        );
+        assert!(
+            context.used_tokens < turn.input.unwrap(),
+            "these are different facts and this capture is where they part"
+        );
+        assert_eq!(context.limit_tokens, Some(1_000_000));
+    }
+
+    /// Two prompts through one process: `result.usage` reports the turn,
+    /// not a running total. Turn one billed 5 output tokens and turn two
+    /// billed 4 — a cumulative field would have said 9.
+    #[test]
+    fn the_result_lines_usage_is_per_turn_and_not_a_running_total() {
+        let mut s = ClaudeStream::new();
+        s.parse_line(INIT);
+        // Turn one, verbatim from the same capture.
+        s.parse_line(r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"cache_creation_input_tokens":10496,"cache_read_input_tokens":15899,"output_tokens":5}}}"#);
+        let first = s.parse_line(r#"{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":2,"cache_creation_input_tokens":10496,"cache_read_input_tokens":15899,"output_tokens":5},"modelUsage":{"claude-opus-5[1m]":{"cacheReadInputTokens":15899,"contextWindow":1000000}}}"#);
+        assert_eq!(usage_of(&first).0.unwrap().output, Some(5));
+
+        s.parse_line(TURN2_DELTA);
+        let second = s.parse_line(TURN2_RESULT);
+        assert_eq!(
+            usage_of(&second).0.unwrap().output,
+            Some(4),
+            "9 here would mean the field accumulates and every turn after \
+             the first would be over-reported"
+        );
+    }
+
+    /// A `result` line with no `usage` at all — a turn that never reached
+    /// the model — states nothing rather than zero.
+    #[test]
+    fn a_turn_that_never_reached_the_model_reports_no_tokens() {
+        let mut s = ClaudeStream::new();
+        let events =
+            s.parse_line(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TokenUsage { .. })),
+            "silence is the honest answer: {events:?}"
+        );
+        assert_eq!(events.len(), 1, "just the bookend");
+    }
+
+    /// The ceiling is only claimed when the map has the session's own
+    /// model in it. An unrecognised model leaves the level stated and the
+    /// ceiling unstated, rather than borrowing a number from whichever
+    /// other model happens to be in the map.
+    #[test]
+    fn an_unmatched_model_leaves_the_ceiling_unstated() {
+        let mut s = ClaudeStream::new();
+        s.parse_line(
+            r#"{"type":"system","subtype":"init","session_id":"x","model":"claude-something-new"}"#,
+        );
+        s.parse_line(TURN2_DELTA);
+        let (_, context) = usage_of(&s.parse_line(TURN2_RESULT));
+        let context = context.expect("the level is still known");
+        assert_eq!(context.used_tokens, 26_417);
+        assert_eq!(context.limit_tokens, None);
+        assert_eq!(context.fraction(), None);
     }
 }

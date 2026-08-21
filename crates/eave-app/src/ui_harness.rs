@@ -8611,3 +8611,118 @@ fn the_inventory_follows_the_session_and_not_the_process(cx: &mut TestAppContext
         "the palette must follow the SESSION's own announcement"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Slice CC — the token gauge.
+
+fn usage_record(
+    seq: u64,
+    turn: Option<eave_core::events::TurnTokens>,
+    context: Option<eave_core::events::ContextWindow>,
+) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::TokenUsage { turn, context },
+        },
+    }
+}
+
+/// **The gauge exists only when the provider said something**, and its
+/// arrival moves nothing else in the composer.
+///
+/// Both halves matter. A permanent slot would print a caption over every
+/// adapter that reports no tokens — the same defect Slice AN removed from
+/// `composer-hint` — and a slot that reflows the send button under it
+/// would make a quiet instrument the loudest thing on the row.
+#[gpui::test]
+fn the_token_gauge_appears_only_when_there_is_a_number_and_moves_nothing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(&h, vcx, vec![user_record(1, "go")]);
+    assert!(
+        !shown(vcx, "composer-usage"),
+        "a session that has been told nothing about tokens must show no gauge"
+    );
+
+    let probes = ["composer-hint", "send"];
+    let before: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
+    assert!(
+        before.iter().all(|b| b.is_some()),
+        "a probe never rendered, so it proves nothing: {before:?}"
+    );
+
+    ask(
+        &h,
+        vcx,
+        vec![
+            user_record(1, "go"),
+            usage_record(
+                2,
+                eave_core::events::TurnTokens::stated(Some(26_417), Some(4), None, None),
+                Some(eave_core::events::ContextWindow {
+                    used_tokens: 26_417,
+                    limit_tokens: Some(1_000_000),
+                }),
+            ),
+        ],
+    );
+    assert!(
+        shown(vcx, "composer-usage"),
+        "the provider stated its tokens and the composer said nothing"
+    );
+
+    let after: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
+    for (i, name) in probes.iter().enumerate() {
+        let (a, b) = (before[i].unwrap(), after[i].unwrap());
+        assert_eq!(
+            (a.origin, a.size.height),
+            (b.origin, b.size.height),
+            "{name} moved or changed height when the gauge appeared: {a:?} -> {b:?}"
+        );
+    }
+}
+
+/// The gauge is the quietest thing on the row it shares, and it says so
+/// in named ranks rather than in numbers.
+///
+/// A rendered assertion cannot see this: gpui resolves text style inside
+/// its own pass and exposes neither the computed size nor the painted ink
+/// to a test. What can be pinned is the property that would decay — a
+/// bare `px(11.0)` creeping in, or the ink being promoted to primary text
+/// the next time somebody wants the number to be easier to read.
+#[test]
+fn the_gauge_names_the_quietest_rank_rather_than_a_number() {
+    let src = include_str!("ui.rs");
+    let at = src.find(r#"composer-usage"#).expect("the gauge element");
+    let body = &src[at..at
+        + src[at..]
+            .find(".child(SharedString::from(usage))")
+            .expect("its end")];
+
+    assert!(
+        body.contains("theme::MICRO_SIZE") && body.contains("theme::MICRO_LINE"),
+        "the gauge left the instrument rank — MICRO is 'timestamps, counts, \
+         the status bar, rail facts' and a token count is a count"
+    );
+    assert!(
+        body.contains("theme::text_tertiary()"),
+        "the gauge was promoted out of tertiary ink. Size and ink are two \
+         channels and instrumentation may spend neither"
+    );
+    for loud in [
+        "theme::BODY_SIZE",
+        "theme::NAME_SIZE",
+        "theme::DISPLAY_SIZE",
+    ] {
+        assert!(!body.contains(loud), "the gauge reached for {loud}");
+    }
+    // No bare literal anywhere in it: every size and space is a named rank.
+    let numeric = body
+        .match_indices("px(")
+        .any(|(i, _)| body[i + 3..].starts_with(|c: char| c.is_ascii_digit()));
+    assert!(
+        !numeric,
+        "the gauge grew a bare px() literal where the scale has a name for it"
+    );
+}
