@@ -27,7 +27,12 @@ pub fn load_cef() -> Library {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     #[cfg(target_os = "macos")]
-    crate::mac::setup_simple_application();
+    // In the gpui arm, NSApp must be a GPUIApplication subclass, not
+    // cefsimple's own NSApplication subclass — and whoever calls
+    // +sharedApplication first decides. So this one stays out of the way.
+    if !crate::gpui_host::gpui_mode() {
+        crate::mac::setup_simple_application();
+    }
 
     library
 }

@@ -42,6 +42,18 @@ sandbox = ["cef/sandbox"]
 [dependencies]
 cef = { version = "151", features = ["build-util"] }
 
+# The in-process arm (`EAVE_CEF_GPUI=1`) puts CEF and gpui in one binary.
+# gpui comes from `../zed-fork` — the pinned wingleeio/zed rev with the BGRA
+# surface patch applied (`../gpui-bgra-surface.patch`), because the stock
+# renderer asserts NV12 on the surface primitive.
+gpui = { path = "../zed-fork/crates/gpui" }
+gpui_platform = { path = "../zed-fork/crates/gpui_platform", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
+core-video = { version = "0.5.2", features = ["metal"] }
+core-foundation = "0.10"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"

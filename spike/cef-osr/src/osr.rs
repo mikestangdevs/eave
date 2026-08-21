@@ -33,6 +33,59 @@ use objc2_metal::{
     MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
+use core_foundation::{base::TCFType, dictionary::CFDictionary, number::CFNumber, string::CFString};
+use core_video::pixel_buffer::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferKeys};
+
+unsafe extern "C" {
+    fn CVPixelBufferGetIOSurface(
+        buffer: core_video::pixel_buffer::CVPixelBufferRef,
+    ) -> *mut std::ffi::c_void;
+}
+
+/// Allocate the texture we own as an IOSurface-backed BGRA `CVPixelBuffer`.
+///
+/// This is the shape the destination has to have anyway: `CVPixelBuffer` is
+/// what gpui's surface primitive takes, and IOSurface-backed is what its
+/// `CVMetalTextureCache` requires. Blitting into a plain private texture
+/// would have measured a slightly cheaper thing than the real one.
+fn make_dest(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    w: u32,
+    h: u32,
+) -> Option<(CVPixelBuffer, Retained<ProtocolObject<dyn MTLTexture>>)> {
+    let attrs = CFDictionary::from_CFType_pairs(&[
+        (
+            CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
+            CFDictionary::<CFString, CFNumber>::from_CFType_pairs(&[]).as_CFType(),
+        ),
+        (
+            CFString::from(CVPixelBufferKeys::MetalCompatibility),
+            CFNumber::from(1i32).as_CFType(),
+        ),
+    ]);
+    let buffer =
+        CVPixelBuffer::new(kCVPixelFormatType_32BGRA, w as usize, h as usize, Some(&attrs)).ok()?;
+    let io_surface = unsafe { CVPixelBufferGetIOSurface(buffer.as_concrete_TypeRef()) };
+    let surface = std::ptr::NonNull::new(io_surface.cast::<IOSurfaceRef>())?;
+
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::BGRA8Unorm,
+            w as usize,
+            h as usize,
+            false,
+        )
+    };
+    unsafe {
+        desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+        desc.setStorageMode(MTLStorageMode::Shared);
+    }
+    let texture = unsafe {
+        device.newTextureWithDescriptor_iosurface_plane(&desc, surface.as_ref(), 0)?
+    };
+    Some((buffer, texture))
+}
+
 fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) => !(v == "0" || v.is_empty()),
@@ -49,7 +102,7 @@ fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// `EAVE_CEF_OSR=1` selects the windowless arm.
 pub fn osr_enabled() -> bool {
-    env_flag("EAVE_CEF_OSR", false)
+    env_flag("EAVE_CEF_OSR", false) || crate::gpui_host::gpui_mode()
 }
 
 /// `EAVE_CEF_SHARED=0` forces the CPU `OnPaint` path so the two upload
@@ -106,8 +159,9 @@ pub fn duration_secs() -> u64 {
 struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// The texture we own and CEF does not. Recreated when the page resizes.
-    dest: Option<(u32, u32, Retained<ProtocolObject<dyn MTLTexture>>)>,
+    /// The texture we own and CEF does not, plus the `CVPixelBuffer` that
+    /// wraps the same IOSurface — the handle gpui's scene takes.
+    dest: Option<(u32, u32, Retained<ProtocolObject<dyn MTLTexture>>, CVPixelBuffer)>,
     /// Imported views onto CEF's pool surfaces, keyed by IOSurface pointer.
     imported: Vec<(usize, Retained<ProtocolObject<dyn MTLTexture>>)>,
 }
@@ -132,25 +186,15 @@ impl Gpu {
         &mut self,
         w: u32,
         h: u32,
-        format: MTLPixelFormat,
-    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
-        if let Some((dw, dh, tex)) = &self.dest {
+    ) -> Option<(Retained<ProtocolObject<dyn MTLTexture>>, CVPixelBuffer)> {
+        if let Some((dw, dh, tex, buf)) = &self.dest {
             if *dw == w && *dh == h {
-                return Some(tex.clone());
+                return Some((tex.clone(), buf.clone()));
             }
         }
-        let desc = unsafe {
-            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                format, w as usize, h as usize, false,
-            )
-        };
-        unsafe {
-            desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
-            desc.setStorageMode(MTLStorageMode::Private);
-        }
-        let tex = self.device.newTextureWithDescriptor(&desc)?;
-        self.dest = Some((w, h, tex.clone()));
-        Some(tex)
+        let (buffer, texture) = make_dest(&self.device, w, h)?;
+        self.dest = Some((w, h, texture.clone(), buffer.clone()));
+        Some((texture, buffer))
     }
 }
 
@@ -175,8 +219,9 @@ fn import_and_blit(io_surface: *mut std::ffi::c_void, w: u32, h: u32) -> Option<
             if let Some((_, tex)) = gpu.imported.iter().find(|(k, _)| *k == key) {
                 let src = tex.clone();
                 let import_us = t0.elapsed().as_micros();
-                let dest = gpu.dest_texture(w, h, MTLPixelFormat::BGRA8Unorm)?;
+                let (dest, buffer) = gpu.dest_texture(w, h)?;
                 let (blit_us, _) = blit(gpu, &src, &dest, w, h)?;
+                crate::gpui_host::publish(buffer);
                 return Some((import_us, blit_us, w, h));
             }
         }
@@ -201,8 +246,9 @@ fn import_and_blit(io_surface: *mut std::ffi::c_void, w: u32, h: u32) -> Option<
             gpu.imported.push((key, src.clone()));
         }
 
-        let dest = gpu.dest_texture(w, h, MTLPixelFormat::BGRA8Unorm)?;
+        let (dest, buffer) = gpu.dest_texture(w, h)?;
         let (blit_us, _) = blit(gpu, &src, &dest, w, h)?;
+        crate::gpui_host::publish(buffer);
         Some((import_us, blit_us, w, h))
     })
 }

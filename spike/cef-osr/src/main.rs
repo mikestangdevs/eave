@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 
+pub mod gpui_host;
 pub mod osr;
 pub mod shared;
 
@@ -18,7 +19,11 @@ fn main() -> Result<(), &'static str> {
         return Err("Failed to parse command line arguments");
     };
 
-    shared::run_main(args.as_main_args(), &cmd_line, std::ptr::null_mut());
+    if gpui_host::gpui_mode() {
+        gpui_host::run(args.as_main_args(), &cmd_line, std::ptr::null_mut());
+    } else {
+        shared::run_main(args.as_main_args(), &cmd_line, std::ptr::null_mut());
+    }
     Ok(())
 }
 
