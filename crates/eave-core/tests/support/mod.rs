@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use eave_core::claude::ClaudeCodeSession;
 use eave_core::events::SessionEvent;
+use eave_core::grok::GrokSession;
 use eave_core::proc::{self, ProcIdentity};
 use eave_core::process;
 use eave_core::session::{AgentSession, SessionError, SpawnConfig};
@@ -66,6 +67,18 @@ pub fn spawn_agent(
     Ok((ReapedSession(Some(session)), rx))
 }
 
+/// The same, for the Grok adapter (Slice AV). A Grok child is setsid'd
+/// into its own group exactly like a Claude one, so it needs exactly the
+/// same reaping — only the concrete session type differs.
+pub fn spawn_grok_agent(
+    cfg: &SpawnConfig,
+) -> Result<(ReapedSession<GrokSession>, Receiver<SessionEvent>), SessionError> {
+    arm_leak_guard();
+    let (session, rx) = GrokSession::spawn(cfg)?;
+    remember(session.identity());
+    Ok((ReapedSession(Some(session)), rx))
+}
+
 /// A session that proves its process group is gone before the test that
 /// owns it finishes — whether it finishes by returning or by panicking.
 ///
@@ -73,22 +86,26 @@ pub fn spawn_agent(
 /// other `AgentSession` method still read exactly as they did. A test that
 /// kills explicitly (because the kill IS what it is testing) keeps doing
 /// so; drop then finds the group already empty and does nothing.
-pub struct ReapedSession(Option<ClaudeCodeSession>);
+///
+/// Generic over the concrete session type so every adapter gets the same
+/// cleanup; it defaults to `ClaudeCodeSession` so the name still means what
+/// it did before there was more than one adapter.
+pub struct ReapedSession<S: AgentSession = ClaudeCodeSession>(Option<S>);
 
-impl Deref for ReapedSession {
-    type Target = ClaudeCodeSession;
+impl<S: AgentSession> Deref for ReapedSession<S> {
+    type Target = S;
     fn deref(&self) -> &Self::Target {
         self.0.as_ref().expect("session taken")
     }
 }
 
-impl DerefMut for ReapedSession {
+impl<S: AgentSession> DerefMut for ReapedSession<S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.as_mut().expect("session taken")
     }
 }
 
-impl Drop for ReapedSession {
+impl<S: AgentSession> Drop for ReapedSession<S> {
     fn drop(&mut self) {
         let Some(session) = self.0.take() else {
             return;
