@@ -1039,4 +1039,43 @@ mod tests {
         assert_eq!(c.snapshot().state_name(), "failed");
         assert_eq!(c.on_tick(10_000_000), None);
     }
+
+    /// **THE Slice CJ regression, at the surface an operator can see.**
+    ///
+    /// Codex multiplexes threads over one connection, so a subagent's
+    /// `turn/completed` arrives mid-turn on eave's own stdout. Folded as
+    /// eave's own it clears `pending_approvals`, and the session stops
+    /// reporting `AwaitingApproval` while the permission card is still on
+    /// screen — an unanswered question that the attention model has
+    /// forgotten is the exact failure Slice K exists to prevent.
+    ///
+    /// Attributed to the thread that owns it, the frame is bytes and
+    /// nothing more: the operator is still being waited on, indefinitely.
+    #[test]
+    fn a_child_threads_turn_end_never_clears_a_pending_approval() {
+        let mut c = Classifier::new(TH, 0);
+        delivered(&mut c, 0);
+        c.on_record(&approval_requested("req-1", "Write"), 1_000);
+        assert_eq!(c.snapshot().state_name(), "awaiting_approval");
+
+        c.on_record(
+            &provider(SessionEvent::ForeignThread {
+                thread_id: "01a00fe7-e358-7a02-8745-e7a0793013ce".into(),
+                event: Box::new(SessionEvent::TurnCompleted {
+                    subtype: "completed".into(),
+                    is_error: false,
+                }),
+            }),
+            2_000,
+        );
+        assert_eq!(
+            c.snapshot().state_name(),
+            "awaiting_approval",
+            "a subagent finishing does not answer the operator's question"
+        );
+        // An hour of it, past both clocks, still parked and still never
+        // offered a kill.
+        assert_eq!(c.on_tick(3_600_000), None);
+        assert_eq!(c.snapshot().state_name(), "awaiting_approval");
+    }
 }

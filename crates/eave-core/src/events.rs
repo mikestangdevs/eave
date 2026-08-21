@@ -309,6 +309,54 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<ContextWindow>,
     },
+    /// A frame that belongs to a DIFFERENT thread on the same connection
+    /// (Slice CJ).
+    ///
+    /// Codex multiplexes: a `Task` spawns a child thread whose turns
+    /// start, run tools and complete on eave's own stdout, each frame
+    /// naming its own `threadId`. eave drives exactly one thread, and
+    /// every other frame is somebody else's.
+    ///
+    /// **Attribution, not narrowing.** Slice CH got the ownership right
+    /// and the type wrong: it wrote a child's frame out as
+    /// `System { subtype: "foreign_thread:<method>" }`, so a child's
+    /// `commandExecution`, its `item/completed` and its token usage all
+    /// collapsed into one opaque string that no later reader could widen
+    /// again. Here the frame is decoded by the same parser it would get
+    /// if it were eave's own, and the decode is kept — `event` is a fully
+    /// typed [`SessionEvent`], `thread_id` is the provider's own id for
+    /// whoever owns it.
+    ///
+    /// **The wrapper IS the safety property**, and that is why this is a
+    /// variant rather than an `Option<String>` field on the events that
+    /// can be foreign. Every consumer matches `SessionEvent::TurnCompleted
+    /// { .. }`, `ToolUseStarted { .. }` and friends; a field would be
+    /// invisible to every one of those patterns, so a child's turn end
+    /// would keep closing eave's turn until each site remembered to check
+    /// it. Nested inside `ForeignThread` those patterns simply do not
+    /// match, so the mistake is not available. The two exhaustive matches
+    /// (`turn::marks_agent_work`, `eave_wire::model::apply_provider`)
+    /// then force any new consumer to decide what a child's frame means
+    /// to it.
+    ///
+    /// comet reached the same shape independently —
+    /// `comet/crates/proto/src/agent.rs:418` is
+    /// `Subagent { parent_tool_use_id: String, event: Box<AgentEvent> }`.
+    /// The delta is the key: comet tags by the parent tool call, which
+    /// requires a child registry it seeds from `subAgentActivity` items
+    /// and drops frames it cannot resolve against; eave tags by the
+    /// thread the provider itself named, which needs no registry and can
+    /// never drop a frame for arriving before one.
+    ///
+    /// **No subagent surface is built on this.** The UI renders nothing
+    /// for it (`model.rs`) and the ledger opens no turn for it
+    /// (`turn.rs`) — this slice removes a narrowing, it does not add a
+    /// feature.
+    ForeignThread {
+        /// The provider's own id for the thread that owns `event`.
+        thread_id: String,
+        event: Box<SessionEvent>,
+    },
     /// A line that was not valid JSON or lacked a type tag. Surfaced, never
     /// fatal — the parser keeps going (a misbehaving CLI must not take the
     /// session state machine down with it).
@@ -497,6 +545,74 @@ mod tests {
     fn a_provider_that_said_nothing_produces_no_turn_tokens() {
         assert_eq!(TurnTokens::stated(None, None, None, None), None);
         assert!(TurnTokens::stated(None, Some(0), None, None).is_some());
+    }
+
+    /// **Slice CJ, back-compat.** eave replays its journal in full on cold
+    /// start (spec 02), and a day's worth of records were written under
+    /// Slice CH as `System { subtype: "foreign_thread:<method>" }`. Those
+    /// records must still load, and they must load as what they are: an
+    /// opaque `System` line whose decode was never performed. Silently
+    /// re-reading them as [`SessionEvent::ForeignThread`] would be worse
+    /// than failing — it would claim a typed decode this build never did,
+    /// on bytes it no longer has the parser context for.
+    ///
+    /// The `kind` tags differ (`system` vs `foreign_thread`), so serde
+    /// cannot confuse the two. This test is what keeps that true if anyone
+    /// ever reaches for a rename or an alias.
+    #[test]
+    fn a_journal_written_under_slice_ch_still_loads_as_what_it_said() {
+        let ch = r#"{"kind":"system","subtype":"foreign_thread:turn/completed","raw":"{\"method\":\"turn/completed\"}"}"#;
+        let ev: SessionEvent = serde_json::from_str(ch).expect("a CH record must still load");
+        assert_eq!(
+            ev,
+            SessionEvent::System {
+                subtype: "foreign_thread:turn/completed".into(),
+                raw: r#"{"method":"turn/completed"}"#.into(),
+            },
+            "yesterday's record states what it knew — no more"
+        );
+        // It is emphatically NOT re-read as an attributed frame: a
+        // `System` is not a `ForeignThread`, and a reader that treats it
+        // as one would be inventing a thread id nobody wrote down.
+        assert!(!matches!(ev, SessionEvent::ForeignThread { .. }));
+        assert_eq!(serde_json::to_string(&ev).unwrap(), ch, "byte for byte");
+
+        // And every older shape still loads beside it.
+        for old in [
+            r#"{"kind":"init","session_id":"abc"}"#,
+            r#"{"kind":"tool_use_started","id":"t","name":"Bash"}"#,
+            r#"{"kind":"turn_completed","subtype":"success","is_error":false}"#,
+            r#"{"kind":"token_usage","turn":{"input":1}}"#,
+        ] {
+            serde_json::from_str::<SessionEvent>(old)
+                .unwrap_or_else(|e| panic!("{old} must still load: {e}"));
+        }
+    }
+
+    /// The carrier's own contract: the thread is named and the payload
+    /// stays a fully typed event through a journal round trip. A wrapper
+    /// that flattened its inner event on the way to disk would have
+    /// reinvented CH's defect one layer down.
+    #[test]
+    fn an_attributed_frame_round_trips_with_its_inner_event_still_typed() {
+        let ev = SessionEvent::ForeignThread {
+            thread_id: "01a00fe7-e358-7a02-8745-e7a0793013ce".into(),
+            event: Box::new(SessionEvent::ToolUseStarted {
+                id: "exec-1".into(),
+                name: "commandExecution".into(),
+                input: r#"{"command":"ls"}"#.into(),
+                call: Some(crate::tool::ToolCall::Run {
+                    command: "ls".into(),
+                }),
+            }),
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert!(line.contains(r#""kind":"foreign_thread""#), "{line}");
+        assert!(
+            line.contains(r#""kind":"tool_use_started""#),
+            "the inner event keeps its own tag rather than becoming text: {line}"
+        );
+        assert_eq!(serde_json::from_str::<SessionEvent>(&line).unwrap(), ev);
     }
 
     /// A percentage needs a ceiling, and a ceiling of zero is a provider

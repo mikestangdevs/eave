@@ -165,6 +165,12 @@ fn marks_agent_work(event: &SessionEvent) -> bool {
         | SessionEvent::DialogRefused { .. }
         | SessionEvent::PostureRefused { .. }
         | SessionEvent::TokenUsage { .. }
+        // Slice CJ. A child thread's work is not eave's turn, however
+        // agent-shaped the frame inside is: opening a turn here would put
+        // a subagent's sentence on the operator's screen as if the session
+        // had produced it. A child only exists because a turn of eave's
+        // own spawned it, so there is nothing for it to open anyway.
+        | SessionEvent::ForeignThread { .. }
         | SessionEvent::Malformed { .. }
         | SessionEvent::Unknown { .. }
         | SessionEvent::Exited { .. } => false,
@@ -511,6 +517,29 @@ impl TurnLedger {
                     }
                     Fold::Activity
                 }
+                // **A child thread's frame changes nothing about eave's
+                // turn** (Slice CJ). It is bytes on the connection, so the
+                // silence clock stays alive — but it never opens eave's
+                // turn, never closes it, never adds to `outstanding` and
+                // never touches `approvals`. That last pair is the CH
+                // bug stated positively: before attribution a child's
+                // `turn/completed` reached the arm above and cleared both,
+                // dropping an open permission question out of the
+                // attention model while its card was still on screen.
+                //
+                // **Not a fourth [`TurnStart`].** The question was asked
+                // and the answer is no: `TurnStart` enumerates shapes of
+                // EAVE's turn — what opens it, what is owed to close it —
+                // and `open()` is what `in_turn()`, `started_ms()` and the
+                // working trailer read. A `TurnStart::Child` would make
+                // every one of those speak for a turn eave does not own,
+                // and would make `settle()` answerable for a frame no
+                // adapter of eave's will ever receive the end of. What the
+                // ledger gains here instead is *sight*: the child's frame
+                // arrives typed and named rather than disguised as an
+                // opaque `System`, so a future subagent slice has a
+                // decision point rather than a string to re-parse.
+                SessionEvent::ForeignThread { .. } => Fold::Activity,
                 // UserEcho, TokenUsage, DialogRefused, PostureRefused,
                 // Malformed, Unknown, (Exited never lands here — the
                 // recorder folds it into Closed): all bytes.
@@ -976,5 +1005,127 @@ mod tests {
         // And hours of the CLI lingering on stdin afterwards stay closed.
         assert!(!l.settle(7_200_000, QUIET));
         assert_eq!(l.open(), None);
+    }
+
+    /// **The bug, at the ledger where it did its damage** (Slice CJ).
+    ///
+    /// Codex multiplexes threads: a child's `turn/completed` arrives on
+    /// eave's own stdout in the middle of eave's own turn. If it reaches
+    /// the `TurnCompleted` arm it closes the prompted turn, clears
+    /// `outstanding` and clears `approvals` — so a permission question the
+    /// operator has not answered leaves the attention model while its card
+    /// is still on screen, and the running tool stops holding
+    /// `QUIET_AFTER` off.
+    ///
+    /// Wrapped in [`SessionEvent::ForeignThread`] it cannot reach that arm
+    /// at all: the pattern does not match through the wrapper. Everything
+    /// eave owns is still owned afterwards.
+    #[test]
+    fn a_child_threads_turn_end_settles_nothing_of_eaves() {
+        let mut l = TurnLedger::new(0);
+        l.on_record(&rec(1, 0, JournalEvent::UserSent { text: "go".into() }), 0);
+        l.on_record(&rec(2, 10, JournalEvent::UserDelivered {}), 10);
+        l.on_record(
+            &provider(
+                20,
+                SessionEvent::ToolUseStarted {
+                    id: "t1".into(),
+                    name: "commandExecution".into(),
+                    input: String::new(),
+                    call: None,
+                },
+            ),
+            20,
+        );
+        l.on_record(
+            &provider(
+                30,
+                SessionEvent::ApprovalRequested {
+                    request_id: "r1".into(),
+                    tool: "fileChange".into(),
+                    display_name: "Edit files".into(),
+                    description: String::new(),
+                    path: None,
+                    input_json: "{}".into(),
+                    suggestions_json: None,
+                },
+            ),
+            30,
+        );
+        assert_eq!(l.open(), Some(TurnStart::Prompted));
+        assert!(l.tools_outstanding());
+        assert_eq!(l.approvals().len(), 1);
+
+        // The child completes. Every fact of eave's must survive it.
+        let child = provider(
+            40,
+            SessionEvent::ForeignThread {
+                thread_id: "01a00fe7-e358-7a02-8745-e7a0793013ce".into(),
+                event: Box::new(SessionEvent::TurnCompleted {
+                    subtype: "completed".into(),
+                    is_error: false,
+                }),
+            },
+        );
+        assert_eq!(
+            l.on_record(&child, 40),
+            Fold::Activity,
+            "bytes, not a settle"
+        );
+        assert_eq!(
+            l.open(),
+            Some(TurnStart::Prompted),
+            "a child's turn end must not close eave's turn"
+        );
+        assert!(
+            l.tools_outstanding(),
+            "nor retire the tool eave is still running"
+        );
+        assert_eq!(
+            l.approvals().len(),
+            1,
+            "nor drop an unanswered question whose card is still on screen"
+        );
+
+        // And eave's OWN terminal frame still closes everything, so the
+        // guard has not traded an early close for a turn that never ends.
+        l.on_record(&completed(50), 50);
+        assert_eq!(l.open(), None);
+        assert!(!l.tools_outstanding());
+        assert!(l.approvals().is_empty());
+    }
+
+    /// A child thread's work never opens a turn of eave's either. Its
+    /// prose and its tool calls are agent-shaped frames, and
+    /// [`marks_agent_work`] would mint an `Unannounced` turn out of any of
+    /// them if the wrapper were unwrapped — putting a subagent's sentence
+    /// on the operator's screen as the session's own.
+    #[test]
+    fn a_child_threads_work_opens_no_turn_of_eaves() {
+        for inner in [
+            SessionEvent::TextDelta {
+                text: "beta".into(),
+            },
+            SessionEvent::AssistantText {
+                text: "beta done".into(),
+            },
+            SessionEvent::ToolUseStarted {
+                id: "exec-1".into(),
+                name: "commandExecution".into(),
+                input: String::new(),
+                call: None,
+            },
+        ] {
+            let mut l = TurnLedger::new(0);
+            let rec = provider(
+                1_000,
+                SessionEvent::ForeignThread {
+                    thread_id: "child".into(),
+                    event: Box::new(inner.clone()),
+                },
+            );
+            l.on_record(&rec, 1_000);
+            assert_eq!(l.open(), None, "{inner:?} opened a turn eave does not own");
+        }
     }
 }

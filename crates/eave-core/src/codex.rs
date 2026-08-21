@@ -1085,20 +1085,67 @@ impl CodexProtocol {
         // channel (`grok.rs`: "one agent process can report on sessions
         // eave is not driving") and simply had not applied it here.
         //
-        // Foreign frames are journaled verbatim, never dropped: a child
-        // thread doing work IS a fact about this session, and a later
-        // subagent slice will want it. It is recorded as somebody else's
-        // fact rather than folded into eave's own.
-        if let (Some(mine), Some(theirs)) = (
+        // Foreign frames are journaled, never dropped: a child thread
+        // doing work IS a fact about this session, and a later subagent
+        // slice will want it. It is recorded as somebody else's fact
+        // rather than folded into eave's own.
+        //
+        // **Slice CJ: attributed, not detyped.** CH wrote the foreign
+        // frame out as `System { subtype: "foreign_thread:<method>" }` —
+        // correct about ownership and wrong about everything else. A
+        // child's `commandExecution` (capture lines 68, 82, 112), its
+        // `item/completed`, its token usage all collapsed into one opaque
+        // string, which is eave's own through-line defect this week:
+        // narrowing provider data at the ingest boundary and never being
+        // able to widen it again. Attribution and filtering are two
+        // concerns and CH fused them; the fusion is what destroyed the
+        // type.
+        //
+        // So the frame is decoded by exactly the parser it would get if
+        // it were eave's own, and then WRAPPED in
+        // [`SessionEvent::ForeignThread`]. The wrapper is the whole
+        // safety property: nothing downstream matches
+        // `SessionEvent::TurnCompleted` through it, so a child's turn
+        // end cannot reach eave's ledger however many arms are added
+        // later. `decode_threaded` is free of `self` for the same reason
+        // — a child's tool cannot land in `outstanding` because the
+        // decoder has nothing to land it in.
+        let foreign = match (
             self.thread_id.as_deref(),
             params.get("threadId").and_then(Value::as_str),
         ) {
-            if mine != theirs {
-                return Step::from_event(SessionEvent::System {
-                    subtype: format!("foreign_thread:{method}"),
+            (Some(mine), Some(theirs)) if mine != theirs => Some(theirs.to_string()),
+            _ => None,
+        };
+        // The turn-scoped methods decode identically whoever owns them.
+        // What differs is only who the fact gets recorded against.
+        if let Some((event, book)) = decode_threaded(method, params, line) {
+            return match foreign {
+                Some(thread_id) => attributed(thread_id, event),
+                None => {
+                    self.record(book);
+                    Step::from_event(event)
+                }
+            };
+        }
+        if let Some(thread_id) = foreign {
+            // A thread-scoped method this parser does not decode
+            // (`turn/started`, `thread/status/changed`, MCP startup, and
+            // whatever 0.149 adds). Verbatim, same contract as an
+            // unrecognised frame of eave's own — and still attributed.
+            //
+            // **This breadth is deliberately kept.** t3code guards only
+            // `turn/started` and `turn/completed`
+            // (`CodexSessionRuntime.ts`), so a child's `item/*` and
+            // `thread/tokenUsage/updated` still reach its parent session.
+            // eave attributes every frame that names a thread.
+            return attributed(
+                thread_id,
+                SessionEvent::System {
+                    subtype: method.to_string(),
                     raw: line.to_string(),
-                });
-            }
+                },
+            );
         }
         match method {
             // The response to `thread/start` already carried the id AND
@@ -1117,24 +1164,6 @@ impl CodexProtocol {
                 }
                 self.thread_opened(params)
             }
-            "item/agentMessage/delta" => match params.get("delta").and_then(Value::as_str) {
-                Some(text) => Step::from_event(SessionEvent::TextDelta { text: text.into() }),
-                None => Step::from_event(malformed(line, "agentMessage delta without text".into())),
-            },
-            "item/started" => self.item_started(params, line),
-            "item/completed" => self.item_completed(params, line),
-            "turn/completed" => {
-                let status = params
-                    .pointer("/turn/status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                Step::from_event(SessionEvent::TurnCompleted {
-                    subtype: status.to_string(),
-                    // The server's own word, not an inference from the
-                    // text: `completed` is the only success.
-                    is_error: status != "completed",
-                })
-            }
             // The server withdrew a request nobody answered. The card must
             // go away — an unanswerable question left on screen is a lie.
             "serverRequest/resolved" => {
@@ -1151,20 +1180,6 @@ impl CodexProtocol {
                     Step::default()
                 }
             }
-            // Slice CC. Codex is the one provider that states both facts
-            // in one frame and labels them itself: `tokenUsage.last` is
-            // the turn just finished, `tokenUsage.total` is the running
-            // session sum, and `modelContextWindow` is the ceiling.
-            "thread/tokenUsage/updated" => match token_usage(params) {
-                Some(event) => Step::from_event(event),
-                // A frame shaped differently from the one this build
-                // knows still reaches the journal verbatim, same contract
-                // as everything else below.
-                None => Step::from_event(SessionEvent::System {
-                    subtype: method.to_string(),
-                    raw: line.to_string(),
-                }),
-            },
             // Everything else the server says, kept verbatim so the
             // journal records a CLI addition without a parser change —
             // `error`, `warning`, `thread/status/changed`,
@@ -1176,78 +1191,185 @@ impl CodexProtocol {
         }
     }
 
-    fn item_started(&mut self, params: &Value, line: &str) -> Step {
-        let Some(item) = params.get("item") else {
-            return Step::from_event(malformed(line, "item/started without item".into()));
-        };
-        let (Some(id), Some(kind)) = (
-            item.get("id").and_then(Value::as_str),
-            item.get("type").and_then(Value::as_str),
-        ) else {
-            return Step::from_event(malformed(line, "item without id or type".into()));
-        };
-        if kind == "userMessage" {
-            return Step::from_event(SessionEvent::UserEcho {
-                text: user_text(item),
-            });
+    /// Record what a frame of eave's OWN means for its in-flight state.
+    ///
+    /// Split out of the decoders (Slice CJ) so that *decoding* a frame and
+    /// *owning* it are two acts. A child thread's frame runs through the
+    /// same decoders and simply never reaches this method, which is why a
+    /// child's `commandExecution` can never appear in `in_flight_tools`
+    /// and why the decoders needed no `mine: bool` argument — the thing
+    /// that would have fused the two concerns all over again.
+    fn record(&mut self, book: Bookkeeping) {
+        match book {
+            Bookkeeping::Nothing => {}
+            Bookkeeping::ToolStarted { id, item } => {
+                self.outstanding.insert(id.clone());
+                self.items.insert(id, item);
+            }
+            Bookkeeping::ToolFinished { id } => {
+                self.outstanding.remove(&id);
+                self.items.remove(&id);
+            }
         }
-        let Some(name) = tool_name(kind, item) else {
-            // Reasoning, plans, agent messages: real items, not tool
-            // calls. Journaled as facts; they must never reach
-            // `in_flight_tools`, which is the difference between "the
-            // agent is working" and "the agent is thinking".
-            return Step::from_event(SessionEvent::System {
-                subtype: format!("item/started/{kind}"),
+    }
+}
+
+/// What a decoded frame would have eave record about its OWN session.
+///
+/// Carried beside the event rather than applied inside the decoder,
+/// because the same frame shape arrives for threads eave does not drive
+/// and only one of them is eave's.
+enum Bookkeeping {
+    /// Nothing about eave's in-flight state changes.
+    Nothing,
+    /// A tool call is outstanding. The item is kept too: an approval
+    /// request for a file change names only its `itemId`, and the paths
+    /// it would touch live in the item.
+    ToolStarted {
+        id: String,
+        item: Value,
+    },
+    ToolFinished {
+        id: String,
+    },
+}
+
+/// One frame, attributed to the thread that owns it.
+fn attributed(thread_id: String, event: SessionEvent) -> Step {
+    Step::from_event(SessionEvent::ForeignThread {
+        thread_id,
+        event: Box::new(event),
+    })
+}
+
+/// Decode one turn-scoped notification — a frame that names a `threadId`
+/// and therefore belongs to exactly one thread on a multiplexed
+/// connection. `None` = not a method this parser decodes.
+///
+/// **Free of `self` on purpose.** It cannot reach eave's in-flight set,
+/// its item cache or its pending approvals, so a child thread's frame can
+/// be run through the very parser eave runs its own through with no
+/// possibility of the child's facts landing in eave's state. That is what
+/// lets attribution stay a wrapper instead of becoming a `to_string()`.
+fn decode_threaded(
+    method: &str,
+    params: &Value,
+    line: &str,
+) -> Option<(SessionEvent, Bookkeeping)> {
+    let plain = |event: SessionEvent| Some((event, Bookkeeping::Nothing));
+    match method {
+        "item/agentMessage/delta" => match params.get("delta").and_then(Value::as_str) {
+            Some(text) => plain(SessionEvent::TextDelta { text: text.into() }),
+            None => plain(malformed(line, "agentMessage delta without text".into())),
+        },
+        "item/started" => Some(decode_item_started(params, line)),
+        "item/completed" => Some(decode_item_completed(params, line)),
+        "turn/completed" => {
+            let status = params
+                .pointer("/turn/status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            plain(SessionEvent::TurnCompleted {
+                subtype: status.to_string(),
+                // The server's own word, not an inference from the text:
+                // `completed` is the only success.
+                is_error: status != "completed",
+            })
+        }
+        // Slice CC. Codex is the one provider that states both facts in
+        // one frame and labels them itself: `tokenUsage.last` is the turn
+        // just finished, `tokenUsage.total` is the running session sum,
+        // and `modelContextWindow` is the ceiling.
+        "thread/tokenUsage/updated" => plain(token_usage(params).unwrap_or_else(|| {
+            // A frame shaped differently from the one this build knows
+            // still reaches the journal verbatim.
+            SessionEvent::System {
+                subtype: method.to_string(),
                 raw: line.to_string(),
-            });
-        };
-        self.outstanding.insert(id.to_string());
-        self.items.insert(id.to_string(), item.clone());
-        Step::from_event(SessionEvent::ToolUseStarted {
+            }
+        })),
+        _ => None,
+    }
+}
+
+fn decode_item_started(params: &Value, line: &str) -> (SessionEvent, Bookkeeping) {
+    let unbooked = |event| (event, Bookkeeping::Nothing);
+    let Some(item) = params.get("item") else {
+        return unbooked(malformed(line, "item/started without item".into()));
+    };
+    let (Some(id), Some(kind)) = (
+        item.get("id").and_then(Value::as_str),
+        item.get("type").and_then(Value::as_str),
+    ) else {
+        return unbooked(malformed(line, "item without id or type".into()));
+    };
+    if kind == "userMessage" {
+        return unbooked(SessionEvent::UserEcho {
+            text: user_text(item),
+        });
+    }
+    let Some(name) = tool_name(kind, item) else {
+        // Reasoning, plans, agent messages: real items, not tool calls.
+        // Journaled as facts; they must never reach `in_flight_tools`,
+        // which is the difference between "the agent is working" and "the
+        // agent is thinking".
+        return unbooked(SessionEvent::System {
+            subtype: format!("item/started/{kind}"),
+            raw: line.to_string(),
+        });
+    };
+    (
+        SessionEvent::ToolUseStarted {
             id: id.to_string(),
             call: Some(decode_tool(kind, item, &name)),
             name,
             input: cap_payload(&tool_input(kind, item)),
-        })
-    }
+        },
+        Bookkeeping::ToolStarted {
+            id: id.to_string(),
+            item: item.clone(),
+        },
+    )
+}
 
-    fn item_completed(&mut self, params: &Value, line: &str) -> Step {
-        let Some(item) = params.get("item") else {
-            return Step::from_event(malformed(line, "item/completed without item".into()));
-        };
-        let (Some(id), Some(kind)) = (
-            item.get("id").and_then(Value::as_str),
-            item.get("type").and_then(Value::as_str),
-        ) else {
-            return Step::from_event(malformed(line, "item without id or type".into()));
-        };
-        if kind == "agentMessage" {
-            return Step::from_event(SessionEvent::AssistantText {
-                text: item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            });
-        }
-        if tool_name(kind, item).is_none() {
-            return Step::from_event(SessionEvent::System {
-                subtype: format!("item/completed/{kind}"),
-                raw: line.to_string(),
-            });
-        }
-        self.outstanding.remove(id);
-        self.items.remove(id);
-        let status = item.get("status").and_then(Value::as_str).unwrap_or("");
-        Step::from_event(SessionEvent::ToolUseFinished {
+fn decode_item_completed(params: &Value, line: &str) -> (SessionEvent, Bookkeeping) {
+    let unbooked = |event| (event, Bookkeeping::Nothing);
+    let Some(item) = params.get("item") else {
+        return unbooked(malformed(line, "item/completed without item".into()));
+    };
+    let (Some(id), Some(kind)) = (
+        item.get("id").and_then(Value::as_str),
+        item.get("type").and_then(Value::as_str),
+    ) else {
+        return unbooked(malformed(line, "item without id or type".into()));
+    };
+    if kind == "agentMessage" {
+        return unbooked(SessionEvent::AssistantText {
+            text: item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    if tool_name(kind, item).is_none() {
+        return unbooked(SessionEvent::System {
+            subtype: format!("item/completed/{kind}"),
+            raw: line.to_string(),
+        });
+    }
+    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    (
+        SessionEvent::ToolUseFinished {
             id: id.to_string(),
             result: cap_payload(&tool_result(kind, item)),
             // `declined` is a failure by the provider's own word: the
             // operator said no and the tool did not run.
             is_error: matches!(status, "failed" | "declined")
                 || item.get("error").is_some_and(|e| !e.is_null()),
-        })
-    }
+        },
+        Bookkeeping::ToolFinished { id: id.to_string() },
+    )
 }
 
 impl Step {
@@ -1810,11 +1932,10 @@ mod usage_tests {
             for ev in p.notification(method, &v, line).events {
                 match ev {
                     SessionEvent::TurnCompleted { .. } => ours += 1,
-                    SessionEvent::System { ref subtype, .. }
-                        if subtype.starts_with("foreign_thread:") =>
-                    {
-                        theirs += 1
-                    }
+                    // Slice CJ moved the carrier from a `System` subtype
+                    // string to the `ForeignThread` wrapper. The rule the
+                    // test asserts is unchanged and so is the count.
+                    SessionEvent::ForeignThread { .. } => theirs += 1,
                     _ => {}
                 }
             }
@@ -1827,5 +1948,132 @@ mod usage_tests {
             theirs > 0,
             "the children's frames must be RECORDED as somebody else's, not dropped"
         );
+    }
+
+    /// Line 82 of the same capture, verbatim: the beta child thread runs a
+    /// shell command.
+    const CHILD_EXEC: &str = r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"exec-eb5c5acb-e779-4020-8af2-f4ffcf4eb07e","pluginId":null,"scriptPath":null,"command":"/usr/bin/zsh -lc 'echo beta-done > beta.txt'","cwd":"/tmp/probe-codex","processId":"62551","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"echo beta-done > beta.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"01a00fe7-e358-7a02-8745-e7a0793013ce","turnId":"01a00fe7-e375-7250-b528-014e85e7a18e","startedAtMs":1786973255872},"emittedAtMs":1786973255872}"#;
+
+    const PARENT: &str = "01a00fe7-c301-7d52-ae1f-41ecda48b29b";
+    const BETA: &str = "01a00fe7-e358-7a02-8745-e7a0793013ce";
+
+    /// Parse one line as the parent thread would see it.
+    fn as_parent(p: &mut CodexProtocol, line: &str) -> Vec<SessionEvent> {
+        p.parse_line(line).events
+    }
+
+    /// **The defect Slice CJ exists to remove.** CH attributed a child's
+    /// frame correctly and then threw the decode away: every child frame
+    /// became `System { subtype: "foreign_thread:<method>" }`, one opaque
+    /// string standing in for a typed tool call, so nothing downstream
+    /// could ever widen it again.
+    ///
+    /// The frame is decoded by the SAME parser eave runs its own frames
+    /// through — `ToolCall::Run` with the command intact — and only then
+    /// marked as somebody else's.
+    #[test]
+    fn a_child_threads_tool_call_arrives_typed_rather_than_stringified() {
+        let mut p = CodexProtocol::new();
+        p.thread_id = Some(PARENT.into());
+
+        let events = as_parent(&mut p, CHILD_EXEC);
+        let [SessionEvent::ForeignThread { thread_id, event }] = events.as_slice() else {
+            panic!("expected one attributed frame, got {events:?}");
+        };
+        assert_eq!(thread_id, BETA, "attributed to the thread that owns it");
+        let SessionEvent::ToolUseStarted { id, name, call, .. } = event.as_ref() else {
+            panic!("a child's tool call must stay a tool call, got {event:?}");
+        };
+        assert_eq!(id, "exec-eb5c5acb-e779-4020-8af2-f4ffcf4eb07e");
+        assert_eq!(name, "commandExecution");
+        assert_eq!(
+            call.as_ref(),
+            Some(&ToolCall::Run {
+                command: "/usr/bin/zsh -lc 'echo beta-done > beta.txt'".into()
+            }),
+            "the typed decode is the whole point: a string cannot be widened back"
+        );
+    }
+
+    /// Decoding a child's frame must not RECORD it. The two acts are split
+    /// (`decode_threaded` has no `self`, `record` is the only writer), and
+    /// this is the assertion that they stay split: a child's shell command
+    /// is not eave's outstanding tool, so `in_flight_tools` must not count
+    /// it and the item cache — which a later approval reads paths out of —
+    /// must not hold it.
+    #[test]
+    fn a_child_threads_tool_never_enters_eaves_in_flight_set() {
+        let mut p = CodexProtocol::new();
+        p.thread_id = Some(PARENT.into());
+        as_parent(&mut p, CHILD_EXEC);
+        assert_eq!(p.in_flight(), 0, "a child's command is not eave's work");
+        assert!(
+            p.items.is_empty(),
+            "nor is its item eave's to read paths from"
+        );
+
+        // The same frame under eave's OWN thread is counted, so the test
+        // above is about attribution and not about a decoder that quietly
+        // stopped booking anything.
+        let mine = CHILD_EXEC.replace(BETA, PARENT);
+        let mut p = CodexProtocol::new();
+        p.thread_id = Some(PARENT.into());
+        as_parent(&mut p, &mine);
+        assert_eq!(p.in_flight(), 1);
+        assert_eq!(p.items.len(), 1);
+    }
+
+    /// Replayed from the live capture: every typed thing the children did
+    /// survives attribution. Four shell commands across two threads, their
+    /// token usage, and their two turn ends — each one a typed
+    /// `SessionEvent` inside the wrapper rather than a subtype string.
+    ///
+    /// The counts are read off the capture (`item/started` with
+    /// `type: commandExecution` on a non-parent `threadId`), never off the
+    /// code under test.
+    #[test]
+    fn every_child_frame_the_capture_carries_survives_as_a_typed_event() {
+        const CAPTURE: &str = "/Users/michaelstang/Desktop/eave/comet/crates/harness/tests/fixtures/codex/live-0.146.1-multi-agent.jsonl";
+        let Ok(text) = std::fs::read_to_string(CAPTURE) else {
+            eprintln!("skipping: {CAPTURE} not present");
+            return;
+        };
+
+        let mut p = CodexProtocol::new();
+        p.thread_id = Some(PARENT.into());
+
+        let (mut commands, mut usage, mut child_ends, mut threads) =
+            (Vec::new(), 0, 0, std::collections::BTreeSet::new());
+        for line in text.lines() {
+            for ev in p.parse_line(line).events {
+                let SessionEvent::ForeignThread { thread_id, event } = ev else {
+                    continue;
+                };
+                threads.insert(thread_id);
+                match *event {
+                    SessionEvent::ToolUseStarted {
+                        call: Some(ToolCall::Run { command }),
+                        ..
+                    } => commands.push(command),
+                    SessionEvent::TokenUsage { .. } => usage += 1,
+                    SessionEvent::TurnCompleted { .. } => child_ends += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(threads.len(), 2, "two children share the connection");
+        assert_eq!(
+            commands.len(),
+            3,
+            "the children's shell commands, typed: lines 68, 82, 112 — got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("alpha-done"))
+                && commands.iter().any(|c| c.contains("beta-done")),
+            "both children's work is legible: {commands:?}"
+        );
+        assert_eq!(usage, 5, "the children's token usage stays a number");
+        assert_eq!(child_ends, 2, "both children's turn ends, owned by them");
+        assert_eq!(p.in_flight(), 0, "and none of it is eave's in-flight work");
     }
 }

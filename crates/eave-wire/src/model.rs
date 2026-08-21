@@ -468,6 +468,12 @@ impl Transcript {
                 }
             }
             SessionEvent::System { .. } => {}
+            // Slice CJ. A child thread's frame is recorded, never
+            // rendered: eave has no subagent surface, and painting a
+            // child's prose or tool row into the parent's transcript is
+            // exactly the confusion attribution exists to prevent. The
+            // journal holds it fully typed for the slice that builds one.
+            SessionEvent::ForeignThread { .. } => {}
             SessionEvent::Malformed { .. } | SessionEvent::Unknown { .. } => {}
             // Terminal classification renders via the `Closed` record that
             // follows; the raw exit event carries no extra display state.
@@ -1038,5 +1044,61 @@ mod tests {
             }
             other => panic!("expected a tool row, got {other:?}"),
         }
+    }
+
+    /// **Slice CJ.** A child thread's frames are journaled fully typed, and
+    /// the transcript still renders none of them: eave has no subagent
+    /// surface, and a subagent's prose or shell command painted into the
+    /// parent's transcript reads as the session's own words. Attribution
+    /// exists to prevent exactly that confusion, so a slice that removed a
+    /// narrowing must not accidentally add a surface.
+    ///
+    /// The turn end is the one that matters most — through the wrapper it
+    /// must not settle the live rows or stamp the turn's outcome.
+    #[test]
+    fn a_child_threads_frames_render_nothing_in_the_parents_transcript() {
+        let mut t = Transcript::new();
+        let child = |event| JournalEvent::Provider {
+            event: SessionEvent::ForeignThread {
+                thread_id: "01a00fe7-e358-7a02-8745-e7a0793013ce".into(),
+                event: Box::new(event),
+            },
+        };
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    child(SessionEvent::TextDelta {
+                        text: "beta".into(),
+                    }),
+                ),
+                rec(
+                    2,
+                    child(SessionEvent::ToolUseStarted {
+                        id: "exec-1".into(),
+                        name: "commandExecution".into(),
+                        input: r#"{"command":"echo beta"}"#.into(),
+                        call: Some(ToolCall::Run {
+                            command: "echo beta".into(),
+                        }),
+                    }),
+                ),
+                rec(
+                    3,
+                    child(SessionEvent::TurnCompleted {
+                        subtype: "completed".into(),
+                        is_error: false,
+                    }),
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(
+            t.rows.is_empty(),
+            "no row belongs to a thread eave is not driving: {:?}",
+            t.rows
+        );
+        assert_eq!(t.turn_tokens, None);
     }
 }
