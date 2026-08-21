@@ -49,8 +49,18 @@ struct EngineProc {
 
 impl EngineProc {
     fn spawn(data_dir: &Path, fake_mode: &str) -> Self {
+        Self::spawn_with_env(data_dir, fake_mode, &[])
+    }
+
+    /// Same, plus `EAVE_*` variables the engine forwards to the agent —
+    /// how a test makes the fake agent announce an id eave did not choose.
+    fn spawn_with_env(data_dir: &Path, fake_mode: &str, env: &[(&str, &str)]) -> Self {
         let log = std::fs::File::create(data_dir.join("engine-test.log")).unwrap();
-        let child = Command::new(engined_bin())
+        let mut cmd = Command::new(engined_bin());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .args(["--data-dir", &data_dir.display().to_string()])
             .env("EAVE_AGENT", fake_agent_bin())
             .env("EAVE_FAKE_MODE", fake_mode)
@@ -578,6 +588,87 @@ async fn send_after_terminal_outcome_resumes_same_provider_session() {
     assert_eq!(flags.len(), 2, "{flags:?}");
     assert!(flags[1].contains("RESUME_FLAG:true"), "{flags:?}");
     assert!(flags[1].contains("ID:s1"), "{flags:?}");
+
+    drop(engine);
+}
+
+/// Cold resume names the id the PROVIDER announced, not the id eave
+/// proposed (slice CD, 2026-08-20).
+///
+/// `send_after_terminal_outcome_resumes_same_provider_session` above
+/// cannot see this: its fake agent announces the same id eave passed, so
+/// resuming under either one looks identical. Here `FAKE_SESSION_ID`
+/// makes the agent announce `provider-minted-9` while eave opened the
+/// session as `s1` — the shape of every non-Claude provider, all of which
+/// mint their own id (Grok and Hermes at `session/new`, Codex at thread
+/// creation) and have never heard of eave's uuid.
+///
+/// Before this slice the engine computed `resume` as a bare `bool` —
+/// "has this session ever seen an `Init`?" — and then resumed under
+/// `cfg.session_id`. The provider's id was sitting in the journal one
+/// field away from the code that needed it. `AgentSession::
+/// provider_session_id()` existed on all five adapters, was asserted by
+/// their tests, and had no consumer in the engine at all.
+#[tokio::test]
+async fn cold_resume_carries_the_providers_own_id_not_eaves() {
+    let dir = scratch();
+    let engine = EngineProc::spawn_with_env(
+        &dir,
+        "resume-probe",
+        &[("EAVE_FAKE_SESSION_ID", "provider-minted-9")],
+    );
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open");
+
+    let mut t = Transcript::new();
+    let mut rx = c.subscribe("s1", None).await.expect("subscribe");
+
+    let flags = |t: &Transcript| -> Vec<String> {
+        t.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Assistant { text, .. } if text.contains("RESUME_FLAG") => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Generation 1: fresh. eave names `s1` on argv; the agent answers with
+    // an id of its own, which is what lands in the journal's `Init`.
+    assert!(c.send("s1", "one").await.expect("send"));
+    let end = Instant::now() + Duration::from_secs(15);
+    while t.closed.is_none() {
+        assert!(Instant::now() < end, "generation 1 never settled");
+        drain_records(&mut rx, &mut t, 1, Duration::from_secs(15)).await;
+    }
+    let g1 = flags(&t);
+    assert_eq!(g1.len(), 1, "{g1:?}");
+    assert!(g1[0].contains("RESUME_FLAG:false"), "{g1:?}");
+    assert!(
+        g1[0].contains("ARGV_ID:s1"),
+        "a FRESH session is named with eave's own id: {g1:?}"
+    );
+
+    // Generation 2: the terminal session gets another send. This must go
+    // out as `--resume provider-minted-9`.
+    t.closed = None;
+    assert!(c.send("s1", "two").await.expect("send 2"));
+    let end = Instant::now() + Duration::from_secs(15);
+    while t.closed.is_none() {
+        assert!(Instant::now() < end, "generation 2 never settled");
+        drain_records(&mut rx, &mut t, 1, Duration::from_secs(15)).await;
+    }
+    let g2 = flags(&t);
+    assert_eq!(g2.len(), 2, "{g2:?}");
+    assert!(g2[1].contains("RESUME_FLAG:true"), "{g2:?}");
+    assert!(
+        g2[1].contains("ARGV_ID:provider-minted-9"),
+        "a resume must carry the id the provider announced, not eave's: {g2:?}"
+    );
+    assert!(
+        !g2[1].contains("ARGV_ID:s1"),
+        "resuming under eave's own uuid is the bug this test exists for: {g2:?}"
+    );
 
     drop(engine);
 }

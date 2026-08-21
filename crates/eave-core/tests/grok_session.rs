@@ -292,13 +292,19 @@ async fn answering_the_same_question_twice_is_a_race_not_an_error() {
     session.kill().await.expect("kill");
 }
 
-/// Resume goes out as `session/load` naming the id eave was given, and the
-/// session reports that id as its own.
+/// Resume goes out as `session/load` naming **Grok's** id, not eave's.
+///
+/// The two ids are deliberately different here. Until 2026-08-20 the
+/// adapter computed its cursor as `cfg.resume.then(|| cfg.session_id)` —
+/// eave's own uuid — which Grok has never issued and cannot load, so a
+/// resume silently opened a fresh session and dropped the conversation.
+/// Setting `session_id` to a value that must NOT appear on the wire is
+/// what makes this test able to fail.
 #[tokio::test]
-async fn a_resumed_session_reports_the_id_it_was_asked_to_load() {
+async fn a_resumed_session_loads_the_providers_id_not_eaves() {
     let mut cfg = fake_cfg("acp-asks", &[]);
-    cfg.session_id = "01a020c7-d363-7a50-9f08-37e0cc12db3a".into();
-    cfg.resume = true;
+    cfg.session_id = "eave-side-id-that-grok-never-issued".into();
+    cfg.resume = Some("01a020c7-d363-7a50-9f08-37e0cc12db3a".into());
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
 
     session

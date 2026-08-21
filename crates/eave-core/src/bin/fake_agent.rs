@@ -598,11 +598,20 @@ fn main() {
             // Like the real CLI, wait for the user message before answering
             // (also makes engine-side delivery deterministic: we are alive
             // and blocked on stdin when the pipe write lands).
-            let (_, resumed) = argv_session();
+            let (argv_id, resumed) = argv_session();
             emit_init();
             let mut line = String::new();
             let _ = std::io::stdin().read_line(&mut line);
-            emit_text(&format!("RESUME_FLAG:{resumed} ID:{}", session_id()));
+            // Two different ids, deliberately. `session_id()` is what this
+            // process ANNOUNCES (overridable with FAKE_SESSION_ID, standing
+            // in for a provider that mints its own); `ARGV_ID` is what eave
+            // actually put on the command line. A resume that reads the
+            // wrong one is only visible when they differ.
+            emit_text(&format!(
+                "RESUME_FLAG:{resumed} ID:{} ARGV_ID:{}",
+                session_id(),
+                argv_id.unwrap_or_default()
+            ));
             emit_result();
         }
         // One turn stating the process's own cwd, then exit (Slice I2:

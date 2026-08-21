@@ -567,7 +567,7 @@ async fn real_claude_resume_with_model() {
     // Second spawn: same id, same model, resuming.
     let mut second = SpawnConfig::new("claude", std::env::temp_dir(), id.clone());
     second.model = Some(model.clone());
-    second.resume = true;
+    second.resume = Some(id.clone());
     let (mut session, mut rx) = spawn_agent(&second).expect("spawn 2 (--resume)");
     session
         .send_user_message("What word did I ask you to remember? Reply with just that word.")

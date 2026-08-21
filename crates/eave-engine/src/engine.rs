@@ -118,6 +118,11 @@ impl EngineConfig {
             "FAKE_PERMISSION_MODE",
             "FAKE_APPROVAL_TOOL",
             "FAKE_APPROVAL_PATH",
+            // The id the fake agent will ANNOUNCE, which the resume tests
+            // set to something other than the id eave proposed — the only
+            // way to tell "resumed under the provider's cursor" apart from
+            // "resumed under our own uuid, which happened to match".
+            "FAKE_SESSION_ID",
         ] {
             if let Ok(v) = std::env::var(format!("EAVE_{key}")) {
                 agent_env.push((key.to_string(), v));
@@ -1075,13 +1080,23 @@ impl Engine {
     async fn spawn_live(self: &Arc<Self>, handle: &Arc<SessionHandle>) -> Result<Live, String> {
         let (header, next_seq, resume) = {
             let s = handle.shared.lock().unwrap();
-            let resume = s.records.iter().any(|r| {
-                matches!(
-                    &r.event,
-                    JournalEvent::Provider {
-                        event: eave_core::events::SessionEvent::Init { .. }
-                    }
-                )
+            // The resume cursor is the LAST provider id this session was
+            // told about — `rev()`, not `find()`. A session that has been
+            // respawned carries several `Init` records and only the newest
+            // names a session the provider still has.
+            //
+            // Presence of an `Init` used to be all this computed (a bool),
+            // and the spawn then resumed under eave's OWN id. That works
+            // for Claude, which honours `--session-id`, and silently opens
+            // a fresh session for Grok, Hermes and Codex, which mint their
+            // own. Reading the id out is the whole fix — the fact was
+            // already in the journal, and was being thrown away one field
+            // short of the place that needed it.
+            let resume = s.records.iter().rev().find_map(|r| match &r.event {
+                JournalEvent::Provider {
+                    event: eave_core::events::SessionEvent::Init { session_id, .. },
+                } => Some(session_id.clone()),
+                _ => None,
             });
             (
                 s.header.clone(),
@@ -1137,7 +1152,11 @@ impl Engine {
             PathBuf::from(&header.cwd),
             handle.session_id.clone(),
         );
-        cfg.resume = resume;
+        // `Some` = continue the provider's own session; `None` = name a
+        // fresh one with `cfg.session_id`. An `Init` that carried an empty
+        // id is not a cursor, and resuming under `""` would be worse than
+        // starting over — it would ask the provider to load nothing.
+        cfg.resume = resume.filter(|id| !id.is_empty());
         cfg.extra_env = self.cfg.agent_env.clone();
         cfg.model = agent.model.clone();
         cfg.extra_args = agent

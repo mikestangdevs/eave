@@ -719,7 +719,10 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
         std::env::temp_dir(),
         loaded.header.session_id.clone(),
     );
-    cfg.resume = true;
+    // Claude's cursor IS the id eave named, so both fields carry it here.
+    // For the ACP providers they differ, which is why this is now a field
+    // of its own rather than a bool over `session_id`.
+    cfg.resume = Some(loaded.header.session_id.clone());
     cfg.extra_env
         .push(("FAKE_MODE".into(), "resume-probe".into()));
     let (mut session, mut rx) = spawn_agent(&cfg).unwrap();
@@ -986,8 +989,9 @@ async fn real_claude_journal_and_cold_resume() {
 
     // Cold resume from the journal's cursor: fresh process, same session.
     let loaded = journal::load(&jpath).unwrap();
+    let sid2 = loaded.header.session_id.clone();
     let mut cfg2 = SpawnConfig::new("claude", std::env::temp_dir(), loaded.header.session_id);
-    cfg2.resume = true;
+    cfg2.resume = Some(sid2);
     let (mut session2, mut rx2) = spawn_agent(&cfg2).unwrap();
     session2
         .send_user_message("What is the codeword? Reply with the codeword only.")

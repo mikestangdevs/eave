@@ -99,8 +99,13 @@ impl ClaudeCodeSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
-        if cfg.resume {
-            cmd.args(["--resume", &cfg.session_id]);
+        if let Some(cursor) = &cfg.resume {
+            // Claude is the one provider whose resume cursor equals the id
+            // eave proposed, because `--session-id` is honoured. So this
+            // reads `cfg.resume` rather than `cfg.session_id` not to change
+            // behaviour here but to stop this file being the template the
+            // other adapters copied — the cursor is the provider's fact.
+            cmd.args(["--resume", cursor]);
         } else {
             cmd.args(["--session-id", &cfg.session_id]);
         }

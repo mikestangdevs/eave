@@ -102,12 +102,37 @@ pub struct SpawnConfig {
     /// The agent CLI binary. Tests point this at the fake-agent harness.
     pub program: PathBuf,
     pub cwd: PathBuf,
-    /// Caller-chosen provider session id, so the resume cursor exists before
+    /// The id eave PROPOSES for a fresh session, so a cursor exists before
     /// the first turn does (research: waku.md §2, driver/claude.rs).
+    ///
+    /// This is a proposal, not a fact. Claude Code and Pi accept it —
+    /// `claude --session-id` and `pi --session-id` both create-under-the-
+    /// given-name. The ACP agents do not: Grok and Hermes mint their own id
+    /// at `session/new` and Codex mints a thread id, and ACP offers no way
+    /// to propose one. For those, this field never reaches the wire.
+    ///
+    /// **Never use this as a resume cursor.** See [`SpawnConfig::resume`].
     pub session_id: String,
-    /// Continue an existing provider session (`--resume`) instead of naming
-    /// a new one (`--session-id`).
-    pub resume: bool,
+    /// Continue an existing provider session, naming **the provider's own
+    /// id for it** — the cursor the provider issued last time, replayed
+    /// from the journal's last `Init { session_id }`.
+    ///
+    /// `None` = start fresh.
+    ///
+    /// This was a `bool` until 2026-08-20, and the bool was a Claude-shaped
+    /// assumption that broke every other provider. Claude resumes by the
+    /// id eave named, so `resume: true` plus [`SpawnConfig::session_id`]
+    /// was sufficient there and the three adapters that came later copied
+    /// the idiom — `cfg.resume.then(|| cfg.session_id.clone())` — into
+    /// Grok, Hermes and Codex, none of which have ever heard of that id.
+    /// The result was a resume that silently opened a NEW session and lost
+    /// the conversation. `Option<String>` makes the broken state
+    /// unrepresentable: you cannot ask to resume without saying what.
+    ///
+    /// `AgentSession::provider_session_id()` is where the cursor comes
+    /// from. It existed on every adapter, was asserted by their tests, and
+    /// had no consumer anywhere in the engine until this slice.
+    pub resume: Option<String>,
     /// Extra environment for the child. The inherited environment is always
     /// sanitized of `EAVE_*` first (spec 01 §Spawn; research: bb.md §1).
     pub extra_env: Vec<(String, String)>,
@@ -127,7 +152,7 @@ impl SpawnConfig {
             program: program.into(),
             cwd: cwd.into(),
             session_id,
-            resume: false,
+            resume: None,
             extra_env: Vec::new(),
             model: None,
             extra_args: Vec::new(),
