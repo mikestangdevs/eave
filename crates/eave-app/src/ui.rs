@@ -7860,6 +7860,26 @@ impl Shell {
                                     .child(format!("Start {}", p.name)),
                             ),
                     )
+                    // Slice CK: **who said what the picker is showing.**
+                    // The list above is either the installed CLI's answer
+                    // or eave's own guess, and those are different claims;
+                    // absent entirely in the one case where they are not
+                    // (the CLI answered and named models), so the resting
+                    // launcher on a working machine is unchanged.
+                    //
+                    // A probe cannot be allowed to hold this frame — see
+                    // `launcher::model_source_note` — so the frame has to
+                    // be able to say it is showing a stale list, and this
+                    // is where it says it.
+                    .children(launcher::model_source_note(p).map(|note| {
+                        div()
+                            .debug_selector(|| "launcher-model-source".into())
+                            .max_w(px(theme::LAUNCHER_MAX_W))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(note)
+                    }))
                     // The engine's own words on a refusal. Not a toast and
                     // not a log line: the screen that asked is the screen
                     // that answers.
@@ -8992,6 +9012,11 @@ pub fn run(data_dir: PathBuf) -> ! {
     // Recorded before anything renders: the friction log resolves against
     // it (Stage L), and it must not differ from the dir the feed loop uses.
     let _ = DATA_DIR.set(data_dir.clone());
+    // Slice CK. **A probe is a spawn, so only a process with a window is
+    // allowed to make one.** The test harness never reaches here, which is
+    // what keeps `cargo test` from starting six vendor CLIs every time a
+    // launcher frame asks for its model choices.
+    eave_core::capabilities::arm();
     let replay: Option<(PathBuf, f64)> = std::env::var("EAVE_REPLAY").ok().map(|p| {
         let speed = std::env::var("EAVE_REPLAY_SPEED")
             .ok()
