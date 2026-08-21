@@ -4576,6 +4576,11 @@ fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
 /// picker is a real P1 popup, and what it chooses reaches the command.
 #[gpui::test]
 fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
+    // This test asserts row 1 of eave's OWN list. A concurrent
+    // `record("claude-code", ["sonnet"])` replaces that list underneath
+    // it, so it must hold the cache turn even though it writes nothing.
+    let _turn = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
     let (mut h, vcx) = boot(cx);
     click(vcx, "launcher-model");
     vcx.run_until_parked();
@@ -4613,6 +4618,9 @@ fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
 /// goes away once the CLI has answered.
 #[gpui::test]
 fn the_launcher_says_whose_model_list_it_is_showing(cx: &mut TestAppContext) {
+    // Held for the whole body: `forget()` protects this test from what ran
+    // BEFORE it, never from what is running BESIDE it.
+    let _turn = eave_core::capabilities::probe_test_lock();
     let (h, vcx) = boot(cx);
     eave_core::capabilities::forget();
     vcx.run_until_parked();

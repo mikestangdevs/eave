@@ -350,6 +350,30 @@ pub fn record(provider_id: &'static str, models: Vec<String>) {
 /// Mirrors `provider::forget_resolutions`, and exists for the same reason:
 /// a process-lifetime memo that no test can reset is a test-order
 /// dependency waiting to happen.
+/// Serialise tests that touch the probe cache. **Test-only.**
+///
+/// The cache is process-global, and `cargo test` runs a crate's tests in
+/// parallel threads of ONE process — so a test calling [`record`] and a
+/// test reading the model list race, and the loser sees the other's
+/// models. `eave-app`'s `the_model_menu_choice_reaches_the_launch` failed
+/// on roughly every second run of its own crate suite that way (2026-08-21):
+/// it asserts row 1 of the static list, and a concurrent
+/// `record("claude-code", ["sonnet"])` replaced the list underneath it.
+///
+/// [`forget`] alone cannot fix that — it protects a test from what ran
+/// BEFORE it, not from what is running BESIDE it. Every test that reads
+/// or writes the cache must hold this for its whole body, including the
+/// ones in other crates, which is why it is `pub` rather than
+/// `#[cfg(test)]`.
+///
+/// Poison is ignored: a panicking test leaves the cache dirty, and the
+/// next test clears it with [`forget`] anyway.
+#[doc(hidden)]
+pub fn probe_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TEST_TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn forget() {
     if let Ok(mut map) = probes().lock() {
         map.clear();
@@ -746,11 +770,6 @@ fn codex_model_list_reply(line: &str) -> Option<Vec<String>> {
 mod tests {
     use super::*;
 
-    /// The cache is process-global, so the tests that clear it take turns.
-    /// Rust runs a suite in parallel by default and two of these would
-    /// otherwise race through each other's `forget()`.
-    static CACHE: Mutex<()> = Mutex::new(());
-
     /// Every provider eave names states where its models come from, one
     /// way or the other. The point of the table is that there is no third
     /// option — a provider cannot silently have no answer.
@@ -1009,7 +1028,7 @@ mod tests {
     /// than as "no models".
     #[test]
     fn an_unasked_provider_is_not_a_provider_with_no_models() {
-        let _turn = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = super::probe_test_lock();
         forget();
         // Claude, because it is the one provider whose posture is proven —
         // an unproven one reads `Refused` and is a different fact, see
@@ -1028,7 +1047,7 @@ mod tests {
     /// different about each.
     #[test]
     fn naming_no_models_is_still_an_answer() {
-        let _turn = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = super::probe_test_lock();
         forget();
         record("pi", vec![]);
         assert_eq!(freshness("pi"), Freshness::Reported { named: 0 });
@@ -1045,7 +1064,7 @@ mod tests {
     /// friendlier name. The picker says so rather than looking pending.
     #[test]
     fn a_provider_eave_would_not_spawn_is_not_probed_either() {
-        let _turn = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = super::probe_test_lock();
         forget();
         for e in crate::provider::CATALOG {
             if crate::session::posture_is_verified(e.id) {
@@ -1068,7 +1087,7 @@ mod tests {
     /// there is nothing to wait for and the UI must not imply there is.
     #[test]
     fn an_unaskable_provider_never_reads_as_pending() {
-        let _turn = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = super::probe_test_lock();
         forget();
         assert!(matches!(freshness("hermes"), Freshness::Unaskable(_)));
         assert!(!freshness("hermes").is_from_the_cli());
@@ -1079,7 +1098,7 @@ mod tests {
     /// freely without a vendor CLI ever starting.
     #[test]
     fn an_unarmed_process_never_spawns_a_probe() {
-        let _turn = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = super::probe_test_lock();
         assert!(
             !is_armed(),
             "the test harness must never arm probes — it does not call run()",

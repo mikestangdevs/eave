@@ -820,9 +820,14 @@ mod tests {
     /// The capability cache is process-global and these tests clear it, so
     /// they take turns. Same reason `eave_core::capabilities::tests` has
     /// its own guard.
+    /// The probe cache is process-global and `cargo test` runs this
+    /// crate's tests in parallel threads of ONE process, so this lock has
+    /// to be the SAME lock the `ui_harness` tests take — a second private
+    /// mutex here would serialise these tests against each other and
+    /// against nothing else. `the_model_menu_choice_reaches_the_launch`
+    /// failed about every second run that way.
     fn cache_turn() -> std::sync::MutexGuard<'static, ()> {
-        static CACHE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        CACHE.lock().unwrap_or_else(|e| e.into_inner())
+        eave_core::capabilities::probe_test_lock()
     }
 
     /// Every mark resolves. `icons` already proves each registered path
