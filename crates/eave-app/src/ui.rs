@@ -10473,7 +10473,20 @@ impl Render for Shell {
         let omnibox_el = self.omnibox_layer(cx);
         // Built here for the same reason the launcher is: the element
         // chain below has neither `self` nor `cx` to spare.
-        let empty_el = empty_state.map(Self::transcript_empty_view);
+        // Slice C5 SUPPRESSED THIS OVER A PAGE, and it was photographed
+        // drawing through docs.rs before it did. The rule at
+        // `showing_page` predicted exactly this: the card was written when
+        // the only thing it could ever cover was an empty transcript, and
+        // a page made that false without changing a line of its code. It
+        // is the second of the webview spike's inventoried surfaces to be
+        // caught this way — the launcher was the first, in C1.
+        //
+        // Suppressed, not adapted: "this session has sent nothing yet" is
+        // a statement about the AGENT, and the agent's surfaces live on
+        // the agent's tab.
+        let empty_el = empty_state
+            .filter(|_| !showing_page)
+            .map(Self::transcript_empty_view);
         let launcher_menu = self.launcher_menu_layer(cx);
         // Built here for the same reason the launcher and its menu are:
         // it needs `self` and `cx`, and the element chain below has
