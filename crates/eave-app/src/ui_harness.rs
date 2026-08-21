@@ -10,6 +10,7 @@
 //! scheduler is the point — it is what retires the scripted-click flake.
 
 use super::*;
+use eave_wire::{TabInfo, TabsSnapshot};
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
 /// The test's end of the plumbing: push engine-shaped events in through
@@ -5188,6 +5189,74 @@ fn rail_with_selected(h: &Harness, vcx: &mut VisualTestContext, infos: Vec<Sessi
     vcx.run_until_parked();
 }
 
+/// Slice C5 — seed the **browser store's** strip.
+///
+/// The strip used to be a projection of the rail, so a test that pushed
+/// rail rows got tabs for free. It is a projection of B1's tab model now,
+/// because page tabs and session tabs share one line and one ordering — so
+/// a test of the strip has to say what is open, which is what this does.
+///
+/// In the running app the shell reconciles the rail into session tabs
+/// itself (`Shell::reconcile_strip`), by asking the engine; there is no
+/// engine here, so the snapshot is supplied directly. That is the same
+/// arrangement every other snapshot in this harness uses.
+fn strip_tabs(h: &Harness, vcx: &mut VisualTestContext, tabs: Vec<TabInfo>, active: Option<&str>) {
+    h.plumbing.push_tabs(TabsSnapshot {
+        order: tabs
+            .iter()
+            .map(|t| eave_wire::Slot::Tab { id: t.id.clone() })
+            .collect(),
+        tabs,
+        groups: Vec::new(),
+        group_tabs: Vec::new(),
+        active: active.map(str::to_string),
+        read_only: false,
+    });
+    vcx.run_until_parked();
+}
+
+/// One session tab, whose id is the session's — which is what lets the AS
+/// assertions keep using `tab-<session_id>` selectors.
+fn session_tab(session_id: &str) -> TabInfo {
+    TabInfo {
+        id: session_id.into(),
+        group: None,
+        pinned: false,
+        content: eave_wire::TabContent::Session {
+            session_id: session_id.into(),
+        },
+        url: None,
+        title: None,
+        favicon_url: None,
+        load: eave_wire::LoadState::Unloaded,
+        pending: None,
+        can_go_back: false,
+        can_go_forward: false,
+        history_len: 0,
+        opener: None,
+        created_ts_ms: 0,
+    }
+}
+
+/// One page tab.
+fn page_tab(id: &str, url: Option<&str>, title: Option<&str>) -> TabInfo {
+    TabInfo {
+        content: eave_wire::TabContent::Page,
+        url: url.map(str::to_string),
+        title: title.map(str::to_string),
+        ..session_tab(id)
+    }
+}
+
+/// The rail AND the strip, for the common case: every session gets a tab,
+/// and the selected one is active — which is what the running app
+/// reconciles to.
+fn rail_and_strip(h: &Harness, vcx: &mut VisualTestContext, infos: Vec<SessionInfo>, id: &str) {
+    let tabs: Vec<TabInfo> = infos.iter().map(|s| session_tab(&s.session_id)).collect();
+    rail_with_selected(h, vcx, infos, id);
+    strip_tabs(h, vcx, tabs, Some(id));
+}
+
 /// Slice AL. The rail's hierarchy, measured on the RENDERED boxes rather
 /// than asserted about the constants — a rank that never reaches an element
 /// is a rank that does not exist.
@@ -7576,20 +7645,27 @@ fn emptying_the_composer_hint_moves_nothing(cx: &mut TestAppContext) {
 fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     let ids = ["aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555"];
-    rail_with_selected(
+    rail_and_strip(
         &h,
         vcx,
         ids.iter().map(|id| session(id)).collect(),
         "aaaa1111",
     );
 
-    // Open: rows, no tabs. The strip is not a second listing of the same
-    // sessions sitting beside the first.
+    // Slice C5 CHANGED THE FIRST HALF OF THIS TEST, and the old assertion
+    // is worth recording because it was right when it was written and is
+    // wrong now. It read: *"the strip is on screen with the rail open —
+    // two lists of the same sessions is not what the toggle is for"*.
+    //
+    // True while the strip held sessions. The strip holds PAGES now, which
+    // the rail does not list and never will, so hiding it when the rail
+    // opens would take the operator's open documents off screen. The two
+    // surfaces are no longer two listings of one thing.
     assert!(shown(vcx, "rail-aaaa1111"), "the rail starts open");
     assert!(
-        !shown(vcx, "session-tabs"),
-        "the strip is on screen with the rail open — two lists of the same \
-         sessions is not what the toggle is for"
+        shown(vcx, "tab-strip"),
+        "the strip is hidden while the rail is open — it holds pages, and \
+         the rail does not"
     );
 
     click(vcx, "rail-toggle");
@@ -7611,16 +7687,46 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
         );
     }
 
-    // ...and it is not decoration: clicking one asks for that session.
+    // ...and it is not decoration. **In two steps now, and the second step
+    // is the slice's central claim.** Clicking a tab does not switch the
+    // session directly; it activates the TAB, and the selection is derived
+    // from which tab is active. That is what makes `TabsState::active` the
+    // single notion of active rather than a second one kept beside the
+    // shell's own — C1's open question, answered.
     let _ = h.drain();
     click(vcx, "tab-dddd4444");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
-        cmds.iter()
-            .any(|c| matches!(c, Command::Select(id) if id == "dddd4444")),
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "dddd4444"
+        )),
         "clicking a tab emitted {cmds:?} — a strip you cannot switch with \
          is the dead end wearing a nicer shape"
+    );
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::Select(id) if id == "dddd4444")),
+        "the shell switched the session without waiting for the strip to \
+         say the tab was active — that is the second notion of active \
+         growing back: {cmds:?}"
+    );
+
+    // The engine answers: that tab is active now. THEN the selection moves.
+    strip_tabs(
+        &h,
+        vcx,
+        ids.iter().map(|id| session_tab(id)).collect(),
+        Some("dddd4444"),
+    );
+    let cmds = h.drain();
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Select(id) if id == "dddd4444")),
+        "the active tab views a session and the shell stayed subscribed to \
+         another one: {cmds:?}"
     );
 
     // And the toggle still goes back.
@@ -7628,8 +7734,8 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
     vcx.run_until_parked();
     assert!(shown(vcx, "rail-aaaa1111"), "the rail did not come back");
     assert!(
-        !shown(vcx, "session-tabs"),
-        "the strip outlived the collapse it exists for"
+        shown(vcx, "tab-strip"),
+        "the strip vanished when the rail came back"
     );
 }
 
@@ -7671,7 +7777,7 @@ fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
     let open_bar = bar(vcx);
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
-    assert!(shown(vcx, "session-tabs"), "the strip did not mount");
+    assert!(shown(vcx, "tab-strip"), "the strip did not mount");
     let shut = well(vcx);
     let shut_bar = bar(vcx);
 
@@ -7743,7 +7849,7 @@ fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_tab_shows_a_realistic_session_name(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
 
@@ -7790,7 +7896,7 @@ fn a_tab_shows_a_realistic_session_name(cx: &mut TestAppContext) {
     let plain = tab.size.width;
     let mut long = session("aaaa1111");
     long.title = Some("chase the rail flake".into());
-    rail_with_selected(&h, vcx, vec![long], "aaaa1111");
+    rail_and_strip(&h, vcx, vec![long], "aaaa1111");
     let wide = vcx
         .debug_bounds("tab-aaaa1111")
         .expect("the tab")
@@ -7820,7 +7926,7 @@ fn a_tab_is_not_a_rail_row(cx: &mut TestAppContext) {
     loaded.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
     loaded.worktree = Some(worktree("eave/aaaa1111", Some(2), true));
     loaded.permission_mode = Some("bypassPermissions".into());
-    rail_with_selected(&h, vcx, vec![loaded], "aaaa1111");
+    rail_and_strip(&h, vcx, vec![loaded], "aaaa1111");
     // Every one of those facts is on the row.
     for sel in ["cwd-aaaa1111", "marks-aaaa1111"] {
         assert!(
@@ -7853,9 +7959,14 @@ fn a_tab_is_not_a_rail_row(cx: &mut TestAppContext) {
     // neither.
     #[allow(clippy::assertions_on_constants)]
     {
+        // Slice C5 raised this ceiling from 176 to 192, because a tab
+        // grew a close affordance (`TAB_CLOSE_W`, 22 px) and a strip you
+        // cannot close a tab from is not a tab strip. The ceiling is still
+        // an argument about the RAIL — 248 px is the surface a tab may not
+        // become — and 186 is not within reach of it.
         assert!(
-            theme::TAB_W <= 176.0,
-            "a tab is {} px wide; the rail it replaces is 248",
+            theme::TAB_W <= 192.0,
+            "a tab is {} px wide; the rail beside it is 248",
             theme::TAB_W
         );
         assert!(
@@ -7885,7 +7996,7 @@ fn selecting_a_tab_moves_no_tab(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let ids = ["aaaa1111", "bbbb2222", "cccc3333"];
     let infos: Vec<SessionInfo> = ids.iter().map(|id| session(id)).collect();
-    rail_with_selected(&h, vcx, infos.clone(), "aaaa1111");
+    rail_and_strip(&h, vcx, infos.clone(), "aaaa1111");
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
 
@@ -7907,7 +8018,7 @@ fn selecting_a_tab_moves_no_tab(cx: &mut TestAppContext) {
         assert_eq!(b.origin.y, first[0].origin.y, "tab {i} baseline");
     }
 
-    rail_with_selected(&h, vcx, infos, "bbbb2222");
+    rail_and_strip(&h, vcx, infos, "bbbb2222");
     let second = boxes(vcx);
     for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
         assert_eq!(
@@ -7949,11 +8060,11 @@ fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
             s
         })
         .collect();
-    rail_with_selected(&h, vcx, infos.clone(), "aaaa1111");
+    rail_and_strip(&h, vcx, infos.clone(), "aaaa1111");
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
 
-    let strip = vcx.debug_bounds("session-tabs").expect("the strip");
+    let strip = vcx.debug_bounds("tab-strip").expect("the strip");
     // The fixture really does overflow — otherwise the two properties below
     // are asserted about a case that never arises.
     assert!(
@@ -7992,8 +8103,8 @@ fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
     }
 
     // The LAST session, selected. Its tab has to come to the operator.
-    rail_with_selected(&h, vcx, infos, "cccd9999");
-    let strip = vcx.debug_bounds("session-tabs").expect("the strip");
+    rail_and_strip(&h, vcx, infos, "cccd9999");
+    let strip = vcx.debug_bounds("tab-strip").expect("the strip");
     let sel = vcx.debug_bounds("tab-cccd9999").expect("the selected tab");
     assert!(
         sel.origin.x >= strip.origin.x
@@ -8028,7 +8139,7 @@ fn a_tab_wears_the_providers_mark_on_the_same_plate_a_row_does(cx: &mut TestAppC
     known.provider = "claude-code".into();
     let mut unknown = session("bbbb2222");
     unknown.provider = "some-agent".into();
-    rail_with_selected(&h, vcx, vec![known, unknown], "aaaa1111");
+    rail_and_strip(&h, vcx, vec![known, unknown], "aaaa1111");
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
 
@@ -8074,7 +8185,7 @@ fn a_tab_wears_the_providers_mark_on_the_same_plate_a_row_does(cx: &mut TestAppC
 #[gpui::test]
 fn five_sessions_fit_the_strip_without_scrolling(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    rail_with_selected(
+    rail_and_strip(
         &h,
         vcx,
         vec![
@@ -8089,7 +8200,7 @@ fn five_sessions_fit_the_strip_without_scrolling(cx: &mut TestAppContext) {
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
 
-    let strip = vcx.debug_bounds("session-tabs").expect("the strip");
+    let strip = vcx.debug_bounds("tab-strip").expect("the strip");
     for sel in [
         "tab-aaaa1111",
         "tab-bbbb2222",
@@ -8168,6 +8279,20 @@ fn open_session_in(h: &Harness, vcx: &mut VisualTestContext, project: &SlashProj
         id: "aaaa1111".into(),
     });
     vcx.run_until_parked();
+}
+
+/// Slice C5 — what the omnibox is holding.
+fn omni_text(h: &Harness, vcx: &mut VisualTestContext) -> String {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell
+            .read(cx)
+            .omni
+            .open
+            .as_ref()
+            .map(|e| e.text.clone())
+            .unwrap_or_default()
+    })
+    .unwrap()
 }
 
 fn draft_of(h: &Harness, vcx: &mut VisualTestContext) -> String {
@@ -9014,5 +9139,464 @@ fn the_gauge_names_the_quietest_rank_rather_than_a_number() {
     assert!(
         !numeric,
         "the gauge grew a bare px() literal where the scale has a name for it"
+    );
+}
+
+// ── Slice C5 — the tab strip and the omnibox ──────────────────────────────
+
+/// **One strip, two kinds of tab.** The shape B1 argued for, C1 could not
+/// draw, and C5 draws.
+///
+/// A page tab and a session tab sit on one line, in one ordering, each
+/// wearing its own identity: the page a globe and its title, the session
+/// the provider's mark and its name. There is no second strip and no second
+/// ordering — B1 modelled the strip as ONE `Slot` list precisely so a
+/// surface would never have to invent a rule for how two of them interleave.
+#[gpui::test]
+fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://example.com/"), Some("Example Domain")),
+            session_tab("aaaa1111"),
+            page_tab("p2", Some("https://docs.rs/gpui"), None),
+        ],
+        Some("aaaa1111"),
+    );
+
+    for sel in ["tab-p1", "tab-aaaa1111", "tab-p2"] {
+        assert!(shown(vcx, sel), "{sel} is not on the strip");
+    }
+    // Drawn in the model's order, left to right, with the session tab
+    // between the two pages exactly where the ordering puts it.
+    let x =
+        |vcx: &mut VisualTestContext, sel: &'static str| vcx.debug_bounds(sel).expect(sel).origin.x;
+    let (p1, sess, p2) = (x(vcx, "tab-p1"), x(vcx, "tab-aaaa1111"), x(vcx, "tab-p2"));
+    assert!(
+        p1 < sess && sess < p2,
+        "the strip reordered the model: p1={p1:?} session={sess:?} p2={p2:?}"
+    );
+
+    // Every tab is the same width, whichever kind it is. A strip whose two
+    // kinds had two metrics would have no rhythm, and the tab you are
+    // aiming for would move when an unrelated one changed kind.
+    let w = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel).expect(sel).size.width
+    };
+    assert_eq!(w(vcx, "tab-p1"), w(vcx, "tab-aaaa1111"));
+    assert_eq!(w(vcx, "tab-p1"), w(vcx, "tab-p2"));
+
+    // And each wears its own mark on the same plate.
+    assert!(shown(vcx, "tab-chip-p1"), "the page tab has no plate");
+    assert!(
+        shown(vcx, "tab-chip-aaaa1111"),
+        "the session tab lost its provider mark"
+    );
+    // Every tab can be closed. This is what ⌘W has a mouse equivalent for.
+    for sel in ["tab-close-p1", "tab-close-aaaa1111", "tab-close-p2"] {
+        assert!(shown(vcx, sel), "{sel} — a tab you cannot close");
+    }
+}
+
+/// A page tab takes the well from the transcript, and says which absence it
+/// is when nothing can draw the page.
+///
+/// The harness builds without `--features web`, so there is no Chromium
+/// here and `page_element` is `None` on every tab. That is exactly the case
+/// this guards: before C5, `showing_page` meant "there are page pixels", so
+/// a page tab in a non-web build rendered the TRANSCRIPT — an agent's
+/// conversation sitting in the well where a document was asked for.
+#[gpui::test]
+fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        Some("aaaa1111"),
+    );
+    assert!(
+        shown(vcx, "send"),
+        "the session tab is active and the composer is not there"
+    );
+    assert!(!shown(vcx, "page-absence"), "no page tab is active");
+
+    // Now the page.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        Some("p1"),
+    );
+    assert!(
+        shown(vcx, "page-absence"),
+        "a page tab is active and the well says nothing about it"
+    );
+    // The agent's chrome is gone with the transcript. A prompt box floating
+    // on somebody else's document is not a browser.
+    assert!(!shown(vcx, "send"), "the composer drew over a page tab");
+}
+
+/// **⌘L opens the omnibox over the page, and row zero says what Return will
+/// do.**
+///
+/// The occlusion rule at `showing_page` says every floating surface must
+/// answer "suppressed, or shown over a page?" at birth. This is the first
+/// surface built since that rule was written and the one case where the
+/// answer is *shown*: an address bar that hid itself whenever a document
+/// was loaded would be an address bar you could only use on a blank tab.
+#[gpui::test]
+fn the_omnibox_opens_over_a_page_and_states_what_return_does(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab(
+            "p1",
+            Some("https://example.com/"),
+            Some("Example"),
+        )],
+        Some("p1"),
+    );
+    assert!(!shown(vcx, "omnibox"), "the omnibox is up before ⌘L");
+
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "omnibox"), "⌘L did not open the omnibox");
+    assert!(
+        shown(vcx, "omni-row-0"),
+        "the omnibox is up with nothing saying what Return does"
+    );
+    // Seeded with the tab's own address, because the commonest reason to
+    // open an address bar is to edit the address in it.
+    assert_eq!(
+        omni_text(&h, vcx),
+        "https://example.com/",
+        "⌘L opened on an empty field over a loaded page"
+    );
+
+    // Typing REPLACES the seed rather than appending to it. Without that,
+    // ⌘L then typing produces `https://example.com/docs.rs` — which a
+    // person only discovers after pressing Return.
+    vcx.simulate_keystrokes("d o c s . r s");
+    vcx.run_until_parked();
+    assert_eq!(omni_text(&h, vcx), "docs.rs");
+
+    // Escape refuses, and changes nothing. Escape must never be both the
+    // only way to dismiss a surface AND a way to lose what you typed.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "omnibox"), "escape did not close the omnibox");
+}
+
+/// **Return goes through the request path, and never commits.**
+///
+/// B1's caveat 2 named this and C1 closed it: `tab_navigate` records a
+/// request that whatever renders pages answers, and the commit is what
+/// moves the tab. An omnibox that committed on Return would re-open the
+/// double journal from the other end — two nav entries, two history visits,
+/// and a back button that needs pressing twice.
+#[gpui::test]
+fn the_omnibox_navigates_through_the_request_path(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![page_tab("p1", None, None)], Some("p1"));
+
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.simulate_keystrokes("e x a m p l e . c o m");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Navigate { tab_id, url })
+                if tab_id == "p1" && url == "https://example.com"
+        )),
+        "Return emitted {cmds:?} — the omnibox must ASK, and it must add \\
+         the scheme the operator did not type"
+    );
+    assert!(!shown(vcx, "omnibox"), "committing left the omnibox up");
+
+    // A sentence is a search, and it goes to the engine that was named on
+    // screen — not silently to whoever the code happens to prefer.
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.simulate_keystrokes("r u s t space t r a i t s");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Navigate { url, .. })
+                if url == "https://duckduckgo.com/?q=rust+traits"
+        )),
+        "a sentence was not searched for: {cmds:?}"
+    );
+}
+
+/// With no page tab to commit into, Return opens one — at NOTHING, and then
+/// asks it to go somewhere.
+///
+/// Two requests rather than `TabOpen { url }`, and the reason is the same
+/// double journal: opening a tab AT a url commits that url in B1's fold,
+/// which records a navigation to a page nobody has fetched.
+#[gpui::test]
+fn the_omnibox_opens_a_tab_when_the_active_one_is_a_session(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.simulate_keystrokes("e x a m p l e . c o m");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenAt { url }) if url == "https://example.com"
+        )),
+        "the omnibox dropped a navigation because the active tab was a \\
+         session: {cmds:?}"
+    );
+}
+
+/// ⌘T opens a page tab **and** the omnibox on it. A new tab with no way to
+/// say where it should go is a blank page and a second keystroke.
+#[gpui::test]
+fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-t");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+        "⌘T opened nothing: {cmds:?}"
+    );
+    assert!(
+        shown(vcx, "omnibox"),
+        "⌘T opened a tab with no way to aim it"
+    );
+
+    // The `+` on the strip is the same act.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    click(vcx, "tab-new");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+        "the strip's + is not ⌘T: {cmds:?}"
+    );
+}
+
+/// ⌘W closes the active TAB, and lands on its right neighbour.
+///
+/// Right then left, which is what every browser does: landing on the left
+/// neighbour each time walks the selection backwards through tabs the
+/// operator has already dealt with. The successor is chosen HERE and not by
+/// the engine's fold — B1's `Closed` clears `active` and does not pick a
+/// replacement, which is correct for a data model and useless for a strip.
+#[gpui::test]
+fn closing_the_active_tab_lands_on_its_right_neighbour(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let tabs = || {
+        vec![
+            page_tab("p1", Some("https://a.test/"), None),
+            page_tab("p2", Some("https://b.test/"), None),
+            page_tab("p3", Some("https://c.test/"), None),
+        ]
+    };
+    strip_tabs(&h, vcx, tabs(), Some("p2"));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-w");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p3"
+        )),
+        "⌘W closed the active tab and landed nowhere: {cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Close(id)) if id == "p2"
+        )),
+        "⌘W did not close the active tab: {cmds:?}"
+    );
+
+    // The last tab has no right neighbour and falls back to its left.
+    strip_tabs(&h, vcx, tabs(), Some("p3"));
+    let _ = h.drain();
+    click(vcx, "tab-close-p3");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p2"
+        )),
+        "the last tab closed onto nothing: {cmds:?}"
+    );
+    // The close × must not ALSO activate the tab it is removing: without
+    // `stop_propagation` the click bubbles, the strip activates a tab, and
+    // the very next frame takes it away.
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p3"
+        )),
+        "the close button activated the tab on its way to removing it: {cmds:?}"
+    );
+}
+
+/// ctrl-tab walks the strip, and wraps. With two tabs open, a cycle that
+/// did not wrap would make the second press do nothing.
+#[gpui::test]
+fn ctrl_tab_walks_the_strip_and_wraps(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let tabs = || vec![page_tab("p1", None, None), session_tab("aaaa1111")];
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("ctrl-tab");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "aaaa1111"
+        )),
+        "ctrl-tab went nowhere: {cmds:?}"
+    );
+
+    // From the last tab it wraps to the first.
+    strip_tabs(&h, vcx, tabs(), Some("aaaa1111"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("ctrl-tab");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p1"
+        )),
+        "ctrl-tab did not wrap: {cmds:?}"
+    );
+
+    // ...and backwards, which is the same walk in the other direction.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("ctrl-shift-tab");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p1"
+        )),
+        "ctrl-shift-tab did not wrap the other way: {cmds:?}"
+    );
+}
+
+/// **⌘L moved the friction log, and the friction log still works.**
+///
+/// ⌘L has meant "the address bar" in every browser since Netscape and eave
+/// is a browser now, so the collision is resolved in the browser's favour.
+/// But the friction log is the instrument the whole dogfood log depends on,
+/// so it moves rather than going away — and this holds BOTH halves, because
+/// a slice that took a chord and forgot to rehome what was on it would look
+/// exactly like a slice that did this properly.
+#[gpui::test]
+fn cmd_l_is_the_omnibox_and_the_friction_log_moved_to_cmd_shift_l(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "omnibox"), "⌘L is not the omnibox");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // ⌘⇧L writes a line and confirms in the footer. The path is stated on
+    // the first write of a run (Stage L), so the note is there either way.
+    vcx.simulate_keystrokes("cmd-shift-l");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "omnibox"),
+        "⌘⇧L opened the omnibox — the shift was not read"
+    );
+    let note = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).friction.clone())
+        .unwrap();
+    assert!(
+        note.is_some(),
+        "⌘⇧L wrote nothing the footer says anything about — the friction \
+         log is the instrument the whole dogfood log depends on, and a \
+         slice that took its chord and forgot to rehome it would look \
+         exactly like this one from outside"
+    );
+}
+
+/// The strip is a projection of the engine's `active`, never a UI-held
+/// selection — the same rule the rail's highlight keeps.
+///
+/// Clicking a tab emits an ASK. Nothing moves on screen until the engine's
+/// snapshot says the tab is active. A shell that moved its own `active`
+/// optimistically would have two of them again, which is precisely the
+/// thing C1 left open and C5 closes.
+#[gpui::test]
+fn the_strip_never_moves_its_own_selection(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let tabs = || vec![page_tab("p1", None, None), page_tab("p2", None, None)];
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+
+    let lit = |vcx: &mut VisualTestContext, sel: &'static str| vcx.debug_bounds(sel).expect(sel);
+    let before = lit(vcx, "tab-p1");
+
+    let _ = h.drain();
+    click(vcx, "tab-p2");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p2"
+        )),
+        "the click emitted no ask: {cmds:?}"
+    );
+    // Selection is a rim and a fill, neither of which moves anything — so
+    // what is asserted is that the LAYOUT did not shift, which is the part
+    // a test can see. `selecting_a_tab_moves_no_tab` covers the metric.
+    assert_eq!(
+        lit(vcx, "tab-p1").origin,
+        before.origin,
+        "the strip re-laid itself out on a click"
     );
 }
