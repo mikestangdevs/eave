@@ -1095,11 +1095,28 @@ mod tests {
         h.feed(SESSIONS_ASKS);
         let (events, _) = h.feed(TOOL_CALL);
         match events.as_slice() {
-            [SessionEvent::ToolUseStarted { id, name, input }] => {
+            [SessionEvent::ToolUseStarted {
+                id,
+                name,
+                input,
+                call,
+            }] => {
                 assert_eq!(id, "call-adbc8e1b-54ac-438e-b439-1b75e3de6766-0");
                 // The vendor's own tool name, not the display title.
                 assert_eq!(name, "write");
                 assert!(input.contains("hello.txt"));
+                // Slice CB, decoded in the shared ACP core: Grok sends no
+                // `kind` on `tool_call`, so this types by the vendor name
+                // out of `_meta["x.ai/tool"]`. A `Write` that named no
+                // path would be the failure worth catching — the row would
+                // say "wrote a file" and not which.
+                assert_eq!(
+                    call.as_ref(),
+                    Some(&crate::tool::ToolCall::Write {
+                        path: "/tmp/probe1/hello.txt".into()
+                    }),
+                    "a typed write must carry its path"
+                );
             }
             other => panic!("expected ToolUseStarted, got {other:?}"),
         }
