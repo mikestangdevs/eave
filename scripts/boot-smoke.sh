@@ -24,11 +24,15 @@
 # still one command and still builds what it tests. `--unbundled` restores the
 # old behaviour for a fast inner loop.
 #
-# Usage: scripts/boot-smoke.sh [speed] [--unbundled] [--cef|--no-cef]
+# Usage: scripts/boot-smoke.sh [speed] [--unbundled] [--cef|--no-cef] [--web]
 #          speed      default 30 ≈ 16 s per fixture
 #          --cef      also smoke the bundled CEF app. Default: on if one has
 #                     already been bundled, off otherwise — bundling it is a
 #                     90 s build and 362 MB, which is not an inner-loop cost.
+#          --web      build eave itself WITH the browser (`--features web`)
+#                     and smoke a real page in it. Same cost reasoning as
+#                     --cef, so same opt-in; this is the one that proves the
+#                     thing we actually ship.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -36,16 +40,31 @@ ROOT="$PWD"
 SPEED=30
 BUNDLED=1
 CEF=auto
+WEB=0
 for arg in "$@"; do
   case "$arg" in
     --unbundled) BUNDLED=0 ;;
     --bundled)   BUNDLED=1 ;;
     --cef)       CEF=1 ;;
     --no-cef)    CEF=0 ;;
+    --web)       WEB=1 ;;
     [0-9]*)      SPEED="$arg" ;;
     *) echo "boot-smoke: unknown argument $arg" >&2; exit 2 ;;
   esac
 done
+
+# `--web` changes what the fixture runs below are running: the SAME asserts,
+# from a bundle that has Chromium linked into it and 317 MB of framework
+# beside it. That is the point rather than an aside — the replay asserts are
+# the only automated check that eave still boots and holds its scroll anchor,
+# and until now they only ever ran against a build with no browser in it.
+#
+# Written as an `if` and not `[ "$WEB" = 1 ] && BUNDLE_FLAGS+=(...)`, because
+# under `set -e` that one-liner EXITS THE SCRIPT when WEB is 0: the test is
+# the last command, it returns 1, and the shell takes the whole line as a
+# failed statement. Silent, and it looks like the smoke passed with no output.
+BUNDLE_FLAGS=()
+if [ "$WEB" = 1 ]; then BUNDLE_FLAGS+=(--features web); fi
 
 # Two fixtures:
 #   real-claude   — a genuine capture; the pacing and markdown the
@@ -74,7 +93,7 @@ if [ "$BUNDLED" = 1 ]; then
   # buries its two assert lines under 40 lines of `unused_unsafe` is a smoke
   # run nobody reads. The log is printed if the bundle step fails.
   BUILD_LOG="${TMPDIR:-/tmp}/eave-boot-smoke-build.log"
-  scripts/bundle-app.sh >"$BUILD_LOG" 2>&1 ||
+  scripts/bundle-app.sh "${BUNDLE_FLAGS[@]+"${BUNDLE_FLAGS[@]}"}" >"$BUILD_LOG" 2>&1 ||
     { echo "boot-smoke: bundle failed" >&2; tail -30 "$BUILD_LOG" >&2; exit 1; }
   APP="$ROOT/target/bundle/eave.app"
   EAVE="$APP/Contents/MacOS/eave"
@@ -102,13 +121,70 @@ for fixture in "${FIXTURES[@]}"; do
   esac
 done
 
+# ---------------------------------------------------------------- WEB -------
+
+# A real page, in eave's own bundle, through eave's own tab model. The
+# fixture runs above prove eave still BOOTS with Chromium linked; this proves
+# the browser in it works, which is a different claim and the one C1 could
+# only make by hand with a screenshot.
+#
+# What is asserted is a DELIVERED FRAME — `[web] accel_paint #N` on stderr,
+# which `EAVE_WEB_TRACE=1` emits from `OnAcceleratedPaint`. That is the exact
+# line where the four silent-failure defects of C1 diverge: a framework that
+# was never dlopen'ed, an async browser creation raced by a load_url, a
+# CefApp dropped after initialize, and a pump that stops after two calls all
+# produce a browser that exists, reports no error anywhere, and never paints.
+# Frame count is the only signal that distinguishes them from success.
+if [ "$WEB" = 1 ] && [ "$BUNDLED" = 1 ]; then
+  if [ ! -x "$APP/Contents/MacOS/eave-web-helper" ] &&
+     [ ! -d "$APP/Contents/Frameworks/eave Helper.app" ]; then
+    echo "── web: FAILED — bundle has no CEF helpers ──" >&2
+    fail=1
+  else
+    echo "── web: a page in eave ──"
+    PAGE="file://$ROOT/spike/cef-osr/probe/static.html"
+    [ -f "$ROOT/spike/cef-osr/probe/static.html" ] ||
+      PAGE="data:text/html,<title>smoke</title><body%20style=background:%23c0ffee>"
+
+    # A THROWAWAY DATA DIR, and a short one. The engine opens a unix socket
+    # inside it and the path has to fit in SUN_LEN (~104 bytes), which a
+    # temp dir under a long TMPDIR does not — it fails with "path must be
+    # shorter than SUN_LEN" and reads like a CEF problem. It also has to be
+    # per-run: CEF takes an exclusive lock on its cache root, so reusing the
+    # developer's real data dir would mean this smoke cannot run while eave
+    # is open.
+    WEB_DIR="/tmp/eave-smoke-$$"
+    rm -rf "$WEB_DIR"; mkdir -p "$WEB_DIR"
+
+    out="$(EAVE_DATA_DIR="$WEB_DIR" EAVE_WEB_TRACE=1 EAVE_WEB_AT_BOOT="$PAGE" \
+           perl -e 'alarm 45; exec @ARGV' "$EAVE" 2>&1 || true)"
+    frames="$(printf '%s' "$out" | grep -c 'accel_paint' || true)"
+    if [ "${frames:-0}" -gt 0 ]; then
+      size="$(printf '%s' "$out" | sed -n 's/.*accel_paint #[0-9]* [^ ]* \([0-9]*x[0-9]*\).*/\1/p' | head -1)"
+      echo "web: a page painted in eave's bundle (${frames} traced frame(s), ${size:-size unknown})"
+    else
+      echo "web: FAILED — eave's bundle opened a tab and never painted a page" >&2
+      printf '%s\n' "$out" | grep -E '^\[web\]|CefInitialize|Chromium' | tail -20 >&2
+      fail=1
+    fi
+    rm -rf "$WEB_DIR"
+  fi
+elif [ "$WEB" = 1 ]; then
+  echo "── web: skipped — needs the bundle (drop --unbundled) ──"
+fi
+
 # ---------------------------------------------------------------- CEF -------
 
-# The CEF bundle's own boot smoke. Separate from the fixtures above because
-# nothing in eave links CEF yet — this proves the ARTEFACT, which is the part
+# The CEF bundle's own boot smoke. It proves the ARTEFACT, which is the part
 # that stops working silently: a bundle whose helper .apps are misnamed, whose
 # framework is the wrong version, or which was signed and then edited, still
 # looks exactly like a working one in Finder.
+#
+# It used to say "nothing in eave links CEF yet", and that is no longer true —
+# `--features web` links it, and `--web` above smokes THAT bundle serving a
+# real page. This stage stays anyway, and is worth keeping precisely because
+# eave now has its own: when a page breaks, the two together answer "is it
+# Chromium or is it us?" in one run. The spike is the control.
 CEF_APP="$ROOT/target/bundle/cef-osr-spike.app"
 if [ "$CEF" = auto ]; then
   [ -d "$CEF_APP" ] && CEF=1 || CEF=0
