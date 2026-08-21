@@ -120,20 +120,94 @@ pub fn drive(snapshot: &TabsSnapshot) {
     if !super::host::running() {
         return;
     }
-    // Slice C1 renders ONE tab: the active one, when it is a page. The model
-    // may hold any number, and the reconciliation below is written per tab so
-    // that lifting this restriction is a matter of choosing more ids, not of
-    // restructuring. Every additional live browser is ~490 MB, so which tabs
-    // stay resident is a policy question and deserves its own slice.
+    // ── THE ANSWER TO "WHAT HAPPENS BEHIND A SESSION TAB?" (Slice C5) ──
+    //
+    // C1 drove exactly one tab — the active one, when it was a page — and
+    // left the real question open: *what happens when the active tab is a
+    // session and a page is loading behind it?* Under C1's rule the answer
+    // was silent and wrong. Switching to a session tab made this function
+    // return before touching anything, so a page mid-load simply stopped
+    // being driven: its pending navigation was never issued, and the strip
+    // would have shown a spinner over a tab nobody was loading.
+    //
+    // **The decision: a page tab that already has a browser keeps loading,
+    // whatever is in front of it.** A background load is the tab's own
+    // business; being looked at is not a precondition for finishing. That
+    // is what every browser does, and it is the only answer under which the
+    // load state in the strip is a fact rather than a decoration.
+    //
+    // **Creation still requires activation**, and that is the whole of the
+    // memory policy. A live browser is ~322 MB of helper processes, so
+    // opening twenty tabs must not cost 6 GB — a tab that has never been
+    // looked at has no browser and costs nothing. This is a deliberately
+    // conservative floor and not a resident-set policy: nothing here evicts
+    // a browser once created, so the ceiling is "tabs you have actually
+    // visited this run". Eviction is a policy question with its own tradeoffs
+    // (a discarded tab loses scroll, form state and JS heap) and it deserves
+    // its own slice; see the report.
+    //
+    // There is therefore ONE notion of active in eave, and it is
+    // `TabsState::active`. It decides which tab's frames are painted and
+    // which tab may create a browser. It does not decide which tabs are
+    // allowed to make progress.
     let active = snapshot.active.as_deref();
-    let Some(tab) = snapshot
+    for tab in snapshot
         .tabs
         .iter()
-        .find(|t| Some(t.id.as_str()) == active && t.content == TabContent::Page)
-    else {
-        return;
-    };
+        .filter(|t| t.content == TabContent::Page)
+    {
+        let is_active = Some(tab.id.as_str()) == active;
+        if !has_browser(&tab.id) && !is_active {
+            // Never looked at. No browser, no cost, and nothing to drive —
+            // its `pending` is still on the tab and will be issued as the
+            // start url the moment it is activated.
+            continue;
+        }
+        drive_tab(tab);
+    }
 
+    // A tab that left the strip takes its browser with it. Nothing did this
+    // before C5 because nothing could close a tab — `EAVE_WEB_AT_BOOT` opens
+    // one and never removes it — and ⌘W is what makes it reachable. Without
+    // this a closed tab keeps ~322 MB of helper processes alive, keeps
+    // loading, and keeps reporting facts about a tab the engine has already
+    // forgotten (which the engine discards, so the leak is silent).
+    //
+    // Driven off the snapshot rather than off the close, for the same reason
+    // everything else here is: the engine owns what a tab IS, and the
+    // snapshot is how that arrives. A close handler would have to be told,
+    // and would be wrong the moment a tab is closed by anything but this
+    // window.
+    let live: Vec<String> = BROWSERS.with(|b| b.borrow().keys().cloned().collect());
+    for id in live {
+        if snapshot.tabs.iter().any(|t| t.id == id) {
+            continue;
+        }
+        if std::env::var("EAVE_WEB_TRACE").is_ok() {
+            eprintln!("[web] closing browser for departed tab {id}");
+        }
+        with_browser(&id, |b| {
+            if let Some(host) = b.host() {
+                // FORCED. The unforced form runs the page's
+                // `beforeunload`, and eave has no dialog surface to ask
+                // the question on — so an unforced close would be
+                // refusable by a page with nowhere for the refusal to be
+                // seen, and this loop would re-issue it on every snapshot
+                // forever. The tab is already gone from the model; the
+                // decision has been made. A `beforeunload` that a person
+                // can actually answer needs the dialog surface first, and
+                // that is the same missing surface `<select>` needs.
+                host.close_browser(1);
+            }
+        });
+        super::host::request_pump();
+    }
+}
+
+/// Reconcile one page tab. Split out of [`drive`] so the loop above reads as
+/// the policy it is, and so the per-tab work is the same whether the tab is
+/// the one being looked at or one loading behind a session.
+fn drive_tab(tab: &eave_wire::TabInfo) {
     if !has_browser(&tab.id) {
         // The pending request is the start url, not a load to issue after
         // creation. `browser_host_create_browser` is ASYNC — the browser
