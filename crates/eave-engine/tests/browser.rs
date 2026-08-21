@@ -1180,6 +1180,87 @@ async fn a_typed_address_is_still_typed_when_the_page_reports_back() {
     );
 }
 
+/// **Slice C5: a refresh is a reload, not a typed visit.**
+///
+/// Every commit arrives through the same door, and a reload arrives with a
+/// `pending` request set — the reload button and the omnibox both go
+/// through `tab_navigate`. So "answered a request" was true for a refresh
+/// too, and every refresh was recorded `Typed`.
+///
+/// That is precisely the inflation `Transition::Reload` exists to prevent:
+/// `counts_as_a_visit()` is false for it, so a page left open on a refresh
+/// loop must not climb the typeahead. Before this fix it climbed once per
+/// refresh, and the omnibox got worse the more a page was reloaded — which
+/// is the opposite of what an address bar is for.
+#[tokio::test]
+async fn a_refresh_is_recorded_as_a_reload_and_does_not_inflate_the_typeahead() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+
+    let tab = client.tab_open(None, true).await.unwrap();
+    // One typed visit, then the same address five more times: a refresh
+    // loop, asked for exactly the way the omnibox asks.
+    land(&client, &tab, "https://refreshed.example/").await;
+    // A rival that was genuinely visited twice. It must outrank the page
+    // that was reloaded six times.
+    land(&client, &tab, "https://rival.example/").await;
+    land(&client, &tab, "https://refreshed.example/").await;
+    for _ in 0..5 {
+        land(&client, &tab, "https://refreshed.example/").await;
+    }
+
+    let raw = std::fs::read_to_string(dir.join("browser").join("history.jsonl")).unwrap();
+    let reloads = raw
+        .lines()
+        .filter(|l| l.contains("refreshed.example") && l.contains("\"reload\""))
+        .count();
+    let typed = raw
+        .lines()
+        .filter(|l| l.contains("refreshed.example") && l.contains("\"typed\""))
+        .count();
+    // Two genuine arrivals — the first, and the return from `rival` — and
+    // five refreshes. Coming BACK to a page you left is a real visit; the
+    // tab was showing something else, so the commit moves it. Only a
+    // commit at the address the tab is already on is a reload, which is
+    // why `is_refresh_of_current` reads the current entry and not the
+    // stack.
+    assert_eq!(
+        typed, 2,
+        "a genuine arrival was demoted to a reload:\n{raw}"
+    );
+    assert_eq!(reloads, 5, "refreshes were not recorded as reloads:\n{raw}");
+
+    // The count, which is the fact the transition exists to protect. Seven
+    // arrivals at that address; two of them were somebody going there.
+    let hits = client
+        .history_query("refreshed.example", Some(50))
+        .await
+        .unwrap();
+    let refreshed = hits
+        .matches
+        .iter()
+        .find(|m| m.entry.url == "https://refreshed.example/")
+        .unwrap_or_else(|| panic!("no entry for the refreshed page: {hits:?}"));
+    assert_eq!(
+        refreshed.entry.visit_count, 2,
+        "a refresh counted as a visit: {:?}",
+        refreshed.entry
+    );
+
+    // And the tab did not accumulate a stack of identical entries. Three:
+    // the page, the rival, the page again. Eight commits landed; before
+    // this fix there were eight entries and the back button needed six
+    // presses to leave a page the operator had refreshed five times.
+    let nav = client.tab_nav(&tab).await.unwrap();
+    assert_eq!(
+        nav.entries.len(),
+        3,
+        "reloads pushed duplicate nav entries: {:?}",
+        nav.entries.iter().map(|e| &e.url).collect::<Vec<_>>()
+    );
+}
+
 /// **The 120 ms fold (Slice C1).** Load state is announced by pages, not by
 /// people: one navigation is `Loading` then `Complete`, and a window of
 /// tabs loading at once multiplies that. A snapshot is the WHOLE strip, so

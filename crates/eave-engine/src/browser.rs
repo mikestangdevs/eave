@@ -328,12 +328,17 @@ impl Browser {
                 // not cosmetic: `Transition` is what ranks the omnibox, so
                 // recording every typed address as a link would make the
                 // typeahead worse the more the address bar is used.
-                let answered_a_request = {
+                //
+                // The THIRD case is a reload, and it has to be read here for
+                // the same reason: the fold makes a refresh and a fresh
+                // navigation indistinguishable once it has run. See
+                // `NavStack::is_refresh_of_current`.
+                let (answered_a_request, is_reload) = {
                     let s = self.store.lock().unwrap();
-                    s.tabs
-                        .tabs
-                        .get(&tab_id)
-                        .is_some_and(|t| t.pending.is_some())
+                    match s.tabs.tabs.get(&tab_id) {
+                        Some(t) => (t.pending.is_some(), t.nav.is_refresh_of_current(&url)),
+                        None => (false, false),
+                    }
                 };
                 let changed = self.tab(TabEvent::Navigated {
                     id: tab_id,
@@ -346,7 +351,19 @@ impl Browser {
                         url,
                         title,
                         ts_ms,
-                        transition: if answered_a_request {
+                        // Reload is checked FIRST, because a refresh
+                        // typically also answers a request — the omnibox
+                        // and the reload button both go through
+                        // `tab_navigate` — and calling that Typed is
+                        // exactly the inflation `Transition::Reload` exists
+                        // to prevent. Before Slice C5 every refresh
+                        // counted as a typed visit, so a page left open on
+                        // a refresh loop climbed to the top of the
+                        // typeahead: the omnibox's ranking got worse the
+                        // more the page was reloaded.
+                        transition: if is_reload {
+                            Transition::Reload
+                        } else if answered_a_request {
                             Transition::Typed
                         } else {
                             Transition::Link

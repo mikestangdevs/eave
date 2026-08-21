@@ -191,10 +191,52 @@ impl NavStack {
         self.current + 1 < self.entries.len()
     }
 
+    /// Whether a commit at `url` would land on the entry the tab is already
+    /// standing on — i.e. whether it is a **reload** rather than a move.
+    ///
+    /// Public because the caller has to decide the history
+    /// [`super::history::Transition`] BEFORE applying the event, and this is
+    /// the one question that decision turns on. Asking after the fold has
+    /// run is too late: the fold has already made the two cases look
+    /// identical.
+    pub fn is_refresh_of_current(&self, url: &str) -> bool {
+        self.current_entry().is_some_and(|e| e.url == url)
+    }
+
     /// Commit a navigation. Everything forward of the current entry is
     /// dropped — the standard browser rule, and the reason a back-then-click
     /// loses the forward arrow.
-    fn commit(&mut self, url: String, title: Option<String>, ts_ms: u64) {
+    ///
+    /// Returns `true` when this was a **refresh of the current entry**
+    /// rather than a move, which is what lets the fold keep the title and
+    /// the favicon it would otherwise clear.
+    ///
+    /// # Why a same-url commit does not push
+    /// Committing the address the tab is already showing is a reload, and a
+    /// reload does not add a history entry in any browser. Before Slice C5
+    /// it pushed one here, so refreshing a page five times left five
+    /// identical entries and the back button needed five presses to leave
+    /// the page you were on. It also truncated the forward stack, so going
+    /// back and then reloading destroyed the forward arrow.
+    ///
+    /// The forward entries are deliberately kept: at `[A, B]` standing on
+    /// `A`, reloading `A` is a reload of `A` and not a new navigation, so
+    /// `B` is still ahead of you. That is the difference between this and
+    /// the truncating path below, and it is the whole reason `Traversed`
+    /// was already a separate variant.
+    fn commit(&mut self, url: String, title: Option<String>, ts_ms: u64) -> bool {
+        if self.is_refresh_of_current(&url) {
+            let e = &mut self.entries[self.current];
+            e.ts_ms = ts_ms;
+            // A commit carries no title (the engine states one later, from
+            // `on_title_change`), so `None` here means "not stated yet" and
+            // NOT "this page has no title". Overwriting with it would blank
+            // the entry a person walks back to.
+            if title.is_some() {
+                e.title = title;
+            }
+            return true;
+        }
         if !self.entries.is_empty() {
             self.entries.truncate(self.current + 1);
         }
@@ -207,6 +249,7 @@ impl NavStack {
             self.entries.drain(0..over);
         }
         self.current = self.entries.len() - 1;
+        false
     }
 }
 
@@ -541,11 +584,22 @@ impl TabsState {
                 let Some(tab) = self.tabs.get_mut(id) else {
                     return false;
                 };
-                tab.nav.commit(u, title.clone(), *ts_ms);
+                let refreshed = tab.nav.commit(u, title.clone(), *ts_ms);
                 // A navigation replaces the tab's title: the old page's
                 // title on the new page is the classic stale-tab bug.
-                tab.title = title;
-                tab.favicon_url = None;
+                //
+                // A RELOAD is the one case where that reasoning does not
+                // apply — it is the same page, so its title and its favicon
+                // are still its own. Clearing them anyway made every
+                // refresh blank the tab's label until the page re-announced
+                // it, which is invisible without a tab strip and obvious
+                // with one (Slice C5).
+                if !refreshed {
+                    tab.title = title;
+                    tab.favicon_url = None;
+                } else if title.is_some() {
+                    tab.title = title;
+                }
                 // A commit answers whatever was asked for, INCLUDING when
                 // the url differs — a redirect landing somewhere else is
                 // still that request landing. Leaving it set would make a
@@ -843,6 +897,114 @@ mod tests {
             title: None,
             ts_ms: 2,
         });
+    }
+
+    /// Slice C5. Reloading is committing the address the tab is already
+    /// showing, and it must not grow the back stack. Before this, a page
+    /// refreshed five times needed the back button pressed five times to
+    /// leave it — every press landing on the same url.
+    #[test]
+    fn a_reload_refreshes_the_current_entry_instead_of_pushing_a_second_one() {
+        let mut s = TabsState::new();
+        open(&mut s, "t", Some("https://a.test/"));
+        nav(&mut s, "t", "https://b.test/");
+        assert_eq!(s.tabs["t"].nav.entries.len(), 2);
+
+        // The same address again, three times.
+        for _ in 0..3 {
+            nav(&mut s, "t", "https://b.test/");
+        }
+        let nav_stack = &s.tabs["t"].nav;
+        assert_eq!(
+            nav_stack.entries.len(),
+            2,
+            "a reload pushed a duplicate entry: {:?}",
+            nav_stack.entries.iter().map(|e| &e.url).collect::<Vec<_>>()
+        );
+        assert_eq!(nav_stack.current, 1);
+        // One press of back still leaves the page.
+        assert!(nav_stack.can_go_back());
+        s.apply(&TabEvent::Traversed {
+            id: "t".into(),
+            delta: -1,
+        });
+        assert_eq!(s.tabs["t"].url(), Some("https://a.test/"));
+    }
+
+    /// The half of the reload rule that a truncating commit would break.
+    /// At `[A, B]` standing on `A`, reloading `A` is a reload of `A` — `B`
+    /// is still ahead. A commit that truncated here would destroy the
+    /// forward arrow every time somebody went back and hit refresh.
+    #[test]
+    fn reloading_after_going_back_keeps_the_forward_entries() {
+        let mut s = TabsState::new();
+        open(&mut s, "t", Some("https://a.test/"));
+        nav(&mut s, "t", "https://b.test/");
+        s.apply(&TabEvent::Traversed {
+            id: "t".into(),
+            delta: -1,
+        });
+        assert_eq!(s.tabs["t"].url(), Some("https://a.test/"));
+        assert!(s.tabs["t"].nav.can_go_forward());
+
+        nav(&mut s, "t", "https://a.test/");
+        assert!(
+            s.tabs["t"].nav.can_go_forward(),
+            "a reload truncated the forward stack"
+        );
+        assert_eq!(s.tabs["t"].nav.entries.len(), 2);
+        // And a real navigation still truncates, which is the rule this
+        // one is carved out of.
+        nav(&mut s, "t", "https://c.test/");
+        assert!(!s.tabs["t"].nav.can_go_forward());
+    }
+
+    /// A reload is the same page, so its title and favicon survive it. Any
+    /// other navigation clears both — the stale-tab bug. Invisible before
+    /// there was a tab strip to blank; the reason this is fixed in C5.
+    #[test]
+    fn a_reload_keeps_the_title_and_favicon_a_navigation_clears() {
+        let mut s = TabsState::new();
+        open(&mut s, "t", Some("https://a.test/"));
+        s.apply(&TabEvent::Titled {
+            id: "t".into(),
+            title: Some("Alpha".into()),
+        });
+        s.apply(&TabEvent::FaviconStated {
+            id: "t".into(),
+            favicon_url: Some("https://a.test/icon.png".into()),
+        });
+
+        // A commit carries no title: the engine states one later. That
+        // `None` means "not stated yet", not "this page has no title".
+        nav(&mut s, "t", "https://a.test/");
+        assert_eq!(s.tabs["t"].display_title(), Some("Alpha"));
+        assert_eq!(
+            s.tabs["t"].favicon_url.as_deref(),
+            Some("https://a.test/icon.png")
+        );
+
+        nav(&mut s, "t", "https://b.test/");
+        assert_eq!(s.tabs["t"].display_title(), None, "a stale title survived");
+        assert_eq!(s.tabs["t"].favicon_url, None);
+    }
+
+    /// The question the engine has to ask BEFORE it folds, because folding
+    /// makes the two cases identical.
+    #[test]
+    fn is_refresh_of_current_reads_the_current_entry_and_not_the_stack() {
+        let mut s = TabsState::new();
+        open(&mut s, "t", Some("https://a.test/"));
+        nav(&mut s, "t", "https://b.test/");
+        let nav_stack = &s.tabs["t"].nav;
+        assert!(nav_stack.is_refresh_of_current("https://b.test/"));
+        // `a.test` IS in the stack, and reloading is not what going back is.
+        assert!(!nav_stack.is_refresh_of_current("https://a.test/"));
+        assert!(!nav_stack.is_refresh_of_current("https://c.test/"));
+        // A tab that has never navigated is not refreshing anything.
+        let mut fresh = TabsState::new();
+        open(&mut fresh, "u", None);
+        assert!(!fresh.tabs["u"].nav.is_refresh_of_current("https://a.test/"));
     }
 
     /// The rule that makes the whole log skippable: an event naming an id
