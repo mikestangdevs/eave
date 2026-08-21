@@ -1060,6 +1060,46 @@ impl CodexProtocol {
 
     fn notification(&mut self, method: &str, v: &Value, line: &str) -> Step {
         let params = v.get("params").unwrap_or(&Value::Null);
+        // **Thread attribution, before anything else reads the frame.**
+        //
+        // Codex multiplexes SEVERAL threads over one connection: a `Task`
+        // spawns a child thread whose turns start, run tools and complete
+        // on the same stdout, each frame naming its own `threadId`. eave
+        // drives exactly one of them — the one it opened, held in
+        // `self.thread_id` — and every other frame is somebody else's.
+        //
+        // Without this guard a child's `turn/completed` became eave's
+        // `TurnCompleted`. Verified against comet's live 0.146.1
+        // multi-agent capture, replayed through this parser: three
+        // threads, and the two children complete at lines 104 and 134
+        // while the parent runs to line 144. So the parent turn was
+        // closed twice, early — and each close clears BOTH `outstanding`
+        // and `pending_approvals` (`attention.rs`), which silently drops
+        // an open permission question out of the attention model while
+        // its card is still on screen.
+        //
+        // comet names this class at `crates/harness/src/codex/
+        // normalize.rs:324` — child turn frames "can never settle the
+        // PARENT turn (the exact bug class the explicit table exists
+        // for)". eave already applied the same rule to Grok's posture
+        // channel (`grok.rs`: "one agent process can report on sessions
+        // eave is not driving") and simply had not applied it here.
+        //
+        // Foreign frames are journaled verbatim, never dropped: a child
+        // thread doing work IS a fact about this session, and a later
+        // subagent slice will want it. It is recorded as somebody else's
+        // fact rather than folded into eave's own.
+        if let (Some(mine), Some(theirs)) = (
+            self.thread_id.as_deref(),
+            params.get("threadId").and_then(Value::as_str),
+        ) {
+            if mine != theirs {
+                return Step::from_event(SessionEvent::System {
+                    subtype: format!("foreign_thread:{method}"),
+                    raw: line.to_string(),
+                });
+            }
+        }
         match method {
             // The response to `thread/start` already carried the id AND
             // the posture, and it always arrives first (verified live
@@ -1724,5 +1764,68 @@ mod usage_tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Thread attribution.
+
+    /// **Replayed through this parser from comet's live capture**, which
+    /// is the only multi-thread Codex bytes that exist in either repo:
+    /// `comet/crates/harness/tests/fixtures/codex/live-0.146.1-multi-agent.jsonl`.
+    ///
+    /// Three threads share the connection. The parent starts at line 9
+    /// and completes at line 144; two children complete at lines 104 and
+    /// 134, in between. Before the attribution guard eave emitted a
+    /// `TurnCompleted` for all three, so the parent turn was closed twice,
+    /// early — and each close clears both `outstanding` and
+    /// `pending_approvals` in `attention.rs`, silently dropping an open
+    /// permission question out of the attention model while its card is
+    /// still on screen.
+    ///
+    /// The assertion is EXACTLY ONE `TurnCompleted`, not "fewer than
+    /// three": the parent's own end must still arrive, or the fix would
+    /// have traded a turn that closes too early for one that never closes.
+    #[test]
+    fn a_child_threads_turn_never_settles_eaves_own() {
+        const CAPTURE: &str = "/Users/michaelstang/Desktop/eave/comet/crates/harness/tests/fixtures/codex/live-0.146.1-multi-agent.jsonl";
+        let Ok(text) = std::fs::read_to_string(CAPTURE) else {
+            // The capture lives in a sibling repo. Absent, this test
+            // states that rather than passing on an empty file.
+            eprintln!("skipping: {CAPTURE} not present");
+            return;
+        };
+
+        let mut p = CodexProtocol::new();
+        // Adopt the PARENT thread, exactly as `thread/start` would.
+        p.thread_id = Some("01a00fe7-c301-7d52-ae1f-41ecda48b29b".into());
+
+        let (mut ours, mut theirs) = (0, 0);
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(method) = v.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            for ev in p.notification(method, &v, line).events {
+                match ev {
+                    SessionEvent::TurnCompleted { .. } => ours += 1,
+                    SessionEvent::System { ref subtype, .. }
+                        if subtype.starts_with("foreign_thread:") =>
+                    {
+                        theirs += 1
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            ours, 1,
+            "one prompt, one turn end: the parent's, at line 144"
+        );
+        assert!(
+            theirs > 0,
+            "the children's frames must be RECORDED as somebody else's, not dropped"
+        );
     }
 }

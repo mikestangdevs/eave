@@ -27,6 +27,20 @@ const APPROVAL_ID: i64 = 7;
 const DIALOG_ID: i64 = 8;
 const INFRA_ID: i64 = 9;
 
+/// The thread id this fake ANNOUNCED at `thread/start`.
+///
+/// Every notification must carry it. Until 2026-08-20 the fake said
+/// `"threadId": thread()` on all 18 of them — a placeholder for a thread it
+/// never opened — and no test noticed, because nothing in the adapter
+/// read the field. Adding the attribution guard in `codex.rs` is what
+/// exposed it: a fake that misattributes its own frames cannot test
+/// attribution, so 16 tests failed for the right reason.
+static THREAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn thread() -> &'static str {
+    THREAD.get().map(String::as_str).unwrap_or("t")
+}
+
 fn emit(v: Value) {
     let mut out = std::io::stdout().lock();
     let mut line = v.to_string();
@@ -95,12 +109,12 @@ fn thread_object(id: &str, cwd: &Value) -> Value {
 fn agent_message(text: &str) {
     emit(json!({
         "method": "item/agentMessage/delta",
-        "params": { "threadId": "t", "turnId": "u", "itemId": "m1", "delta": text },
+        "params": { "threadId": thread(), "turnId": "u", "itemId": "m1", "delta": text },
     }));
     emit(json!({
         "method": "item/completed",
         "params": {
-            "threadId": "t", "turnId": "u", "completedAtMs": 0,
+            "threadId": thread(), "turnId": "u", "completedAtMs": 0,
             "item": { "type": "agentMessage", "id": "m1", "text": text },
         },
     }));
@@ -123,7 +137,7 @@ fn turn_completed(status: &str) {
     emit(json!({
         "method": "turn/completed",
         "params": {
-            "threadId": "t",
+            "threadId": thread(),
             "turn": { "id": "u", "items": [], "status": status, "error": null },
         },
     }));
@@ -190,6 +204,7 @@ fn main() {
                         std::env::var("FAKE_CODEX_THREAD")
                             .unwrap_or_else(|_| "01a020c6-0000-7000-8000-fakethread01".into())
                     });
+                let _ = THREAD.set(thread_id.clone());
                 let cwd = asked_params.get("cwd").cloned().unwrap_or(Value::Null);
                 let mut result = json!({
                     "thread": thread_object(&thread_id, &cwd),
@@ -238,14 +253,14 @@ fn main() {
                 emit(json!({
                     "method": "turn/started",
                     "params": {
-                        "threadId": "t",
+                        "threadId": thread(),
                         "turn": { "id": "u", "items": [], "status": "inProgress" },
                     },
                 }));
                 emit(json!({
                     "method": "item/started",
                     "params": {
-                        "threadId": "t", "turnId": "u", "startedAtMs": 0,
+                        "threadId": thread(), "turnId": "u", "startedAtMs": 0,
                         "item": {
                             "type": "userMessage", "id": "um1",
                             "content": [{ "type": "text", "text": text }],
@@ -266,7 +281,7 @@ fn main() {
                     emit(json!({
                         "method": "item/completed",
                         "params": {
-                            "threadId": "t", "turnId": "u", "completedAtMs": 0,
+                            "threadId": thread(), "turnId": "u", "completedAtMs": 0,
                             "item": command_item(
                                 if accepted { "completed" } else { "declined" },
                                 if accepted { Some(0) } else { None },
@@ -352,7 +367,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
             emit(json!({
                 "method": "item/started",
                 "params": {
-                    "threadId": "t", "turnId": "u", "startedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "startedAtMs": 0,
                     "item": command_item("inProgress", None, None),
                 },
             }));
@@ -361,7 +376,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
             emit(json!({
                 "method": "item/started",
                 "params": {
-                    "threadId": "t", "turnId": "u", "startedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "startedAtMs": 0,
                     "item": { "type": "reasoning", "id": "r1", "summary": [], "content": [] },
                 },
             }));
@@ -369,7 +384,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
             emit(json!({
                 "method": "item/completed",
                 "params": {
-                    "threadId": "t", "turnId": "u", "completedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "completedAtMs": 0,
                     "item": command_item("completed", Some(0), Some("hello")),
                 },
             }));
@@ -382,14 +397,14 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
             emit(json!({
                 "method": "item/started",
                 "params": {
-                    "threadId": "t", "turnId": "u", "startedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "startedAtMs": 0,
                     "item": command_item("inProgress", None, None),
                 },
             }));
             emit(json!({
                 "method": "item/completed",
                 "params": {
-                    "threadId": "t", "turnId": "u", "completedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "completedAtMs": 0,
                     "item": command_item("failed", Some(2), Some("nope")),
                 },
             }));
@@ -401,7 +416,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
             emit(json!({
                 "method": "item/started",
                 "params": {
-                    "threadId": "t", "turnId": "u", "startedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "startedAtMs": 0,
                     "item": command_item("inProgress", None, None),
                 },
             }));
@@ -410,7 +425,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
                 "method": "item/commandExecution/requestApproval",
                 "params": {
                     "itemId": "c1",
-                    "threadId": "t",
+                    "threadId": thread(),
                     "turnId": "u",
                     "startedAtMs": 0,
                     "command": "echo hello",
@@ -423,7 +438,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 emit(json!({
                     "method": "serverRequest/resolved",
-                    "params": { "threadId": "t", "requestId": APPROVAL_ID },
+                    "params": { "threadId": thread(), "requestId": APPROVAL_ID },
                 }));
                 turn_completed("aborted");
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -441,7 +456,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
             emit(json!({
                 "method": "item/started",
                 "params": {
-                    "threadId": "t", "turnId": "u", "startedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "startedAtMs": 0,
                     "item": {
                         "type": "fileChange", "id": "f1", "status": "inProgress",
                         "changes": [
@@ -457,7 +472,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
                 "method": "item/fileChange/requestApproval",
                 "params": {
                     "itemId": "f1",
-                    "threadId": "t",
+                    "threadId": thread(),
                     "turnId": "u",
                     "startedAtMs": 0,
                     "grantRoot": "/tmp/eave-fake",
@@ -469,7 +484,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
                 "id": DIALOG_ID,
                 "method": "item/tool/requestUserInput",
                 "params": {
-                    "itemId": "d1", "threadId": "t", "turnId": "u",
+                    "itemId": "d1", "threadId": thread(), "turnId": "u",
                     "isBlocking": true,
                     "questions": [{ "id": "q1", "prompt": "which one?" }],
                 },
@@ -479,7 +494,7 @@ fn run_turn(mode: &str, asked: &Value, asked_method: &str) {
             emit(json!({
                 "method": "item/started",
                 "params": {
-                    "threadId": "t", "turnId": "u", "startedAtMs": 0,
+                    "threadId": thread(), "turnId": "u", "startedAtMs": 0,
                     "item": command_item("inProgress", None, None),
                 },
             }));
