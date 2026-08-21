@@ -43,9 +43,12 @@ sandbox = ["cef/sandbox"]
 cef = { version = "151", features = ["build-util"] }
 
 # The in-process arm (`EAVE_CEF_GPUI=1`) puts CEF and gpui in one binary.
-# gpui comes from `../zed-fork` — the pinned wingleeio/zed rev with the BGRA
-# surface patch applied (`../gpui-bgra-surface.patch`), because the stock
-# renderer asserts NV12 on the surface primitive.
+# gpui comes from `../zed-fork` — a local checkout of the pinned rev with the
+# BGRA surface change applied, because the stock renderer asserts NV12 on the
+# surface primitive. That change is now fork commit `8521fc1` (see
+# crates/eave-app/Cargo.toml) and the patch file it used to live in has been
+# retired; this probe keeps its own checkout because it is a throwaway with
+# its own `[workspace]`.
 gpui = { path = "../zed-fork/crates/gpui" }
 gpui_platform = { path = "../zed-fork/crates/gpui_platform", features = [
     "font-kit",
