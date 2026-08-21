@@ -10,6 +10,7 @@ pub mod events;
 pub mod grok;
 pub mod hermes;
 pub mod journal;
+pub mod pi;
 pub mod proc;
 pub mod process;
 pub mod provider;
