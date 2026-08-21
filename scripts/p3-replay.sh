@@ -25,6 +25,14 @@
 # default to 6 keeps the real work identical and the headline number
 # comparable to every report before this one.
 #
+# WHAT A FAILURE LOOKS LIKE NOW (Slice C4). The assert no longer has two
+# outcomes. `PASS` means it anchored a real measured row AND compared it at
+# least once. `FAIL … jump(s)` is the real regression. `FAIL never-anchored`
+# and `FAIL anchored-but-never-observed` mean the run tested NOTHING — the
+# app was too starved of frames to anchor, which is a fact about the
+# machine, not about the code under test. Do not re-run those until green;
+# read `checks=` and the `REPLAY_REFUSE` lines this script now prints.
+#
 # The assert being swept is the anchor invariant (jumps=0). Slice P3 adds
 # no motion and no row heights, so a jump here would mean the glyph swap
 # changed a row's measured height — which is exactly the regression an
@@ -46,13 +54,35 @@ for reduced in inherit 0; do
   for fixture in "${FIXTURES[@]}"; do
     for i in $(seq 1 "$RUNS"); do
       if [ "$reduced" = 0 ]; then export EAVE_REDUCE_MOTION=0; else unset EAVE_REDUCE_MOTION; fi
-      out="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
-             "$PWD/target/debug/eave" 2>/dev/null | grep REPLAY_ASSERT || true)"
+      # KEEP THE WITNESS. This used to be `| grep REPLAY_ASSERT`, which
+      # threw away the only lines that explain a failure: the assert has
+      # printed `REPLAY_JUMP from=… to=…` since Stage F and nobody read one
+      # for nine slices, because the sweep deleted it before anyone could.
+      # Slice C4 diagnosed the approvals anchor jump in an afternoon once
+      # the line was visible. Capture everything; summarise; and on
+      # anything that is not a clean PASS, print the whole conversation.
+      all="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
+             "$PWD/target/debug/eave" 2>/dev/null | grep -E '^REPLAY_' || true)"
+      out="$(printf '%s\n' "$all" | grep REPLAY_ASSERT || true)"
       tag="rm=$reduced $(basename "$fixture" .tap.jsonl) #$i"
+      # A refusal is not a failure by itself — the assert re-arms — but it
+      # says the machine was too starved of frames to anchor on the first
+      # try, which is the leading indicator for the failure below it.
+      noise="$(printf '%s\n' "$all" | grep -E 'REPLAY_(REFUSE|JUMP|WATCH)' || true)"
       case "$out" in
-        *PASS*) pass=$((pass+1)); echo "PASS  $tag  ${out}" ;;
+        # `if`, NOT `[ -n "$noise" ] && printf …`. Under `set -e` an
+        # `&&` chain whose test fails IS the statement's exit status, so
+        # the quiet case — no refusals, which is the normal case — would
+        # kill the sweep mid-run. Same footgun bit Slice C3 in
+        # `boot-smoke.sh`.
+        *PASS*) pass=$((pass+1)); echo "PASS  $tag  ${out}"
+                if [ -n "$noise" ]; then
+                  printf '%s\n' "$noise" | sed 's/^/        · /'
+                fi ;;
         *)      fail=$((fail+1)); failed_lines+=("$tag :: ${out:-<no assert line>}")
-                echo "FAIL  $tag  ${out:-<no assert line>}" ;;
+                echo "FAIL  $tag  ${out:-<no assert line>}"
+                printf '%s\n' "${all:-<no REPLAY_ lines at all — the app did not boot>}" \
+                  | sed 's/^/        │ /' ;;
       esac
     done
   done

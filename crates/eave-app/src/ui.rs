@@ -2130,32 +2130,76 @@ struct Veil {
 /// the logical scroll anchor while frames stream/settle below is a scroll
 /// jump — the acceptance requires zero.
 ///
-/// **Slice C4 gave it a witness.** It always printed a `REPLAY_JUMP` line
-/// naming the from/to offsets, and nobody had ever read one, because
-/// `p3-replay.sh` pipes the run through `grep REPLAY_ASSERT` and the
-/// witness line is not that. So a jump was a boolean for nine slices. The
-/// extra fields here exist to answer the three questions the boolean
-/// cannot: WHICH batch moved it, WHETHER the view actually moved in pixels
-/// or only the index did, and whether the move happened inside
-/// `apply_records` (a splice/remeasure) or between batches (a layout).
+/// **Slice C4 gave it a witness, and then gave it a conscience.**
+///
+/// The witness: it had always printed `REPLAY_JUMP from=… to=…`, and nobody
+/// had read one in nine slices, because `p3-replay.sh` piped every run
+/// through `grep REPLAY_ASSERT`. A jump was a boolean. The lines it prints
+/// now answer what the boolean could not — which batch moved it, whether
+/// the view moved in PIXELS or only the index did, and whether a fold or a
+/// frame did it.
+///
+/// The conscience: it used to freeze by scrolling a PIXEL distance, and a
+/// row no frame has laid out is zero pixels tall, so on a starved machine
+/// it "froze" one index past the end of the list and reported the next
+/// append's renumbering as a jump. **~12% of runs asserted nothing and
+/// said FAIL.** So arming is now separate from being anchored
+/// ([`ReplayAnchor`]), the arm is checked against measured geometry
+/// (`arm_replay_anchor`), a frame has to confirm it, and `checks` counts
+/// the times the anchor was actually looked at — because zero is a failure
+/// with its own name, not a PASS.
 struct ReplayAssert {
-    frozen: Option<ListOffset>,
     jumps: usize,
-    /// How many record batches have been folded since the freeze. The
-    /// fixture only delivers one, so a jump here is always "the batch
-    /// after the freeze" — but real-claude delivers many, and a jump at
-    /// batch 1 and a jump at batch 12 are different bugs.
+    /// How many record batches have been folded since the anchor was held.
+    /// The approvals fixture only delivers one, so a jump there is always
+    /// "the batch after the freeze" — but real-claude delivers many, and a
+    /// jump at batch 1 and a jump at batch 12 are different bugs.
     batch: usize,
-    /// The frozen anchor in PIXELS, not items. This is the severity
-    /// question: an `item_ix` that changes while the pixel offset does not
-    /// is bookkeeping, and a reader sees nothing. A pixel offset that
-    /// moves is a jump under someone's cursor.
-    frozen_px: f32,
-    /// Item count at the freeze, so a jump to `item_ix == count` can be
-    /// recognised for what it is: `logical_scroll_top` went `None` and the
-    /// bottom-aligned default took over.
-    frozen_count: usize,
+    /// How many times the anchor was actually COMPARED against a later
+    /// state. Counted because zero is a failure: an assert that anchored
+    /// and then never observed anything has asserted nothing, and saying
+    /// PASS there is the whole bug this slice fixed, wearing a different
+    /// hat.
+    checks: usize,
+    /// Arming attempts that were turned down, and the last reason. A run
+    /// that refuses forever is a FAIL with its own message rather than a
+    /// silent nothing.
+    refusals: usize,
+    last_refusal: &'static str,
 }
+
+/// Where the anchor is in its life cycle. Lives in a `thread_local` rather
+/// than on [`ReplayAssert`] because two places have to see it and only one
+/// of them has a `&mut TranscriptState`: `apply_records` arms and compares,
+/// and `Shell::render` — which is the ONLY vantage point that can watch a
+/// frame go by — is what promotes `Arming` to `Held`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReplayAnchor {
+    /// Nothing anchored. The next batch with enough measured content will
+    /// try again.
+    Idle,
+    /// `scroll_to` accepted `ix` and the arm-time checks passed, but no
+    /// frame has laid the list out yet, so nothing has confirmed the
+    /// anchor survives a layout. `frames` counts renders since arming:
+    /// the FIRST one proves nothing, because `Shell::render` runs before
+    /// the list element lays out. The second is the evidence.
+    Arming { ix: usize, frames: u32 },
+    /// A layout has run and kept it. Only now do comparisons mean
+    /// anything, and only now does a difference count as a jump.
+    Held { ix: usize, off: f32, px: f32 },
+}
+
+/// Margin above the viewport height required below the anchor before the
+/// assert will freeze (px).
+///
+/// Not a taste number. gpui re-anchors a bottom-aligned list whenever the
+/// content below the scroll top does not fill the viewport — it walks
+/// upward and sets `logical_scroll_top = None`, which resolves to the end.
+/// The old pixel freeze scrolled up exactly 600 px into a 643 px viewport,
+/// so it was ALWAYS 43 px inside that trap and was saved only by whatever
+/// rows the fixture happened to append next. This is the cushion that makes
+/// the freeze independent of the fixture.
+const FREEZE_MARGIN: f32 = 96.0;
 
 /// One-word summary of what the fold asked the list to do in this batch —
 /// the left-hand side of the ordering the C4 directive asks for. `splice`
@@ -2194,26 +2238,25 @@ fn describe_row(display: &crate::display::DisplayList, ix: usize) -> String {
     }
 }
 
-// The frozen anchor, mirrored where a `&self` render can see it.
+// The anchor's life cycle, mirrored where a `&self` render can see it.
 //
-// The jump check runs inside `apply_records`, which is the only place with
-// a `&mut TranscriptState` — so on its own it can only report that the
-// anchor moved BETWEEN two batches, never whether a layout in the gap did
-// it. `Shell::render` samples the same value once a frame and reports the
-// first divergence it sees, which pins the move to a frame rather than to
-// the fold. Read-only from render's side, so it cannot trip the `already
-// borrowed` papercut that scroll handlers hit.
+// The arm/compare half runs inside `apply_records`, the only place with a
+// `&mut TranscriptState`. But arming is not the same as being anchored:
+// `Shell::render` runs BEFORE the list element lays out, so the only proof
+// that a layout kept the anchor is a later frame finding it still there.
+// `Shell::render` is the vantage point for that, and this cell is how the
+// two halves agree. Read-only against the list from render's side, so it
+// cannot trip the `already borrowed` papercut that scroll handlers hit.
 thread_local! {
-    static REPLAY_WATCH: std::cell::Cell<Option<(usize, f32, f32)>> =
-        const { std::cell::Cell::new(None) };
+    static REPLAY_ANCHOR: std::cell::Cell<ReplayAnchor> =
+        const { std::cell::Cell::new(ReplayAnchor::Idle) };
 }
 
-/// Frames rendered since process start. The axis the anchor bug actually
-/// lives on: `ListState` measures a row when a frame lays it out, and a row
-/// no frame has laid out contributes ZERO to the height sum that
-/// `scroll_by` walks. So "how many frames happened before the freeze" is
-/// the whole question, and replay speed is only one of the knobs that
-/// moves it.
+/// Frames rendered since process start. The axis the anchor bug lived on:
+/// `ListState` measures a row when a frame lays it out, and a row no frame
+/// has laid out contributes ZERO to the height sum a pixel scroll walks. So
+/// "how many frames happened before the freeze" was the whole question, and
+/// replay speed was only one of the knobs that moved it.
 static REPLAY_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn replay_frames() -> u64 {
@@ -2227,55 +2270,96 @@ fn replay_trace() -> bool {
     *ON.get_or_init(|| std::env::var("EAVE_REPLAY_TRACE").is_ok())
 }
 
-fn replay_watch_set(at: ListOffset, px_offset: f32) {
-    REPLAY_WATCH.with(|w| w.set(Some((at.item_ix, f32::from(at.offset_in_item), px_offset))));
-}
-
-/// Called once per `Shell::render`. Prints at most one line per divergence
-/// and then re-arms on the new value, so a slow drift reads as a sequence
-/// of frames rather than as one line repeated until the process exits.
+/// Called once per `Shell::render`, and it does two jobs.
+///
+/// **Promotion.** An `Arming` anchor becomes `Held` only when a frame has
+/// gone by with it intact. `frames` has to reach 2, not 1: this runs at the
+/// TOP of a render, before the list element lays out, so the first call
+/// after arming is looking at a list that has not been given the chance to
+/// disagree yet. The second call is the first one whose answer means
+/// anything.
+///
+/// **Refusal.** If that layout DID move the anchor — gpui re-anchors a
+/// bottom-aligned list whose content no longer fills the viewport — the
+/// arm is abandoned out loud and the next batch tries again. That case is
+/// the one the old assert reported as a jump.
 fn replay_watch_frame(list: &ListState, rows: usize) {
     REPLAY_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    REPLAY_WATCH.with(|w| {
-        let Some((ix, off, was_px)) = w.get() else {
-            return;
-        };
+    REPLAY_ANCHOR.with(|cell| {
         let cur = list.logical_scroll_top();
-        // `EAVE_REPLAY_TRACE=1` prints every frame, not just the ones that
-        // moved. A passing run and a failing run of the same fixture then
-        // differ as two text files, and the first line where they diverge
-        // is the frame the bug happens on — which is a shorter road to the
-        // ordering than reasoning about which of them "should" race.
-        if replay_trace() {
+        let cur_off = f32::from(cur.offset_in_item);
+        let cur_px = -f32::from(list.scroll_px_offset_for_scrollbar().y);
+        if replay_trace() && cell.get() != ReplayAnchor::Idle {
             println!(
-                "REPLAY_TRACE at=({},{:.1}) px={:.1} items={} rows={} end={:?}",
+                "REPLAY_TRACE at=({},{:.1}) px={:.1} items={} rows={} state={:?}",
                 cur.item_ix,
-                f32::from(cur.offset_in_item),
-                -f32::from(list.scroll_px_offset_for_scrollbar().y),
+                cur_off,
+                cur_px,
                 list.item_count(),
                 rows,
-                list.is_scrolled_to_end(),
+                cell.get(),
             );
         }
-        if cur.item_ix == ix && f32::from(cur.offset_in_item) == off {
-            return;
+        match cell.get() {
+            ReplayAnchor::Idle => {}
+            ReplayAnchor::Arming { ix, frames } => {
+                let frames = frames + 1;
+                if cur.item_ix != ix || cur_off != 0.0 {
+                    println!(
+                        "REPLAY_REFUSE reason=layout-moved-the-anchor want=({ix},0) \
+got=({},{:.1}) frames={frames} rows={rows} — re-arming on the next batch",
+                        cur.item_ix, cur_off,
+                    );
+                    cell.set(ReplayAnchor::Idle);
+                } else if frames >= 2 {
+                    println!(
+                        "REPLAY_FREEZE held=({ix},0) row={} px={cur_px:.1} items={} \
+rows={rows} frames={}",
+                        describe_ix(ix, rows),
+                        list.item_count(),
+                        replay_frames(),
+                    );
+                    cell.set(ReplayAnchor::Held {
+                        ix,
+                        off: 0.0,
+                        px: cur_px,
+                    });
+                } else {
+                    cell.set(ReplayAnchor::Arming { ix, frames });
+                }
+            }
+            ReplayAnchor::Held { ix, off, px } => {
+                if cur.item_ix == ix && cur_off == off {
+                    return;
+                }
+                println!(
+                    "REPLAY_WATCH frame moved ({ix},{off:.1}) -> ({},{:.1})  \
+px {px:.1}->{cur_px:.1} (d={:.1}) items={} rows={rows}",
+                    cur.item_ix,
+                    cur_off,
+                    cur_px - px,
+                    list.item_count(),
+                );
+                cell.set(ReplayAnchor::Held {
+                    ix: cur.item_ix,
+                    off: cur_off,
+                    px: cur_px,
+                });
+            }
         }
-        let now_px = -f32::from(list.scroll_px_offset_for_scrollbar().y);
-        println!(
-            "REPLAY_WATCH frame moved ({},{:.1}) -> ({},{:.1})  px {:.1}->{:.1} \
-(d={:.1}) items={} rows={}",
-            ix,
-            off,
-            cur.item_ix,
-            f32::from(cur.offset_in_item),
-            was_px,
-            now_px,
-            now_px - was_px,
-            list.item_count(),
-            rows,
-        );
-        w.set(Some((cur.item_ix, f32::from(cur.offset_in_item), now_px)));
     });
+}
+
+/// `describe_row` without a `DisplayList` to hand — the frame path has the
+/// row count but not the list itself.
+fn describe_ix(ix: usize, rows: usize) -> &'static str {
+    if ix < rows {
+        "row"
+    } else if ix == rows {
+        "spacer"
+    } else {
+        "past-end"
+    }
 }
 
 struct TranscriptState {
@@ -2480,8 +2564,8 @@ impl TranscriptState {
         self.assert_scroll();
 
         if let Some(mut ra) = self.assert_replay.take() {
-            match ra.frozen {
-                None => {
+            match REPLAY_ANCHOR.with(|c| c.get()) {
+                ReplayAnchor::Idle => {
                     let users = self
                         .transcript
                         .rows
@@ -2490,97 +2574,227 @@ impl TranscriptState {
                         .count();
                     if users >= 2 {
                         // A user scrolled up mid-stream: freeze here.
-                        self.scroll = ScrollMode::Free;
-                        self.assert_scroll();
-                        self.list.scroll_by(px(-600.));
-                        let f = self.list.logical_scroll_top();
-                        ra.frozen = Some(f);
-                        ra.frozen_px = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
-                        ra.frozen_count = self.list.item_count();
-                        replay_watch_set(f, ra.frozen_px);
-                        // `px` is the anchor's pixel offset, and the scroll
-                        // that produced it was exactly -600 from the end, so
-                        // `px + 600` is the list's MEASURED content height at
-                        // the freeze — the quantity the landing point is a
-                        // function of. It is not the true content height:
-                        // rows the layout never had a reason to measure carry
-                        // height 0 in the tree, including the ones this very
-                        // batch just spliced in.
-                        println!(
-                            "REPLAY_FREEZE at=({},{:?},{}) px={:.1} measured_h={:.1} \
-viewport_h={:.1} items={} rows={} frames={} ops={}",
-                            f.item_ix,
-                            f.offset_in_item,
-                            describe_row(&self.display, f.item_ix),
-                            ra.frozen_px,
-                            ra.frozen_px + 600.0,
-                            f32::from(self.list.viewport_bounds().size.height),
-                            ra.frozen_count,
-                            self.display.len(),
-                            replay_frames(),
-                            describe_ops(&ops),
-                        );
+                        if let Some(why) = self.arm_replay_anchor(&ops) {
+                            ra.refusals += 1;
+                            ra.last_refusal = why;
+                        }
                     }
                 }
-                Some(f) => {
+                // Armed but not yet proven: a frame has to go by with the
+                // anchor intact before anything it says is worth reading.
+                // Deliberately no comparison here — comparing against an
+                // unproven anchor is exactly what produced nine slices of
+                // phantom jumps.
+                ReplayAnchor::Arming { ix, frames } => {
+                    if replay_trace() {
+                        println!("REPLAY_WAIT arming=({ix},0) frames={frames}");
+                    }
+                }
+                ReplayAnchor::Held { ix, off, px } => {
                     ra.batch += 1;
+                    ra.checks += 1;
                     let cur = self.list.logical_scroll_top();
+                    let cur_off = f32::from(cur.offset_in_item);
                     if replay_trace() {
                         println!(
                             "REPLAY_BATCH #{} ops={} anchor=({},{:.1}) items={} rows={}",
                             ra.batch,
                             describe_ops(&ops),
                             cur.item_ix,
-                            f32::from(cur.offset_in_item),
+                            cur_off,
                             self.list.item_count(),
                             self.display.len(),
                         );
                     }
-                    if cur.item_ix != f.item_ix || cur.offset_in_item != f.offset_in_item {
+                    if cur.item_ix != ix || cur_off != off {
                         let cur_px = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
                         // `describe_row` for both ends: an anchor that moves
                         // from one row id to a DIFFERENT row id is a real
                         // reanchor; the same id at a new index is a splice
                         // renumbering rows above it.
                         println!(
-                            "REPLAY_JUMP batch={} from=({},{:?},{}) to=({},{:?},{}) \
-px {:.1}->{:.1} (d={:.1}) items={}->{} rows={} ops={}",
+                            "REPLAY_JUMP batch={} from=({},{:.1},{}) to=({},{:.1},{}) \
+px {:.1}->{:.1} (d={:.1}) items={} rows={} ops={}",
                             ra.batch,
-                            f.item_ix,
-                            f.offset_in_item,
-                            describe_row(&self.display, f.item_ix),
+                            ix,
+                            off,
+                            describe_row(&self.display, ix),
                             cur.item_ix,
-                            cur.offset_in_item,
+                            cur_off,
                             describe_row(&self.display, cur.item_ix),
-                            ra.frozen_px,
+                            px,
                             cur_px,
-                            cur_px - ra.frozen_px,
-                            ra.frozen_count,
+                            cur_px - px,
                             self.list.item_count(),
                             self.display.len(),
                             describe_ops(&ops),
                         );
                         ra.jumps += 1;
-                        ra.frozen = Some(cur);
-                        ra.frozen_px = cur_px;
-                        ra.frozen_count = self.list.item_count();
-                        replay_watch_set(cur, cur_px);
+                        REPLAY_ANCHOR.with(|c| {
+                            c.set(ReplayAnchor::Held {
+                                ix: cur.item_ix,
+                                off: cur_off,
+                                px: cur_px,
+                            })
+                        });
                     }
                 }
             }
             if self.transcript.closed.is_some() {
-                let jumps = ra.jumps;
+                // THE ASSERT MUST NEVER REPORT A RESULT WHILE ASSERTING
+                // NOTHING. Three verdicts, and two of them are failures the
+                // old assert could not express — it had exactly one way to
+                // pass and one to fail, so a run that anchored nothing came
+                // out as a jump, and a run that anchored but never looked
+                // again would have come out as a PASS.
+                let held = matches!(REPLAY_ANCHOR.with(|c| c.get()), ReplayAnchor::Held { .. });
+                let verdict = if !held {
+                    Some(format!(
+                        "FAIL never-anchored — {} refusal(s), last: {}. The list never \
+carried {:.0} px of MEASURED content below a real row, so this run tested nothing. \
+Frames rendered: {}. See docs/reports/stage-c4-anchor.md.",
+                        ra.refusals,
+                        ra.last_refusal,
+                        f32::from(self.list.viewport_bounds().size.height) + FREEZE_MARGIN,
+                        replay_frames(),
+                    ))
+                } else if ra.checks == 0 {
+                    Some(
+                        "FAIL anchored-but-never-observed — the anchor was held and then \
+no further batch arrived to compare it against, so this run tested nothing."
+                            .to_string(),
+                    )
+                } else if ra.jumps > 0 {
+                    Some(format!("FAIL {} jump(s)", ra.jumps))
+                } else {
+                    None
+                };
                 println!(
-                    "REPLAY_ASSERT rows={} jumps={} {}",
+                    "REPLAY_ASSERT rows={} jumps={} checks={} {}",
                     self.display.len(),
-                    jumps,
-                    if jumps == 0 { "PASS" } else { "FAIL" }
+                    ra.jumps,
+                    ra.checks,
+                    verdict.as_deref().unwrap_or("PASS"),
                 );
-                std::process::exit(if jumps == 0 { 0 } else { 1 });
+                std::process::exit(if verdict.is_none() { 0 } else { 1 });
             }
             self.assert_replay = Some(ra);
         }
         Ok(())
+    }
+
+    /// Try to anchor the replay assert. Returns `Some(reason)` if it
+    /// refused.
+    ///
+    /// **THE RULE: ANCHOR BY ITEM INDEX, NEVER BY PIXELS.** A `ListState`
+    /// row that no frame has laid out is ZERO PIXELS TALL in the sum-tree
+    /// that a pixel scroll walks, so `scroll_by(px(-600.))` — what this
+    /// used to be — seeks straight off the end of an unmeasured list and
+    /// "freezes" one index past the last item. Nothing is anchored; the
+    /// next append renumbers the index; the assert calls that a jump. That
+    /// was the ~12% approvals failure, diagnosed in
+    /// `docs/reports/stage-c4-anchor.md`.
+    ///
+    /// **This was already known IN THIS FILE.** `perf_fill_10k`'s scroll
+    /// driver says it in as many words — *"Item-based (not pixel
+    /// `scroll_by`): unmeasured rows are zero-height in the seek, so pixel
+    /// scrolling would teleport past them unmeasured"* — about 500 lines
+    /// from where the assert made the mistake. It is the second time a
+    /// fact this project had already written down failed to reach the call
+    /// site that needed it (`EAVE_REDUCE_MOTION` was the first), which is
+    /// why the rule is here, at the call site, and not only in a report.
+    ///
+    /// Two things are checked before anchoring, and neither is optional:
+    ///
+    /// 1. **The anchor row is MEASURED.** `bounds_for_item` returns `Some`
+    ///    only for a `ListItem::Measured`, which makes it the public test
+    ///    for "a frame has laid this row out". It answers only for rows at
+    ///    or below the current scroll top, which is why the probe scrolls
+    ///    to 0 first — no layout runs between these calls, so nothing is
+    ///    ever displayed there.
+    /// 2. **A full viewport of MEASURED content sits below it**, plus
+    ///    [`FREEZE_MARGIN`]. gpui re-anchors a bottom-aligned list whose
+    ///    content no longer fills the viewport by setting
+    ///    `logical_scroll_top = None`, which resolves to the end — a jump
+    ///    the assert would report against itself. Unmeasured rows below
+    ///    are counted as zero, so the sum is a LOWER bound and measuring
+    ///    them later can only help.
+    ///
+    /// A refusal restores follow-tail exactly as it was and returns; the
+    /// next batch tries again. Refusing forever is a FAIL with its own
+    /// message, above — never a silent PASS.
+    fn arm_replay_anchor(&mut self, ops: &crate::display::DiffOps) -> Option<&'static str> {
+        let viewport = f32::from(self.list.viewport_bounds().size.height);
+        let refuse = |why: &'static str, detail: String| -> Option<&'static str> {
+            println!(
+                "REPLAY_REFUSE reason={why} {detail} frames={}",
+                replay_frames()
+            );
+            Some(why)
+        };
+        if viewport <= 0.0 {
+            return refuse("no-layout-yet", "the list has never been laid out".into());
+        }
+        let need = viewport + FREEZE_MARGIN;
+
+        self.scroll = ScrollMode::Free;
+        self.assert_scroll();
+        // Probe position. `bounds_for_item` answers `None` for anything
+        // above the current scroll top, and follow-tail parks that at the
+        // end of the list, so from there every row reads as unmeasured.
+        // This is a probe, not a scroll: no frame runs before the real
+        // anchor is set or follow is restored below.
+        self.list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        });
+
+        let count = self.list.item_count();
+        let mut below = 0.0f32;
+        let mut want: Option<usize> = None;
+        for ix in (0..count).rev() {
+            let Some(b) = self.list.bounds_for_item(ix) else {
+                continue; // unmeasured: worth zero, and only ever grows
+            };
+            if below >= need {
+                want = Some(ix);
+                break;
+            }
+            below += f32::from(b.size.height);
+        }
+
+        let Some(ix) = want else {
+            let detail = format!("measured={below:.1} need={need:.1} items={count}");
+            self.scroll = ScrollMode::Follow;
+            self.assert_scroll();
+            return refuse("not-enough-measured-content", detail);
+        };
+
+        self.list.scroll_to(ListOffset {
+            item_ix: ix,
+            offset_in_item: px(0.),
+        });
+        let got = self.list.logical_scroll_top();
+        if got.item_ix != ix || f32::from(got.offset_in_item) != 0.0 {
+            let detail = format!(
+                "asked=({ix},0) got=({},{:?})",
+                got.item_ix, got.offset_in_item
+            );
+            self.scroll = ScrollMode::Follow;
+            self.assert_scroll();
+            return refuse("scroll_to-was-clamped", detail);
+        }
+
+        println!(
+            "REPLAY_ARM at=({ix},0) row={} below={below:.1} need={need:.1} viewport={viewport:.1} \
+items={count} rows={} frames={} ops={}",
+            describe_row(&self.display, ix),
+            self.display.len(),
+            replay_frames(),
+            describe_ops(ops),
+        );
+        REPLAY_ANCHOR.with(|c| c.set(ReplayAnchor::Arming { ix, frames: 0 }));
+        None
     }
 
     /// Re-assert the scroll intent after content changed (spec 03: the
@@ -9756,11 +9970,11 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         }
         if replay_assert {
             t.assert_replay = Some(ReplayAssert {
-                frozen: None,
                 jumps: 0,
                 batch: 0,
-                frozen_px: 0.0,
-                frozen_count: 0,
+                checks: 0,
+                refusals: 0,
+                last_refusal: "none",
             });
         }
         t

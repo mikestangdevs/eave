@@ -112,12 +112,18 @@ fi
 fail=0
 for fixture in "${FIXTURES[@]}"; do
   echo "── boot smoke: $(basename "$fixture") ──"
-  out="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
-         "$EAVE" 2>/dev/null | grep REPLAY_ASSERT || true)"
+  # Same witness rule as `p3-replay.sh` (Slice C4): capture every REPLAY_
+  # line and print them all on anything that is not a clean PASS. This
+  # script had the identical `| grep REPLAY_ASSERT`, so it would have
+  # reported the approvals anchor jump as one inscrutable word too.
+  all="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
+         "$EAVE" 2>/dev/null | grep -E '^REPLAY_' || true)"
+  out="$(printf '%s\n' "$all" | grep REPLAY_ASSERT || true)"
   echo "${out:-<no assert line — the app did not boot>}"
   case "$out" in
     *PASS*) ;;
-    *) fail=1 ;;
+    *) fail=1
+       printf '%s\n' "${all:-<no REPLAY_ lines at all>}" | sed 's/^/    │ /' ;;
   esac
 done
 
