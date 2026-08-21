@@ -53,63 +53,79 @@
 //! than assumed benign ([`GrokProto::note_tool_call`]). `--always-approve`
 //! is never passed, and `--no-leader` is always passed — see [`spawn`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::os::unix::process::ExitStatusExt;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
-use tokio::sync::{mpsc, watch};
+use serde_json::Value;
+use tokio::sync::mpsc;
 
-use crate::events::{cap_payload, SessionEvent};
-use crate::proc::{self, ProcIdentity};
-use crate::process;
+use crate::acp::permission::{self, PendingApprovals};
+use crate::acp::update::{AcpStream, Thoughts, ToolInput, ToolNaming, UpdateSpec};
+use crate::acp::wire::{self, Frame, SharedStdin};
+use crate::acp::{
+    self, AcpChild, AcpSpec, ChildEnv, ChildSpec, HandshakeError, HandshakeGate, ModeVerdict,
+};
+use crate::events::SessionEvent;
+use crate::proc::ProcIdentity;
 use crate::session::{
     AgentSession, ApprovalDecision, KillReport, SessionError, SessionWatch, SpawnConfig,
 };
-use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
 
-const STDERR_RING_CAP: usize = 4096;
-const EVENT_CHANNEL_CAP: usize = 256;
+/// Grok's ACP quirks, in one place. Everything not named here is the
+/// shared core's (`crate::acp`).
+const GROK: AcpSpec = AcpSpec {
+    provider_id: "grok",
+    acp_args: spawn_args,
+    // Nothing beyond eave's own variables: Grok's auto-approve posture
+    // lives in `~/.grok/config.toml`, not in the environment, so there is
+    // nothing here to scrub. It is caught on the wire instead — see
+    // [`posture_refusal`].
+    child_env: |cfg| ChildEnv::sanitized().and_extra(&cfg.extra_env),
+    // Grok emits session updates under BOTH the standard ACP notification
+    // and its own vendor channel, and they are not interchangeable in
+    // practice: `tool_call` arrives on `session/update` while
+    // `turn_completed` arrives on `_x.ai/session_notification` (capture
+    // 2026-08-20). Reading only the standard one loses the end of every
+    // turn.
+    update_channels: &["session/update", "_x.ai/session_notification"],
+    update: UpdateSpec {
+        // Grok puts its real tool name on the wire, so eave shows the real
+        // tool name rather than ACP's coarse `kind`.
+        tool_naming: ToolNaming::VendorMeta(GROK_TOOL_META),
+        tool_input: ToolInput::RawInput,
+        // Reasoning is not the reply, and the Claude adapter surfaces only
+        // assistant text too.
+        thoughts: Thoughts::Dropped,
+        progress_events: false,
+        // Grok reports the end of a turn on the wire (`turn_completed`),
+        // so there is no RPC reply to flush accumulated text at.
+        accumulate_turn_text: false,
+    },
+    asking_modes: &[GROK_MODE_ASKS],
+};
 
-/// The ACP version eave speaks. Grok 1.0.5 answers `initialize` with
-/// `protocolVersion: 1`.
-const ACP_PROTOCOL_VERSION: i64 = 1;
+/// Where Grok hangs its own tool metadata on an ACP tool call.
+const GROK_TOOL_META: &str = "x.ai/tool";
 
-/// JSON-RPC ids eave owns for the two handshake calls. Prompt ids start
-/// above them and only ever increase, so a late response can always be
-/// attributed.
-const RPC_INITIALIZE: i64 = 1;
-const RPC_SESSION: i64 = 2;
+/// The posture string for a session that routes permission questions to
+/// eave, and the one for a session that answers them itself. These are
+/// eave's names for what `yolo` means, not strings Grok emits.
+const GROK_MODE_ASKS: &str = "default";
+const GROK_MODE_YOLO: &str = "always-approve";
+
+/// First JSON-RPC id handed to a `session/prompt`. Above the two handshake
+/// ids the shared core owns, and only ever increasing, so a late response
+/// can always be attributed.
 const RPC_PROMPT_BASE: i64 = 16;
-
-type ExitFacts = (Option<i32>, Option<i32>);
-type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
-
-/// One permission question Grok is parked on, and the two facts needed to
-/// answer it: the JSON-RPC id it asked with, and the option ids it offered.
-/// The option ids are **the provider's own strings**, captured from the
-/// request rather than hardcoded — Grok varies them by tool kind
-/// (`allow-edits-session` for an edit, and nothing guarantees a Bash call
-/// spells its options the same way).
-struct PendingPermission {
-    rpc_id: Value,
-    allow: Option<String>,
-    reject: Option<String>,
-}
 
 /// ACP session state and the outstanding-tool set, kept together because
 /// both are read by the trait methods off the reader task.
 #[derive(Default)]
 pub struct GrokProto {
     session_id: Option<String>,
-    outstanding: HashSet<String>,
-    pending: HashMap<String, PendingPermission>,
+    stream: AcpStream,
+    pending: PendingApprovals,
     /// The posture the session reports (`yolo`): `Some(false)` = it asks,
     /// `Some(true)` = it auto-approves, `None` = it has not said yet.
     yolo: Option<bool>,
@@ -129,7 +145,7 @@ impl GrokProto {
     }
 
     pub fn in_flight(&self) -> usize {
-        self.outstanding.len()
+        self.stream.in_flight()
     }
 
     pub fn pending_approvals(&self) -> usize {
@@ -137,7 +153,7 @@ impl GrokProto {
     }
 
     pub fn approval_is_open(&self, request_id: &str) -> bool {
-        self.pending.contains_key(request_id)
+        self.pending.is_open(request_id)
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -152,30 +168,15 @@ impl GrokProto {
 }
 
 pub struct GrokSession {
-    identity: ProcIdentity,
-    pgid: i32,
-    /// Shared because two writers exist: the engine answering an approval
-    /// or sending a message, and the reader task driving the ACP
-    /// handshake. Serialized by the mutex so a JSON-RPC frame can never
-    /// interleave with another mid-line.
-    stdin: SharedStdin,
+    child: AcpChild,
     shared: Arc<Shared>,
-    exit_rx: watch::Receiver<Option<ExitFacts>>,
-    /// Publishes the ACP session id once `session/new` (or `session/load`)
-    /// returns. `send_user_message` waits on this rather than racing the
-    /// handshake.
-    ready_rx: watch::Receiver<Option<SessionReady>>,
-    stdout_eof: Arc<AtomicBool>,
-    exited_flag: Arc<AtomicBool>,
 }
 
 struct Shared {
     proto: Mutex<GrokProto>,
-    last_activity: Mutex<Instant>,
-    /// Set at kill initiation; the reader drops all protocol input from
-    /// then on — descendants holding inherited pipes may emit stale lines
-    /// after the leader dies (spec 01 §Kill).
-    kill_initiated: AtomicBool,
+    /// Settled once `session/new` (or `session/load`) returns.
+    /// `send_user_message` waits on this rather than racing the handshake.
+    ready: HandshakeGate,
 }
 
 impl GrokSession {
@@ -184,163 +185,58 @@ impl GrokSession {
     /// handle and its event stream; `SessionEvent::Exited` is always the
     /// final event.
     pub fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
-        let mut cmd = Command::new(&cfg.program);
-        cmd.current_dir(&cfg.cwd);
-        cmd.args(spawn_args(cfg));
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-
-        let eave_vars: Vec<String> = std::env::vars()
-            .map(|(k, _)| k)
-            .filter(|k| k.starts_with("EAVE_"))
-            .collect();
-        for var in eave_vars {
-            cmd.env_remove(var);
-        }
-        for (k, v) in &cfg.extra_env {
-            cmd.env(k, v);
-        }
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let mut child = cmd.spawn().map_err(SessionError::Spawn)?;
-        let pid = child.id().expect("freshly spawned child has a pid") as i32;
-        let identity = match proc::identity_of(pid) {
-            Some(id) => id,
-            // Same reasoning as the Claude adapter: a fast child can exit
-            // before we fingerprint it, and a zombie is not inspectable.
-            // Confirm the exit and record a sentinel identity that can
-            // never match; a child that is alive yet uninspectable stays a
-            // hard error.
-            None => match child.try_wait() {
-                Ok(Some(_)) => ProcIdentity {
-                    pid,
-                    start_tvsec: 0,
-                    start_tvusec: 0,
-                },
-                _ => return Err(SessionError::IdentityUnavailable { pid }),
-            },
-        };
-
-        let stdin: SharedStdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take()));
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-
         let shared = Arc::new(Shared {
             proto: Mutex::new(GrokProto::new()),
-            last_activity: Mutex::new(Instant::now()),
-            kill_initiated: AtomicBool::new(false),
+            ready: HandshakeGate::new(),
         });
-        let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
-        let (exit_tx, exit_rx) = watch::channel(None);
-        let (ready_tx, ready_rx) = watch::channel(None);
 
-        let stdout_eof = Arc::new(AtomicBool::new(false));
-        let exited_flag = Arc::new(AtomicBool::new(false));
-
-        // Open the ACP handshake. Everything else is driven by what comes
-        // back, in the reader task.
-        let resume_id = cfg.resume.then(|| cfg.session_id.clone());
+        let resume_id = acp::resume_cursor(cfg);
         let session_cwd = cfg.cwd.display().to_string();
-        let handshake_stdin = Arc::clone(&stdin);
-        tokio::spawn(async move {
-            write_line(&handshake_stdin, &initialize_frame()).await;
-        });
-
         let reader_shared = Arc::clone(&shared);
-        let reader_tx = events_tx.clone();
-        let reader_eof = Arc::clone(&stdout_eof);
-        let reader_stdin = Arc::clone(&stdin);
-        let stdout_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                *reader_shared.last_activity.lock().unwrap() = Instant::now();
-                if reader_shared.kill_initiated.load(Ordering::SeqCst) {
-                    continue;
-                }
-                let (events, frames) = {
-                    let mut proto = reader_shared.proto.lock().unwrap();
-                    proto.handle_line(&line, resume_id.as_deref(), &session_cwd, &ready_tx)
-                };
-                for frame in frames {
-                    write_line(&reader_stdin, &frame).await;
-                }
-                for event in events {
-                    // Receiver gone just means nobody is listening; keep
-                    // draining so the child never blocks on a full pipe.
-                    let _ = reader_tx.send(event).await;
-                }
-            }
-            // EOF (or read error): with the process still alive this is
-            // provable stream death — the attention monitor's `failed`
-            // input (spec 01).
-            reader_eof.store(true, Ordering::SeqCst);
-        });
 
-        let ring: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let ring_writer = Arc::clone(&ring);
-        let stderr_task = tokio::spawn(async move {
-            let mut stderr = stderr;
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = stderr.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                let mut ring = ring_writer.lock().unwrap();
-                ring.extend(&buf[..n]);
-                while ring.len() > STDERR_RING_CAP {
-                    ring.pop_front();
-                }
-            }
-        });
-
-        // Supervisor: reap the leader, drain both readers, then emit the
-        // terminal Exited event and publish the exit facts.
-        let super_exited = Arc::clone(&exited_flag);
-        tokio::spawn(async move {
-            let status = child.wait().await;
-            super_exited.store(true, Ordering::SeqCst);
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            let facts: ExitFacts = match &status {
-                Ok(s) => (s.code(), s.signal()),
-                Err(_) => (None, None),
-            };
-            let stderr_tail = {
-                let mut ring = ring.lock().unwrap();
-                String::from_utf8_lossy(ring.make_contiguous()).into_owned()
-            };
-            let _ = events_tx
-                .send(SessionEvent::Exited {
-                    code: facts.0,
-                    signal: facts.1,
-                    stderr_tail,
-                })
-                .await;
-            let _ = exit_tx.send(Some(facts));
-        });
-
-        Ok((
-            Self {
-                identity,
-                pgid: pid,
-                stdin,
-                shared,
-                exit_rx,
-                ready_rx,
-                stdout_eof,
-                exited_flag,
+        let (child, events_rx) = AcpChild::spawn(
+            ChildSpec {
+                program: cfg.program.clone(),
+                cwd: cfg.cwd.clone(),
+                args: (GROK.acp_args)(cfg),
+                env: (GROK.child_env)(cfg),
             },
-            events_rx,
-        ))
+            move |mut lines, ctx, tx| async move {
+                // Open the ACP handshake. Everything else is driven by
+                // what comes back.
+                wire::try_write(&ctx.stdin, &wire::initialize_frame()).await;
+                while let Some(line) = lines.next().await {
+                    let (events, frames) = {
+                        let mut proto = reader_shared.proto.lock().unwrap();
+                        proto.handle_line(
+                            &line,
+                            resume_id.as_deref(),
+                            &session_cwd,
+                            &reader_shared.ready,
+                        )
+                    };
+                    for frame in frames {
+                        wire::try_write(&ctx.stdin, &frame).await;
+                    }
+                    for event in events {
+                        // Receiver gone just means nobody is listening;
+                        // keep draining so the child never blocks on a
+                        // full pipe.
+                        let _ = tx.send(event).await;
+                    }
+                }
+                // The stream ended. A caller blocked in `await_session`
+                // would otherwise wait on a handshake that can no longer
+                // complete: the sender lives here, so settling it as a
+                // stated failure is the reader's last act.
+                reader_shared.ready.settle_if_pending(
+                    "the grok process ended before it opened an ACP session, so eave has \
+                     nothing to send a prompt to",
+                );
+            },
+        )?;
+
+        Ok((Self { child, shared }, events_rx))
     }
 }
 
@@ -354,7 +250,10 @@ impl GrokSession {
 ///   run the real work THERE — outside the process group eave setsid'd and
 ///   signals. eave would report a verified kill while the agent kept
 ///   running in a process it never owned. Passing it explicitly means
-///   operator config cannot move the work out from under us.
+///   operator config cannot move the work out from under us. comet
+///   independently landed on the same flag for a different reason
+///   (`comet/crates/harness/src/acp/mod.rs:239` — a stale leader reads as
+///   total silent non-response); two apps, one flag, two failure modes.
 /// - **No `--always-approve`, ever.** The whole point of the slice is that
 ///   eave is the thing being asked.
 ///
@@ -381,51 +280,26 @@ impl GrokSession {
     /// hung agent, and eave does not time out into a decision — the
     /// attention clocks classify it and the operator decides (spec 01).
     /// The wait ends by itself when the child dies, because the reader
-    /// task drops the sender.
+    /// settles the channel at EOF.
     async fn await_session(&self) -> Result<String, SessionError> {
-        let mut rx = self.ready_rx.clone();
-        loop {
-            let settled = rx.borrow_and_update().clone();
-            match settled {
-                Some(Ok(id)) => return Ok(id),
-                // The handshake failed for a stated reason. Report THAT,
-                // not a generic broken pipe: "grok could not resume
-                // session X" is the sentence the operator needs.
-                Some(Err(reason)) => {
-                    return Err(SessionError::Io(std::io::Error::other(reason)));
-                }
-                None => {}
-            }
-            if rx.changed().await.is_err() {
-                return Err(SessionError::StdinClosed);
-            }
-        }
+        self.shared
+            .ready
+            .session_id()
+            .await
+            .map_err(|err| match err {
+                HandshakeError::Refused(reason) => SessionError::Io(std::io::Error::other(reason)),
+                HandshakeError::Gone => SessionError::StdinClosed,
+            })
     }
 
-    async fn await_exit(&self, window: std::time::Duration) -> bool {
-        let mut rx = self.exit_rx.clone();
-        let waited = tokio::time::timeout(window, async {
-            loop {
-                if rx.borrow_and_update().is_some() {
-                    return true;
-                }
-                if rx.changed().await.is_err() {
-                    return false;
-                }
-            }
-        })
-        .await;
-        matches!(waited, Ok(true))
-    }
-
-    fn exited(&self) -> bool {
-        self.exit_rx.borrow().is_some()
+    fn stdin(&self) -> &SharedStdin {
+        self.child.stdin()
     }
 }
 
 #[async_trait]
 impl crate::provider::AgentAdapter for GrokSession {
-    const PROVIDER_ID: &'static str = "grok";
+    const PROVIDER_ID: &'static str = GROK.provider_id;
 
     const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Verified {
         evidence: "grok.rs `posture_refusal`: the ACP session's own `yolo` field is read off the \
@@ -446,7 +320,7 @@ impl crate::provider::AgentAdapter for GrokSession {
 #[async_trait]
 impl AgentSession for GrokSession {
     fn identity(&self) -> ProcIdentity {
-        self.identity
+        self.child.identity()
     }
 
     fn provider_session_id(&self) -> Option<String> {
@@ -463,21 +337,17 @@ impl AgentSession for GrokSession {
     }
 
     fn last_activity(&self) -> Instant {
-        *self.shared.last_activity.lock().unwrap()
+        self.child.last_activity()
     }
 
     fn watch(&self) -> SessionWatch {
-        SessionWatch::new(
-            self.identity,
-            Arc::clone(&self.stdout_eof),
-            Arc::clone(&self.exited_flag),
-        )
+        self.child.watch()
     }
 
     async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {
         let session_id = self.await_session().await?;
         let id = self.shared.proto.lock().unwrap().next_prompt_id();
-        write_frame(&self.stdin, &prompt_frame(id, &session_id, text)).await
+        wire::write_frame(self.stdin(), &wire::prompt_frame(id, &session_id, text)).await
     }
 
     fn pending_approvals(&self) -> usize {
@@ -520,97 +390,42 @@ impl AgentSession for GrokSession {
                 // some other option could grant more than the operator
                 // clicked (`allow_always` ends review for the whole
                 // session), so the question stays open and answerable.
-                ApprovalDecision::Allow => match &pending.allow {
-                    Some(option) => (pending.rpc_id.clone(), Some(option.clone())),
+                ApprovalDecision::Allow => match pending.option_of_kind("allow_once") {
+                    Some(option) => (pending.rpc_id.clone(), Some(option)),
                     None => return Ok(false),
                 },
                 // A deny is ALWAYS expressible: the named reject option if
                 // there is one, and ACP's own `cancelled` outcome if there
                 // is not. Refusing must never fail for want of vocabulary.
-                ApprovalDecision::Deny { .. } => (pending.rpc_id.clone(), pending.reject.clone()),
+                ApprovalDecision::Deny { .. } => (
+                    pending.rpc_id.clone(),
+                    pending.option_of_kind("reject_once"),
+                ),
             }
         };
-        write_frame(
-            &self.stdin,
-            &permission_response_frame(&rpc_id, option_id.as_deref()),
-        )
-        .await?;
+        permission::deliver(self.stdin(), &rpc_id, option_id.as_deref()).await?;
         // Only now is the question closed: a failed write leaves it open so
         // the operator can try again rather than facing a dead card.
-        self.shared.proto.lock().unwrap().pending.remove(request_id);
+        self.shared.proto.lock().unwrap().pending.close(request_id);
 
         if let ApprovalDecision::Deny { message } = decision {
             if !message.trim().is_empty() {
                 let session_id = self.await_session().await?;
                 let id = self.shared.proto.lock().unwrap().next_prompt_id();
-                write_frame(&self.stdin, &prompt_frame(id, &session_id, message)).await?;
+                wire::write_frame(self.stdin(), &wire::prompt_frame(id, &session_id, message))
+                    .await?;
             }
         }
         Ok(true)
     }
 
     async fn kill(&mut self) -> Result<KillReport, SessionError> {
-        self.shared.kill_initiated.store(true, Ordering::SeqCst);
-        let already_exited = self.exited();
-        let mut escalated = false;
-
-        if !already_exited {
-            // Group signals are safe without a pid-reuse guard: while any
-            // member lives the pgid stays reserved by the kernel; once the
-            // group is empty, killpg is ESRCH — a no-op.
-            let _ = process::killpg(self.pgid, libc::SIGTERM);
-            if !self.await_exit(KILL_GRACE).await {
-                escalated = true;
-                let _ = process::killpg(self.pgid, libc::SIGKILL);
-                if !self.await_exit(KILL_VERIFY_WINDOW).await {
-                    return Err(SessionError::KillUnproven {
-                        remaining: vec![self.identity.pid],
-                    });
-                }
-            }
-        }
-
-        if process::await_group_empty(self.pgid, KILL_VERIFY_WINDOW).await {
-            return Ok(KillReport {
-                escalated,
-                already_exited,
-                stragglers_killed: Vec::new(),
-            });
-        }
-
-        // One bounded straggler scan (spec 01 §Kill step 3). Pids are fresh
-        // from the scan, which is the guard for signalling them directly.
-        let _ = process::killpg(self.pgid, libc::SIGKILL);
-        let stragglers = process::scan_group_pids(self.pgid)
-            .await
-            .unwrap_or_default();
-        for &pid in &stragglers {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-        if process::await_group_empty(self.pgid, KILL_VERIFY_WINDOW).await {
-            Ok(KillReport {
-                escalated,
-                already_exited,
-                stragglers_killed: stragglers,
-            })
-        } else {
-            Err(SessionError::KillUnproven {
-                remaining: stragglers,
-            })
-        }
+        self.child.kill().await
     }
 }
 
 // ---------------------------------------------------------------------------
 // ACP protocol plumbing
-
-/// What the handshake produced: the ACP session id, or the reason there
-/// will never be one. Carried through a watch channel so a caller blocked
-/// in `send_user_message` gets the actual failure instead of hanging on a
-/// session that was refused (e.g. `--resume` with an id Grok never issued).
-type SessionReady = Result<String, String>;
 
 impl GrokProto {
     /// Parse one JSON-RPC line into events for the engine and frames to
@@ -621,28 +436,28 @@ impl GrokProto {
         line: &str,
         resume_id: Option<&str>,
         cwd: &str,
-        ready: &watch::Sender<Option<SessionReady>>,
-    ) -> (Vec<SessionEvent>, Vec<String>) {
+        ready: &HandshakeGate,
+    ) -> (Vec<SessionEvent>, Vec<Value>) {
         let line = line.trim();
         if line.is_empty() {
             return (Vec::new(), Vec::new());
         }
         let v: Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(err) => return (vec![malformed(line, err.to_string())], Vec::new()),
+            Err(err) => return (vec![wire::malformed(line, err.to_string())], Vec::new()),
         };
 
-        let method = v.get("method").and_then(Value::as_str);
-        let has_id = v.get("id").is_some();
-        match (method, has_id) {
-            // Agent → client request: it wants an answer on the same id.
-            (Some(m), true) => self.handle_request(m, &v, line),
-            // Notification: session updates and vendor extensions.
-            (Some(m), false) => (self.handle_notification(m, &v, line), Vec::new()),
-            // Response to something eave asked.
-            (None, true) => self.handle_response(&v, line, resume_id, cwd, ready),
-            (None, false) => (
-                vec![malformed(
+        match wire::classify(&v) {
+            Frame::Request { method, id } => self.handle_request(method, &id.clone(), &v, line),
+            Frame::Notification { method } => {
+                (self.handle_notification(method, &v, line), Vec::new())
+            }
+            Frame::Response { id } => {
+                let id = id.as_i64();
+                self.handle_response(id, &v, line, resume_id, cwd, ready)
+            }
+            Frame::Unclassifiable => (
+                vec![wire::malformed(
                     line,
                     "neither request, notification, nor response".into(),
                 )],
@@ -653,19 +468,19 @@ impl GrokProto {
 
     fn handle_response(
         &mut self,
+        id: Option<i64>,
         v: &Value,
         line: &str,
         resume_id: Option<&str>,
         cwd: &str,
-        ready: &watch::Sender<Option<SessionReady>>,
-    ) -> (Vec<SessionEvent>, Vec<String>) {
-        let id = v.get("id").and_then(Value::as_i64);
+        ready: &HandshakeGate,
+    ) -> (Vec<SessionEvent>, Vec<Value>) {
         let error = v.get("error");
         match id {
-            Some(RPC_INITIALIZE) => {
+            Some(wire::RPC_INITIALIZE) => {
                 if let Some(err) = error {
                     let reason = format!("grok rejected the ACP handshake: {err}");
-                    let _ = ready.send(Some(Err(reason)));
+                    ready.refuse(reason);
                     return (
                         vec![SessionEvent::System {
                             subtype: "grok_initialize_failed".into(),
@@ -675,9 +490,9 @@ impl GrokProto {
                     );
                 }
                 // Handshake accepted: open (or reload) the session.
-                (Vec::new(), vec![session_frame(resume_id, cwd)])
+                (Vec::new(), vec![wire::session_frame(resume_id, cwd)])
             }
-            Some(RPC_SESSION) => {
+            Some(wire::RPC_SESSION) => {
                 if let Some(err) = error {
                     // The loud case that matters most: `--resume` with an
                     // id Grok never issued. Grok answers `FS_NOT_FOUND`
@@ -691,7 +506,7 @@ impl GrokProto {
                         ),
                         None => format!("grok could not open a session: {err}"),
                     };
-                    let _ = ready.send(Some(Err(reason)));
+                    ready.refuse(reason);
                     return (
                         vec![SessionEvent::System {
                             subtype: "grok_session_failed".into(),
@@ -712,12 +527,12 @@ impl GrokProto {
                 match session_id {
                     Some(id) => {
                         self.session_id = Some(id.clone());
-                        let _ = ready.send(Some(Ok(id)));
+                        ready.ready(id);
                     }
                     None => {
                         let reason = "grok opened a session without naming it".to_string();
-                        let _ = ready.send(Some(Err(reason.clone())));
-                        return (vec![malformed(line, reason)], Vec::new());
+                        ready.refuse(reason.clone());
+                        return (vec![wire::malformed(line, reason)], Vec::new());
                     }
                 }
                 (Vec::new(), Vec::new())
@@ -732,28 +547,29 @@ impl GrokProto {
     fn handle_request(
         &mut self,
         method: &str,
+        rpc_id: &Value,
         v: &Value,
-        line: &str,
-    ) -> (Vec<SessionEvent>, Vec<String>) {
-        let rpc_id = v.get("id").cloned().unwrap_or(Value::Null);
+        _line: &str,
+    ) -> (Vec<SessionEvent>, Vec<Value>) {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
         match method {
             "session/request_permission" => {
-                (vec![self.note_permission(&rpc_id, &params)], Vec::new())
+                (vec![self.note_permission(rpc_id, &params)], Vec::new())
             }
             // eave declares no filesystem or terminal capability at
             // `initialize`, precisely so that Grok performs its own I/O and
             // the permission gate above is the ONE place a write is
             // reviewed. A capability request arriving anyway is answered
-            // with a plain JSON-RPC "method not found" and journaled
-            // verbatim — never silently serviced, which would make eave the
-            // thing performing the write it is supposed to be policing.
+            // with a plain JSON-RPC "method not found" and journaled as the
+            // refusal it is — never silently serviced, which would make
+            // eave the thing performing the write it is supposed to be
+            // policing.
             _ => (
-                vec![SessionEvent::Unknown {
-                    event_type: method.to_string(),
-                    raw: line.to_string(),
+                vec![SessionEvent::DialogRefused {
+                    request_id: wire::id_key(rpc_id),
+                    dialog: method.to_string(),
                 }],
-                vec![method_not_found_frame(&rpc_id, method)],
+                vec![wire::method_not_found_frame(rpc_id, method)],
             ),
         }
     }
@@ -772,19 +588,10 @@ impl GrokProto {
         let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
         let meta = tool_call
             .get("_meta")
-            .and_then(|m| m.get("x.ai/tool"))
+            .and_then(|m| m.get(GROK_TOOL_META))
             .cloned()
             .unwrap_or(Value::Null);
         let options = params.get("options").cloned().unwrap_or(Value::Null);
-
-        let pick = |kind: &str| -> Option<String> {
-            options
-                .as_array()?
-                .iter()
-                .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))
-                .and_then(|o| o.get("optionId").and_then(Value::as_str))
-                .map(str::to_string)
-        };
 
         // The request id eave answers with. Grok's own tool-call id is the
         // stable, meaningful choice — it is the same id the tool events
@@ -793,9 +600,8 @@ impl GrokProto {
             .get("toolCallId")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| rpc_id.to_string());
+            .unwrap_or_else(|| wire::id_key(rpc_id));
 
-        let raw_input = tool_call.get("rawInput").cloned().unwrap_or(Value::Null);
         let title = tool_call
             .get("title")
             .and_then(Value::as_str)
@@ -811,54 +617,32 @@ impl GrokProto {
             .and_then(Value::as_str)
             .unwrap_or(&tool)
             .to_string();
-        // The concrete path, preferring the one Grok itself resolved in
-        // `_meta.input.path` over re-deriving it from the raw arguments.
-        let path = meta
-            .get("input")
-            .and_then(|i| i.get("path"))
-            .and_then(Value::as_str)
-            .or_else(|| raw_input.get("file_path").and_then(Value::as_str))
-            .or_else(|| raw_input.get("path").and_then(Value::as_str))
-            .map(str::to_string);
 
-        self.pending.insert(
-            request_id.clone(),
-            PendingPermission {
-                rpc_id: rpc_id.clone(),
-                allow: pick("allow_once"),
-                reject: pick("reject_once"),
-            },
-        );
+        self.pending.open(request_id.clone(), rpc_id, &options);
 
         SessionEvent::ApprovalRequested {
             request_id,
             tool,
             display_name,
             description: title,
-            path,
-            input_json: cap_payload(&raw_input.to_string()),
-            suggestions_json: (!options.is_null()).then(|| options.to_string()),
+            path: permission::approval_path(&tool_call, Some(GROK_TOOL_META)),
+            input_json: permission::approval_input(&tool_call),
+            suggestions_json: permission::suggestions(&options),
         }
     }
 }
 
 impl GrokProto {
     fn handle_notification(&mut self, method: &str, v: &Value, line: &str) -> Vec<SessionEvent> {
+        if GROK.carries_updates(method) {
+            let update = v
+                .get("params")
+                .and_then(|p| p.get("update"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            return self.handle_update(&update, line);
+        }
         match method {
-            // Grok emits session updates under BOTH the standard ACP
-            // notification and its own vendor channel, and they are not
-            // interchangeable in practice: `tool_call` arrives on
-            // `session/update` while `turn_completed` arrives on
-            // `_x.ai/session_notification` (capture 2026-08-20). Reading
-            // only the standard one loses the end of every turn.
-            "session/update" | "_x.ai/session_notification" => {
-                let update = v
-                    .get("params")
-                    .and_then(|p| p.get("update"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                self.handle_update(&update, line)
-            }
             // The posture channel. This is the only place Grok states
             // whether the session auto-approves, and it lands before the
             // first tool call.
@@ -894,37 +678,9 @@ impl GrokProto {
     }
 
     fn handle_update(&mut self, update: &Value, line: &str) -> Vec<SessionEvent> {
-        let kind = update
-            .get("sessionUpdate")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        match kind {
-            "agent_message_chunk" => match update
-                .get("content")
-                .and_then(|c| c.get("text"))
-                .and_then(Value::as_str)
-            {
-                Some(text) => vec![SessionEvent::TextDelta {
-                    text: text.to_string(),
-                }],
-                None => Vec::new(),
-            },
-            // Reasoning, not transcript. The Claude adapter surfaces only
-            // assistant text too; recording chain-of-thought as if it were
-            // the reply would put words in the agent's mouth.
-            "agent_thought_chunk" => Vec::new(),
-            "user_message_chunk" => match update
-                .get("content")
-                .and_then(|c| c.get("text"))
-                .and_then(Value::as_str)
-            {
-                Some(text) => vec![SessionEvent::UserEcho {
-                    text: text.to_string(),
-                }],
-                None => Vec::new(),
-            },
-            "tool_call" => self.note_tool_call(update),
-            "tool_call_update" => self.note_tool_update(update),
+        match crate::acp::update::kind_of(update) {
+            // Grok reports the end of a turn on the wire rather than in the
+            // prompt's RPC reply.
             "turn_completed" => {
                 let stop = update
                     .get("stop_reason")
@@ -939,78 +695,22 @@ impl GrokProto {
                     is_error,
                 }]
             }
-            // Everything else is recorded verbatim rather than dropped, so
-            // a Grok update this build has never heard of still reaches the
-            // journal (same contract as the Claude adapter's `System`).
-            other => vec![SessionEvent::System {
-                subtype: other.to_string(),
-                raw: line.to_string(),
-            }],
+            // The fail-closed backstop. If a tool is starting and the
+            // session has still not stated its posture, eave has no proof
+            // it will ever be asked, so it refuses HERE rather than letting
+            // the first write through on the assumption that silence means
+            // "asks". This is the Grok analogue of Slice K's "a CLI that
+            // named no mode at all is unproven, never probably fine".
+            "tool_call" => {
+                let mut out = Vec::new();
+                if !self.announced {
+                    out.extend(self.refuse_unstated_posture());
+                }
+                out.extend(self.stream.decode(&GROK.update, update, line));
+                out
+            }
+            _ => self.stream.decode(&GROK.update, update, line),
         }
-    }
-
-    /// A tool call became outstanding — and the fail-closed backstop.
-    ///
-    /// If a tool is starting and the session has still not stated its
-    /// posture, eave has no proof it will ever be asked, so it refuses
-    /// here rather than letting the first write through on the assumption
-    /// that silence means "asks". This is the Grok analogue of Slice K's
-    /// "a CLI that named no mode at all is unproven, never probably fine".
-    fn note_tool_call(&mut self, update: &Value) -> Vec<SessionEvent> {
-        let mut out = Vec::new();
-        if !self.announced {
-            out.extend(self.refuse_unstated_posture());
-        }
-        let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
-            return out;
-        };
-        self.outstanding.insert(id.to_string());
-        let meta = update
-            .get("_meta")
-            .and_then(|m| m.get("x.ai/tool"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let title = update
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let name = meta
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(&title)
-            .to_string();
-        let input = update.get("rawInput").cloned().unwrap_or(Value::Null);
-        out.push(SessionEvent::ToolUseStarted {
-            id: id.to_string(),
-            name,
-            input: cap_payload(&input.to_string()),
-        });
-        out
-    }
-
-    /// A tool call resolved. Grok sends several `tool_call_update`s per
-    /// call — title refinements and diffs — and only the ones carrying a
-    /// terminal `status` close it.
-    fn note_tool_update(&mut self, update: &Value) -> Vec<SessionEvent> {
-        let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
-            return Vec::new();
-        };
-        let status = update.get("status").and_then(Value::as_str);
-        let (is_error, done) = match status {
-            Some("completed") => (false, true),
-            Some("failed") => (true, true),
-            _ => (false, false),
-        };
-        if !done {
-            return Vec::new();
-        }
-        self.outstanding.remove(id);
-        vec![SessionEvent::ToolUseFinished {
-            id: id.to_string(),
-            result: cap_payload(&flatten_content(update.get("content"))),
-            is_error,
-        }]
     }
 
     /// The session stated its posture. `Init` is emitted here — once, with
@@ -1058,37 +758,31 @@ impl GrokProto {
     }
 }
 
-/// The posture string for a session that routes permission questions to
-/// eave, and the one for a session that answers them itself. These are
-/// eave's names for what `yolo` means, not strings Grok emits.
-const GROK_MODE_ASKS: &str = "default";
-const GROK_MODE_YOLO: &str = "always-approve";
-
-/// Postures that provably ASK. Everything else is refused — including a
-/// posture this build has never heard of and a session that stated none:
-/// the question "does this review writes?" has no safe default, and a
-/// wrong guess here is unreviewed writes on someone's machine (spec 04
-/// §Permissions).
+/// Postures that provably ASK — the verdict comes from the shared,
+/// fail-closed rule ([`crate::acp::classify_mode`]); the sentence is
+/// Grok's own, because the fix is Grok's own.
 fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
-    match mode {
-        Some(GROK_MODE_ASKS) => None,
-        Some(GROK_MODE_YOLO) => Some(SessionEvent::PostureRefused {
-            mode: GROK_MODE_YOLO.into(),
-            reason: "this Grok session auto-approves every tool call, so eave would never be \
-                     asked before it writes. The cause is ambient config — `[ui] permission_mode \
-                     = \"always-approve\"` in ~/.grok/config.toml, or /always-approve in a \
-                     previous session — and no command-line flag overrides it back on. Clear \
-                     that setting and reopen the session."
-                .into(),
-        }),
-        Some(other) => Some(SessionEvent::PostureRefused {
-            mode: other.to_string(),
+    match acp::classify_mode(GROK.asking_modes, mode) {
+        ModeVerdict::Asks => None,
+        ModeVerdict::Unproven(other) if other == GROK_MODE_YOLO => {
+            Some(SessionEvent::PostureRefused {
+                mode: GROK_MODE_YOLO.into(),
+                reason: "this Grok session auto-approves every tool call, so eave would never be \
+                         asked before it writes. The cause is ambient config — `[ui] \
+                         permission_mode = \"always-approve\"` in ~/.grok/config.toml, or \
+                         /always-approve in a previous session — and no command-line flag \
+                         overrides it back on. Clear that setting and reopen the session."
+                    .into(),
+            })
+        }
+        ModeVerdict::Unproven(other) => Some(SessionEvent::PostureRefused {
+            mode: other.clone(),
             reason: format!(
                 "this Grok session reports permission posture {other:?}, which eave cannot prove \
                  asks before it writes"
             ),
         }),
-        None => Some(SessionEvent::PostureRefused {
+        ModeVerdict::Unstated => Some(SessionEvent::PostureRefused {
             mode: "unstated".into(),
             reason: "this Grok session started running tools without ever stating whether it \
                      asks before it writes, so eave cannot prove its writes are reviewable"
@@ -1097,152 +791,10 @@ fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
     }
 }
 
-/// Flatten an ACP tool-result `content` array to text. Grok mixes shapes:
-/// `{type:"content", content:{type:"text", text}}` for output and
-/// `{type:"diff", ...}` for edits. Text is taken where it exists; anything
-/// else is kept as its own JSON so the record still says what happened
-/// instead of silently becoming an empty string.
-fn flatten_content(content: Option<&Value>) -> String {
-    let Some(items) = content.and_then(Value::as_array) else {
-        return String::new();
-    };
-    let mut out = Vec::new();
-    for item in items {
-        if let Some(text) = item
-            .get("content")
-            .and_then(|c| c.get("text"))
-            .and_then(Value::as_str)
-        {
-            out.push(text.to_string());
-        } else if let Some(text) = item.get("text").and_then(Value::as_str) {
-            out.push(text.to_string());
-        } else {
-            out.push(item.to_string());
-        }
-    }
-    out.join("\n")
-}
-
-fn malformed(line: &str, error: String) -> SessionEvent {
-    const MALFORMED_LINE_CAP: usize = 512;
-    let mut shown = line.to_string();
-    if shown.len() > MALFORMED_LINE_CAP {
-        shown.truncate(MALFORMED_LINE_CAP);
-    }
-    SessionEvent::Malformed { line: shown, error }
-}
-
-// ---------------------------------------------------------------------------
-// Outbound frames
-
-/// The `initialize` call that opens ACP.
-///
-/// **eave declares no filesystem and no terminal capability on purpose.**
-/// With `fs.writeTextFile: true` Grok delegates its writes to the client —
-/// verified 2026-08-20, the write arrived as an `fs/write_text_file`
-/// request — which would make eave the process performing the very writes
-/// it exists to supervise, and would put a second, silent path to disk
-/// beside the permission gate. Declaring nothing keeps Grok's own tools
-/// doing Grok's own work, with `session/request_permission` as the single
-/// review point. The permission request still fires either way (verified
-/// with capabilities off).
-fn initialize_frame() -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": RPC_INITIALIZE,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": ACP_PROTOCOL_VERSION,
-            "clientCapabilities": {
-                "fs": { "readTextFile": false, "writeTextFile": false },
-                "terminal": false,
-            },
-        },
-    })
-    .to_string()
-}
-
-/// Open a new session, or reload one Grok already knows.
-///
-/// Note what is NOT here: a caller-chosen session id. Grok issues its own
-/// at `session/new` and ACP offers no way to propose one, so
-/// `SpawnConfig::session_id` is honoured only in its `resume` role — see
-/// the module docs on `provider_session_id`.
-fn session_frame(resume_id: Option<&str>, cwd: &str) -> String {
-    let (method, mut params) = match resume_id {
-        Some(id) => ("session/load", json!({ "sessionId": id })),
-        None => ("session/new", json!({})),
-    };
-    // The SESSION's cwd, passed explicitly. Reading the current process's
-    // cwd here would name the engine's directory: the child was spawned
-    // with `current_dir`, but this frame is built in eave's own process.
-    params["cwd"] = json!(cwd);
-    params["mcpServers"] = json!([]);
-    json!({ "jsonrpc": "2.0", "id": RPC_SESSION, "method": method, "params": params }).to_string()
-}
-
-fn prompt_frame(id: i64, session_id: &str, text: &str) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "session/prompt",
-        "params": {
-            "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": text }],
-        },
-    })
-    .to_string()
-}
-
-/// Answer one permission request. `Some(option)` selects an id Grok
-/// offered; `None` is ACP's own `cancelled` outcome, which eave uses as
-/// the deny of last resort when a request arrives without a
-/// `reject_once` option — refusing is always expressible, even when the
-/// provider forgot to offer a word for it.
-fn permission_response_frame(rpc_id: &Value, option: Option<&str>) -> String {
-    let outcome = match option {
-        Some(id) => json!({ "outcome": "selected", "optionId": id }),
-        None => json!({ "outcome": "cancelled" }),
-    };
-    json!({ "jsonrpc": "2.0", "id": rpc_id, "result": { "outcome": outcome } }).to_string()
-}
-
-fn method_not_found_frame(rpc_id: &Value, method: &str) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": rpc_id,
-        "error": {
-            "code": -32601,
-            "message": format!(
-                "eave declares no {method} capability; it does not act on the filesystem on the \
-                 agent's behalf"
-            ),
-        },
-    })
-    .to_string()
-}
-
-/// Write one JSON-RPC frame to the child's stdin under the shared lock.
-async fn write_frame(stdin: &SharedStdin, line: &str) -> Result<(), SessionError> {
-    let mut guard = stdin.lock().await;
-    let pipe = guard.as_mut().ok_or(SessionError::StdinClosed)?;
-    let mut payload = String::with_capacity(line.len() + 1);
-    payload.push_str(line);
-    payload.push('\n');
-    pipe.write_all(payload.as_bytes()).await?;
-    pipe.flush().await?;
-    Ok(())
-}
-
-/// Best-effort write from the reader/handshake tasks, which have no one to
-/// report to: a closed pipe means the child is already going away.
-async fn write_line(stdin: &SharedStdin, line: &str) {
-    let _ = write_frame(stdin, line).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::Handshake;
 
     // Every fixture below is a real line captured from `grok agent stdio`
     // 1.0.5 on 2026-08-20 (probe transcripts in the Slice AV report). Only
@@ -1269,31 +821,27 @@ mod tests {
 
     const SESSION_ID: &str = "01a020c5-af30-7fb3-b886-bcaa75a72299";
 
-    /// A parser plus the channel the handshake reports through.
+    /// A parser plus the gate the handshake reports through.
     struct Harness {
         proto: GrokProto,
-        ready_tx: watch::Sender<Option<SessionReady>>,
-        ready_rx: watch::Receiver<Option<SessionReady>>,
+        gate: HandshakeGate,
     }
 
     impl Harness {
         fn new() -> Self {
-            let (ready_tx, ready_rx) = watch::channel(None);
             Self {
                 proto: GrokProto::new(),
-                ready_tx,
-                ready_rx,
+                gate: HandshakeGate::new(),
             }
         }
 
-        fn feed(&mut self, line: &str) -> (Vec<SessionEvent>, Vec<String>) {
-            self.proto
-                .handle_line(line, None, "/tmp/probe", &self.ready_tx)
+        fn feed(&mut self, line: &str) -> (Vec<SessionEvent>, Vec<Value>) {
+            self.proto.handle_line(line, None, "/tmp/probe", &self.gate)
         }
 
-        fn feed_resuming(&mut self, line: &str, id: &str) -> (Vec<SessionEvent>, Vec<String>) {
+        fn feed_resuming(&mut self, line: &str, id: &str) -> (Vec<SessionEvent>, Vec<Value>) {
             self.proto
-                .handle_line(line, Some(id), "/tmp/probe", &self.ready_tx)
+                .handle_line(line, Some(id), "/tmp/probe", &self.gate)
         }
 
         /// Drive the handshake to the point a real session has a name.
@@ -1303,8 +851,11 @@ mod tests {
             h
         }
 
-        fn ready(&self) -> Option<SessionReady> {
-            self.ready_rx.borrow().clone()
+        /// The gate's settled state. Read directly rather than awaited:
+        /// these tests feed lines synchronously, so a wait would have
+        /// nothing left to wait for.
+        fn ready(&self) -> Handshake {
+            self.gate.state()
         }
     }
 
@@ -1316,13 +867,13 @@ mod tests {
         let (events, frames) = h.feed(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#);
         assert!(events.is_empty(), "the handshake is not transcript");
         assert_eq!(frames.len(), 1);
-        let sent: Value = serde_json::from_str(&frames[0]).unwrap();
+        let sent = &frames[0];
         assert_eq!(sent["method"], "session/new");
         assert_eq!(sent["params"]["cwd"], "/tmp/probe");
 
         h.feed(SESSION_NEW);
         assert_eq!(h.proto.session_id(), Some(SESSION_ID));
-        assert_eq!(h.ready(), Some(Ok(SESSION_ID.to_string())));
+        assert_eq!(h.ready(), Handshake::Ready(SESSION_ID.to_string()));
     }
 
     /// Grok issues its own session ids, so resume is the ONE place
@@ -1335,7 +886,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#,
             "01a020c7-d363-7a50-9f08-37e0cc12db3a",
         );
-        let sent: Value = serde_json::from_str(&frames[0]).unwrap();
+        let sent = &frames[0];
         assert_eq!(sent["method"], "session/load");
         assert_eq!(
             sent["params"]["sessionId"],
@@ -1368,7 +919,7 @@ mod tests {
             events.as_slice(),
             [SessionEvent::System { subtype, .. }] if subtype == "grok_session_failed"
         ));
-        let Some(Err(reason)) = h.ready() else {
+        let Handshake::Refused(reason) = h.ready() else {
             panic!(
                 "the handshake must settle as a stated failure, got {:?}",
                 h.ready()
@@ -1432,8 +983,14 @@ mod tests {
             .pending
             .get("call-adaf4213-2ff0-4064-a133-be3cf729551d-0")
             .expect("question is open");
-        assert_eq!(pending.allow.as_deref(), Some("allow-once"));
-        assert_eq!(pending.reject.as_deref(), Some("reject-once"));
+        assert_eq!(
+            pending.option_of_kind("allow_once").as_deref(),
+            Some("allow-once")
+        );
+        assert_eq!(
+            pending.option_of_kind("reject_once").as_deref(),
+            Some("reject-once")
+        );
     }
 
     /// A refusal must always be expressible. When a request arrives with no
@@ -1441,13 +998,11 @@ mod tests {
     /// outcome rather than failing to answer.
     #[test]
     fn a_deny_is_expressible_even_when_no_reject_option_is_offered() {
-        let with_reject = permission_response_frame(&json!(0), Some("reject-once"));
-        let parsed: Value = serde_json::from_str(&with_reject).unwrap();
+        let parsed = wire::permission_response_frame(&Value::from(0), Some("reject-once"));
         assert_eq!(parsed["result"]["outcome"]["outcome"], "selected");
         assert_eq!(parsed["result"]["outcome"]["optionId"], "reject-once");
 
-        let bare = permission_response_frame(&json!(0), None);
-        let parsed: Value = serde_json::from_str(&bare).unwrap();
+        let parsed = wire::permission_response_frame(&Value::from(0), None);
         assert_eq!(parsed["result"]["outcome"]["outcome"], "cancelled");
         assert!(
             parsed["result"]["outcome"].get("optionId").is_none(),
@@ -1630,21 +1185,33 @@ mod tests {
 
     /// eave declares no filesystem capability precisely so it is never the
     /// process performing the agent's writes. A capability request arriving
-    /// anyway is refused on the wire, not quietly serviced.
+    /// anyway is refused on the wire, not quietly serviced — and the
+    /// refusal is VISIBLE.
+    ///
+    /// `DialogRefused`, not `Unknown`: every other eave adapter
+    /// (`stream.rs`, `codex.rs`, `pi.rs`, `hermes.rs`) reports an
+    /// unservable client request that way, and `eave-wire`'s model renders
+    /// it as a marker row. Grok alone used to emit `Unknown`, which the
+    /// model draws as nothing at all — so an agent trying to route a write
+    /// through eave left no trace an operator could see.
     #[test]
     fn a_filesystem_request_is_refused_rather_than_serviced() {
         let mut h = Harness::opened();
         let write_req = r#"{"jsonrpc":"2.0","id":7,"method":"fs/write_text_file","params":{"path":"/tmp/probe/x.txt","content":"hi"}}"#;
         let (events, frames) = h.feed(write_req);
         assert_eq!(frames.len(), 1);
-        let sent: Value = serde_json::from_str(&frames[0]).unwrap();
+        let sent = &frames[0];
         assert_eq!(sent["id"], 7);
         assert_eq!(sent["error"]["code"], -32601);
         assert!(sent.get("result").is_none(), "a refusal is not a result");
-        assert!(matches!(
-            events.as_slice(),
-            [SessionEvent::Unknown { event_type, .. }] if event_type == "fs/write_text_file"
-        ));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::DialogRefused { request_id, dialog }]
+                    if dialog == "fs/write_text_file" && request_id == "7"
+            ),
+            "the refusal must reach the transcript, got {events:?}"
+        );
     }
 
     /// A misbehaving CLI must not take the session state machine down.

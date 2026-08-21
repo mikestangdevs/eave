@@ -4,6 +4,7 @@
 //! parse, process-group identity, verified kill, append-only journal with
 //! crash-tail repair, cold resume. No UI, no wire protocol.
 
+pub mod acp;
 pub mod attention;
 pub mod claude;
 pub mod codex;
