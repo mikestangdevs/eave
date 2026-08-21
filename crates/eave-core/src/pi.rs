@@ -72,7 +72,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
 
-use crate::events::{cap_payload, SessionEvent};
+use crate::events::{cap_payload, ContextWindow, SessionEvent, TurnTokens};
 use crate::proc::{self, ProcIdentity};
 use crate::process;
 use crate::session::{
@@ -1137,7 +1137,19 @@ impl PiStream {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let text = flatten_content(msg.and_then(|m| m.get("content")));
-        match role {
+        // Slice CC. Pi states usage on the assistant message itself, and
+        // `message_end` carries the authoritative copy: RPC mode writes
+        // `toJsonEvent(event)` (`dist/modes/rpc/rpc-mode.js`) and strips
+        // cumulative snapshots off `message_update` only. It is prepended
+        // rather than substituted — a tool-call-only assistant message has
+        // no text to state and still cost tokens, and its verbatim record
+        // is still worth keeping.
+        let mut out: Vec<SessionEvent> = (role == "assistant")
+            .then(|| pi_usage(msg.and_then(|m| m.get("usage"))))
+            .flatten()
+            .into_iter()
+            .collect();
+        out.extend(match role {
             "assistant" if !text.is_empty() => vec![SessionEvent::AssistantText { text }],
             // Pi echoes the user's own message back as a `user` message,
             // which is what `--replay-user-messages` gets from Claude.
@@ -1146,8 +1158,54 @@ impl PiStream {
             // already reported them; emitting both would double every tool
             // in the transcript.
             _ => vec![system("message_end", line)],
-        }
+        });
+        out
     }
+}
+
+/// Pi's `Usage` off an assistant message (Slice CC).
+///
+/// The shape is `@earendil-works/pi-ai`'s `Usage`:
+/// `{input, output, cacheRead, cacheWrite, cacheWrite1h?, reasoning?,
+/// totalTokens, cost}`. Two things about it decide this mapping, both read
+/// out of the installed package rather than assumed:
+///
+/// - **`input` is uncached only.** `api/anthropic-messages.js` computes
+///   `totalTokens = input + output + cacheRead + cacheWrite`, which is
+///   correct only if the four are disjoint. So the whole prompt is
+///   `input + cacheRead + cacheWrite`, exactly as for Claude.
+/// - **`totalTokens` is pi's own context measure.** `calculateContextTokens`
+///   (`core/compaction/compaction.js`) is literally
+///   `usage.totalTokens || input + output + cacheRead + cacheWrite`, and
+///   it is what pi's own compaction trigger reads. It is taken verbatim,
+///   never recomputed.
+///
+/// Pi states no context ceiling on this wire, so `limit_tokens` is `None`
+/// — the level without the ceiling, which is what pi said.
+fn pi_usage(usage: Option<&Value>) -> Option<SessionEvent> {
+    let usage = usage?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let (fresh, cache_read, cache_write) =
+        (count("input"), count("cacheRead"), count("cacheWrite"));
+    let input = match (fresh, cache_read, cache_write) {
+        (None, None, None) => None,
+        (a, b, c) => Some(a.unwrap_or(0) + b.unwrap_or(0) + c.unwrap_or(0)),
+    };
+    let turn = TurnTokens::stated(input, count("output"), cache_read, cache_write);
+    // A zero `totalTokens` is pi's initialiser, not a measurement: every
+    // provider adapter in pi-ai seeds the struct with zeros and overwrites
+    // it when the response settles. An aborted message can still carry the
+    // seed, and "the context is empty" is a claim eave will not make.
+    let context = count("totalTokens")
+        .filter(|t| *t > 0)
+        .map(|used_tokens| ContextWindow {
+            used_tokens,
+            limit_tokens: None,
+        });
+    if turn.is_none() && context.is_none() {
+        return None;
+    }
+    Some(SessionEvent::TokenUsage { turn, context })
 }
 
 fn gate_refusal(reason: impl Into<String>) -> SessionEvent {
@@ -1570,6 +1628,75 @@ mod tests {
                 text: "run the bash tool".into()
             }]
         );
+    }
+
+    /// **Slice CC.** Pi states usage on the assistant message, and its
+    /// `input` is uncached-only — `api/anthropic-messages.js` in the
+    /// installed `@earendil-works/pi-ai` computes `totalTokens = input +
+    /// output + cacheRead + cacheWrite`, which is only right if the four
+    /// are disjoint. So the prompt is 12 + 19,000 + 400 = 19,412, and
+    /// reporting the bare `input` would say the model read twelve tokens.
+    #[test]
+    fn an_assistant_message_states_the_whole_prompt_and_pis_own_context_total() {
+        let mut s = stream();
+        let end = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":12,"output":455,"cacheRead":19000,"cacheWrite":400,"reasoning":30,"totalTokens":19867,"cost":{"input":0.1,"output":0.2,"cacheRead":0.0,"cacheWrite":0.0,"total":0.3}}}}"#;
+        match s.parse_line(end).as_slice() {
+            [SessionEvent::TokenUsage { turn, context }, SessionEvent::AssistantText { .. }] => {
+                let turn = turn.expect("stated");
+                assert_eq!(turn.input, Some(19_412));
+                assert_eq!(turn.output, Some(455));
+                assert_eq!(turn.cache_read, Some(19_000));
+                assert_eq!(turn.cache_write, Some(400));
+                // `totalTokens` is pi's OWN context measure — the value
+                // `calculateContextTokens` returns and its compaction
+                // trigger reads. Taken verbatim, never recomputed.
+                assert_eq!(
+                    *context,
+                    Some(crate::events::ContextWindow {
+                        used_tokens: 19_867,
+                        limit_tokens: None,
+                    }),
+                    "pi states the level and never a ceiling"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A tool-call message costs tokens and has no text. Its usage must
+    /// still be reported, and its verbatim record must still be kept —
+    /// the tool steps are where a turn's tokens actually go.
+    #[test]
+    fn a_tool_call_message_reports_its_tokens_and_still_keeps_its_record() {
+        let mut s = stream();
+        let end = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls"}}],"usage":{"input":5,"output":88,"cacheRead":10000,"cacheWrite":0,"totalTokens":10093}}}"#;
+        match s.parse_line(end).as_slice() {
+            [SessionEvent::TokenUsage { turn, .. }, SessionEvent::System { subtype, .. }] => {
+                assert_eq!(turn.expect("stated").output, Some(88));
+                assert_eq!(subtype, "message_end");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A message with no usage — and a user echo, which never carries one
+    /// — report nothing. Pi seeds its usage struct with zeros, so a zero
+    /// `totalTokens` is the initialiser rather than an empty context.
+    #[test]
+    fn a_message_without_real_usage_reports_no_tokens() {
+        let mut s = stream();
+        for line in [
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}],"usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":1}}}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"totalTokens":0}}}"#,
+        ] {
+            assert!(
+                !s.parse_line(line)
+                    .iter()
+                    .any(|e| matches!(e, SessionEvent::TokenUsage { .. })),
+                "{line}"
+            );
+        }
     }
 
     /// `agent_settled` is the terminal turn event; `agent_end` is not,

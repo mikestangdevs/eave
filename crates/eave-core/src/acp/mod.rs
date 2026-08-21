@@ -60,6 +60,7 @@ pub mod child;
 pub mod handshake;
 pub mod permission;
 pub mod update;
+pub mod usage;
 pub mod wire;
 
 pub use child::{AcpChild, AcpLines, ChildContext, ChildEnv, ChildSpec, EVENT_CHANNEL_CAP};

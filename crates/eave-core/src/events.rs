@@ -46,6 +46,108 @@ pub fn cap_payload(s: &str) -> String {
     )
 }
 
+/// What one unit of finished model work cost, in the provider's own words
+/// (Slice CC).
+///
+/// **`input` is the WHOLE prompt, cache included**, and `cache_read` /
+/// `cache_write` are subsets of it, stated separately. That convention is
+/// not eave's invention — it is what the providers that define the term
+/// define it as:
+///
+/// - Codex app-server: `tokenUsage.last.totalTokens` = `inputTokens` +
+///   `outputTokens`, with `cachedInputTokens` a portion of `inputTokens`
+///   (verified against comet's live 0.146.1 capture,
+///   `comet/crates/harness/tests/fixtures/codex/live-0.146.1-multi-agent.jsonl:35`).
+/// - Grok: *"ACP `_meta.usage.inputTokens` (PromptUsage) is still the
+///   **full** prompt sum; only the headless projector subtracts cache"* —
+///   grok 1.0.5's own bundled documentation.
+///
+/// Claude and pi are the exceptions, and their adapters convert: both
+/// follow the Messages API, whose `input_tokens` counts only the tokens
+/// that were neither read from nor written to cache (pi computes its own
+/// `totalTokens` as `input + output + cacheRead + cacheWrite`, which is
+/// only correct if the buckets are disjoint). So `stream.rs` and `pi.rs`
+/// add three disjoint stated counts. That is exact arithmetic on numbers
+/// the provider stated, and it is the only arithmetic in this slice —
+/// nothing here is ever derived from message length, character count, or
+/// any other proxy.
+///
+/// Every field is `Option` because a provider that did not say a number
+/// gets `None`. Never a zero: "the provider reported no cache tokens" and
+/// "the provider does not report cache tokens" are different facts and a
+/// zero would erase the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnTokens {
+    /// The whole prompt sent, cache included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u64>,
+    /// Tokens the model generated, reasoning included where the provider
+    /// folds it in (all five do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+    /// The portion of `input` that was served from cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// The portion of `input` that was written to cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+}
+
+impl TurnTokens {
+    /// Build one only if the provider stated at least one number.
+    ///
+    /// An all-`None` `TurnTokens` claims a usage statement was made when
+    /// none was; this is the constructor that refuses to manufacture one,
+    /// so a `Some(TurnTokens)` anywhere downstream always carries a fact.
+    pub fn stated(
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_write: Option<u64>,
+    ) -> Option<Self> {
+        let any = input.is_some() || output.is_some();
+        let any = any || cache_read.is_some() || cache_write.is_some();
+        any.then_some(Self {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        })
+    }
+}
+
+/// How full the model's context window is right now (Slice CC).
+///
+/// This is a *level*, not a *cost*: it goes down when the agent compacts
+/// and it is the number that decides whether the next turn fits. The ACP
+/// schema names it exactly — `used` is "Tokens currently in context",
+/// `size` is "Total context window size in tokens"
+/// (`acp/schema.py::_UsageUpdate`, agent-client-protocol 1.x).
+///
+/// `used_tokens` is not optional: a context statement that does not say
+/// how much is in context is not a statement. `limit_tokens` is, because
+/// pi reports the level and never the ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContextWindow {
+    pub used_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_tokens: Option<u64>,
+}
+
+impl ContextWindow {
+    /// 0.0..=1.0 of the window in use, when the provider stated a ceiling.
+    ///
+    /// `None` when it did not, and `None` for a stated ceiling of zero —
+    /// which is a provider bug, not a full window, and dividing by it
+    /// would report `inf` as a percentage.
+    pub fn fraction(&self) -> Option<f32> {
+        let limit = self.limit_tokens.filter(|l| *l > 0)?;
+        Some(self.used_tokens as f32 / limit as f32)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -184,6 +286,29 @@ pub enum SessionEvent {
     /// (Slice K amendment 1). The session is refused, loudly and with the
     /// reason — it must never silently fall back to unreviewed writes.
     PostureRefused { mode: String, reason: String },
+    /// The provider stated something about tokens (Slice CC).
+    ///
+    /// **Two different facts, never one.** `turn` is what the work just
+    /// finished cost; `context` is how full the window is right now. They
+    /// are not the same number and they do not even move together: a turn
+    /// with two model round-trips bills the prompt TWICE (Claude's
+    /// `result.usage` for the tool turn in
+    /// `docs/research/claude-stream-capture-tool-turn.jsonl` sums to
+    /// 53,820 input tokens) while the context it left behind held 26,967.
+    /// Adding the halves, or showing one under the other's label, is the
+    /// lying UI this variant exists to make impossible — hence two named
+    /// types rather than five sibling integers.
+    ///
+    /// Both are `Option` because most providers state one and not the
+    /// other, and either may arrive alone: an ACP `usage_update` is
+    /// context-only, an ACP prompt response is turn-only. A record with
+    /// both `None` is never emitted.
+    TokenUsage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnTokens>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<ContextWindow>,
+    },
     /// A line that was not valid JSON or lacked a type tag. Surfaced, never
     /// fatal — the parser keeps going (a misbehaving CLI must not take the
     /// session state machine down with it).
@@ -320,5 +445,85 @@ mod tests {
         // The raw input is still the fact of record beside it: typing adds
         // a lens, it never replaces what the provider said.
         assert!(line.contains(r#""input":"{\"command\":\"ls\"}""#), "{line}");
+    }
+
+    /// **Slice CC, the same contract from the other side.** Adding a
+    /// variant must not change how any older variant reads, and the new
+    /// one must survive its own round trip with the halves intact.
+    #[test]
+    fn adding_token_usage_did_not_disturb_the_records_already_written() {
+        for old in [
+            r#"{"kind":"init","session_id":"abc"}"#,
+            r#"{"kind":"text_delta","text":"hi"}"#,
+            r#"{"kind":"turn_completed","subtype":"success","is_error":false}"#,
+            r#"{"kind":"system","subtype":"status","raw":"{}"}"#,
+            r#"{"kind":"exited","code":0,"signal":null,"stderr_tail":""}"#,
+        ] {
+            serde_json::from_str::<SessionEvent>(old)
+                .unwrap_or_else(|e| panic!("{old} must still load: {e}"));
+        }
+
+        let ev = SessionEvent::TokenUsage {
+            turn: TurnTokens::stated(Some(26_397), Some(5), Some(15_899), Some(10_496)),
+            context: Some(ContextWindow {
+                used_tokens: 26_397,
+                limit_tokens: Some(1_000_000),
+            }),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""kind":"token_usage""#), "{json}");
+        assert_eq!(serde_json::from_str::<SessionEvent>(&json).unwrap(), ev);
+    }
+
+    /// A number the provider did not state stays absent, all the way
+    /// through the wire. A zero here would read as "no cache was used",
+    /// which is a claim about the run rather than about the report.
+    #[test]
+    fn an_unstated_count_is_absent_rather_than_zero() {
+        let ev = SessionEvent::TokenUsage {
+            turn: TurnTokens::stated(Some(10), Some(2), None, None),
+            context: None,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("cache_read"), "{json}");
+        assert!(!json.contains("context"), "{json}");
+        assert_eq!(serde_json::from_str::<SessionEvent>(&json).unwrap(), ev);
+    }
+
+    /// The constructor refuses to invent a usage statement out of four
+    /// silences — so `Some(TurnTokens)` downstream always means the
+    /// provider said something.
+    #[test]
+    fn a_provider_that_said_nothing_produces_no_turn_tokens() {
+        assert_eq!(TurnTokens::stated(None, None, None, None), None);
+        assert!(TurnTokens::stated(None, Some(0), None, None).is_some());
+    }
+
+    /// A percentage needs a ceiling, and a ceiling of zero is a provider
+    /// bug rather than a full window.
+    #[test]
+    fn a_context_fraction_needs_a_stated_ceiling() {
+        let w = ContextWindow {
+            used_tokens: 500,
+            limit_tokens: Some(1000),
+        };
+        assert_eq!(w.fraction(), Some(0.5));
+        assert_eq!(
+            ContextWindow {
+                used_tokens: 500,
+                limit_tokens: None
+            }
+            .fraction(),
+            None
+        );
+        assert_eq!(
+            ContextWindow {
+                used_tokens: 500,
+                limit_tokens: Some(0)
+            }
+            .fraction(),
+            None,
+            "dividing by a zero ceiling reports inf, not a full window"
+        );
     }
 }

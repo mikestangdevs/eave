@@ -943,3 +943,85 @@ async fn live_hermes_still_asks_before_a_dangerous_command() {
         "this machine's Hermes has an approval bypass active"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Token accounting (Slice CC)
+
+/// **Slice CC.** Hermes states its two token facts on two different
+/// channels, and eave keeps them apart all the way to the event channel:
+/// the `usage_update` gauge is a level with no bill on it, and the settled
+/// prompt response is a bill with no level on it.
+///
+/// The fixture's numbers are its own; its shapes are the ACP schema's
+/// (`acp/schema.py`, `_UsageUpdate` and `Usage` — the package installed
+/// alongside the operator's real Hermes). Nothing here reaches Hermes,
+/// the network, or any credential.
+#[tokio::test]
+async fn the_two_token_facts_arrive_separately_and_stay_separate() {
+    use eave_core::events::{ContextWindow, TurnTokens};
+
+    let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "usage")]);
+    let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
+    recv_until(&mut rx, is_init).await;
+    session.send_user_message("count").await.unwrap();
+    let events = recv_until(&mut rx, is_turn_done).await;
+
+    let usage: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::TokenUsage { turn, context } => Some((*turn, *context)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage.len(), 2, "one gauge, one bill: {events:?}");
+
+    // The gauge, mid-turn: a level and nothing else.
+    assert_eq!(
+        usage[0],
+        (
+            None,
+            Some(ContextWindow {
+                used_tokens: 21_884,
+                limit_tokens: Some(200_000),
+            })
+        ),
+        "a usage_update states occupancy and must never be read as a bill"
+    );
+
+    // The bill, on the settled response: tokens and nothing else.
+    assert_eq!(
+        usage[1],
+        (
+            TurnTokens::stated(Some(21_884), Some(455), Some(19_000), Some(0)),
+            None
+        ),
+        "the prompt response states the turn and must never be read as occupancy"
+    );
+
+    // And it lands before the bookend, so a reader folding events in order
+    // has the turn's cost by the time the turn ends.
+    let bill_ix = events
+        .iter()
+        .rposition(|e| matches!(e, SessionEvent::TokenUsage { turn: Some(_), .. }))
+        .unwrap();
+    let done_ix = events.iter().rposition(is_turn_done).unwrap();
+    assert!(bill_ix < done_ix, "{events:?}");
+}
+
+/// A turn that says nothing about tokens emits no token record at all.
+/// A zeroed one would read as a free turn, which is a claim about the run
+/// rather than about the report.
+#[tokio::test]
+async fn a_turn_with_no_usage_on_the_wire_reports_no_tokens() {
+    let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "normal")]);
+    let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
+    recv_until(&mut rx, is_init).await;
+    session.send_user_message("hi").await.unwrap();
+    let events = recv_until(&mut rx, is_turn_done).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::TokenUsage { .. })),
+        "silence is the honest answer: {events:?}"
+    );
+}

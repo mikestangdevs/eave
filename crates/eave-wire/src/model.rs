@@ -9,7 +9,7 @@
 //! `UserDelivered` confirmation is seen; a `Closed` record finalizes every
 //! still-pending send as undelivered (spec 02 §Delivery state).
 
-use eave_core::events::SessionEvent;
+use eave_core::events::{ContextWindow, SessionEvent, TurnTokens};
 use eave_core::journal::{JournalEvent, Outcome, Record};
 use eave_core::tool::ToolCall;
 
@@ -196,6 +196,21 @@ pub struct Transcript {
     /// `Init`, and the newer one is the one describing the process that
     /// just started.
     pub inventory: Option<Vec<String>>,
+    /// What the last settled turn cost, in the provider's own words
+    /// (Slice CC). `None` until a provider states one — most journals
+    /// written before this slice never will, and a session driving an
+    /// adapter with no usage on its wire never will either.
+    pub turn_tokens: Option<TurnTokens>,
+    /// How full the model's context window was when the provider last
+    /// said (Slice CC).
+    ///
+    /// **Kept apart from `turn_tokens` on purpose, and updated apart from
+    /// it.** These arrive on different frames at different times — an ACP
+    /// `usage_update` is context-only and lands mid-turn, an ACP prompt
+    /// response is bill-only and lands at the end — so each is last-wins
+    /// on its own. Folding them together would let a gauge erase the last
+    /// turn's cost, and a bill erase the level.
+    pub context: Option<ContextWindow>,
     rev_counter: u64,
 }
 
@@ -440,6 +455,18 @@ impl Transcript {
             }),
             // Stage E consumes these from the journal; Stage C does not
             // render them (spec 01 §Attention clocks).
+            // Slice CC: instrumentation, not transcript. It updates two
+            // fields and pushes no row — a token count is not something
+            // that happened in the conversation, and a row per turn would
+            // put a number between every message.
+            SessionEvent::TokenUsage { turn, context } => {
+                if turn.is_some() {
+                    self.turn_tokens = *turn;
+                }
+                if context.is_some() {
+                    self.context = *context;
+                }
+            }
             SessionEvent::System { .. } => {}
             SessionEvent::Malformed { .. } | SessionEvent::Unknown { .. } => {}
             // Terminal classification renders via the `Closed` record that
@@ -693,6 +720,67 @@ mod tests {
             ts_ms: 0,
             event,
         }
+    }
+
+    /// **Slice CC.** The two token facts fold independently, and a
+    /// record carrying one must never clear the other.
+    ///
+    /// This is the projection-side half of the same distinction the event
+    /// makes: a context gauge arrives mid-turn (ACP `usage_update`, Codex
+    /// `thread/tokenUsage/updated`) and a bill arrives at the end (the
+    /// settled prompt response, Claude's `result` line). Fold them into
+    /// one slot and every gauge wipes the last turn's cost off the
+    /// screen.
+    #[test]
+    fn a_context_gauge_does_not_erase_the_last_turns_bill() {
+        let usage = |turn, context| JournalEvent::Provider {
+            event: SessionEvent::TokenUsage { turn, context },
+        };
+        let bill = TurnTokens::stated(Some(19_412), Some(455), Some(19_000), Some(400));
+        let gauge = |used| {
+            Some(ContextWindow {
+                used_tokens: used,
+                limit_tokens: Some(200_000),
+            })
+        };
+
+        let mut t = Transcript::new();
+        t.apply(1, &[rec(1, usage(bill, gauge(19_867)))]).unwrap();
+        assert_eq!(t.turn_tokens, bill);
+        assert_eq!(t.context, gauge(19_867));
+
+        // A gauge-only record moves the level and leaves the bill alone.
+        t.apply(1, &[rec(2, usage(None, gauge(21_000)))]).unwrap();
+        assert_eq!(t.context, gauge(21_000));
+        assert_eq!(t.turn_tokens, bill, "the last bill is still the last bill");
+
+        // A bill-only record moves the bill and leaves the level alone.
+        let next = TurnTokens::stated(Some(21_000), Some(9), None, None);
+        t.apply(1, &[rec(3, usage(next, None))]).unwrap();
+        assert_eq!(t.turn_tokens, next);
+        assert_eq!(t.context, gauge(21_000));
+
+        // And it is instrumentation, not conversation: no rows.
+        assert!(t.rows.is_empty(), "{:?}", t.rows);
+    }
+
+    /// A journal that predates the slice replays to no token facts at
+    /// all, rather than to zeroes.
+    #[test]
+    fn a_journal_with_no_usage_records_projects_no_token_facts() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[rec(
+                1,
+                JournalEvent::Provider {
+                    event: SessionEvent::AssistantText { text: "hi".into() },
+                },
+            )],
+        )
+        .unwrap();
+        assert_eq!(t.turn_tokens, None);
+        assert_eq!(t.context, None);
     }
 
     /// **Slice AR2.** The inventory is derived by replay like every other

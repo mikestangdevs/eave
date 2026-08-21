@@ -538,9 +538,16 @@ impl GrokProto {
                 (Vec::new(), Vec::new())
             }
             // A prompt turn's response. `turn_completed` already reported
-            // the outcome as an event; this is the bookend and carries
-            // nothing new.
-            _ => (Vec::new(), Vec::new()),
+            // the OUTCOME, so this is the bookend for that — but it is not
+            // empty: the settled response is where ACP puts the turn's
+            // token bill, and reading the outcome while dropping the bill
+            // was the narrowing this slice exists to stop (slice CC).
+            _ => (
+                crate::acp::usage::from_prompt_response(v.get("result"))
+                    .into_iter()
+                    .collect(),
+                Vec::new(),
+            ),
         }
     }
 
@@ -1301,5 +1308,98 @@ mod tests {
         assert!(!spawn_args(&cfg)
             .iter()
             .any(|a| a.starts_with("--permission")));
+    }
+
+    // -----------------------------------------------------------------
+    // Slice CC, decoded in the shared ACP core (`acp::usage`) after slice
+    // CA moved the protocol out of this file. The tests stay HERE because
+    // they drive `GrokProto::handle_line` end to end — a decoder that is
+    // correct in isolation and unreachable from the wire is not a feature.
+
+    /// The settled prompt response carries the turn's bill on a
+    /// first-class `usage` (ACP 1.x, grok 1.0.5).
+    #[test]
+    fn a_settled_prompt_response_states_the_turns_tokens() {
+        let mut h = Harness::opened();
+        let line = r#"{"jsonrpc":"2.0","id":100,"result":{"stopReason":"end_turn","usage":{"totalTokens":50103,"inputTokens":48210,"outputTokens":1893,"cachedReadTokens":41000,"cachedWriteTokens":0,"thoughtTokens":412}}}"#;
+        match h.feed(line).0.as_slice() {
+            [SessionEvent::TokenUsage { turn, context }] => {
+                let turn = turn.expect("stated");
+                // Taken as sent: grok's own manual says the ACP
+                // `inputTokens` is already the full prompt sum, so adding
+                // the cache buckets here would double-count 41,000.
+                assert_eq!(turn.input, Some(48_210));
+                assert_eq!(turn.output, Some(1_893));
+                assert_eq!(turn.cache_read, Some(41_000));
+                assert_eq!(turn.cache_write, Some(0));
+                assert_eq!(
+                    *context, None,
+                    "a bill is not a level; the gauge rides usage_update"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// comet found the same numbers on `_meta` at grok 1.0.4
+    /// (`comet/crates/harness/src/acp/mod.rs:1665`). Both spellings are
+    /// read so an older grok is not silently dropped.
+    #[test]
+    fn the_older_meta_spelling_comet_found_still_reads() {
+        let mut h = Harness::opened();
+        let line = r#"{"jsonrpc":"2.0","id":100,"result":{"stopReason":"end_turn","_meta":{"inputTokens":812,"outputTokens":45}}}"#;
+        match h.feed(line).0.as_slice() {
+            [SessionEvent::TokenUsage { turn, .. }] => {
+                let turn = turn.expect("stated");
+                assert_eq!(turn.input, Some(812));
+                assert_eq!(turn.output, Some(45));
+                assert_eq!(turn.cache_read, None, "1.0.4 did not say, so eave does not");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A response with no usage anywhere emits nothing at all. Silence is
+    /// the honest answer; a zeroed record would read as a free turn.
+    #[test]
+    fn a_response_without_usage_emits_nothing() {
+        let mut h = Harness::opened();
+        let line = r#"{"jsonrpc":"2.0","id":100,"result":{"stopReason":"end_turn"}}"#;
+        assert!(h.feed(line).0.is_empty());
+    }
+
+    /// `usage_update` is the context gauge and ONLY the context gauge —
+    /// the distinction comet recorded in `docs/research/acp.md` and
+    /// deliberately left unmapped. eave maps it because its event has a
+    /// separate slot for it that cannot be mistaken for a bill.
+    #[test]
+    fn a_usage_update_states_the_level_and_never_the_bill() {
+        let mut h = Harness::opened();
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"01a020c5-af30-7fb3-b886-bcaa75a72299","update":{"sessionUpdate":"usage_update","used":22457,"size":1000000,"cost":{"amount":0.01,"currency":"USD"}}}}"#;
+        match h.feed(line).0.as_slice() {
+            [SessionEvent::TokenUsage { turn, context }] => {
+                assert_eq!(*turn, None, "a gauge says nothing about what a turn cost");
+                let context = context.expect("stated");
+                assert_eq!(context.used_tokens, 22_457);
+                assert_eq!(context.limit_tokens, Some(1_000_000));
+                assert!((context.fraction().unwrap() - 0.022457).abs() < 1e-6);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A `usage_update` shaped differently from the schema's is journaled
+    /// verbatim, not guessed at.
+    #[test]
+    fn an_unreadable_usage_update_is_kept_verbatim() {
+        let mut h = Harness::opened();
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"01a020c5-af30-7fb3-b886-bcaa75a72299","update":{"sessionUpdate":"usage_update","cost":{"amount":0.01,"currency":"USD"}}}}"#;
+        match h.feed(line).0.as_slice() {
+            [SessionEvent::System { subtype, raw }] => {
+                assert_eq!(subtype, "usage_update");
+                assert_eq!(raw, line);
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 }

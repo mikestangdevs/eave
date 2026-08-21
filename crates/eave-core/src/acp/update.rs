@@ -179,6 +179,17 @@ impl AcpStream {
                     is_error,
                 }]
             }
+            // Slice CC: ACP's own context gauge. `used` is "Tokens
+            // currently in context" and `size` is "Total context window
+            // size in tokens" (`_UsageUpdate`, agent-client-protocol 1.x);
+            // Grok's serde table names the same four fields in `struct
+            // UsageUpdate with 4 elements` (1.0.5 binary, read offline).
+            // An update with no `used` is not a gauge, so it falls through
+            // to the verbatim record rather than becoming a zero.
+            "usage_update" => match crate::acp::usage::from_usage_update(update) {
+                Some(ev) => vec![ev],
+                None => vec![system(update, line)],
+            },
             _ => vec![system(update, line)],
         }
     }

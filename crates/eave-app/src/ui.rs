@@ -34,6 +34,7 @@ use gpui::{
 use gpui_platform::application;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use eave_core::events::{ContextWindow, TurnTokens};
 use eave_core::session::AgentConfig;
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
@@ -8073,6 +8074,56 @@ fn composer_hint(pending: usize, has_draft: bool) -> &'static str {
     }
 }
 
+/// A token count, shortened for a chrome slot (Slice CC).
+///
+/// **The rounding is a display choice and only a display choice** — the
+/// journal keeps the exact count the provider stated, and this is the one
+/// place a number loses digits. Counts below ten thousand keep all of
+/// theirs, because that is the range where the last digit still means
+/// something to a reader (a 455-token reply is not "0.5k").
+fn compact_tokens(n: u64) -> String {
+    match n {
+        0..=9_999 => n.to_string(),
+        10_000..=99_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        100_000..=999_999 => format!("{}k", n / 1_000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// The one line of token instrumentation the composer carries (Slice CC).
+///
+/// Two facts, never merged: what the window holds now, and what the last
+/// settled turn cost. They are printed in that order because the first is
+/// the one that changes a decision — a window near full is why you start
+/// a new session — and the second is a receipt.
+///
+/// **Every part is omitted when the provider did not state it**, and the
+/// whole line is omitted when it stated nothing. There is no zero and no
+/// placeholder: an adapter with no usage on its wire renders no gauge,
+/// which is the truth about that adapter.
+fn usage_line(turn: Option<TurnTokens>, context: Option<ContextWindow>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = context {
+        parts.push(match c.limit_tokens {
+            Some(limit) => format!(
+                "ctx {}/{}",
+                compact_tokens(c.used_tokens),
+                compact_tokens(limit)
+            ),
+            None => format!("ctx {}", compact_tokens(c.used_tokens)),
+        });
+    }
+    if let Some(t) = turn {
+        if let Some(input) = t.input {
+            parts.push(format!("{} in", compact_tokens(input)));
+        }
+        if let Some(output) = t.output {
+            parts.push(format!("{} out", compact_tokens(output)));
+        }
+    }
+    parts.join(" · ")
+}
+
 /// The name of the key on a macOS keyboard. Spelled out rather than drawn
 /// as `⏎`, because the physical key this refers to has the word printed
 /// on it and a glyph would be eave's translation of it.
@@ -8264,6 +8315,12 @@ impl Render for Shell {
         // outcomes — because the case analysis above is the part that was
         // right, and a card is a lie in exactly the same circumstances a
         // caption was.
+        // Slice CC: the two token facts the composer's gauge states,
+        // read off the same replayed projection as everything else.
+        let usage = {
+            let t = &self.transcript.read(cx).transcript;
+            usage_line(t.turn_tokens, t.context)
+        };
         let show_launcher = state.session_id.is_none();
         let launch_error = state.launch_error.clone();
         let empty_state: Option<EmptyState> = if !state.display.is_empty() {
@@ -8435,6 +8492,33 @@ impl Render for Shell {
                                 .child(SharedString::from(composer_hint(pending_here, has_draft))),
                         )
                         .child(div().flex_1())
+                        // Slice CC. The quietest rank in the application
+                        // (`MICRO`, tertiary ink) at the far end of a row
+                        // whose left half is already chrome: this is
+                        // instrumentation, and it must lose every contest
+                        // with the session name, the message text and the
+                        // send button.
+                        //
+                        // The slot follows `composer-hint`'s doctrine
+                        // rather than inventing one — when there is
+                        // nothing true to say, it says nothing, because a
+                        // permanent "0 tokens" caption over an adapter
+                        // that reports none would be a lie printed on
+                        // every frame forever. Unlike that slot this one
+                        // is not mounted when empty: no test probes for
+                        // it, and the row's height is `SEND_BUTTON` (26),
+                        // which `MICRO_LINE` (15) clears either way, so
+                        // nothing moves.
+                        .children((!usage.is_empty()).then(|| {
+                            div()
+                                .debug_selector(|| "composer-usage".into())
+                                .flex_none()
+                                .mr(px(theme::SPACE_2))
+                                .text_size(px(theme::MICRO_SIZE))
+                                .line_height(px(theme::MICRO_LINE))
+                                .text_color(theme::text_tertiary())
+                                .child(SharedString::from(usage))
+                        }))
                         .child(
                             div()
                                 .size(px(theme::SEND_BUTTON))
@@ -10145,6 +10229,70 @@ mod tests {
             !line.contains("default") && !line.contains("·  ·"),
             "an unconfigured model surfaced as a name: {line:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Slice CC — the token gauge's words.
+
+    /// **The two facts stay two facts, and neither is invented.**
+    ///
+    /// The numbers below are the ones a real turn produced: the tool turn
+    /// in `docs/research/claude-stream-capture-tool-turn.jsonl` billed
+    /// 53,820 input tokens and left 26,967 in a 1M window. A gauge that
+    /// showed one number would have to pick, and either pick is wrong
+    /// half the time.
+    #[test]
+    fn the_gauge_states_the_level_and_the_bill_separately() {
+        let line = usage_line(
+            TurnTokens::stated(Some(53_820), Some(112), Some(42_778), Some(11_038)),
+            Some(ContextWindow {
+                used_tokens: 26_967,
+                limit_tokens: Some(1_000_000),
+            }),
+        );
+        assert_eq!(line, "ctx 27.0k/1.0M · 53.8k in · 112 out");
+    }
+
+    /// A provider that states one fact renders one fact, and a provider
+    /// that states none renders nothing at all. There is no zero here to
+    /// mistake for a free turn or an empty window.
+    #[test]
+    fn an_unstated_fact_leaves_the_gauge_shorter_rather_than_zeroed() {
+        // pi: a level with no ceiling, and a bill.
+        assert_eq!(
+            usage_line(
+                TurnTokens::stated(Some(19_412), Some(455), None, None),
+                Some(ContextWindow {
+                    used_tokens: 19_867,
+                    limit_tokens: None
+                }),
+            ),
+            "ctx 19.9k · 19.4k in · 455 out"
+        );
+        // An ACP prompt response, alone: the bill and no level.
+        assert_eq!(
+            usage_line(TurnTokens::stated(None, Some(45), None, None), None),
+            "45 out"
+        );
+        // Nothing said.
+        assert_eq!(usage_line(None, None), "");
+        assert!(
+            usage_line(TurnTokens::stated(None, None, None, None), None).is_empty(),
+            "four silences are not a usage statement"
+        );
+    }
+
+    /// Small counts keep every digit; only large ones round, and the
+    /// journal keeps the exact number either way.
+    #[test]
+    fn only_large_counts_lose_digits() {
+        assert_eq!(compact_tokens(0), "0");
+        assert_eq!(compact_tokens(455), "455");
+        assert_eq!(compact_tokens(9_999), "9999");
+        assert_eq!(compact_tokens(26_417), "26.4k");
+        assert_eq!(compact_tokens(200_000), "200k");
+        assert_eq!(compact_tokens(258_400), "258k");
+        assert_eq!(compact_tokens(1_000_000), "1.0M");
     }
 
     /// The composer's trailing line, which used to be a permanent caption.

@@ -828,6 +828,14 @@ impl Reader {
                     .await;
                     return;
                 }
+                // Slice CC: the settled response carries the turn's token
+                // bill beside its stop reason. Emitted BEFORE
+                // `TurnCompleted` so a reader that stops folding at the
+                // turn boundary still sees it — the bill belongs to the
+                // turn that just ended, not to the next one.
+                if let Some(usage) = crate::acp::usage::from_prompt_response(v.get("result")) {
+                    self.emit(usage).await;
+                }
                 let stop = v
                     .get("result")
                     .and_then(|r| r.get("stopReason"))
