@@ -23,6 +23,7 @@
 //! writer decides ordering.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -31,7 +32,9 @@ use tokio::sync::broadcast;
 use eave_core::browser::bookmarks::{BookmarkEvent, BookmarkId};
 use eave_core::browser::history::{HistoryEvent, Transition};
 use eave_core::browser::snapshot::{BookmarksSnapshot, TabsSnapshot};
-use eave_core::browser::tabs::{GroupId, LoadState, NavStack, Setting, TabContent, TabEvent, TabId};
+use eave_core::browser::tabs::{
+    normalize_url, GroupId, LoadState, NavStack, PendingNav, Setting, TabContent, TabEvent, TabId,
+};
 use eave_core::browser::{BrowserStore, OpenReport};
 use eave_core::journal::now_ms;
 use eave_wire::{HistoryQueryOk, PageFact};
@@ -59,11 +62,35 @@ pub const HISTORY_QUERY_DEFAULT_LIMIT: usize = 8;
 /// because a typeahead nobody can read is not worth a slower keystroke.
 pub const HISTORY_QUERY_MAX_LIMIT: usize = 100;
 
+/// Why the tab strip changed — and therefore how urgently it has to be
+/// sent.
+///
+/// B1 sent a snapshot on every poke, which was right when the only thing
+/// that could poke was an operator. A page engine changes the arithmetic:
+/// one navigation produces `Loading` → `Complete` plus a title and a
+/// favicon, and a strip of tabs loading at once produces that many at
+/// once. Without a distinction the snapshot rate would follow the *pages*,
+/// not the person.
+///
+/// The split is the same one `run_subscription` already makes between a
+/// text delta and everything else: prose can wait 120 ms, an event cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabPoke {
+    /// Anything durable — opened, closed, moved, committed — plus a
+    /// navigation *request*, which is not durable but is an operator
+    /// action and must not sit in a buffer behind a spinner.
+    Structural,
+    /// Load state only. The spinner, and nothing else.
+    Load,
+}
+
 /// The engine's browser state.
 pub struct Browser {
     store: StdMutex<BrowserStore>,
-    tabs_tx: broadcast::Sender<()>,
+    tabs_tx: broadcast::Sender<TabPoke>,
     bookmarks_tx: broadcast::Sender<()>,
+    /// Distinguishes two requests for the same address. See [`PendingNav`].
+    nav_seq: AtomicU64,
     /// What opening the logs found. Held so it can be stated more than
     /// once — at startup on stderr, and to anything that asks later.
     report: OpenReport,
@@ -79,6 +106,7 @@ impl Browser {
             store: StdMutex::new(store),
             tabs_tx,
             bookmarks_tx,
+            nav_seq: AtomicU64::new(0),
             report,
         }))
     }
@@ -87,8 +115,14 @@ impl Browser {
         &self.report
     }
 
-    pub fn subscribe_tabs(&self) -> broadcast::Receiver<()> {
+    pub fn subscribe_tabs(&self) -> broadcast::Receiver<TabPoke> {
         self.tabs_tx.subscribe()
+    }
+
+    /// Announce a tab-strip change. Returns whether anyone was listening,
+    /// which nothing acts on — a strip nobody watches still changed.
+    fn poke_tabs(&self, kind: TabPoke) -> bool {
+        self.tabs_tx.send(kind).is_ok()
     }
 
     pub fn subscribe_bookmarks(&self) -> broadcast::Receiver<()> {
@@ -114,7 +148,9 @@ impl Browser {
             .tab_event(event)
             .map_err(|e| format!("write tabs log: {e}"))?;
         if changed {
-            let _ = self.tabs_tx.send(());
+            // Everything that reaches the log is durable, and therefore
+            // structural by definition.
+            self.poke_tabs(TabPoke::Structural);
         }
         Ok(changed)
     }
@@ -239,29 +275,43 @@ impl Browser {
         Ok(changed)
     }
 
-    /// A navigation the operator asked for.
+    /// A navigation the operator asked for. **A request, not a commit.**
     ///
-    /// **In this slice it commits immediately**, because no page engine is
-    /// attached to report what actually landed. Once one is, this becomes
-    /// a request and the commit arrives as
-    /// [`PageFact::Committed`] — the seam is already in place, and the
-    /// caveat is stated in the slice report rather than left to be
-    /// discovered.
+    /// B1 committed here, because nothing was attached to say what
+    /// actually landed. Slice C1 attaches a page engine, and if this still
+    /// committed then every navigation would be recorded twice — once on
+    /// the ask and once on [`PageFact::Committed`] — which is two nav
+    /// entries, two history visits, and a back button that needs pressing
+    /// twice to go anywhere.
+    ///
+    /// So this now records only the intent, transiently. Whatever renders
+    /// pages watches [`PendingNav`], loads it, and reports back through
+    /// [`Self::tab_stated`]. **With nothing attached, nothing happens** —
+    /// which is the honest answer to "go to this address" from a program
+    /// that cannot fetch pages, and is what the load state already said.
     pub fn tab_navigate(&self, tab_id: TabId, url: String) -> Result<bool, String> {
-        let ts_ms = now_ms();
-        let changed = self.tab(TabEvent::Navigated {
-            id: tab_id,
-            url: url.clone(),
-            title: None,
-            ts_ms,
-        })?;
+        let Some(url) = normalize_url(&url) else {
+            return Err("not a url".into());
+        };
+        // `fetch_add` rather than a lock: the seq only ever has to differ
+        // from the previous one, so its exact value carries no meaning and
+        // nothing observes it in order.
+        let seq = self.nav_seq.fetch_add(1, Ordering::Relaxed);
+        let changed = {
+            let mut s = self.store.lock().unwrap();
+            match s.tabs.tabs.get_mut(&tab_id) {
+                Some(t) => {
+                    t.pending = Some(PendingNav { url, seq });
+                    // Asking is itself a load state: the omnibox commits,
+                    // and the tab should say so before any engine answers.
+                    t.load = LoadState::Loading;
+                    true
+                }
+                None => return Err(format!("no such tab: {tab_id}")),
+            }
+        };
         if changed {
-            self.history(HistoryEvent::Visited {
-                url,
-                title: None,
-                ts_ms,
-                transition: Transition::Typed,
-            })?;
+            let _ = self.poke_tabs(TabPoke::Structural);
         }
         Ok(changed)
     }
@@ -271,6 +321,17 @@ impl Browser {
         match fact {
             PageFact::Committed { url, title } => {
                 let ts_ms = now_ms();
+                // Read the request BEFORE applying the commit, because the
+                // fold clears it. A commit that answers a request the
+                // operator typed is a TYPED visit even though it arrives
+                // by the same door as a link click — and the difference is
+                // not cosmetic: `Transition` is what ranks the omnibox, so
+                // recording every typed address as a link would make the
+                // typeahead worse the more the address bar is used.
+                let answered_a_request = {
+                    let s = self.store.lock().unwrap();
+                    s.tabs.tabs.get(&tab_id).is_some_and(|t| t.pending.is_some())
+                };
                 let changed = self.tab(TabEvent::Navigated {
                     id: tab_id,
                     url: url.clone(),
@@ -282,7 +343,11 @@ impl Browser {
                         url,
                         title,
                         ts_ms,
-                        transition: Transition::Link,
+                        transition: if answered_a_request {
+                            Transition::Typed
+                        } else {
+                            Transition::Link
+                        },
                     })?;
                 }
                 Ok(changed)
@@ -334,7 +399,7 @@ impl Browser {
             }
         };
         if changed {
-            let _ = self.tabs_tx.send(());
+            self.poke_tabs(TabPoke::Load);
         }
         changed
     }

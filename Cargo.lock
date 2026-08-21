@@ -923,7 +923,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "gpui_util",
  "indexmap",
@@ -1266,7 +1266,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2034,7 +2034,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2118,7 +2118,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -2152,7 +2152,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2201,7 +2201,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -2212,7 +2212,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "console_error_panic_hook",
  "gpui",
@@ -2225,7 +2225,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "schemars",
  "serde",
@@ -2235,7 +2235,7 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "anyhow",
  "log",
@@ -2245,7 +2245,7 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -2269,7 +2269,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2297,7 +2297,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -2478,7 +2478,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3115,7 +3115,7 @@ dependencies = [
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -3850,7 +3850,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "collections",
  "serde",
@@ -4509,7 +4509,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "derive_refineable",
 ]
@@ -4697,7 +4697,7 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "async-task",
  "backtrace",
@@ -5169,7 +5169,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "heapless",
  "log",
@@ -5859,7 +5859,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "perf",
  "quote",
@@ -7144,7 +7144,7 @@ dependencies = [
 [[package]]
 name = "zlog"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7161,7 +7161,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -7172,7 +7172,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/wingleeio/zed?rev=5d1f83d9f27a19bec1fb241dc33b42238af9cf8d#5d1f83d9f27a19bec1fb241dc33b42238af9cf8d"
+source = "git+file:///Users/michaelstang/Desktop/eave/gpui-fork.git?rev=8521fc1477eb6f625dba32af7124a210b0bdfe27#8521fc1477eb6f625dba32af7124a210b0bdfe27"
 
 [[package]]
 name = "zune-core"

@@ -39,7 +39,7 @@ use eave_wire::{
     SendOk, SessionInfo, SubscriptionItem, TabNavOk, UnsubscribeOk, PROTO_VERSION,
 };
 
-use crate::browser::Browser;
+use crate::browser::{Browser, TabPoke};
 
 const BROADCAST_CAP: usize = 4096;
 /// Watch pokes carry no payload (snapshots are taken at emission), so the
@@ -2581,11 +2581,33 @@ fn changed(r: Result<bool, String>) -> ResponseBody {
 }
 
 /// The tab-strip subscription (Slice B1): a full snapshot now, and another
-/// after every change. Identical in shape to [`run_watch`] — snapshot,
-/// send, wait, coalesce — because it makes the identical promise: fold by
-/// replacement, no deltas, nothing to go stale.
+/// after every change. Fold by replacement, no deltas, nothing to go stale
+/// — the same promise [`run_watch`] makes.
+///
+/// # The 120 ms fold (Slice C1)
+/// B1 sent one snapshot per poke, which was correct while the only thing
+/// that could poke was a person. With a page engine attached, load state
+/// is announced by *pages*: a navigation is `Loading` then `Complete`, and
+/// a window of tabs loading at once multiplies that. A snapshot is the
+/// whole strip, so paying one per spinner tick is the expensive way to
+/// redraw nothing.
+///
+/// So this borrows [`run_subscription`]'s fold exactly, including the two
+/// properties that make it feel instant rather than laggy:
+///
+/// - the window is measured **from the last emit**, so the leading edge of
+///   a burst after quiet goes out immediately and only a *sustained* storm
+///   is throttled;
+/// - a [`TabPoke::Structural`] change **flushes at once**. Opening,
+///   closing, moving, committing and asking to navigate are operator-facing
+///   and never wait behind a spinner. Only [`TabPoke::Load`] is
+///   latency-tolerant, for the same reason only prose was.
 async fn run_tabs(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+    const COALESCE: Duration = Duration::from_millis(120);
     let mut rx = engine.browser.subscribe_tabs();
+    // Assigned at the top of every iteration, because this loop sends
+    // before it waits — the first snapshot is unconditional.
+    let mut last_emit;
     loop {
         let item = SubscriptionItem::Tabs {
             snapshot: engine.browser.tabs_snapshot(),
@@ -2593,15 +2615,28 @@ async fn run_tabs(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u
         if send_item(&w, id, item).await.is_err() {
             return;
         }
-        match rx.recv().await {
-            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                // A burst of pokes collapses into one snapshot. Lag is
-                // harmless for the same reason: the next snapshot is
-                // complete, so nothing was missed by not sending the
-                // intermediate ones.
-                while rx.try_recv().is_ok() {}
-            }
+        last_emit = Instant::now();
+
+        // Wait for something to change. Lag is harmless here for the same
+        // reason a burst is: the next snapshot is complete, so nothing was
+        // missed by not sending the intermediate ones.
+        let mut flush = match rx.recv().await {
+            Ok(kind) => kind == TabPoke::Structural,
+            Err(broadcast::error::RecvError::Lagged(_)) => true,
             Err(broadcast::error::RecvError::Closed) => return,
+        };
+        while !flush {
+            let since = last_emit.elapsed();
+            if since >= COALESCE {
+                break;
+            }
+            match tokio::time::timeout(COALESCE - since, rx.recv()).await {
+                Err(_window_elapsed) => break,
+                Ok(Ok(TabPoke::Structural)) => flush = true,
+                Ok(Ok(TabPoke::Load)) => {}
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => flush = true,
+                Ok(Err(broadcast::error::RecvError::Closed)) => return,
+            }
         }
     }
 }

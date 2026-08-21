@@ -14,6 +14,7 @@
 //! | favicon **url** | yes | one short string, and it names the tab |
 //! | favicon **bytes** | no | a cache; re-fetched by whichever engine wins |
 //! | [`LoadState`] | no | a restored tab is not loading. It is [`LoadState::Unloaded`] |
+//! | [`PendingNav`] | no | a restored tab is not mid-navigation either |
 //! | scroll offset, form state, JS heap | no | the engine's, not ours |
 //!
 //! The load state is the one worth being loud about: journaling it would
@@ -133,6 +134,27 @@ impl LoadState {
     }
 }
 
+/// A navigation the operator asked for that has not landed yet.
+///
+/// Transient, and journaled for exactly as long as [`LoadState`] is —
+/// which is not at all. A tab restored from disk is not mid-navigation,
+/// and a strip that came back claiming to be loading three addresses
+/// nobody asked for again would be the same lie.
+///
+/// # Why there is a sequence number
+/// A bare `Option<String>` cannot tell "go to example.com" from "go to
+/// example.com **again**", and the second one is what a reload is. The
+/// page engine watches this field; without `seq` it would see no change
+/// and do nothing, and the reload button would be dead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingNav {
+    /// Normalized, as [`normalize_url`] leaves it.
+    pub url: String,
+    /// Increases per request, engine-wide. Only ever compared for
+    /// inequality against the last one a renderer acted on.
+    pub seq: u64,
+}
+
 /// One entry in a tab's back/forward stack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NavEntry {
@@ -210,6 +232,11 @@ pub struct Tab {
     /// Transient. Not journaled; see the module docs.
     #[serde(default, skip_serializing_if = "LoadState::is_default_state")]
     pub load: LoadState,
+    /// A navigation asked for and not yet landed. Transient, not
+    /// journaled. Set by [`crate::browser::tabs`]'s caller when the
+    /// operator asks; cleared by the commit that answers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingNav>,
     /// The tab this one was opened from, when it was opened from one.
     /// Stated so a client can place a child tab beside its parent; nothing
     /// in this crate acts on it.
@@ -479,6 +506,10 @@ impl TabsState {
                     title: None,
                     favicon_url: None,
                     load: LoadState::Unloaded,
+                    // A tab opened AT a url has already committed it below;
+                    // it is not waiting on anything. A tab opened at nothing
+                    // is not waiting either.
+                    pending: None,
                     opener: opener.clone(),
                     created_ts_ms: *ts_ms,
                 };
@@ -513,6 +544,12 @@ impl TabsState {
                 // title on the new page is the classic stale-tab bug.
                 tab.title = title;
                 tab.favicon_url = None;
+                // A commit answers whatever was asked for, INCLUDING when
+                // the url differs — a redirect landing somewhere else is
+                // still that request landing. Leaving it set would make a
+                // renderer that watches this field navigate again, which
+                // is a loop, not a retry.
+                tab.pending = None;
                 true
             }
             TabEvent::Traversed { id, delta } => {

@@ -29,7 +29,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::bookmarks::{Bookmark, BookmarkTree};
-use super::tabs::{GroupId, LoadState, TabContent, TabGroup, TabId, TabsState, Slot};
+use super::tabs::{GroupId, LoadState, PendingNav, Slot, TabContent, TabGroup, TabId, TabsState};
 
 /// One tab, as the strip sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +57,18 @@ pub struct TabInfo {
     /// [`LoadState::Unloaded`], which is what is true of it.
     #[serde(default, skip_serializing_if = "LoadState::is_default_state")]
     pub load: LoadState,
+    /// A navigation asked for and not yet landed.
+    ///
+    /// This crosses the wire because **whatever renders pages is a client**
+    /// — in eave it lives in the app process, not the engine — so this is
+    /// the only way it can be told to go somewhere. It reads the request,
+    /// loads it, and answers with [`crate::browser::tabs::TabEvent::Navigated`]
+    /// via a `tab_stated` frame, which is what clears this field.
+    ///
+    /// Transient, exactly like `load`: never journaled, so a restored tab
+    /// carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingNav>,
     /// The back and forward arrows, as two facts instead of a stack. See
     /// the module docs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -137,6 +149,7 @@ impl TabsState {
                 title: t.display_title().map(str::to_string),
                 favicon_url: t.favicon_url.clone(),
                 load: t.load.clone(),
+                pending: t.pending.clone(),
                 can_go_back: t.nav.can_go_back(),
                 can_go_forward: t.nav.can_go_forward(),
                 history_len: t.nav.entries.len(),

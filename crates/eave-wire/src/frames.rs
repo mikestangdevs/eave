@@ -42,7 +42,8 @@ pub use eave_core::browser::snapshot::{
     BookmarkNode, BookmarksSnapshot, TabInfo, TabsSnapshot,
 };
 pub use eave_core::browser::tabs::{
-    GroupId, LoadState, NavEntry, NavStack, Setting, Slot, TabContent, TabGroup, TabId,
+    GroupId, LoadState, NavEntry, NavStack, PendingNav, Setting, Slot, TabContent, TabGroup,
+    TabId,
 };
 
 pub const PROTO_VERSION: u32 = 1;

@@ -21,6 +21,37 @@ use eave_wire::{
     Setting, Slot, SubscriptionItem, TabContent, TabsSnapshot,
 };
 
+/// Navigate the way the world works after Slice C1: the operator asks, and
+/// a page engine answers.
+///
+/// B1's `TabNavigate` committed on its own, because nothing was attached to
+/// say what landed. It is now a request, so a test that wants a page to
+/// have LANDED has to say so — and these two frames are exactly the two the
+/// CEF host sends for every real navigation.
+///
+/// Tests that are about the *seam* send the two halves by hand. This helper
+/// is for the ones that are about something else (history, the nav stack)
+/// and merely need a page to be there.
+async fn land(client: &Client, tab: &str, url: &str) {
+    client
+        .browser_do(Request::TabNavigate {
+            tab_id: tab.to_string(),
+            url: url.to_string(),
+        })
+        .await
+        .unwrap();
+    client
+        .browser_do(Request::TabStated {
+            tab_id: tab.to_string(),
+            fact: PageFact::Committed {
+                url: url.to_string(),
+                title: None,
+            },
+        })
+        .await
+        .unwrap();
+}
+
 fn engined_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_eave-engined"))
 }
@@ -382,13 +413,7 @@ async fn back_and_forward_survive_a_restart_and_stay_off_the_snapshot() {
 
     let tab = client.tab_open(Some("https://a.example/"), true).await.unwrap();
     for url in ["https://b.example/", "https://c.example/"] {
-        client
-            .browser_do(Request::TabNavigate {
-                tab_id: tab.clone(),
-                url: url.into(),
-            })
-            .await
-            .unwrap();
+        land(&client, &tab, url).await;
     }
     // Two steps back, then a new navigation: c must be gone.
     assert!(client
@@ -402,13 +427,7 @@ async fn back_and_forward_survive_a_restart_and_stay_off_the_snapshot() {
     assert_eq!(nav.current_entry().unwrap().url, "https://b.example/");
     assert!(nav.can_go_forward());
 
-    client
-        .browser_do(Request::TabNavigate {
-            tab_id: tab.clone(),
-            url: "https://d.example/".into(),
-        })
-        .await
-        .unwrap();
+    land(&client, &tab, "https://d.example/").await;
     let nav = client.tab_nav(&tab).await.unwrap();
     assert_eq!(
         nav.entries.iter().map(|e| e.url.as_str()).collect::<Vec<_>>(),
@@ -591,13 +610,7 @@ async fn history_answers_typeahead_and_forgets_from_the_file_itself() {
         "https://docs.rs/serde",
         "https://secret.example/very-private-page",
     ] {
-        client
-            .browser_do(Request::TabNavigate {
-                tab_id: tab.clone(),
-                url: url.into(),
-            })
-            .await
-            .unwrap();
+        land(&client, &tab, url).await;
     }
 
     // Typing an address prefix.
@@ -677,13 +690,7 @@ async fn clearing_a_range_forgets_that_window_only() {
     tokio::time::sleep(Duration::from_millis(30)).await;
     let boundary = eave_core::journal::now_ms();
     tokio::time::sleep(Duration::from_millis(30)).await;
-    client
-        .browser_do(Request::TabNavigate {
-            tab_id: tab.clone(),
-            url: "https://beta.example/".into(),
-        })
-        .await
-        .unwrap();
+    land(&client, &tab, "https://beta.example/").await;
 
     assert!(client
         .browser_do(Request::HistoryClear {
@@ -912,4 +919,226 @@ async fn an_unknown_browser_method_errors_on_its_own_id() {
     let env: ResponseEnvelope = serde_json::from_str(&line).unwrap();
     assert_eq!(env.id, 77, "the error must carry the caller's own id");
     assert!(matches!(env.body, ResponseBody::Err { .. }));
+}
+
+/// **The seam B1 left open, now closed (Slice C1).**
+///
+/// B1's `tab_navigate` committed on its own, and said in its own report that
+/// this had to change before a page engine attached. It has attached. If
+/// the request still committed, every navigation would be recorded TWICE —
+/// once when asked and once when the page reported what landed — which is
+/// two nav entries, two history visits, and a back button that needs
+/// pressing twice to go one page back.
+///
+/// So: asking does not commit. It records a request that whatever renders
+/// pages can see, and the commit is what moves the tab.
+#[tokio::test]
+async fn a_navigation_is_a_request_until_a_page_says_otherwise() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+
+    let tab = client.tab_open(None, true).await.unwrap();
+    let mut rx = client.watch_tabs().await.unwrap();
+    tabs_until(&mut rx, "the new tab", |s| s.tabs.len() == 1).await;
+
+    // Ask.
+    assert!(client
+        .browser_do(Request::TabNavigate {
+            tab_id: tab.clone(),
+            url: "https://asked.example/".into(),
+        })
+        .await
+        .unwrap());
+
+    let asked = tabs_until(&mut rx, "the request", |s| s.tabs[0].pending.is_some()).await;
+    let info = &asked.tabs[0];
+    assert_eq!(
+        info.pending.as_ref().unwrap().url,
+        "https://asked.example/",
+        "the request must reach whatever renders pages — it is a client"
+    );
+    assert_eq!(
+        info.load,
+        LoadState::Loading,
+        "asking is itself a load state; the tab should say so before any engine answers"
+    );
+    assert_eq!(
+        info.url, None,
+        "a tab must not claim to be showing a page nobody has fetched"
+    );
+    assert_eq!(info.history_len, 0, "the request pushed a nav entry");
+
+    // The request is NOT durable. Nothing about it may reach the log.
+    let raw = std::fs::read_to_string(dir.join("browser").join("tabs.jsonl")).unwrap();
+    assert!(
+        !raw.contains("asked.example"),
+        "a navigation request was journaled; a restart would replay it: {raw}"
+    );
+
+    // Now a page engine answers — and answers with a DIFFERENT url, because
+    // that is what a redirect is.
+    assert!(client
+        .browser_do(Request::TabStated {
+            tab_id: tab.clone(),
+            fact: PageFact::Committed {
+                url: "https://landed.example/".into(),
+                title: Some("Landed".into()),
+            },
+        })
+        .await
+        .unwrap());
+
+    let landed = tabs_until(&mut rx, "the commit", |s| s.tabs[0].url.is_some()).await;
+    let info = &landed.tabs[0];
+    assert_eq!(info.url.as_deref(), Some("https://landed.example/"));
+    assert_eq!(info.title.as_deref(), Some("Landed"));
+    assert_eq!(
+        info.history_len, 1,
+        "exactly one entry: the ask and the commit are one navigation, not two"
+    );
+    assert!(
+        info.pending.is_none(),
+        "a commit answers the request even when it lands elsewhere — leaving it \
+         set makes a renderer that watches it navigate again, which is a loop"
+    );
+
+    // And history recorded ONE visit, at the url that actually landed.
+    let hits = client.history_query("landed", Some(50)).await.unwrap();
+    assert_eq!(hits.matches.len(), 1, "{hits:?}");
+    assert_eq!(hits.total_entries, 1, "the ask and the commit both journaled");
+    let asked_for = client.history_query("asked.example", Some(50)).await.unwrap();
+    assert!(
+        asked_for.matches.is_empty(),
+        "history recorded an address that was never reached: {asked_for:?}"
+    );
+}
+
+/// A typed address stays typed through the commit.
+///
+/// Not cosmetic: `Transition` is what ranks the omnibox, and `Typed` is
+/// weighted above `Link` precisely because choosing an address is a
+/// stronger signal than following one. Since every commit now arrives
+/// through the same door a link click does, the provenance has to be
+/// carried across the request rather than inferred at the far end —
+/// otherwise the typeahead gets worse the more the address bar is used.
+#[tokio::test]
+async fn a_typed_address_is_still_typed_when_the_page_reports_back() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+
+    let tab = client.tab_open(None, true).await.unwrap();
+
+    // Asked for: this is a typed visit.
+    land(&client, &tab, "https://typed.example/").await;
+    // Not asked for: the page navigated itself, so this is a link.
+    client
+        .browser_do(Request::TabStated {
+            tab_id: tab.clone(),
+            fact: PageFact::Committed {
+                url: "https://followed.example/".into(),
+                title: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let raw = std::fs::read_to_string(dir.join("browser").join("history.jsonl")).unwrap();
+    let typed_line = raw
+        .lines()
+        .find(|l| l.contains("typed.example"))
+        .expect("no visit for the typed address");
+    let followed_line = raw
+        .lines()
+        .find(|l| l.contains("followed.example"))
+        .expect("no visit for the followed link");
+    assert!(
+        typed_line.contains("\"typed\""),
+        "a typed address was recorded as something else: {typed_line}"
+    );
+    assert!(
+        followed_line.contains("\"link\""),
+        "a link was recorded as typed: {followed_line}"
+    );
+}
+
+/// **The 120 ms fold (Slice C1).** Load state is announced by pages, not by
+/// people: one navigation is `Loading` then `Complete`, and a window of
+/// tabs loading at once multiplies that. A snapshot is the WHOLE strip, so
+/// paying one per spinner tick is the expensive way to redraw nothing.
+///
+/// Two properties, both borrowed from the record fold and both load-bearing:
+/// a sustained storm of load changes is throttled, and anything structural
+/// cuts the line.
+#[tokio::test]
+async fn load_state_folds_but_a_structural_change_cuts_the_line() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+
+    let tab = client.tab_open(None, true).await.unwrap();
+    let mut rx = client.watch_tabs().await.unwrap();
+    tabs_until(&mut rx, "the new tab", |s| s.tabs.len() == 1).await;
+
+    // A storm of load-state changes, sustained past several windows. Every
+    // one of these is a real change, so B1 would have sent a snapshot for
+    // each.
+    let storm = 40;
+    let started = Instant::now();
+    for i in 0..storm {
+        client
+            .browser_do(Request::TabStated {
+                tab_id: tab.clone(),
+                fact: PageFact::Load {
+                    load: if i % 2 == 0 {
+                        LoadState::Loading
+                    } else {
+                        LoadState::Complete
+                    },
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let elapsed = started.elapsed();
+
+    // Drain what actually arrived, allowing one more window to land.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut frames = 0;
+    while tokio::time::timeout(Duration::from_millis(50), rx.recv())
+        .await
+        .is_ok()
+    {
+        frames += 1;
+    }
+
+    // The bound the fold promises: at most one frame per window, plus a
+    // leading edge and a trailing flush. Derived from the elapsed time
+    // rather than a fixed number, because the storm's duration is what
+    // decides how many windows it spans.
+    let windows = (elapsed.as_millis() / 120) as usize + 3;
+    assert!(
+        frames <= windows,
+        "{frames} snapshots for {storm} load changes over {elapsed:?} — \
+         the fold is not folding (bound was {windows})"
+    );
+
+    // Now the other half: a structural change must NOT wait for a window.
+    // Pin the tab and require the frame promptly — well inside the 120 ms
+    // the load path would have cost.
+    let pinned_at = Instant::now();
+    assert!(client
+        .browser_do(Request::TabPin {
+            tab_id: tab.clone(),
+            pinned: true
+        })
+        .await
+        .unwrap());
+    tabs_until(&mut rx, "the pin", |s| s.tabs[0].pinned).await;
+    assert!(
+        pinned_at.elapsed() < Duration::from_millis(120),
+        "an operator action waited behind the spinner fold ({:?})",
+        pinned_at.elapsed()
+    );
 }

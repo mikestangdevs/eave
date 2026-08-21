@@ -16,13 +16,34 @@ eave-engine = { path = "../eave-engine" }
 
 # gpui — the wingleeio/zed fork (comet's), pinned to the FIXED rev comet
 # ships: upstream base f14fea9 (our previous no-fork pin) + a 17-commit
-# rebased stack. Decision 2026-08-17 reversing the no-fork rule (spec 03
+# rebased stack, plus ONE commit of our own (Slice C1). Decision
+# 2026-08-17 reversing the no-fork rule (spec 03
 # §No-fork consequences, 04 ledger): window vibrancy blurs only what is
 # behind the WINDOW; in-app translucent depth needs the BackdropBlur
 # scene primitive, which upstream does not have. NEVER pin a branch —
 # `cargo update` silently moving the renderer is waku's failure mode.
 # Frozen pin, not chasing upstream; rebase-classify before any bump.
-# All 17 commits over f14fea9 (verified `git log f14fea9..5d1f83d`):
+#
+# ---------------------------------------------------------------------
+# THE REMOTE IS A LOCAL PATH, AND THAT IS A KNOWN DEFECT (Slice C1).
+# We do not have push access to wingleeio/zed (`gh api` reports
+# `push: false`), so commit 18 — which is OURS, not comet's — cannot
+# live there. It is pushed to a bare repo on this machine instead:
+#
+#     /Users/michaelstang/Desktop/eave/gpui-fork.git   branch `eave-line`
+#
+# Consequence, stated plainly: **this manifest only resolves on Mike's
+# machine.** CI and any second checkout will fail to fetch gpui. The fix
+# is to publish the fork and change the two urls below back to https —
+# nothing else moves, because the rev is already a real immutable sha:
+#
+#     gh repo create <owner>/zed --public --source ... # or fork zed
+#     git -C <clone> push <remote> eave-line
+#
+# See docs/reports/stage-c1-osr.md, caveat 1.
+# ---------------------------------------------------------------------
+#
+# All 18 commits over f14fea9 (verified `git log f14fea9..8521fc1`):
 #   [permanent product primitives — survive any upstream bump]
 #   14baea0 EdgeFade — scoped per-primitive vertical fade for scroll edges
 #   a6c1ad5 BackdropBlur primitive, horizontal EdgeFade, macOS glass fixes
@@ -45,10 +66,19 @@ eave-engine = { path = "../eave-engine" }
 #   [stack bookkeeping]
 #   53518c0 merge: edge-fade line into comet-line
 #   236f664 merge: danperks transparent-window alpha-blend PR
+#   [ours — Slice C1, the page-as-scene-primitive commit]
+#   8521fc1 single-plane BGRA surfaces (PaintSurface beyond video).
+#           `PaintSurface` was livekit's: the fragment shader converts
+#           YCbCr and the renderer ASSERTED NV12, so a browser frame
+#           aborted the process. Adds a second fragment function and
+#           pipeline; the pixel format picks between them. Vertex stage,
+#           content mask and z-order untouched — which is the whole
+#           point, because it means BackdropBlur sees the page.
+#           (Was spike/gpui-bgra-surface.patch; the patch file retired.)
 # `runtime_shaders` avoids a build-time Metal toolchain dependency;
 # `font-kit` is the macOS text system.
-gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
+gpui = { git = "file:///Users/michaelstang/Desktop/eave/gpui-fork.git", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27" }
+gpui_platform = { git = "file:///Users/michaelstang/Desktop/eave/gpui-fork.git", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
     "font-kit",
     "runtime_shaders",
 ] }
@@ -65,7 +95,7 @@ libc = "0.2"
 # `cargo build` once without. `.debug_selector()` calls compile to a
 # no-op in production builds (gpui elements/div.rs cfg gate).
 [dev-dependencies]
-gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
+gpui = { git = "file:///Users/michaelstang/Desktop/eave/gpui-fork.git", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
     "test-support",
 ] }
 # Slice P3: the icon-parse test uses the SAME parser gpui uses at runtime,
