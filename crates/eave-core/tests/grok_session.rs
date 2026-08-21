@@ -86,6 +86,7 @@ async fn a_grok_session_announces_itself_and_streams_a_reply() {
             SessionEvent::Init {
                 session_id,
                 permission_mode,
+                ..
             } => Some((session_id.clone(), permission_mode.clone())),
             _ => None,
         })

@@ -124,6 +124,19 @@ pub const MODEL_DEFAULT: &str = "CLI default";
 /// Every agent eave names, in strip order. Claude first because it is
 /// the reference adapter — the one whose permission posture was proven
 /// first and against which the others are written.
+/// Pi's picker: [`MODEL_DEFAULT`] followed by the adapter's own tested
+/// list. Not written out twice — the tail is asserted equal to
+/// `eave_core::pi::MODELS` in the tests below.
+const PI_MODELS: &[&str] = &[
+    MODEL_DEFAULT,
+    "anthropic/claude-opus-4-5",
+    "anthropic/claude-sonnet-4-5",
+    "anthropic/claude-haiku-4-5",
+    "openai/gpt-5.3-codex",
+    "google/gemini-3.1-pro-preview",
+    "xai/grok-4.6",
+];
+
 pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "claude-code",
@@ -168,13 +181,26 @@ pub const PROVIDERS: &[Provider] = &[
         // no model, let the CLI decide" entry, is the only selection eave
         // could honour, and it goes in with the line that makes the tile
         // live rather than before it.
-        models: &[],
+        //
+        // Integrated 2026-08-20: the tile IS live, so the entry goes in.
+        models: &[MODEL_DEFAULT],
     },
     Provider {
         id: "pi",
         name: "Pi",
         mark: icons::PI_MARK,
-        models: &[],
+        // Slice AX shipped the model list tested, in
+        // `eave_core::pi::MODELS`: Pi is multi-provider underneath and
+        // `--model` takes a `provider/id` pair, so the provider axis is
+        // carried IN the model string and eave's picker needs no second
+        // dimension. `--provider` is never sent.
+        //
+        // It cannot be used verbatim, because every list here must open
+        // with `MODEL_DEFAULT` — "send no --model at all", which is not
+        // the same as sending the first one. So the default is prepended
+        // and `pi_offers_exactly_the_adapters_tested_models` pins the tail
+        // to the adapter's list, which is what stops the two drifting.
+        models: PI_MODELS,
     },
 ];
 
@@ -498,21 +524,85 @@ mod tests {
     /// Over every such provider rather than a named one: this was written
     /// against `cursor-agent` while its CLI was absent from the machine,
     /// and the CLI appeared three hours later.
+    ///
+    /// **It asserted `NoAdapter` for every undrivable tile until the four
+    /// adapters landed, and that assertion was too narrow rather than
+    /// wrong.** There are now two distinct reasons eave will not drive a
+    /// provider, and collapsing them would throw away the more useful one:
+    ///
+    /// - `NoAdapter` — nothing in `provider::ADAPTERS` can spawn it.
+    ///   `cursor-agent` today (Slice AY is an unreviewed WIP commit and is
+    ///   deliberately not registered).
+    /// - `PostureUnproven` — the adapter exists and works, but eave has not
+    ///   established the CLI asks before it writes, so it refuses to run
+    ///   it. **Codex today**: the adapter is complete and checks the
+    ///   app-server's own `approvalPolicy`/`approvalsReviewer`/`sandbox`
+    ///   on every spawn, but nobody has ever watched Codex ask, because
+    ///   `codex login status` said `Not logged in` on the machine it was
+    ///   built on. Slice AU asked for it to stay dark until one real
+    ///   approval is captured.
+    ///
+    /// What the tile owes a person is unchanged and is what this still
+    /// checks: it draws, it says something true, and it says something
+    /// about **eave** rather than about this machine.
     #[test]
     fn a_tile_eave_cannot_drive_still_draws_and_says_why() {
         let dead: Vec<&Provider> = PROVIDERS.iter().filter(|p| !eave_can_drive(p)).collect();
         assert!(!dead.is_empty(), "nothing to prove if every tile is live");
         for p in dead {
-            assert_eq!(
-                availability(p),
-                Availability::NoAdapter,
+            let a = availability(p);
+            assert!(
+                matches!(
+                    a,
+                    Availability::NoAdapter | Availability::PostureUnproven { .. }
+                ),
                 "{}: eave cannot drive it, so the tile must say that and not something about \
-                 this machine",
+                 this machine — got {a:?}",
                 p.id
             );
-            assert_eq!(availability(p).tile_status(), "no adapter yet");
-            assert!(availability(p).why_not(p.id).is_some());
+            assert!(
+                !a.tile_status().is_empty(),
+                "{}: an undrivable tile with no caption tells a person nothing",
+                p.id
+            );
+            assert!(a.why_not(p.id).is_some());
         }
+    }
+
+    /// The launcher's Pi list and the adapter's tested list must not drift.
+    ///
+    /// They cannot be one constant: every picker here opens with
+    /// [`MODEL_DEFAULT`] ("send no `--model` at all"), which the adapter's
+    /// list has no business carrying. So the launcher prepends it, and this
+    /// pins everything after it to `eave_core::pi::MODELS` — the list Slice
+    /// AX actually verified against `pi --list-models`.
+    #[test]
+    fn pi_offers_exactly_the_adapters_tested_models() {
+        assert_eq!(
+            PI_MODELS[0], MODEL_DEFAULT,
+            "the first choice must be the CLI's own default"
+        );
+        assert_eq!(
+            &PI_MODELS[1..],
+            eave_core::pi::MODELS,
+            "the launcher's Pi models drifted from the adapter's tested list"
+        );
+    }
+
+    /// The two undrivable reasons do not read the same, because they do not
+    /// have the same fix: one waits on eave, the other waits on evidence.
+    #[test]
+    fn a_missing_adapter_and_an_unproven_posture_do_not_say_the_same_thing() {
+        let no_adapter = Availability::NoAdapter;
+        let unproven = Availability::PostureUnproven {
+            reason: "stand-in reason, not a real evidence string",
+        };
+        assert_ne!(
+            no_adapter.tile_status(),
+            unproven.tile_status(),
+            "a tile eave cannot drive AT ALL and one it refuses to TRUST read identically, so \
+             the caption cannot tell a person which of the two they are looking at"
+        );
     }
 
     /// Every mark resolves. `icons` already proves each registered path

@@ -424,6 +424,26 @@ impl GrokSession {
 }
 
 #[async_trait]
+impl crate::provider::AgentAdapter for GrokSession {
+    const PROVIDER_ID: &'static str = "grok";
+
+    const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Verified {
+        evidence: "grok.rs `posture_refusal`: the ACP session's own `yolo` field is read off the \
+                   wire before the first tool call, and a session that reports `yolo: true` emits \
+                   PostureRefused and is killed. Slice AV verified denial is not advisory — a \
+                   denied write left the directory empty and the turn ended PermissionRejected. \
+                   NOTE: eave cannot FORCE Grok to ask (`grok agent stdio` takes no \
+                   --permission-mode), so this is verify-and-refuse, not verify-and-correct: a \
+                   machine with `permission_mode = \"always-approve\"` in ~/.grok/config.toml has \
+                   every session refused.",
+    };
+
+    fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
+        GrokSession::spawn(cfg)
+    }
+}
+
+#[async_trait]
 impl AgentSession for GrokSession {
     fn identity(&self) -> ProcIdentity {
         self.identity
@@ -1009,6 +1029,10 @@ impl GrokProto {
         let mut out = vec![SessionEvent::Init {
             session_id,
             permission_mode: Some(mode.to_string()),
+            // Empty is the honest answer, not a placeholder: this
+            // provider has announced no command inventory to eave.
+            // ACP's `availableCommands` is not read yet — see Not done.
+            slash_commands: Vec::new(),
         }];
         if let Some(refusal) = posture_refusal(Some(mode)) {
             out.push(refusal);
@@ -1023,6 +1047,10 @@ impl GrokProto {
             out.push(SessionEvent::Init {
                 session_id,
                 permission_mode: None,
+                // Empty is the honest answer, not a placeholder: this
+                // provider has announced no command inventory to eave.
+                // ACP's `availableCommands` is not read yet — see Not done.
+                slash_commands: Vec::new(),
             });
         }
         out.extend(posture_refusal(None));
@@ -1439,6 +1467,7 @@ mod tests {
             [SessionEvent::Init {
                 session_id,
                 permission_mode,
+                ..
             }, SessionEvent::PostureRefused { mode, reason }] => {
                 assert_eq!(session_id, SESSION_ID);
                 assert_eq!(permission_mode.as_deref(), Some("always-approve"));
@@ -1460,6 +1489,7 @@ mod tests {
             [SessionEvent::Init {
                 session_id,
                 permission_mode,
+                ..
             }] => {
                 assert_eq!(session_id, SESSION_ID);
                 assert_eq!(permission_mode.as_deref(), Some("default"));

@@ -1318,6 +1318,10 @@ impl Reader {
             self.emit(SessionEvent::Init {
                 session_id,
                 permission_mode: mode,
+                // Empty is the honest answer, not a placeholder: this
+                // provider has announced no command inventory to eave.
+                // ACP's `availableCommands` is not read yet — see Not done.
+                slash_commands: Vec::new(),
             })
             .await;
             let reason = match &refusal {
@@ -1350,6 +1354,10 @@ impl Reader {
             self.emit(SessionEvent::Init {
                 session_id,
                 permission_mode: mode.clone(),
+                // Empty is the honest answer, not a placeholder: this
+                // provider has announced no command inventory to eave.
+                // ACP's `availableCommands` is not read yet — see Not done.
+                slash_commands: Vec::new(),
             })
             .await;
             self.emit(SessionEvent::PostureRefused {
@@ -1363,6 +1371,10 @@ impl Reader {
         self.emit(SessionEvent::Init {
             session_id: session_id.clone(),
             permission_mode: mode,
+            // Empty is the honest answer, not a placeholder: this
+            // provider has announced no command inventory to eave.
+            // ACP's `availableCommands` is not read yet — see Not done.
+            slash_commands: Vec::new(),
         })
         .await;
         let _ = self.shared.ready.send(Handshake::Verified(session_id));
@@ -1421,6 +1433,28 @@ fn json_id_from_key(key: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::provider::AgentAdapter for HermesSession {
+    const PROVIDER_ID: &'static str = "hermes";
+
+    const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Verified {
+        evidence: "hermes.rs: posture is proven TWICE per spawn — `modes.currentModeId` read off \
+                   the ACP wire, plus two dangerous canaries through `hermes approvals test` (a \
+                   dry-run evaluator that never executes), which is the only check that can see a \
+                   bypass living in config or env. Slice AW proved `--ignore-user-config` does NOT \
+                   close the approval bypass — the gate reads a different config loader — so the \
+                   canary is load-bearing. LIMITS, stated because Verified is binary and this is \
+                   not parity with Claude: the guard is pattern-based, so it asks on `rm -rf` and \
+                   ALLOWS `cat ~/.ssh/id_rsa`; Hermes stops waiting after 60s and denies on its \
+                   own; and ACP carries no free text on the response, so the operator's deny \
+                   message never reaches the model.",
+    };
+
+    fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
+        HermesSession::spawn(cfg)
+    }
+}
 
 #[async_trait]
 impl AgentSession for HermesSession {

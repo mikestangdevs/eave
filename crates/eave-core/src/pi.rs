@@ -538,6 +538,28 @@ impl PiSession {
 }
 
 #[async_trait]
+impl crate::provider::AgentAdapter for PiSession {
+    const PROVIDER_ID: &'static str = "pi";
+
+    const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Verified {
+        evidence: "pi.rs: Pi has NO permission system of its own — Slice AX measured a bare \
+                   `pi --mode rpc` executing a shell write with zero approval traffic. eave \
+                   INSTALLS one: a TypeScript gate on Pi's `tool_call` hook, written \
+                   content-addressed to temp and loaded with -e, and the session refuses to send \
+                   any prompt unless `get_commands` proves the gate loaded FROM THE EXACT PATH \
+                   eave wrote (name alone would let another extension spoof it). \
+                   `await_posture` is fail-closed on all four paths: verified, refused, timeout, \
+                   and channel-closed. KNOWN GAP: Pi's RPC has an ungated shell escape — \
+                   `{\"type\":\"bash\"}` dispatches as `user_bash`, not `tool_call`, so the gate \
+                   cannot see it. eave never sends it.",
+    };
+
+    fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
+        PiSession::spawn(cfg)
+    }
+}
+
+#[async_trait]
 impl AgentSession for PiSession {
     fn identity(&self) -> ProcIdentity {
         self.identity
@@ -1034,6 +1056,10 @@ impl PiStream {
         vec![SessionEvent::Init {
             session_id,
             permission_mode: Some(GATE_POSTURE.into()),
+            // Empty is the honest answer, not a placeholder: this
+            // provider has announced no command inventory to eave.
+            // Pi's `get_commands` is read for the gate proof, not for the palette.
+            slash_commands: Vec::new(),
         }]
     }
 
@@ -1225,6 +1251,10 @@ mod tests {
             vec![SessionEvent::Init {
                 session_id: "eave-abc-123".into(),
                 permission_mode: Some("eave-gate".into()),
+                // Empty is the honest answer, not a placeholder: this
+                // provider has announced no command inventory to eave.
+                // Pi's `get_commands` is read for the gate proof, not for the palette.
+                slash_commands: Vec::new(),
             }]
         );
     }

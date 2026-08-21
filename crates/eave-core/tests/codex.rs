@@ -879,6 +879,7 @@ async fn the_real_app_server_reports_the_posture_eave_requires() {
     let SessionEvent::Init {
         session_id,
         permission_mode,
+        ..
     } = events.last().unwrap().clone()
     else {
         unreachable!()

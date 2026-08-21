@@ -213,18 +213,22 @@ adapters! {
     // Claude Code — the reference adapter. Slice K's posture proof.
     crate::claude::ClaudeCodeSession,
 
-    // The four below are being written in parallel (Slices AT/codex,
-    // AT/grok, AT/hermes, AT/pi). Each lands as
-    // `crates/eave-core/src/<id>.rs`, adds its `pub mod` to `lib.rs`, and
-    // uncomments its own line here. Nothing else.
+    // Slices AU/AV/AW/AX, integrated 2026-08-20. Each declares its own
+    // POSTURE, and three of the four are Verified by a runtime check that
+    // refuses the session rather than by a claim in this table. Read the
+    // evidence strings: they are not equivalent to Claude's, and two of
+    // them name real gaps.
+    //
+    // Codex is registered but POSTURE is Unproven ON PURPOSE — the adapter
+    // is complete and its tile stays dark, because nobody has ever watched
+    // Codex ask. Slice AU requested that and it is honoured here.
+    crate::codex::CodexSession,
 
-    // crate::codex::CodexSession,
+    crate::grok::GrokSession,
 
-    // crate::grok::GrokSession,
+    crate::hermes::HermesSession,
 
-    // crate::hermes::HermesSession,
-
-    // crate::pi::PiSession,
+    crate::pi::PiSession,
 }
 
 /// The adapter for a provider id, or `None` if eave cannot drive it.

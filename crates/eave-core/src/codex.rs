@@ -433,6 +433,26 @@ fn no_thread() -> SessionError {
 }
 
 #[async_trait]
+impl crate::provider::AgentAdapter for CodexSession {
+    const PROVIDER_ID: &'static str = "codex";
+
+    const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Unproven {
+        reason: "the Codex adapter checks the app-server's own `approvalPolicy`, \
+                 `approvalsReviewer` and `sandbox.type` on every spawn and refuses fail-closed \
+                 otherwise — but NOBODY HAS EVER WATCHED CODEX ASK. `codex login status` reports \
+                 `Not logged in` on the machine this was built on, so every turn 401'd and the \
+                 approval round trip is schema-derived, never observed. Slice AU asked for this \
+                 to stay Unproven until one real approval is captured; honour that before \
+                 flipping it, and note `sandbox: \"read-only\"` is load-bearing — under \
+                 `workspace-write` the agent writes inside the cwd with NO request at all.",
+    };
+
+    fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
+        CodexSession::spawn(cfg)
+    }
+}
+
+#[async_trait]
 impl AgentSession for CodexSession {
     fn identity(&self) -> ProcIdentity {
         self.identity
@@ -880,6 +900,10 @@ impl CodexProtocol {
         let init = SessionEvent::Init {
             session_id: id.clone(),
             permission_mode: Some(mode.clone()),
+            // Empty is the honest answer, not a placeholder: this
+            // provider has announced no command inventory to eave.
+            // the app-server's command list is not read yet — see Not done.
+            slash_commands: Vec::new(),
         };
         if let Some(refusal) = posture_refusal(policy, reviewer, sandbox, &mode) {
             // The Init is still emitted: what the CLI said it was doing is

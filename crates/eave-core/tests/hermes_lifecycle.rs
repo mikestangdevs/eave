@@ -168,6 +168,7 @@ async fn a_new_session_discovers_the_id_hermes_minted() {
     let SessionEvent::Init {
         session_id,
         permission_mode,
+        ..
     } = events.last().unwrap()
     else {
         unreachable!()
@@ -885,6 +886,7 @@ async fn live_hermes_acp_opens_a_session_in_the_asking_mode() {
         SessionEvent::Init {
             session_id,
             permission_mode,
+            ..
         } => {
             assert_eq!(
                 permission_mode.as_deref(),
