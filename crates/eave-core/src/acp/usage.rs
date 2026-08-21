@@ -51,16 +51,24 @@ pub fn from_prompt_response(result: Option<&Value>) -> Option<SessionEvent> {
         .get("usage")
         .or_else(|| result.pointer("/_meta/usage"))
         .or_else(|| result.get("_meta"))?;
-    let count = |keys: [&str; 2]| {
+    let count = |keys: &[&str]| {
         keys.iter()
             .find_map(|k| usage.get(*k))
             .and_then(Value::as_u64)
     };
     let turn = TurnTokens::stated(
-        count(["inputTokens", "input_tokens"]),
-        count(["outputTokens", "output_tokens"]),
-        count(["cachedReadTokens", "cached_read_tokens"]),
-        count(["cachedWriteTokens", "cached_write_tokens"]),
+        count(&["inputTokens", "input_tokens"]),
+        count(&["outputTokens", "output_tokens"]),
+        count(&["cachedReadTokens", "cached_read_tokens"]),
+        // Grok spells the write bucket `cacheCreationTokens` on the
+        // frames verified live at 1.0.5 and `cachedWriteTokens` on the
+        // ACP-generic path. Both are read so a STATED zero — which is a
+        // fact about the turn — is not lost to a spelling.
+        count(&[
+            "cachedWriteTokens",
+            "cached_write_tokens",
+            "cacheCreationTokens",
+        ]),
     )?;
     Some(SessionEvent::TokenUsage {
         turn: Some(turn),

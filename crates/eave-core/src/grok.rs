@@ -692,7 +692,27 @@ impl GrokProto {
                 }
                 out
             }
-            _ => Vec::new(),
+            // Everything else Grok pushes, recorded verbatim.
+            //
+            // This was `Vec::new()` — a silent drop — and the live probe
+            // (2026-08-20, grok 1.0.5) is what exposed it: `strings` over
+            // the shipped binary names **204** distinct `_x.ai/...`
+            // methods and this adapter handles two, so ~202 vendor
+            // notifications were being discarded without a record.
+            // Confirmed on real bytes: `_x.ai/task_backgrounded` and
+            // `_x.ai/task_completed` — Grok's background-work lifecycle,
+            // the frames that answer whether it self-starts — produced
+            // NOTHING at all, not even an unknown.
+            //
+            // Every other adapter in this crate already records what it
+            // does not understand (`claude.rs` `System`/`Unknown`,
+            // `codex.rs` `foreign_thread:` since slice CH), and
+            // `events.rs` states the contract on `Unknown`: "Surfaced,
+            // never fatal". Grok was the one that did not.
+            other => vec![SessionEvent::System {
+                subtype: other.to_string(),
+                raw: line.to_string(),
+            }],
         }
     }
 
@@ -1519,5 +1539,91 @@ mod tests {
             matches!(events.as_slice(), [SessionEvent::TextDelta { .. }]),
             "a lowered gate lets the agent's last words through, got {events:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The live self-start capture (grok 1.0.5, probe 2026-08-20).
+
+    fn selfstart_capture() -> String {
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/grok-selfstart-1.0.5.jsonl"
+        );
+        std::fs::read_to_string(p).expect("fixture")
+    }
+
+    /// **The settled prompt response bills the WHOLE turn**, verified
+    /// live at grok 1.0.5.
+    ///
+    /// This test was written to prove the opposite and disproved itself,
+    /// which is why it is worth keeping. The response `_meta` carries
+    /// BOTH `inputTokens: 18431` — the last model call — and
+    /// `_meta.usage.inputTokens: 53677` with `modelCalls: 3`, the turn.
+    /// Slice CC's fallback chain reads `_meta.usage` first, so it was
+    /// already correct; reading `_meta` directly would under-report this
+    /// turn by 2.9x, and by more the more model calls it made.
+    ///
+    /// What the probe DID find: Grok spells the cache-write bucket
+    /// `cacheCreationTokens` here, where the ACP-generic path spells it
+    /// `cachedWriteTokens`. The stated zero was being dropped.
+    #[test]
+    fn the_settled_response_bills_the_whole_turn_not_its_last_model_call() {
+        let mut h = Harness::opened();
+        let mut billed = Vec::new();
+        for line in selfstart_capture().lines() {
+            for ev in h.feed(line).0 {
+                if let SessionEvent::TokenUsage { turn: Some(t), .. } = ev {
+                    billed.push(t);
+                }
+            }
+        }
+        assert_eq!(billed.len(), 1, "one turn, one bill: {billed:?}");
+        let t = billed[0];
+        assert_eq!(t.input, Some(53_677), "the whole turn, not its last call");
+        assert_eq!(t.output, Some(292));
+        assert_eq!(t.cache_read, Some(46_848));
+        // Grok spells the write bucket `cacheCreationTokens` here and
+        // `cachedWriteTokens` on the ACP path; a zero it STATED is not the
+        // same as a silence.
+        assert_eq!(
+            t.cache_write,
+            Some(0),
+            "a zero Grok STATED is not the same as a silence"
+        );
+        assert_ne!(
+            t.input,
+            Some(18_431),
+            "18,431 is the response `_meta` — the last model call only"
+        );
+    }
+
+    /// Grok pushes `task_backgrounded` / `task_completed` for work it puts
+    /// in the background — verified live; the pair is absent from every
+    /// capture in comet and was recorded as UNKNOWN until this probe.
+    ///
+    /// In THIS capture both land inside the turn, because the backgrounded
+    /// command was an `echo` that finished immediately. A long-running one
+    /// would outlive `turn_completed`, which is the shape slice CF's
+    /// `Unannounced` exists for. eave records both verbatim today and
+    /// opens no turn from them — stated here so the gap is a decision
+    /// with a test, not an oversight.
+    #[test]
+    fn grok_pushes_its_background_task_lifecycle_and_eave_records_it() {
+        let mut h = Harness::opened();
+        let (mut backgrounded, mut completed) = (0, 0);
+        for line in selfstart_capture().lines() {
+            for ev in h.feed(line).0 {
+                if let SessionEvent::System { subtype, .. } = &ev {
+                    if subtype.contains("task_backgrounded") {
+                        backgrounded += 1;
+                    }
+                    if subtype.contains("task_completed") {
+                        completed += 1;
+                    }
+                }
+            }
+        }
+        assert!(backgrounded > 0, "the backgrounding push must be recorded");
+        assert!(completed > 0, "the completion push must be recorded");
     }
 }
