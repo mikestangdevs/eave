@@ -9283,7 +9283,7 @@ pub fn run(data_dir: PathBuf) -> ! {
             // initialisation touches `NSApp` and expects the one the
             // subclass installed; BEFORE the window exists, because the
             // first tab snapshot can arrive as soon as the feed connects.
-            let web = crate::web::initialize();
+            let web = crate::web::initialize(&data_dir);
 
             let shell = bootstrap(
                 cx,

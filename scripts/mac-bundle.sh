@@ -155,7 +155,18 @@ cef_check_pin() {
     if [[ "$bad" == 0 ]]; then
       echo "  ✓ lockfile cef + cef-dll-sys = $want"
     else
-      echo "    fix: cargo update -p cef -p cef-dll-sys --precise $want" >&2
+      # TWO INVOCATIONS, not one. `cargo update -p cef -p cef-dll-sys
+      # --precise <v>` moves `cef` and leaves `cef-dll-sys` where it was,
+      # silently and with exit 0 — measured on this lockfile in Slice C3,
+      # which is how the product build ended up half-pinned. `--precise`
+      # applies to the resolution as a whole, and once `cef` is settled
+      # `cef-dll-sys` is already "compatible" and never reconsidered.
+      # Whoever reads this line is fixing a broken pin; give them the
+      # command that actually fixes it.
+      local dir; dir="$(dirname "$lock")"
+      echo "    fix: (cd $dir &&" >&2
+      echo "          cargo update -p cef --precise $want &&" >&2
+      echo "          cargo update -p cef-dll-sys --precise $want)" >&2
       fail=1
     fi
   fi

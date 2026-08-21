@@ -2,10 +2,16 @@
 # Build and assemble a runnable macOS .app. ONE command: it runs cargo
 # itself, so there is no build step to forget and no order to get wrong.
 #
-#     scripts/bundle-app.sh                     # debug eave.app
-#     scripts/bundle-app.sh --release
+#     scripts/bundle-app.sh                     # debug eave.app, no browser
+#     scripts/bundle-app.sh --features web      # …with Chromium inside it
+#     scripts/bundle-app.sh --release --features web
 #     scripts/bundle-app.sh cef-osr-spike       # the CEF spike's app
 #     scripts/bundle-app.sh --out /tmp/x eave
+#
+# `--features web` is what makes eave a browser. It is not a default because
+# the `web` feature drags a 343 MB Chromium download into any build that has
+# it, and `cargo test` must not need Chromium to run 850 tests about session
+# state. So the browser is opt-in at the build, and this flag is the opt-in.
 #
 # WHY A BUNDLE STEP EXISTS NOW. Until CEF, `cargo build` produced something
 # you could run — target/debug/eave opened a window. With CEF in the binary it
@@ -31,37 +37,61 @@ command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 PROFILE=debug
 OUT=""
 TARGET=eave
+FEATURES=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release) PROFILE=release; shift ;;
     --debug)   PROFILE=debug; shift ;;
     --out)     OUT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    --features) FEATURES="$2"; shift 2 ;;
+    --features=*) FEATURES="${1#*=}"; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     -*)        echo "bundle-app: unknown flag $1" >&2; exit 2 ;;
     *)         TARGET="$1"; shift ;;
   esac
 done
 
+# Does the requested feature list turn the browser on? Matched as a whole
+# word inside a comma/space list, so `web` hits and `webview` would not.
+case ",${FEATURES// /,}," in
+  *,web,*) WANT_WEB=1 ;;
+  *)       WANT_WEB=0 ;;
+esac
+
 # The target table.
 #
-# NEEDS_CEF is the whole difference. eave is 0 today and becomes 1 the moment
-# eave-app links cef — at which point it gets the framework and the five
-# helpers with no other change here, because the helper identifiers are
-# derived from whatever CFBundleIdentifier the app's own plist declares.
+# NEEDS_CEF is the whole difference: it decides whether the 317 MB framework
+# and the five helper bundles are assembled. For `eave` it is no longer a
+# constant — C2 wrote it as 0 with a note saying it "becomes 1 the moment
+# eave-app links cef", and C1 then made linking cef a per-build choice rather
+# than a property of the tree. So it tracks the feature: an eave built
+# without `web` has no CEF in the binary and must NOT get a framework (317 MB
+# of Chromium beside a binary that never calls it), and an eave built with
+# `web` must, or it dies inside CefInitialize.
 case "$TARGET" in
   eave)
     MANIFEST="Cargo.toml"
     CARGO_ARGS=(-p eave-app)
     BIN="eave"
-    HELPER_BIN=""
+    NEEDS_CEF="$WANT_WEB"
+    # The helper is a SEPARATE BINARY, and it only exists behind the feature
+    # (`required-features = ["web"]` in eave-app's manifest). Naming it when
+    # the feature is off would ask cargo to build a bin it will not emit.
+    if [[ "$WANT_WEB" == 1 ]]; then
+      HELPER_BIN="eave-web-helper"
+      # English.lproj/InfoPlist.strings lives here. CEF's own resources come
+      # from inside the framework, not from this directory.
+      RESOURCES="crates/eave-app/resources/mac"
+    else
+      HELPER_BIN=""
+      RESOURCES=""
+    fi
     # eave's plist is hand-written and carries its own reasoning (the
     # identifier note in particular). It is a template, not a generated file,
     # and this script substitutes into it rather than replacing it.
     PLIST_TEMPLATE="dist/macos/Info.plist"
-    RESOURCES=""
     ICON_PNG="dist/macos/icon-1024.png"
     ICNS_NAME="eave.icns"
-    NEEDS_CEF=0
     ;;
   cef-osr-spike)
     MANIFEST="spike/cef-osr/Cargo.toml"
@@ -108,6 +138,17 @@ fi
 echo "── build ($PROFILE) ──"
 BUILD_FLAGS=(--manifest-path "$MANIFEST" "${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}")
 [[ "$PROFILE" == release ]] && BUILD_FLAGS+=(--release)
+# THE FEATURES GO ON BOTH BINARIES. This is the whole of what Slice C1's
+# `scripts/package-web.sh` had that this did not, and the reason that script
+# existed at all. It drove cef-rs's `bundle-cef-app`, which builds the helper
+# itself with a hard-coded `cargo build --bin <helper>` and no way to pass
+# `--features` — so C1 wrapped cargo in a shim that spliced the flag back in.
+# No shim is needed here, because this script runs cargo directly and can
+# simply pass the flag; the shim was a workaround for a bundler we no longer
+# use. What had to survive is the RULE: a helper built without `--features
+# web` is not a CEF helper, it is a binary that exits immediately, and the
+# app it serves shows a permanently blank page with nothing in any log.
+[[ -n "$FEATURES" ]] && BUILD_FLAGS+=(--features "$FEATURES")
 cargo build "${BUILD_FLAGS[@]}" --bin "$BIN"
 [[ -n "$HELPER_BIN" ]] && cargo build "${BUILD_FLAGS[@]}" --bin "$HELPER_BIN"
 

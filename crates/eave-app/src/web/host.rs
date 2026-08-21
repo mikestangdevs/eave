@@ -423,7 +423,7 @@ fn load_framework() -> bool {
     if !loader.load() {
         eprintln!(
             "eave: no Chromium framework beside the binary — eave must run from \
-             inside its .app (scripts/package-web.sh assembles one)"
+             inside its .app (scripts/bundle-app.sh --features web assembles one)"
         );
         return false;
     }
@@ -436,18 +436,35 @@ fn load_framework() -> bool {
 
 /// Start CEF in this (browser) process. Returns whether a page engine is
 /// now running.
-pub fn initialize() -> bool {
+pub fn initialize(data_dir: &std::path::Path) -> bool {
     if DISABLED.load(Ordering::SeqCst) || !load_framework() {
         return false;
     }
     open_pump_channel();
     let args = args::Args::new();
     let mut app = EaveCefApp::new();
+
+    // WHERE CHROMIUM KEEPS ITS STATE. Unset, CEF picks a process-global
+    // temporary directory, warns about it on every single launch, and — the
+    // part that actually matters — gives two eave instances the SAME one.
+    // Chromium takes an exclusive lock on its cache root, so the second
+    // instance does not get a degraded browser, it gets no browser at all.
+    // eave already has a per-instance data dir (that is what `--data-dir`
+    // and `EAVE_DATA_DIR` are for, and what the test harness leans on to run
+    // instances side by side), so pointing CEF at a subdirectory of it makes
+    // the browser follow the same rule as the rest of eave's state.
+    //
+    // `browser/chromium` rather than `browser/`, because `browser/` is
+    // already where the tab and history journals live and Chromium treats
+    // its cache root as territory it owns.
+    let cache = data_dir.join("browser").join("chromium");
+    let _ = std::fs::create_dir_all(&cache);
     let settings = Settings {
         no_sandbox: 1,
         windowless_rendering_enabled: 1,
         // gpui owns [NSApp run]; CEF gets pumped instead of running its own.
         external_message_pump: 1,
+        root_cache_path: cache.to_string_lossy().as_ref().into(),
         ..Default::default()
     };
     let ok = cef::initialize(

@@ -87,7 +87,7 @@ pub fn install_nsapp() {}
 
 /// Start CEF. Returns whether a page engine is now running.
 #[cfg(not(feature = "web"))]
-pub fn initialize() -> bool {
+pub fn initialize(_data_dir: &std::path::Path) -> bool {
     false
 }
 

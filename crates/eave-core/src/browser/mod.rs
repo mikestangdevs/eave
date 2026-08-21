@@ -1,15 +1,22 @@
 //! Browser state: tabs, groups, bookmarks, history.
 //!
 //! **Data only.** Nothing here fetches a page, renders one, or knows which
-//! engine will. Every page fact arrives as an event that something else
+//! engine does. Every page fact arrives as an event that something else
 //! states, which is the point: this is the half of a browser that does not
-//! care whether Chromium, WebKit, or a wry webview wins the spike.
+//! care what draws the page.
+//!
+//! The spike it was written not to prejudge has since been decided —
+//! Chromium via CEF, off-screen, in `eave-app/src/web/` — and this module
+//! did not change to accommodate it, which is the strongest evidence the
+//! separation was real rather than decorative.
 //!
 //! # Layout on disk
 //! ```text
 //! <data_dir>/browser/tabs.jsonl        session restore: tabs, groups, ordering
 //! <data_dir>/browser/bookmarks.jsonl   the hierarchy
 //! <data_dir>/browser/history.jsonl     the visit log
+//! <data_dir>/browser/chromium/         CEF's own cache root — NOT ours, and
+//!                                      not a journal; see web/host.rs
 //! ```
 //!
 //! Three files, not one, and the reason is that they have three different
