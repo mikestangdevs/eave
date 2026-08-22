@@ -10308,3 +10308,53 @@ fn widening_the_rail_costs_the_content_and_nothing_else(cx: &mut TestAppContext)
          the inset card A′ deleted, creeping back in as a rounding error"
     );
 }
+
+/// **A build with no page engine closes the fact channel on the first poll,
+/// and that closure must not be read as a signal.**
+///
+/// This is the trigger for "eave renders no tabs at all" — the defect Slice
+/// D1 photographed, verified against `main`, and filed as unexplained, and
+/// which Slice D3 traced end to end.
+///
+/// The subscription task in `feed_loop` selects over two channels: the tab
+/// snapshots coming from the engine, and the facts a page reports on its way
+/// back. Its fact arm used to `return` on `None`. `None` on an
+/// `UnboundedReceiver` means only "every sender has been dropped" — and in a
+/// build without `--features web` that is true *immediately*, because this
+/// sink is the one below and it takes the sender by value with nothing to
+/// hold it. So the task ended before its first `select!` could favour the
+/// other arm, `rx` was dropped with it, and the engine's first tab snapshot
+/// arrived at a dead receiver. The client's read loop found the stream,
+/// failed to send, removed the subscription, and discarded every later
+/// snapshot against an absent entry — silently, at a layer with no logging.
+/// The engine was reporting `run_tabs order=9 sent_ok=true` the whole time.
+///
+/// The fix is a guard on that arm, which retires it instead of returning.
+/// **This test pins the TRIGGER rather than the fix**, deliberately: the
+/// guard lives in a spawned async task inside `feed_loop` and this harness
+/// drives the shell through `Plumbing` fakes that never build a `Client`, so
+/// there is no seam here to assert it through. What this holds is the fact
+/// that made the guard necessary — so that a later tidy-up which makes this
+/// sink *hold* its sender cannot quietly remove the reason the guard is
+/// there, and so that anyone who deletes the guard finds this explanation
+/// attached to the thing that will bite them.
+///
+/// Verified in the product rather than here: with the guard, the strip
+/// renders seven tabs and the pane header states an address
+/// (`docs/shots/d3-rail-rest.png`); without it, both are empty.
+#[cfg(not(feature = "web"))]
+#[gpui::test]
+fn a_build_with_no_page_engine_closes_the_fact_channel_at_once(_cx: &mut TestAppContext) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::web::Fact>();
+    crate::web::install_fact_sink(tx);
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "this build's fact sink now keeps its sender alive. That is not a \
+         bug, but the tab subscription's fact arm is guarded on the \
+         assumption that a closed channel is NORMAL here rather than fatal \
+         — read that guard before relying on this staying open."
+    );
+}

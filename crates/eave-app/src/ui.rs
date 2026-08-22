@@ -629,6 +629,8 @@ async fn feed_loop(
                 // not a capture of anything. It is also what makes the
                 // screenshot in the slice report reproducible.
                 let mut boot_url = std::env::var("EAVE_WEB_AT_BOOT").ok();
+                // Whether any page can still report. See the `fact` arm.
+                let mut facts_open = true;
                 loop {
                     if let Some(url) = boot_url.clone() {
                         // Only once, and only if nothing is there: a
@@ -682,13 +684,41 @@ async fn feed_loop(
                         // reports, not requests, and sending them as
                         // requests is precisely the double-journal Slice
                         // B1 warned about.
-                        fact = fact_rx.recv() => match fact {
+                        //
+                        // **The guard is the fix for "eave renders no tabs
+                        // at all" (Slice D3).** This arm used to `return` on
+                        // `None`, and `None` here means only "every sender
+                        // is gone" — which in a build without `--features
+                        // web` is true on the FIRST poll, because that
+                        // build's `install_fact_sink` takes the sender and
+                        // drops it (nothing reports, so there is nothing to
+                        // hold). So the task returned immediately, `rx` went
+                        // with it, and the engine's first tab snapshot
+                        // arrived at a dropped receiver: the client's read
+                        // loop found the stream, failed to send, and removed
+                        // the subscription. Every later snapshot was
+                        // discarded against `pending=None`, silently, at a
+                        // layer with no logging.
+                        //
+                        // Traced end to end before it was believed: the
+                        // engine reported `run_tabs id=4 order=9
+                        // sent_ok=true` five times over while the app
+                        // reported `watch_tabs ok=true` and nothing after
+                        // it. Slice D1 saw the symptom, checked that the
+                        // journal held twelve tabs and that `main` did the
+                        // same thing, and filed it as unexplained.
+                        //
+                        // A closed fact channel means "no page will ever
+                        // report", not "stop watching the strip". The guard
+                        // retires the arm and leaves the loop alive.
+                        fact = fact_rx.recv(), if facts_open => match fact {
                             Some((tab_id, fact)) => {
                                 let _ = client
                                     .browser_do(eave_wire::Request::TabStated { tab_id, fact })
                                     .await;
                             }
-                            None => return,
+                            // Not `return`. See above.
+                            None => facts_open = false,
                         },
                     }
                 }
