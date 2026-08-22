@@ -1358,7 +1358,29 @@ pub const RAIL_TABS_VISIBLE: usize = 9;
 /// The OPEN section's height cap: [`RAIL_TABS_VISIBLE`] rows and the gaps
 /// **between** them, which is one fewer gap than rows.
 pub fn rail_tabs_max_h() -> f32 {
-    let n = RAIL_TABS_VISIBLE as f32;
+    rail_tabs_h(RAIL_TABS_VISIBLE)
+}
+
+/// The OPEN section's height for `n` tabs — the exact height, capped at
+/// [`RAIL_TABS_VISIBLE`].
+///
+/// **It has to be definite, and that is a layout fact rather than a
+/// preference.** The section is a scroll container, and a scroll container's
+/// automatic minimum size is zero: given only a `max_h` it collapses to
+/// nothing and the strip renders as an empty header. Slice D1 shipped exactly
+/// that for one commit, and the harness could not see it — with nine tabs the
+/// content measures `rail_tabs_max_h()` precisely, so the box came out the
+/// right size for the wrong reason and every containment assertion passed. It
+/// took a screenshot with twelve tabs in the journal to catch it.
+///
+/// Zero rows gives zero height rather than one row of empty box, so a rail
+/// with nothing open shows a header and no gap under it.
+pub fn rail_tabs_h(n: usize) -> f32 {
+    let n = n.min(RAIL_TABS_VISIBLE);
+    if n == 0 {
+        return 0.0;
+    }
+    let n = n as f32;
     RAIL_TAB_H * n + TAB_GAP * (n - 1.0)
 }
 

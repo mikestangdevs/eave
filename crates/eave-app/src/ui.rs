@@ -6111,7 +6111,17 @@ impl Shell {
                     // pretending to be a product change.
                     .debug_selector(|| "tab-strip".into())
                     .w_full()
-                    .max_h(px(theme::rail_tabs_max_h()))
+                    // **A DEFINITE height, not a `max_h`.** This is a scroll
+                    // container, and a scroll container's automatic minimum
+                    // size is zero — so `max_h` alone let it collapse to
+                    // nothing. The harness did not catch it: nine tabs
+                    // measure exactly `rail_tabs_max_h()`, so the box came
+                    // out the right size for the wrong reason and every
+                    // containment assertion passed. It took a capture with
+                    // twelve tabs in the journal and an empty OPEN section on
+                    // screen to see it — the render-vs-measure gap the
+                    // webview spike named, arriving from the other side.
+                    .h(px(theme::rail_tabs_h(rows.len())))
                     .overflow_y_scroll()
                     .track_scroll(&self.tabs_scroll)
                     // Same reason the horizontal strip stopped propagation:
