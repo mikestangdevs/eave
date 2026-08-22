@@ -277,10 +277,12 @@ const QUIET_MS: u64 = 100;
 /// give. It claimed CEF "calls it exactly once, ever. Measured, not
 /// inferred", and that was the whole justification for the timer. C6
 /// re-measured: a thirty-second run logs `schedule #0` through `#24`, which
-/// is the trace's own cap, so the true count is *at least* 25. The once-ever
-/// number was an artefact of the bug it was recorded alongside — the `App`
-/// object was being dropped after `initialize`, taking the handler with it,
-/// which is fixed and documented above.
+/// is the trace's own cap, so the true count is *at least* 25 — see
+/// [`TRACE_CAP`], which now says so in the log rather than leaving the next
+/// reader to find it here. The once-ever number was an artefact of the bug it
+/// was recorded alongside — the `App` object was being dropped after
+/// `initialize`, taking the handler with it, which is fixed and documented
+/// above.
 ///
 /// What IS true, and what the heartbeat is actually for, is the next
 /// paragraph's problem: **CEF suppresses `OnScheduleMessagePumpWork` for the
@@ -314,7 +316,11 @@ pub fn start_pump(cx: &mut gpui::App) {
         loop {
             let ms = if super::tabs::any_browser() {
                 let quiet = now_ms() >= ACTIVE_UNTIL.load(Ordering::Relaxed);
-                if quiet { QUIET_MS } else { BUSY_MS }
+                if quiet {
+                    QUIET_MS
+                } else {
+                    BUSY_MS
+                }
             } else {
                 IDLE_MS
             };
@@ -356,7 +362,7 @@ pub fn start_pump(cx: &mut gpui::App) {
                 // the quit observer can close browsers and call `CefShutdown`
                 // legally. Keep pumping afterwards — the deferred block is
                 // main-queue work like any other and still has to be run.
-                let _ = cx.update(|app| app.quit());
+                cx.update(|app| app.quit());
             }
             pump_cef();
             refresh_if_painted(cx);
@@ -417,9 +423,7 @@ static REQUESTED_DURING_PUMP: AtomicBool = AtomicBool::new(false);
 fn pump_cef() {
     if traced() {
         let n = PUMPS.fetch_add(1, Ordering::Relaxed);
-        if n < 25 {
-            eprintln!("[web] pump #{n}");
-        }
+        trace_capped("pump", n, format_args!(""));
     }
     IN_PUMP.store(true, Ordering::SeqCst);
     REQUESTED_DURING_PUMP.store(false, Ordering::SeqCst);
@@ -453,7 +457,41 @@ fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
     LAST_REFRESHED.store(seen, Ordering::Relaxed);
     // A page that is painting is a page that is doing something.
     note_activity();
-    let _ = cx.update(|app| app.refresh_windows());
+    cx.update(|app| app.refresh_windows());
+}
+
+/// How many `pump`/`schedule` lines the trace prints before it goes quiet.
+///
+/// The cap exists because both counters run at the heartbeat's rate and an
+/// uncapped trace is a log nobody reads. **What it must never be is silent**,
+/// which is what it was, and that silence has now produced two wrong
+/// conclusions from the same log:
+///
+///   * C6's predecessor read `schedule #0` with no more after it and wrote
+///     down "CEF calls `OnScheduleMessagePumpWork` exactly once, ever.
+///     Measured, not inferred" — the justification for the heartbeat, from a
+///     number the cap had truncated.
+///   * 2026-08-21, reading a blank-page capture: `pump #0 … pump #24` was
+///     read as "the pump starves at 25 in 14 s" and blamed on C7's interval
+///     logic. The true count that run was in the hundreds; the page was blank
+///     for another reason entirely, and the pump was never involved.
+///
+/// So the cap announces itself once, and [`shutdown`] prints the totals the
+/// counters actually hold. A truncated log that says it is truncated is a
+/// measurement; one that does not is a trap that reads as evidence.
+const TRACE_CAP: u64 = 25;
+
+/// One capped trace line. `extra` is appended verbatim after the counter.
+fn trace_capped(what: &str, n: u64, extra: std::fmt::Arguments<'_>) {
+    if n < TRACE_CAP {
+        eprintln!("[web] {what} #{n}{extra}");
+    } else if n == TRACE_CAP {
+        eprintln!(
+            "[web] {what}: {TRACE_CAP} lines is the trace cap — no more will be \
+             printed. The counter keeps running; the total is in the shutdown \
+             line. DO NOT read the last number above as a count."
+        );
+    }
 }
 
 /// `EAVE_WEB_TRACE`, read once. The pump asks on every turn and the shutdown
@@ -491,10 +529,14 @@ wrap_browser_process_handler! {
             // the predicate `stop_cef` shuts down on. See there.
             let n = SCHEDULES.fetch_add(1, Ordering::Relaxed);
             if traced() {
-                if n < 25 {
-                    eprintln!("[web] schedule #{n} delay={delay_ms} in_pump={}",
-                        IN_PUMP.load(Ordering::SeqCst));
-                }
+                trace_capped(
+                    "schedule",
+                    n,
+                    format_args!(
+                        " delay={delay_ms} in_pump={}",
+                        IN_PUMP.load(Ordering::SeqCst)
+                    ),
+                );
             }
             if IN_PUMP.load(Ordering::SeqCst) {
                 // Suppressed by CEF's own contract; `pump` re-posts on the
@@ -686,6 +728,14 @@ fn stop_cef(from_pump: bool) {
     }
     if trace {
         eprintln!("[web] shutdown: {pumps} pumps in {waited} ms, quiet={quiet}");
+        // The numbers the capped lines above are a prefix of. These are what
+        // "did the pump run?" is actually answered from.
+        eprintln!(
+            "[web] totals: {} pumps, {} schedules, {} frames delivered",
+            PUMPS.load(Ordering::Relaxed),
+            SCHEDULES.load(Ordering::Relaxed),
+            super::osr::frames_delivered(),
+        );
     }
     super::tabs::forget_all();
 
@@ -757,4 +807,3 @@ const SHUTDOWN_STEP_MS: u64 = 1;
 const SHUTDOWN_QUIET_ROUNDS: u32 = 50;
 /// How long `CefShutdown` gets before the watchdog exits the process anyway.
 const SHUTDOWN_DEADLINE_MS: u64 = 1500;
-
