@@ -1362,6 +1362,20 @@ pub fn rail_tabs_max_h() -> f32 {
     RAIL_TAB_H * n + TAB_GAP * (n - 1.0)
 }
 
+/// **The changes section's height cap (Slice D1).**
+///
+/// It shares the rail with the tab list and the session list now, so it is
+/// `flex_none` and bounded: a repo with two hundred changed files may not push
+/// the sessions off the bottom of the window. Eight rows plus the header and
+/// the footer fact, which is what a 760 px rail can give it once the OPEN
+/// section has taken [`rail_tabs_max_h`].
+///
+/// `FILES_RAIL_W` is retired with the column it sized — it was defined as
+/// `= RAIL_W`, and that symmetry is what made the window read as an IDE.
+pub fn files_section_max_h() -> f32 {
+    RAIL_LABEL_SLOT_H * 8.0 + SECTION_LINE + SMALL_LINE + SPACE_3 * 2.0
+}
+
 /// **The pane header (Slice D1): the one line that says what the content
 /// region is, and — for a page — where it is.**
 ///
@@ -1570,6 +1584,14 @@ pub const TAB_GAP: f32 = SPACE_1;
 // — statuses use the text tiers, counts use the existing success/danger
 // state colors; the add/remove diff washes are B2 tokens.
 
+/// **Retired by Slice D1 with the column it sized.**
+///
+/// It was `= RAIL_W`, and that literal symmetry — 248 left, 248 right, a
+/// document between them — is what made eave's silhouette an IDE rather than
+/// anything of its own. The changes list is a section of the one rail now.
+/// Kept as a definition and not a call site, so a slice that wants a second
+/// column back has to say so out loud.
+#[allow(dead_code)]
 pub const FILES_RAIL_W: f32 = RAIL_W;
 /// Fixed slot for the one-letter status glyph so paths align.
 pub const FILE_STATUS_W: f32 = 12.0;

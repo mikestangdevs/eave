@@ -9553,6 +9553,73 @@ fn the_rail_owns_the_left_edge_and_the_content_owns_the_rest(cx: &mut TestAppCon
     );
 }
 
+/// **There is one vertical band, not two.**
+///
+/// `FILES_RAIL_W` was defined as `= RAIL_W` — 248 left, 248 right, a document
+/// between them — and that literal symmetry is what made eave's silhouette an
+/// IDE rather than anything of its own. All three D1 frame proposals deleted
+/// the second column independently, which is the strongest signal in that
+/// paper: three different starting points agreeing is not taste.
+///
+/// Asserted as containment and as reach, so it cannot be satisfied by moving
+/// the column somewhere else on the right.
+#[gpui::test]
+fn the_changes_list_is_a_section_of_the_rail_not_a_second_column(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_files((
+        "aaaa1111".into(),
+        Some(FilesSnapshot {
+            state: GitState::Ok,
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Modified,
+                adds: Some(3),
+                dels: Some(1),
+                orig_path: None,
+                untracked: false,
+            }],
+            omitted: 0,
+            watching: true,
+            basis: DiffBasis::WorkingTree,
+        }),
+    ));
+    vcx.run_until_parked();
+
+    let rail = vcx.debug_bounds("rail").expect("the rail");
+    let files = vcx
+        .debug_bounds("files-section")
+        .expect("the changes section did not render");
+    let well = vcx
+        .debug_bounds("content-well")
+        .expect("the content region");
+
+    assert!(
+        files.origin.x >= rail.origin.x
+            && files.origin.x + files.size.width <= rail.origin.x + rail.size.width,
+        "the changes list runs {:?}..{:?} and the rail runs {:?}..{:?} — it is \
+         still a column of its own",
+        files.origin.x,
+        files.origin.x + files.size.width,
+        rail.origin.x,
+        rail.origin.x + rail.size.width
+    );
+    // ...and it is BELOW the session list it is about, not beside it.
+    let rows = vcx.debug_bounds("rail-rows").expect("the session list");
+    assert!(
+        files.origin.y >= rows.origin.y,
+        "the changes section sits above the sessions it describes"
+    );
+    // The content region reaches the window's right edge, which is the half
+    // that a merely-relocated column would fail.
+    let window = vcx.debug_bounds("shell-root").expect("the root");
+    assert_eq!(
+        well.origin.x + well.size.width,
+        window.origin.x + window.size.width,
+        "something is between the content region and the window's right edge"
+    );
+}
+
 /// A page tab takes the well from the transcript, and says which absence it
 /// is when nothing can draw the page.
 ///

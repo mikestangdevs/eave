@@ -7406,6 +7406,11 @@ impl Shell {
                 )
                 .fade_overflow_y(&self.rail_scroll),
             )
+            // Slice D1: the changes section, between the session list it is
+            // about and the resource line that aggregates over all of them.
+            // Collapsible from the pane header's trailing toggle, which is
+            // where the titlebar's `files-toggle` went.
+            .children((!self.files.read(cx).collapsed).then(|| self.files_rail(cx, phase)))
             // Stage L: the aggregate resource fact, under the list it
             // aggregates and outside the scroller — a ceiling the
             // operator has to scroll to find is a ceiling they meet by
@@ -7625,12 +7630,26 @@ impl Shell {
             }
             _ => None,
         };
-        // Rows on the bare glass ground, mirroring rail() — no plate.
+        // **Slice D1 — a SECTION of the rail, not a rail.**
+        //
+        // It was a second 248 px column on the right, `FILES_RAIL_W` defined
+        // literally as `= RAIL_W`, and that symmetry is what made the whole
+        // window read as an IDE: two panels docked either side of a document.
+        // All three frame proposals deleted it independently — the strongest
+        // signal in the D1 paper, because three different starting points
+        // agreeing is not taste.
+        //
+        // It keeps every fact and every affordance it had. What it loses is
+        // its own edge of the window and its own width; it is `flex_none`
+        // under the session list, capped, with its own scroller, so a repo
+        // with two hundred changed files cannot push the sessions off screen.
         div()
-            .w(px(theme::FILES_RAIL_W))
-            .h_full()
+            .debug_selector(|| "files-section".into())
+            .w_full()
             .flex_none()
-            .pr(px(theme::PLATE_MARGIN))
+            .max_h(px(theme::files_section_max_h()))
+            .border_t_1()
+            .border_color(theme::border())
             .flex()
             .flex_col()
             .child(
@@ -10732,7 +10751,6 @@ impl Render for Shell {
         // empty log (the Stage E cosmetic bug), only when follow is broken.
         let show_affordance = state.scroll != ScrollMode::Follow && !state.display.is_empty();
         let rail_collapsed = self.sessions.read(cx).collapsed;
-        let files_collapsed = self.files.read(cx).collapsed;
         let composer_text = self.composer.read(cx).text.clone();
         let has_draft = !composer_text.is_empty();
         let pending_here = self
@@ -11085,6 +11103,11 @@ impl Render for Shell {
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
         // This root bg is the glass ground.
         let root = div()
+            // Slice D1: tagged so a test can ask whether anything sits
+            // between the content region and the window's own edges — which
+            // is the question the whole frame turns on, and which no
+            // element-relative measurement can answer.
+            .debug_selector(|| "shell-root".into())
             .size_full()
             .flex()
             .flex_col()
@@ -11384,8 +11407,7 @@ impl Render for Shell {
                                     ),
                             )
                             .child(self.footer(cx)),
-                    )
-                    .when(!files_collapsed, |d| d.child(self.files_rail(cx, pulse))),
+                    ),
             )
             // Slice P1: the overlay layer mounts at the ROOT and nowhere
             // else — `deferred` fixes paint order, but layout stays where
