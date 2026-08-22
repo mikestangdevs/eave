@@ -20,11 +20,12 @@ use std::collections::HashMap;
 
 use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType};
 use gpui::{
-    div, prelude::*, App, Bounds, Element, ElementId, FocusHandle, GlobalElementId,
+    div, prelude::*, px, App, Bounds, Corners, Element, ElementId, FocusHandle, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
 };
 
 use super::{input, osr};
+use crate::theme;
 
 thread_local! {
     /// One focus handle per tab, kept across frames. A fresh handle every
@@ -73,9 +74,20 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let down_focus = focus.clone();
 
+    // What Chromium says the pointer should be over whatever is under it.
+    // Read at render because that is where gpui takes it; kept fresh by the
+    // pump's redraw gate, which now moves on a chrome change and not only on
+    // a delivered frame (`host::refresh_if_painted`). Without that, hovering
+    // a link on a page that is not repainting would set the cursor on the
+    // NEXT mouse move instead of this one.
+    let cursor = super::tabs::chrome(tab_id)
+        .map(|c| c.cursor)
+        .unwrap_or_default();
+
     Some(
         div()
             .size_full()
+            .cursor(cursor)
             .track_focus(&focus)
             .on_mouse_down(gpui::MouseButton::Left, move |ev, window, cx| {
                 // Focus first. A page that has never been clicked receives
@@ -231,7 +243,39 @@ impl Element for PageSurface {
         }
 
         if let Some(buffer) = osr::frame(&self.tab_id) {
-            window.paint_surface(bounds, buffer);
+            // Bottom corners match the card; the header owns the top of
+            // the card so the page's top edge is square against it.
+            window.paint_surface_with_corners(
+                bounds,
+                buffer,
+                Corners {
+                    top_left: px(0.),
+                    top_right: px(0.),
+                    bottom_right: px(theme::RADIUS_PANEL),
+                    bottom_left: px(theme::RADIUS_PANEL),
+                },
+            );
+        }
+
+        // A `<select>` dropdown, an autofill list, a colour picker.
+        //
+        // Chromium paints these as a SECOND surface with its own size and
+        // its own position inside the view, and eave used to drop them —
+        // so every `<select>` on the web opened a menu that could not be
+        // seen and still ate the next click. Painted after the page and at
+        // the rect CEF gave, which is already in view coordinates, so the
+        // element's own origin is the only conversion.
+        //
+        // Square corners, deliberately: this is a menu sitting ON the page,
+        // not the page itself, and rounding it to the card's radius would
+        // round a widget that Chromium already drew its own shadow and
+        // border into.
+        if let Some((buffer, rect)) = osr::popup(&self.tab_id) {
+            let at = Bounds {
+                origin: gpui::point(bounds.origin.x + px(rect.x), bounds.origin.y + px(rect.y)),
+                size: gpui::size(px(rect.width), px(rect.height)),
+            };
+            window.paint_surface(at, buffer);
         }
     }
 }

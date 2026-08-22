@@ -58,6 +58,38 @@ else
   bad "no Chromium Embedded Framework.framework in Contents/Frameworks"
 fi
 
+# DOES THE BINARY ACTUALLY CONTAIN A BROWSER?
+#
+# Everything above this line checks the SCAFFOLDING — the framework is
+# beside the binary, the helpers exist, the identifiers are distinct. None
+# of it looks at the binary, so a bundle assembled around an eave built
+# WITHOUT `--features web` passed every check and then showed a blank page.
+# That is not hypothetical: `target/` is shared, and this checkout has had
+# several concurrent cargo invocations in it — a peer running `cargo build`
+# or `cargo test` without the feature overwrites `target/debug/eave`
+# between this script's cargo step and its copy. The bundle then carries
+# 317 MB of Chromium beside a binary that cannot call it, and said
+# "eave.app is sound".
+#
+# `cef_load_library` is the marker because CEF is dlopened on macOS rather
+# than linked, so `otool -L` shows nothing either way; the loader symbol is
+# present only when the feature compiled it in. Checked ONLY when the
+# framework is there — a deliberately feature-off bundle is a real
+# configuration and must still verify.
+if [[ -d "$FW" ]]; then
+  # `strings | grep -q` would be wrong here: `grep -q` exits at the first
+  # match, `strings` takes SIGPIPE, and under `set -o pipefail` the pipeline
+  # reports failure *because* the marker was found. Count into a variable
+  # instead, so the pipeline always runs to completion.
+  CEF_MARKERS="$(strings -a "$APP/Contents/MacOS/$NAME" | grep -cF "cef_load_library" || true)"
+  if [[ "$CEF_MARKERS" -gt 0 ]]; then
+    ok "binary was built with --features web"
+  else
+    bad "framework is present but the binary has no CEF loader in it — \
+built without --features web; every page will be blank"
+  fi
+fi
+
 # ------------------------------------------------------------- identity ----
 
 echo "identity"

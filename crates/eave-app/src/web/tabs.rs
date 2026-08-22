@@ -102,6 +102,213 @@ pub fn with_browser<R>(tab_id: &str, f: impl FnOnce(&Browser) -> R) -> Option<R>
     Some(f(&browser))
 }
 
+// ---------------------------------------------------------------------------
+// What a page ASKS for (as against what it reports)
+// ---------------------------------------------------------------------------
+
+/// Something a page asked eave to do that only the engine can decide.
+///
+/// The mirror of [`Fact`], and deliberately a different type. A fact is
+/// "this happened, fold it"; a request is "may I" — the engine can refuse,
+/// reorder, or answer it differently, and a page that could write tab state
+/// directly would be the second source of truth the whole `web` module is
+/// built to avoid (module docs).
+#[derive(Debug, Clone)]
+pub enum PageRequest {
+    /// `target="_blank"`, `window.open`, ⌘-click. Carries the tab that
+    /// asked, so the engine can record the opener relationship it already
+    /// models ([`eave_core::browser::snapshot::TabInfo::opener`]).
+    OpenTab {
+        url: String,
+        opener: String,
+        activate: bool,
+    },
+}
+
+static REQUESTS: OnceLock<tokio::sync::mpsc::UnboundedSender<PageRequest>> = OnceLock::new();
+
+/// Give the page engine somewhere to ask. Requests raised before this is
+/// called are dropped, for the same reason facts are: there is no engine to
+/// ask, and a queue held across a reconnect would open tabs for links
+/// clicked before it.
+pub fn install_request_sink(tx: tokio::sync::mpsc::UnboundedSender<PageRequest>) {
+    let _ = REQUESTS.set(tx);
+}
+
+fn request(req: PageRequest) {
+    if let Some(tx) = REQUESTS.get() {
+        let _ = tx.send(req);
+    }
+}
+
+/// Whether `EAVE_WEB_TRACE` is set, asked once.
+///
+/// Cached because the callers now include `on_cursor_change`, which fires on
+/// every pointer move across a boundary — an env lookup per mouse move is
+/// the kind of cost that does not show up in a profile but is still wrong.
+pub(super) fn trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EAVE_WEB_TRACE").is_ok())
+}
+
+// ---------------------------------------------------------------------------
+// Per-tab chrome state: what the page told us that the shell draws
+// ---------------------------------------------------------------------------
+
+/// The things a page states continuously that belong to the CHROME, not to
+/// the tab model.
+///
+/// Deliberately app-local rather than `PageFact`s on the wire. The engine
+/// journals what it is told and broadcasts it to every client; a cursor that
+/// changes on every pointer move, or a progress value that changes sixty
+/// times a second, would be a fold and a broadcast per frame for state that
+/// is meaningless to any client that is not the one holding the mouse. The
+/// rule this draws: **a fact crosses the wire when a second client would
+/// need it, or when it must survive a restart.** A cursor is neither.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageChrome {
+    /// 0.0 to 1.0 across a load.
+    pub progress: f32,
+    /// The link under the pointer.
+    pub status: Option<String>,
+    /// The page has asked to be fullscreen.
+    pub fullscreen: bool,
+    /// What the pointer should look like over this page.
+    pub cursor: gpui::CursorStyle,
+}
+
+thread_local! {
+    /// Chrome state by tab. Main thread only, like `BROWSERS`: every writer
+    /// is a CEF UI callback and every reader is a gpui render.
+    static CHROME: std::cell::RefCell<HashMap<String, PageChrome>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// Whether each tab is the one being looked at, as last told to CEF.
+    /// See [`set_visibility`] — this exists so an unchanged visibility is
+    /// not re-sent on every snapshot fold.
+    static VISIBLE: std::cell::RefCell<HashMap<String, bool>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// The last url REPORTED per tab, so `on_address_change` can tell a
+    /// real move from the echo of a load it already reported. See
+    /// `on_address_change` for why the dedup is not left to the engine.
+    static LAST_URL: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Bumped whenever [`PageChrome`] actually CHANGES for any tab.
+///
+/// The pump redraws on delivered frames and never on vsync — the property
+/// the spike measured an idle page at 1 frame in 9 seconds to protect. But
+/// a cursor crossing a link boundary is a real change that may deliver no
+/// frame at all, so the gate needs a second reason rather than a lower bar.
+/// This is that reason: a counter that moves on change and not on callback,
+/// so a page reporting the same cursor sixty times a second still costs
+/// zero redraws.
+static CHROME_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the chrome has changed. Read by the pump's redraw gate.
+pub fn chrome_revision() -> u64 {
+    CHROME_REV.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The back/forward arrows as **Chromium** sees them, for Slice E2's
+/// `PageFact::Load`.
+///
+/// `None` when there is no browser on the callback — the engine then falls
+/// back to its own nav stack, which is the D1 behaviour and the right
+/// default. It is not `Some(false)`: "I could not ask" and "there is no
+/// history" are different answers, and collapsing them is how the arrows
+/// got hardcoded to false in the first place (`strip.rs:419`).
+fn nav_flags(browser: Option<&mut Browser>) -> (Option<bool>, Option<bool>) {
+    match browser {
+        Some(b) => (Some(b.can_go_back() == 1), Some(b.can_go_forward() == 1)),
+        None => (None, None),
+    }
+}
+
+/// Move the redraw gate for a chrome change that is not a [`PageChrome`]
+/// field — a download's progress, say. Same counter, same contract: it
+/// moves on a CHANGE, never on a callback.
+pub(super) fn bump_chrome_revision() {
+    CHROME_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn set_chrome(tab_id: &str, f: impl FnOnce(&mut PageChrome)) {
+    let changed = CHROME.with(|c| {
+        let mut map = c.borrow_mut();
+        let entry = map.entry(tab_id.to_string()).or_default();
+        let before = entry.clone();
+        f(entry);
+        *entry != before
+    });
+    if changed {
+        CHROME_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What the page last said about itself. `None` for a tab with no browser.
+pub fn chrome(tab_id: &str) -> Option<PageChrome> {
+    CHROME.with(|c| c.borrow().get(tab_id).cloned())
+}
+
+fn forget_chrome(tab_id: &str) {
+    CHROME.with(|c| c.borrow_mut().remove(tab_id));
+    LAST_URL.with(|u| u.borrow_mut().remove(tab_id));
+    // Or a rebuilt browser for a reused tab id would inherit a visibility
+    // that was never sent to it, and a restored background tab would paint
+    // at full rate because this said it had already been hidden.
+    VISIBLE.with(|v| v.borrow_mut().remove(tab_id));
+}
+
+/// Record `url` as this tab's address, and say whether it CHANGED.
+///
+/// Both callers matter: `on_load_start` calls it to seed the value (and
+/// ignores the answer, because a load is a report either way), and
+/// `on_address_change` calls it to decide whether it has anything to say.
+fn note_url(tab_id: &str, url: &str) -> bool {
+    LAST_URL.with(|u| {
+        let mut map = u.borrow_mut();
+        match map.get(tab_id) {
+            Some(prev) if prev == url => false,
+            _ => {
+                map.insert(tab_id.to_string(), url.to_string());
+                true
+            }
+        }
+    })
+}
+
+/// Chromium's cursor, as gpui's.
+///
+/// Not exhaustive and deliberately so: gpui has no equivalent for the
+/// panning cursors or the eight-way resize set, and inventing one by
+/// picking a near-miss would be worse than the arrow — a wrong cursor
+/// states a wrong affordance. Everything unmapped falls to
+/// [`gpui::CursorStyle::Arrow`], which is what it would have been anyway.
+fn cursor_style(type_: CursorType) -> gpui::CursorStyle {
+    use gpui::CursorStyle as G;
+    match type_ {
+        CursorType::HAND => G::PointingHand,
+        CursorType::IBEAM => G::IBeam,
+        CursorType::VERTICALTEXT => G::IBeam,
+        CursorType::CROSS => G::Crosshair,
+        CursorType::WAIT | CursorType::PROGRESS => G::OperationNotAllowed,
+        CursorType::MOVE => G::ClosedHand,
+        CursorType::COPY => G::DragCopy,
+        CursorType::ALIAS => G::DragLink,
+        CursorType::NOTALLOWED | CursorType::NODROP => G::OperationNotAllowed,
+        CursorType::CONTEXTMENU => G::ContextualMenu,
+        CursorType::EASTWESTRESIZE | CursorType::COLUMNRESIZE => G::ResizeLeftRight,
+        CursorType::NORTHSOUTHRESIZE | CursorType::ROWRESIZE => G::ResizeUpDown,
+        CursorType::EASTRESIZE => G::ResizeRight,
+        CursorType::WESTRESIZE => G::ResizeLeft,
+        CursorType::NORTHRESIZE => G::ResizeUp,
+        CursorType::SOUTHRESIZE => G::ResizeDown,
+        _ => G::Arrow,
+    }
+}
+
 /// Reconcile the page engine against the tab strip.
 ///
 /// Called on every snapshot, and cheap when nothing changed — which is the
@@ -164,6 +371,7 @@ pub fn drive(snapshot: &TabsSnapshot) {
             continue;
         }
         drive_tab(tab);
+        set_visibility(&tab.id, is_active);
     }
 
     // A tab that left the strip takes its browser with it. Nothing did this
@@ -204,6 +412,116 @@ pub fn drive(snapshot: &TabsSnapshot) {
     }
 }
 
+/// `EAVE_WEB_PROBE_CLICK=x,y` — click once INSIDE the page, from in here,
+/// as soon as it has loaded.
+///
+/// # Why this exists rather than a synthetic OS click
+/// The capture rig drives eave the way a person does: a Quartz mouse event
+/// at screen coordinates. That stopped working on this machine — a control
+/// run clicked eave's OWN reload button and `on_load_start` did not move,
+/// so clicks were reaching no window at all, and any conclusion drawn from
+/// a shot taken that way would have been about the machine rather than
+/// about eave. (`scripts/dev.sh` running from another checkout kills every
+/// eave on the machine on each rebuild and `open -n`s its own, taking
+/// frontmost with it.)
+///
+/// A probe that posts the click through CEF needs no window to be key, no
+/// process to be frontmost, and nothing else on the machine to hold still.
+/// It proves strictly less than a real click — it does not exercise
+/// gpui's hit-testing or the window-to-page coordinate conversion, both of
+/// which `page.rs` owns — and it proves exactly the thing a `<select>`
+/// needs proven: that Chromium opens a popup and that eave receives,
+/// blits and places it.
+///
+/// Coordinates are PAGE space, which for a probe page is the only space
+/// that is knowable without measuring the frame first.
+///
+/// Same family as `EAVE_WEB_AT_BOOT` and `EAVE_WEB_TRACE`: instrumentation
+/// that only exists when asked for, and costs one `env::var` per load when
+/// it is not.
+/// Fired from the paint path, not from `on_load_end`.
+///
+/// The first version fired on load-end and produced nothing: the trace shows
+/// `probe click` landing BEFORE `accel_paint #0`, so the click was hit-tested
+/// against a document that had loaded but not yet laid out, and Chromium had
+/// no `<select>` box under the point. Waiting for real pixels is the whole
+/// correction — a page that has painted is a page with boxes in it.
+pub(super) fn probe_click(tab_id: &str) {
+    let Ok(spec) = std::env::var("EAVE_WEB_PROBE_CLICK") else {
+        return;
+    };
+    // `x,y` is a whole click; `x,y,hold` presses and does not release.
+    //
+    // Both are needed and neither is the obvious default for the other. A
+    // `<button onclick=…>` fires on the UP, so a held press does nothing at
+    // all; a `<select>` opens on the DOWN and the matching up closes it
+    // again, so a whole click leaves nothing on screen to photograph. The
+    // full click is the default because it is what a person does.
+    let mut parts = spec.split(',');
+    let (Some(x), Some(y)) = (parts.next(), parts.next()) else {
+        eprintln!("eave: EAVE_WEB_PROBE_CLICK wants `x,y` or `x,y,hold`, got {spec:?}");
+        return;
+    };
+    let hold = parts.next().map(str::trim) == Some("hold");
+    let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) else {
+        eprintln!("eave: EAVE_WEB_PROBE_CLICK wants two numbers, got {spec:?}");
+        return;
+    };
+    let at = gpui::point(gpui::px(x), gpui::px(y));
+    let m = gpui::Modifiers::default();
+    eprintln!("[web] probe click at {x},{y} in {tab_id} (hold={hold})");
+    with_browser(tab_id, |b| {
+        // Focus first, for the same reason `page.rs` does it on a real
+        // click: a page that has never been focused receives no input.
+        super::input::focus(b, true);
+        super::input::mouse_button(b, at, &m, MouseButtonType::LEFT, false, 1);
+        if !hold {
+            super::input::mouse_button(b, at, &m, MouseButtonType::LEFT, true, 1);
+        }
+    });
+    super::host::note_activity();
+    super::host::request_pump();
+}
+
+/// Tell a browser whether anybody is looking at it.
+///
+/// **Nothing called `was_hidden` before this** — confirmed independently by
+/// Slice E1 on `a4b3983` — so every page tab behind another tab went on
+/// compositing at 60 Hz into a buffer nothing painted. Twenty background
+/// tabs were twenty renderers doing full work for no viewer.
+///
+/// # This is not eviction, and it does not contradict C5
+/// C5's rule stands: **a page tab that already has a browser keeps loading,
+/// whatever is in front of it.** `was_hidden` does not touch loading,
+/// script, timers or network — it is Chromium's own "this view is not on
+/// screen", the same signal a background tab in Chrome gets. The page still
+/// finishes its load behind a session tab and still reports the facts that
+/// drive the strip's spinner; it just stops producing frames nobody is
+/// going to draw. Slice E3's eviction is the next step up the same ladder
+/// and answers a different question (memory, not GPU).
+///
+/// # Why it is idempotent here rather than tracked
+/// `drive` runs on every snapshot, so this would otherwise re-issue the
+/// same visibility on every fold. CEF treats a repeat as a no-op, but the
+/// call still crosses into Chromium, so the last value is remembered per
+/// tab and only a CHANGE is sent — the same shape as `set_view`'s
+/// size check, and for the same reason.
+fn set_visibility(tab_id: &str, visible: bool) {
+    let changed =
+        VISIBLE.with(|v| v.borrow_mut().insert(tab_id.to_string(), visible) != Some(visible));
+    if !changed {
+        return;
+    }
+    if trace() {
+        eprintln!("[web] was_hidden({}) for {tab_id}", !visible);
+    }
+    with_browser(tab_id, |b| {
+        if let Some(host) = b.host() {
+            host.was_hidden(if visible { 0 } else { 1 });
+        }
+    });
+}
+
 /// Reconcile one page tab. Split out of [`drive`] so the loop above reads as
 /// the policy it is, and so the per-tab work is the same whether the tab is
 /// the one being looked at or one loading behind a session.
@@ -221,6 +539,22 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
             .as_ref()
             .map(|p| p.url.as_str())
             .or(tab.url.as_deref());
+        // Seed the address dedup from the tab's COMMITTED url, not from
+        // whatever the browser reports first.
+        //
+        // Slice E3 makes a browser's lifetime shorter than its tab's: an
+        // idle page tab is evicted and rebuilt at the same url under the
+        // same tab id. `on_before_close` clears this tab's chrome state on
+        // the way out, so without seeding here the rebuilt browser's first
+        // `on_address_change` would look like a move to a url the tab is
+        // already standing on — and the engine would fold it as a reload
+        // and write a `Transition::Reload` visit for a page nobody
+        // reloaded. Seeding from the tab makes the dedup a property of the
+        // TAB rather than of the browser, which is also what makes it
+        // survive a restart.
+        if let Some(url) = tab.url.as_deref() {
+            note_url(&tab.id, url);
+        }
         create(&tab.id, start);
         // Creating a browser is work CEF has to be pumped to finish.
         super::host::request_pump();
@@ -242,12 +576,30 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
             // failing second is what loses a navigation permanently: the
             // request would never be retried, because nothing about the
             // tab changes to prompt one.
-            let issued = with_browser(&tab.id, |b| match b.main_frame() {
-                Some(frame) => {
-                    frame.load_url(Some(&CefString::from(pending.url.as_str())));
-                    true
+            let issued = with_browser(&tab.id, |b| {
+                // A walk must use Chromium's stack. `load_url` of the
+                // walked address would push a fresh CEF entry, and the
+                // next `can_go_back` would disagree with the engine
+                // stack the arrows read. Fall back to a load only when
+                // Chromium has nowhere to walk — a restored tab whose
+                // CEF history is empty.
+                if let Some(delta) = pending.delta {
+                    if delta < 0 && b.can_go_back() != 0 {
+                        b.go_back();
+                        return true;
+                    }
+                    if delta > 0 && b.can_go_forward() != 0 {
+                        b.go_forward();
+                        return true;
+                    }
                 }
-                None => false,
+                match b.main_frame() {
+                    Some(frame) => {
+                        frame.load_url(Some(&CefString::from(pending.url.as_str())));
+                        true
+                    }
+                    None => false,
+                }
             });
             if issued == Some(true) {
                 ACTED.with(|a| {
@@ -381,8 +733,71 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        /// `target="_blank"`, `window.open`, and middle-click.
+        ///
+        /// **Returning 1 cancels Chromium's popup and is the only correct
+        /// answer here.** Letting CEF proceed asks it to create a browser
+        /// with a `WindowInfo` we did not fill in — under off-screen
+        /// rendering that is a browser with no render handler and no
+        /// window, i.e. a page that exists and can never be seen. Before
+        /// this, every `target="_blank"` link in eave was a dead link: the
+        /// click was consumed, nothing opened, and nothing said why.
+        ///
+        /// So the popup is refused and re-asked as an eave tab. That is a
+        /// REQUEST and not a report — `PageRequest` rather than `PageFact`
+        /// — because opening a tab is the engine's decision and the page
+        /// engine is a client like any other (module docs).
+        ///
+        /// The dispositions are not all the same thing. A background tab
+        /// (⌘-click) must not steal focus; `SAVE_TO_DISK` is a download and
+        /// not a tab at all, and is left to the download handler rather
+        /// than being turned into a tab that immediately closes itself.
+        #[allow(clippy::too_many_arguments)]
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: i32,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: i32,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut i32>,
+        ) -> i32 {
+            let url = target_url.map(|u| u.to_string()).unwrap_or_default();
+            if trace() {
+                eprintln!("[web] on_before_popup {target_disposition:?} url={url:?}");
+            }
+            // A download wearing a popup's clothes. Cancel the window; the
+            // download handler is what should see this, and turning it into
+            // a tab would open a page that closes itself.
+            if target_disposition == WindowOpenDisposition::SAVE_TO_DISK {
+                return 1;
+            }
+            if url.is_empty() {
+                // `window.open()` with no url — a page about to write into
+                // the new window through the returned handle. eave has
+                // nowhere to put that handle, so refusing is the honest
+                // answer; opening a blank tab that never receives its
+                // content would be worse.
+                return 1;
+            }
+            let activate = target_disposition != WindowOpenDisposition::NEW_BACKGROUND_TAB;
+            request(PageRequest::OpenTab {
+                url,
+                opener: self.tab_id.clone(),
+                activate,
+            });
+            1
+        }
+
         fn on_after_created(&self, browser: Option<&mut Browser>) {
-            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+            if trace() {
                 eprintln!("[web] browser created for {}", self.tab_id);
             }
             let Some(browser) = browser.cloned() else { return };
@@ -402,6 +817,13 @@ wrap_life_span_handler! {
             let gone = BROWSERS.with(|b| b.borrow_mut().remove(&self.tab_id));
             drop(gone);
             super::osr::forget(&self.tab_id);
+            forget_chrome(&self.tab_id);
+            // A held dialog callback is a stopped renderer. This browser is
+            // going away and so is the page that would have been unblocked,
+            // but the callback is still answered rather than dropped —
+            // releasing one unanswered is the difference between a clean
+            // teardown and a hang.
+            super::dialogs::forget(&self.tab_id);
         }
     }
 }
@@ -417,10 +839,11 @@ wrap_load_handler! {
         /// commit are different frames and carry different urls.
         fn on_load_start(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
             _transition_type: TransitionType,
         ) {
+            let (can_go_back, can_go_forward) = nav_flags(browser);
             if std::env::var("EAVE_WEB_TRACE").is_ok() {
                 eprintln!("[web] on_load_start is_main={:?} url={:?}",
                     frame.as_ref().map(|f| f.is_main()),
@@ -436,28 +859,49 @@ wrap_load_handler! {
             if url.is_empty() {
                 return;
             }
+            // Seed the address dedup. The answer is ignored on purpose: a
+            // load is worth reporting whether or not the address moved
+            // (a reload does not move it), and it is `on_address_change`
+            // that has to be quiet about the echo.
+            note_url(&self.tab_id, &url);
             report(&self.tab_id, PageFact::Committed { url, title: None });
-            report(&self.tab_id, PageFact::Load { load: LoadState::Loading });
+            report(
+                &self.tab_id,
+                PageFact::Load {
+                    load: LoadState::Loading,
+                    can_go_back,
+                    can_go_forward,
+                },
+            );
         }
 
         fn on_load_end(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
             _http_status_code: i32,
         ) {
+            let (can_go_back, can_go_forward) = nav_flags(browser);
             if std::env::var("EAVE_WEB_TRACE").is_ok() {
                 eprintln!("[web] on_load_end status={_http_status_code}");
             }
             if frame.map(|f| f.is_main()) != Some(1) {
                 return;
             }
-            report(&self.tab_id, PageFact::Load { load: LoadState::Complete });
+            set_chrome(&self.tab_id, |c| c.progress = 1.0);
+            report(
+                &self.tab_id,
+                PageFact::Load {
+                    load: LoadState::Complete,
+                    can_go_back,
+                    can_go_forward,
+                },
+            );
         }
 
         fn on_load_error(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
             _error_code: Errorcode,
             error_text: Option<&CefString>,
@@ -472,8 +916,292 @@ wrap_load_handler! {
             // The engine's own words, rendered verbatim — `LoadState::Failed`
             // exists to carry them rather than to be re-worded by eave.
             let reason = error_text.map(|t| t.to_string()).unwrap_or_default();
-            report(&self.tab_id, PageFact::Load { load: LoadState::Failed { reason } });
+            let (can_go_back, can_go_forward) = nav_flags(browser);
+            report(
+                &self.tab_id,
+                PageFact::Load {
+                    load: LoadState::Failed { reason },
+                    can_go_back,
+                    can_go_forward,
+                },
+            );
         }
+    }
+}
+
+/// A download in flight, as the shell needs to see it.
+///
+/// App-local for the same reason [`PageChrome`] is: a byte count that
+/// changes many times a second is not something to journal or broadcast.
+/// What SHOULD outlive the app — "this file was downloaded from this url" —
+/// is a `downloads.rs` in `eave-core` beside `history.rs`, and that is a
+/// slice of its own (spec 06-browser D4). This is the half that makes a
+/// download link do something instead of nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Download {
+    pub id: u32,
+    pub url: String,
+    pub file_name: String,
+    /// Where it is being written. Empty until Chromium settles the path.
+    pub path: String,
+    pub received: i64,
+    pub total: i64,
+    pub percent: i32,
+    pub done: bool,
+    pub cancelled: bool,
+}
+
+thread_local! {
+    /// Downloads by CEF's own id, newest state wins.
+    static DOWNLOADS: std::cell::RefCell<HashMap<u32, Download>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Every download this run knows about, newest first.
+pub fn downloads() -> Vec<Download> {
+    let mut all: Vec<Download> = DOWNLOADS.with(|d| d.borrow().values().cloned().collect());
+    all.sort_by_key(|d| std::cmp::Reverse(d.id));
+    all
+}
+
+/// Where downloads go.
+///
+/// `~/Downloads` when it exists, the home directory when it does not, and
+/// the temp dir if even that is unreadable. **Chromium is told the
+/// directory and left to pick the final name**, which is what makes
+/// `report.pdf` land beside an existing `report.pdf` as `report (1).pdf`
+/// rather than silently replacing someone's file. Writing our own
+/// uniquifier here would be re-implementing that badly.
+fn download_dir() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let downloads = std::path::Path::new(&home).join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+        return std::path::PathBuf::from(home);
+    }
+    std::env::temp_dir()
+}
+
+wrap_download_handler! {
+    struct PageDownloadHandler {
+        tab_id: String,
+    }
+
+    impl DownloadHandler {
+        /// Whether a download may begin at all.
+        ///
+        /// Always yes. The place to refuse a download is a policy eave does
+        /// not have yet (spec 06-browser E1); refusing here silently would
+        /// be the same do-nothing behaviour this handler exists to remove.
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> i32 {
+            1
+        }
+
+        /// A download started. **Returning without calling `cont` cancels
+        /// it**, which is exactly what used to happen: with no download
+        /// handler at all, clicking a download link did nothing, silently,
+        /// with no error anywhere. That is the single worst kind of missing
+        /// feature — indistinguishable from a broken page.
+        ///
+        /// `show_dialog = 0`: eave has no file-save dialog surface yet
+        /// (spec 06-browser D6), and asking CEF to show one it cannot draw
+        /// off-screen would hang the download on a prompt nobody can see.
+        /// Downloading straight to `~/Downloads` is what every browser does
+        /// by default anyway; the "ask where to save" setting is the
+        /// feature that needs the surface, not this.
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> i32 {
+            let name = suggested_name
+                .map(|n| n.to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "download".to_string());
+            let target = download_dir().join(&name);
+            let url = download_item
+                .as_ref()
+                .map(|d| CefString::from(&d.url()).to_string())
+                .unwrap_or_default();
+            let id = download_item.as_ref().map(|d| d.id()).unwrap_or(0);
+            if trace() {
+                eprintln!("[web] download starting id={id} name={name:?} -> {}", target.display());
+            }
+            DOWNLOADS.with(|d| {
+                d.borrow_mut().insert(
+                    id,
+                    Download {
+                        id,
+                        url,
+                        file_name: name,
+                        path: target.to_string_lossy().to_string(),
+                        received: 0,
+                        total: 0,
+                        percent: 0,
+                        done: false,
+                        cancelled: false,
+                    },
+                )
+            });
+            if let Some(callback) = callback {
+                callback.cont(Some(&CefString::from(&*target.to_string_lossy())), 0);
+            }
+            0
+        }
+
+        /// Progress, completion and cancellation.
+        ///
+        /// Called often — several times a second on a live transfer — so
+        /// this only bumps the redraw gate when something a person could
+        /// SEE actually changed. A byte count that moved but left the
+        /// percentage alone is not a repaint.
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            _callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(item) = download_item else { return };
+            let id = item.id();
+            let next = Download {
+                id,
+                url: CefString::from(&item.url()).to_string(),
+                file_name: CefString::from(&item.suggested_file_name()).to_string(),
+                path: CefString::from(&item.full_path()).to_string(),
+                received: item.received_bytes(),
+                total: item.total_bytes(),
+                percent: item.percent_complete(),
+                done: item.is_complete() == 1,
+                cancelled: item.is_canceled() == 1,
+            };
+            let changed = DOWNLOADS.with(|d| {
+                let mut map = d.borrow_mut();
+                match map.get(&id) {
+                    Some(prev) if prev == &next => false,
+                    _ => {
+                        map.insert(id, next.clone());
+                        true
+                    }
+                }
+            });
+            if !changed {
+                return;
+            }
+            if trace() && (next.done || next.cancelled || next.percent % 25 == 0) {
+                eprintln!(
+                    "[web] download id={id} {}% {}/{} done={} cancelled={}",
+                    next.percent, next.received, next.total, next.done, next.cancelled
+                );
+            }
+            // A download is chrome, not page pixels: it changes something
+            // eave draws with no page frame to carry the change, which is
+            // exactly what the chrome revision counter is for.
+            bump_chrome_revision();
+        }
+    }
+}
+
+wrap_request_handler! {
+    struct PageRequestHandler {
+        tab_id: String,
+    }
+
+    impl RequestHandler {
+        /// The renderer for this tab died.
+        ///
+        /// **This is the worst failure mode eave had, because it produced no
+        /// failure.** The last frame stays in `PAGES` and keeps being
+        /// painted, so a crashed tab is a photograph of the page it used to
+        /// be: it looks alive, scrolls nothing, and answers no click. The
+        /// operator's only evidence is that the web stopped working.
+        ///
+        /// Reported as `LoadState::Failed`, reusing the surface
+        /// `on_load_error` already feeds rather than inventing a state the
+        /// strip would have to learn. A dead renderer IS a failed load —
+        /// the distinction the operator cares about is *why*, and that
+        /// rides in the reason string.
+        ///
+        /// # Why the frame is dropped
+        /// `osr::forget` here is the point of the whole handler. Leaving the
+        /// last frame up is what makes a crash invisible; dropping it is
+        /// what makes the tab go blank and the failure state show. It also
+        /// releases the destination buffer of a browser that will never
+        /// paint again.
+        ///
+        /// Recovery is not automatic and deliberately so: a page that
+        /// crashed once will usually crash again on reload, and a tab that
+        /// silently reloaded itself into a loop would be worse than one
+        /// that says what happened. `drive` will rebuild the browser when
+        /// the operator navigates or reloads.
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: i32,
+            error_string: Option<&CefString>,
+        ) {
+            // Chromium's own words when it has any; its own words are what
+            // `LoadState::Failed` exists to carry verbatim.
+            let detail = error_string
+                .map(|e| e.to_string())
+                .filter(|e| !e.is_empty());
+            let reason = match detail {
+                Some(detail) => format!("{} ({detail})", termination_reason(status)),
+                None if error_code != 0 => {
+                    format!("{} (code {error_code})", termination_reason(status))
+                }
+                None => termination_reason(status).to_string(),
+            };
+            if trace() {
+                eprintln!("[web] render process terminated for {}: {reason}", self.tab_id);
+            }
+            // Drop the stale frame FIRST, so nothing can repaint the corpse
+            // between the report and the next render.
+            super::osr::forget(&self.tab_id);
+            set_chrome(&self.tab_id, |c| {
+                c.progress = 0.;
+                c.status = None;
+                c.fullscreen = false;
+            });
+            report(
+                &self.tab_id,
+                PageFact::Load {
+                    load: LoadState::Failed { reason },
+                    // A dead renderer cannot be asked about its history, and
+                    // `None` is what says so — the engine keeps its own nav
+                    // stack, which is exactly the state that survives this.
+                    can_go_back: None,
+                    can_go_forward: None,
+                },
+            );
+        }
+    }
+}
+
+/// Why a renderer died, in words an operator can act on.
+///
+/// Chromium's status codes are not self-explanatory and two of them mean
+/// very different things to the person reading them: `PROCESS_OOM` is "this
+/// page wanted more memory than it could have" and is about the page, while
+/// `LAUNCH_FAILED` is about eave's own install and is not the page's fault
+/// at all. Rendering both as "the page crashed" would send someone looking
+/// in the wrong place.
+fn termination_reason(status: TerminationStatus) -> &'static str {
+    match status {
+        TerminationStatus::PROCESS_CRASHED => "the page's renderer crashed",
+        TerminationStatus::PROCESS_OOM => "the page ran out of memory",
+        TerminationStatus::PROCESS_WAS_KILLED => "the page's renderer was killed",
+        TerminationStatus::LAUNCH_FAILED => "the page's renderer could not start",
+        TerminationStatus::INTEGRITY_FAILURE => "the page's renderer failed an integrity check",
+        _ => "the page's renderer stopped",
     }
 }
 
@@ -484,11 +1212,164 @@ wrap_display_handler! {
 
     impl DisplayHandler {
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
-            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+            if trace() {
                 eprintln!("[web] on_title_change {:?}", title.map(|t| t.to_string()));
             }
             let title = title.map(|t| t.to_string()).filter(|t| !t.is_empty());
             report(&self.tab_id, PageFact::Titled { title });
+        }
+
+        /// The address changed **without a load** — `history.pushState`,
+        /// `replaceState`, a fragment jump.
+        ///
+        /// `on_load_start` cannot see any of those: no document is fetched,
+        /// so no load starts. On a single-page app that is most of the
+        /// navigation that ever happens, and without this the omnibox shows
+        /// the address you arrived at half an hour ago while the page has
+        /// moved on — the classic embedded-browser tell.
+        ///
+        /// # Why the dedup
+        /// This ALSO fires for every ordinary navigation, right after
+        /// `on_load_start` has already reported the same url. The engine's
+        /// [`eave_core::browser::tabs::NavStack::commit`] treats a same-url
+        /// commit as a refresh and does not push a second entry, so the
+        /// stack would stay correct — but the fold still writes a
+        /// `HistoryEvent::Visited` with `Transition::Reload` each time, and
+        /// a reload entry per navigation is exactly the typeahead inflation
+        /// Slice C5 removed. Dedup here, where the previous url is known,
+        /// costs a `HashMap` lookup and keeps that fix intact.
+        fn on_address_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            // Sub-frames change address constantly and are not the tab's
+            // address — the same rule `on_load_start` keeps, and the
+            // classic version of this bug is an iframe's url in the
+            // omnibox.
+            if frame.map(|f| f.is_main()) != Some(1) {
+                return;
+            }
+            let Some(url) = url.map(|u| u.to_string()).filter(|u| !u.is_empty()) else {
+                return;
+            };
+            if trace() {
+                eprintln!("[web] on_address_change {url:?}");
+            }
+            if !note_url(&self.tab_id, &url) {
+                return;
+            }
+            report(&self.tab_id, PageFact::Committed { url, title: None });
+        }
+
+        /// Where the page says its icon lives.
+        ///
+        /// `PageFact::Favicon` has existed on the wire since Slice B1 and
+        /// **nothing has ever sent one** — `TabInfo::favicon_url`, the
+        /// engine's `FaviconStated` fold and the strip's globe stand-in
+        /// were all built against a fact that was never raised. This raises
+        /// it. Fetching and decoding the bytes is still ahead (spec
+        /// 06-browser D13); a url the strip can act on is the half that was
+        /// missing from the model rather than from the renderer.
+        ///
+        /// Chromium offers every declared icon, best first. Taking the
+        /// first is the same choice Chrome makes at this stage; choosing by
+        /// size needs the bytes, which is the fetch half.
+        fn on_favicon_urlchange(
+            &self,
+            _browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            // `CefStringList` only reads by value and we hold a borrow.
+            // The clone is shallow — a `Borrowed` collection, which `Drop`
+            // does not free — so this reads the list without taking
+            // ownership of Chromium's.
+            let first = icon_urls
+                .map(|l| l.clone())
+                .and_then(|l| l.into_iter().next())
+                .filter(|u| !u.is_empty());
+            if trace() {
+                eprintln!("[web] on_favicon_urlchange {first:?}");
+            }
+            report(&self.tab_id, PageFact::Favicon { favicon_url: first });
+        }
+
+        /// 0.0 to 1.0 across a load.
+        ///
+        /// Local to the app and not a `PageFact`: `LoadState` is a fold the
+        /// engine journals decisions against, and a value that changes
+        /// sixty times a second does not belong in it. The strip reads this
+        /// directly through [`progress`].
+        fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
+            set_chrome(&self.tab_id, |c| c.progress = progress as f32);
+        }
+
+        /// The link under the pointer — the bubble in the corner.
+        fn on_status_message(&self, _browser: Option<&mut Browser>, value: Option<&CefString>) {
+            let text = value.map(|v| v.to_string()).filter(|v| !v.is_empty());
+            set_chrome(&self.tab_id, |c| c.status = text.clone());
+        }
+
+        /// The page asked for fullscreen (a video, usually).
+        ///
+        /// Recorded, not acted on: what fullscreen MEANS in a browser that
+        /// is also an IDE is a frame decision, not a renderer one (spec
+        /// 06-browser D10). Recording it is what lets the shell answer
+        /// later without the page having to ask twice.
+        fn on_fullscreen_mode_change(&self, _browser: Option<&mut Browser>, fullscreen: i32) {
+            if trace() {
+                eprintln!("[web] on_fullscreen_mode_change {fullscreen}");
+            }
+            set_chrome(&self.tab_id, |c| c.fullscreen = fullscreen != 0);
+        }
+
+        /// The pointer, over whatever is under it.
+        ///
+        /// A native browser gets this from the OS view; an off-screen one
+        /// gets it here and nowhere else, so without this the cursor is an
+        /// arrow over every link, every text field and every column-resize
+        /// handle on the web. It is the single loudest "this is a picture
+        /// of a website" tell, and it is one callback.
+        ///
+        /// Returning 0 lets CEF keep its own bookkeeping; eave sets the
+        /// real cursor from gpui, where the page element is
+        /// ([`super::page::page_element`]).
+        fn on_cursor_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _cursor: *mut u8,
+            type_: CursorType,
+            _custom_cursor_info: Option<&CursorInfo>,
+        ) -> i32 {
+            set_chrome(&self.tab_id, |c| c.cursor = cursor_style(type_));
+            0
+        }
+
+        /// `console.log` from the page.
+        ///
+        /// Returning 0 keeps Chromium's own default handling. This is
+        /// wired now because it is the cheap half of spec 06-browser E8 —
+        /// an agent that can read the page's console — and because a
+        /// renderer that is throwing on every frame is otherwise silent.
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            level: LogSeverity,
+            message: Option<&CefString>,
+            source: Option<&CefString>,
+            line: i32,
+        ) -> i32 {
+            if trace() {
+                eprintln!(
+                    "[web] console {:?} {}:{} {}",
+                    level,
+                    source.map(|s| s.to_string()).unwrap_or_default(),
+                    line,
+                    message.map(|m| m.to_string()).unwrap_or_default(),
+                );
+            }
+            0
         }
     }
 }
@@ -517,5 +1398,216 @@ wrap_client! {
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(PageDisplayHandler::new(self.tab_id.clone()))
         }
+
+        /// Wired for `on_render_process_terminated` alone so far. The rest
+        /// of this handler is the largest single gap left in eave's
+        /// browser: HTTP auth (`get_auth_credentials`), certificate errors
+        /// (`on_certificate_error`) and resource control all live here.
+        /// See `docs/spec/06-browser.md` D7, D8, E1.
+        /// Downloads. Without this arm a download link is a dead link
+        /// that reports nothing — CEF cancels a download whose handler
+        /// never calls `cont`, and with no handler at all there is nothing
+        /// to call it.
+        /// `alert()` / `confirm()` / `prompt()` / `beforeunload`. Without
+        /// this arm CEF suppresses the dialog and continues as if the
+        /// person had cancelled — `confirm()` is permanently false and
+        /// nothing says why.
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(super::dialogs::PageJsDialogHandler::new(self.tab_id.clone()))
+        }
+
+        /// Camera, microphone, geolocation, notifications, clipboard.
+        /// Without this arm they are all auto-denied without asking.
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(super::dialogs::PagePermissionHandler::new(self.tab_id.clone()))
+        }
+
+        /// `<input type=file>`. Without this arm the click is consumed and
+        /// no picker opens — there is no native window to parent one to
+        /// under off-screen rendering.
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(super::dialogs::PageFileDialogHandler::new(self.tab_id.clone()))
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(PageDownloadHandler::new(self.tab_id.clone()))
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(PageRequestHandler::new(self.tab_id.clone()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// Only the parts that are eave's own reasoning: the address dedup, the
+// change detection behind the redraw gate, and the cursor mapping. Nothing
+// here starts CEF — these run under `cargo test --features web` without a
+// framework, which is the same bargain `mod.rs` makes for the whole module.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The counter is process-wide (the pump reads it from gpui's executor),
+    /// so the tests that assert on it take a turn rather than racing.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_first_url_for_a_tab_is_a_change() {
+        assert!(note_url("t1", "https://a.test/"));
+    }
+
+    #[test]
+    fn the_same_url_twice_is_not_a_change() {
+        assert!(note_url("t2", "https://a.test/"));
+        assert!(!note_url("t2", "https://a.test/"));
+    }
+
+    /// The case the dedup exists for: `on_load_start` seeds the url and
+    /// `on_address_change` immediately echoes it. The echo must be silent,
+    /// or every navigation writes a spurious `Transition::Reload` into
+    /// history and inflates the typeahead — the inflation Slice C5 removed.
+    #[test]
+    fn a_pushstate_after_a_load_is_a_change_but_the_echo_is_not() {
+        assert!(note_url("t3", "https://a.test/"));
+        assert!(!note_url("t3", "https://a.test/"), "the echo of the load");
+        assert!(note_url("t3", "https://a.test/next"), "a real pushState");
+    }
+
+    #[test]
+    fn tabs_do_not_share_an_address() {
+        assert!(note_url("t4a", "https://a.test/"));
+        assert!(
+            note_url("t4b", "https://a.test/"),
+            "a second tab at the same url is its own first navigation"
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_forgets_its_address() {
+        assert!(note_url("t5", "https://a.test/"));
+        forget_chrome("t5");
+        assert!(
+            note_url("t5", "https://a.test/"),
+            "a reused tab id must not inherit the old tab's address"
+        );
+    }
+
+    #[test]
+    fn a_changed_cursor_moves_the_redraw_gate() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = chrome_revision();
+        set_chrome("t6", |c| c.cursor = gpui::CursorStyle::PointingHand);
+        assert!(chrome_revision() > before);
+    }
+
+    /// The whole point of the change detection. Chromium reports the cursor
+    /// on every pointer move within one element, not only on the crossing,
+    /// so a gate that moved on each callback would ask gpui to redraw the
+    /// window at pointer rate over a page that is not painting — throwing
+    /// away the idle-page property the spike measured at 1 frame in 9
+    /// seconds.
+    #[test]
+    fn repeating_the_same_cursor_does_not() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        set_chrome("t7", |c| c.cursor = gpui::CursorStyle::IBeam);
+        let settled = chrome_revision();
+        for _ in 0..64 {
+            set_chrome("t7", |c| c.cursor = gpui::CursorStyle::IBeam);
+        }
+        assert_eq!(
+            chrome_revision(),
+            settled,
+            "64 identical reports, 0 redraws"
+        );
+    }
+
+    #[test]
+    fn chrome_is_absent_until_the_page_states_something() {
+        assert!(chrome("t8-never-touched").is_none());
+        set_chrome("t8-never-touched", |c| c.progress = 0.5);
+        assert_eq!(chrome("t8-never-touched").map(|c| c.progress), Some(0.5));
+    }
+
+    /// The two that must not read alike. `PROCESS_OOM` is about the page;
+    /// `LAUNCH_FAILED` is about eave's own install. Collapsing them to "the
+    /// page crashed" sends the reader looking in the wrong place.
+    #[test]
+    fn a_dead_renderer_says_which_kind_of_dead() {
+        assert_eq!(
+            termination_reason(TerminationStatus::PROCESS_OOM),
+            "the page ran out of memory"
+        );
+        assert_eq!(
+            termination_reason(TerminationStatus::LAUNCH_FAILED),
+            "the page's renderer could not start"
+        );
+        assert_ne!(
+            termination_reason(TerminationStatus::PROCESS_OOM),
+            termination_reason(TerminationStatus::LAUNCH_FAILED)
+        );
+    }
+
+    /// An unrecognised status still says something true rather than
+    /// nothing — a blank reason renders as a failed tab with no
+    /// explanation, which is the state this handler exists to remove.
+    #[test]
+    fn an_unknown_termination_still_explains_itself() {
+        let said = termination_reason(TerminationStatus::ABNORMAL_TERMINATION);
+        assert!(!said.is_empty());
+        assert!(said.contains("renderer"), "got {said:?}");
+    }
+
+    /// Downloads land in `~/Downloads` when it exists. The fallbacks are
+    /// the point: a machine without one must still download somewhere
+    /// rather than silently refuse, which is the do-nothing behaviour the
+    /// whole handler exists to remove.
+    #[test]
+    fn downloads_have_somewhere_to_go() {
+        let dir = download_dir();
+        assert!(dir.is_absolute(), "got {dir:?}");
+        assert!(dir.is_dir(), "not a directory: {dir:?}");
+    }
+
+    #[test]
+    fn nothing_is_downloading_until_something_downloads() {
+        assert!(downloads()
+            .iter()
+            .all(|d| !d.file_name.is_empty() || d.id == 0));
+    }
+
+    /// The redraw gate must move for a download too — it changes something
+    /// eave draws with no page frame to carry the change. Same counter,
+    /// same contract as a cursor.
+    #[test]
+    fn a_download_update_moves_the_redraw_gate() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = chrome_revision();
+        bump_chrome_revision();
+        assert!(chrome_revision() > before);
+    }
+
+    #[test]
+    fn the_cursors_that_matter_are_mapped() {
+        use gpui::CursorStyle as G;
+        assert_eq!(cursor_style(CursorType::HAND), G::PointingHand, "links");
+        assert_eq!(cursor_style(CursorType::IBEAM), G::IBeam, "text");
+        assert_eq!(cursor_style(CursorType::EASTWESTRESIZE), G::ResizeLeftRight);
+        assert_eq!(cursor_style(CursorType::NOTALLOWED), G::OperationNotAllowed);
+    }
+
+    /// An unmapped cursor falls to the arrow rather than to a near-miss.
+    /// A wrong cursor states a wrong affordance, which is worse than a
+    /// plain one — see `cursor_style`.
+    #[test]
+    fn an_unmapped_cursor_is_an_arrow_and_not_a_guess() {
+        assert_eq!(
+            cursor_style(CursorType::NORTHEASTPANNING),
+            gpui::CursorStyle::Arrow
+        );
     }
 }

@@ -314,7 +314,11 @@ pub fn start_pump(cx: &mut gpui::App) {
         loop {
             let ms = if super::tabs::any_browser() {
                 let quiet = now_ms() >= ACTIVE_UNTIL.load(Ordering::Relaxed);
-                if quiet { QUIET_MS } else { BUSY_MS }
+                if quiet {
+                    QUIET_MS
+                } else {
+                    BUSY_MS
+                }
             } else {
                 IDLE_MS
             };
@@ -446,7 +450,19 @@ fn pump_cef() {
 /// **after** `CefDoMessageLoopWork` has returned. Do not fold it back into the
 /// pump: that shape is what Slice C6 removed.
 fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
-    let seen = super::osr::frames_delivered();
+    // Two reasons to redraw, one gate. A frame arriving is the obvious
+    // one; the chrome changing is the one added with the display handler,
+    // because a cursor crossing a link boundary or a status bubble
+    // appearing is a real change that may deliver no frame at all. Both
+    // counters move on an EVENT and not on a clock, so the "never on
+    // vsync" property is unchanged.
+    //
+    // The two counters are PACKED, not mixed: frames in the low 32 bits,
+    // chrome revisions in the high 32. A hash of the pair could collide and
+    // silently drop a redraw; a pack cannot until one of them passes 2^32,
+    // which at 60 Hz is eight centuries of frames.
+    let seen =
+        (super::tabs::chrome_revision() << 32) | (super::osr::frames_delivered() & 0xffff_ffff);
     if seen == LAST_REFRESHED.load(Ordering::Relaxed) {
         return;
     }
@@ -757,4 +773,3 @@ const SHUTDOWN_STEP_MS: u64 = 1;
 const SHUTDOWN_QUIET_ROUNDS: u32 = 50;
 /// How long `CefShutdown` gets before the watchdog exits the process anyway.
 const SHUTDOWN_DEADLINE_MS: u64 = 1500;
-

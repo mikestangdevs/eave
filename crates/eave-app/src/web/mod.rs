@@ -24,6 +24,32 @@
 //! happened back through `tab_stated` frames. Nothing here writes tab state
 //! directly, and nothing in the engine knows Chromium exists.
 //!
+//! # The one rule this module is written around
+//! **Under an external message pump, CEF runs its handlers SYNCHRONOUSLY on
+//! your stack.** Everything you are holding when you call into Chromium is
+//! therefore lent to Chromium mid-call. That has bitten this project twice,
+//! in two disguises that look nothing alike:
+//!
+//! - **Every BORROW you hold.** `with_browser` clones the handle and ends
+//!   the `RefCell` borrow *before* calling in, because `close_browser`
+//!   re-enters `on_before_close`, which borrows the same map. Slice C6
+//!   measured that as an `already borrowed` abort on ⌘Q with a page open;
+//!   C7 fixed it in the helper rather than at a call site, **48 of 48**.
+//! - **Every CONTINUATION you hold.** A callback that hands you a
+//!   `Callback` object has **stopped the page** until you answer it — a
+//!   `CefJsdialogCallback`, a file, permission or download callback. Park
+//!   one across your own bookkeeping and you get a hung renderer rather
+//!   than a crash; answer one twice and it is a use-after-free inside
+//!   Chromium.
+//!
+//! In practice: **answer before you file, remove before you reply, and
+//! answer on the way out of `on_before_close` rather than dropping.**
+//!
+//! Stated together because the second was found by a different session, on
+//! a different symptom, after the first had already been written down as
+//! though it were only about `RefCell`s. It never was. An abort and a hang;
+//! one rule. Anything added here that takes a CEF callback inherits it.
+//!
 //! # Diagnostics
 //! `EAVE_WEB_TRACE=1` narrates the page engine's lifecycle on stderr: every
 //! reconciliation, every browser created, the load callbacks, the pump, and
@@ -42,6 +68,8 @@
 //! real configuration and not an error.
 
 #[cfg(feature = "web")]
+mod dialogs;
+#[cfg(feature = "web")]
 mod host;
 #[cfg(feature = "web")]
 mod input;
@@ -53,11 +81,17 @@ mod page;
 mod tabs;
 
 #[cfg(feature = "web")]
+#[cfg(feature = "web")]
+pub use dialogs::{answer, any_pending, pending, Answer, Ask, Pending};
+#[cfg(feature = "web")]
 pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 #[cfg(feature = "web")]
 pub use page::page_element;
 #[cfg(feature = "web")]
-pub use tabs::{drive, install_fact_sink, web_memory, Fact};
+pub use tabs::{
+    chrome, downloads, drive, install_fact_sink, install_request_sink, web_memory, Download, Fact,
+    PageChrome, PageRequest,
+};
 
 // ---------------------------------------------------------------------------
 // The feature-off half
@@ -114,6 +148,132 @@ pub fn drive(_snapshot: &eave_wire::TabsSnapshot) {}
 /// Give the page engine somewhere to report. Nothing reports here.
 #[cfg(not(feature = "web"))]
 pub fn install_fact_sink(_tx: tokio::sync::mpsc::UnboundedSender<Fact>) {}
+
+/// What a page asked for. Nothing asks here.
+#[cfg(not(feature = "web"))]
+#[derive(Debug, Clone)]
+pub enum PageRequest {
+    OpenTab {
+        url: String,
+        opener: String,
+        activate: bool,
+    },
+}
+
+/// Give the page engine somewhere to ask. Nothing asks here.
+#[cfg(not(feature = "web"))]
+pub fn install_request_sink(_tx: tokio::sync::mpsc::UnboundedSender<PageRequest>) {}
+
+/// What the page last said about itself — progress, status, cursor,
+/// fullscreen. All defaults with no page engine, which is honest: a build
+/// without Chromium has no page to have a cursor over.
+#[cfg(not(feature = "web"))]
+#[derive(Debug, Clone, Default)]
+pub struct PageChrome {
+    pub progress: f32,
+    pub status: Option<String>,
+    pub fullscreen: bool,
+    pub cursor: gpui::CursorStyle,
+}
+
+/// What the page last said about itself. `None` — there is no page.
+#[cfg(not(feature = "web"))]
+pub fn chrome(_tab_id: &str) -> Option<PageChrome> {
+    None
+}
+
+/// A download in flight.
+#[cfg(not(feature = "web"))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Download {
+    pub id: u32,
+    pub url: String,
+    pub file_name: String,
+    pub path: String,
+    pub received: i64,
+    pub total: i64,
+    pub percent: i32,
+    pub done: bool,
+    pub cancelled: bool,
+}
+
+/// Everything downloading, newest first. Empty — nothing can download
+/// without a page engine to download it.
+#[cfg(not(feature = "web"))]
+pub fn downloads() -> Vec<Download> {
+    Vec::new()
+}
+
+/// What a page is asking a person. Nothing asks here.
+#[cfg(not(feature = "web"))]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ask {
+    Alert {
+        message: String,
+    },
+    Confirm {
+        message: String,
+    },
+    Prompt {
+        message: String,
+        default: String,
+    },
+    Leave {
+        message: String,
+        reloading: bool,
+    },
+    Permission {
+        kinds: Vec<String>,
+    },
+    Files {
+        title: String,
+        multiple: bool,
+        folder: bool,
+        save: bool,
+    },
+}
+
+#[cfg(not(feature = "web"))]
+impl Ask {
+    pub fn is_refusable(&self) -> bool {
+        !matches!(self, Ask::Alert { .. })
+    }
+}
+
+/// An outstanding ask, and which tab is stopped on it.
+#[cfg(not(feature = "web"))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub tab_id: String,
+    pub origin: String,
+    pub ask: Ask,
+}
+
+/// What a person answered.
+#[cfg(not(feature = "web"))]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    Ok,
+    Cancel,
+    Text(String),
+    Files(Vec<String>),
+}
+
+/// What this tab is stopped on. `None` — there is no page to stop.
+#[cfg(not(feature = "web"))]
+pub fn pending(_tab_id: &str) -> Option<Pending> {
+    None
+}
+
+/// Whether any tab is stopped on an ask.
+#[cfg(not(feature = "web"))]
+pub fn any_pending() -> bool {
+    false
+}
+
+/// Answer a tab's outstanding ask. Nothing is outstanding here.
+#[cfg(not(feature = "web"))]
+pub fn answer(_tab_id: &str, _answer: Answer) {}
 
 /// Resident bytes across the CEF process tree, and how many processes that
 /// is. `None` when nothing is running or the probe failed — the same

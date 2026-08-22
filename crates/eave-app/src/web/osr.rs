@@ -50,6 +50,25 @@ unsafe extern "C" {
 /// nothing.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Popup frames delivered, for the capture rig. Counted separately from
+/// `FRAMES` because "the page painted" and "the `<select>` painted" are
+/// different claims and a capture that cannot tell them apart proves
+/// neither.
+static POPUP_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Which page frame `EAVE_WEB_PROBE_CLICK` rides.
+///
+/// Not frame 0: that one arrives at the pre-resize size (1600x1200 in this
+/// rig) and is a partly-laid-out document — clicking into it finds no boxes,
+/// which is what moving the probe off `on_load_end` was meant to fix.
+///
+/// Frame 1 is the settled one (1632x1394, the view's real size), and it is
+/// also the LAST one a static page ever produces. An earlier version waited
+/// for frame 2 and simply never fired: a page with nothing moving in it
+/// paints twice and then stops, so "wait a few frames" is not a thing a
+/// static page will do for you.
+const PROBE_AFTER_FRAMES: u64 = 1;
+
 pub fn frames_delivered() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -65,7 +84,62 @@ thread_local! {
     /// space. One source of truth, so the two can never disagree.
     static VIEWS: RefCell<HashMap<String, View>> = RefCell::new(HashMap::new());
 
+    /// The latest popup frame per tab — a `<select>` dropdown, an autofill
+    /// list, a colour picker. Separate from `PAGES` because it is a
+    /// separate surface with its own size, not a region of the page.
+    static POPUPS: RefCell<HashMap<String, CVPixelBuffer>> = RefCell::new(HashMap::new());
+
+    /// Where each tab's popup sits and whether it is up. `None` means no
+    /// popup is showing, which is the state that must survive
+    /// `on_popup_show(false)` even though a stale frame is still in
+    /// `POPUPS` — Chromium does not paint a blank frame on the way down,
+    /// so a shown-flag is the only thing that can retract the widget.
+    static POPUP_RECTS: RefCell<HashMap<String, PopupRect>> = RefCell::new(HashMap::new());
+
     static GPU: RefCell<Option<Gpu>> = const { RefCell::new(None) };
+}
+
+/// The popup for a tab: its frame and where to put it. `None` when no popup
+/// is showing.
+///
+/// Both halves are required, and that is the whole reason this is one
+/// function rather than two. A frame with no rect cannot be placed, and a
+/// rect with no frame would paint a hole — so a popup that is mid-open,
+/// with a size but no pixels yet, correctly draws nothing for one frame
+/// instead of a black rectangle.
+fn show_popup(tab_id: &str, rect: PopupRect) {
+    POPUP_RECTS.with(|r| {
+        r.borrow_mut().insert(tab_id.to_string(), rect);
+    });
+}
+
+/// Take the popup down.
+///
+/// Clears the RECT and deliberately leaves the last frame in `POPUPS`.
+/// Chromium does not paint an empty frame on the way down, so the pixels
+/// are still there and always will be; the rect is the thing that decides
+/// whether they are drawn. Clearing the frame instead would work too, and
+/// would throw away a buffer that the next popup on this tab can reuse.
+fn hide_popup(tab_id: &str) {
+    POPUP_RECTS.with(|r| {
+        r.borrow_mut().remove(tab_id);
+    });
+}
+
+/// Whether a popup is up for this tab, whatever has been painted.
+///
+/// Test-only for now. The product asks the same question through [`popup`],
+/// which needs the frame as well; this is the half that isolates the state
+/// machine from whether Metal ever ran.
+#[cfg(test)]
+fn popup_shown(tab_id: &str) -> bool {
+    POPUP_RECTS.with(|r| r.borrow().contains_key(tab_id))
+}
+
+pub fn popup(tab_id: &str) -> Option<(CVPixelBuffer, PopupRect)> {
+    let rect = POPUP_RECTS.with(|r| r.borrow().get(tab_id).copied())?;
+    let frame = POPUPS.with(|p| p.borrow().get(tab_id).cloned())?;
+    Some((frame, rect))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,8 +192,21 @@ pub fn forget(tab_id: &str) {
     PAGES.with(|p| {
         p.borrow_mut().remove(tab_id);
     });
+    POPUPS.with(|p| {
+        p.borrow_mut().remove(tab_id);
+    });
+    POPUP_RECTS.with(|r| {
+        r.borrow_mut().remove(tab_id);
+    });
     VIEWS.with(|v| {
         v.borrow_mut().remove(tab_id);
+    });
+    // The destination buffers too, or the cache grows by a tab's worth of
+    // 24 MB allocations every time a tab is closed and never shrinks.
+    GPU.with(|cell| {
+        if let Some(gpu) = cell.borrow_mut().as_mut() {
+            gpu.forget_tab(tab_id);
+        }
     });
 }
 
@@ -132,12 +219,54 @@ pub fn forget(tab_id: &str) {
 /// `MTLTexture` is what the blit writes into.
 type Dest = (CVPixelBuffer, Retained<ProtocolObject<dyn MTLTexture>>);
 
+/// Which surface of which tab a destination buffer belongs to.
+///
+/// A browser under off-screen rendering paints TWO things, and CEF
+/// distinguishes them only by a `PaintElementType` on the callback: the
+/// page ([`PaintElementType::VIEW`]) and, when a `<select>` is open or
+/// Chromium wants to draw its own autofill list or colour picker, a popup
+/// ([`PaintElementType::POPUP`]) with its own size and its own position
+/// inside the view.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct SurfaceKey {
+    tab_id: String,
+    popup: bool,
+}
+
+/// Where a tab's popup is, inside the page, in logical pixels.
+///
+/// CEF gives this in VIEW coordinates — relative to the browser, not to the
+/// window and not to the screen — which is exactly what the page element
+/// needs, because the element paints the page at its own bounds and the
+/// popup is offset from there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopupRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// One destination per size, reused. Reallocating per frame would be a
-    /// 24 MB malloc 60 times a second for no reason.
-    dest: HashMap<(u32, u32), Dest>,
+    /// One destination per SURFACE per size, reused.
+    ///
+    /// **The key carries the surface and not just the size, and that is a
+    /// fix rather than a detail.** Keyed on `(w, h)` alone — as it was —
+    /// every tab laid out at the same size shared one `CVPixelBuffer`,
+    /// because `CVPixelBuffer::clone` is a retain and not a copy. Two page
+    /// tabs are the same size in the common case (a background tab is
+    /// never told it was hidden, so it keeps painting at the size the
+    /// foreground tab last published), so a background tab's frames landed
+    /// in the buffer the foreground tab was displaying. The page's own
+    /// `<select>` popup would have collided the same way the moment it
+    /// matched the page's dimensions.
+    ///
+    /// Reallocating per frame is still not the answer — that would be a
+    /// 24 MB malloc 60 times a second — so the cache stays and the key
+    /// gets wider.
+    dest: HashMap<(SurfaceKey, u32, u32), Dest>,
 }
 
 impl Gpu {
@@ -151,13 +280,20 @@ impl Gpu {
         })
     }
 
-    fn dest_texture(&mut self, w: u32, h: u32) -> Option<Dest> {
-        if let Some(found) = self.dest.get(&(w, h)) {
+    fn dest_texture(&mut self, key: &SurfaceKey, w: u32, h: u32) -> Option<Dest> {
+        if let Some(found) = self.dest.get(&(key.clone(), w, h)) {
             return Some(found.clone());
         }
         let made = make_dest(&self.device, w, h)?;
-        self.dest.insert((w, h), made.clone());
+        self.dest.insert((key.clone(), w, h), made.clone());
         Some(made)
+    }
+
+    /// Drop every destination belonging to a tab. Called when its browser
+    /// closes — without this the cache is a leak keyed by a tab id that
+    /// will never be asked for again, at 24 MB a size.
+    fn forget_tab(&mut self, tab_id: &str) {
+        self.dest.retain(|(k, _, _), _| k.tab_id != tab_id);
     }
 }
 
@@ -208,10 +344,20 @@ fn make_dest(device: &Retained<ProtocolObject<dyn MTLDevice>>, w: u32, h: u32) -
 /// would be GPU work rather than encode time. Blocking the pump on the GPU
 /// every frame would be paying 8× for a number nobody reads at runtime — and
 /// the copy is ordered against the read by Metal regardless.
-fn import_and_blit(tab_id: &str, io_surface: *mut std::ffi::c_void, w: u32, h: u32) -> bool {
+fn import_and_blit(
+    tab_id: &str,
+    popup: bool,
+    io_surface: *mut std::ffi::c_void,
+    w: u32,
+    h: u32,
+) -> bool {
     if w == 0 || h == 0 {
         return false;
     }
+    let key = SurfaceKey {
+        tab_id: tab_id.to_string(),
+        popup,
+    };
     GPU.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
@@ -243,7 +389,7 @@ fn import_and_blit(tab_id: &str, io_surface: *mut std::ffi::c_void, w: u32, h: u
             return false;
         };
 
-        let Some((buffer, dest)) = gpu.dest_texture(w, h) else {
+        let Some((buffer, dest)) = gpu.dest_texture(&key, w, h) else {
             return false;
         };
         let Some(cb) = gpu.queue.commandBuffer() else {
@@ -268,8 +414,19 @@ fn import_and_blit(tab_id: &str, io_surface: *mut std::ffi::c_void, w: u32, h: u
         encoder.endEncoding();
         cb.commit();
 
-        PAGES.with(|p| p.borrow_mut().insert(tab_id.to_string(), buffer));
-        FRAMES.fetch_add(1, Ordering::Relaxed);
+        if popup {
+            POPUPS.with(|p| p.borrow_mut().insert(tab_id.to_string(), buffer));
+        } else {
+            PAGES.with(|p| p.borrow_mut().insert(tab_id.to_string(), buffer));
+        }
+        let n = FRAMES.fetch_add(1, Ordering::Relaxed);
+        // `EAVE_WEB_PROBE_CLICK` fires HERE, on a page frame, and only on
+        // the one at `PROBE_AFTER_FRAMES` — see `tabs::probe_click` for why
+        // load-end was too early. Once, because a probe that clicked on
+        // every frame would reopen the popup it just closed forever.
+        if !popup && n == PROBE_AFTER_FRAMES {
+            super::tabs::probe_click(tab_id);
+        }
         true
     })
 }
@@ -323,6 +480,48 @@ wrap_render_handler! {
         }
 
         /// The GPU path — the one that runs.
+        /// A popup opened or closed.
+        ///
+        /// The retraction is the half that is easy to miss: Chromium does
+        /// NOT paint an empty frame on the way down, so the last popup
+        /// frame stays in `POPUPS` after the menu closes. Clearing the RECT
+        /// is what takes the widget off the screen — [`popup`] needs both,
+        /// so a frame with no rect is not drawn.
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: i32) {
+            if super::tabs::trace() {
+                eprintln!("[web] on_popup_show show={show} tab={}", self.tab_id);
+            }
+            if show == 0 {
+                hide_popup(&self.tab_id);
+                // Count it: the page underneath is now un-occluded and the
+                // window has to be redrawn to show that, and the pump only
+                // redraws when this counter moves.
+                FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Where the popup goes, in view coordinates.
+        ///
+        /// Always called before the first popup paint, so storing the rect
+        /// here and the pixels there cannot race: the rect is present by
+        /// the time a frame exists to place.
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            let Some(rect) = rect else { return };
+            let next = PopupRect {
+                x: rect.x as f32,
+                y: rect.y as f32,
+                width: rect.width as f32,
+                height: rect.height as f32,
+            };
+            if super::tabs::trace() {
+                eprintln!(
+                    "[web] on_popup_size {}x{} at {},{}",
+                    next.width, next.height, next.x, next.y
+                );
+            }
+            show_popup(&self.tab_id, next);
+        }
+
         fn on_accelerated_paint(
             &self,
             _browser: Option<&mut Browser>,
@@ -339,15 +538,20 @@ wrap_render_handler! {
                 }
             }
             // A `<select>` dropdown is a SECOND surface with its own
-            // geometry. Compositing and hit-testing it is the next slice;
-            // dropping it here is deliberate and visible (the widget simply
-            // does not appear) rather than silently drawn over the page.
-            if type_ == PaintElementType::POPUP {
-                return;
-            }
+            // geometry, and it arrives here with `POPUP` on the callback and
+            // nothing else to tell it apart. It used to be dropped, which
+            // meant every `<select>` on the web opened a menu that could not
+            // be seen and still swallowed the next click. It is now blitted
+            // into its own destination and painted over the page at the rect
+            // `on_popup_size` gave us.
+            let popup = type_ == PaintElementType::POPUP;
             let w = info.extra.coded_size.width.max(0) as u32;
             let h = info.extra.coded_size.height.max(0) as u32;
-            import_and_blit(&self.tab_id, info.shared_texture_io_surface, w, h);
+            if popup && super::tabs::trace() {
+                let n = POPUP_FRAMES.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[web] popup frame #{n} {w}x{h}");
+            }
+            import_and_blit(&self.tab_id, popup, info.shared_texture_io_surface, w, h);
         }
 
         /// The CPU fallback. Reached only if the GPU path is unavailable —
@@ -365,9 +569,7 @@ wrap_render_handler! {
             if std::env::var("EAVE_WEB_TRACE").is_ok() {
                 eprintln!("[web] cpu on_paint {_width}x{_height}");
             }
-            if type_ == PaintElementType::POPUP {
-                return;
-            }
+            let _ = type_;
             // Not implemented: the accelerated path is the one the spike
             // measured and the one CEF takes here. Saying so beats a silent
             // half-copy that would look like a rendering bug.
@@ -376,5 +578,102 @@ wrap_render_handler! {
                 eprintln!("eave: CEF fell back to CPU painting; the page will not draw");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// The popup state machine and the surface keying, which are eave's own
+// reasoning. Nothing here starts CEF or touches Metal.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect() -> PopupRect {
+        PopupRect {
+            x: 12.,
+            y: 40.,
+            width: 180.,
+            height: 220.,
+        }
+    }
+
+    #[test]
+    fn no_popup_until_one_is_sized() {
+        assert!(!popup_shown("p1"));
+        show_popup("p1", rect());
+        assert!(popup_shown("p1"));
+    }
+
+    /// The retraction. Chromium paints no empty frame on the way down, so
+    /// if the rect did not decide visibility the last `<select>` a tab
+    /// opened would stay on screen for the life of the tab.
+    #[test]
+    fn closing_a_popup_takes_it_off_the_screen() {
+        show_popup("p2", rect());
+        hide_popup("p2");
+        assert!(!popup_shown("p2"));
+    }
+
+    /// A popup that has been sized but not yet painted must draw NOTHING
+    /// rather than a black rectangle — `popup()` needs both halves, which
+    /// is why it is one function and not two.
+    #[test]
+    fn a_sized_popup_with_no_frame_yet_paints_nothing() {
+        show_popup("p3", rect());
+        assert!(popup_shown("p3"));
+        assert!(
+            popup(&"p3".to_string()).is_none(),
+            "a rect with no pixels is not something to paint"
+        );
+    }
+
+    #[test]
+    fn tabs_do_not_share_a_popup() {
+        show_popup("p4a", rect());
+        assert!(popup_shown("p4a"));
+        assert!(!popup_shown("p4b"));
+    }
+
+    #[test]
+    fn closing_a_tab_takes_its_popup_with_it() {
+        show_popup("p5", rect());
+        forget("p5");
+        assert!(!popup_shown("p5"));
+    }
+
+    /// The bug the wider key fixes. Two tabs laid out at the same size --
+    /// the COMMON case, because a background tab is never told it was
+    /// hidden and keeps the size the foreground tab published -- must not
+    /// resolve to the same destination buffer, or one tab's frames land in
+    /// the buffer the other is displaying.
+    #[test]
+    fn two_tabs_at_the_same_size_are_different_surfaces() {
+        let a = SurfaceKey {
+            tab_id: "t-a".into(),
+            popup: false,
+        };
+        let b = SurfaceKey {
+            tab_id: "t-b".into(),
+            popup: false,
+        };
+        assert_ne!(a, b);
+    }
+
+    /// And a tab's own popup is not its page, however the sizes land.
+    #[test]
+    fn a_tabs_popup_is_not_its_page() {
+        let page = SurfaceKey {
+            tab_id: "t-c".into(),
+            popup: false,
+        };
+        let menu = SurfaceKey {
+            tab_id: "t-c".into(),
+            popup: true,
+        };
+        assert_ne!(page, menu);
     }
 }
