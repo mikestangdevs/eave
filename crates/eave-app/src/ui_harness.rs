@@ -9340,7 +9340,7 @@ fn the_omnibox_navigates_through_the_request_path(cx: &mut TestAppContext) {
         cmds.iter().any(|c| matches!(
             c,
             Command::Browser(BrowserCmd::Navigate { url, .. })
-                if url == "https://duckduckgo.com/?q=rust+traits"
+                if url == "https://www.google.com/search?q=rust+traits"
         )),
         "a sentence was not searched for: {cmds:?}"
     );
