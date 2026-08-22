@@ -1052,6 +1052,25 @@ pub const TOOL_NAME_LINE: f32 = 16.0;
 pub const COMPOSER_LINE: f32 = 22.0;
 pub const COMPOSER_MIN_H: f32 = 24.0;
 
+// ── Slice E1: the find bar ──────────────────────────────────────────────
+//
+// It floats over a live page, which is the one ground in this application
+// eave does not draw — so it takes the composer's material
+// (`chrome_glass` + `border_strong` + `shadow_panel`), the material this
+// project measured against *scrolling content underneath*, rather than the
+// pointer menus' `menu_glass`, which was measured against chrome.
+
+/// The bar's height. [`RAIL_TAB_H`] rather than a new number: it is a
+/// single row of controls, which is what that rank already means here.
+pub const FIND_BAR_H: f32 = RAIL_TAB_H;
+/// The query field never collapses to nothing while empty, so the bar does
+/// not resize under the first keystroke.
+pub const FIND_FIELD_MIN_W: f32 = 120.0;
+/// …and never grows past this, so a pasted paragraph does not push the
+/// tally off the window. The text truncates; the SEARCH still uses all of
+/// it.
+pub const FIND_FIELD_MAX_W: f32 = 240.0;
+
 /// Weight roles — the only weights the shell uses. Prose is NORMAL;
 /// labels/names are MEDIUM; STRONG is reserved for escalated notices
 /// and the armed send glyph. (Markdown `**bold**` inside prose keeps

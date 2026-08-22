@@ -57,7 +57,16 @@ pub fn frames_delivered() -> u64 {
 thread_local! {
     /// The latest completed frame per tab, as a buffer WE own — CEF's
     /// surface may not outlive its callback.
-    static PAGES: RefCell<HashMap<String, CVPixelBuffer>> = RefCell::new(HashMap::new());
+    ///
+    /// **The size travels with the buffer, and Slice E1 is why.** A
+    /// `CVPixelBuffer` on its own does not say what geometry it was drawn
+    /// for, and `paint_surface` scales whatever it is given to fill the
+    /// bounds it is given. So a frame produced at the old size, painted
+    /// into the new bounds during a live resize, is a *stretched* page —
+    /// and it stays stretched for as many frames as CEF takes to answer.
+    /// Carrying the coded size is what lets the element ask "is this frame
+    /// the right size?" and refuse to scale when the answer is no.
+    static PAGES: RefCell<HashMap<String, Frame>> = RefCell::new(HashMap::new());
 
     /// Where each tab's page element was laid out, in device pixels, and at
     /// what scale. Published by the element at paint; read here to answer
@@ -66,6 +75,53 @@ thread_local! {
     static VIEWS: RefCell<HashMap<String, View>> = RefCell::new(HashMap::new());
 
     static GPU: RefCell<Option<Gpu>> = const { RefCell::new(None) };
+}
+
+/// A finished page frame, and the geometry Chromium coded it at.
+///
+/// The two are one value because they are only ever true together: the
+/// moment they are separated, something will paint the pixels at a size
+/// they were not drawn for and call it a resize.
+#[derive(Clone)]
+pub struct Frame {
+    pub buffer: CVPixelBuffer,
+    /// **Device** pixels — `AcceleratedPaintInfo::coded_size`, which is the
+    /// logical size times the scale CEF was told about.
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Frame {
+    /// The size this frame is 1:1 at under `scale`, in logical pixels.
+    ///
+    /// Not "the size it was drawn for": if the scale has changed since, the
+    /// honest answer is still one device pixel per device pixel, because
+    /// that is the only rendering of these pixels that invents nothing.
+    pub fn logical(&self, scale: f32) -> (f32, f32) {
+        let scale = if scale > 0. { scale } else { 1. };
+        (self.width as f32 / scale, self.height as f32 / scale)
+    }
+}
+
+/// What changed about where a page is laid out — and therefore which of
+/// CEF's two notification calls it owes.
+///
+/// **They are not the same call and one does not imply the other.**
+/// `WasResized` re-asks `GetViewRect`; the device scale factor lives in
+/// `GetScreenInfo`, which CEF caches and re-reads only on
+/// `NotifyScreenInfoChanged`. A build that sends only `WasResized` renders
+/// a retina page at 1× after a drag to an external display — the geometry
+/// is right, the resolution is a display behind, and nothing errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewChange {
+    /// Same box, same scale. CEF is told nothing.
+    Same,
+    /// New box, same scale. `WasResized`.
+    Resized,
+    /// New scale, whatever the box did. `NotifyScreenInfoChanged` **and**
+    /// `WasResized` — the second because a scale change is also a change in
+    /// the device-pixel size of the same logical box.
+    Rescaled,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -96,21 +152,26 @@ pub fn view(tab_id: &str) -> View {
     VIEWS.with(|v| v.borrow().get(tab_id).copied().unwrap_or_default())
 }
 
-/// Publish where the element was laid out. Returns whether the SIZE changed,
-/// which is the only part CEF has to be told about.
-pub fn set_view(tab_id: &str, next: View) -> bool {
+/// Publish where the element was laid out. Returns what CEF has to be told
+/// about, which is never the origin — that is ours, for input.
+pub fn set_view(tab_id: &str, next: View) -> ViewChange {
     VIEWS.with(|v| {
         let mut v = v.borrow_mut();
         let previous = v.insert(tab_id.to_string(), next);
         match previous {
-            Some(p) => p.width != next.width || p.height != next.height || p.scale != next.scale,
-            None => true,
+            Some(p) if p.scale != next.scale => ViewChange::Rescaled,
+            Some(p) if p.width != next.width || p.height != next.height => ViewChange::Resized,
+            Some(_) => ViewChange::Same,
+            // First layout. The browser was created at whatever
+            // `View::default` said, so this is a real change even when the
+            // numbers happen to agree.
+            None => ViewChange::Rescaled,
         }
     })
 }
 
 /// The newest frame for a tab, if one has arrived.
-pub fn frame(tab_id: &str) -> Option<CVPixelBuffer> {
+pub fn frame(tab_id: &str) -> Option<Frame> {
     PAGES.with(|p| p.borrow().get(tab_id).cloned())
 }
 
@@ -268,7 +329,20 @@ fn import_and_blit(tab_id: &str, io_surface: *mut std::ffi::c_void, w: u32, h: u
         encoder.endEncoding();
         cb.commit();
 
-        PAGES.with(|p| p.borrow_mut().insert(tab_id.to_string(), buffer));
+        let evicted = PAGES.with(|p| {
+            p.borrow_mut().insert(
+                tab_id.to_string(),
+                Frame {
+                    buffer,
+                    width: w,
+                    height: h,
+                },
+            )
+        });
+        // Dropped outside the borrow. A `CVPixelBuffer` release is not a CEF
+        // call, so this is not the `with_browser` hazard — but the shape is
+        // the one this module keeps, and a `Frame` will grow fields.
+        drop(evicted);
         FRAMES.fetch_add(1, Ordering::Relaxed);
         true
     })

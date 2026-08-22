@@ -314,7 +314,11 @@ pub fn start_pump(cx: &mut gpui::App) {
         loop {
             let ms = if super::tabs::any_browser() {
                 let quiet = now_ms() >= ACTIVE_UNTIL.load(Ordering::Relaxed);
-                if quiet { QUIET_MS } else { BUSY_MS }
+                if quiet {
+                    QUIET_MS
+                } else {
+                    BUSY_MS
+                }
             } else {
                 IDLE_MS
             };
@@ -356,7 +360,7 @@ pub fn start_pump(cx: &mut gpui::App) {
                 // the quit observer can close browsers and call `CefShutdown`
                 // legally. Keep pumping afterwards — the deferred block is
                 // main-queue work like any other and still has to be run.
-                let _ = cx.update(|app| app.quit());
+                cx.update(|app| app.quit());
             }
             pump_cef();
             refresh_if_painted(cx);
@@ -408,6 +412,13 @@ static QUIT_STARTED: AtomicBool = AtomicBool::new(false);
 /// browser that was created and then never loaded its page, with no error
 /// anywhere. cefclient's external pump solves it the same way, by noticing
 /// requests raised during the pump and re-posting once afterwards.
+/// How many pumps and schedules the trace narrates before it goes quiet.
+///
+/// The cap itself is right — an hour-long session would otherwise write
+/// hundreds of thousands of lines — but a cap that does not SAY it has
+/// capped is a number that lies. See the note at its use.
+const TRACE_CAP: u64 = 25;
+
 static IN_PUMP: AtomicBool = AtomicBool::new(false);
 static REQUESTED_DURING_PUMP: AtomicBool = AtomicBool::new(false);
 
@@ -417,7 +428,9 @@ static REQUESTED_DURING_PUMP: AtomicBool = AtomicBool::new(false);
 fn pump_cef() {
     if traced() {
         let n = PUMPS.fetch_add(1, Ordering::Relaxed);
-        if n < 25 {
+        if n == TRACE_CAP {
+            eprintln!("[web] pump #{n} — further pumps not traced");
+        } else if n < TRACE_CAP {
             eprintln!("[web] pump #{n}");
         }
     }
@@ -446,15 +459,43 @@ fn pump_cef() {
 /// **after** `CefDoMessageLoopWork` has returned. Do not fold it back into the
 /// pump: that shape is what Slice C6 removed.
 fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
+    // Slice E1: **or if the CHROME changed.** The frame counter is the
+    // right gate for the page's own pixels and the wrong one for anything
+    // eave draws *about* the page. A right-click on a still document, and a
+    // find result that moves the tally from "3 of 17" to "4 of 17", both
+    // repaint nothing in Chromium — so a redraw gate that only watches
+    // delivered frames leaves the menu unopened and the number stale until
+    // something unrelated asks for a frame. Taken with `swap` so the flag
+    // is consumed exactly once.
+    let chrome = CHROME_DIRTY.swap(false, Ordering::Relaxed);
     let seen = super::osr::frames_delivered();
-    if seen == LAST_REFRESHED.load(Ordering::Relaxed) {
+    let painted = seen != LAST_REFRESHED.load(Ordering::Relaxed);
+    if !painted && !chrome {
         return;
     }
     LAST_REFRESHED.store(seen, Ordering::Relaxed);
-    // A page that is painting is a page that is doing something.
-    note_activity();
-    let _ = cx.update(|app| app.refresh_windows());
+    if painted {
+        // A page that is painting is a page that is doing something. A
+        // chrome change is not: it must not extend the busy tail, or an
+        // open find bar would hold the pump at `BUSY_MS` for as long as it
+        // is up.
+        note_activity();
+    }
+    cx.update(|app| app.refresh_windows());
 }
+
+/// Something eave draws ABOUT the page changed, and no page frame is coming
+/// to carry it onto the screen.
+///
+/// The counterpart to the frame counter — see [`refresh_if_painted`]. Cheap
+/// and idempotent, so the callers do not have to know whether a redraw is
+/// already pending.
+pub(super) fn note_chrome_change() {
+    CHROME_DIRTY.store(true, Ordering::Relaxed);
+    request_pump();
+}
+
+static CHROME_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// `EAVE_WEB_TRACE`, read once. The pump asks on every turn and the shutdown
 /// loop runs it a thousand times, so an `env::var` per call is a real cost.
@@ -463,7 +504,7 @@ fn no_heartbeat() -> bool {
     *OFF.get_or_init(|| std::env::var("EAVE_WEB_NO_HEARTBEAT").is_ok())
 }
 
-fn traced() -> bool {
+pub(super) fn traced() -> bool {
     static TRACED: OnceLock<bool> = OnceLock::new();
     *TRACED.get_or_init(|| std::env::var("EAVE_WEB_TRACE").is_ok())
 }
@@ -490,8 +531,18 @@ wrap_browser_process_handler! {
             // Counted unconditionally, not just under trace: this counter is
             // the predicate `stop_cef` shuts down on. See there.
             let n = SCHEDULES.fetch_add(1, Ordering::Relaxed);
-            if traced() {
-                if n < 25 {
+            // **The cap announces itself.** It used to be a bare
+            // `if n < 25`, and a silent cap on a counter is worse than no
+            // counter: this one has produced two wrong conclusions in this
+            // project's history — a thirty-second run logs `schedule #24`
+            // and stops, which reads as "CEF asked 25 times" when the real
+            // figure was 203. Slice E1 was reading these traces all day and
+            // fixing it was one line inside a `collapsible_if` clippy was
+            // already asking for.
+            if traced() && n <= TRACE_CAP {
+                if n == TRACE_CAP {
+                    eprintln!("[web] schedule #{n} — further schedules not traced");
+                } else {
                     eprintln!("[web] schedule #{n} delay={delay_ms} in_pump={}",
                         IN_PUMP.load(Ordering::SeqCst));
                 }
@@ -757,4 +808,3 @@ const SHUTDOWN_STEP_MS: u64 = 1;
 const SHUTDOWN_QUIET_ROUNDS: u32 = 50;
 /// How long `CefShutdown` gets before the watchdog exits the process anyway.
 const SHUTDOWN_DEADLINE_MS: u64 = 1500;
-
