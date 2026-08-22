@@ -73,7 +73,11 @@ def main() -> None:
         }
     )
     opened("t-sess-b", {"kind": "session", "session_id": SESSION_B})
-    events.append({"kind": "activated", "id": "t-sess-a"})
+    # `D1_ACTIVE` picks which tab the capture opens on. A PAGE makes the pane
+    # header draw its address arm — the shot A′ exists for — and needs the CEF
+    # bundle under it; a session makes it draw the breadcrumb and works in any
+    # build. Default is the page, because the address is the claim.
+    events.append({"kind": "activated", "id": os.environ.get("D1_ACTIVE", "t-gpui")})
 
     path = os.path.join(data, "browser", "tabs.jsonl")
     os.makedirs(os.path.dirname(path), exist_ok=True)
