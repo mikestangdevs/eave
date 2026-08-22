@@ -1308,8 +1308,85 @@ pub const SKELETON_WIDTHS: [f32; 5] = [0.72, 0.46, 0.88, 0.34, 0.61];
 // The old opaque L2 rail slabs read as gray cardboard next to the glass;
 // a sidebar on frost has no plate to get wrong.
 
-/// Rail width (62 × the 4 px unit).
-pub const RAIL_W: f32 = 248.0;
+/// **The rail's RESTING width (Slice D3): 220, down from 248.**
+///
+/// The verdict on 248 was "too thick". The replacement is bracketed by the
+/// two reference rails that could actually be measured, rather than picked
+/// by feel. Both shots are 144 dpi, so device pixels halve to points:
+///
+/// | reference | window | rail | share |
+/// | --- | --- | --- | --- |
+/// | Radius (browser) | 1723 pt | **184.5 pt** | 10.7% |
+/// | Radius (agent)   | 1361 pt | **270.0 pt** | 19.8% |
+///
+/// Measured as *the vertical seam that persists down the full column*, which
+/// matters: a single scanline finds the command palette's edge instead and
+/// reports 481 pt for the first shot. The third rail reference (Dia) is a
+/// 524 pt crop of a marketing image, so its absolute figures are not usable
+/// and only its composition is.
+///
+/// **The references disagree by 85 px; what they agree on is a SHARE of the
+/// window** — a rail is a tenth to a fifth of it. Mike's windows are ~1720 pt
+/// (display 3456×2234 at 2×), where this is 13.3%: inside the bracket and
+/// near the browser end, which is the right end for an app whose hero is a
+/// page.
+///
+/// **228 and not the 220 the directive asked for, because 220 is a number
+/// the session row cannot state its facts at.** The rail's width is not a
+/// free choice — three tests hold three different facts to a floor, and each
+/// one implies a minimum rail:
+///
+/// | fact | floor | needs |
+/// | --- | --- | --- |
+/// | the folder stays recognisable (`a_marked_row_still_shows_its_folder`) | 80 px of path | 211 |
+/// | the memory ceiling is stated whole (`the_rail_states_what_every_live_agent_costs`) | 173.4 px of text | 223 |
+/// | the action strip never covers the name's start (`the_action_strip_does_not_cover_the_session_name`) | 48 px of name | **227** |
+///
+/// The first two were 237 and 223 before this slice moved the row's lower
+/// lines off their 40 px indent (see `meta_indent` in `ui.rs`); the third is
+/// untouched by that, because it is a line-ONE constraint: four 24 px targets
+/// and three gaps is 108 px of corner, and the name starts where the state
+/// dot and the identity chip leave it. So 227 is the binding number and 228
+/// is it rounded to the 4 px unit.
+///
+/// **Getting to 220 means offering fewer than four affordances in that
+/// corner** — which is what `ui.rs` already recommends at the strip ("the fix
+/// for that is to offer fewer of them in the corner"), and which stage 3's
+/// context menu makes possible. That is a product call, not a geometry one,
+/// so this slice measured it and left it.
+///
+/// **This is a default, not the width.** [`RAIL_W_MIN`] / [`RAIL_W_MAX`]
+/// bound the drag and the shell holds the live value; this constant is only
+/// what a data dir with no saved width starts at. **Anything that needs the
+/// CURRENT width must read `Shell::rail_w`, not this** — and the tests that
+/// measure name fits read the rendered row, which is why they kept working
+/// when this moved.
+pub const RAIL_W: f32 = 228.0;
+
+/// The narrowest the rail may be dragged.
+///
+/// Not a taste bound. A′ gave the rail the window's left edge, so it
+/// *contains the traffic lights*, and those sit at a window-fixed x — a rail
+/// narrower than [`TRAFFIC_CLEARANCE`] would have them hanging off its right
+/// edge onto the page. That is an 86 px floor; 180 is that floor plus a name
+/// slot worth having (~130 px after the row's chrome).
+/// `the_rail_never_narrows_past_its_own_traffic_lights` holds it.
+pub const RAIL_W_MIN: f32 = 180.0;
+
+/// The widest the rail may be dragged.
+///
+/// Past this the rail stops reading as navigation beside a document and
+/// starts reading as a second column — the IDE look Slice D1 deleted the
+/// files rail to escape. 320 is the old 248 plus the same 72 px the floor
+/// sits below it, so the resting width is centred in its own range.
+pub const RAIL_W_MAX: f32 = 320.0;
+
+/// The resize handle straddling the rail's seam.
+///
+/// The seam is a hairline and a 1 px hit target is not a control. 8 px
+/// centred on it gives 4 either side — [`RAIL_CARD_BLEED`]'s reasoning
+/// (a mark must bleed past the thing it marks) applied to a hit box.
+pub const RAIL_HANDLE_W: f32 = 8.0;
 
 /// **The collapsed rail is a SPINE, never nothing (Slice D1).**
 ///
@@ -1325,13 +1402,28 @@ pub const RAIL_W: f32 = 248.0;
 /// i.e. the width a tab's identity mark needs and nothing more.
 pub const RAIL_SPINE_W: f32 = 44.0;
 
-/// A tab's row height in the vertical strip (Slice D1).
+/// A tab's row height in the vertical strip (Slice D1; 28 → 24 in D3).
 ///
-/// `RAIL_NAME_LINE` 19 + `SPACE_1` above and below is 27, which is
-/// [`TAB_H`]'s own derivation — rounded to the 4 px unit because a vertical
-/// list of them stacks, and an odd height accumulates a half-pixel seam every
-/// other row where a horizontal strip only ever had one.
-pub const RAIL_TAB_H: f32 = 28.0;
+/// **The tallest thing on the row sets it, and that was never the name.**
+/// At 28 the row was an 18 px provider plate with 5 px of air; the name's 19
+/// px line box fitted inside that with room to spare. So shrinking the TYPE
+/// could not have shortened the list by one pixel — only the mark could, and
+/// [`RAIL_MARK`] takes it to 16. The row is 16 + `SPACE_1` above and below =
+/// **24**, and [`RAIL_NAME_LINE`] 19 still sits inside it on 2.5 px of air.
+///
+/// This is the load-bearing half of "density lives in the rail", and it is
+/// the half that is easy to get wrong: the first attempt moved the type and
+/// the leading down as well, which shortened nothing extra and flattened the
+/// row's two ranks into one. See [`RAIL_NAME_LINE`].
+///
+/// Still a multiple of the 4 px unit, for D1's reason: a vertical list of
+/// these stacks, and an odd height accumulates a half-pixel seam every other
+/// row where a horizontal strip only ever had one.
+///
+/// **The freed height is not a saving, it is the pinned zone's budget.** Nine
+/// rows were 9×28 + 8×4 = 284 px; they are now 9×24 + 8×4 = **248**, and the
+/// 36 px difference is roughly one row of stage 3's favicon grid.
+pub const RAIL_TAB_H: f32 = 24.0;
 
 /// **How many tabs the OPEN section shows before it scrolls (Slice D1).**
 ///
@@ -1502,12 +1594,52 @@ pub const RADIUS_CHIP: f32 = 5.0;
 /// underneath it, and `the_action_strip_does_not_cover_the_session_name`
 /// shaped its measurement at **14.0** — so the layout, the token and the
 /// test each believed something different about the same glyphs. The tests
-/// still write `13.0` as a literal (§7: never derive an expectation from
+/// still write the value as a literal (§7: never derive an expectation from
 /// the constant under test) and guard it against this value, so moving the
 /// name's size fails loudly instead of sliding the measurement with it.
-pub const RAIL_NAME_SIZE: f32 = 13.0;
-/// The line box [`RAIL_NAME_SIZE`] sits in. See that constant.
+///
+/// **Slice D3 moved it 13.0 → 12.5, and that is the whole "step down one
+/// notch".** The rail is navigation and the transcript is reading, so they
+/// should not share a scale — but before this they nearly did: 13.0 against
+/// [`BODY_SIZE`] 13.5 is a *half a point*, which is not a step, it is a
+/// rounding difference wearing a step's name. The old doc said so itself
+/// ("the size step over the folder line (12.5) is half a point") and treated
+/// it as a fact rather than a defect. 12.5 lands the rail's name ON the
+/// folder line's size, so the rail has ONE size instead of two that differ
+/// by less than a pixel, and the step over the reading column becomes a
+/// visible 1.0.
+pub const RAIL_NAME_SIZE: f32 = 12.5;
+/// The line box [`RAIL_NAME_SIZE`] sits in.
+///
+/// **Slice D3 tried to take this to 17 with the size, and two tests refused
+/// it — correctly.** The rail row's second line (the folder, the facts) is
+/// already 17, so a 17 px name gives the row two ranks with the same line box
+/// and no anchor: `a_rail_row_says_its_name_louder_than_its_facts` and
+/// `nothing_on_the_row_competes_with_the_session_name` both fired.
+///
+/// The lesson is worth keeping, because "step the rail down one notch" reads
+/// like a single knob and is not: a row's height is set by its TALLEST item,
+/// and a *rank* inside the row is set by the DIFFERENCE between items. Moving
+/// every number down by the same amount shortens nothing (the mark was
+/// already the tallest thing) and flattens the hierarchy (the gap closes).
+/// The density came from [`RAIL_MARK`] and [`RAIL_TAB_H`] instead, and this
+/// stayed where it was.
 pub const RAIL_NAME_LINE: f32 = 19.0;
+
+/// **The rail row's leading mark box — one slot, whatever fills it.**
+///
+/// A session row fills it with the provider chip; from Slice D3's stage 2 a
+/// page row fills it with a favicon. Making that ONE size is a compositional
+/// decision, not a saving: the references put a page and a project on
+/// adjacent rows and the eye reads them as one list because the marks line
+/// up. Two sizes would make the mixed strip read as two lists interleaved —
+/// which is the thing D1 built the single strip to stop doing.
+///
+/// 16 rather than [`PROVIDER_CHIP`]'s 18 because it is what a 24 px row can
+/// hold with `SPACE_1` of air above and below, and because 16 is the size a
+/// favicon is actually served at (`16×16` is the ICO default; anything else
+/// is being rescaled either way).
+pub const RAIL_MARK: f32 = 16.0;
 
 // ---------------------------------------------------------------------------
 // Session tabs (Slice AS) — switching sessions with the rail collapsed.
