@@ -7687,29 +7687,35 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
          collapsed rail shows, and two tab lists at once is neither"
     );
 
-    // Collapsed: a SPINE entry for every session, in the rail's order.
+    // **Collapsed, there is no tab list at all — and this test now records
+    // that as the operator's decision rather than asserting against it.**
     //
-    // **Slice D1 changed what "collapsed" means and this test is where that
-    // is checked.** The strip used to appear on collapse and vanish on
-    // expand; in A′ it lives in the open rail, so collapsing it would have
-    // taken every tab off screen — the very dead end Slice AS built this
-    // test to close, re-opened by the frame that was supposed to improve it.
-    // `theme::RAIL_SPINE_W` is the answer: 44 px that still carries every
-    // tab's plate and state dot. The walk this test describes is unchanged;
-    // only the selectors it walks through are.
-    for sel in [
-        "spine-aaaa1111",
-        "spine-bbbb2222",
-        "spine-cccc3333",
-        "spine-dddd4444",
-        "spine-eeee5555",
-    ] {
-        assert!(
-            shown(vcx, sel),
-            "{sel} is missing — collapsing the rail took that session out \
-             of reach, which is the whole defect"
-        );
-    }
+    // The history is worth keeping because the same ground has been walked
+    // three times. Slice AS found the dead end (*"when i close the chat panel
+    // we need to convert to page tabs for sessions so i can still switch"*)
+    // and answered it with a strip in the titlebar. Slice C5 kept that. D1's
+    // first build moved the strip into the rail and answered the collapse
+    // case with a 44 px spine. The operator then ruled the spine out
+    // (2026-08-21: *"i dont want the border on left side or on top on menu
+    // close. we should close to full screen"*) and explicitly parked the
+    // question the spine was answering — *"the top bar was supposed to be a
+    // space for tabs when the sidebar was closed but idk about it now"*.
+    //
+    // So: with the rail shut, switching is ctrl-tab and ⌘L, and the toggle
+    // that reopens the rail is on the pane header. **That toggle being
+    // reachable is the part that is not negotiable**, and it is asserted
+    // below — the first cut of this change left it inside the rail it
+    // closes, and shutting the menu became one-way.
+    assert!(
+        !shown(vcx, "tab-strip"),
+        "the strip survived the collapse — closing the menu is supposed to \
+         give the window to the content"
+    );
+    assert!(
+        shown(vcx, "rail-toggle"),
+        "the control that reopens the rail is inside the rail — closing the \
+         menu is a one-way door"
+    );
 
     // ...and it is not decoration. **In two steps now, and the second step
     // is the slice's central claim.** Clicking a tab does not switch the
@@ -7717,8 +7723,13 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
     // from which tab is active. That is what makes `TabsState::active` the
     // single notion of active rather than a second one kept beside the
     // shell's own — C1's open question, answered.
+    // Re-open, and switch from the list — the walk the operator actually
+    // takes now.
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "tab-strip"), "the rail did not reopen");
     let _ = h.drain();
-    click(vcx, "spine-dddd4444");
+    click(vcx, "tab-dddd4444");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
@@ -7753,17 +7764,19 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
          another one: {cmds:?}"
     );
 
-    // And the toggle still goes back.
+    // And the toggle is an involution: shut, open, and the rail is back.
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-aaaa1111"),
+        "the rail did not collapse again"
+    );
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
     assert!(shown(vcx, "rail-aaaa1111"), "the rail did not come back");
     assert!(
         shown(vcx, "tab-strip"),
         "the strip vanished when the rail came back"
-    );
-    assert!(
-        !shown(vcx, "spine-aaaa1111"),
-        "the spine survived the rail re-opening — two tab lists at once"
     );
 }
 
@@ -7817,9 +7830,9 @@ fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
     assert!(
-        shown(vcx, "spine-tabs"),
-        "collapsing left no spine — every open tab just went off screen, \
-         which is the dead end Slice AS was built to close"
+        !shown(vcx, "rail"),
+        "the rail survived the collapse — closing the menu gives the window \
+         to the content"
     );
     let shut = well(vcx);
     let shut_bar = bar(vcx);
@@ -9617,6 +9630,68 @@ fn the_changes_list_is_a_section_of_the_rail_not_a_second_column(cx: &mut TestAp
         well.origin.x + well.size.width,
         window.origin.x + window.size.width,
         "something is between the content region and the window's right edge"
+    );
+}
+
+/// **Closing the menu gives the window to the content.**
+///
+/// The operator's ruling, 2026-08-21: *"i dont want the border on left side
+/// or on top on menu close. we should close to full screen and the top close
+/// icon stay on the top."*
+///
+/// Geometry is what this file can prove: the content region starts at the
+/// window's own left edge, and the only thing above it is the header's own
+/// height. Whether that header still PAINTS a band is a colour question and
+/// belongs to a capture — `Shell::pane_header` drops its `bg` and its bottom
+/// rule in this state and the shots in the report show it.
+#[gpui::test]
+fn closing_the_menu_gives_the_window_to_the_content(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+
+    let open = vcx
+        .debug_bounds("content-well")
+        .expect("the content region");
+    assert!(
+        open.origin.x >= px(theme::RAIL_W),
+        "the content region starts at {:?} with the rail open",
+        open.origin.x
+    );
+
+    click(vcx, "rail-toggle");
+    vcx.run_until_parked();
+
+    let shut = vcx
+        .debug_bounds("content-well")
+        .expect("the content region");
+    assert_eq!(
+        shut.origin.x,
+        px(0.),
+        "the content region starts at {:?} with the menu shut — something is \
+         still holding the window's left edge",
+        shut.origin.x
+    );
+    let root = vcx.debug_bounds("shell-root").expect("the root");
+    assert_eq!(
+        shut.size.width, root.size.width,
+        "the content region is {:?} wide in a {:?} window",
+        shut.size.width, root.size.width
+    );
+
+    // The one thing that may not go with the borders: the way back. A
+    // control that closes something must not live inside the thing it
+    // closes, and the first cut of this change had it doing exactly that.
+    assert!(
+        shown(vcx, "rail-toggle"),
+        "there is no way to reopen the rail — closing the menu is one-way"
+    );
+    let toggle = vcx.debug_bounds("rail-toggle").expect("the toggle");
+    assert!(
+        toggle.origin.x >= px(theme::TRAFFIC_CLEARANCE),
+        "the reopen toggle sits at {:?}, inside the traffic lights' \
+         clearance of {} — it is under the close button",
+        toggle.origin.x,
+        theme::TRAFFIC_CLEARANCE
     );
 }
 

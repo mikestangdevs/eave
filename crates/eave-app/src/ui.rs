@@ -5467,12 +5467,27 @@ impl Shell {
         // is a spine they overhang it and land partly on this line. The pad
         // is what the spine does not already cover; expanded, the rail covers
         // the whole clearance and this is an ordinary gutter.
+        // Shut, this row starts at the window's own left edge, so it owes the
+        // traffic lights their full clearance. Open, the rail has already
+        // covered them and this is an ordinary gutter.
         let lead = if rail_collapsed {
-            (theme::TRAFFIC_CLEARANCE - theme::RAIL_SPINE_W).max(theme::SPACE_3)
+            theme::TRAFFIC_CLEARANCE
         } else {
             theme::SPACE_3
         };
 
+        // **With the rail shut the header paints nothing and draws no rule
+        // — the operator's ruling, 2026-08-21.** Closing the menu is meant to
+        // give the window to the content, and a band across the top with a
+        // hairline under it is the second thing in the way after the rail
+        // itself. Open, it is the top edge of a region that has a frame
+        // around it and reads as part of that frame; shut, there is no frame
+        // to be part of, so it is a row of controls over the content and
+        // nothing more.
+        //
+        // The traffic lights sit at a fixed window position either way, which
+        // is the half of "the top close icon stay on the top" that costs
+        // nothing: they are the window's, not eave's.
         let row = div()
             .debug_selector(|| "pane-header".into())
             .w_full()
@@ -5480,9 +5495,11 @@ impl Shell {
             .flex_none()
             .pl(px(lead))
             .pr(px(theme::SPACE_3))
-            .bg(theme::rail_plate())
-            .border_b_1()
-            .border_color(theme::border())
+            .when(!rail_collapsed, |d| {
+                d.bg(theme::rail_plate())
+                    .border_b_1()
+                    .border_color(theme::border())
+            })
             .flex()
             .flex_row()
             .items_center()
@@ -5492,6 +5509,20 @@ impl Shell {
         // not move when the active tab's kind changes. Built here rather than
         // appended per-arm for the same reason.
         let files = self.files_toggle(cx);
+
+        // **The rail toggle lives HERE, not in the rail — and the test is
+        // what found that out.** The first cut of this change put it in the
+        // rail's own top region, which was fine while collapsing left a
+        // spine behind. Once collapsing unmounted the rail outright, the
+        // control that reopens it went with it: shut the menu and there was
+        // no way back short of a relaunch.
+        // `the_collapse_toggles_still_toggle_after_the_glyph_swap` failed with
+        // `element rail-toggle did not render`, which is the whole bug in one
+        // line. A control that closes something must not live inside the
+        // thing it closes.
+        let rail = self.rail_toggle(cx);
+
+        let row = row.child(rail);
 
         match active.map(|t| (t, t.content.clone())) {
             // ── a page: the browser toolbar ──────────────────────────────
@@ -5945,138 +5976,6 @@ impl Shell {
             ))
     }
 
-    /// The collapsed rail: every open tab as its identity plate and its state
-    /// dot, and nothing else.
-    ///
-    /// **The traffic lights overhang it.** They sit at a fixed window position
-    /// (16, 17) and need `TRAFFIC_CLEARANCE` 86; the spine is 44. So the top
-    /// region here is empty and `Shell::pane_header` pads its leading edge by
-    /// the difference — the lights land across the seam, which is what every
-    /// browser with a collapsible sidebar does and the only alternative would
-    /// be moving them, i.e. moving the window controls when a panel toggles.
-    fn rail_spine(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
-        let snapshot = self.strip_snapshot(cx);
-        let chips: HashMap<String, strip::SessionChip> = self
-            .sessions
-            .read(cx)
-            .sessions
-            .iter()
-            .map(|s| {
-                let (_, provider_label) = provider_identity(&s.provider);
-                (
-                    s.session_id.clone(),
-                    strip::SessionChip {
-                        label: row_label(s, &provider_label),
-                        state: s.state.clone(),
-                        provider: s.provider.clone(),
-                    },
-                )
-            })
-            .collect();
-        let tabs: Vec<AnyElement> = strip::items(&snapshot, &chips)
-            .iter()
-            .filter_map(|i| match i {
-                strip::StripItem::Tab(t) => Some(self.spine_tab(t, phase, cx)),
-                // A group's head has nothing to draw at this width: its
-                // colour alone would be a dot indistinguishable from a state
-                // dot, saying something different.
-                strip::StripItem::Group { .. } => None,
-            })
-            .collect();
-
-        div()
-            .debug_selector(|| "rail-spine".into())
-            .w(px(theme::RAIL_SPINE_W))
-            .h_full()
-            .flex_none()
-            .bg(theme::rail_plate())
-            .border_r_1()
-            .border_color(theme::border())
-            .flex()
-            .flex_col()
-            .items_center()
-            .child(
-                div()
-                    .w_full()
-                    .h(px(theme::TITLEBAR_H))
-                    .flex_none()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .child(self.rail_toggle(cx))
-            .child(
-                div()
-                    .id("spine-tabs")
-                    .debug_selector(|| "spine-tabs".into())
-                    .flex_1()
-                    .min_h(px(0.))
-                    .w_full()
-                    .overflow_y_scroll()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .pt(px(theme::SPACE_2))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(theme::TAB_GAP))
-                    .children(tabs),
-            )
-            .into_any_element()
-    }
-
-    /// One tab on the spine: the plate, and the state dot over its corner.
-    fn spine_tab(
-        &self,
-        tab: &strip::StripTab,
-        phase: Option<f32>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let id = tab.id.clone();
-        let activate = id.clone();
-        let is_sel = tab.active;
-        let (dot, pulsing) = spine_dot(tab);
-        div()
-            .id(SharedString::from(format!("spine-{id}")))
-            .debug_selector({
-                let id = id.clone();
-                move || format!("spine-{id}")
-            })
-            .flex_none()
-            .size(px(theme::RAIL_TAB_H))
-            .rounded(px(theme::RADIUS_BUTTON))
-            .when(is_sel, |d| d.shadow(theme::selection_rim()))
-            .hover_fade(
-                format!("spine-{id}"),
-                if is_sel {
-                    theme::overlay_strong()
-                } else {
-                    theme::wash_rest()
-                },
-                theme::overlay(),
-            )
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.cancel_rename(cx);
-                this.close_omnibox(cx);
-                this.activate_tab(&activate, cx);
-            }))
-            .relative()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(tab_plate(tab, &id))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(0.))
-                    .right(px(0.))
-                    .child(loaders::work_dot(
-                        theme::STATE_DOT,
-                        dot,
-                        phase.filter(|_| pulsing),
-                    )),
-            )
-            .into_any_element()
-    }
-
     /// **Slice D1 — the strip, vertical, in the rail.**    /// **Slice D1 — the strip, vertical, in the rail.**
     ///
     /// Same projection of B1's browser store that Slice C5 built, same single
@@ -6378,60 +6277,10 @@ impl Shell {
             .items_center()
             .gap(px(theme::SPACE_1))
             .child(loaders::work_dot(theme::STATE_DOT, dot, phase.filter(|_| pulsing)).flex_none())
-            .child(
-                // The 18 px plate. On a session tab the provider's own
-                // mark, on the same opaque `chip_plate` at the same size
-                // the rail row uses — the plate is not decoration:
-                // `claude_brand` (#D97757) over a wash over the glass
-                // ground measures 2.55:1 at the bright end of the backdrop
-                // sweep, under the 3:1 a non-text mark owes its surface;
-                // on `chip_plate` it is 6.01:1 in every state.
-                //
-                // On a page tab, a globe on the same plate at the same
-                // size, so both kinds produce identical tab metrics.
-                div()
-                    .size(px(theme::PROVIDER_CHIP))
-                    .flex_none()
-                    .rounded(px(theme::RADIUS_CHIP))
-                    .bg(theme::chip_plate())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(match &tab.kind {
-                        strip::TabKind::Page => icons::tagged_icon(
-                            icons::GLOBAL,
-                            12.0,
-                            theme::text_secondary_on_wash(),
-                            format!("tab-chip-{id}"),
-                        )
-                        .into_any_element(),
-                        strip::TabKind::Session { chip, .. } => {
-                            let provider = chip
-                                .as_ref()
-                                .map(|c| c.provider.clone())
-                                .unwrap_or_default();
-                            match provider_mark(&provider) {
-                                Some(mark) => icons::tagged_icon(
-                                    mark,
-                                    12.0,
-                                    provider_mark_ink(&provider),
-                                    format!("tab-chip-{id}"),
-                                )
-                                .into_any_element(),
-                                None => div()
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("tab-chip-{id}")
-                                    })
-                                    .font_family(theme::MONO)
-                                    .text_size(px(theme::MICRO_SIZE))
-                                    .text_color(theme::text_secondary_on_wash())
-                                    .child(SharedString::from(provider_identity(&provider).0))
-                                    .into_any_element(),
-                            }
-                        }
-                    }),
-            )
+            // The 18 px identity plate — see `tab_plate`, which is the
+            // one implementation of it: a tab means the same thing at
+            // every width this frame draws it at.
+            .child(tab_plate(tab, &id))
             .child(
                 // A FIXED slot, not `flex_1`. Every tab is the same width,
                 // so the name gets the same room on every one of them.
@@ -7225,17 +7074,6 @@ impl Shell {
         } else {
             rows
         };
-        // **Slice D1 — collapsed, the rail is a SPINE and never nothing.**
-        //
-        // See `theme::RAIL_SPINE_W`. The strip lives in the rail now, so a
-        // rail that collapsed to zero would take every open tab off screen —
-        // exactly the dead end Slice AS's operator walked into. The spine
-        // keeps every tab reachable as its identity plate plus its state dot,
-        // which is the same information a tab carries at a glance anyway; what
-        // it drops is the name, the session list and the changes section.
-        if self.sessions.read(cx).collapsed {
-            return self.rail_spine(cx, phase);
-        }
 
         // **Slice D1 — the rail owns the window's left edge, floor to
         // ceiling, and it PAINTS.**
@@ -7282,8 +7120,7 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .justify_end()
-                    .pr(px(theme::RAIL_GUTTER))
-                    .child(self.rail_toggle(cx)),
+                    .pr(px(theme::RAIL_GUTTER)),
             )
             .child(self.rail_tabs(cx, phase))
             .child(
@@ -11164,7 +11001,22 @@ impl Render for Shell {
                     .min_w(px(0.))
                     .flex()
                     .flex_row()
-                    .child(self.rail(cx, pulse))
+                    // **Collapsed means GONE, on the operator's ruling
+                    // (2026-08-21): "i dont want the border on left side or
+                    // on top on menu close. we should close to full screen
+                    // and the top close icon stay on the top."**
+                    //
+                    // The first build of A′ collapsed to a 44 px spine, so
+                    // that every open tab stayed reachable — the dead end
+                    // Slice AS closed. That is still a real cost and it is
+                    // stated in the report rather than solved here: with the
+                    // rail shut there is no tab LIST, and switching is
+                    // ctrl-tab and ⌘L. The operator parked the question of
+                    // where tabs live in that state ("the top bar was
+                    // supposed to be a space for tabs when the sidebar was
+                    // closed but idk about it now"), so this slice does not
+                    // answer it — it gets the borders out of the way.
+                    .when(!rail_collapsed, |d| d.child(self.rail(cx, pulse)))
                     .child(
                         // **The content region: full-bleed, not a card.**
                         //
