@@ -40,7 +40,12 @@ python3 "$ROOT/scripts/d1-seed-tabs.py" "$DATA"
 
 export EAVE_REDUCE_MOTION=0
 export EAVE_DOGFOOD_LOG="${TMPDIR:-/tmp}/d3-shot-log.md"
-EAVE_DATA_DIR="$DATA" "$BIN" >/dev/null 2>&1 &
+# **The app's stderr is kept, not discarded.** A capture rig that throws it
+# away cannot explain its own failures, and this script's guard has already
+# caught one it could not explain (a drag that ended at RAIL_W_MIN instead of
+# where it was released) precisely because the log was going to /dev/null.
+APPLOG="${TMPDIR:-/tmp}/d3-app.log"
+EAVE_DATA_DIR="$DATA" "$BIN" >"$APPLOG" 2>&1 &
 APP_PID=$!
 echo "app pid $APP_PID (ours, by \$! — never by pgrep)"
 
@@ -74,28 +79,76 @@ shot() {
   echo "captured $SHOTS/$1.png ($(stat -f%z "$SHOTS/$1.png") bytes)"
 }
 
+SEAM_HOVER=228
 sleep 6
 shot "d3-rail-rest"
+
+# **A resize you cannot discover is not a feature.** The seam is a hairline
+# with no grip drawn on it, so the ONLY thing that says the rail can be
+# dragged is the pointer changing over it -- which makes the pointer the
+# affordance, and it has to be photographed like one. `-C` is what puts the
+# cursor in the shot; without it this frame is indistinguishable from
+# `d3-rail-rest` and proves nothing.
+raise
+python3 "$ROOT/scripts/d3-hover.py" "$((WX + SEAM_HOVER))" "$((WY + 400))"
+sleep 1
+screencapture -x -o -C -l "$WINID" "$SHOTS/d3-rail-seam-cursor.png"
+echo "captured $SHOTS/d3-rail-seam-cursor.png (with the pointer)"
 
 # ── mid-drag ───────────────────────────────────────────────────────────────
 #
 # The seam sits at the rail's width; the handle straddles it, so grabbing at
 # exactly RAIL_W is inside the target either way. 228 is `theme::RAIL_W` —
-# written here as a literal because this script cannot read the crate, and
-# checked by the probe below rather than trusted.
+# a literal here because this script cannot read the crate, and checked by
+# the probe below rather than trusted.
 SEAM=228
 TO=$((SEAM + 84))          # a visible widening, still inside RAIL_W_MAX 320
-raise
-python3 "$ROOT/scripts/d3-drag.py" grab "$((WX + SEAM))" "$((WY + 400))"
-python3 "$ROOT/scripts/d3-drag.py" drag "$((WX + SEAM))" "$((WY + 400))" "$((WX + TO))"
-# No `raise` here: raising mid-drag would post an activation click and end it.
-sleep 1
-screencapture -x -o -l "$WINID" "$SHOTS/d3-rail-mid-drag.png"
-echo "captured $SHOTS/d3-rail-mid-drag.png"
-python3 "$ROOT/scripts/d3-drag.py" drop "$((WX + TO))" "$((WY + 400))"
-RELEASED=1
-sleep 1
-shot "d3-rail-dragged"
+INSIDE=$((SEAM + 40))      # past the resting seam, short of the dragged one
+probe() { python3 "$ROOT/scripts/d1-probe.py" "$SHOTS/$1.png" "$2" 400; }
+REST_PX="$(probe d3-rail-rest $INSIDE)"
+
+# **The gesture is retried, and the retry is announced.** The app's own
+# arithmetic is right on every attempt — instrumented, it reports
+# `grab=228 start=228 -> w=<x>` for each move it receives — but roughly one
+# attempt in three never gets the moves. The window server throttles the
+# synthetic gesture and re-synthesises it: the app saw x=234.42188,
+# 235.17188, 235.46094, 235.75 and then nothing, while THIS SCRIPT only ever
+# posts integers. Those four fractional values are the tell. Slowing the
+# steps to 0.09 s over 16 (see `d3-drag.py`) reduced it and did not remove
+# it, so the rig retries rather than claiming a determinism it does not have.
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  raise
+  python3 "$ROOT/scripts/d3-drag.py" grab "$((WX + SEAM))" "$((WY + 400))"
+  python3 "$ROOT/scripts/d3-drag.py" drag "$((WX + SEAM))" "$((WY + 400))" "$((WX + TO))"
+  # No `raise` here: raising mid-drag posts an activation click and ends it.
+  # The settle is 2 s because the app is still draining moves when the last
+  # one is posted.
+  sleep 2
+  # `-C` — WITH the cursor, and only here. The first cut of this shot came
+  # out BYTE-IDENTICAL to the released one, which is the honest answer to
+  # "what does a drag in progress look like": the rail follows the pointer
+  # live and nothing else changes, because the affordance IS the pointer.
+  # `col-resize` is the only thing on screen that says a divider is being
+  # held, and `screencapture` omits the cursor unless asked.
+  screencapture -x -o -C -l "$WINID" "$SHOTS/d3-rail-mid-drag.png"
+  python3 "$ROOT/scripts/d3-drag.py" drop "$((WX + TO))" "$((WY + 400))"
+  RELEASED=1
+  sleep 1
+  shot "d3-rail-dragged"
+  if [ "$(probe d3-rail-dragged $INSIDE)" != "$REST_PX" ]; then
+    [ "$attempt" -gt 1 ] && echo "note: the drag took $attempt attempts (synthetic input, see the header)"
+    break
+  fi
+  if [ "$attempt" -ge 3 ]; then
+    echo "FAIL: three synthetic drags in a row moved nothing" >&2
+    echo "--- app stderr ($APPLOG) ---" >&2; tail -40 "$APPLOG" >&2
+    exit 1
+  fi
+  echo "note: attempt $attempt moved nothing; retrying"
+  RELEASED=0
+done
 
 # ── the guard ──────────────────────────────────────────────────────────────
 #
@@ -107,13 +160,11 @@ shot "d3-rail-dragged"
 # only after it widens: x is past the resting seam and short of the dragged
 # one. At rest that point is content; dragged, it is rail. Two surfaces, two
 # pixels.
-probe() { python3 "$ROOT/scripts/d1-probe.py" "$SHOTS/$1.png" "$2" 400; }
-INSIDE=$((SEAM + 40))
-REST_PX="$(probe d3-rail-rest $INSIDE)"
 DRAG_PX="$(probe d3-rail-dragged $INSIDE)"
 echo "probe @${INSIDE},400 — rest:[$REST_PX] dragged:[$DRAG_PX]"
 if [ "$REST_PX" = "$DRAG_PX" ]; then
   echo "FAIL: x=$INSIDE is the same surface before and after the drag — the seam did not move" >&2
+  echo "--- app stderr ($APPLOG) ---" >&2; tail -40 "$APPLOG" >&2
   exit 1
 fi
 # And the rail is genuinely there at rest, so "it moved" is not "it vanished".
@@ -124,3 +175,4 @@ if [ "$LEFT_REST" != "$LEFT_DRAG" ]; then
   exit 1
 fi
 echo "ok: the seam moved outward and the rail is still a rail"
+echo "app stderr: $APPLOG"
