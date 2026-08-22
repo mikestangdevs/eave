@@ -287,6 +287,50 @@ pub fn warning_plate_strong_glass() -> Hsla {
 pub fn danger_plate_glass() -> Hsla {
     glass_tint(0x332c2c)
 }
+/// **The rail's own surface (Slice D1) — and this REVERSES the shell-model
+/// ruling that stood from 2026-08-17 to now.**
+///
+/// The old rule was *"the rails paint NO surface of their own; their rows sit
+/// directly on the glass ground, and the CONTENT WELL between them is the
+/// differentiated card."* That rule is what left eave with **no owner for any
+/// window edge**: the outer 248 px on each side was bare ground with text
+/// floating in it, the traffic lights sat on that same bare ground, and the
+/// only outlined object in the whole frame was a card in the middle. An inset
+/// card is what you draw when nothing owns the edges.
+///
+/// A′ gives the left edge to the rail, floor to ceiling, titlebar line
+/// included — so the rail has to paint, and [`content_plate`] has no job left.
+/// The two changes are one change and neither works alone: a painted rail
+/// beside a floating card is two competing plates, and a full-bleed content
+/// region beside an unpainted rail has no seam at all.
+///
+/// The value is a *lift*, not a slab. The failure mode the old ruling was
+/// avoiding is real — "the old opaque L2 rail slabs read as gray cardboard
+/// next to the glass" — and it came from an OPAQUE fill. This is a white wash
+/// over the shared glass ground, so the desktop's bleed still carries through
+/// it at the same hue; it reads as *the frame*, not as cardboard, and it
+/// composites like every other rung.
+///
+/// **α .055 is a floor, not a preference, and the seam is two things.** The
+/// step over the ground is `α × (229.5 − ground)`, and the glass ground moves
+/// with the desktop: at the bright end of the 52-backdrop sweep it sits near
+/// 90/255, where α .044 (`raised`'s value) buys only 6.1 — inside the noise of
+/// [`SURFACE_STEP_FLOOR`]. .055 buys 7.7 at the bright end and 12.1 at the
+/// dark, so the fill clears the floor across the whole sweep;
+/// `every_rung_is_a_step_you_can_see` measures it. The rail's right
+/// **hairline** carries the seam as well — the same "read a plate from its
+/// rim" reasoning `border_inset` already documents — so neither is asked to
+/// work alone.
+///
+/// It lands ABOVE [`raised`], and that ordering is F.2's, not a new one: the
+/// old ladder put chrome (L2 `#282828`) above in-log raised blocks (L1
+/// `#232323`). The rail is chrome. They never composite over one another —
+/// `raised` lives in the reading column and this is the frame around it — but
+/// when a rung has an order it should be the order the ladder already had.
+pub fn rail_plate() -> Hsla {
+    ink(0.055)
+}
+
 /// The content well (comet's shell model, adopted 2026-08-17): the
 /// transcript + composer pane floats over the glass ground as an inset
 /// rounded card, darkened by a black wash so the desktop's bleed dims
@@ -1266,8 +1310,82 @@ pub const SKELETON_WIDTHS: [f32; 5] = [0.72, 0.46, 0.88, 0.34, 0.61];
 
 /// Rail width (62 × the 4 px unit).
 pub const RAIL_W: f32 = 248.0;
+
+/// **The collapsed rail is a SPINE, never nothing (Slice D1).**
+///
+/// In the old frame the strip lived in the titlebar, so collapsing the rail
+/// cost you the session list and kept the tabs. A′ moves the strip INTO the
+/// rail, which means a rail that collapsed to zero would take every open tab
+/// off screen — the exact dead end Slice AS's operator walked into
+/// (*"when i close the chat panel we need to convert to page tabs for
+/// sessions so i can still switch"*). So it collapses to a spine that still
+/// holds every tab as a chip and a state dot.
+///
+/// 44 px is `PROVIDER_CHIP` 18 + `SPACE_2` either side + the two hairlines —
+/// i.e. the width a tab's identity mark needs and nothing more.
+pub const RAIL_SPINE_W: f32 = 44.0;
+
+/// A tab's row height in the vertical strip (Slice D1).
+///
+/// `RAIL_NAME_LINE` 19 + `SPACE_1` above and below is 27, which is
+/// [`TAB_H`]'s own derivation — rounded to the 4 px unit because a vertical
+/// list of them stacks, and an odd height accumulates a half-pixel seam every
+/// other row where a horizontal strip only ever had one.
+pub const RAIL_TAB_H: f32 = 28.0;
+
+/// **How many tabs the OPEN section shows before it scrolls (Slice D1).**
+///
+/// The section is `flex_none` and capped rather than `flex_1`, because the
+/// rail holds two lists and an unbounded one would starve the other: nine open
+/// tabs would push every session off the bottom of a 760 px window.
+///
+/// Nine is what the default window can give it without doing that: see
+/// [`rail_tabs_max_h`] for the arithmetic, which is **`9 × 28 + 8 × 4 = 284`
+/// px** of a 760 px rail — the gaps are eight, not nine, and leaving them out
+/// is exactly the error `nine_tabs_fit_the_rail_without_scrolling` caught on
+/// this slice's first run (the ninth row landed at 334 px inside a 252 px
+/// box). That is the whole reason the test measures rendered rows instead of
+/// re-deriving them from these constants: a computed assertion would have
+/// made the same mistake and agreed with itself.
+///
+/// It is a **floor on what is visible, not a limit on what is open**: the
+/// tenth tab scrolls.
+///
+/// Against the old horizontal strip's **five** — measured, and the ceiling
+/// that made the axis a frame problem rather than a styling one.
+pub const RAIL_TABS_VISIBLE: usize = 9;
+
+/// The OPEN section's height cap: [`RAIL_TABS_VISIBLE`] rows and the gaps
+/// **between** them, which is one fewer gap than rows.
+pub fn rail_tabs_max_h() -> f32 {
+    let n = RAIL_TABS_VISIBLE as f32;
+    RAIL_TAB_H * n + TAB_GAP * (n - 1.0)
+}
+
+/// **The pane header (Slice D1): the one line that says what the content
+/// region is, and — for a page — where it is.**
+///
+/// 32 px, the same for a page and for a session, and *the same height* is the
+/// point rather than a coincidence: one strip holds two kinds of tab, and if
+/// each kind produced a differently-shaped region beneath it the mixed strip
+/// would read as an accident. Both kinds resolve to this line.
+///
+/// It exists because A had a hole. The omnibox is the *edit* affordance, and a
+/// palette that appears on ⌘L is not a display — so before this slice eave
+/// showed the current address **nowhere at rest** (`strip::page_label` draws a
+/// tab's title and falls back to the url only when there is no title), and
+/// `can_go_back`/`can_go_forward` had nowhere to live at all. For an app whose
+/// stance is *every element states an observed fact*, a browser that will not
+/// say where you are is a stance violation, not a missing feature.
+pub const PANE_HEADER_H: f32 = 32.0;
+
 /// Ground margin around the floating content card (and the air the rails
 /// keep from the window edges).
+///
+/// **Slice D1 retired its frame-level use.** The content region is full-bleed
+/// now and the rail owns its edge, so nothing insets a card any more. It
+/// survives only as the rail's own left pad, where it is the same 12 px it
+/// always was.
 pub const PLATE_MARGIN: f32 = SPACE_3;
 
 /// The rail's one left edge, and the rule that goes with it.
@@ -2238,52 +2356,67 @@ mod tests {
     /// ordering and no magnitude, so a ladder whose rungs differed by 1/255
     /// passed it. `raised -> panel` was 3.9/255.
     ///
-    /// **Slice AG re-pointed this at the ladder eave paints.** It used to
-    /// sweep 52 backdrops over `wash_raised`/`wash_panel`/`wash_modal`, and
-    /// `panel()`, `composer()` and `surface_modal()` had **zero call sites**
-    /// between them — one rung of the five was painted. The reading column's
-    /// real ladder is `canvas → content_plate → raised`: the well is an inset
-    /// card that SINKS below the frost, and a directive block rises inside
-    /// it.
+    /// **Slice D1 re-pointed this again, because the ladder changed shape.**
+    /// Slice AG had aimed it at `canvas → content_plate → raised` — an inset
+    /// card that SINKS below the frost, with a directive block rising inside
+    /// it. A′ deletes the inset card: the content region is full-bleed and the
+    /// **rail** is what paints now, so `content_plate` has no call site and
+    /// measuring it would be measuring a fiction. What eave paints is:
     ///
-    /// The first step is the same shape as `inset` and the composer, and gets
-    /// the same ruling (2026-08-20, `floating_chrome_is_always_carried_by_
-    /// something`): **the fill alone cannot carry it, so the rim does.** The
-    /// well's black wash drops the ground by only 2.0/255 over a black
-    /// desktop — there is no room below a near-black ground — while its
-    /// `border()` hairline rises 11.8/255 there. At the bright end the fill
-    /// is at its strongest (−14.8) and the rim at its weakest (+11.8). The
-    /// assertion is on the surface, not on either part.
+    ///  - **the frame**, `canvas → rail_plate` — a lift, the new rung; and
+    ///  - **the reading column**, `canvas → raised` — a directive block
+    ///    rising straight off the ground the transcript sits on.
     ///
-    /// The second step needs no ruling and no fix: `well → card` measures
-    /// +8.0 to +9.7 across the whole sweep. It was measured in Slice AF and
-    /// asserted by nothing until now.
+    /// Both are asserted here on the same 52-backdrop sweep the old rungs
+    /// got, which is the whole reason the surface was added as a token rather
+    /// than as a literal: a new plane in the frame owes the same proof.
+    ///
+    /// `rail_plate` is carried by **two** things and the assertion says so.
+    /// Its fill clears the floor unaided across the sweep (+12.1/255 at the
+    /// dark end, +7.7 at the bright), and its right hairline is a second
+    /// carrier — the "read a plate from its rim" reasoning `border_inset`
+    /// documents. The fill alone is asserted, because a seam that needed both
+    /// would be a seam that fails the moment a layout drops the border.
     #[test]
     fn every_rung_is_a_step_you_can_see() {
-        let mut worst_carried = f32::MAX;
+        let mut worst_rail = f32::MAX;
+        let mut worst_card = f32::MAX;
         for g in grounds() {
-            let well = over(wash_content(), g);
-            let card = over(wash_raised(), well);
-            let rim = over(border(), g);
-
-            // canvas -> content_plate: fill sinks, rim rises, and at every
-            // backdrop at least one of them clears the floor.
-            let fill_d = (units(g) - units(well)).abs();
-            let rim_d = (units(rim) - units(g)).abs();
-            let carried = fill_d.max(rim_d);
-            worst_carried = worst_carried.min(carried);
+            // The FRAME: canvas -> rail_plate. The rail owns the window's
+            // left edge now, so this seam is the one that says the frame
+            // exists at all.
+            let rail = over(rail_plate(), g);
+            let rail_step = units(rail) - units(g);
+            worst_rail = worst_rail.min(rail_step);
             assert!(
-                carried >= SURFACE_STEP_FLOOR,
-                "the content well is invisible on ground {:.1}: fill {fill_d:.1}/255, \
-                 rim {rim_d:.1}/255, floor {SURFACE_STEP_FLOOR}",
+                rail_step >= SURFACE_STEP_FLOOR,
+                "the rail is {rail_step:.1}/255 above ground {:.1}, floor \
+                 {SURFACE_STEP_FLOOR} — the frame has no seam on this backdrop",
                 units(g)
             );
 
-            // content_plate -> raised: a plain step, no rim needed.
-            let step = units(card) - units(well);
+            // The READING COLUMN: canvas -> raised. A′ deleted the inset
+            // card between them, so a directive block now rises straight off
+            // the ground the transcript sits on.
+            let card = over(wash_raised(), g);
+            let card_step = units(card) - units(g);
+            worst_card = worst_card.min(card_step);
             assert!(
-                step >= SURFACE_STEP_FLOOR,
-                "well->card is {step:.1}/255 on ground {:.1}, floor {SURFACE_STEP_FLOOR}",
+                card_step >= SURFACE_STEP_FLOOR,
+                "canvas->raised is {card_step:.1}/255 on ground {:.1}, floor \
+                 {SURFACE_STEP_FLOOR}",
+                units(g)
+            );
+
+            // The rail is chrome and sits ABOVE an in-log raised block —
+            // F.2's ordering, kept rather than re-argued. They never
+            // composite over one another; this pins the ordering so a later
+            // retune of either cannot silently swap them.
+            assert!(
+                units(rail) > units(card),
+                "rail {:.1} is not above raised {:.1} on ground {:.1}",
+                units(rail),
+                units(card),
                 units(g)
             );
         }
@@ -2291,9 +2424,13 @@ mod tests {
         // raising SURFACE_STEP_FLOOR cannot make this pass by moving the bar
         // it is measured against.
         assert!(
-            worst_carried >= 8.0,
-            "the worst backdrop leaves the content well at only {worst_carried:.1}/255 \
+            worst_rail >= 7.0,
+            "the worst backdrop leaves the rail at only {worst_rail:.1}/255 \
              — that is the floor, not clearance"
+        );
+        assert!(
+            worst_card >= 6.0,
+            "the worst backdrop leaves a raised block at only {worst_card:.1}/255"
         );
     }
 
@@ -2764,6 +2901,35 @@ mod tests {
     /// asserts a magnitude on that pair, which subsumes the direction.
     #[test]
     fn glass_ladder_never_inverts_on_any_backdrop() {
+        for b in (0..=255).step_by(5) {
+            let v = b as f32 / 255.0;
+            let ground = over(glass_canvas(), (v, v, v));
+            let g = luma(ground);
+            // **Slice D1: the well is gone and the ordering it guarded went
+            // with it.** `wash_content` has no call site — A′ made the
+            // content region full-bleed — so `well < ground` is no longer a
+            // claim about anything eave draws. What replaces it is a
+            // three-rung ordering that IS painted: the ground the transcript
+            // sits on, a raised block in it, and the rail around it.
+            let card = luma(over(wash_raised(), ground));
+            let rail = luma(over(rail_plate(), ground));
+            assert!(
+                g < card,
+                "backdrop {b}: ground {g} did not sink below a raised block {card}"
+            );
+            assert!(
+                card < rail,
+                "backdrop {b}: raised {card} did not sink below the rail {rail}"
+            );
+        }
+    }
+
+    /// The retired well's ordering, kept as a record rather than as a guard.
+    ///
+    /// `wash_content` still exists and still sinks; nothing paints it. If a
+    /// later slice brings an inset card back, this is the constraint it had.
+    #[test]
+    fn the_retired_content_well_still_sinks() {
         for b in (0..=255).step_by(5) {
             let v = b as f32 / 255.0;
             let ground = over(glass_canvas(), (v, v, v));

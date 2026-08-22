@@ -2681,7 +2681,16 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
                      back to a snapping .hover)"
                 )
             });
-        let window = &src[at..src.len().min(at + 600)];
+        // **600 CHARACTERS, not 600 bytes.** `&src[at..at + 600]` panics the
+        // moment that end index lands inside a multi-byte character, and this
+        // file is full of them — em dashes, ⌘, ′. It had never fired because
+        // no boundary had happened to fall there yet; Slice D1 wrote a `′`
+        // into a doc comment at exactly the wrong offset and the test died
+        // with `not a char boundary` instead of an assertion message. A
+        // latent panic in a test is worse than a latent panic in the product:
+        // it fails as noise, so the reader looks for the bug in their own
+        // change.
+        let window: String = src[at..].chars().take(600).collect();
         assert!(
             window.contains(wash),
             "{selector} should hover to {wash} — a filled control replaces \
@@ -7672,14 +7681,28 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
     assert!(!shown(vcx, "rail-aaaa1111"), "the rail did not collapse");
+    assert!(
+        !shown(vcx, "tab-strip"),
+        "the full strip survived the collapse — the spine is what a \
+         collapsed rail shows, and two tab lists at once is neither"
+    );
 
-    // Collapsed: a tab for every session, in the rail's order.
+    // Collapsed: a SPINE entry for every session, in the rail's order.
+    //
+    // **Slice D1 changed what "collapsed" means and this test is where that
+    // is checked.** The strip used to appear on collapse and vanish on
+    // expand; in A′ it lives in the open rail, so collapsing it would have
+    // taken every tab off screen — the very dead end Slice AS built this
+    // test to close, re-opened by the frame that was supposed to improve it.
+    // `theme::RAIL_SPINE_W` is the answer: 44 px that still carries every
+    // tab's plate and state dot. The walk this test describes is unchanged;
+    // only the selectors it walks through are.
     for sel in [
-        "tab-aaaa1111",
-        "tab-bbbb2222",
-        "tab-cccc3333",
-        "tab-dddd4444",
-        "tab-eeee5555",
+        "spine-aaaa1111",
+        "spine-bbbb2222",
+        "spine-cccc3333",
+        "spine-dddd4444",
+        "spine-eeee5555",
     ] {
         assert!(
             shown(vcx, sel),
@@ -7695,7 +7718,7 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
     // single notion of active rather than a second one kept beside the
     // shell's own — C1's open question, answered.
     let _ = h.drain();
-    click(vcx, "tab-dddd4444");
+    click(vcx, "spine-dddd4444");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
@@ -7738,6 +7761,10 @@ fn collapsing_the_rail_leaves_a_way_to_switch_sessions(cx: &mut TestAppContext) 
         shown(vcx, "tab-strip"),
         "the strip vanished when the rail came back"
     );
+    assert!(
+        !shown(vcx, "spine-aaaa1111"),
+        "the spine survived the rail re-opening — two tab lists at once"
+    );
 }
 
 /// **The transcript does not move when the strip appears.**
@@ -7772,13 +7799,28 @@ fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
         vcx.debug_bounds("content-well")
             .expect("the reading column did not render")
     };
-    let bar = |vcx: &mut VisualTestContext| vcx.debug_bounds("titlebar").expect("the titlebar");
+    // **Slice D1 re-pointed this from the titlebar to the pane header.** The
+    // titlebar no longer exists — A′ gave the titlebar LINE to the rail on
+    // the left and to this header on the right — but the question is
+    // unchanged and is still the right one: does collapsing the rail move
+    // the reading column vertically?
+    let bar =
+        |vcx: &mut VisualTestContext| vcx.debug_bounds("pane-header").expect("the pane header");
 
     let open = well(vcx);
     let open_bar = bar(vcx);
+    assert!(
+        shown(vcx, "tab-strip"),
+        "the strip is not mounted with the rail OPEN — in A′ the strip lives \
+         in the rail, so this is its normal state rather than its collapsed one"
+    );
     click(vcx, "rail-toggle");
     vcx.run_until_parked();
-    assert!(shown(vcx, "tab-strip"), "the strip did not mount");
+    assert!(
+        shown(vcx, "spine-tabs"),
+        "collapsing left no spine — every open tab just went off screen, \
+         which is the dead end Slice AS was built to close"
+    );
     let shut = well(vcx);
     let shut_bar = bar(vcx);
 
@@ -7791,8 +7833,8 @@ fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
     );
     assert_eq!(
         open_bar.size.height, shut_bar.size.height,
-        "the titlebar changed height to hold the strip, which is the same \
-         bug one element up"
+        "the pane header changed height when the rail collapsed, which is \
+         the same bug one element up"
     );
     assert!(
         shut.size.width >= open.size.width + px(200.),
@@ -7815,20 +7857,25 @@ fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
         "re-opening the rail did not return the column to where it was"
     );
 
-    // The strip fits its host with room, asserted as CLEARANCE against
-    // literals rather than as a fit against the constants the layout uses.
+    // The rail reserves the traffic lights their room, asserted as CLEARANCE
+    // against literals rather than as a fit against the constants the layout
+    // uses. The lights sit at a fixed window position and the rail is what
+    // they land on now, so this is the assertion that stops a later slice
+    // shrinking the rail's top region out from under them.
     #[allow(clippy::assertions_on_constants)]
     {
         assert!(
-            theme::TAB_H <= 32.0,
-            "a tab is {} px tall; the titlebar is 48 and the traffic lights \
-             live in it",
-            theme::TAB_H
+            theme::TITLEBAR_H >= 44.0,
+            "the rail's top region is {} px and the traffic lights sit at \
+             y=17 with a 12 px glyph",
+            theme::TITLEBAR_H
         );
         assert!(
-            theme::TITLEBAR_H - theme::TAB_H >= 16.0,
-            "the strip leaves {} px of titlebar around it",
-            theme::TITLEBAR_H - theme::TAB_H
+            theme::RAIL_W >= theme::TRAFFIC_CLEARANCE,
+            "the rail is {} px wide and the traffic lights need {} — an \
+             expanded rail has to contain them outright",
+            theme::RAIL_W,
+            theme::TRAFFIC_CLEARANCE
         );
     }
 }
@@ -7851,8 +7898,6 @@ fn the_tab_strip_costs_the_transcript_no_height(cx: &mut TestAppContext) {
 fn a_tab_shows_a_realistic_session_name(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
-    click(vcx, "rail-toggle");
-    vcx.run_until_parked();
 
     // `real_name_width` shapes at 13 px semibold and guards those two
     // against the tokens, so a slice that moves the name's size fails here
@@ -7936,47 +7981,60 @@ fn a_tab_is_not_a_rail_row(cx: &mut TestAppContext) {
         );
     }
 
-    click(vcx, "rail-toggle");
-    vcx.run_until_parked();
     assert!(shown(vcx, "tab-aaaa1111"), "the tab did not mount");
-    // ...and none of them is on the tab.
+
+    // **The question had to change shape, because A′ put both surfaces in
+    // one column.** Before this slice the test collapsed the rail, so the row
+    // was gone and `!shown(freight)` answered it. With the rail open the row
+    // is on screen *by design* and its freight is on screen with it — so
+    // "is this element visible" now answers nothing at all, and a test left
+    // in that form would have gone on passing while measuring the row.
+    //
+    // What it asks instead is containment: none of the row's freight is
+    // INSIDE the tab's box.
+    let tab = vcx.debug_bounds("tab-aaaa1111").expect("the tab");
     for sel in [
         "cwd-aaaa1111",
         "marks-aaaa1111",
         "ren-aaaa1111",
         "arc-aaaa1111",
-        "rail-resource",
-        "rail-archived",
     ] {
-        assert!(
-            !shown(vcx, sel),
-            "{sel} followed the session onto the tab strip — a strip \
-             carrying the rail's freight needs the rail's room"
-        );
+        if let Some(b) = vcx.debug_bounds(sel) {
+            let inside = b.origin.y >= tab.origin.y
+                && b.origin.y + b.size.height <= tab.origin.y + tab.size.height;
+            assert!(
+                !inside,
+                "{sel} is inside the tab's own box ({b:?} within {tab:?}) — a \
+                 tab carrying the rail's freight needs the rail's room"
+            );
+        }
     }
 
-    // Stated as a width ceiling as well, against literals: the rail is
-    // 248 px wide and gives a name 158 of them, and a tab may approach
-    // neither.
-    #[allow(clippy::assertions_on_constants)]
-    {
-        // Slice C5 raised this ceiling from 176 to 192, because a tab
-        // grew a close affordance (`TAB_CLOSE_W`, 22 px) and a strip you
-        // cannot close a tab from is not a tab strip. The ceiling is still
-        // an argument about the RAIL — 248 px is the surface a tab may not
-        // become — and 186 is not within reach of it.
-        assert!(
-            theme::TAB_W <= 192.0,
-            "a tab is {} px wide; the rail beside it is 248",
-            theme::TAB_W
-        );
-        assert!(
-            theme::TAB_NAME_W <= 112.0,
-            "the tab's name slot is {} px — at that width it is the rail's \
-             158 px name slot with the folder deleted, not a tab",
-            theme::TAB_NAME_W
-        );
-    }
+    // **Slice D1 deleted this test's width ceiling, and the deletion is the
+    // honest half of the change rather than a concession.**
+    //
+    // It used to read: *"the rail is 248 px wide and gives a name 158 of
+    // them, and a tab may approach neither"*, asserted as `TAB_W <= 192` and
+    // `TAB_NAME_W <= 112`. Both constants are gone from the layout — a row
+    // takes the rail's width and its name is `flex_1` — so the ceiling is not
+    // merely unmeasurable, it is **false**: a tab's name slot is now exactly
+    // the rail's name slot, and that was the point. C5's caveat 8 recorded
+    // what the old ceiling cost (`package the dmg`, 108.8 px, clipped).
+    //
+    // What survives is the claim that actually mattered, and it is asserted
+    // above and below rather than through a proxy: **a tab is not a row
+    // because of what it CARRIES, not because of how wide it is.** The two
+    // now sit in one column at one width, which makes the freight test
+    // sharper than it was when a width ceiling could stand in for it.
+    let tab = vcx.debug_bounds("tab-aaaa1111").expect("the tab");
+    let row = vcx.debug_bounds("rail-aaaa1111").expect("the rail row");
+    assert!(
+        tab.size.height < row.size.height,
+        "the tab is {:?} tall and the row {:?} — a tab that has grown to a \
+         row's height has grown to a row",
+        tab.size.height,
+        row.size.height
+    );
 }
 
 /// Selection is a neutral raised fill plus a rim, and it moves nothing.
@@ -7998,8 +8056,6 @@ fn selecting_a_tab_moves_no_tab(cx: &mut TestAppContext) {
     let ids = ["aaaa1111", "bbbb2222", "cccc3333"];
     let infos: Vec<SessionInfo> = ids.iter().map(|id| session(id)).collect();
     rail_and_strip(&h, vcx, infos.clone(), "aaaa1111");
-    click(vcx, "rail-toggle");
-    vcx.run_until_parked();
 
     let boxes = |vcx: &mut VisualTestContext| -> Vec<gpui::Bounds<Pixels>> {
         ["tab-aaaa1111", "tab-bbbb2222", "tab-cccc3333"]
@@ -8009,14 +8065,20 @@ fn selecting_a_tab_moves_no_tab(cx: &mut TestAppContext) {
     };
     let first = boxes(vcx);
     // Every tab is the same box, which is what makes the strip a strip.
+    //
+    // **Slice D1 swapped which dimension is the fixed one, and that is the
+    // axis change in one assertion.** A horizontal tab was `TAB_W` wide with
+    // a shared baseline; a row is `RAIL_TAB_H` tall on a shared left edge,
+    // and its WIDTH is the rail's rather than a constant — which is what
+    // gives a three-word title the room `TAB_NAME_W` denied it.
     for (i, b) in first.iter().enumerate() {
         assert_eq!(
-            b.size.width,
-            px(theme::TAB_W),
-            "tab {i} is not the fixed width"
+            b.size.height,
+            px(theme::RAIL_TAB_H),
+            "tab {i} is not the fixed height"
         );
-        assert_eq!(b.size.height, first[0].size.height, "tab {i} height");
-        assert_eq!(b.origin.y, first[0].origin.y, "tab {i} baseline");
+        assert_eq!(b.size.width, first[0].size.width, "tab {i} width");
+        assert_eq!(b.origin.x, first[0].origin.x, "tab {i} left edge");
     }
 
     rail_and_strip(&h, vcx, infos, "bbbb2222");
@@ -8046,7 +8108,7 @@ fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let ids = [
         "aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555", "ffff6666", "aaab7777",
-        "bbbc8888", "cccd9999",
+        "bbbc8888", "cccd9999", "dddda111", "eeeeb222", "ffffc333",
     ];
     // Distinct activity stamps, newest first, so the rail's order is a
     // known thing rather than whatever `fold_rail` does with a nine-way tie
@@ -8062,17 +8124,24 @@ fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
         })
         .collect();
     rail_and_strip(&h, vcx, infos.clone(), "aaaa1111");
-    click(vcx, "rail-toggle");
-    vcx.run_until_parked();
 
     let strip = vcx.debug_bounds("tab-strip").expect("the strip");
     // The fixture really does overflow — otherwise the two properties below
     // are asserted about a case that never arises.
+    //
+    // **Slice D1 had to grow the fixture to keep this true.** Nine tabs
+    // overflowed the horizontal strip; nine is exactly what the rail now
+    // shows (`nine_tabs_fit_the_rail_without_scrolling` asserts the other
+    // side of that line), so the count went to twelve. A test whose
+    // precondition quietly stopped holding would have gone on passing while
+    // measuring nothing — which is the failure mode this assertion exists
+    // to prevent, and it earned its keep on exactly this change.
     assert!(
-        px(theme::TAB_W) * (ids.len() as f32) > strip.size.width,
-        "nine tabs fit in {:?}, so this test is not measuring an \
+        px(theme::RAIL_TAB_H) * (ids.len() as f32) > strip.size.height,
+        "{} tabs fit in {:?}, so this test is not measuring an \
          overflowing strip at all",
-        strip.size.width
+        ids.len(),
+        strip.size.height
     );
 
     let tabs = [
@@ -8085,6 +8154,9 @@ fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
         "tab-aaab7777",
         "tab-bbbc8888",
         "tab-cccd9999",
+        "tab-dddda111",
+        "tab-eeeeb222",
+        "tab-ffffc333",
     ];
     for sel in tabs {
         assert!(
@@ -8093,30 +8165,30 @@ fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
              session with no tab is unreachable with the rail shut"
         );
     }
-    // In the rail's own order, left to right. Two surfaces disagreeing
+    // In the rail's own order, top to bottom. Two surfaces disagreeing
     // about the order of the same list is its own kind of dead end.
-    let xs: Vec<Pixels> = tabs
+    let ys: Vec<Pixels> = tabs
         .iter()
-        .map(|sel| vcx.debug_bounds(sel).unwrap().origin.x)
+        .map(|sel| vcx.debug_bounds(sel).unwrap().origin.y)
         .collect();
-    for w in xs.windows(2) {
-        assert!(w[1] > w[0], "the strip is not in the rail's order: {xs:?}");
+    for w in ys.windows(2) {
+        assert!(w[1] > w[0], "the strip is not in the rail's order: {ys:?}");
     }
 
     // The LAST session, selected. Its tab has to come to the operator.
-    rail_and_strip(&h, vcx, infos, "cccd9999");
+    rail_and_strip(&h, vcx, infos, "ffffc333");
     let strip = vcx.debug_bounds("tab-strip").expect("the strip");
-    let sel = vcx.debug_bounds("tab-cccd9999").expect("the selected tab");
+    let sel = vcx.debug_bounds("tab-ffffc333").expect("the selected tab");
     assert!(
-        sel.origin.x >= strip.origin.x
-            && sel.origin.x + sel.size.width <= strip.origin.x + strip.size.width,
+        sel.origin.y >= strip.origin.y
+            && sel.origin.y + sel.size.height <= strip.origin.y + strip.size.height,
         "the selected tab sits at {:?}..{:?} and the strip runs {:?}..{:?} \
          — the session you are reading is off the end of the only control \
          that could take you anywhere else",
-        sel.origin.x,
-        sel.origin.x + sel.size.width,
-        strip.origin.x,
-        strip.origin.x + strip.size.width
+        sel.origin.y,
+        sel.origin.y + sel.size.height,
+        strip.origin.y,
+        strip.origin.y + strip.size.height
     );
 }
 
@@ -8141,8 +8213,6 @@ fn a_tab_wears_the_providers_mark_on_the_same_plate_a_row_does(cx: &mut TestAppC
     let mut unknown = session("bbbb2222");
     unknown.provider = "some-agent".into();
     rail_and_strip(&h, vcx, vec![known, unknown], "aaaa1111");
-    click(vcx, "rail-toggle");
-    vcx.run_until_parked();
 
     for sel in ["tab-chip-aaaa1111", "tab-chip-bbbb2222"] {
         assert!(shown(vcx, sel), "{sel} did not render");
@@ -8154,6 +8224,11 @@ fn a_tab_wears_the_providers_mark_on_the_same_plate_a_row_does(cx: &mut TestAppC
         "a provider with a logo and one without gave their names different \
          slots — the two chips are supposed to be interchangeable"
     );
+    // Slice D1: the name slot is `flex_1` now rather than `TAB_NAME_W`, so
+    // the assertion above stopped being trivially true the moment the width
+    // came from layout instead of from a constant. Two providers whose
+    // plates differed by a pixel would now give their names two different
+    // widths, which is exactly what it is here to catch.
     // And the fallback really is the initials, which is the only half of a
     // provider's identity this harness can read at all.
     assert_eq!(provider_identity("some-agent").0, "SA");
@@ -8172,35 +8247,39 @@ fn a_tab_wears_the_providers_mark_on_the_same_plate_a_row_does(cx: &mut TestAppC
     );
 }
 
-/// Five sessions — the operator's own configuration — fit the strip at the
-/// default window with no scrolling at all.
+/// **Nine tabs fit the rail at the default window with no scrolling — where
+/// five fitted the titlebar strip.**
 ///
-/// The scroll exists for the ninth session, not for the fifth. A switcher
-/// that made you scroll to reach half of what you have open is a switcher
-/// that hides what it is for, and [`theme::TAB_W`] is set where it is
-/// partly to keep this true.
+/// This is `five_sessions_fit_the_strip_without_scrolling`, re-pointed at the
+/// vertical axis, and the number it asserts going from five to nine is the
+/// whole functional case for A′. The old ceiling was not a styling problem:
+/// a horizontal strip shares the titlebar with everything else on that line,
+/// and `TAB_W` was set where it was *partly to keep five true* — C5's caveat
+/// records the three-word operator titles that clipped to buy it. Vertical
+/// space is what the window has spare.
 ///
-/// Measured on the RENDERED strip, never computed from `WINDOW_W` minus the
-/// titlebar's own constants — that arithmetic would agree with the layout
-/// by construction and could not fail.
+/// Still measured on the RENDERED rows, never computed from `RAIL_TAB_H`
+/// times [`theme::RAIL_TABS_VISIBLE`] — that arithmetic would agree with the
+/// layout by construction and could not fail. That was the original test's
+/// rule and it survives the axis change unchanged.
 #[gpui::test]
-fn five_sessions_fit_the_strip_without_scrolling(cx: &mut TestAppContext) {
+fn nine_tabs_fit_the_rail_without_scrolling(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    let ids = [
+        "aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555", "ffff6666", "aaab7777",
+        "bbbc8888", "cccd9999",
+    ];
     rail_and_strip(
         &h,
         vcx,
-        vec![
-            session("aaaa1111"),
-            session("bbbb2222"),
-            session("cccc3333"),
-            session("dddd4444"),
-            session("eeee5555"),
-        ],
+        ids.iter().map(|id| session(id)).collect(),
         "aaaa1111",
     );
-    click(vcx, "rail-toggle");
-    vcx.run_until_parked();
 
+    // No `rail-toggle` click: A′ put the strip INSIDE the open rail, so the
+    // tabs are on screen in the state the operator is normally in. That
+    // click was load-bearing in every strip test before this slice and is
+    // gone from all of them.
     let strip = vcx.debug_bounds("tab-strip").expect("the strip");
     for sel in [
         "tab-aaaa1111",
@@ -8208,18 +8287,21 @@ fn five_sessions_fit_the_strip_without_scrolling(cx: &mut TestAppContext) {
         "tab-cccc3333",
         "tab-dddd4444",
         "tab-eeee5555",
+        "tab-ffff6666",
+        "tab-aaab7777",
+        "tab-bbbc8888",
+        "tab-cccd9999",
     ] {
         let tab = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
         assert!(
-            tab.origin.x >= strip.origin.x
-                && tab.origin.x + tab.size.width <= strip.origin.x + strip.size.width,
-            "{sel} runs {:?}..{:?} and the strip runs {:?}..{:?} — five \
-             sessions is what the operator runs and all five have to be on \
-             screen at the default window size",
-            tab.origin.x,
-            tab.origin.x + tab.size.width,
-            strip.origin.x,
-            strip.origin.x + strip.size.width
+            tab.origin.y >= strip.origin.y
+                && tab.origin.y + tab.size.height <= strip.origin.y + strip.size.height,
+            "{sel} runs {:?}..{:?} and the strip runs {:?}..{:?} — nine tabs \
+             have to be on screen at the default window size",
+            tab.origin.y,
+            tab.origin.y + tab.size.height,
+            strip.origin.y,
+            strip.origin.y + strip.size.height
         );
     }
 }
@@ -9171,19 +9253,28 @@ fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     for sel in ["tab-p1", "tab-aaaa1111", "tab-p2"] {
         assert!(shown(vcx, sel), "{sel} is not on the strip");
     }
-    // Drawn in the model's order, left to right, with the session tab
-    // between the two pages exactly where the ordering puts it.
-    let x =
-        |vcx: &mut VisualTestContext, sel: &'static str| vcx.debug_bounds(sel).expect(sel).origin.x;
-    let (p1, sess, p2) = (x(vcx, "tab-p1"), x(vcx, "tab-aaaa1111"), x(vcx, "tab-p2"));
+    // Drawn in the model's order, TOP TO BOTTOM since Slice D1 turned the
+    // axis, with the session tab between the two pages exactly where the
+    // ordering puts it. One ordering is the claim; which way it runs is not.
+    let y =
+        |vcx: &mut VisualTestContext, sel: &'static str| vcx.debug_bounds(sel).expect(sel).origin.y;
+    let (p1, sess, p2) = (y(vcx, "tab-p1"), y(vcx, "tab-aaaa1111"), y(vcx, "tab-p2"));
     assert!(
         p1 < sess && sess < p2,
         "the strip reordered the model: p1={p1:?} session={sess:?} p2={p2:?}"
     );
 
-    // Every tab is the same width, whichever kind it is. A strip whose two
+    // Every tab is the same box, whichever kind it is. A strip whose two
     // kinds had two metrics would have no rhythm, and the tab you are
-    // aiming for would move when an unrelated one changed kind.
+    // aiming for would move when an unrelated one changed kind. On the
+    // vertical axis the shared metric is the HEIGHT; the width is the
+    // rail's and is therefore shared trivially, so it is asserted too but
+    // proves less than it used to.
+    let hgt = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel).expect(sel).size.height
+    };
+    assert_eq!(hgt(vcx, "tab-p1"), hgt(vcx, "tab-aaaa1111"));
+    assert_eq!(hgt(vcx, "tab-p1"), hgt(vcx, "tab-p2"));
     let w = |vcx: &mut VisualTestContext, sel: &'static str| {
         vcx.debug_bounds(sel).expect(sel).size.width
     };
@@ -9200,6 +9291,266 @@ fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     for sel in ["tab-close-p1", "tab-close-aaaa1111", "tab-close-p2"] {
         assert!(shown(vcx, sel), "{sel} — a tab you cannot close");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice D1 — the frame (A′): the rail owns the window, and the pane header
+// is the line that says where you are.
+
+/// **The address is on screen at rest.** The whole reason A′ exists.
+///
+/// Before this slice eave showed the current url NOWHERE without a
+/// keystroke: `strip::page_label` draws a tab's title and falls back to the
+/// address only when there is no title, so on a page with a title the
+/// address lived only inside the omnibox — a surface you have to summon. For
+/// an app whose stance is *every element states an observed fact*, a browser
+/// that will not say where it is was a stance violation rather than a
+/// missing feature, and this is the test that would have caught it.
+///
+/// Deliberately measured on a tab that HAS a title, because the titleless
+/// case was never the broken one.
+#[gpui::test]
+fn the_address_is_on_screen_without_a_keystroke(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab(
+            "p1",
+            Some("https://docs.rs/gpui/latest/gpui/"),
+            Some("gpui - Rust"),
+        )],
+        Some("p1"),
+    );
+
+    assert!(
+        shown(vcx, "pane-address-text"),
+        "no address on screen with a page open — the tab shows the TITLE, so \
+         without this line the url is reachable only through ⌘L"
+    );
+    // And it is the typing form, which is what a person reads: scheme and
+    // `www.` stripped, path kept. The path is the half that distinguishes
+    // two pages on one host, so a header showing only the host would state
+    // a fact too coarse to act on.
+    assert_eq!(
+        eave_wire::typing_form("https://docs.rs/gpui/latest/gpui/"),
+        "docs.rs/gpui/latest/gpui"
+    );
+}
+
+/// **The header is the same height for a page and for a session.**
+///
+/// One strip holds two kinds of tab. If each kind produced a
+/// differently-shaped region beneath it, the mixed strip would read as an
+/// accident of history rather than as the thing the application is — so the
+/// two headers being identical in geometry, and different only in what they
+/// say, is the frame's answer to eave's one genuinely novel constraint.
+///
+/// A third kind of tab is a third arm in `Shell::pane_header` and changes no
+/// geometry at all; this is the assertion that keeps that true.
+#[gpui::test]
+fn both_kinds_of_tab_get_the_same_header(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://example.com/"), Some("Example Domain")),
+            session_tab("aaaa1111"),
+        ],
+        Some("p1"),
+    );
+    let on_page = vcx
+        .debug_bounds("pane-header")
+        .expect("the header on a page");
+    assert!(shown(vcx, "pane-address"), "a page has no address field");
+
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://example.com/"), Some("Example Domain")),
+            session_tab("aaaa1111"),
+        ],
+        Some("aaaa1111"),
+    );
+    let on_session = vcx
+        .debug_bounds("pane-header")
+        .expect("the header on a session");
+    assert!(shown(vcx, "pane-crumb"), "a session has no breadcrumb");
+    assert!(
+        !shown(vcx, "pane-address"),
+        "a session tab drew an address field — a transcript has no url, and \
+         a field standing empty over one states a fact that is not true"
+    );
+
+    assert_eq!(
+        (on_page.origin, on_page.size),
+        (on_session.origin, on_session.size),
+        "the header changed shape between a page tab and a session tab: \
+         {on_page:?} -> {on_session:?}. Two kinds of tab, one silhouette."
+    );
+}
+
+/// **The back and forward arrows say what the ENGINE says, and nothing else.**
+///
+/// `can_go_back` / `can_go_forward` have crossed the wire since B1 and are
+/// populated from the real stack (`snapshot.rs:153`); `TabGo` has been
+/// walkable just as long. The app had never sent that request once, because
+/// there was no surface for the arrows to live on — so this asserts both
+/// halves: the arrows reflect the engine's facts, and clicking an enabled one
+/// actually emits the walk.
+///
+/// Disabled is DRAWN, not hidden: a control that disappears when it cannot
+/// act makes the row's geometry depend on history, and the reload button
+/// would slide sideways as you browsed.
+#[gpui::test]
+fn the_arrows_state_the_engines_history_and_walk_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let fresh = page_tab("p1", Some("https://example.com/"), Some("Example Domain"));
+    strip_tabs(&h, vcx, vec![fresh.clone()], Some("p1"));
+
+    // A tab with no history still draws both arrows.
+    for sel in ["nav-back", "nav-fwd", "nav-reload"] {
+        assert!(shown(vcx, sel), "{sel} is not drawn on a fresh page tab");
+    }
+    // ...and clicking the disabled one sends nothing.
+    let _ = h.drain();
+    click(vcx, "nav-back");
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
+        "back walked a stack the engine says is empty"
+    );
+
+    // Now the engine states a history.
+    let mut visited = fresh;
+    visited.can_go_back = true;
+    visited.history_len = 2;
+    strip_tabs(&h, vcx, vec![visited], Some("p1"));
+    let _ = h.drain();
+    click(vcx, "nav-back");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Go { tab_id, delta }) if tab_id == "p1" && *delta == -1
+        )),
+        "back did not walk the stack: {cmds:?}"
+    );
+    // Forward is still what the engine says it is, which is nothing.
+    let _ = h.drain();
+    click(vcx, "nav-fwd");
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
+        "forward walked a stack the engine says is empty"
+    );
+}
+
+/// **Reload is a navigation to where the tab already is — and a tab with no
+/// address does not offer one.**
+///
+/// The first half is only safe because of C5's reload fix:
+/// `NavStack::is_refresh_of_current` asks the question BEFORE the fold runs,
+/// so a same-url commit does not push a duplicate entry or truncate the
+/// forward stack. The second half is the instrument rule — a reload button
+/// that navigated to the empty string would be worse than one that is inert.
+#[gpui::test]
+fn reload_goes_where_the_tab_already_is(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://example.com/"), None)],
+        Some("p1"),
+    );
+    let _ = h.drain();
+    click(vcx, "nav-reload");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Navigate { tab_id, url })
+                if tab_id == "p1" && url == "https://example.com/"
+        )),
+        "reload did not re-navigate to the current address: {cmds:?}"
+    );
+
+    // A tab that has never navigated has nothing to reload.
+    strip_tabs(&h, vcx, vec![page_tab("p2", None, None)], Some("p2"));
+    let _ = h.drain();
+    click(vcx, "nav-reload");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "reload fired on a tab with no committed url"
+    );
+}
+
+/// **The rail owns the window's left edge, and the content region owns the
+/// other three.**
+///
+/// The frame's whole diagnosis in one measurement. Before A′ nothing owned
+/// any edge: both rails painted no surface, so the outer 248 px each side was
+/// bare ground with text floating in it, and the only outlined object was an
+/// inset card in the middle. Asserted as geometry rather than as colour,
+/// because colour is `theme.rs`'s to prove
+/// (`every_rung_is_a_step_you_can_see` sweeps the rail's seam over 52
+/// backdrops) and placement is this file's.
+#[gpui::test]
+fn the_rail_owns_the_left_edge_and_the_content_owns_the_rest(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+
+    let rail = vcx.debug_bounds("rail").expect("the rail");
+    let well = vcx
+        .debug_bounds("content-well")
+        .expect("the content region");
+    let header = vcx.debug_bounds("pane-header").expect("the pane header");
+
+    assert_eq!(
+        rail.origin.x,
+        px(0.),
+        "the rail does not start at the window's left edge"
+    );
+    assert_eq!(
+        rail.origin.y,
+        px(0.),
+        "the rail does not reach the titlebar line — the traffic lights are \
+         sitting on whatever is behind it"
+    );
+    // No margin between them: the content region is full-bleed, so the
+    // seam is the rail's own hairline and nothing else.
+    assert!(
+        well.origin.x - (rail.origin.x + rail.size.width) <= px(1.),
+        "there is {:?} of ground between the rail and the content region — \
+         an inset card is what you draw when nothing owns the edges",
+        well.origin.x - (rail.origin.x + rail.size.width)
+    );
+    assert_eq!(
+        well.origin.y,
+        px(0.),
+        "the content region does not own the top edge"
+    );
+    // The header is the content region's top edge, not a floating band.
+    assert_eq!(
+        header.origin.y, well.origin.y,
+        "the pane header is not flush with the top of the region it heads"
+    );
+    assert_eq!(
+        header.size.height,
+        px(theme::PANE_HEADER_H),
+        "the pane header is not the height its token names"
+    );
 }
 
 /// A page tab takes the well from the transcript, and says which absence it
