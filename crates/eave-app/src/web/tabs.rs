@@ -107,6 +107,21 @@ mod favicon_pick {
 }
 
 thread_local! {
+    /// Tabs whose browser has been ASKED for and has not arrived yet.
+    ///
+    /// `browser_host_create_browser` is async: nothing lands in `BROWSERS`
+    /// until `on_after_created`, so `has_browser` answers *false* for the
+    /// whole gap. Anything that reconciles more than once inside that gap
+    /// and keys off `has_browser` alone will ask for a second browser for
+    /// the same tab — two renderers, two sets of helpers, and the second
+    /// `insert` silently evicting the first.
+    ///
+    /// This was survivable while `drive` ran only on snapshots, which are
+    /// far rarer than a browser start. Preloading reconciles on the pump,
+    /// which is not, so the gap became reachable and had to be closed.
+    static CREATING: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
     /// Live browsers by tab id. Main thread only: every CEF UI callback
     /// lands there under an external pump, and so does gpui's render.
     static BROWSERS: std::cell::RefCell<HashMap<String, Browser>> =
@@ -127,6 +142,14 @@ pub fn any_browser() -> bool {
 /// Whether a tab has a live browser.
 pub fn has_browser(tab_id: &str) -> bool {
     BROWSERS.with(|b| b.borrow().contains_key(tab_id))
+}
+
+/// A browser for this tab exists or is on its way.
+///
+/// The question every caller actually means when it asks `has_browser`
+/// before deciding whether to create one. See [`CREATING`].
+pub fn browser_wanted(tab_id: &str) -> bool {
+    has_browser(tab_id) || CREATING.with(|c| c.borrow().contains(tab_id))
 }
 
 /// Page tabs the well is painting this frame. Not the engine's `active`:
@@ -539,10 +562,11 @@ pub fn drive(snapshot: &TabsSnapshot) {
         let is_active = Some(tab.id.as_str()) == active;
         let shown = is_active || is_on_screen(&tab.id);
         if !has_browser(&tab.id) && !shown {
-            // Never looked at. No browser, no cost, and nothing to drive —
-            // its `pending` is still on the tab and will be issued as the
-            // start url the moment it is activated. A split pane counts as
-            // looked at even when it is not `active`.
+            // Not shown and not yet warmed. Its `pending` is still on the
+            // tab and will be issued as the start url when a browser
+            // arrives — either from the preload pass below, or on
+            // activation if the cap never reached this tab. A split pane
+            // counts as shown even when it is not `active`.
             continue;
         }
         drive_tab(tab);
@@ -561,6 +585,60 @@ pub fn drive(snapshot: &TabsSnapshot) {
     // snapshot is how that arrives. A close handler would have to be told,
     // and would be wrong the moment a tab is closed by anything but this
     // window.
+    // ── WARMING, WHICH IS THE OTHER HALF OF THE MEMORY POLICY ──
+    //
+    // Until this existed, `shown` above was the ONLY thing that could
+    // create a browser, so every tab restored at launch booted Chromium the
+    // first time it was opened or dragged into a split, and the well showed
+    // `PAGE_STARTING` over an empty pane while it came up. Creation is
+    // async (`on_after_created`), so that gap is unavoidable once you are
+    // already waiting for it — the fix is to not be waiting for it.
+    //
+    // The rule lives in `evict_policy::preload_queue` because it is a
+    // question about tabs and timestamps with no Chromium in it, and
+    // because `evict_policy` compiles in BOTH feature states while this
+    // module does not. A preload rule the default test run never executed
+    // would be a rule nobody checks.
+    //
+    // **One per pass, deliberately.** Eight `create_browser` calls in a
+    // single turn asks for eight sets of helper processes at once, on the
+    // pump, during launch — the moment eave can least afford it. The queue
+    // is re-derived next tick and `request_redrive` makes sure there is one.
+    let warm = super::evict_policy::preload_queue(
+        &snapshot.tabs,
+        super::evict::residency,
+        eave_core::thresholds::page_preload_max(),
+    );
+    if let Some(id) = warm.first() {
+        if let Some(tab) = snapshot.tabs.iter().find(|t| &t.id == id) {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] warming {} ({} queued)", tab.id, warm.len());
+            }
+            drive_tab(tab);
+            // **Visibility is deliberately NOT set here.** `set_visibility`
+            // routes through `with_browser`, which does nothing while the
+            // browser is still being created — but it records the value
+            // first, so a `false` written now makes the real call later look
+            // unchanged and `was_hidden(1)` is never sent. A warmed tab
+            // would then render at full rate, unwatched, for as long as it
+            // lived. The loop above hides it on the next pass, once the
+            // browser exists and the call can actually land.
+        }
+        if warm.len() > 1 {
+            super::evict::request_redrive();
+        }
+        super::host::request_pump();
+    }
+
+    // A tab can also depart while its browser is still being created, and
+    // that one is not in `BROWSERS` to be reaped. Left marked, it would be
+    // permanently unwarmable — `drive_tab` would return early forever — so
+    // the mark is pruned against the strip rather than against the map.
+    CREATING.with(|c| {
+        c.borrow_mut()
+            .retain(|id| snapshot.tabs.iter().any(|t| &t.id == id))
+    });
+
     let live: Vec<String> = BROWSERS.with(|b| b.borrow().keys().cloned().collect());
     for id in live {
         if snapshot.tabs.iter().any(|t| t.id == id) {
@@ -692,6 +770,10 @@ fn set_visibility(tab_id: &str, visible: bool) {
 /// the one being looked at or one loading behind a session.
 fn drive_tab(tab: &eave_wire::TabInfo) {
     if !has_browser(&tab.id) {
+        // Asked for already and still coming. Asking twice would make two.
+        if CREATING.with(|c| c.borrow().contains(&tab.id)) {
+            return;
+        }
         // The pending request is the start url, not a load to issue after
         // creation. `browser_host_create_browser` is ASYNC — the browser
         // does not exist until `on_after_created` — so creating and then
@@ -803,6 +885,7 @@ fn create(tab_id: &str, url: Option<&str>) {
     if std::env::var("EAVE_WEB_TRACE").is_ok() {
         eprintln!("[web] creating browser for {tab_id} at {url:?}");
     }
+    CREATING.with(|c| c.borrow_mut().insert(tab_id.to_string()));
     let mut client = PageClient::new(tab_id.to_string());
     let start = CefString::from(url.unwrap_or("about:blank"));
     browser_host_create_browser(
@@ -990,6 +1073,7 @@ wrap_life_span_handler! {
             // `insert` returns whatever it evicted; dropping that here
             // rather than inside the closure keeps the CEF release off a
             // stack that holds the borrow.
+            CREATING.with(|c| c.borrow_mut().remove(&self.tab_id));
             let evicted = BROWSERS.with(|b| b.borrow_mut().insert(self.tab_id.clone(), browser));
             drop(evicted);
             // Slice E1: zoom belongs to the TAB, not to the browser. A tab

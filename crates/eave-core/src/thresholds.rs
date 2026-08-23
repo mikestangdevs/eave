@@ -179,3 +179,39 @@ pub fn page_idle_evict_after() -> Duration {
 pub fn page_audio_hold() -> Duration {
     env_duration("EAVE_THRESH_PAGE_AUDIO_MS", PAGE_AUDIO_HOLD)
 }
+
+/// How many page tabs may hold a browser at once.
+///
+/// # What this is for, and why it is not the same knob as eviction
+/// [`PAGE_IDLE_EVICT_AFTER`] answers "when does a tab eave built a browser
+/// for give it back". This answers the other question C5 and E3 both left
+/// open: **which tabs get a browser before anybody asks.** Until now the
+/// answer was "none" — creation required activation — so every restored
+/// tab booted the first time it was opened or pulled into a split, and the
+/// well showed "starting the page…" over an empty pane while Chromium came
+/// up. That is the defect this bounds.
+///
+/// # Where eight comes from
+/// A decision, like the twenty minutes, and it should not be quoted as a
+/// derivation. What IS measured is the cost either side of it: E3 found ten
+/// page tabs at 0.90 GB against a 0.32 GB floor, so a resident tab is worth
+/// roughly **60 MB**, not the ~322 MB the create-on-activation rule was
+/// written to avoid. Eight is therefore about half a gigabyte over the
+/// floor — inside what the measurement says is affordable, and past any
+/// plausible "the tabs I am actually working in".
+///
+/// The thing that would move it is the same evidence that would move the
+/// eviction clock: how many tabs a real operator actually cycles between.
+/// `docs/dogfood-log.md` is where that comes from.
+pub const PAGE_PRELOAD_MAX: usize = 8;
+
+/// [`PAGE_PRELOAD_MAX`], overridable via `EAVE_THRESH_PAGE_PRELOAD_MAX`.
+///
+/// Zero is a legitimate value and restores the old behaviour exactly: no
+/// tab is warmed, and every page boots when it is first shown.
+pub fn page_preload_max() -> usize {
+    std::env::var("EAVE_THRESH_PAGE_PRELOAD_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(PAGE_PRELOAD_MAX)
+}

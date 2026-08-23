@@ -230,6 +230,39 @@ pub fn was_evicted(tab_id: &str) -> bool {
     SEEN.with(|s| s.borrow().get(tab_id).is_some_and(|seen| seen.evicted))
 }
 
+/// Where this tab's browser stands, for the preload rule.
+///
+/// **`resident` is asked of `tabs` rather than remembered here.** This
+/// module learns about browsers through callbacks — `note_created`,
+/// `note_closed` — and a fourth copy of "does this tab have a browser"
+/// would be a fourth thing that can fall out of step. `browser_wanted`
+/// reads the map that actually owns the answer.
+///
+/// The `SEEN` borrow is released before returning, because the caller is
+/// `tabs::drive` and `drive` creates browsers.
+pub fn residency(tab_id: &str) -> super::evict_policy::Residency {
+    let seen = SEEN.with(|s| s.borrow().get(tab_id).copied());
+    super::evict_policy::Residency {
+        // `browser_wanted`, not `has_browser`: a tab whose browser is still
+        // being created is already spoken for, and warming it again would
+        // ask CEF for a second one.
+        resident: super::tabs::browser_wanted(tab_id),
+        evicted: seen.is_some_and(|s| s.evicted),
+        last_active_ms: seen.map_or(0, |s| s.last_active_ms),
+    }
+}
+
+/// Reconcile the strip again on the next tick.
+///
+/// Preloading warms **one** browser per pass on purpose, so a restored
+/// session of eight tabs does not ask Chromium for eight process groups in
+/// a single turn of the pump. This is how the next one gets asked for: the
+/// pump ticks whether or not the strip changed, which is the same property
+/// the eviction clock needs and the reason it is read here.
+pub fn request_redrive() {
+    REDRIVE.with(|r| r.set(true));
+}
+
 // ---------------------------------------------------------------------------
 // The clock
 // ---------------------------------------------------------------------------

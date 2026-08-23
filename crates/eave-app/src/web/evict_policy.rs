@@ -139,6 +139,82 @@ pub fn verdict(
     Verdict::Evict
 }
 
+// ---------------------------------------------------------------------------
+// The other half of the same question (the preload rule)
+// ---------------------------------------------------------------------------
+
+/// Where one page tab's browser stands right now.
+///
+/// `resident` and `evicted` are **not** opposites, and the distinction is
+/// the whole reason preloading and eviction can coexist. A tab that has
+/// never been opened is not resident and not evicted — warm it. A tab eave
+/// took the browser back from is not resident *and* evicted — leave it
+/// alone, or the next tick hands back exactly what the last one reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Residency {
+    /// This tab has a browser.
+    pub resident: bool,
+    /// eave took this tab's browser back for idleness.
+    pub evicted: bool,
+    /// When this tab was last the active tab.
+    pub last_active_ms: u64,
+}
+
+/// Which tabs should be given a browser *before* anyone asks for one, most
+/// recently used first.
+///
+/// # The rule
+/// A page tab is warmed when it is not resident, has not been evicted, and
+/// there is room under `cap`. Those are the only three reasons a tab is
+/// missing from this list, and they are worth knowing apart when someone
+/// reports "it still booted": it was already warm, eave had deliberately
+/// reclaimed it, or tabs used more recently spent the budget.
+///
+/// # Why the cap counts residents rather than warmings
+/// `cap` is a ceiling on *resident page browsers*, not a number of tabs to
+/// warm per pass. Counting only new warmings would let eight already-open
+/// tabs sit beside eight freshly warmed ones.
+///
+/// # Why the order needs a tiebreak
+/// At launch every tab is first seen in the same instant, so
+/// `last_active_ms` is identical across the strip and sorting on it alone
+/// would leave the choice to whatever order the map happened to yield.
+/// Strip position breaks the tie, which makes the answer both deterministic
+/// and defensible: leftmost first when nothing else distinguishes them.
+pub fn preload_queue(
+    tabs: &[TabInfo],
+    residency: impl Fn(&str) -> Residency,
+    cap: usize,
+) -> Vec<String> {
+    let pages: Vec<(usize, &TabInfo, Residency)> = tabs
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.content == TabContent::Page)
+        .map(|(i, t)| (i, t, residency(&t.id)))
+        .collect();
+
+    let budget = cap.saturating_sub(pages.iter().filter(|(_, _, r)| r.resident).count());
+    if budget == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(usize, &TabInfo, Residency)> = pages
+        .into_iter()
+        .filter(|(_, _, r)| !r.resident && !r.evicted)
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.2.last_active_ms
+            .cmp(&a.2.last_active_ms)
+            .then(a.0.cmp(&b.0))
+    });
+
+    candidates
+        .into_iter()
+        .take(budget)
+        .map(|(_, t, _)| t.id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +411,132 @@ mod tests {
             .filter(|t| verdict(t, &idle_since(0), t.id == "t0", true, now, clock()).evicts())
             .count();
         assert_eq!(evicted, 9);
+    }
+    // ── preload ──────────────────────────────────────────────────────────
+
+    fn session(id: &str) -> TabInfo {
+        TabInfo {
+            content: TabContent::Session {
+                session_id: "s".into(),
+            },
+            ..page(id)
+        }
+    }
+
+    /// Cold, never-opened page tabs are exactly what the old rule left to
+    /// boot on first sight. They are the reason this function exists.
+    fn cold() -> Residency {
+        Residency::default()
+    }
+
+    #[test]
+    fn a_never_opened_page_tab_is_warmed_before_anyone_asks() {
+        let tabs = vec![page("a"), page("b")];
+        assert_eq!(preload_queue(&tabs, |_| cold(), 8), vec!["a", "b"]);
+    }
+
+    /// The defect this whole change is about: opening a tab, or dragging one
+    /// into a split, must not be the thing that starts Chromium.
+    #[test]
+    fn nothing_is_left_cold_when_the_strip_fits_under_the_cap() {
+        let tabs: Vec<TabInfo> = (0..8).map(|i| page(&format!("t{i}"))).collect();
+        assert_eq!(preload_queue(&tabs, |_| cold(), 8).len(), 8);
+    }
+
+    #[test]
+    fn session_tabs_are_not_warmed_and_do_not_spend_the_budget() {
+        let tabs = vec![session("s0"), session("s1"), page("p")];
+        assert_eq!(preload_queue(&tabs, |_| cold(), 2), vec!["p"]);
+    }
+
+    /// The interlock with E3. Handing a browser straight back to a tab eave
+    /// just reclaimed would make eviction a no-op with extra steps, and the
+    /// memory would never actually be returned.
+    #[test]
+    fn an_evicted_tab_is_left_alone_rather_than_immediately_rewarmed() {
+        let tabs = vec![page("kept"), page("reclaimed")];
+        let q = preload_queue(
+            &tabs,
+            |id| Residency {
+                evicted: id == "reclaimed",
+                ..cold()
+            },
+            8,
+        );
+        assert_eq!(q, vec!["kept"]);
+    }
+
+    #[test]
+    fn the_cap_counts_browsers_already_resident_not_just_new_ones() {
+        let tabs: Vec<TabInfo> = (0..6).map(|i| page(&format!("t{i}"))).collect();
+        // Three are already up, so a cap of four leaves room for exactly one.
+        let q = preload_queue(
+            &tabs,
+            |id| Residency {
+                resident: matches!(id, "t0" | "t1" | "t2"),
+                ..cold()
+            },
+            4,
+        );
+        assert_eq!(q, vec!["t3"]);
+    }
+
+    #[test]
+    fn a_full_cap_warms_nothing_further() {
+        let tabs: Vec<TabInfo> = (0..10).map(|i| page(&format!("t{i}"))).collect();
+        let q = preload_queue(
+            &tabs,
+            |id| Residency {
+                resident: id < "t8",
+                ..cold()
+            },
+            8,
+        );
+        assert!(q.is_empty(), "expected no warmings, got {q:?}");
+    }
+
+    /// Most recently used first, because the budget is spent on the tabs
+    /// most likely to be reached for next.
+    #[test]
+    fn the_budget_goes_to_the_most_recently_used_tabs() {
+        let tabs = vec![page("old"), page("newest"), page("middle")];
+        let q = preload_queue(
+            &tabs,
+            |id| Residency {
+                last_active_ms: match id {
+                    "newest" => 300,
+                    "middle" => 200,
+                    _ => 100,
+                },
+                ..cold()
+            },
+            2,
+        );
+        assert_eq!(q, vec!["newest", "middle"]);
+    }
+
+    /// At launch every tab is first seen in the same instant, so the stamps
+    /// tie and strip order has to decide. Without the tiebreak this test is
+    /// flaky rather than wrong, which is the worse failure.
+    #[test]
+    fn tabs_seen_in_the_same_instant_fall_back_to_strip_order() {
+        let tabs: Vec<TabInfo> = (0..5).map(|i| page(&format!("t{i}"))).collect();
+        let q = preload_queue(
+            &tabs,
+            |_| Residency {
+                last_active_ms: 1_000,
+                ..cold()
+            },
+            3,
+        );
+        assert_eq!(q, vec!["t0", "t1", "t2"]);
+    }
+
+    /// `EAVE_THRESH_PAGE_PRELOAD_MAX=0` has to restore the old behaviour
+    /// exactly, so the change is reversible at runtime without a build.
+    #[test]
+    fn a_cap_of_zero_restores_create_on_activation() {
+        let tabs: Vec<TabInfo> = (0..4).map(|i| page(&format!("t{i}"))).collect();
+        assert!(preload_queue(&tabs, |_| cold(), 0).is_empty());
     }
 }
