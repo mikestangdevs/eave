@@ -25,7 +25,7 @@ use gpui::AnimationExt as _;
 use gpui::{
     actions, deferred, div, img, list, point, prelude::*, px, quad, relative, size, AnyElement,
     App, BorderStyle, Bounds, ClickEvent, ClipboardEntry, Context, Corners, CursorStyle,
-    DispatchPhase, DragMoveEvent, Edges, Element, Entity, ExternalPaths, FocusHandle, Font,
+    DispatchPhase, Div, DragMoveEvent, Edges, Element, Entity, ExternalPaths, FocusHandle, Font,
     FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image, ImageFormat,
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
@@ -3886,12 +3886,6 @@ struct ComposerState {
     /// composer hint so a ninth file does not vanish. Cleared on send
     /// and on session switch (the files are the fact that travels).
     overflow: usize,
-    /// When the caret last went solid (inventory §1.20). Every keystroke
-    /// resets it, which is what keeps a typing burst from blinking: the
-    /// cadence is solid through its first half-period, so the caret only
-    /// starts flashing once the typist has stopped. `None` until the first
-    /// keystroke — a caret nobody has typed at has nothing to blink about.
-    caret_anchor: Option<Instant>,
 }
 
 impl ComposerState {
@@ -4594,6 +4588,24 @@ struct Shell {
     /// a session, so it must survive the feed events that rebuild the
     /// rail underneath it.
     rename: Option<RenameEdit>,
+    /// Which field the caret is blinking in, and when it last went solid.
+    ///
+    /// **One anchor for the whole window, carrying the field it belongs
+    /// to.** It lived on `ComposerState` while the composer was the only
+    /// box with a caret in it. Four boxes later, four anchors would be four
+    /// clocks that have to agree about a fact only one of them can observe
+    /// — which key was struck last — so the field travels with the instant
+    /// instead. That makes "the keyboard moved to another box" a change to
+    /// *this* value, which is what lets a caret that has just arrived start
+    /// solid rather than half-way through somebody else's blink.
+    ///
+    /// A `Cell` because the render pass anchors a field nobody has typed
+    /// into yet (⌘L an instant ago), and `render` reaches it through
+    /// `&self`. Same reason `tab_scrolled_to` above is one, and the same
+    /// constraint: no notify, so a write here cannot cost a frame.
+    ///
+    /// `None` until the first keystroke of the run.
+    caret: Cell<Option<(Field, Instant)>>,
     /// Slice Q2 — the launcher's own state. Held on the shell rather than
     /// in `TranscriptState` because it is a *choice in progress*, not a
     /// fact about a session: it survives the feed events that clear the
@@ -4830,6 +4842,59 @@ impl SlashCache {
 /// distinction is the same one the transcript's empty state draws between
 /// "nothing sent yet" and a replay still arriving (Slice M).
 const READING: &str = "reading skills…";
+
+/// One of eave's four typed-into surfaces, named so a caret can belong to
+/// one of them.
+///
+/// **Not a focus model.** This shell has none, and inventing one here would
+/// be a second notion of "where the keyboard is" sitting beside the ladder
+/// of gates in [`Shell::on_key`] — which is the one that actually decides,
+/// and the one a keystroke obeys. This is a *name* for a rung of that
+/// ladder, so the caret can be drawn in the box the next character will
+/// land in and in no other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    /// The message composer, at the foot of a selected session.
+    Composer,
+    /// ⌘L's address bar.
+    Omnibox,
+    /// ⌘F's find-in-page query.
+    Find,
+    /// The rail's inline rename box.
+    Rename,
+}
+
+/// The caret glyph. A half-width vertical bar rather than a full block: it
+/// marks a position between two characters, and a block marks a character.
+const CARET: &str = "▏";
+
+/// One caret, for every field whose text does not wrap.
+///
+/// The composer's is not built here and cannot be — its text wraps, so its
+/// caret has to live *inside* the string as a colour-only run or it stops
+/// travelling with the last line. Every other field in eave truncates
+/// instead, and a truncating box has to keep the caret out of the string it
+/// is clipping, or the first thing a long value clips is the insertion
+/// point. So: a sibling, `flex_none`, always in the layout and only
+/// sometimes in the ink.
+///
+/// **Drawn at zero opacity rather than removed**, which is what makes the
+/// blink ink and never layout — nothing on the row moves as it flashes.
+///
+/// **The lit state is in the SELECTOR**, because `ui_harness` asserts what
+/// it can find by `debug_selector` and cannot read colour. A caret that
+/// identified itself as plain `caret-omnibox` would have a test under the
+/// fact that something is there and no test at all under the thing it
+/// exists to do. `caret-omnibox-lit` and `caret-omnibox-dark` are two
+/// elements to a test and one element to a reader. (The find bar's tally
+/// already takes this trick, from Slice E3's evicted tab chip.)
+fn caret_glyph(field: &'static str, lit: bool) -> Div {
+    div()
+        .debug_selector(move || format!("caret-{field}-{}", if lit { "lit" } else { "dark" }))
+        .flex_none()
+        .text_color(theme::text().opacity(if lit { 1.0 } else { 0.0 }))
+        .child(CARET)
+}
 
 /// One open rail rename (Stage AC).
 ///
@@ -6535,10 +6600,20 @@ impl Shell {
     ///
     /// Capture phase, and it consumes nothing — see the mount site for why the
     /// bubble phase stopped being enough once backspace became an action.
+    ///
+    /// **ANY key, in WHICHEVER field owns the keyboard.** Not just the keys
+    /// that change the text: backspacing to empty, a rejected ⌘-chord and an
+    /// arrow key are all "the typist is still here", and a caret that blinked
+    /// through them would be flashing at somebody actively using the field.
+    /// And not just the composer's — this stamped the composer's anchor
+    /// unconditionally until the omnibox, the find bar and the rename field
+    /// got carets of their own, which is why the omnibox used to blink on the
+    /// composer's last keystroke rather than on yours.
     fn note_keystroke(&mut self, _: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let struck = cx.background_executor().now();
-        self.composer
-            .update(cx, |c, _| c.caret_anchor = Some(struck));
+        if let Some(field) = self.caret_field(cx) {
+            self.caret
+                .set(Some((field, cx.background_executor().now())));
+        }
     }
 
     /// Return in the composer: choose a slash command, or send.
@@ -7367,25 +7442,23 @@ impl Shell {
                                                 text.clone()
                                             })),
                                     )
-                                    // The caret: the composer's own glyph,
-                                    // on the composer's own blink clock.
-                                    // `caret_lit` is ONE clock for the whole
-                                    // window, so eave's two carets can never
-                                    // blink out of phase — the N1 rule about
-                                    // phase-locked indicators, applied to the
-                                    // one other place this app draws a caret.
+                                    // The caret. ONE anchor for the whole
+                                    // window (`Shell::caret`), so eave's four
+                                    // carets can never blink out of phase with
+                                    // each other — the N1 rule about
+                                    // phase-locked indicators, and the reason
+                                    // the field travels with the instant
+                                    // rather than each box timing itself.
                                     //
-                                    // Drawn at zero opacity rather than
-                                    // removed, so the blink never changes the
-                                    // layout of the line it is on.
+                                    // Until this slice the call here read the
+                                    // COMPOSER's draft, which is empty by
+                                    // definition while somebody is typing into
+                                    // an address bar — so the one caret an
+                                    // operator stares at while typing a url
+                                    // was the one that could never blink.
                                     .child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(px(theme::BODY_SIZE))
-                                            .text_color(theme::text().opacity(
-                                                if self.caret_lit(cx) { 1.0 } else { 0.0 },
-                                            ))
-                                            .child("▏"),
+                                        caret_glyph("omnibox", self.caret_lit(Field::Omnibox, cx))
+                                            .text_size(px(theme::BODY_SIZE)),
                                     ),
                             )
                             .when(!row_els.is_empty(), |d| {
@@ -7635,10 +7708,11 @@ impl Shell {
         } else {
             None
         };
-        let find = self
-            .find_here(cx)
-            .filter(|t| t == tab_id)
-            .and_then(|_| self.find_bar(cx));
+        // Two statements rather than an `and_then`, because `find_bar`
+        // takes `&mut Context` now (it leases the caret clock) and the
+        // closure would still be holding the reborrow `find_here` took.
+        let find_here = self.find_here(cx).is_some_and(|t| t == *tab_id);
+        let find = if find_here { self.find_bar(cx) } else { None };
         let absence: Option<&'static str> = if page_el.is_some() || !is_page {
             None
         } else if crate::web::available() {
@@ -8125,38 +8199,95 @@ impl Shell {
         cx.notify();
     }
 
-    /// Is the composer caret drawn this frame? (inventory §1.20 — 500 ms
+    /// Which field the next printable key will land in, or `None` when the
+    /// answer is "nowhere with a caret in it".
+    ///
+    /// **The order mirrors [`Shell::on_key`]'s gates, and it has to.** A
+    /// caret drawn in a box that is not the one consuming keys is worse
+    /// than no caret at all: it is a confident wrong answer to the exact
+    /// question somebody is asking at the moment they look for it. The two
+    /// ladders are kept in step by a test that drives real keystrokes
+    /// through the real shell rather than re-reading this list.
+    ///
+    /// The rungs that own the keyboard **without being fields** — a page
+    /// dialog, an open menu — are deliberately not modelled here. They sit
+    /// over whatever is behind them and they are gone in a keystroke or
+    /// two. What matters is that the four boxes that *do* have carets
+    /// cannot disagree with each other about which of them is live.
+    fn caret_field(&self, cx: &App) -> Option<Field> {
+        if self.omnibox_open() {
+            return Some(Field::Omnibox);
+        }
+        if self.find_here(cx).is_some() {
+            return Some(Field::Find);
+        }
+        if self.rename.is_some() {
+            return Some(Field::Rename);
+        }
+        // The composer is mounted with a session and not before, and that
+        // is what keeps N4's idle floor reachable: a window sitting at the
+        // launcher has no field, so it takes no lease and schedules
+        // nothing. The floor was never about carets — it is about a window
+        // nobody is typing into.
+        self.transcript
+            .read(cx)
+            .session_id
+            .is_some()
+            .then_some(Field::Composer)
+    }
+
+    /// Is `field`'s caret drawn this frame? (inventory §1.20 — 500 ms
     /// half-period, solid through the first half so a typing burst never
     /// blinks.)
     ///
-    /// **Only a draft blinks, and that is a divergence worth reading.** A
-    /// blink is the one tween in this slice that never settles, so its
-    /// consumer holds a pulse lease for as long as it is on screen — and
-    /// eave's caret is on screen always, which would mean a window that
-    /// redraws 30 times a second forever. That directly contradicts the
-    /// invariant N1 was built around and asserts twice: *a window with
-    /// nothing mid-flight schedules nothing at all.* Gating on a draft keeps
-    /// the invariant reachable — an idle eave still schedules nothing — and
-    /// keeps the blink where it means something, marking the insertion point
-    /// in real text rather than decorating a placeholder. Measured cost of
-    /// the ungated version is in `docs/reports/stage-n2-hover.md` §5; if the
-    /// user wants it always, delete the `has_draft` early return and nothing
-    /// else changes.
-    fn caret_lit(&self, cx: &mut Context<Self>) -> bool {
-        let (has_draft, anchor) = {
-            let c = self.composer.read(cx);
-            (!c.field.read(cx).content().is_empty(), c.caret_anchor)
-        };
-        if !has_draft {
-            return true;
+    /// **Only the field taking the next key draws one.** The others answer
+    /// `false`, and every caller renders that as zero opacity rather than
+    /// as a missing element — so the answer is ink and never layout, in all
+    /// four boxes.
+    ///
+    /// # What this was, and why the shape changed
+    /// One caret, gated on the composer holding a draft. The gate was there
+    /// for N4's idle floor: a blink is the one tween that never settles, so
+    /// its consumer holds a lease for as long as it is on screen, and a
+    /// caret is on screen always. At the shared clock's 30 fps that is a
+    /// window redrawing forever, which is the invariant N1 asserts twice.
+    ///
+    /// Two things were wrong with the gate rather than one. The visible
+    /// one: an empty composer got a **static** glyph, and a glyph that
+    /// never moves reads as decoration rather than as an insertion point.
+    /// The other was invisible from here — the omnibox called this same
+    /// function, so **it** was gated on the composer's draft too, and the
+    /// composer is empty by definition while somebody is typing into an
+    /// address bar. Its caret could not blink, ever. The rail's rename
+    /// field went solid by hand and said so in a comment. Three fields, no
+    /// blink, and the report that arrived was the obvious one.
+    ///
+    /// The floor is kept a different way now: by making a caret **cheap**
+    /// (`motion::caret_now`, a 100 ms lease instead of 33 ms) and by
+    /// leasing only while a field owns the keyboard — rather than by
+    /// refusing to blink. A window nobody is typing into still schedules
+    /// nothing at all.
+    fn caret_lit(&self, field: Field, cx: &mut Context<Self>) -> bool {
+        if self.caret_field(cx) != Some(field) {
+            return false;
         }
-        // The lease is the whole reason this call is `&mut`: it is what
-        // keeps the clock ticking, and dropping it is what parks the clock.
+        // The lease is what keeps the clock ticking, and not asking for one
+        // is what parks it.
         let view = cx.entity_id();
-        let (Some(now), Some(anchor)) = (motion::pulse_now(view, cx), anchor) else {
-            // Reduced motion, or a draft that arrived without a keystroke
-            // (a paste through the fixture path). Solid.
+        let Some(now) = motion::caret_now(view, cx) else {
+            // Reduced motion. Solid — the resting state, not a missing one.
             return true;
+        };
+        let anchor = match self.caret.get() {
+            Some((f, at)) if f == field => at,
+            // Focused, but nobody has typed here yet: ⌘L an instant ago, or
+            // a session just selected. Anchor now, so the field opens solid
+            // and its first blink is a half-period away instead of wherever
+            // another box's clock had got to.
+            _ => {
+                self.caret.set(Some((field, now)));
+                now
+            }
         };
         motion::caret_visible(now.saturating_duration_since(anchor))
     }
@@ -9446,7 +9577,10 @@ impl Shell {
     /// The highlight is a projection of the feed task's actual
     /// subscription (`TranscriptState::session_id`); clicking only
     /// *requests* a switch.
-    fn rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
+    /// `caret_lit` is asked for in the root render pass and passed down,
+    /// because this one takes `&Context` and a lease needs `&mut`. It is
+    /// the rename field's, and it is false unless that field is open.
+    fn rail(&self, cx: &Context<Self>, phase: Option<f32>, caret_lit: bool) -> AnyElement {
         // Already in draw order: `fold_rail` decided it when each row
         // arrived, and deliberately does not re-decide it here (Stage AB).
         let all = self.sessions.read(cx).sessions.clone();
@@ -9755,7 +9889,9 @@ impl Shell {
                                     .debug_selector(|| format!("rename-{}", info.session_id))
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .truncate()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
                                     .border_1()
                                     .border_color(theme::border_strong())
                                     .rounded(px(theme::RADIUS_BUTTON))
@@ -9782,15 +9918,31 @@ impl Shell {
                                     // handler always states a cursor, not
                                     // that every cursor is a pointer.
                                     .cursor_text()
-                                    // A SOLID caret, deliberately. The
-                                    // composer's blink holds a pulse lease
-                                    // for as long as it is on screen
-                                    // (`caret_lit`), and this field is one
-                                    // more surface that would then be
-                                    // pinned at the frame rate. N4's idle
-                                    // floor is worth more than a blink on
-                                    // a box that is open for four seconds.
-                                    .child(SharedString::from(format!("{text}▏")))
+                                    // The title and the caret are SIBLINGS
+                                    // here, unlike the composer's, whose
+                                    // caret is drawn inside the text field
+                                    // because that text wraps. This one
+                                    // truncates instead, and a truncating
+                                    // box has to keep the caret out of the
+                                    // string it is clipping — otherwise the
+                                    // first thing a long title clips is the
+                                    // insertion point.
+                                    //
+                                    // It blinks now. The comment that stood
+                                    // here traded the blink for N4's idle
+                                    // floor at 30 fps, which was the right
+                                    // call against the only clock there was;
+                                    // a caret costs 100 ms ticks now, and
+                                    // only while its field owns the
+                                    // keyboard, so the floor is bought back
+                                    // without spending the caret.
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .child(SharedString::from(text.to_string())),
+                                    )
+                                    .child(caret_glyph("rename", caret_lit))
                                     .into_any_element(),
                                 // Stage AB: `min_w(0)` is what makes
                                 // `truncate` bite inside a flex row — a
@@ -12862,8 +13014,9 @@ impl Shell {
     /// is also the corner least likely to cover the top of a page's own
     /// content. It is a sibling of the page inside the well's `relative`
     /// box, so it needs no anchoring and cannot disturb any layout.
-    fn find_bar(&self, cx: &App) -> Option<AnyElement> {
+    fn find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let tab = self.find_here(cx)?;
+        let caret_lit = self.caret_lit(Field::Find, cx);
         let state = crate::web::find_state(&tab);
         let tally = state.tally();
         let empty = state.query.is_empty();
@@ -12907,6 +13060,10 @@ impl Shell {
                             state.query.clone()
                         }),
                 )
+                // The find bar had no caret at all before this slice, which
+                // made it the one field in eave where "where am I typing"
+                // had no answer on screen even in principle.
+                .child(caret_glyph("find", caret_lit))
                 // **The tally is absent, not blank, when there is nothing
                 // to say.** An empty slot reserved for a number is a
                 // surface claiming it knows something it does not — see
@@ -14680,7 +14837,11 @@ impl Render for Shell {
         // tab and shows over a page). But an explicit "shown over a page,
         // because X" is a fine answer too. The unacceptable answer is not
         // having considered it.
-        let caret_lit = self.caret_lit(cx);
+        // Two asks, because the two boxes are drawn by different passes and
+        // the rail's takes `&Context`. They cannot disagree: at most one
+        // field owns the keyboard, so at most one of these is ever true.
+        let caret_lit = self.caret_lit(Field::Composer, cx);
+        let rename_caret_lit = self.caret_lit(Field::Rename, cx);
         // Slice CM: the blink is decided once for the window (see `caret_lit`)
         // and handed down. The field does not ask, because asking would mean a
         // second lease on the pulse clock and a second reason for an idle
@@ -14837,6 +14998,16 @@ impl Render for Shell {
                         .text_size(px(theme::BODY_SIZE))
                         .line_height(px(theme::COMPOSER_LINE))
                         .text_color(theme::text())
+                        // The composer's caret is drawn INSIDE the text field
+                        // (Slice CM), so unlike the other three it is not an
+                        // element a test can find. The state is put on its
+                        // mount instead, for the same reason `caret_glyph`
+                        // puts it in a selector: `ui_harness` cannot read
+                        // colour, and an alpha nobody can assert is a blink
+                        // with no test under it.
+                        .debug_selector(move || {
+                            format!("caret-composer-{}", if caret_lit { "lit" } else { "dark" })
+                        })
                         .child(composer_field),
                 )
                 .child(
@@ -15281,7 +15452,9 @@ impl Render for Shell {
                     // supposed to be a space for tabs when the sidebar was
                     // closed but idk about it now"), so this slice does not
                     // answer it — it gets the borders out of the way.
-                    .when(!rail_collapsed, |d| d.child(self.rail(cx, pulse)))
+                    .when(!rail_collapsed, |d| {
+                        d.child(self.rail(cx, pulse, rename_caret_lit))
+                    })
                     .child(
                         // Content is a floating card on the window surface:
                         // uniform gutter, rounded, darker than the glass.
@@ -16591,7 +16764,6 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         attachments: Vec::new(),
                         parked_files: HashMap::new(),
                         overflow: 0,
-                        caret_anchor: None,
                     });
                     // Slice K: the approval card's buttons are built by a
                     // static row fn with no `Context`, so give the transcript
@@ -16637,6 +16809,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         focus: cx.focus_handle(),
                         demo: DemoOverlay::default(),
                         rename: None,
+                        caret: Cell::new(None),
                         launcher: LauncherUi::default(),
                         files_wait_since: Cell::new(None),
                         slash: SlashPalette::default(),
