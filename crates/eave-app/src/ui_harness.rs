@@ -11097,6 +11097,315 @@ fn a_session_nobody_launched_from_a_tab_replaces_nothing(cx: &mut TestAppContext
     );
 }
 
+/// Slice T1 — seed the bookmark tree. `(id, depth, title, url)`; a `None`
+/// url makes a folder, exactly as `BookmarkAdd` means it.
+fn push_bookmarks(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    nodes: &[(&str, usize, Option<&str>, Option<&str>)],
+) {
+    h.plumbing.push_bookmarks(eave_wire::BookmarksSnapshot {
+        nodes: nodes
+            .iter()
+            .map(|(id, depth, title, url)| eave_wire::BookmarkNode {
+                bookmark: eave_wire::Bookmark {
+                    id: (*id).into(),
+                    parent: None,
+                    title: title.map(str::to_string),
+                    kind: match url {
+                        Some(u) => eave_wire::BookmarkKind::Link { url: (*u).into() },
+                        None => eave_wire::BookmarkKind::Folder,
+                    },
+                    created_ts_ms: 0,
+                },
+                depth: *depth,
+                children: 0,
+            })
+            .collect(),
+        ..Default::default()
+    });
+    vcx.run_until_parked();
+}
+
+/// A page tab with a real address, so the bar has something to be over.
+fn visited_tab(id: &str, url: &str) -> TabInfo {
+    let mut t = page_tab(id, Some(url), Some("a page"));
+    t.history_len = 1;
+    t
+}
+
+/// Slice T1 — bookmarks sit **on top of pages**, which means they are not
+/// there in a chat.
+///
+/// That is the operator's own ruling and it has a real cost: the bar
+/// vanishes when the well holds a session. Asserted in both directions so
+/// the cost stays a decision rather than becoming a surprise.
+#[gpui::test]
+fn the_bookmarks_bar_is_over_a_page_and_absent_in_a_chat(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://docs.rs/"),
+        ],
+        Some("p1"),
+    );
+    assert!(shown(vcx, "bookmarks-bar"), "no bar over a page");
+    assert!(shown(vcx, "bookmark-gh"), "the bar drew none of its chips");
+
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://docs.rs/"),
+        ],
+        Some("aaaa1111"),
+    );
+    assert!(
+        !shown(vcx, "bookmarks-bar"),
+        "the bar drew over an agent's conversation"
+    );
+}
+
+/// A folder opens its children under it, and only its DIRECT children.
+#[gpui::test]
+fn a_bookmark_folder_opens_its_children_under_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("dev"), None),
+            ("rs", 1, None, Some("https://docs.rs/")),
+            ("inner", 1, Some("inner"), None),
+            ("deep", 2, None, Some("https://deep.test/")),
+        ],
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    assert!(shown(vcx, "bookmark-folder-dev"), "the folder never drew");
+    assert!(!shown(vcx, "bookmark-child-rs"), "the folder opened itself");
+
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "bookmark-child-rs"), "the folder opened empty");
+    assert!(
+        !shown(vcx, "bookmark-child-deep"),
+        "a grandchild drew as a child — the run did not stop at the folder's depth"
+    );
+
+    // Clicking it again shuts it. One folder open at a time, and a
+    // disclosure that only opens is a trap.
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "bookmark-child-rs"),
+        "the folder would not shut"
+    );
+}
+
+/// Clicking a bookmark sends the tab you are looking at, which is what a
+/// bookmarks bar has meant in every browser.
+#[gpui::test]
+fn clicking_a_bookmark_sends_the_active_tab_to_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    click(vcx, "bookmark-gh");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Navigate { tab_id, url })
+                if tab_id == "p1" && url == "https://github.com/"
+        )),
+        "the bookmark opened somewhere other than the tab in front of you: {cmds:?}"
+    );
+}
+
+/// Dropping the address into a folder files it INSIDE, and onto the bar
+/// files it on the bar.
+///
+/// The drop handlers are driven directly rather than through a synthetic
+/// drag, which is what `the_rail_draws_the_width_it_was_dragged_to` does
+/// for the divider: gpui's drag is a multi-frame gesture and the thing
+/// worth pinning is what the handler ASKS the engine for.
+#[gpui::test]
+fn dropping_an_address_files_it_where_it_landed(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("dev", 0, Some("dev"), None)]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            let drag = AddressDrag {
+                url: "https://docs.rs/".into(),
+                title: Some("docs.rs".into()),
+            };
+            shell.add_bookmark(Some("dev".into()), None, &drag, cx);
+            shell.add_bookmark(None, Some(0), &drag, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    let adds: Vec<_> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::BookmarkAdd {
+                parent,
+                index,
+                url,
+                title,
+            }) => Some((parent.clone(), *index, url.clone(), title.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        adds,
+        vec![
+            (
+                Some("dev".to_string()),
+                None,
+                Some("https://docs.rs/".to_string()),
+                Some("docs.rs".to_string())
+            ),
+            (
+                None,
+                Some(0),
+                Some("https://docs.rs/".to_string()),
+                Some("docs.rs".to_string())
+            ),
+        ],
+        "a drop did not land where it was aimed: {cmds:?}"
+    );
+}
+
+/// A bookmark dragged onto a folder goes in it; dragged onto a chip, it
+/// takes that chip's place.
+#[gpui::test]
+fn moving_a_bookmark_reparents_or_reorders(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("gh", 0, None, Some("https://github.com/")),
+            ("dev", 0, Some("dev"), None),
+        ],
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.move_bookmark("gh".into(), Some("dev".into()), 0, cx);
+            shell.move_bookmark("gh".into(), None, 1, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    let moves: Vec<_> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::BookmarkMove {
+                bookmark_id,
+                parent,
+                index,
+            }) => Some((bookmark_id.clone(), parent.clone(), *index)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves,
+        vec![
+            ("gh".to_string(), Some("dev".to_string()), 0),
+            ("gh".to_string(), None, 1),
+        ],
+        "{cmds:?}"
+    );
+}
+
+/// Slice T1 — the bar makes folders, and names them so two are told apart.
+///
+/// A folder created unnamed would draw as an empty chip: eave has no
+/// inline rename for a bookmark yet (`BookmarkRename` is on the wire and
+/// nothing calls it), so the operator could open it and fill it but never
+/// identify it.
+#[gpui::test]
+fn the_bar_makes_folders_and_names_them_apart(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    click(vcx, "bookmark-new-folder");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::BookmarkAdd { url: None, title: Some(t), .. })
+                if t == "new folder"
+        )),
+        "the bar's folder button made no folder: {cmds:?}"
+    );
+
+    // With one already there, the next is distinguishable from it.
+    push_bookmarks(&h, vcx, &[("f1", 0, Some("new folder"), None)]);
+    let _ = h.drain();
+    click(vcx, "bookmark-new-folder");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::BookmarkAdd { url: None, title: Some(t), .. })
+                if t == "new folder 2"
+        )),
+        "a second folder was made indistinguishable from the first: {cmds:?}"
+    );
+}
+
 /// ⌘W closes the active TAB, and lands on its right neighbour.
 ///
 /// Right then left, which is what every browser does: landing on the left

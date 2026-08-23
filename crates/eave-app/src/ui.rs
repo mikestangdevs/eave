@@ -47,6 +47,7 @@ use eave_wire::{
 };
 
 use crate::attach::{self, StagedFile};
+use crate::bookmarks;
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
 use crate::icons;
@@ -377,6 +378,33 @@ enum BrowserCmd {
         /// The client does, because the client is where the snapshot is.
         workspace: Option<String>,
     },
+    /// Slice T1 — file a page on the bookmarks bar.
+    ///
+    /// `parent: None` is the bar itself; `Some` is a folder on it. `index:
+    /// None` appends, which is what a drop onto empty bar space means.
+    BookmarkAdd {
+        parent: Option<String>,
+        index: Option<usize>,
+        title: Option<String>,
+        /// Present makes a link, absent makes a **folder** — the wire's own
+        /// rule, kept rather than split into two verbs, because "a bookmark
+        /// with a url" is what every caller actually has in hand.
+        url: Option<String>,
+    },
+    /// Slice T1 — drag a bookmark somewhere else on the bar, or into a
+    /// folder on it.
+    ///
+    /// The engine's `BookmarkMove` is two list edits with the node itself
+    /// untouched, and it refuses a move that would make a cycle — see
+    /// `BookmarkTree::would_cycle`. Neither is this client's problem, which
+    /// is exactly why the drop handler can be this short.
+    BookmarkMove {
+        bookmark_id: String,
+        parent: Option<String>,
+        index: usize,
+    },
+    /// Slice T1 — take a bookmark off the bar. A folder takes its subtree.
+    BookmarkRemove { bookmark_id: String },
     /// Slice T1 — a session tab taking a blank tab's place.
     ///
     /// ⌘T makes a page tab and offers the launcher in it. Starting a
@@ -427,6 +455,7 @@ struct Queues {
     notes: Mutex<VecDeque<RowNoteEvent>>,
     /// Slice C1. The tab strip, engine-wide like the session watch.
     tabs: Mutex<VecDeque<eave_wire::TabsSnapshot>>,
+    bookmarks: Mutex<VecDeque<eave_wire::BookmarksSnapshot>>,
     /// Slice C5. One typeahead answer: the text it was asked for, and what
     /// came back. The text travels WITH the answer so a reply that lands
     /// after the next keystroke can be discarded rather than shown against
@@ -442,6 +471,16 @@ struct Queues {
 /// so there is nothing to go stale and nothing to resync.
 struct WebTabsState {
     snapshot: eave_wire::TabsSnapshot,
+}
+
+/// Slice T1: the bookmark hierarchy, folded by replacement.
+///
+/// An entity for the same reason [`WebTabsState`] is one — the pump folds
+/// it and the pump exists before the shell does. Bookmarks are ENGINE-WIDE
+/// like tabs and unlike everything session-shaped, so they arrive on their
+/// own subscription and have nothing to do with which session is selected.
+struct BookmarksState {
+    snapshot: eave_wire::BookmarksSnapshot,
 }
 
 /// Slice C5: the last typeahead answer, and the text it answered for.
@@ -493,6 +532,12 @@ impl Plumbing {
     /// other snapshot on this shell.
     fn push_tabs(&self, ev: eave_wire::TabsSnapshot) {
         self.queues.tabs.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
+    /// Slice T1: the whole bookmark tree, folded by replacement like every
+    /// other snapshot on this shell.
+    fn push_bookmarks(&self, ev: eave_wire::BookmarksSnapshot) {
+        self.queues.bookmarks.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
     fn push_diff(&self, ev: DiffEvent) {
@@ -553,6 +598,39 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     opener: None,
                     activate: true,
                 })
+                .await;
+        }
+        BrowserCmd::BookmarkAdd {
+            parent,
+            index,
+            title,
+            url,
+        } => {
+            let _ = client
+                .browser_create(eave_wire::Request::BookmarkAdd {
+                    parent,
+                    index,
+                    title,
+                    url,
+                })
+                .await;
+        }
+        BrowserCmd::BookmarkMove {
+            bookmark_id,
+            parent,
+            index,
+        } => {
+            let _ = client
+                .browser_do(eave_wire::Request::BookmarkMove {
+                    bookmark_id,
+                    parent,
+                    index,
+                })
+                .await;
+        }
+        BrowserCmd::BookmarkRemove { bookmark_id } => {
+            let _ = client
+                .browser_do(eave_wire::Request::BookmarkRemove { bookmark_id })
                 .await;
         }
         BrowserCmd::ReplaceWithSessionTab {
@@ -775,6 +853,28 @@ async fn feed_loop(
             Ok(rx) => rx,
             Err(_) => continue 'conn,
         };
+
+        // Slice T1: the bookmark tree.
+        //
+        // Its own task, for the reason the strip's is: bookmarks are
+        // ENGINE-WIDE. They have nothing to do with which session is
+        // selected, so putting them in the select!s below would couple them
+        // to the loop whose whole job is that selection. Dies with the
+        // connection, because it holds a clone of the client.
+        {
+            let client = Arc::clone(&client);
+            let plumbing = plumbing.clone();
+            tokio::spawn(async move {
+                let Ok(mut rx) = client.watch_bookmarks().await else {
+                    return;
+                };
+                while let Some(item) = rx.recv().await {
+                    if let SubscriptionItem::Bookmarks { snapshot } = item {
+                        plumbing.push_bookmarks(snapshot);
+                    }
+                }
+            });
+        }
 
         // Slice C1: the tab strip, and the page facts going the other way.
         //
@@ -4162,6 +4262,38 @@ struct RailDrag {
 #[derive(Clone, Copy, Debug)]
 struct RailResize;
 
+/// Slice T1 — a page being dragged onto the bookmarks bar.
+///
+/// Carries the address and the page's own title rather than a tab id: the
+/// drop files a bookmark, and a bookmark is a url. A tab id would make the
+/// bookmark depend on a tab that may be closed before the drop lands.
+#[derive(Clone, Debug)]
+struct AddressDrag {
+    url: String,
+    title: Option<String>,
+}
+
+/// Slice T1 — a bookmark being dragged along the bar, or into a folder.
+#[derive(Clone, Debug)]
+struct BookmarkDrag {
+    id: String,
+}
+
+/// Both render nothing. gpui draws the dragged element itself when a drag
+/// has no preview, which for a chip is the right ghost — a second thing
+/// following the pointer would be one too many.
+impl Render for AddressDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+impl Render for BookmarkDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 impl Render for RailResize {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
@@ -4181,6 +4313,7 @@ struct Shell {
     thumbs: HashMap<PathBuf, Arc<Image>>,
     /// Slice C1: the browser's tab strip.
     web_tabs: Entity<WebTabsState>,
+    bookmarks: Entity<BookmarksState>,
     commands: tokio_mpsc::UnboundedSender<Command>,
     perf: Option<PerfProbe>,
     /// Transient ⌘⇧L confirmation shown in the footer ("logged 14:52:03"
@@ -4319,6 +4452,8 @@ struct Shell {
     /// Cleared when consumed, unlike the two `asked_*` sets — this one is a
     /// pending act, not a record that something was already asked for.
     launched_from_tab: RefCell<Option<String>>,
+    /// Which bookmark folder is open on the bar (Slice T1). One at a time.
+    bookmark_folder_open: RefCell<Option<String>>,
     /// Checkout roots a project has already been asked for (Slice T1),
     /// keyed on the root rather than the session.
     ///
@@ -6946,6 +7081,21 @@ impl Shell {
                             .cursor_pointer()
                             .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
                             .on_click(cx.listener(|this, _, _, cx| this.open_omnibox(cx)))
+                            // Slice T1 — drag the address onto the
+                            // bookmarks bar to file it. The RAW url, not the
+                            // typing form drawn beside it: `typing_form`
+                            // drops the scheme so the row reads
+                            // `github.com/eave`, and a bookmark stored that
+                            // way is a bookmark that cannot be navigated
+                            // to. What is shown and what is kept are
+                            // different strings and this is the one place
+                            // that has both.
+                            .when_some(tab.url.clone(), |d, url| {
+                                let title = tab.title.clone();
+                                d.on_drag(AddressDrag { url, title }, |drag, _, _, cx| {
+                                    cx.new(|_| drag.clone())
+                                })
+                            })
                             .flex()
                             .items_center()
                             .child(
@@ -7612,6 +7762,351 @@ impl Shell {
                     .children(rows),
             )
             .into_any_element()
+    }
+
+    /// Slice T1 — **the bookmarks bar**, under the pane header, on a page.
+    ///
+    /// `None` unless a page tab is showing, and that is the operator's own
+    /// ruling: bookmarks sit *on top of pages*. It follows that the bar is
+    /// not there in a chat, which is a real cost and was accepted when the
+    /// place was chosen.
+    ///
+    /// # Why this is a UI-only slice
+    ///
+    /// The store underneath is complete and was complete before this slice
+    /// started: `Folder | Link`, a node naming its parent, ordered child
+    /// ids, `BookmarkAdd/Move/Rename/Remove/Retarget`, a `WatchBookmarks`
+    /// subscription and a cycle check on moves. 127 mentions in
+    /// `eave-core`, 93 in `eave-engine`, 31 in `eave-wire` — and five in
+    /// this crate, all of them `SubscriptionItem::Bookmarks { .. } => {}`.
+    /// Every bookmark fact eave draws here was already durable; nothing had
+    /// ever asked for it.
+    ///
+    /// # The two drags
+    ///
+    /// Dragging eave's OWN chrome — the address out of the pane header, a
+    /// chip along the bar, a chip into a folder — is gpui drag, which this
+    /// file already uses for the rail divider. Dragging a link out of the
+    /// rendered page is a different animal: CEF windowless mode needs
+    /// `StartDragging` and the `DragTarget*` family plumbed through, and
+    /// eave has none of it. That gesture is deliberately absent rather than
+    /// half-built.
+    fn bookmarks_bar(&self, showing_page: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !showing_page {
+            return None;
+        }
+        let items = bookmarks::bar(&self.bookmarks.read(cx).snapshot);
+        let open = self.bookmark_folder_open.borrow().clone();
+        let end = items.len();
+
+        Some(
+            div()
+                .debug_selector(|| "bookmarks-bar".into())
+                .id("bookmarks-bar")
+                .flex_none()
+                .w_full()
+                .h(px(theme::RAIL_TAB_H))
+                .px(px(theme::SPACE_2))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACE_1))
+                .overflow_x_hidden()
+                // The bar's own empty space is a drop target: past the last
+                // chip means the end, which is where a person aiming at
+                // "not into any of these" naturally lets go.
+                .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
+                .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
+                    this.add_bookmark(None, None, drag, cx)
+                }))
+                .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
+                .on_drop(cx.listener(move |this, drag: &BookmarkDrag, _, cx| {
+                    this.move_bookmark(drag.id.clone(), None, end, cx)
+                }))
+                .children(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, item)| self.bookmark_chip(item, ix, open.as_deref(), cx)),
+                )
+                // New folder. Trailing the chips rather than heading them:
+                // this bar grows to the RIGHT, so a control after the last
+                // chip stays put as bookmarks are added — the opposite of
+                // the vertical tab list, where the `+` had to go in the
+                // header for exactly the same reason.
+                .child(
+                    div()
+                        .id("bookmark-new-folder")
+                        .debug_selector(|| "bookmark-new-folder".into())
+                        .flex_none()
+                        .size(px(theme::TAB_CLOSE))
+                        .rounded(px(theme::RADIUS_BUTTON))
+                        .hover_fade("bookmark-new-folder", theme::wash_rest(), theme::overlay())
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.new_bookmark_folder(cx)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icons::tagged_icon(
+                            icons::FOLDER,
+                            theme::ICON_SM,
+                            theme::text_tertiary(),
+                            "bookmark-new-folder-glyph",
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// One chip on the bar — a link, or a folder that opens under it.
+    fn bookmark_chip(
+        &self,
+        item: &bookmarks::BarItem,
+        index: usize,
+        open: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = item.id.clone();
+        let sel = item.id.clone();
+        let folder = item.is_folder();
+        let url = item.url.clone();
+        let is_open = folder && open == Some(item.id.as_str());
+        let (click_id, drop_id, drag_id) = (id.clone(), id.clone(), id.clone());
+
+        let chip = div()
+            .id(SharedString::from(format!("bookmark-{id}")))
+            .debug_selector(move || {
+                if folder {
+                    format!("bookmark-folder-{sel}")
+                } else {
+                    format!("bookmark-{sel}")
+                }
+            })
+            .flex_none()
+            .h(px(theme::GROUP_HEAD_H))
+            .px(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .when(is_open, |d| d.bg(theme::wash_rest()))
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .child(icons::tagged_icon(
+                if folder { icons::FOLDER } else { icons::GLOBAL },
+                12.0,
+                theme::text_secondary(),
+                "bookmark-glyph",
+            ))
+            .child(
+                div()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .text_color(theme::text())
+                    .child(SharedString::from(item.label.clone())),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                match &url {
+                    // A link goes in the tab you are looking at, which is
+                    // what a bookmarks bar has meant in every browser.
+                    Some(url) => this.open_bookmark(url.clone(), cx),
+                    None => this.toggle_bookmark_folder(&click_id, cx),
+                }
+                cx.notify();
+            }))
+            .on_drag(BookmarkDrag { id: drag_id }, |drag, _, _, cx| {
+                cx.new(|_| drag.clone())
+            })
+            // Dropping ONTO a chip means "put it here", at this chip's
+            // index — except on a folder, where it means "put it inside".
+            .on_drop(cx.listener(move |this, drag: &BookmarkDrag, _, cx| {
+                if drag.id == drop_id {
+                    return;
+                }
+                if folder {
+                    this.move_bookmark(drag.id.clone(), Some(drop_id.clone()), 0, cx)
+                } else {
+                    this.move_bookmark(drag.id.clone(), None, index, cx)
+                }
+            }))
+            .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
+                if folder {
+                    this.add_bookmark(Some(id.clone()), None, drag, cx)
+                } else {
+                    this.add_bookmark(None, Some(index), drag, cx)
+                }
+            }))
+            .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::overlay()))
+            .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::overlay()));
+
+        if !is_open {
+            return chip.into_any_element();
+        }
+        div()
+            .relative()
+            .flex_none()
+            .child(chip)
+            .child(self.bookmark_folder_menu(item, cx))
+            .into_any_element()
+    }
+
+    /// What an open folder shows: its direct children, under it.
+    ///
+    /// `deferred` because it overhangs everything below the bar, and the
+    /// bar is painted before the content well — without it the menu is
+    /// drawn under the page.
+    fn bookmark_folder_menu(
+        &self,
+        folder: &bookmarks::BarItem,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let children = bookmarks::children_of(&self.bookmarks.read(cx).snapshot, &folder.id);
+        let fid = folder.id.clone();
+        deferred(
+            div()
+                .debug_selector(move || format!("bookmark-menu-{fid}"))
+                .absolute()
+                .top(px(theme::GROUP_HEAD_H))
+                .left_0()
+                .min_w(px(theme::DIRECTIVE_MAX_W / 3.))
+                .p(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_PANEL))
+                .bg(theme::overlay())
+                .shadow(theme::selection_rim())
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_1))
+                .children(if children.is_empty() {
+                    // An empty folder is a fact, and saying so beats an
+                    // empty box the operator cannot tell from a failure.
+                    vec![div()
+                        .debug_selector(|| "bookmark-menu-empty".into())
+                        .px(px(theme::SPACE_2))
+                        .text_size(px(theme::MICRO_SIZE))
+                        .text_color(theme::text_tertiary())
+                        .child("empty")
+                        .into_any_element()]
+                } else {
+                    children
+                        .iter()
+                        .map(|child| {
+                            let url = child.url.clone();
+                            let cid = child.id.clone();
+                            div()
+                                .id(SharedString::from(format!("bookmark-child-{}", child.id)))
+                                .debug_selector(move || format!("bookmark-child-{cid}"))
+                                .px(px(theme::SPACE_2))
+                                .h(px(theme::GROUP_HEAD_H))
+                                .rounded(px(theme::RADIUS_BUTTON))
+                                .cursor_pointer()
+                                .hover_fade("bookmark-child", theme::overlay(), theme::wash_rest())
+                                .flex()
+                                .items_center()
+                                .text_size(px(theme::MICRO_SIZE))
+                                .text_color(theme::text())
+                                .child(SharedString::from(child.label.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(url) = url.clone() {
+                                        this.open_bookmark(url, cx);
+                                    }
+                                    this.bookmark_folder_open.replace(None);
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>()
+                }),
+        )
+        .into_any_element()
+    }
+
+    /// Send the active tab to a bookmark. Falls back to opening a tab when
+    /// there is no page tab to send — the same rule the omnibox commits by.
+    fn open_bookmark(&mut self, url: String, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let target = strip::active_is_page(&snapshot)
+            .then(|| snapshot.active.clone())
+            .flatten();
+        let cmd = match target {
+            Some(tab_id) => BrowserCmd::Navigate { tab_id, url },
+            None => BrowserCmd::OpenAt {
+                url,
+                activate: true,
+            },
+        };
+        let _ = self.commands.send(Command::Browser(cmd));
+    }
+
+    fn toggle_bookmark_folder(&mut self, id: &str, _cx: &mut Context<Self>) {
+        let mut open = self.bookmark_folder_open.borrow_mut();
+        if open.as_deref() == Some(id) {
+            *open = None;
+        } else {
+            *open = Some(id.to_string());
+        }
+    }
+
+    fn add_bookmark(
+        &mut self,
+        parent: Option<String>,
+        index: Option<usize>,
+        drag: &AddressDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self
+            .commands
+            .send(Command::Browser(BrowserCmd::BookmarkAdd {
+                parent,
+                index,
+                title: drag.title.clone(),
+                url: Some(drag.url.clone()),
+            }));
+        cx.notify();
+    }
+
+    /// Slice T1 — a folder on the bar.
+    ///
+    /// Named on creation rather than left blank and renamed after. eave has
+    /// no inline rename for a bookmark yet (`BookmarkRename` is on the wire
+    /// and nothing calls it), so a folder created unnamed would draw as an
+    /// empty chip the operator could open and fill but never identify. The
+    /// count makes the second one distinguishable from the first, which is
+    /// the whole job until a rename exists.
+    fn new_bookmark_folder(&mut self, cx: &mut Context<Self>) {
+        let existing = bookmarks::bar(&self.bookmarks.read(cx).snapshot)
+            .iter()
+            .filter(|i| i.is_folder())
+            .count();
+        let title = if existing == 0 {
+            "new folder".to_string()
+        } else {
+            format!("new folder {}", existing + 1)
+        };
+        let _ = self
+            .commands
+            .send(Command::Browser(BrowserCmd::BookmarkAdd {
+                parent: None,
+                index: None,
+                title: Some(title),
+                url: None,
+            }));
+        cx.notify();
+    }
+
+    fn move_bookmark(
+        &mut self,
+        bookmark_id: String,
+        parent: Option<String>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self
+            .commands
+            .send(Command::Browser(BrowserCmd::BookmarkMove {
+                bookmark_id,
+                parent,
+                index,
+            }));
+        cx.notify();
     }
 
     /// Slice T1 — the `TABS` divider: where the projects stop.
@@ -13311,6 +13806,10 @@ impl Render for Shell {
                                     // — for a page — where it is. See
                                     // `Shell::pane_header`.
                                     .child(self.pane_header(cx, rail_collapsed))
+                                    // Slice T1 — the bookmarks bar, under
+                                    // the header and above the page, on a
+                                    // page tab only.
+                                    .children(self.bookmarks_bar(showing_page, cx))
                                     .child(
                                         // Stage H glass: the list's viewport runs
                                         // the full column height and the composer
@@ -14173,6 +14672,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     let web_tabs = cx.new(|_| WebTabsState {
         snapshot: eave_wire::TabsSnapshot::default(),
     });
+    let bookmarks = cx.new(|_| BookmarksState {
+        snapshot: eave_wire::BookmarksSnapshot::default(),
+    });
     let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
     let transcript = cx.new(|_| {
         let mut t = TranscriptState::new();
@@ -14235,6 +14737,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let transcript = transcript.clone();
         let cmd_tx = cmd_tx.clone();
         let web_tabs = web_tabs.clone();
+        let bookmarks = bookmarks.clone();
         let typeahead = typeahead.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
@@ -14340,6 +14843,16 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 if let Some(snapshot) = tab_snapshots.into_iter().last() {
                     crate::web::drive(&snapshot);
                     web_tabs.update(cx, |state, cx| {
+                        state.snapshot = snapshot;
+                        cx.notify();
+                    });
+                }
+                // Slice T1. Same fold as the strip's: a bookmark burst is
+                // several states of one tree, and only the last is true.
+                let bookmark_snapshots: Vec<eave_wire::BookmarksSnapshot> =
+                    queues.bookmarks.lock().unwrap().drain(..).collect();
+                if let Some(snapshot) = bookmark_snapshots.into_iter().last() {
+                    bookmarks.update(cx, |state, cx| {
                         state.snapshot = snapshot;
                         cx.notify();
                     });
@@ -14505,6 +15018,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                     cx.observe(&web_tabs, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&bookmarks, |_, _, cx| cx.notify()).detach();
                     cx.observe(&typeahead, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
@@ -14520,6 +15034,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         asked_for_session_tab: RefCell::new(HashSet::new()),
                         asked_for_project: RefCell::new(HashSet::new()),
                         launched_from_tab: RefCell::new(None),
+                        bookmark_folder_open: RefCell::new(None),
                         asked_to_select: RefCell::new(None),
                         closed_pages: VecDeque::new(),
                         conn: conn.clone(),
@@ -14529,6 +15044,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         composer,
                         thumbs: HashMap::new(),
                         web_tabs: web_tabs.clone(),
+                        bookmarks: bookmarks.clone(),
                         commands: cmd_tx.clone(),
                         perf: perf_10k.then(|| PerfProbe {
                             frame_times: Vec::new(),

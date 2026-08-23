@@ -65,6 +65,11 @@ pub mod omnibox;
 /// behaviour worth asserting lives.
 pub mod strip;
 
+/// The bookmarks bar's model half (Slice T1): B1's flat, depth-first
+/// `BookmarksSnapshot` read as a bar of top-level chips and the runs of
+/// children each folder opens. Public for the same reason `strip` is.
+pub mod bookmarks;
+
 /// The macOS menu bar (Slice Y). Private: it is wiring, not part of the
 /// headless surface the acceptance runs use.
 mod app_menus;
