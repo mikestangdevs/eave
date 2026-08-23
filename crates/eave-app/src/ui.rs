@@ -1713,6 +1713,51 @@ fn spine_dot(tab: &strip::StripTab) -> (Hsla, bool) {
     }
 }
 
+thread_local! {
+    /// Test seam (Slice E3): forces which page tabs [`page_resident`]
+    /// reports as holding a live page.
+    ///
+    /// A `thread_local` set by tests, in the same shape as this file's other
+    /// harness seams, because the real answer comes from CEF and the harness
+    /// runs in a build with no Chromium in it — so without this the evicted
+    /// treatment would be a rendering path the suite could never enter, and
+    /// "an evicted tab looks different" would be a claim with no test under
+    /// it.
+    static RESIDENT_OVERRIDE: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: declare exactly which page tabs hold a live page, or hand
+/// residency back to the page engine with `None`.
+///
+/// Every test that sets this must clear it — the `thread_local` outlives the
+/// test on a reused thread, and a leaked override would make an unrelated
+/// test's tabs recede for reasons its author never wrote down.
+#[cfg(test)]
+fn set_resident_for_test(ids: Option<&[&str]>) {
+    RESIDENT_OVERRIDE.with(|o| {
+        *o.borrow_mut() = ids.map(|ids| ids.iter().map(|s| s.to_string()).collect());
+    });
+}
+
+/// Whether this page tab's page is in memory right now (Slice E3).
+///
+/// **A build with no page engine reports every tab resident**, and that is
+/// the honest answer rather than the convenient one: `web::page_is_resident`
+/// says `false` there because there is no Chromium to hold anything, but
+/// "unloaded" on screen means *eave gave this page back and will fetch it
+/// again* — a statement about a browser that exists. A build that has no
+/// browser at all is not making that statement about every tab; it is not
+/// making it at all.
+fn page_resident(tab_id: &str) -> bool {
+    if let Some(forced) =
+        RESIDENT_OVERRIDE.with(|o| o.borrow().as_ref().map(|set| set.contains(tab_id)))
+    {
+        return forced;
+    }
+    !crate::web::available() || crate::web::page_is_resident(tab_id)
+}
+
 /// A tab's 18 px identity plate: the provider's mark for a session, a globe
 /// for a page, on the same `chip_plate` at the same size the rail row uses.
 ///
@@ -1730,11 +1775,36 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
         .items_center()
         .justify_center()
         .child(match &tab.kind {
+            // **The globe IS eave's favicon** — `PageFact::Favicon` is on
+            // the wire and nothing reports one, so there is no site mark to
+            // dim and this is the equivalent the directive asked for.
+            //
+            // Slice E3: a page eave is not holding draws it receded, and
+            // under a selector that NAMES the state. The ink alone would be
+            // the honest half and an untestable one — this harness asserts
+            // what it can find by `debug_selector`, not what colour it came
+            // out — so the state is in the selector too and the suite can
+            // hold the treatment to account.
             strip::TabKind::Page => icons::tagged_icon(
                 icons::GLOBAL,
                 12.0,
-                theme::text_secondary_on_wash(),
-                format!("tab-chip-{id}"),
+                if tab.resident {
+                    theme::text_secondary_on_wash()
+                } else {
+                    // One rung down the existing ladder rather than a new
+                    // token. `text_tertiary` reads **5.72:1** on
+                    // `chip_plate`, well clear of the 3.0 non-text floor,
+                    // and its "may not be drawn where a state wash can land
+                    // on it" restriction is satisfied here for the reason
+                    // the plate exists at all: the plate is OPAQUE, so the
+                    // row's hover and selection washes never reach the mark.
+                    theme::text_tertiary()
+                },
+                if tab.resident {
+                    format!("tab-chip-{id}")
+                } else {
+                    format!("tab-chip-unloaded-{id}")
+                },
             )
             .into_any_element(),
             strip::TabKind::Session { chip, .. } => {
@@ -6015,7 +6085,7 @@ impl Shell {
                 )
             })
             .collect();
-        let items = strip::items(&snapshot, &chips);
+        let items = strip::items(&snapshot, &chips, &page_resident);
 
         // Scroll the active tab into view on the EDGE of it changing, never
         // every frame. `scroll_to_item` arms an active item that prepaint

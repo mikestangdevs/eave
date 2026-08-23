@@ -219,7 +219,7 @@ pub fn note_activity() {
     ACTIVE_UNTIL.store(now_ms() + BUSY_TAIL_MS, Ordering::Relaxed);
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -314,7 +314,11 @@ pub fn start_pump(cx: &mut gpui::App) {
         loop {
             let ms = if super::tabs::any_browser() {
                 let quiet = now_ms() >= ACTIVE_UNTIL.load(Ordering::Relaxed);
-                if quiet { QUIET_MS } else { BUSY_MS }
+                if quiet {
+                    QUIET_MS
+                } else {
+                    BUSY_MS
+                }
             } else {
                 IDLE_MS
             };
@@ -358,6 +362,16 @@ pub fn start_pump(cx: &mut gpui::App) {
                 // main-queue work like any other and still has to be run.
                 let _ = cx.update(|app| app.quit());
             }
+            // Slice E3's eviction clock, read HERE and not on snapshots:
+            // the pump ticks whether or not anything changed, which is the
+            // property a clock needs. It runs BEFORE `pump_cef` because a
+            // close it asks for is work CEF has to be pumped to finish, and
+            // that pump is on the next line rather than a tick away.
+            //
+            // No borrow is held across it, for the same reason nothing else
+            // here holds one: it closes browsers, and closing a browser
+            // runs `on_before_close` synchronously on this stack.
+            super::evict::tick();
             pump_cef();
             refresh_if_painted(cx);
         }
@@ -757,4 +771,3 @@ const SHUTDOWN_STEP_MS: u64 = 1;
 const SHUTDOWN_QUIET_ROUNDS: u32 = 50;
 /// How long `CefShutdown` gets before the watchdog exits the process anyway.
 const SHUTDOWN_DEADLINE_MS: u64 = 1500;
-

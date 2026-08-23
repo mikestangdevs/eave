@@ -2263,6 +2263,12 @@ mod tests {
             // The ink every OTHER provider's mark takes, and the fallback
             // initials chip with it.
             ("text_secondary_on_wash", text_secondary_on_wash()),
+            // Slice E3: the ink a page tab's globe takes when eave is not
+            // holding that page. It is one rung quieter ON PURPOSE — that is
+            // the whole treatment — so it is the rung most likely to be
+            // pushed under the floor by a later re-solve, and it belongs in
+            // this list rather than in a comment claiming it is fine.
+            ("text_tertiary (unloaded tab)", text_tertiary()),
             ("text", text()),
         ] {
             let c: Rgba = ink.into();
