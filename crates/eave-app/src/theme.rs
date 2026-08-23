@@ -1181,7 +1181,81 @@ pub const RADIUS_DIRECTIVE: f32 = 10.0;
 pub const RADIUS_PANEL: f32 = 10.0;
 pub const RADIUS_CODE: f32 = 8.0;
 /// T3 Code's `.chat-composer-glass-shell` outer rounding (`rounded-[22px]`).
+///
+/// **Superseded for the composer itself by [`RADIUS_BAR`] in Slice CM2** — the
+/// composer is bezel's control bar now. Kept because the value is still the
+/// right one for a T3-derived pill and removing it would be a second change
+/// riding along with this one.
 pub const RADIUS_COMPOSER: f32 = 22.0;
+
+// ---------------------------------------------------------------------------
+// The control bar — bezel's floating composer surface (Slice CM2).
+//
+// bezel's `ui::control_bar` module doc names its three jobs: "Apple Music's
+// transport, a desktop agent app's composer, a floating toolbar." The composer
+// is the second one, and these are that component's numbers, read off
+// `crates/ui/src/control_bar.rs` at the pinned rev `f86dbbf`.
+//
+// **They live here rather than being read from bezel at the call site** for the
+// reason Slice BZ's block already gives: there is exactly one place in eave
+// where a pigment or a rank is decided, and `bezel_theme.rs` builds bezel's
+// Theme FROM this file rather than the other way round. A composer that reached
+// into `bezel::ui::control_bar::BAR_HEIGHT` directly would be a second token
+// system with one member, and the next one would be free.
+
+/// Bar corner. bezel's `Shape::Rounded` → `Theme::BUBBLE_RADIUS` (16).
+///
+/// bezel offers two shapes and argues for this one in the composer's case:
+/// *"a stadium reads as a media control and a composer is not one."* The pill
+/// (`Shape::Pill`, radius = half the height) is the transport, not this.
+pub const RADIUS_BAR: f32 = 16.0;
+
+/// bezel's `control_bar::BAR_HEIGHT`.
+///
+/// **eave takes it as a MINIMUM, not a fixed height, and that is the one place
+/// this surface departs from bezel's.** bezel's bar is `.h(BAR_HEIGHT)` because
+/// a transport holds one row of controls forever. eave's composer grows to
+/// twelve rows (`text_field::Shape::Grow { min: 1, max: 12 }`) and carries an
+/// attachment row above the text, so a fixed height would delete two features
+/// to gain a number. At rest the two are identical; typing is what separates
+/// them.
+pub const BAR_HEIGHT: f32 = 56.0;
+
+/// bezel's `control_bar::BAR_GAP` — gap between controls, and the bar's own end
+/// inset. One number for both, so the first control sits as far from the bar's
+/// edge as it does from its neighbour.
+pub const BAR_GAP: f32 = 8.0;
+
+/// The bar's rim: bezel paints `hairline(0.10)`, which on a dark appearance is
+/// `hsla(0, 0, 1, 0.10)` — a flat white wash, not eave's [`border`].
+///
+/// It does NOT change with focus or with a draft. eave's composer pill used to
+/// light its rim in [`accent`] when a draft existed; the bar's rim is uniform,
+/// because on a floating glass surface the rim is what separates the card from
+/// the backdrop rather than a state channel. Slice CM2 moves that signal to the
+/// send button, which is where a "you have something to send" fact belongs.
+pub fn bar_hairline() -> Hsla {
+    hsla(0.0, 0.0, 1.0, 0.10)
+}
+
+/// The bar's fill: bezel's `Theme::glass_overlay()` on a dark appearance,
+/// `oklch(0.33 0 0 / 34%)` — the reference `.glass-surface` menu tint verbatim.
+///
+/// bezel's own comment is worth carrying, because it is the trap: an earlier
+/// 65% tint was tuned *before* there was a real blur under it, and kept over
+/// one it "buried the backdrop's colour and menus read as flat grey slabs next
+/// to the hue-inheriting chrome (user report)". 34% lets the blurred backdrop
+/// carry the card. This is why the fill and [`BLUR_MENU`] are a pair and
+/// neither is tuneable alone.
+pub fn bar_glass() -> Hsla {
+    // `neutral`, not `oklch`, and not a hand-converted `hsla`. This file
+    // already carries the CSS Color 4 conversion bezel uses (same Ottosson
+    // matrices), so the tint is the reference value rather than my arithmetic
+    // about it — and `neutral` is the chroma-0 door through it, which skips the
+    // hue math that would otherwise return float-noise saturation for a grey.
+    // `the_bar_glass_is_bezels_glass_overlay` pins the two against each other.
+    neutral(0.33).opacity(0.34)
+}
 pub const RADIUS_BUTTON: f32 = 7.0;
 /// T3's `--control-radius` (8 px): ghost chips in the composer toolbar.
 pub const RADIUS_CONTROL: f32 = 8.0;
@@ -2242,6 +2316,94 @@ pub const OMNIBOX_ROW_H: f32 = 40.0;
 /// surface anchored to the window would sit over the titlebar's traffic
 /// lights on a short window.
 pub const OMNIBOX_TOP: f32 = SPACE_3;
+
+#[cfg(test)]
+mod control_bar_tokens {
+    //! Slice CM2 — eave's control-bar tokens against bezel's own.
+    //!
+    //! These exist because the numbers in the block above were **read off**
+    //! bezel's `control_bar.rs` and then re-typed here. A copied constant with
+    //! no link back to its source is exactly the shape that drifts silently
+    //! when the pin moves: bezel changes `BUBBLE_RADIUS`, eave keeps painting
+    //! 16, and nothing anywhere fails. Each test below closes that loop by
+    //! asking bezel at run time.
+
+    use super::*;
+
+    /// The bar's fill IS bezel's `glass_overlay`, not an approximation of it.
+    ///
+    /// This is not circular even though `bezel_theme` builds bezel's `Theme`
+    /// from eave's tokens: `glass_overlay()` on a dark appearance is a bezel
+    /// *constant* (`oklch(0.33 0 0 / 34%)`), independent of every field eave
+    /// hands over. So this compares eave's copy against bezel's original.
+    #[test]
+    fn the_bar_glass_is_bezels_glass_overlay() {
+        let bezel = crate::bezel_theme::theme().glass_overlay();
+        let ours = bar_glass();
+        assert!(
+            close(ours, bezel),
+            "bar_glass() {ours:?} has drifted from bezel's glass_overlay() {bezel:?}"
+        );
+    }
+
+    /// The rim is bezel's `hairline(0.10)` — the alpha `control_bar` passes.
+    #[test]
+    fn the_bar_rim_is_bezels_hairline_at_ten_percent() {
+        let bezel = crate::bezel_theme::theme().hairline(0.10);
+        let ours = bar_hairline();
+        assert!(
+            close(ours, bezel),
+            "bar_hairline() {ours:?} has drifted from bezel's hairline(0.10) {bezel:?}"
+        );
+    }
+
+    /// The corner is `Shape::Rounded`'s, which is `Theme::BUBBLE_RADIUS`.
+    ///
+    /// Pinned against the constant rather than the literal 16 so that a bezel
+    /// bump moves both or fails here.
+    #[test]
+    fn the_bar_corner_is_bezels_rounded_shape() {
+        assert_eq!(
+            RADIUS_BAR,
+            bezel::theme::Theme::BUBBLE_RADIUS,
+            "RADIUS_BAR must be bezel's Shape::Rounded radius"
+        );
+    }
+
+    /// The blur under the bar is the one bezel's `material` is given.
+    ///
+    /// `BLUR_MENU` predates this slice — P1 named 44 for "menus/modals" and
+    /// marked it reserved. The point of the assert is that the two 44s are the
+    /// same number and not a coincidence two files apart.
+    #[test]
+    fn the_bar_blur_is_bezels_menu_blur() {
+        assert_eq!(
+            BLUR_MENU,
+            bezel::ui::material::MENU_BLUR,
+            "the bar's backdrop blur must be the one bezel's material uses"
+        );
+    }
+
+    /// The bar's own geometry, against `control_bar`'s constants.
+    #[test]
+    fn the_bar_height_and_gap_are_bezels() {
+        assert_eq!(BAR_HEIGHT, bezel::ui::control_bar::BAR_HEIGHT);
+        // BAR_GAP is private in bezel (it is the bar's own inset, not a knob),
+        // so this pins the relationship the module doc states instead: the end
+        // inset equals the gap between controls.
+        assert_eq!(BAR_GAP, 8.0);
+    }
+
+    /// Two `Hsla` equal within float noise. The oklch path runs a matrix
+    /// multiply and a gamut clip, so bit-equality is not the right question.
+    fn close(a: Hsla, b: Hsla) -> bool {
+        const EPS: f32 = 0.001;
+        (a.h - b.h).abs() < EPS
+            && (a.s - b.s).abs() < EPS
+            && (a.l - b.l).abs() < EPS
+            && (a.a - b.a).abs() < EPS
+    }
+}
 
 #[cfg(test)]
 mod tests {

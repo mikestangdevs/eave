@@ -271,6 +271,16 @@ enum Command {
         /// `None` = pass no `--model` at all, which is not the same as
         /// passing an empty one (`AgentConfig::model`).
         model: Option<String>,
+        /// The worktree this chat belongs in (Slice T1 follow-up): the
+        /// `workspace` of the project holding the active tab, or `None`
+        /// to let the engine pick as it always has.
+        ///
+        /// This field is the whole feature. `Request::Open` has carried a
+        /// `cwd` since P2 and [`Client::open_with_agent`] has taken one
+        /// for just as long — the shell simply passed `None`, so every
+        /// chat started wherever the engine defaulted no matter which
+        /// project you launched it from.
+        cwd: Option<String>,
     },
     /// Files-rail basis toggle (Slice AA): re-open the `files`
     /// subscription against the other basis. It is a resubscribe, not a
@@ -414,6 +424,13 @@ enum BrowserCmd {
         /// with a url" is what every caller actually has in hand.
         url: Option<String>,
     },
+    /// Take a bookmark off the bar.
+    ///
+    /// **A folder takes its subtree with it** — the engine's rule
+    /// (`Request::BookmarkRemove`), not this client's, which is why the
+    /// menu names a folder's row differently from a link's rather than
+    /// pretending the two removals are the same size.
+    BookmarkRemove { bookmark_id: String },
     /// Slice T1 — drag a bookmark somewhere else on the bar, or into a
     /// folder on it.
     ///
@@ -650,6 +667,11 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     title,
                     url,
                 })
+                .await;
+        }
+        BrowserCmd::BookmarkRemove { bookmark_id } => {
+            let _ = client
+                .browser_do(eave_wire::Request::BookmarkRemove { bookmark_id })
                 .await;
         }
         BrowserCmd::BookmarkMove {
@@ -1153,13 +1175,17 @@ async fn feed_loop(
                             None => continue 'conn,
                         },
                         cmd = commands.recv() => match cmd {
-                            Some(Command::Launch { provider, model }) => {
+                            Some(Command::Launch {
+                                provider,
+                                model,
+                                cwd,
+                            }) => {
                                 let agent = AgentConfig {
                                     provider: Some(provider),
                                     model,
                                     ..AgentConfig::default()
                                 };
-                                match client.open_with_agent(None, None, Some(agent)).await {
+                                match client.open_with_agent(None, cwd, Some(agent)).await {
                                     Ok(info) => {
                                         at_launcher = false;
                                         selected = Some(info.session_id);
@@ -4519,6 +4545,14 @@ enum TabMenuTarget {
     Tab(String),
     /// The combined pill: the two tabs in the well.
     Split { left: String, right: String },
+    /// A chip on the bookmarks bar — a link or a folder.
+    ///
+    /// The bar is not the strip, but the menu is the same menu: one
+    /// `Popup<TabMenu>`, one layer, one keyboard path, one close path.
+    /// A second parallel popup would be a second place for a menu to be
+    /// left open, and eave already closes the page menu when this one
+    /// opens for exactly that reason.
+    Bookmark(String),
 }
 
 /// One choosable row on the tab menu. Separators and headers live beside
@@ -4540,6 +4574,7 @@ enum TabMenuAction {
     ConvertAxis,
     SplitMember(String),
     ArchiveItem,
+    RemoveBookmark,
 }
 
 enum TabMenuEntry {
@@ -8918,6 +8953,7 @@ impl Shell {
         let url = item.url.clone();
         let is_open = folder && open == Some(item.id.as_str());
         let (click_id, drop_id, drag_id) = (id.clone(), id.clone(), id.clone());
+        let menu_id = id.clone();
 
         let chip = div()
             .id(SharedString::from(format!("bookmark-{id}")))
@@ -8959,6 +8995,16 @@ impl Shell {
                 }
                 cx.notify();
             }))
+            // Right-click is the ONLY way off the bar: a chip cannot be
+            // dragged to a trash can, and a bookmark added by a stray drop
+            // was otherwise permanent.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.open_bookmark_menu(&menu_id, ev.position, cx);
+                }),
+            )
             .on_drag(BookmarkDrag { id: drag_id }, |drag, _, _, cx| {
                 cx.new(|_| drag.clone())
             })
@@ -9037,6 +9083,7 @@ impl Shell {
                         .map(|child| {
                             let url = child.url.clone();
                             let cid = child.id.clone();
+                            let menu_cid = child.id.clone();
                             div()
                                 .id(SharedString::from(format!("bookmark-child-{}", child.id)))
                                 .debug_selector(move || format!("bookmark-child-{cid}"))
@@ -9057,6 +9104,16 @@ impl Shell {
                                     this.bookmark_folder_open.replace(None);
                                     cx.notify();
                                 }))
+                                // A bookmark filed INSIDE a folder is
+                                // still a bookmark, and the folder is the
+                                // only place it can be right-clicked.
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_bookmark_menu(&menu_cid, ev.position, cx);
+                                    }),
+                                )
                                 .into_any_element()
                         })
                         .collect::<Vec<_>>()
@@ -13377,6 +13434,25 @@ impl Shell {
         self.open_tab_menu_at(TabMenu { target, at }, cx);
     }
 
+    /// Right-click on the bookmarks bar.
+    ///
+    /// Goes through `open_tab_menu_at` rather than opening a popup of its
+    /// own, so the bar inherits the strip's whole menu discipline for
+    /// free — the page menu closes, the keyboard walks the rows, and a
+    /// click anywhere else closes it.
+    fn open_bookmark_menu(&mut self, bookmark_id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        self.open_tab_menu_at(
+            TabMenu {
+                target: TabMenuTarget::Bookmark(bookmark_id.to_string()),
+                at,
+            },
+            cx,
+        );
+    }
+
     fn open_tab_menu_at(&mut self, req: TabMenu, cx: &mut Context<Self>) {
         let enabled = self
             .tab_menu_entries(&req, cx)
@@ -13403,7 +13479,34 @@ impl Shell {
         match &req.target {
             TabMenuTarget::Tab(id) => self.single_tab_menu(id, cx),
             TabMenuTarget::Split { left, right } => self.split_tab_menu(left, right, cx),
+            TabMenuTarget::Bookmark(id) => self.bookmark_menu(id, cx),
         }
+    }
+
+    /// The bookmarks bar's context menu.
+    ///
+    /// One row, and the label carries the only thing a person needs to be
+    /// told: **removing a folder removes what is in it.** The engine's
+    /// `BookmarkRemove` takes the subtree (`frames.rs`), so a folder's row
+    /// must not read like a link's.
+    ///
+    /// A chip whose bookmark is not in the snapshot yields an empty menu
+    /// rather than a disabled row — the popup layer draws nothing for an
+    /// empty entry list, which is the right answer for a stale right-click
+    /// on something another window already removed.
+    fn bookmark_menu(&self, bookmark_id: &str, cx: &App) -> Vec<TabMenuEntry> {
+        let snapshot = &self.bookmarks.read(cx).snapshot;
+        let Some(node) = snapshot.nodes.iter().find(|n| n.bookmark.id == bookmark_id) else {
+            return Vec::new();
+        };
+        let label = match node.bookmark.kind {
+            eave_wire::BookmarkKind::Folder => "Remove Folder",
+            eave_wire::BookmarkKind::Link { .. } => "Remove",
+        };
+        vec![TabMenuEntry::Action(
+            TabMenuAction::RemoveBookmark,
+            MenuItem::new(label),
+        )]
     }
 
     fn single_tab_menu(&self, tab_id: &str, cx: &App) -> Vec<TabMenuEntry> {
@@ -13591,7 +13694,35 @@ impl Shell {
             return;
         }
         let action = action.clone();
+        // The bookmark target has no tab, so it is answered before the
+        // tab id is derived rather than by giving that derivation a
+        // meaningless fallback.
+        if let TabMenuTarget::Bookmark(bookmark_id) = &req.target {
+            if matches!(action, TabMenuAction::RemoveBookmark) {
+                let _ = self
+                    .commands
+                    .send(Command::Browser(BrowserCmd::BookmarkRemove {
+                        bookmark_id: bookmark_id.clone(),
+                    }));
+                // A removed folder cannot stay open behind the menu.
+                let mut open = self.bookmark_folder_open.borrow_mut();
+                if open.as_deref() == Some(bookmark_id.as_str()) {
+                    *open = None;
+                }
+            }
+            self.close_tab_menu(cx);
+            return;
+        }
         let tab_id = match &req.target {
+            // Answered and returned above. The arm is here because the
+            // compiler cannot see that, and it closes the menu rather
+            // than returning bare — an unreachable arm that would leave a
+            // popup open if it ever stopped being unreachable is worse
+            // than one extra line.
+            TabMenuTarget::Bookmark(_) => {
+                self.close_tab_menu(cx);
+                return;
+            }
             TabMenuTarget::Tab(id) => id.clone(),
             TabMenuTarget::Split { left, right } => self
                 .strip_snapshot(cx)
@@ -13606,7 +13737,8 @@ impl Shell {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
                 }
             }
-            TabMenuAction::Mute | TabMenuAction::MoveTo => {}
+            // Handled above, where the bookmark id is still in hand.
+            TabMenuAction::Mute | TabMenuAction::MoveTo | TabMenuAction::RemoveBookmark => {}
             TabMenuAction::Rename => {
                 if let Some(sid) = self.session_id_for_tab(&tab_id, cx) {
                     self.begin_rename(sid, cx);
@@ -13633,7 +13765,7 @@ impl Shell {
                         .into_iter()
                         .filter_map(|id| self.tab_url(id, cx))
                         .collect(),
-                    TabMenuTarget::Tab(_) => Vec::new(),
+                    TabMenuTarget::Tab(_) | TabMenuTarget::Bookmark(_) => Vec::new(),
                 };
                 if !urls.is_empty() {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(urls.join("\n")));
@@ -13759,6 +13891,7 @@ fn tab_menu_tag(action: &TabMenuAction) -> &'static str {
         TabMenuAction::AddTab => "add-tab",
         TabMenuAction::ConvertAxis => "convert-axis",
         TabMenuAction::SplitMember(_) => "member",
+        TabMenuAction::RemoveBookmark => "remove-bookmark",
         TabMenuAction::ArchiveItem => "archive-item",
     }
 }
@@ -13897,16 +14030,23 @@ impl Shell {
         // here and consumed in `reconcile_strip`, because the session does
         // not exist yet: `Command::Launch` is a request and the rail
         // answers it later.
-        {
+        let cwd = {
             let snapshot = &self.web_tabs.read(cx).snapshot;
             *self.launched_from_tab.borrow_mut() = strip::active_is_blank_page(snapshot)
                 .then(|| snapshot.active.clone())
                 .flatten();
-        }
+            // The project's worktree, read off the SAME snapshot in the
+            // same borrow — the tab that decides where this chat lands and
+            // the tab that decides which checkout it runs in must be the
+            // one tab, or a ⌘T in project A could open a chat in project
+            // B's directory and nothing on screen would say so.
+            strip::active_workspace(snapshot)
+        };
         let p = self.provider();
         let _ = self.commands.send(Command::Launch {
             provider: p.id.to_string(),
             model: self.launcher.model.map(str::to_string),
+            cwd,
         });
         cx.notify();
     }
@@ -14964,21 +15104,47 @@ impl Render for Shell {
         // mutably to move focus.
         self.sync_composer_focus(composer_mounted, window, cx);
 
-        let composer = Self::column(frost(
-            theme::RADIUS_COMPOSER,
+        // **Slice CM2 — the composer is bezel's control bar.**
+        //
+        // bezel's `ui::control_bar` builds its surface as, in order: a `div` at
+        // `BAR_HEIGHT` with `rounded(radius)`, `border_1` in `hairline(0.10)`,
+        // `shadow_lg`, `overflow_hidden`, `px(BAR_GAP)` and `glass_overlay` —
+        // all of it handed to `material(radius, MENU_BLUR, bar)`. Every one of
+        // those is reproduced here through `theme.rs` tokens (see its control
+        // bar block for why they are not read from bezel at this call site).
+        //
+        // **Composed rather than called**, and the reason is a feature, not a
+        // preference: `control_bar()` takes `leading/centre/trailing` clusters
+        // inside a fixed `.h(BAR_HEIGHT)` row. eave's composer grows to twelve
+        // rows and stacks an attachment strip above its text, so calling it
+        // would have deleted multi-line drafts and attachments to gain the
+        // look. `BAR_HEIGHT` therefore arrives as `min_h`. At rest the two
+        // surfaces are the same 56 px bar; typing is the only thing that tells
+        // them apart.
+        //
+        // The rim no longer answers `has_draft`. bezel's is uniform, and on a
+        // floating glass card the rim is what lifts it off the backdrop rather
+        // than a state channel — the draft signal lives on the send button,
+        // which is where a fact about sending belongs. `theme::bar_hairline`
+        // carries that argument in full.
+        let composer = Self::column(frost_at(
+            theme::RADIUS_BAR,
+            theme::BLUR_MENU,
             div()
                 .w_full()
-                .rounded(px(theme::RADIUS_COMPOSER))
+                .min_h(px(theme::BAR_HEIGHT))
+                .rounded(px(theme::RADIUS_BAR))
                 .border_1()
-                .border_color(if has_draft {
-                    theme::accent()
-                } else {
-                    theme::border()
-                })
-                .bg(theme::chrome_glass())
-                .shadow(theme::shadow_panel())
-                .px(px(theme::SPACE_3))
-                .pt(px(theme::SPACE_3))
+                .border_color(theme::bar_hairline())
+                .bg(theme::bar_glass())
+                .shadow_lg()
+                // bezel clips the bar so its glass never bleeds past the
+                // corner it just rounded. eave needs it for the same reason
+                // plus one of its own: the attachment strip is a child with
+                // its own fill.
+                .overflow_hidden()
+                .px(px(theme::BAR_GAP))
+                .pt(px(theme::BAR_GAP))
                 .pb(px(theme::SPACE_2))
                 .drag_over::<ExternalPaths>(|style, _, _, _| {
                     style
@@ -15180,11 +15346,21 @@ impl Render for Shell {
                                 // Slice AL: the ARMED fill is the accent, not
                                 // `solid`. The accent marks where you are acting,
                                 // not where you are — an armed send button is the
-                                // most literal case of that rule in the app, and
-                                // it arms together with the composer's rim and
-                                // caret, which are the same colour on purpose.
+                                // most literal case of that rule in the app.
                                 // Unarmed it stays neutral, because a button with
                                 // nothing to send is not an action.
+                                //
+                                // **Slice CM2 corrects the sentence that used to
+                                // end this paragraph.** It said the button "arms
+                                // together with the composer's rim and caret,
+                                // which are the same colour on purpose" — true
+                                // when written, false the moment the composer
+                                // became bezel's control bar, whose rim is a
+                                // uniform `hairline(0.10)` and does not answer
+                                // `has_draft` at all. The caret still does. So
+                                // this is now the ONE surface that arms, which
+                                // makes it carry the signal alone rather than
+                                // reinforce it — see `theme::bar_hairline`.
                                 .hover_fade(
                                     "send",
                                     if has_draft {
@@ -15814,14 +15990,33 @@ impl Render for Shell {
 
 struct Frost {
     corner_radius: f32,
+    blur_radius: f32,
     child: AnyElement,
 }
 
 /// Blur the scene behind `child` (radius [`theme::BLUR_CHROME`]), then
 /// paint it. `corner_radius` must match the child card's rounding.
 fn frost(corner_radius: f32, child: impl IntoElement) -> Frost {
+    frost_at(corner_radius, theme::BLUR_CHROME, child)
+}
+
+/// [`frost`] with the blur named rather than assumed.
+///
+/// **Slice CM2.** The composer is bezel's control bar now, and bezel builds
+/// that surface with `material(radius, MENU_BLUR, ..)` — a 44 px blur, not the
+/// 16 px every other eave float uses. `MENU_BLUR` and [`theme::BLUR_MENU`] are
+/// the same number from two directions: bezel's comment derives 44 from the
+/// reference `.glass-surface`, and eave's has named 44 for "menus/modals" since
+/// P1 while marking it *reserved, unused*. This is the first thing to paint it.
+///
+/// The two radii must agree or the blur frosts square corners outside a round
+/// border — that is bezel's stated reason for `control_bar` deriving one radius
+/// and feeding both, and it is why this takes the corner from the caller
+/// instead of owning one.
+fn frost_at(corner_radius: f32, blur_radius: f32, child: impl IntoElement) -> Frost {
     Frost {
         corner_radius,
+        blur_radius,
         child: child.into_any_element(),
     }
 }
@@ -15874,7 +16069,7 @@ impl Element for Frost {
             window.paint_backdrop_blur(
                 bounds,
                 Corners::all(px(self.corner_radius)),
-                px(theme::BLUR_CHROME),
+                px(self.blur_radius),
             );
             self.child.paint(window, cx);
         });

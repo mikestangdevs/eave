@@ -570,6 +570,28 @@ pub fn tab_slot(snapshot: &TabsSnapshot, tab_id: &str) -> Option<(Option<String>
         .map(|ix| (None, ix))
 }
 
+/// The checkout root the active tab's project is bound to.
+///
+/// Slice T1 gave a group a `workspace`; this is the read that finally
+/// spends it. A chat launched while a project's tab is active belongs in
+/// that project's worktree, so `Command::Launch` carries this as its
+/// `cwd` and the engine starts the CLI there.
+///
+/// `None` for a loose tab, for a group with no workspace, and for no
+/// active tab at all — all three mean the same thing to the caller
+/// (**let the engine pick**), which is exactly what eave did before this
+/// existed.
+pub fn active_workspace(snapshot: &TabsSnapshot) -> Option<String> {
+    let active = snapshot.active.as_deref()?;
+    let (group, _) = tab_slot(snapshot, active)?;
+    let group = group?;
+    snapshot
+        .groups
+        .iter()
+        .find(|g| g.id == group)
+        .and_then(|g| g.workspace.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
