@@ -159,6 +159,10 @@ gpui_platform = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc147
 # ambiguity about which theme a line means. It builds against OUR gpui via
 # the `[patch]` in the workspace root — see that comment for why.
 bezel = { git = "https://github.com/crabtalk/bezel", rev = "f86dbbfc84569cc69f3cba6ebb3d99d858dcb259", default-features = false }
+# Slice CM. The one dependency `text_field.rs` carries out of bezel — already
+# in the tree three times over (gpui, cosmic-text and bezel itself all pull it),
+# so this resolves to the same 1.13.3 and adds nothing to the build.
+unicode-segmentation = "1.13"
 
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 futures = "0.3"
