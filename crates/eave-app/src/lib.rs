@@ -81,6 +81,9 @@ pub mod theme;
 // Slice BZ: bezel's tokens, built from ours. The only place in the tree
 // allowed to write a bezel token — see the module doc for why that matters.
 pub mod bezel_theme;
+/// bezel's `TextField`, vendored — the editing engine eave never had. See the
+/// module doc for the provenance and the enumerated delta.
+pub mod text_field;
 
 pub mod ui;
 
