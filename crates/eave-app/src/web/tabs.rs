@@ -1597,6 +1597,18 @@ wrap_client! {
         fn find_handler(&self) -> Option<FindHandler> {
             Some(super::find::PageFindHandler::new(self.tab_id.clone()))
         }
+
+        /// Present only so that eave is TOLD about audio (Slice E3). It
+        /// declines every capture it is offered — see `PageAudioHandler`.
+        ///
+        /// Slice R1: this arm was left inside a TEST FUNCTION by the E3
+        /// merge and compiled nowhere, which is why `note_audio_started`
+        /// read as dead code. `cargo check` does not build `#[cfg(test)]`
+        /// under a feature flag; `--all-targets` does, and that is the only
+        /// reason it was caught.
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            Some(PageAudioHandler::new(self.tab_id.clone()))
+        }
     }
 }
 
@@ -1770,10 +1782,5 @@ mod tests {
             cursor_style(CursorType::NORTHEASTPANNING),
             gpui::CursorStyle::Arrow
         );
-        /// Present only so that eave is TOLD about audio (Slice E3). It
-        /// declines every capture it is offered — see `PageAudioHandler`.
-        fn audio_handler(&self) -> Option<AudioHandler> {
-            Some(PageAudioHandler::new(self.tab_id.clone()))
-        }
     }
 }

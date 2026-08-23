@@ -705,7 +705,7 @@ mod tests {
         show_popup("p3", rect());
         assert!(popup_shown("p3"));
         assert!(
-            popup(&"p3".to_string()).is_none(),
+            popup("p3").is_none(),
             "a rect with no pixels is not something to paint"
         );
     }

@@ -74,9 +74,9 @@
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
-mod find;
-#[cfg(feature = "web")]
 mod evict;
+#[cfg(feature = "web")]
+mod find;
 #[cfg(feature = "web")]
 mod host;
 #[cfg(feature = "web")]

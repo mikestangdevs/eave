@@ -31,8 +31,7 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
     Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
     TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance,
-    WindowBounds,
-    WindowControlArea, WindowHandle, WindowOptions,
+    WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
 };
 use gpui_platform::application;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -5392,7 +5391,7 @@ impl Shell {
                     .id(gpui::SharedString::from(tag.to_string()))
                     .debug_selector({
                         let tag = tag.to_string();
-                        move || tag.clone().into()
+                        move || tag.clone()
                     })
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_2))
