@@ -82,6 +82,14 @@ pub mod policy;
 /// The gated caller is a handful of lines in `dialogs.rs`.
 pub mod permissions;
 
+/// `com.apple.quarantine` on a finished download (G4).
+///
+/// **Ungated**, and it is the one module here that is ungated for a
+/// stronger reason than testability: nothing in it is Chromium's. It is
+/// two `libc` calls and a string format, so the suite can assert against a
+/// real file on a real disk rather than against a mock of the platform.
+pub mod quarantine;
+
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]

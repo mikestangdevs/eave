@@ -826,12 +826,6 @@ wrap_life_span_handler! {
             if trace() {
                 eprintln!("[web] on_before_popup {target_disposition:?} url={url:?}");
             }
-            // A download wearing a popup's clothes. Cancel the window; the
-            // download handler is what should see this, and turning it into
-            // a tab would open a page that closes itself.
-            if target_disposition == WindowOpenDisposition::SAVE_TO_DISK {
-                return 1;
-            }
             if url.is_empty() {
                 // `window.open()` with no url — a page about to write into
                 // the new window through the returned handle. eave has
@@ -840,7 +834,11 @@ wrap_life_span_handler! {
                 // content would be worse.
                 return 1;
             }
-            let activate = target_disposition != WindowOpenDisposition::NEW_BACKGROUND_TAB;
+            let Some(activate) = tab_disposition(target_disposition) else {
+                // Not a tab. Cancel the WINDOW — there is nowhere to put
+                // one — and leave whatever else is coming to see it.
+                return 1;
+            };
             request(PageRequest::OpenTab {
                 url,
                 opener: self.tab_id.clone(),
@@ -1173,6 +1171,24 @@ wrap_download_handler! {
                 done: item.is_complete() == 1,
                 cancelled: item.is_canceled() == 1,
             };
+            // G4: Gatekeeper reacts to one extended attribute and nothing
+            // else, and without it eave hands over an unsigned binary with
+            // LESS friction than every other browser on the machine.
+            //
+            // **As soon as the file exists, not when it finishes.** Marking
+            // at completion leaves a window in which a fully-written
+            // executable sits in ~/Downloads unquarantined; Chromium marks
+            // the partial file for exactly this reason. `mark` is
+            // XATTR_CREATE, so it returns true once per path and can never
+            // overwrite or clear a quarantine — calling it on every update
+            // is one refused syscall, which is nothing beside the bytes
+            // being written.
+            if !next.path.is_empty()
+                && super::quarantine::mark(std::path::Path::new(&next.path))
+                && trace()
+            {
+                eprintln!("[web] download id={id} quarantined at {}", next.path);
+            }
             let changed = DOWNLOADS.with(|d| {
                 let mut map = d.borrow_mut();
                 match map.get(&id) {
@@ -1200,12 +1216,97 @@ wrap_download_handler! {
     }
 }
 
+/// What a [`WindowOpenDisposition`] means for a browser whose windows are
+/// tabs.
+///
+/// `Some(activate)` = open a page tab, focused or not. `None` = **not ours**
+/// — leave it to whatever else is going to see it.
+///
+/// One function, two callers: `on_before_popup` (a `target="_blank"`, a
+/// `window.open`) and `on_open_urlfrom_tab` (a middle-click, a ⌘-click).
+/// Chromium routes those down different paths and hands eave the same
+/// vocabulary at the end of each, so the risk worth removing is the two
+/// sites disagreeing about what `NEW_BACKGROUND_TAB` means.
+fn tab_disposition(disposition: WindowOpenDisposition) -> Option<bool> {
+    match disposition {
+        // ⌘-click, middle-click, `target="_blank" rel=noopener` from a
+        // background context. **Not activated** — that is the whole point
+        // of the gesture: keep this, I am still reading.
+        WindowOpenDisposition::NEW_BACKGROUND_TAB => Some(false),
+        WindowOpenDisposition::NEW_FOREGROUND_TAB => Some(true),
+        // eave is one window and a page is a tab in it (the C3 ruling), so
+        // "new window" and "new popup" are tabs too. A page cannot make
+        // eave grow a second window by asking.
+        WindowOpenDisposition::NEW_WINDOW | WindowOpenDisposition::NEW_POPUP => Some(true),
+        // A download wearing a navigation's clothes. Not a tab — the
+        // download handler is what should see it, and turning it into a
+        // tab would open a page that closes itself.
+        WindowOpenDisposition::SAVE_TO_DISK => None,
+        // "Open in incognito." eave has no private context, and opening an
+        // ordinary tab here would answer a request for privacy with a
+        // silent no. Declining leaves the link where it was.
+        WindowOpenDisposition::OFF_THE_RECORD => None,
+        // An ordinary navigation, or Chromium telling us to do nothing.
+        _ => None,
+    }
+}
+
 wrap_request_handler! {
     struct PageRequestHandler {
         tab_id: String,
     }
 
     impl RequestHandler {
+        /// A link the operator asked to open *somewhere else* (G3).
+        ///
+        /// **This is where a middle-click lands**, and until it was filled
+        /// a middle-click on a page did nothing at all. CEF's own words for
+        /// this callback name the case: navigation "that might open in a
+        /// special way (e.g. links clicked via middle-click or
+        /// ctrl + left-click)". It is a different path from
+        /// `on_before_popup` — that one is `window.open` and
+        /// `target="_blank"` — and an embedder that fills only the popup
+        /// half gets a browser where `target="_blank"` works and the
+        /// muscle-memory gesture silently does not.
+        ///
+        /// Returning 1 means **eave handled it**, which cancels the
+        /// navigation CEF was about to attempt. That is right: eave has no
+        /// second window to open one in, and the tab it does open is asked
+        /// for through the sink rather than issued here — the borrow rule
+        /// in the module docs.
+        ///
+        /// Returning 0 hands it back, which is what a disposition eave has
+        /// no tab for wants: a download, or a request for a private context
+        /// eave does not have.
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let url = target_url.map(|u| u.to_string()).unwrap_or_default();
+            if trace() {
+                eprintln!(
+                    "[web] on_open_urlfrom_tab {target_disposition:?} gesture={user_gesture} \
+                     url={url:?}"
+                );
+            }
+            if url.is_empty() {
+                return 0;
+            }
+            let Some(activate) = tab_disposition(target_disposition) else {
+                return 0;
+            };
+            request(PageRequest::OpenTab {
+                url,
+                opener: self.tab_id.clone(),
+                activate,
+            });
+            1
+        }
+
         /// Decide what a navigation is allowed to do, before it starts.
         ///
         /// **This method was empty, and an empty `on_before_browse` is not

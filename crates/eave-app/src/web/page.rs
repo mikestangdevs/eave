@@ -73,6 +73,7 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
     let (down_id, up_id, move_id, wheel_id, key_id) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let (right_down_id, right_up_id) = (id.clone(), id.clone());
+    let (mid_down_id, mid_up_id) = (id.clone(), id.clone());
     let down_focus = focus.clone();
     let right_focus = focus.clone();
 
@@ -182,6 +183,52 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                         to_page(&right_up_id, ev.position),
                         &ev.modifiers,
                         MouseButtonType::RIGHT,
+                        true,
+                        ev.click_count as i32,
+                    );
+                });
+                super::host::note_activity();
+                super::host::request_pump();
+            })
+            // ── THE MIDDLE BUTTON (G3) ───────────────────────────────
+            //
+            // Open-link-in-new-tab is muscle memory, and until this it did
+            // nothing on a page — for the same two-absences-one-symptom
+            // reason the right button had: `page_element` forwarded LEFT
+            // and RIGHT and nothing else, AND no `on_open_urlfrom_tab` was
+            // supplied (`tabs.rs`). Either gap alone gives a middle-click
+            // that silently does nothing, so fixing one and testing would
+            // have read as "still broken".
+            //
+            // **No focus grab.** Middle-clicking a link is not a claim on
+            // the keyboard — the operator has said "keep this, I am still
+            // reading here", and stealing focus to the page they are
+            // deliberately not moving to would be the wrong half of the
+            // gesture. The right and left buttons focus; this one does not.
+            .on_mouse_down(gpui::MouseButton::Middle, move |ev, _window, _cx| {
+                super::tabs::with_browser(&mid_down_id, |b| {
+                    input::mouse_button(
+                        b,
+                        to_page(&mid_down_id, ev.position),
+                        &ev.modifiers,
+                        MouseButtonType::MIDDLE,
+                        false,
+                        ev.click_count as i32,
+                    );
+                });
+                super::host::note_activity();
+                super::host::request_pump();
+            })
+            // Both edges, for the reason the right button states: Blink
+            // raises `auxclick` on the UP edge, so omitting it would send a
+            // press that never ends and no click at all.
+            .on_mouse_up(gpui::MouseButton::Middle, move |ev, _window, _cx| {
+                super::tabs::with_browser(&mid_up_id, |b| {
+                    input::mouse_button(
+                        b,
+                        to_page(&mid_up_id, ev.position),
+                        &ev.modifiers,
+                        MouseButtonType::MIDDLE,
                         true,
                         ev.click_count as i32,
                     );
