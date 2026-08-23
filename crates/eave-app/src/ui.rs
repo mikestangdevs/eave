@@ -13401,7 +13401,12 @@ pub fn run(data_dir: PathBuf) -> ! {
     // an `Application`-level concern and gpui exposes no `App` setter — which
     // is why the harness renders every glyph as empty coverage (icons.rs).
     application()
-        .with_assets(icons::Icons)
+        // Slice BZ: both icon sets through one source — gpui takes only one,
+        // and a bezel component whose glyph does not resolve draws an empty
+        // square rather than failing. eave's set wins a shared name. Kept
+        // after the tool-row revert because it is the seam any later adoption
+        // needs, and rebuilding it is the expensive half of trying again.
+        .with_assets(crate::bezel_theme::Assets)
         .run(move |cx: &mut App| {
             let queues = Arc::new(Queues::default());
             let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);

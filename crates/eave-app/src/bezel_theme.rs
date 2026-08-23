@@ -44,6 +44,61 @@ pub fn install(cx: &mut App) {
     Theme::install_custom(from_eave_tokens(), cx);
 }
 
+/// The asset source, once, for both icon sets.
+///
+/// gpui takes exactly ONE [`AssetSource`] per `Application`, and both eave and
+/// bezel ship their own — each serving paths shaped `icons/<name>.svg`. A
+/// bezel component that draws an icon calls `svg().path(..)`, which resolves
+/// through whichever source the application registered, so registering eave's
+/// alone means every bezel glyph silently renders as empty coverage. Not an
+/// error, not a panic: a blank square where a chevron should be.
+///
+/// **eave's set wins a collision, deliberately.** The two sets overlap by
+/// name (`check`, `close`, `plus` are in both) and eave's glyphs are the ones
+/// the rest of the app paints; letting bezel's answer for a shared name would
+/// mean the same idea drawn two ways on one screen depending on which
+/// component asked. So eave is tried first and bezel is the fallback, which
+/// also means adopting a bezel component never silently restyles an eave one.
+pub struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match crate::icons::Icons.load(path)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => bezel::ui::icons::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        let mut out = crate::icons::Icons.list(path)?;
+        for p in bezel::ui::icons::Assets.list(path)? {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// bezel's theme where there is no `App` to read the global from.
+///
+/// bezel's components are catalog traits on `&Theme`, and the intended way to
+/// reach one is `Theme::of(cx)`. eave's transcript rows are rendered by
+/// `render_row`, which takes no context at all — it is a pure function of the
+/// row and the animation phase, which is exactly why the display list can be
+/// folded and measured without a window.
+///
+/// Threading an `App` down to it to fetch a constant would trade that property
+/// away for nothing, because eave's theme IS constant: there is one appearance
+/// and no runtime switch. So this hands back the same value the global holds,
+/// built once. `the_global_and_the_context_free_theme_are_the_same` is what
+/// keeps that sentence true — if eave ever grows a second appearance, that
+/// test fails and this function is the thing that has to change.
+pub fn theme() -> &'static Theme {
+    static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    THEME.get_or_init(from_eave_tokens)
+}
+
 /// eave's tokens, in the shape bezel reads them.
 ///
 /// **Every field on the right-hand side is a call into [`crate::theme`].**
@@ -350,6 +405,21 @@ mod tests {
              caveat in the report is stale",
             divergence(0.38)
         );
+    }
+
+    /// The context-free theme and the installed global must not drift.
+    ///
+    /// They are the same constructor today. The day eave grows a light
+    /// appearance they stop being the same value, and this is the test that
+    /// says so before a screen does.
+    #[test]
+    fn the_global_and_the_context_free_theme_are_the_same() {
+        let built = super::from_eave_tokens();
+        let cached = super::theme();
+        assert_eq!(built.text, cached.text);
+        assert_eq!(built.bg, cached.bg);
+        assert_eq!(built.appearance, cached.appearance);
+        assert_eq!(built.font_mono, cached.font_mono);
     }
 
     #[test]
