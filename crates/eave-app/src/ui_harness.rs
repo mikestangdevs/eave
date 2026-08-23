@@ -10004,7 +10004,10 @@ fn cmd_shift_t_reopens_a_closed_page_tab_and_not_a_session_tab(cx: &mut TestAppC
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt { url }) if url == "https://closed.test/"
+            Command::Browser(BrowserCmd::OpenAt {
+                url,
+                activate: true
+            }) if url == "https://closed.test/"
         )),
         "⌘⇧T did not reopen the closed page tab: {cmds:?}"
     );
@@ -10058,7 +10061,7 @@ fn cmd_click_a_link_opens_a_background_tab_and_does_not_steal_focus(cx: &mut Tes
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenBackground { url, .. })
+            Command::Browser(BrowserCmd::OpenAt { url, activate: false })
                 if url == "https://eave.sh/ok"
         )),
         "⌘-click did not open a background tab: {cmds:?}"
@@ -10466,7 +10469,8 @@ fn the_omnibox_opens_a_tab_when_the_active_one_is_a_session(cx: &mut TestAppCont
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt { url }) if url == "https://example.com"
+            Command::Browser(BrowserCmd::OpenAt { url, activate: true })
+                if url == "https://example.com"
         )),
         "the omnibox dropped a navigation because the active tab was a \\
          session: {cmds:?}"
@@ -10697,5 +10701,445 @@ fn the_strip_never_moves_its_own_selection(cx: &mut TestAppContext) {
         lit(vcx, "tab-p1").origin,
         before.origin,
         "the strip re-laid itself out on a click"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice E1 — page interaction: find, zoom, and the page's own menu
+// ---------------------------------------------------------------------------
+//
+// **These run with the `web` feature OFF, which is the whole reason the
+// state they read lives outside the gate** (`web/mod.rs`). What is asserted
+// here is eave's half — which surfaces mount, what they say, and what
+// intent a row emits. Chromium's half (that `Find` really counts, that
+// `set_zoom_level` really rescales, that a right-click really produces a
+// `run_context_menu`) is not assertable in this process at all and is
+// verified by the capture rig instead; the report says which is which.
+//
+// Every one of them calls `pretend_available_for_test`, because a build
+// with no Chromium in it correctly refuses all of this — see
+// `Shell::active_page`.
+
+/// Ask for a page menu the way Chromium does, and get it onto the screen.
+///
+/// **The wake-up is supplied by hand here, and that is a real gap the
+/// report states.** In production `web::menu`'s handler calls
+/// `host::note_chrome_change`, and the pump's redraw gate turns that into a
+/// `refresh_windows` — because a right-click on a still page delivers no
+/// frame, so the frame counter alone would leave the menu unopened. There
+/// is no pump in this process, so that link in the chain is exercised by
+/// the capture rig and not by this test. What IS exercised is everything
+/// after it: the request being taken in the render pass, the row set, and
+/// what each row emits.
+#[track_caller]
+fn request_page_menu(h: &Harness, vcx: &mut VisualTestContext, menu: crate::web::PageMenu) {
+    crate::web::request_menu(menu);
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    // Let the entrance land, so nothing below asserts against a surface
+    // that is still arriving.
+    drive(h, vcx, Duration::from_millis(16));
+}
+
+/// A page tab, active, with the page engine pretending to exist.
+fn page_shell(h: &Harness, vcx: &mut VisualTestContext, url: Option<&str>) -> &'static str {
+    crate::web::pretend_available_for_test();
+    rail_with_selected(h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        h,
+        vcx,
+        vec![page_tab("pppp1111", url, Some("A page"))],
+        Some("pppp1111"),
+    );
+    "pppp1111"
+}
+
+/// ⌘F opens the find bar, and it is **over the page** — the one place a
+/// floating surface is allowed to be, because it is about the page.
+#[gpui::test]
+fn cmd_f_opens_the_find_bar_over_a_page(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    page_shell(&h, vcx, Some("https://example.com/"));
+
+    assert!(
+        !shown(vcx, "find-bar"),
+        "the bar was up before anyone asked"
+    );
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "find-bar"), "⌘F opened nothing over a page");
+    // Nothing typed, so there is nothing to count — and an empty slot
+    // reserved for a number would be the surface claiming it knows
+    // something it does not.
+    assert!(
+        !shown(vcx, "find-tally"),
+        "the bar stated a count for a query nobody has typed"
+    );
+}
+
+/// …and does nothing over a session. ⌘F over a transcript must not open a
+/// bar that searches nothing.
+#[gpui::test]
+fn cmd_f_does_nothing_over_a_session_tab(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "find-bar"),
+        "⌘F opened a find bar over a transcript, which it cannot search"
+    );
+}
+
+/// Typing states the query; escape takes the bar away.
+#[gpui::test]
+fn the_find_bar_takes_text_and_escape_dismisses_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.simulate_keystrokes("e a v e");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::find_state(tab).query,
+        "eave",
+        "the bar did not take what was typed into it"
+    );
+
+    // Backspace deletes ONE character — unlike the omnibox's, which clears
+    // a seeded address whole. Nothing seeded this field, so there is no
+    // selection to delete over.
+    vcx.simulate_keystrokes("backspace");
+    vcx.run_until_parked();
+    assert_eq!(crate::web::find_state(tab).query, "eav");
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "find-bar"), "escape left the bar up");
+    assert_eq!(
+        crate::web::find_state(tab).query,
+        "",
+        "a dismissed bar kept its query, so ⌘F would reopen on a stale search"
+    );
+}
+
+/// The bar states the COUNT, and the count is CEF's, transcribed.
+///
+/// Reachable in a build with no Chromium in it because the find state lives
+/// outside the feature gate (`web/mod.rs`): `note_find_result` is what the
+/// gated handler calls, and calling it here drives the same path a real
+/// `OnFindResult` does. **The three states are asserted through the
+/// SELECTOR** — `find-tally-3-of-17` rather than `find-tally` — because a
+/// harness reads elements, not text, and a tally identified only by its ink
+/// would have a test under its existence and none under what it says.
+#[gpui::test]
+fn the_find_bar_states_the_count_as_a_fact(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.simulate_keystrokes("e a v e");
+    vcx.run_until_parked();
+    // Nothing has come back yet: a query with no answer states nothing,
+    // rather than reserving a slot for a number it does not have.
+    assert!(
+        !shown(vcx, "find-tally-1-of-17"),
+        "the bar stated a count before CEF had answered"
+    );
+
+    // CEF reports progressively. This one is NOT final, and a count of
+    // zero that is not final means *not yet* — the bar must not flash
+    // "no matches" on every keystroke over a long page.
+    crate::web::note_find_result(tab, 0, 0, false);
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "find-tally-no-matches"),
+        "an unsettled zero was rendered as a real absence"
+    );
+
+    // A real count, with no active match yet — which is what CEF actually
+    // sends first, and it must not read as "0 of 17".
+    crate::web::note_find_result(tab, 17, 0, true);
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "find-tally-1-of-17"),
+        "the bar did not state the count CEF gave it"
+    );
+
+    // Stepping moves the ordinal, and the ordinal is CEF's, transcribed.
+    crate::web::note_find_result(tab, 17, 3, true);
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "find-tally-3-of-17"), "the ordinal did not move");
+
+    // And a settled zero is the real absence, worth stating plainly.
+    crate::web::find_search(tab, "nothingmatchesthis", true, false);
+    crate::web::note_find_result(tab, 0, 0, true);
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "find-tally-no-matches"),
+        "a settled zero said nothing where it should say so"
+    );
+}
+
+/// **The bar does not own the whole keyboard, and that is the difference
+/// from the omnibox.** The omnibox is modal — a key falling through it
+/// would land somewhere invisible. The find bar sits over a live page that
+/// is still the thing being read, so the keys that scroll it have to reach
+/// it.
+#[gpui::test]
+fn the_find_bar_lets_the_pages_own_keys_through(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.simulate_keystrokes("e a v e");
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.simulate_keystrokes("pagedown");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::find_state(tab).query,
+        "eave",
+        "an arrow key was typed into the find field instead of scrolling the page"
+    );
+    assert!(shown(vcx, "find-bar"), "a scroll key dismissed the bar");
+}
+
+/// The pane header states zoom **only** when it is not the default. A chip
+/// reading 100% on every tab forever is a decoration.
+#[gpui::test]
+fn the_pane_header_states_zoom_only_when_it_is_not_the_default(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    page_shell(&h, vcx, Some("https://example.com/"));
+
+    assert!(
+        !shown(vcx, "pane-zoom"),
+        "a tab nobody has zoomed stated a zoom"
+    );
+
+    vcx.simulate_keystrokes("cmd-=");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "pane-zoom"),
+        "⌘+ zoomed nothing and said nothing"
+    );
+
+    // ⌘0 is the dismissal, and it puts the tab back in the same state as
+    // one that was never touched — so the fact goes away rather than
+    // becoming "100%".
+    vcx.simulate_keystrokes("cmd-0");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "pane-zoom"),
+        "⌘0 left a 100% chip behind, which is a decoration"
+    );
+}
+
+/// Zoom is per TAB. Zooming one and switching away must not carry the
+/// number across.
+#[gpui::test]
+fn zoom_belongs_to_the_tab_it_was_asked_on(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("pppp1111", Some("https://a.example/"), Some("A")),
+            page_tab("pppp2222", Some("https://b.example/"), Some("B")),
+        ],
+        Some("pppp1111"),
+    );
+
+    vcx.simulate_keystrokes("cmd-=");
+    vcx.run_until_parked();
+    assert_eq!(crate::web::zoom_percent("pppp1111"), Some(110));
+    assert_eq!(
+        crate::web::zoom_percent("pppp2222"),
+        None,
+        "zooming one tab zoomed another"
+    );
+}
+
+/// The menu Chromium asks for opens, and its rows are a function of what
+/// was under the pointer.
+#[gpui::test]
+fn the_page_menu_says_what_was_clicked(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    // Bare text: the three navigation rows plus Copy, and nothing else.
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            link_url: None,
+            selection: None,
+            editable: false,
+        },
+    );
+    assert!(shown(vcx, "menu-row-0"), "the page menu never opened");
+    assert!(shown(vcx, "menu-row-3"), "Copy is missing");
+    assert!(
+        !shown(vcx, "menu-row-4"),
+        "a menu over bare text offered a link row"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+}
+
+/// A menu over a link gains the two link rows; a menu over a selection
+/// gains the search row.
+#[gpui::test]
+fn a_link_and_a_selection_each_add_their_own_rows(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            link_url: Some("https://linked.example/".into()),
+            selection: Some("some words".into()),
+            editable: false,
+        },
+    );
+    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab, Search.
+    assert!(shown(vcx, "menu-row-6"), "the search row is missing");
+    assert!(
+        !shown(vcx, "menu-row-7"),
+        "the menu grew a row nothing asked for"
+    );
+}
+
+/// **Open Link in New Tab opens it in the BACKGROUND.** That row has meant
+/// "keep this, I am still reading" in every browser for twenty years;
+/// foregrounding it would be the behaviour of an ordinary click, which the
+/// operator did not perform.
+#[gpui::test]
+fn opening_a_link_in_a_new_tab_does_not_steal_the_window(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            link_url: Some("https://linked.example/".into()),
+            selection: None,
+            editable: false,
+        },
+    );
+    let _ = h.drain();
+    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab.
+    click(vcx, "menu-row-5");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenAt { url, activate: false })
+                if url == "https://linked.example/"
+        )),
+        "Open Link in New Tab did not open the link, or stole the window: {cmds:?}"
+    );
+}
+
+/// The search row searches for the selection — **all of it**, whatever the
+/// label had room to show — and does not try to navigate to it.
+#[gpui::test]
+fn the_search_row_searches_for_the_whole_selection(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    // Deliberately something `omnibox::resolve` would read as an ADDRESS.
+    // A person who highlights `example.com` in a paragraph and asks to
+    // search for it has not asked to go there.
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            link_url: None,
+            selection: Some("example.com".into()),
+            editable: false,
+        },
+    );
+    let _ = h.drain();
+    // Back, Forward, Reload, Copy, Search.
+    click(vcx, "menu-row-4");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    let opened = cmds.iter().find_map(|c| match c {
+        Command::Browser(BrowserCmd::OpenAt { url, .. }) => Some(url.clone()),
+        _ => None,
+    });
+    let Some(opened) = opened else {
+        panic!("the search row opened nothing: {cmds:?}");
+    };
+    assert!(
+        opened.starts_with(&crate::omnibox::search_prefix()),
+        "the search row navigated to the selection instead of searching for it: {opened}"
+    );
+    assert!(
+        opened.contains("example.com"),
+        "the query lost the selection: {opened}"
+    );
+}
+
+/// Back and Forward are **disabled rather than absent** when there is no
+/// history — the same choice the pane header's arrows make. A menu whose
+/// length changes with history depth moves its own rows under the pointer.
+#[gpui::test]
+fn the_page_menu_disables_history_rows_rather_than_dropping_them(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            link_url: None,
+            selection: None,
+            editable: false,
+        },
+    );
+    assert!(
+        shown(vcx, "menu-row-0"),
+        "a disabled Back row still renders"
+    );
+    let _ = h.drain();
+    click(vcx, "menu-row-0");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
+        "a disabled Back row walked the history anyway: {cmds:?}"
     );
 }

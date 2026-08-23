@@ -96,6 +96,12 @@ actions!(
         ActivateLastTab,
         /// Slice E2 — ⌘⇧T. Reopens the last-closed *page* tab.
         ReopenClosedTab,
+        /// Slice E1 — ⌘F, the find bar over the page.
+        FindInPage,
+        /// Slice E1 — ⌘+ / ⌘- / ⌘0, per-tab page zoom.
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
     ]
 );
 
@@ -324,21 +330,21 @@ enum BrowserCmd {
     /// binds ⌘[ / ⌘] to the same path so a chord and a click cannot
     /// disagree.
     Go { tab_id: String, delta: i32 },
-    /// ⌘-click a link: a page tab that does not steal the active one.
-    ///
-    /// B1 modelled `TabOpen { activate: false }` for this and nothing in
-    /// the product had used it. Two requests, not `TabOpen { url }`, for
-    /// the same double-journal reason as [`Self::OpenAt`].
-    OpenBackground { url: String, opener: Option<String> },
-    /// The omnibox committing with no page tab to commit into: open one and
-    /// send it there.
+    /// Open a page tab and send it somewhere.
     ///
     /// **Two requests, not `TabOpen { url }`.** Opening a tab AT a url
     /// commits that url in the fold, which records a navigation to a page
     /// nobody has fetched — the double-journal B1's caveat 2 named and C1
     /// closed. The tab opens at nothing and is then asked to go somewhere,
     /// which is the same path every other navigation takes.
-    OpenAt { url: String },
+    ///
+    /// `activate` is Slice E1's. The omnibox committing with no page tab to
+    /// commit into wants the tab it just asked for; the context menu's
+    /// **Open Link in New Tab** does not — that row has meant "keep this,
+    /// I am still reading" in every browser for twenty years, and
+    /// foregrounding it would be the behaviour of an ordinary click, which
+    /// the operator did not do.
+    OpenAt { url: String, activate: bool },
     /// A tab that views this session.
     ///
     /// Unconditional. **Whether one is needed is decided where the snapshot
@@ -508,7 +514,7 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 .browser_do(eave_wire::Request::TabGo { tab_id, delta })
                 .await;
         }
-        BrowserCmd::OpenAt { url } => {
+        BrowserCmd::OpenAt { url, activate } => {
             // Open at NOTHING, then ask. See `BrowserCmd::OpenAt`.
             if let Ok(tab_id) = client
                 .browser_create(eave_wire::Request::TabOpen {
@@ -517,24 +523,7 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     index: None,
                     content: eave_wire::TabContent::Page,
                     opener: None,
-                    activate: true,
-                })
-                .await
-            {
-                let _ = client
-                    .browser_do(eave_wire::Request::TabNavigate { tab_id, url })
-                    .await;
-            }
-        }
-        BrowserCmd::OpenBackground { url, opener } => {
-            if let Ok(tab_id) = client
-                .browser_create(eave_wire::Request::TabOpen {
-                    url: None,
-                    group: None,
-                    index: None,
-                    content: eave_wire::TabContent::Page,
-                    opener,
-                    activate: false,
+                    activate,
                 })
                 .await
             {
@@ -3715,9 +3704,9 @@ impl Element for LinkText {
                         if ev.modifiers.platform {
                             if let Some(tx) = &commands {
                                 if markdown::web_url(href).is_some() {
-                                    let _ = tx.send(Command::Browser(BrowserCmd::OpenBackground {
+                                    let _ = tx.send(Command::Browser(BrowserCmd::OpenAt {
                                         url: href.to_string(),
-                                        opener: None,
+                                        activate: false,
                                     }));
                                 }
                             }
@@ -3902,6 +3891,13 @@ struct Shell {
     /// buffer lives here, and those two would otherwise drift the moment
     /// somebody switched tabs mid-dialog.
     dialog_text: Option<(String, String)>,
+    /// Slice E1 — the page's context menu, when it is up.
+    ///
+    /// P1's `Popup`, carrying the whole request rather than just an anchor:
+    /// the rows are a function of what was clicked (a link, a selection, an
+    /// editable field), and that has to survive the menu's exit or the rows
+    /// would empty out mid-fade.
+    page_menu: Popup<crate::web::PageMenu>,
     /// Slice C5 — the last typeahead answer the engine sent.
     typeahead: Entity<TypeaheadState>,
     /// Slice C5 — the session this window has already asked to select on
@@ -5316,6 +5312,22 @@ impl Shell {
             self.omnibox_key(ks, cx);
             return;
         }
+        // ── Slice E1 ──────────────────────────────────────────────────
+        //
+        // The find bar owns the keyboard while it is up, but **not all of
+        // it** — and that is the difference from the omnibox above. The
+        // omnibox is modal: it was opened instead of doing anything else,
+        // so a key falling through it would land somewhere invisible. The
+        // find bar sits over a live page that is still scrolling, still
+        // running, and still the thing the operator is looking at. Page-up
+        // and the arrows have to reach it.
+        //
+        // So this consumes what belongs to the field — text, backspace,
+        // paste, ⏎ and ⇧⏎ to cycle, escape to dismiss — and answers
+        // `false` for the rest, which then takes the ordinary path.
+        if self.find_key(ks, cx) {
+            return;
+        }
         // ⌘W is an ACTION (`CloseTab`), not an arm here. gpui dispatches a
         // matched action before the bubble-phase key listeners, so an
         // interception at this point never ran — the window was already
@@ -5676,9 +5688,10 @@ impl Shell {
         let Some(url) = self.closed_pages.pop_back() else {
             return;
         };
-        let _ = self
-            .commands
-            .send(Command::Browser(BrowserCmd::OpenAt { url }));
+        let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+            url,
+            activate: true,
+        }));
         cx.notify();
     }
 
@@ -5888,7 +5901,10 @@ impl Shell {
             .map(|t| t.id.clone());
         let cmd = match target {
             Some(tab_id) => BrowserCmd::Navigate { tab_id, url },
-            None => BrowserCmd::OpenAt { url },
+            None => BrowserCmd::OpenAt {
+                url,
+                activate: true,
+            },
         };
         let _ = self.commands.send(Command::Browser(cmd));
         self.close_omnibox(cx);
@@ -6220,7 +6236,10 @@ impl Shell {
             .map(|t| t.id.clone());
         let cmd = match target {
             Some(tab_id) => BrowserCmd::Navigate { tab_id, url },
-            None => BrowserCmd::OpenAt { url },
+            None => BrowserCmd::OpenAt {
+                url,
+                activate: true,
+            },
         };
         let _ = self.commands.send(Command::Browser(cmd));
         self.close_omnibox(cx);
@@ -6393,6 +6412,32 @@ impl Shell {
                                     )),
                             ),
                     )
+                    // ── Slice E1: the zoom fact ──────────────────────────
+                    //
+                    // **Present only when it is not 100%**, which is the
+                    // whole design. A chip reading "100%" on every tab
+                    // forever is a decoration: it states something that is
+                    // true of every page nobody has touched, so it carries
+                    // no information and costs a permanent slot in the one
+                    // line this region has. `web::zoom_percent` answers
+                    // `None` for a tab that has never been zoomed AND for
+                    // one that ⌘0 has put back, because those are the same
+                    // state and must read the same.
+                    //
+                    // A fact, not a control. It has no click handler and no
+                    // hover wash, because ⌘0 is the dismissal and inventing
+                    // a second one would be inventing an affordance this
+                    // slice was not asked for.
+                    .children(crate::web::zoom_percent(&tab.id).map(|pct| {
+                        div()
+                            .debug_selector(|| "pane-zoom".into())
+                            .flex_none()
+                            .px(px(theme::SPACE_1))
+                            .text_size(px(theme::DETAIL_SIZE))
+                            .line_height(px(theme::DETAIL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(format!("{pct}%"))
+                    }))
                     .child(files)
             }
             // ── a session: the breadcrumb ────────────────────────────────
@@ -10457,6 +10502,418 @@ impl Shell {
     }
 }
 
+/// Slice E1 — page interaction: find, zoom, and the page's own menu.
+///
+/// # One rule holds this block together
+/// **Every one of these is about a page, so every one of them is a no-op
+/// when the active tab is not a page.** ⌘F over a transcript must not open
+/// a bar that searches nothing; ⌘+ over a session must not zoom a document
+/// that is not there. [`Shell::active_page`] is the single gate, and it
+/// answers `None` for a session tab, for no tab at all, and for a build
+/// with no page engine in it.
+impl Shell {
+    /// The active tab, when it is a page **this build can render**.
+    ///
+    /// The `available()` half is not belt-and-braces. A build without
+    /// Chromium still has page tabs — C5 opens them, and the well says
+    /// which of the two absences it is — so without this, ⌘F over one of
+    /// them would open a find bar that can never count, and ⌘+ would state
+    /// a zoom for a document that is not there. Both would be surfaces
+    /// asserting facts they cannot back, which is the one thing this shell
+    /// is not allowed to do.
+    fn active_page(&self, cx: &App) -> Option<String> {
+        if !crate::web::available() {
+            return None;
+        }
+        let snapshot = self.strip_snapshot(cx);
+        let active = snapshot.active.as_deref()?;
+        snapshot
+            .tabs
+            .iter()
+            .find(|t| t.id == active && t.content == eave_wire::TabContent::Page)
+            .map(|t| t.id.clone())
+    }
+
+    /// The active page, when its find bar is up.
+    fn find_here(&self, cx: &App) -> Option<String> {
+        self.active_page(cx).filter(|t| crate::web::find_is_open(t))
+    }
+
+    /// ⌘F. Opens the bar, or leaves an open one alone.
+    ///
+    /// **Idempotent on purpose.** ⌘F on a bar that is already up must not
+    /// throw the query away — every browser on this platform re-focuses
+    /// instead, and since this shell has one focus handle and the bar is
+    /// already the thing consuming keys, "leave it alone" *is* re-focusing.
+    fn find_in_page(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_page(cx) else {
+            return;
+        };
+        crate::web::find_open(&tab);
+        cx.notify();
+    }
+
+    /// One keystroke, while the find bar is up. Returns whether it was
+    /// consumed — see the note at the call site for why that is not always.
+    fn find_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.find_here(cx) else {
+            return false;
+        };
+        let query = crate::web::find_state(&tab).query;
+        match ks.key.as_str() {
+            "escape" => {
+                // Clears the highlight and leaves the page where it
+                // scrolled to, which is what makes escape read as an undo
+                // of the *search* rather than of the *scroll*.
+                crate::web::find_close(&tab, true);
+            }
+            "enter" => {
+                // `find_next` = true: advance from the active match without
+                // re-counting. Restarting the search on every ⏎ is how a
+                // find bar ends up permanently saying "1 of 17".
+                crate::web::find_search(&tab, &query, !ks.modifiers.shift, true);
+            }
+            "backspace" => {
+                let mut next = query;
+                next.pop();
+                crate::web::find_search(&tab, &next, true, false);
+            }
+            "v" if ks.modifiers.platform => {
+                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                    return true;
+                };
+                let next = format!("{query}{}", text.replace(['\n', '\r'], ""));
+                crate::web::find_search(&tab, &next, true, false);
+            }
+            _ => {
+                // Anything with a command or control modifier is a shortcut
+                // and belongs to whatever else is bound to it — including
+                // ⌘C, which the operator may well want for the page's
+                // selection while the bar is up.
+                if ks.modifiers.platform || ks.modifiers.control {
+                    return false;
+                }
+                let Some(ch) = ks.key_char.clone() else {
+                    // Arrows, page-up, tab: not text, and the page below is
+                    // still the thing being read. Let them through.
+                    return false;
+                };
+                crate::web::find_search(&tab, &format!("{query}{ch}"), true, false);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// ⌘+ / ⌘- / ⌘0. `delta` of 0 is the reset.
+    fn zoom(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_page(cx) else {
+            return;
+        };
+        if delta == 0 {
+            crate::web::zoom_reset(&tab);
+        } else {
+            crate::web::zoom_step(&tab, delta);
+        }
+        cx.notify();
+    }
+
+    /// The find bar, when it is up. Mounted over the page.
+    ///
+    /// # The occlusion rule, answered at birth
+    /// `Shell::render` states the rule every floating surface owes an
+    /// answer to: **suppressed, or shown over a page?** This one is *shown
+    /// over a page, and only over a page* — it does not exist otherwise.
+    /// The reason it is allowed to is the sharper form of the rule that
+    /// came out of D1: a surface may sit over a page **only if it is about
+    /// the page**. A launcher over a loaded document is a bug because the
+    /// launcher is about eave; a find bar is about the document underneath
+    /// it, and covering forty pixels of the thing it is searching is the
+    /// cost of saying so.
+    ///
+    /// Top-RIGHT, which is where every browser on this platform puts it and
+    /// is also the corner least likely to cover the top of a page's own
+    /// content. It is a sibling of the page inside the well's `relative`
+    /// box, so it needs no anchoring and cannot disturb any layout.
+    fn find_bar(&self, cx: &App) -> Option<AnyElement> {
+        let tab = self.find_here(cx)?;
+        let state = crate::web::find_state(&tab);
+        let tally = state.tally();
+        let empty = state.query.is_empty();
+        Some(
+            div()
+                .debug_selector(|| "find-bar".into())
+                .absolute()
+                .top(px(theme::SPACE_3))
+                .right(px(theme::SPACE_3))
+                .occlude()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACE_2))
+                .h(px(theme::FIND_BAR_H))
+                .px(px(theme::SPACE_3))
+                .rounded(px(theme::RADIUS_PANEL))
+                .border_1()
+                .border_color(theme::border_strong())
+                .bg(theme::chrome_glass())
+                .shadow(theme::shadow_panel())
+                .text_size(px(theme::BODY_SIZE))
+                .line_height(px(theme::BODY_LINE))
+                .child(
+                    div()
+                        .debug_selector(|| "find-query".into())
+                        .min_w(px(theme::FIND_FIELD_MIN_W))
+                        .max_w(px(theme::FIND_FIELD_MAX_W))
+                        .truncate()
+                        .text_color(if empty {
+                            theme::text_tertiary()
+                        } else {
+                            theme::text()
+                        })
+                        // The placeholder is the chord, not an instruction.
+                        // "Find in page" would be a label on a surface that
+                        // is already unmistakably a find bar.
+                        .child(if empty {
+                            "Find".to_string()
+                        } else {
+                            state.query.clone()
+                        }),
+                )
+                // **The tally is absent, not blank, when there is nothing
+                // to say.** An empty slot reserved for a number is a
+                // surface claiming it knows something it does not — see
+                // `web::Find::tally` for the three states.
+                //
+                // **The state is in the SELECTOR, not only in the ink.**
+                // `ui_harness` asserts what it can find by `debug_selector`
+                // and cannot read the text a thing came out with, so a
+                // tally that identified itself as plain `find-tally` would
+                // have no test under the thing it exists to say — only
+                // under the fact that something is there. `find-tally-3-of-17`
+                // and `find-tally-no-matches` are different elements to a
+                // test and the same element to a reader. (Slice E3's trick,
+                // taken; it did the same for an evicted tab's chip, where
+                // the treatment was ink-only and therefore unassertable.)
+                .children(tally.map(|t| {
+                    let selector = format!("find-tally-{}", t.replace(' ', "-"));
+                    div()
+                        .debug_selector(move || selector.clone())
+                        .flex_none()
+                        .text_color(theme::text_tertiary())
+                        .child(t)
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The rows of the page's context menu, for one request.
+    ///
+    /// Rebuilt per render, like every other menu in this file: a menu
+    /// states what was true when it was drawn. What each row is *for* comes
+    /// from Chromium — whether there is a link under the pointer, whether
+    /// there is a selection — because that is a fact about a DOM this
+    /// process cannot see.
+    ///
+    /// **Disabled rather than absent** for the navigation three, which is
+    /// the same choice the pane header's arrows make: a menu whose length
+    /// changes with history depth moves its own rows under the pointer.
+    fn page_menu_items(&self, req: &crate::web::PageMenu, cx: &App) -> Vec<MenuItem> {
+        let snapshot = self.strip_snapshot(cx);
+        let tab = snapshot.tabs.iter().find(|t| t.id == req.tab_id);
+        let back = tab.map(|t| t.can_go_back).unwrap_or(false);
+        let fwd = tab.map(|t| t.can_go_forward).unwrap_or(false);
+        let has_url = tab.map(|t| t.url.is_some()).unwrap_or(false);
+
+        let mut items = vec![
+            MenuItem::new("Back").trailing("⌘["),
+            MenuItem::new("Forward").trailing("⌘]"),
+            MenuItem::new("Reload").trailing("⌘R"),
+        ];
+        if !back {
+            items[0] = items[0].clone().disabled();
+        }
+        if !fwd {
+            items[1] = items[1].clone().disabled();
+        }
+        if !has_url {
+            items[2] = items[2].clone().disabled();
+        }
+
+        let copy = MenuItem::new("Copy").trailing("⌘C");
+        items.push(if req.selection.is_some() {
+            copy
+        } else {
+            copy.disabled()
+        });
+
+        if req.link_url.is_some() {
+            items.push(MenuItem::new("Copy Link"));
+            items.push(MenuItem::new("Open Link in New Tab"));
+        }
+        if let Some(selection) = req.selection.as_deref() {
+            items.push(MenuItem::new(format!(
+                "Search for \u{201c}{}\u{201d}",
+                elide(selection, MENU_SELECTION_CAP)
+            )));
+        }
+        items
+    }
+
+    /// Open the menu Chromium asked for. Called from the render pass,
+    /// which is where the request is taken.
+    fn open_page_menu(&mut self, req: crate::web::PageMenu, cx: &mut Context<Self>) {
+        let enabled = self
+            .page_menu_items(&req, cx)
+            .iter()
+            .map(|i| i.enabled)
+            .collect();
+        let now = cx.background_executor().now();
+        self.page_menu.open(req, enabled, now);
+        cx.notify();
+    }
+
+    fn close_page_menu(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.page_menu.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.page_menu.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Do what row `ix` says, then close.
+    ///
+    /// **Every navigation row goes through the engine, not through CEF.**
+    /// `BrowserCmd::Go` and `Navigate` are the same path the pane header's
+    /// arrows take, and the engine owns the back/forward stack — calling
+    /// `browser.go_back()` here would walk Chromium's history while the
+    /// engine's idea of it stood still, which is the two-sources-of-truth
+    /// shape the whole `web` module is written against. `Copy` is the
+    /// exception and has to be: the selection lives in a document only
+    /// Blink can read.
+    fn run_page_menu(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(req) = self.page_menu.data().cloned() else {
+            return;
+        };
+        let items = self.page_menu_items(&req, cx);
+        let Some(item) = items.get(ix) else {
+            return;
+        };
+        if !item.enabled {
+            return;
+        }
+        let label = item.label.to_string();
+        let tab_id = req.tab_id.clone();
+        match label.as_str() {
+            "Back" => {
+                let _ = self
+                    .commands
+                    .send(Command::Browser(BrowserCmd::Go { tab_id, delta: -1 }));
+            }
+            "Forward" => {
+                let _ = self
+                    .commands
+                    .send(Command::Browser(BrowserCmd::Go { tab_id, delta: 1 }));
+            }
+            "Reload" => self.reload(cx),
+            "Copy" => crate::web::copy_selection(&tab_id),
+            "Copy Link" => {
+                if let Some(url) = req.link_url.as_deref() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.to_string()));
+                }
+            }
+            "Open Link in New Tab" => {
+                if let Some(url) = req.link_url.clone() {
+                    // **In the background**, which is what ⌘-click and this
+                    // row have meant in every browser for twenty years: the
+                    // operator asked for the link to be kept, not to be
+                    // followed. Foregrounding it would be the behaviour of
+                    // an ordinary click, which they did not do.
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                        url,
+                        activate: false,
+                    }));
+                }
+            }
+            _ => {
+                // The search row, whose label carries the (elided)
+                // selection and therefore cannot be matched on.
+                if let Some(selection) = req.selection.as_deref() {
+                    let target = omnibox::search(selection, &omnibox::search_prefix());
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                        url: target.url().to_string(),
+                        activate: true,
+                    }));
+                }
+            }
+        }
+        self.close_page_menu(cx);
+    }
+
+    /// The menu's surface, through P1's machinery.
+    ///
+    /// `overlay::menu_layer` and not a bespoke surface, which is what the
+    /// slice was asked for and is also the only way the dismissal is right:
+    /// the layer carries the full-window occluding catcher that makes a
+    /// click elsewhere dismiss the menu **without also landing on whatever
+    /// it was over**. A page is exactly the surface where getting that
+    /// wrong is worst — the stray click would go to a live document.
+    fn page_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let req = self.page_menu.data()?.clone();
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let live = self.page_menu.is_open();
+        let highlighted = self.page_menu.highlighted();
+        let rows = self
+            .page_menu_items(&req, cx)
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                overlay::menu_row(
+                    ix,
+                    item,
+                    highlighted == Some(ix),
+                    live,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.run_page_menu(ix, cx)),
+                )
+            })
+            .collect();
+        overlay::menu_layer(
+            &self.page_menu,
+            point(px(req.x), px(req.y)),
+            now,
+            reduced,
+            rows,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_page_menu(cx)),
+        )
+    }
+}
+
+/// How much of a selection the `Search for "…"` row shows.
+///
+/// The row searches for **all** of it; only the label is cut. A menu row
+/// that grew to the width of a paragraph would be a menu the width of the
+/// window, and `MENU_MAX_W` would truncate it anyway — this cuts on a
+/// character boundary and says so with an ellipsis instead.
+const MENU_SELECTION_CAP: usize = 32;
+
+/// Cut to `cap` CHARACTERS, not bytes, with an ellipsis when it cut.
+///
+/// Characters because a selection is arbitrary page text: Slice D1 lost a
+/// test to `&src[at..at + 600]` landing inside a multi-byte character, and
+/// a panic in a menu row is a panic in the render pass.
+fn elide(text: &str, cap: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= cap {
+        return text;
+    }
+    let head: String = text.chars().take(cap).collect();
+    format!("{}\u{2026}", head.trim_end())
+}
+
 /// Slice Q2 — the launcher.
 impl Shell {
     fn provider(&self) -> &'static launcher::Provider {
@@ -11846,6 +12303,18 @@ impl Render for Shell {
         // element being built. Both are `None` in the shipped app.
         let demo_trigger = overlay::demo_enabled().then(|| self.demo_trigger(cx));
         let demo_layer = self.demo_layer(cx);
+        // Slice E1. Chromium asks for a context menu on the PUMP, not on a
+        // gpui event, so the request is taken here — the render pass is the
+        // first place after it that holds `&mut self`. `host::note_chrome_change`
+        // is what guarantees a render pass happens at all: a right-click on
+        // a still page delivers no frame, so the frame counter alone would
+        // leave the menu unopened until something unrelated asked for a
+        // redraw.
+        if let Some(req) = crate::web::take_menu_request() {
+            self.open_page_menu(req, cx);
+        }
+        let page_menu_layer = self.page_menu_layer(cx);
+        let find_bar = self.find_bar(cx);
         // Slice Q2, built here for the same reason: the launcher and its
         // model menu both need `self` and `cx`, and the element chain
         // below has neither to spare.
@@ -11911,6 +12380,13 @@ impl Render for Shell {
                     None => window.remove_window(),
                 }
             }))
+            // Slice E1. Mounted on the root beside the strip's own
+            // chords, and every one of them is a no-op unless the active
+            // tab is a page — see `Shell::active_page`.
+            .on_action(cx.listener(|this, _: &FindInPage, _, cx| this.find_in_page(cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0, cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(true, cx)))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.cycle_tab(false, cx)))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go(-1, cx)))
@@ -12024,6 +12500,18 @@ impl Render for Shell {
                                             // would dim content the page believes
                                             // is fully visible.
                                             .children(page_el)
+                                            // Slice E1. **Shown over a page, and
+                                            // only over a page** — the
+                                            // occlusion rule answered at
+                                            // birth. It is allowed to
+                                            // because it is ABOUT the page
+                                            // underneath it; see
+                                            // `Shell::find_bar`. A sibling
+                                            // of the page inside this
+                                            // `relative` box, so it needs no
+                                            // anchoring and can disturb no
+                                            // layout.
+                                            .children(find_bar)
                                             // Slice C5. A page tab with nothing to
                                             // draw says which of the two absences
                                             // it is, rather than showing an empty
@@ -12225,7 +12713,14 @@ impl Render for Shell {
             // After `demo_layer` so that if both are ever mounted at once
             // the launcher's menu is on top — the launcher is the product
             // surface and the demo is a test fixture.
-            .children(launcher_menu);
+            .children(launcher_menu)
+            // Slice E1. Root-mounted for the reason `overlay::menu_layer`
+            // gives: `deferred` fixes paint order but layout stays where it
+            // is written, and this menu opens over a region that also holds
+            // a virtualized list. Last, so that a page menu opened while
+            // something else is up is the thing on top — it was opened by
+            // the most recent act.
+            .children(page_menu_layer);
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
         // claims this frame during the pass above; the root asks once, here,
@@ -12724,6 +13219,22 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         KeyBinding::new("cmd-8", ActivateTab8, None),
         KeyBinding::new("cmd-9", ActivateLastTab, None),
         KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
+        // ── Slice E1 ──────────────────────────────────────────────────
+        //
+        // ⌘F is find-in-page and nothing else. eave has no other find, so
+        // there is no collision to resolve here — unlike ⌘L, which had one.
+        KeyBinding::new("cmd-f", FindInPage, None),
+        // **Three chords for zoom-in, and all three are needed.** On a US
+        // layout ⌘+ requires shift, so the keystroke that reaches gpui is
+        // `cmd-shift-=`; the bare `cmd-=` is what people actually press;
+        // and `cmd-+` is what the keypad and some layouts produce. Binding
+        // only the one that reads best in a menu is how a browser ends up
+        // with a zoom-in that works for the person who wrote it.
+        KeyBinding::new("cmd-=", ZoomIn, None),
+        KeyBinding::new("cmd-shift-=", ZoomIn, None),
+        KeyBinding::new("cmd-+", ZoomIn, None),
+        KeyBinding::new("cmd--", ZoomOut, None),
+        KeyBinding::new("cmd-0", ZoomReset, None),
         // Slice K: answering is a first-class act, so it gets real
         // bindings rather than living only inside the key handler.
         KeyBinding::new("cmd-shift-a", ApproveOldest, None),
@@ -13145,6 +13656,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         slash: SlashPalette::default(),
                         omni: Omnibox::default(),
                         dialog_text: None,
+                        page_menu: Popup::default(),
                         typeahead: typeahead.clone(),
                         asked_for_session_tab: RefCell::new(HashSet::new()),
                         asked_to_select: RefCell::new(None),
@@ -13273,6 +13785,53 @@ fn perf_fill_10k(state: &mut TranscriptState) {
 #[cfg(test)]
 #[path = "ui_harness.rs"]
 mod harness;
+
+#[cfg(test)]
+mod e1_tests {
+    use super::{elide, MENU_SELECTION_CAP};
+
+    /// The row shows a cut of the selection; the search uses all of it.
+    #[test]
+    fn a_long_selection_is_cut_for_the_label_and_says_so() {
+        let long = "a".repeat(MENU_SELECTION_CAP * 3);
+        let shown = elide(&long, MENU_SELECTION_CAP);
+        assert!(shown.ends_with('\u{2026}'), "{shown}");
+        assert_eq!(shown.chars().count(), MENU_SELECTION_CAP + 1);
+    }
+
+    /// A short selection is shown whole and gains no ellipsis.
+    #[test]
+    fn a_short_selection_is_shown_whole() {
+        assert_eq!(elide("eave", MENU_SELECTION_CAP), "eave");
+    }
+
+    /// **Characters, not bytes.** Slice D1 lost a test to
+    /// `&src[at..at + 600]` landing inside a multi-byte character, and a
+    /// selection is arbitrary page text — a panic here would be a panic in
+    /// the render pass, which takes the window with it.
+    #[test]
+    fn cutting_a_selection_never_splits_a_character() {
+        // Every one of these is multi-byte, so a byte slice at any cap in
+        // range would land inside one.
+        let text = "\u{2014}".repeat(MENU_SELECTION_CAP * 2);
+        for cap in 1..=(MENU_SELECTION_CAP * 2) {
+            let out = elide(&text, cap);
+            assert!(!out.is_empty(), "cap {cap} produced nothing");
+        }
+        let mixed = "日本語のテキストをここに置く、長めに、もっと長く、さらに長く";
+        for cap in 1..=40 {
+            let _ = elide(mixed, cap);
+        }
+    }
+
+    /// A selection spanning lines becomes one line. A menu row cannot hold
+    /// a newline, and a raw `\n` in a label renders as a gap nobody asked
+    /// for.
+    #[test]
+    fn a_selection_across_lines_becomes_one_line() {
+        assert_eq!(elide("two\n  lines\there", 40), "two lines here");
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,64 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>eave — slice E1 fixture</title>
+<!--
+  Slice E1's capture page. Local rather than a network fetch, so the
+  capture is hermetic: the whole rig's assertions are about pixel
+  positions and a match COUNT, and a page that can change under us would
+  make a red run mean "the site changed" as often as "eave broke".
+
+  It carries four things, one for each thing the slice built:
+
+  * `eave` exactly SEVENTEEN times in the prose, so the find bar's tally is
+    a number the rig can check rather than a number it reads back to
+    itself. (The word appears nowhere else in this file's rendered text —
+    the title says "slice E1 fixture" on purpose, and comments do not
+    render.)
+  * a LINK on a flat chip of one exact colour (#1e3a5f), so the right-click
+    has something under it that makes the menu grow its two link rows —
+    and so the rig can FIND it rather than being told where it is. A
+    hardcoded offset into a page's prose is the kind of coordinate that is
+    silently wrong after any layout change.
+  * a 40x40 magenta square pinned to the bottom-right of the viewport. It
+    is the RESIZE PROBE: a stretched frame scales it, so its rendered
+    width along the bottom edge is a direct measurement of whether the
+    page was scaled to fit or drawn at one device pixel per device pixel.
+  * a 40x40 lime square pinned to the top-left, as the paired control —
+    a page painted top-left-anchored keeps this one still while the
+    magenta one moves, which is exactly what distinguishes "anchored and
+    clipped" from "scaled".
+-->
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #12131a; color: #e8e8ee;
+               font: 16px/1.7 -apple-system, system-ui, sans-serif; }
+  main { padding: 72px 64px; max-width: 46em; }
+  h1 { font-size: 28px; margin: 0 0 24px; font-weight: 600; letter-spacing: -0.01em; }
+  p { margin: 0 0 18px; }
+  a { color: #cfe6f5; }
+  /* The rig has to right-click the link, and a text run cannot be located
+     by an exact-colour probe — it is antialiased at every edge. So the
+     link sits on a flat chip of one exact colour, which `e1-probe.py`
+     finds and the capture clicks the centre of. It reads as a highlighted
+     link, which is honest about what it is: the place the rig aims at. */
+  a#the-link { background: #1e3a5f; padding: 2px 6px; border-radius: 4px;
+               text-decoration: none; }
+  #probe-br { position: fixed; right: 0; bottom: 0; width: 40px; height: 40px;
+              background: #ff00ff; }
+  #probe-tl { position: fixed; left: 0; top: 0; width: 40px; height: 40px;
+              background: #00ff00; }
+</style>
+<div id="probe-tl"></div>
+<div id="probe-br"></div>
+<main>
+  <h1>A page, for measuring</h1>
+  <p>The word below is repeated a known number of times so that a find bar
+     can be checked against arithmetic instead of against itself.</p>
+  <p>eave eave eave eave eave eave eave eave eave</p>
+  <p>eave eave eave eave eave eave eave eave</p>
+  <p>The link is here, and it is
+     <a id="the-link" href="https://example.com/linked">a link to somewhere else</a>,
+     which is what a right-click needs in order to be a right-click on a link.</p>
+  <p>Everything else on this page is filler, and it is filler on purpose:
+     the shot is of the chrome, so the document under it should be quiet
+     enough that a reader can see where one ends and the other begins.</p>
+</main>

@@ -204,7 +204,16 @@ pub fn resolve(input: &str, prefix: &str) -> Option<Target> {
     }
 }
 
-fn search(query: &str, prefix: &str) -> Target {
+/// A search for `query`, whatever the text looks like.
+///
+/// Public since Slice E1: the page's context menu has a `Search for "…"`
+/// row, and a **selection is not a line typed into an address bar**.
+/// Running it through [`resolve`] would send `example.com` — three words a
+/// person highlighted in a paragraph — to a DNS lookup instead of to a
+/// search engine, because `resolve`'s whole job is to guess which of the
+/// two a typed line is. Here there is nothing to guess: the operator asked
+/// to search for it.
+pub fn search(query: &str, prefix: &str) -> Target {
     Target::Search {
         url: format!("{prefix}{}", percent_encode_query(query)),
         query: query.to_string(),

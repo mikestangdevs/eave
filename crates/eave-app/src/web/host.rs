@@ -452,23 +452,42 @@ fn pump_cef() {
 fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
     // Two reasons to redraw, one gate. A frame arriving is the obvious
     // one; the chrome changing is the one added with the display handler,
-    // because a cursor crossing a link boundary or a status bubble
-    // appearing is a real change that may deliver no frame at all. Both
-    // counters move on an EVENT and not on a clock, so the "never on
-    // vsync" property is unchanged.
+    // because a cursor crossing a link boundary, a status bubble appearing,
+    // a find tally moving from "3 of 17" to "4 of 17" or a right-click menu
+    // opening is a real change that may deliver no frame at all. Both
+    // counters move on an EVENT and not on a clock, so the "never on vsync"
+    // property is unchanged.
     //
     // The two counters are PACKED, not mixed: frames in the low 32 bits,
     // chrome revisions in the high 32. A hash of the pair could collide and
     // silently drop a redraw; a pack cannot until one of them passes 2^32,
     // which at 60 Hz is eight centuries of frames.
-    let seen =
-        (super::tabs::chrome_revision() << 32) | (super::osr::frames_delivered() & 0xffff_ffff);
-    if seen == LAST_REFRESHED.load(Ordering::Relaxed) {
+    //
+    // `CHROME_DIRTY` is the second way in, from Slice E1: a one-shot flag
+    // for callers that change something drawn about the page without owning
+    // a revision counter. Taken with `swap` so it is consumed exactly once.
+    // Two mechanisms rather than one because they answer to different
+    // owners — the display handler counts revisions, the find and menu
+    // paths raise a flag — and either alone would leave the other's changes
+    // on the screen a frame late.
+    let chrome_dirty = CHROME_DIRTY.swap(false, Ordering::Relaxed);
+    let frames = super::osr::frames_delivered();
+    let seen = (super::tabs::chrome_revision() << 32) | (frames & 0xffff_ffff);
+    let last = LAST_REFRESHED.load(Ordering::Relaxed);
+    if seen == last && !chrome_dirty {
         return;
     }
+    // Whether the PAGE painted, as opposed to anything else having changed.
+    let painted = (last & 0xffff_ffff) != (frames & 0xffff_ffff);
     LAST_REFRESHED.store(seen, Ordering::Relaxed);
-    // A page that is painting is a page that is doing something.
-    note_activity();
+    if painted {
+        // A page that is painting is a page that is doing something. A
+        // chrome change is not: it must not extend the busy tail, or an
+        // open find bar would hold the pump at `BUSY_MS` for as long as it
+        // is up. (Slice E1 — the earlier version noted activity on any
+        // change at all, which made an idle page with a find bar busy.)
+        note_activity();
+    }
     cx.update(|app| app.refresh_windows());
 }
 
@@ -506,6 +525,19 @@ fn trace_capped(what: &str, n: u64, extra: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Something eave draws ABOUT the page changed, and no page frame is coming
+/// to carry it onto the screen.
+///
+/// The counterpart to the frame counter — see [`refresh_if_painted`]. Cheap
+/// and idempotent, so the callers do not have to know whether a redraw is
+/// already pending.
+pub(super) fn note_chrome_change() {
+    CHROME_DIRTY.store(true, Ordering::Relaxed);
+    request_pump();
+}
+
+static CHROME_DIRTY: AtomicBool = AtomicBool::new(false);
+
 /// `EAVE_WEB_TRACE`, read once. The pump asks on every turn and the shutdown
 /// loop runs it a thousand times, so an `env::var` per call is a real cost.
 fn no_heartbeat() -> bool {
@@ -513,7 +545,7 @@ fn no_heartbeat() -> bool {
     *OFF.get_or_init(|| std::env::var("EAVE_WEB_NO_HEARTBEAT").is_ok())
 }
 
-fn traced() -> bool {
+pub(super) fn traced() -> bool {
     static TRACED: OnceLock<bool> = OnceLock::new();
     *TRACED.get_or_init(|| std::env::var("EAVE_WEB_TRACE").is_ok())
 }
