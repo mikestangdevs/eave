@@ -214,6 +214,25 @@ pub fn request_pump() {
     }
 }
 
+/// Pump CEF on this stack.
+///
+/// The async pump task lives on gpui's executor, which does not run while
+/// AppKit is inside a live-resize tracking loop (`NSEventTrackingRunLoopMode`).
+/// `PageSurface::paint` therefore calls this after `WasResized` so Chromium
+/// can layout on the same frames the window is changing size. Re-entrant
+/// calls are a no-op: nesting `CefDoMessageLoopWork` is forbidden, and the
+/// in-flight pump already re-posts via [`REQUESTED_DURING_PUMP`].
+pub fn pump_now() {
+    if !running() {
+        return;
+    }
+    if IN_PUMP.load(Ordering::SeqCst) {
+        REQUESTED_DURING_PUMP.store(true, Ordering::SeqCst);
+        return;
+    }
+    pump_cef();
+}
+
 /// Mark the page as busy, so the pump stays fast for a moment.
 pub fn note_activity() {
     ACTIVE_UNTIL.store(now_ms() + BUSY_TAIL_MS, Ordering::Relaxed);

@@ -16,7 +16,7 @@
 //! `tab_navigate` and `tab_stated` as different frames, and the reason C1
 //! could attach a page engine without the engine learning what Chromium is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use cef::*;
@@ -49,11 +49,62 @@ fn report(tab_id: &str, fact: PageFact) {
     }
 }
 
+/// Chromium lists icons best-first, but "best" is often a 16×16 ICO.
+/// gpui's `img` decodes PNG/SVG/WEBP more reliably, so those win; an ICO
+/// is still taken over drawing nothing. The plate falls back to the globe
+/// if decode fails.
+fn pick_favicon_url(urls: &[String]) -> Option<String> {
+    let score = |u: &str| {
+        let l = u.to_ascii_lowercase();
+        if l.contains(".svg") {
+            0
+        } else if l.contains(".png") || l.contains(".webp") {
+            1
+        } else if l.contains(".jpg") || l.contains(".jpeg") {
+            2
+        } else if l.contains(".ico") {
+            4
+        } else {
+            3
+        }
+    };
+    urls.iter()
+        .filter(|u| !u.is_empty())
+        .min_by_key(|u| score(u))
+        .cloned()
+}
+
 /// CEF caps a windowless browser at `windowless_frame_rate`, and **its
 /// default is 30** — not the display's rate, not the page's. The spike
 /// located this by finding a hard 30 Hz ceiling on a page that could
 /// produce far more. Set explicitly, so the number is a decision.
 const FRAME_RATE: i32 = 60;
+
+#[cfg(test)]
+mod favicon_pick {
+    use super::pick_favicon_url;
+
+    #[test]
+    fn prefers_png_over_ico() {
+        let urls = [
+            "https://a.test/favicon.ico".into(),
+            "https://a.test/icon.png".into(),
+        ];
+        assert_eq!(
+            pick_favicon_url(&urls).as_deref(),
+            Some("https://a.test/icon.png")
+        );
+    }
+
+    #[test]
+    fn takes_an_ico_when_that_is_all_there_is() {
+        let urls = ["https://a.test/favicon.ico".into()];
+        assert_eq!(
+            pick_favicon_url(&urls).as_deref(),
+            Some("https://a.test/favicon.ico")
+        );
+    }
+}
 
 thread_local! {
     /// Live browsers by tab id. Main thread only: every CEF UI callback
@@ -76,6 +127,22 @@ pub fn any_browser() -> bool {
 /// Whether a tab has a live browser.
 pub fn has_browser(tab_id: &str) -> bool {
     BROWSERS.with(|b| b.borrow().contains_key(tab_id))
+}
+
+/// Page tabs the well is painting this frame. Not the engine's `active`:
+/// a split shows two, and the one that is not `active` still has to stay
+/// composited and ineligible for eviction.
+pub fn set_shown_pages(ids: impl IntoIterator<Item = impl AsRef<str>>) {
+    SHOWN.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.extend(ids.into_iter().map(|id| id.as_ref().to_string()));
+    });
+}
+
+/// Whether this page tab is on screen, split pane or not.
+pub fn is_on_screen(tab_id: &str) -> bool {
+    SHOWN.with(|s| s.borrow().contains(tab_id))
 }
 
 /// Do something with a tab's browser, if it has one.
@@ -188,6 +255,12 @@ thread_local! {
     /// not re-sent on every snapshot fold.
     static VISIBLE: std::cell::RefCell<HashMap<String, bool>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// Page tabs the shell is currently painting, which may be more than
+    /// the engine's `active` when two tabs share the well. Drive and
+    /// eviction both read this so a split pane does not go hidden or get
+    /// discarded for not being `active`.
+    static SHOWN: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
 
     /// The last url REPORTED per tab, so `on_address_change` can tell a
     /// real move from the echo of a load it already reported. See
@@ -427,14 +500,16 @@ pub fn drive(snapshot: &TabsSnapshot) {
         .filter(|t| t.content == TabContent::Page)
     {
         let is_active = Some(tab.id.as_str()) == active;
-        if !has_browser(&tab.id) && !is_active {
+        let shown = is_active || is_on_screen(&tab.id);
+        if !has_browser(&tab.id) && !shown {
             // Never looked at. No browser, no cost, and nothing to drive —
             // its `pending` is still on the tab and will be issued as the
-            // start url the moment it is activated.
+            // start url the moment it is activated. A split pane counts as
+            // looked at even when it is not `active`.
             continue;
         }
         drive_tab(tab);
-        set_visibility(&tab.id, is_active);
+        set_visibility(&tab.id, shown);
     }
 
     // A tab that left the strip takes its browser with it. Nothing did this
@@ -1370,14 +1445,25 @@ wrap_display_handler! {
             // The clone is shallow — a `Borrowed` collection, which `Drop`
             // does not free — so this reads the list without taking
             // ownership of Chromium's.
-            let first = icon_urls
+            let urls: Vec<String> = icon_urls
                 .map(|l| l.clone())
-                .and_then(|l| l.into_iter().next())
-                .filter(|u| !u.is_empty());
+                .map(|l| l.into_iter().filter(|u| !u.is_empty()).collect())
+                .unwrap_or_default();
+            // Chromium lists "best first", but "best" is often a 16×16
+            // ICO. The plate paints through gpui's `img`, which prefers a
+            // PNG/SVG/WEBP it can decode without a codec surprise. Fall
+            // back to whatever Chromium offered rather than drawing
+            // nothing.
+            let picked = pick_favicon_url(&urls);
             if trace() {
-                eprintln!("[web] on_favicon_urlchange {first:?}");
+                eprintln!("[web] on_favicon_urlchange {picked:?} from {urls:?}");
             }
-            report(&self.tab_id, PageFact::Favicon { favicon_url: first });
+            report(
+                &self.tab_id,
+                PageFact::Favicon {
+                    favicon_url: picked,
+                },
+            );
         }
 
         /// 0.0 to 1.0 across a load.

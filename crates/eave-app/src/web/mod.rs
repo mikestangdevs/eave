@@ -109,8 +109,8 @@ pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 pub use page::page_element;
 #[cfg(feature = "web")]
 pub use tabs::{
-    chrome, copy_selection, downloads, drive, install_fact_sink, install_request_sink, web_memory,
-    Download, Fact, PageChrome, PageRequest,
+    chrome, copy_selection, downloads, drive, install_fact_sink, install_request_sink,
+    is_on_screen, set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -733,6 +733,15 @@ pub fn web_memory() -> Option<(usize, u64)> {
 #[cfg(not(feature = "web"))]
 pub fn page_element(_tab_id: &str, _cx: &mut gpui::App) -> Option<gpui::AnyElement> {
     None
+}
+
+/// No page engine, so nothing is on screen as a page.
+#[cfg(not(feature = "web"))]
+pub fn set_shown_pages(_ids: impl IntoIterator<Item = impl AsRef<str>>) {}
+
+#[cfg(not(feature = "web"))]
+pub fn is_on_screen(_tab_id: &str) -> bool {
+    false
 }
 
 #[cfg(not(feature = "web"))]
