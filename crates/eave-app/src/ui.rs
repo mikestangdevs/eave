@@ -13734,6 +13734,13 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     // auto-hidden system bar has nothing to reveal.
     crate::app_menus::init(cx); // handlers only — the bar goes in last
 
+    // Slice BZ: bezel's Theme global, built from `theme.rs`. Installed in
+    // `bootstrap` rather than in `run` for the reason the two lines around it
+    // give — the harness boots the same wiring production does, so a bezel
+    // component under test paints the tokens it will paint on screen. It must
+    // precede any bezel component's first paint; nothing here paints one yet.
+    crate::bezel_theme::install(cx);
+
     // Slice M (§1.22): honoured for the one animation eave has. gpui
     // applies this inside `with_animation` itself — a oneshot renders its
     // end state and schedules no frames — so the veil becomes "the text

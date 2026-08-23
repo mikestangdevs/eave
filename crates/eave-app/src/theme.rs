@@ -867,6 +867,49 @@ pub fn code_block_text() -> Hsla {
 }
 
 // ---------------------------------------------------------------------------
+// Slice BZ — three roles bezel's Theme names and eave had no name for.
+//
+// Adopting bezel must not create a second token system, and the rule for
+// closing a gap is to EXTEND this file and derive, never to write a literal
+// into the bezel global. Each one below is a function of a token above it, so
+// re-valuing the pigment re-values these with it — the property that makes
+// them tokens rather than constants.
+//
+// They are painted by bezel's components. Nothing in `ui.rs` reads them yet,
+// and that is not a reason to withhold them: the alternative is bezel
+// inventing the value instead, somewhere this file cannot see it.
+
+/// Text-selection highlight in an editable field.
+///
+/// eave genuinely had none — the composer never rendered a selection, and
+/// [`selection_rim`] is a *shadow* on a selected row, a different thing
+/// wearing a similar name. Derived from [`accent`], because a selection is
+/// the app speaking about the operator's own act, which is the accent's job
+/// everywhere else. At 0.30 it lands between [`overlay_strong`] and
+/// [`overlay_strongest`] in weight, so a selection reads heavier than a hover
+/// without becoming a fill.
+pub fn selection() -> Hsla {
+    accent().opacity(0.30)
+}
+
+/// Warning copy in the quiet tier — secondary text on a warning surface.
+///
+/// [`danger_ink`] is this role for danger, and Slice AQ sampled it against the
+/// quiet-tier floor. There is no sampled amber sibling, so this derives the
+/// relationship instead: the pigment carried toward the reading tone, which
+/// lifts it without desaturating it, so the hue survives. The fill and the rim
+/// keep [`warning`] at full strength — AQ's rule, and the reason the rings were
+/// re-valued.
+pub fn warning_muted() -> Hsla {
+    crate::motion::mix(warning(), text(), 0.35)
+}
+
+/// Success copy in the quiet tier. Same derivation as [`warning_muted`].
+pub fn success_muted() -> Hsla {
+    crate::motion::mix(success(), text(), 0.35)
+}
+
+// ---------------------------------------------------------------------------
 // Rhythm — every gap and padding derives from a 4 px base unit.
 // SPACE_HALF exists only for sub-grid baseline nudges (caret alignment),
 // never for gaps between elements.

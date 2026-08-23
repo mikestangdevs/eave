@@ -75,7 +75,7 @@ pub mod theme;
 
 // Slice BZ: bezel's tokens, built from ours. The only place in the tree
 // allowed to write a bezel token — see the module doc for why that matters.
-mod bezel_theme;
+pub mod bezel_theme;
 
 pub mod ui;
 
