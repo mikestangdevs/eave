@@ -647,6 +647,22 @@ fn create(tab_id: &str, url: Option<&str>) {
     );
 }
 
+/// Copy the page's current selection to the system clipboard.
+///
+/// Slice E1. `Frame::copy` and not gpui's clipboard: the selection lives in
+/// a document this process cannot read, so the only thing that knows what
+/// "copy" means here is Blink. Routed through the MAIN frame, because a
+/// selection inside an iframe is still the page's selection and CEF resolves
+/// it from there.
+pub fn copy_selection(tab_id: &str) {
+    with_browser(tab_id, |b| {
+        if let Some(frame) = b.main_frame() {
+            frame.copy();
+        }
+    });
+    super::host::request_pump();
+}
+
 /// Close every browser. Runs before `CefShutdown`, which blocks forever if
 /// a windowless browser is still live.
 pub fn close_all() {
@@ -810,6 +826,11 @@ wrap_life_span_handler! {
             // stack that holds the borrow.
             let evicted = BROWSERS.with(|b| b.borrow_mut().insert(self.tab_id.clone(), browser));
             drop(evicted);
+            // Slice E1: zoom belongs to the TAB, not to the browser. A tab
+            // whose browser was closed and re-made must come back at the
+            // size it was left at — after the insert, because `reapply`
+            // goes through `with_browser`.
+            super::zoom_reapply(&self.tab_id);
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -824,6 +845,11 @@ wrap_life_span_handler! {
             // releasing one unanswered is the difference between a clean
             // teardown and a hang.
             super::dialogs::forget(&self.tab_id);
+            // Slice E1. A find that outlived its page would state a count
+            // about a document that is gone; the zoom is dropped for the
+            // same reason `close_browser` is reached at all, which is that
+            // the tab itself has left the strip.
+            super::forget_page(&self.tab_id);
         }
     }
 }
@@ -1435,6 +1461,20 @@ wrap_client! {
 
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(PageRequestHandler::new(self.tab_id.clone()))
+        }
+
+        /// Slice E1. **In windowless mode this is not a customisation hook,
+        /// it is the whole menu**: CEF has no window to put one in, so a
+        /// client without this has a right-click that does nothing.
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(super::menu::PageContextMenuHandler::new(self.tab_id.clone()))
+        }
+
+        /// Slice E1. The find COUNT, which is the only thing about find
+        /// that is eave's to state — the walking and the highlighting are
+        /// Chromium's.
+        fn find_handler(&self) -> Option<FindHandler> {
+            Some(super::find::PageFindHandler::new(self.tab_id.clone()))
         }
     }
 }

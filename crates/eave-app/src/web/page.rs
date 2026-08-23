@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType};
 use gpui::{
-    div, prelude::*, px, App, Bounds, Corners, Element, ElementId, FocusHandle, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
+    div, prelude::*, px, size, App, Bounds, ContentMask, Corners, Element, ElementId, FocusHandle,
+    GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
 };
 
 use super::{input, osr};
@@ -72,7 +72,9 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
 
     let (down_id, up_id, move_id, wheel_id, key_id) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+    let (right_down_id, right_up_id) = (id.clone(), id.clone());
     let down_focus = focus.clone();
+    let right_focus = focus.clone();
 
     // What Chromium says the pointer should be over whatever is under it.
     // Read at render because that is where gpui takes it; kept fresh by the
@@ -139,6 +141,54 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                     );
                 });
             })
+            // ── THE RIGHT BUTTON (Slice E1) ──────────────────────────
+            //
+            // Until this slice `page_element` forwarded LEFT and nothing
+            // else, so a right-click on a page never reached Chromium at
+            // all. That is half of why the context menu did nothing; the
+            // other half was that no `CefContextMenuHandler` was supplied
+            // (`web/menu.rs`). Either absence alone produces the same
+            // symptom, which is why fixing one and testing would have read
+            // as "still broken".
+            //
+            // Both edges are sent. Blink raises `contextmenu` on the DOWN
+            // edge, so the UP is not what opens the menu — but a page that
+            // sees a button go down and never come up is a page holding a
+            // press forever, and `mousedown` handlers that expect a pair
+            // (a canvas, a map, a custom control) are left mid-gesture.
+            .on_mouse_down(gpui::MouseButton::Right, move |ev, window, cx| {
+                // Focus first, exactly as the left button does: the menu is
+                // about this page, and what follows it — Copy, ⌘F — is
+                // keyboard work on a surface that has to own the keyboard.
+                window.focus(&right_focus, cx);
+                super::tabs::with_browser(&right_down_id, |b| {
+                    input::mouse_button(
+                        b,
+                        to_page(&right_down_id, ev.position),
+                        &ev.modifiers,
+                        MouseButtonType::RIGHT,
+                        false,
+                        ev.click_count as i32,
+                    );
+                    input::focus(b, true);
+                });
+                super::host::note_activity();
+                super::host::request_pump();
+            })
+            .on_mouse_up(gpui::MouseButton::Right, move |ev, _window, _cx| {
+                super::tabs::with_browser(&right_up_id, |b| {
+                    input::mouse_button(
+                        b,
+                        to_page(&right_up_id, ev.position),
+                        &ev.modifiers,
+                        MouseButtonType::RIGHT,
+                        true,
+                        ev.click_count as i32,
+                    );
+                });
+                super::host::note_activity();
+                super::host::request_pump();
+            })
             .on_scroll_wheel(move |ev, window, _cx| {
                 super::tabs::with_browser(&wheel_id, |b| {
                     let d = ev.delta.pixel_delta(window.line_height());
@@ -154,6 +204,22 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 super::host::request_pump();
             })
             .on_key_down(move |ev, _window, _cx| {
+                // **Not while the find bar is up, and the capture rig is
+                // what found this.** gpui dispatches key events leaf-first
+                // on the bubble phase, so this listener runs BEFORE
+                // `Shell::on_key` — and neither stops the other. Typing
+                // `eave` into the find bar therefore also typed it into
+                // the document: harmless-looking on prose, except that
+                // space scrolls, `/` opens a site's own find, and any
+                // focused field on the page silently collects the query.
+                //
+                // The bar is a surface eave owns over a page it does not,
+                // and while it is up it owns the text. Everything else
+                // still reaches the page — see `Shell::find_key`, which
+                // deliberately answers `false` for the keys that scroll.
+                if super::find_is_open(&key_id) {
+                    return;
+                }
                 super::tabs::with_browser(&key_id, |b| {
                     input::key(b, &ev.keystroke);
                 });
@@ -163,6 +229,86 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
             .child(PageSurface { tab_id: id })
             .into_any_element(),
     )
+}
+
+thread_local! {
+    /// How many frames in a row this tab has been painted at a size that is
+    /// not the size it was asked for, and when that run started.
+    ///
+    /// **Both numbers, because neither is the whole answer.** Frames are
+    /// what the artefact is made of; milliseconds are how long it is on
+    /// screen. They come apart precisely where this slice's fix lives: the
+    /// pump kick does not reduce the number of wrong-size *paints* — a
+    /// window that jumps to a new size paints once at the old frame either
+    /// way — it reduces how long that one paint stays up, because nothing
+    /// asks gpui to redraw until a new frame arrives and nothing produces a
+    /// new frame until CEF is pumped. A page at `QUIET_MS` is pumped every
+    /// 100 ms; one that has just been told it resized is pumped every 8.
+    static STALE: RefCell<HashMap<String, (u32, std::time::Instant)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Count, and narrate, the frames spent at the wrong size.
+///
+/// **This is the slice's measurement, not decoration.** "Resize is smooth
+/// now" is not a claim a screenshot can settle: the artefact is one or two
+/// frames long, and a shutter that takes 200 ms to open will always find
+/// the steady state. What CAN be measured is how many frames were painted
+/// before Chromium's answer arrived, and that number is the whole
+/// difference the pump kick makes — a page at `QUIET_MS` waits up to 100 ms
+/// (six frames at 60) to be pumped, and one at `BUSY_MS` waits eight.
+///
+/// Under `EAVE_WEB_STRETCH=1` the counter still runs and still reports, so
+/// the before and the after are the same instrument on the same binary.
+/// The only difference is what those frames LOOKED like: scaled, or drawn
+/// at one device pixel per device pixel and clipped.
+fn note_fit(tab_id: &str, fits: bool, fw: f32, fh: f32, want_w: f32, want_h: f32) {
+    if !super::host::traced() {
+        return;
+    }
+    STALE.with(|s| {
+        let mut s = s.borrow_mut();
+        let entry = s
+            .entry(tab_id.to_string())
+            .or_insert((0, std::time::Instant::now()));
+        if fits {
+            if entry.0 > 0 {
+                eprintln!(
+                    "[web] resize settled at {want_w:.0}x{want_h:.0} after {} stale frame(s), {} ms",
+                    entry.0,
+                    entry.1.elapsed().as_millis()
+                );
+                entry.0 = 0;
+            }
+        } else {
+            if entry.0 == 0 {
+                entry.1 = std::time::Instant::now();
+                eprintln!(
+                    "[web] resize wants {want_w:.0}x{want_h:.0}, frame is {fw:.0}x{fh:.0}"
+                );
+            }
+            entry.0 += 1;
+        }
+    });
+}
+
+/// `EAVE_WEB_STRETCH=1` — put the resize behaviour back the way it was
+/// before Slice E1, for the length of one measurement.
+///
+/// **A knob rather than an edit, and the reason is C7's.** That slice found
+/// a comment in `host.rs` that had been wrong for two slices because
+/// re-checking it required changing the code, and kept
+/// `EAVE_WEB_NO_HEARTBEAT` so the next person could re-measure instead of
+/// re-reasoning. This is the same shape: with it set, the stale frame is
+/// scaled into the new bounds and no pump is asked for on a view change —
+/// exactly what `a4b3983` did — so the capture rig can photograph the
+/// before and the after from **one binary** rather than asking a reader to
+/// trust that two builds differed only here.
+///
+/// Read once. It is consulted from `paint`, which runs at frame rate.
+fn stretch_for_measurement() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EAVE_WEB_STRETCH").is_ok())
 }
 
 struct PageSurface {
@@ -227,34 +373,109 @@ impl Element for PageSurface {
         // space and element space become the same space, so there is no
         // offset to guess at. (A guessed 28 pt title-bar offset cost the
         // spike a capture run.)
+        let scale = window.scale_factor();
         let view = osr::View {
             width: f32::from(bounds.size.width).round() as i32,
             height: f32::from(bounds.size.height).round() as i32,
-            scale: window.scale_factor(),
+            scale,
             origin_x: f32::from(bounds.origin.x),
             origin_y: f32::from(bounds.origin.y),
         };
-        if osr::set_view(&self.tab_id, view) {
+        let change = osr::set_view(&self.tab_id, view);
+        if change != osr::ViewChange::Same {
             super::tabs::with_browser(&self.tab_id, |b| {
                 if let Some(host) = b.host() {
+                    // **`NotifyScreenInfoChanged` first, then `WasResized`,
+                    // and one does not stand in for the other.**
+                    // `WasResized` re-asks `GetViewRect` and nothing else;
+                    // the device scale factor is answered by
+                    // `GetScreenInfo`, which CEF caches and re-reads only
+                    // when told to. Sending only `WasResized` after a drag
+                    // to a display with a different backing scale leaves the
+                    // page laid out at the right logical size and rasterised
+                    // at the old resolution — a soft page, and no error
+                    // anywhere.
+                    if change == osr::ViewChange::Rescaled {
+                        host.notify_screen_info_changed();
+                    }
                     host.was_resized();
                 }
             });
+            // **Belt and braces, and the measurement says so.** The
+            // reasoning for asking is sound on its face: under an external
+            // pump nothing in Chromium runs until we run it, and a page
+            // that is merely open is pumped at `QUIET_MS` — 100 ms, or six
+            // frames at 60 — so the correctly-sized frame could arrive a
+            // tenth of a second after the window had already moved.
+            //
+            // It does not. `scripts/e1-resize-sweep.sh` runs the same sweep
+            // with this branch and with `EAVE_WEB_STRETCH=1` (which skips
+            // these two lines, among others) and both settle in **one
+            // stale frame, 8–24 ms** — with 2 s between resizes, which is
+            // five times `BUSY_TAIL_MS`, so the busy tail had long expired.
+            // The reason is that `WasResized` queues work inside Chromium
+            // and Chromium then raises its own `OnScheduleMessagePumpWork`
+            // — which is not suppressed here, because this is not inside a
+            // `CefDoMessageLoopWork` call. CEF asks before we would have.
+            //
+            // Kept because it costs a channel send and it does not depend
+            // on Chromium's scheduler staying helpful. **Stated as measured
+            // rather than as the fix**, so the next reader does not quote
+            // it as the reason resizes are prompt: they were already.
+            if !stretch_for_measurement() {
+                super::host::note_activity();
+                super::host::request_pump();
+            }
         }
 
-        if let Some(buffer) = osr::frame(&self.tab_id) {
-            // Bottom corners match the card; the header owns the top of
-            // the card so the page's top edge is square against it.
-            window.paint_surface_with_corners(
-                bounds,
-                buffer,
-                Corners {
-                    top_left: px(0.),
-                    top_right: px(0.),
-                    bottom_right: px(theme::RADIUS_PANEL),
-                    bottom_left: px(theme::RADIUS_PANEL),
-                },
-            );
+        // ── THE RESIZE TRANSIENT (Slice E1) ──────────────────────────────
+        //
+        // `paint_surface` scales its buffer to fill the bounds it is given,
+        // which is right in the steady state and a **stretch** in every
+        // frame between "the window changed size" and "Chromium answered".
+        // A page is not a video: it has a layout, and a layout stretched
+        // horizontally is not a smaller rendering of the same thing, it is
+        // the wrong picture.
+        //
+        // So: paint the stale frame at one device pixel per device pixel,
+        // anchored top-left, clipped to the space the element actually has.
+        // Growing, the new strip of the well shows what is under it for a
+        // frame or two; shrinking, the overhang is clipped. Both are *the
+        // page, correct, and momentarily the wrong size* — which is what
+        // every browser on this platform does while you drag its corner,
+        // and is honest in a way that stretching is not.
+        //
+        // Bottom corners match the card; the header owns the top of the
+        // card so the page's top edge is square against it.
+        let corners = Corners {
+            top_left: px(0.),
+            top_right: px(0.),
+            bottom_right: px(theme::RADIUS_PANEL),
+            bottom_left: px(theme::RADIUS_PANEL),
+        };
+        if let Some(frame) = osr::frame(&self.tab_id) {
+            let (fw, fh) = frame.logical(scale);
+            let want_w = f32::from(bounds.size.width);
+            let want_h = f32::from(bounds.size.height);
+            // Half a logical pixel of slack: the coded size is a rounded
+            // count of device pixels, so exact float equality is the wrong
+            // test and would put the steady state on the transient path at
+            // odd scales.
+            let fits = (fw - want_w).abs() < 0.5 && (fh - want_h).abs() < 0.5;
+
+            note_fit(&self.tab_id, fits, fw, fh, want_w, want_h);
+
+            if fits || stretch_for_measurement() {
+                window.paint_surface_with_corners(bounds, frame.buffer, corners);
+            } else {
+                let at = Bounds {
+                    origin: bounds.origin,
+                    size: size(px(fw), px(fh)),
+                };
+                window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    window.paint_surface_with_corners(at, frame.buffer, corners);
+                });
+            }
         }
 
         // A `<select>` dropdown, an autofill list, a colour picker.
@@ -265,6 +486,12 @@ impl Element for PageSurface {
         // seen and still ate the next click. Painted after the page and at
         // the rect CEF gave, which is already in view coordinates, so the
         // element's own origin is the only conversion.
+        //
+        // **Deliberately NOT through the resize-transient path above.** A
+        // popup is placed by a rect Chromium computed for the CURRENT view;
+        // it has no stale-size problem to solve, and clipping it to the
+        // page's bounds or anchoring it top-left would move a menu that is
+        // already where it belongs.
         //
         // Square corners, deliberately: this is a menu sitting ON the page,
         // not the page itself, and rounding it to the card's radius would

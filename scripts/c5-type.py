@@ -37,11 +37,28 @@ KEYCODES = {
     "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22,
     "5": 23, "9": 25, "7": 26, "8": 28, "0": 29, "o": 31, "u": 32,
     "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
-    ".": 47, "/": 44, "-": 27, " ": 49,
+    ".": 47, "/": 44, "-": 27, " ": 49, "=": 24,
     # Slice E2 — ⌘[ / ⌘]. Positional ANSI bracket keys (`kVK_ANSI_LeftBracket`
     # / `kVK_ANSI_RightBracket`), not the characters, same as every other
     # entry here.
     "[": 33, "]": 30,
+}
+
+# Named keys, which are neither characters nor chords. `send` taps these
+# through Quartz for the same reason it taps chords that way: a key with no
+# character to insert is matched on its keycode, and Quartz delivers those
+# to this window reliably. (Slice E1 added them for escape and the zoom
+# chords; `=` and `0` are in KEYCODES above and reachable as `cmd-=`.)
+NAMED = {
+    "escape": 53,
+    "return": 36,
+    "enter": 36,
+    "tab": 48,
+    "delete": 51,
+    "left": 123,
+    "right": 124,
+    "down": 125,
+    "up": 126,
 }
 
 MODIFIERS = {
@@ -78,7 +95,11 @@ def tap(keycode: int, flags: int = 0, char: str | None = None) -> None:
 
 
 def send(token: str) -> None:
-    """A chord (`cmd-shift-l`) or a run of plain characters (`doc`)."""
+    """A named key (`escape`), a chord (`cmd-shift-l`), or a run of plain
+    characters (`doc`)."""
+    if token in NAMED:
+        tap(NAMED[token])
+        return
     if "-" in token and len(token) > 1:
         *mods, key = token.split("-")
         flags = 0
@@ -86,9 +107,10 @@ def send(token: str) -> None:
             if m not in MODIFIERS:
                 raise SystemExit(f"unknown modifier {m!r} in {token!r}")
             flags |= MODIFIERS[m]
-        if key not in KEYCODES:
+        code = KEYCODES.get(key, NAMED.get(key))
+        if code is None:
             raise SystemExit(f"unknown key {key!r} in {token!r}")
-        tap(KEYCODES[key], flags)
+        tap(code, flags)
         return
     # **Plain text goes through System Events, not through Quartz**, and
     # that split is the finding rather than a preference.

@@ -461,14 +461,27 @@ fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
     // chrome revisions in the high 32. A hash of the pair could collide and
     // silently drop a redraw; a pack cannot until one of them passes 2^32,
     // which at 60 Hz is eight centuries of frames.
+    //
+    // Slice R1 merged E1's `CHROME_DIRTY` in ALONGSIDE the pack rather than
+    // choosing between them. They are not redundant: the pack covers chrome
+    // eave learned about FROM Chromium (a link hover, a status bubble), and
+    // the flag covers chrome eave decided on ITSELF (a find tally moving
+    // "3 of 17" to "4 of 17", a context menu opening) — which bumps no CEF
+    // revision and would otherwise wait for an unrelated frame.
+    let chrome = CHROME_DIRTY.swap(false, Ordering::Relaxed);
     let seen =
         (super::tabs::chrome_revision() << 32) | (super::osr::frames_delivered() & 0xffff_ffff);
-    if seen == LAST_REFRESHED.load(Ordering::Relaxed) {
+    let last = LAST_REFRESHED.load(Ordering::Relaxed);
+    if seen == last && !chrome {
         return;
     }
+    // E1: only a real FRAME is activity. A chrome change is not, or an open
+    // find bar would hold the pump at `BUSY_MS` for as long as it is up.
+    let painted = (seen & 0xffff_ffff) != (last & 0xffff_ffff);
     LAST_REFRESHED.store(seen, Ordering::Relaxed);
-    // A page that is painting is a page that is doing something.
-    note_activity();
+    if painted {
+        note_activity();
+    }
     cx.update(|app| app.refresh_windows());
 }
 
@@ -506,6 +519,19 @@ fn trace_capped(what: &str, n: u64, extra: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Something eave draws ABOUT the page changed, and no page frame is coming
+/// to carry it onto the screen.
+///
+/// The counterpart to the frame counter — see [`refresh_if_painted`]. Cheap
+/// and idempotent, so the callers do not have to know whether a redraw is
+/// already pending.
+pub(super) fn note_chrome_change() {
+    CHROME_DIRTY.store(true, Ordering::Relaxed);
+    request_pump();
+}
+
+static CHROME_DIRTY: AtomicBool = AtomicBool::new(false);
+
 /// `EAVE_WEB_TRACE`, read once. The pump asks on every turn and the shutdown
 /// loop runs it a thousand times, so an `env::var` per call is a real cost.
 fn no_heartbeat() -> bool {
@@ -513,7 +539,7 @@ fn no_heartbeat() -> bool {
     *OFF.get_or_init(|| std::env::var("EAVE_WEB_NO_HEARTBEAT").is_ok())
 }
 
-fn traced() -> bool {
+pub(super) fn traced() -> bool {
     static TRACED: OnceLock<bool> = OnceLock::new();
     *TRACED.get_or_init(|| std::env::var("EAVE_WEB_TRACE").is_ok())
 }
