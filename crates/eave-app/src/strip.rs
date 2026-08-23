@@ -106,6 +106,10 @@ pub struct StripTab {
     pub resident: bool,
     pub active: bool,
     pub pinned: bool,
+    /// Where the page says its icon lives. `None` for a session tab, and
+    /// for a page that has not reported one yet — the plate then draws
+    /// the globe, which is the honest stand-in, not a missing mark.
+    pub favicon_url: Option<String>,
     /// The group this tab is in, and where in its run it sits. `None` for a
     /// loose tab.
     pub run: Option<GroupRun>,
@@ -372,6 +376,10 @@ fn strip_tab(
         },
         active: active == Some(info.id.as_str()),
         pinned: info.pinned,
+        favicon_url: match &info.content {
+            TabContent::Page => info.favicon_url.clone(),
+            TabContent::Session { .. } => None,
+        },
         run,
     }
 }
@@ -655,6 +663,26 @@ mod tests {
                 (NEW_TAB_LABEL, true),
                 ("about:blank", false),
             ]
+        );
+    }
+
+    #[test]
+    fn a_page_tab_carries_its_favicon_url_and_a_session_tab_does_not() {
+        let mut p = page("p", Some("https://a.test/"), Some("A"));
+        p.favicon_url = Some("https://a.test/favicon.png".into());
+        let s = snap(vec![p, session_tab("s", "sess")], Some("p"));
+        let items = items(&s, &chips(&[("sess", "work")]), &|_| true);
+        let urls: Vec<Option<&str>> = items
+            .iter()
+            .filter_map(|i| match i {
+                StripItem::Tab(t) => Some(t.favicon_url.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec![Some("https://a.test/favicon.png"), None],
+            "session tabs must not inherit a page's favicon"
         );
     }
 

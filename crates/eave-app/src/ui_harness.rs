@@ -12295,3 +12295,529 @@ fn a_build_with_no_page_engine_closes_the_fact_channel_at_once(_cx: &mut TestApp
          — read that guard before relying on this staying open."
     );
 }
+
+/// Two page tabs in the well, side by side. Dropping one tab onto another
+/// is the Arc/Brave gesture; the engine still has one `active`, the well
+/// paints both.
+#[gpui::test]
+fn dropping_a_tab_on_another_tab_splits_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    assert!(
+        !shown(vcx, "split-well"),
+        "a single tab must not draw a split"
+    );
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "split-well"), "the well did not split");
+    assert!(shown(vcx, "split-pane-left"), "left pane missing");
+    assert!(shown(vcx, "split-pane-right"), "right pane missing");
+    assert!(shown(vcx, "split-handle"), "no divider between panes");
+}
+
+/// Dragging a tab onto itself is not a split — that would be a pane of
+/// the same tab twice, and the only honest answer is to do nothing.
+#[gpui::test]
+fn dropping_a_tab_on_itself_does_not_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/"), Some("A"))],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p1", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "a tab dropped on itself opened a split"
+    );
+}
+
+/// Two sessions cannot share the well: this shell has one transcript
+/// subscription, and a second session pane would be a caption over an
+/// empty log. The drop is refused rather than drawn dishonestly.
+#[gpui::test]
+fn two_session_tabs_do_not_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("s1"), session_tab("s2")],
+        Some("s1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("s2", "s1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "two sessions opened a split this shell cannot back"
+    );
+}
+
+/// Clicking a tab that is not in the split leaves it — the well is a view
+/// of two tabs, not a lock. The third tab fills the card.
+#[gpui::test]
+fn clicking_a_third_tab_leaves_the_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"));
+
+    click(vcx, "tab-p3");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "clicking a third tab left the split on screen"
+    );
+}
+
+/// Dropping a background tab onto the well (the document currently in
+/// front) splits with that document. Left/right is which half of the
+/// card the pointer was over.
+#[gpui::test]
+fn dropping_a_tab_on_the_well_splits_with_the_page_in_front(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p2", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"), "well drop did not split");
+    assert!(shown(vcx, "split-pane-left"));
+    assert!(shown(vcx, "split-pane-right"));
+}
+
+/// The actual gesture: mouse-down on one tab, move past gpui's 2px drag
+/// threshold, mouse-up on another. If this fails, `on_drag`/`on_drop` on
+/// the rail tab is not wired, and calling `split_tabs` from a test is not
+/// the same as the operator dragging.
+#[gpui::test]
+fn dragging_one_tab_onto_another_splits_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    let from = vcx.debug_bounds("tab-p2").expect("tab-p2");
+    let onto = vcx.debug_bounds("tab-p1").expect("tab-p1");
+    vcx.simulate_mouse_down(from.center(), MouseButton::Left, Modifiers::none());
+    let mut mid = from.center();
+    mid.y += px(8.);
+    vcx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_mouse_move(onto.center(), Some(MouseButton::Left), Modifiers::none());
+    vcx.simulate_mouse_up(onto.center(), MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "split-well"),
+        "dragging tab-p2 onto tab-p1 did not split the well — on_drag/on_drop \
+         on the rail tab is not firing"
+    );
+}
+
+/// Split tabs share one rail pill, side by side, matching the well.
+/// Stacked full-width rows would mean the strip is silent about the split.
+#[gpui::test]
+fn split_tabs_sit_side_by_side_on_the_rail(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ],
+        Some("p1"),
+    );
+    assert!(
+        !shown(vcx, "split-tabs"),
+        "a single page must not draw the combined pill"
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "split-tabs"),
+        "split tabs must share one rail pill"
+    );
+    let a = vcx.debug_bounds("tab-p1").expect("tab-p1");
+    let b = vcx.debug_bounds("tab-p2").expect("tab-p2");
+    assert_eq!(
+        a.origin.y, b.origin.y,
+        "split tabs must sit on one row, not stack: p1 {a:?} p2 {b:?}"
+    );
+    assert!(
+        a.origin.x < b.origin.x,
+        "left pane's tab should be the left chip"
+    );
+    let c = vcx.debug_bounds("tab-p3").expect("tab-p3");
+    assert!(
+        c.origin.y > a.origin.y,
+        "a tab that is not in the split stays a row under the pill"
+    );
+}
+
+/// `flex_basis(0)` plus the grow factor is the ratio. Without the zero
+/// basis, a pane whose page had not reflowed kept its old content width
+/// and the other pane got leftovers.
+#[gpui::test]
+fn both_split_panes_take_a_share_of_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    let left = vcx.debug_bounds("split-pane-left").expect("left");
+    let right = vcx.debug_bounds("split-pane-right").expect("right");
+    assert!(
+        left.size.width > px(200.) && right.size.width > px(200.),
+        "a 50/50 split collapsed a pane: left {:?} right {:?}",
+        left.size.width,
+        right.size.width
+    );
+}
+
+/// Clicking a pane focuses it (the ring) and does not leave the split.
+#[gpui::test]
+fn clicking_a_split_pane_focuses_it_without_leaving(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    h.drain();
+
+    click(vcx, "split-pane-left");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"), "clicking a pane left the split");
+    assert!(
+        h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Activate(id)) if id == "p1")),
+        "clicking the left pane did not activate it"
+    );
+}
+
+/// Clicking a chip in the combined pill focuses that pane, same as
+/// clicking the pane itself. It must not unsplit — that is reserved for
+/// a tab that is not in the well.
+#[gpui::test]
+fn clicking_a_chip_in_the_combined_row_keeps_the_split(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    h.drain();
+
+    click(vcx, "tab-p1");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "split-well") && shown(vcx, "split-tabs"),
+        "clicking a split chip unsplits the well"
+    );
+    assert!(
+        h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Activate(id)) if id == "p1")),
+        "clicking the left chip did not activate that pane"
+    );
+}
+
+fn open_tab_strip_menu(h: &Harness, vcx: &mut VisualTestContext, tab_id: &str) {
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.open_tab_menu(tab_id, gpui::point(px(240.), px(180.)), cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+}
+
+/// Two-finger click on a rail tab opens the single-tab menu, not the
+/// page's Chromium menu.
+#[gpui::test]
+fn a_right_click_on_a_tab_opens_the_single_tab_menu(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    let from = vcx.debug_bounds("tab-p1").expect("tab-p1");
+    vcx.simulate_mouse_down(from.center(), MouseButton::Right, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-menu-copy-link"),
+        "right-clicking a tab did not open Copy Link"
+    );
+    assert!(
+        shown(vcx, "tab-menu-add-split"),
+        "Add Split View missing on a tab that has a partner"
+    );
+    assert!(
+        !shown(vcx, "tab-menu-separate"),
+        "a single tab offered the split menu"
+    );
+}
+
+/// Right-clicking a tab that is in the well opens the split menu.
+#[gpui::test]
+fn a_right_click_on_a_split_tab_opens_the_split_menu(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    open_tab_strip_menu(&h, vcx, "p1");
+    assert!(
+        shown(vcx, "tab-menu-separate"),
+        "split tab menu missing Separate All Tabs"
+    );
+    assert!(
+        shown(vcx, "tab-menu-convert-axis"),
+        "Convert to Vertical Split View missing"
+    );
+    assert!(shown(vcx, "menu-header"), "Tab Options header missing");
+}
+
+/// Copy Link writes the tab's url, which is the one thing Share and
+/// Copy Link can honestly do without a share sheet.
+#[gpui::test]
+fn copy_link_from_the_tab_menu_writes_the_url(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/path"), Some("A"))],
+        Some("p1"),
+    );
+    open_tab_strip_menu(&h, vcx, "p1");
+    click(vcx, "tab-menu-copy-link");
+    vcx.run_until_parked();
+    let text = vcx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("clipboard empty after Copy Link");
+    assert_eq!(text, "https://a.test/path");
+}
+
+/// Separate All Tabs is the split menu's unsplit — the well is a view,
+/// and this is how you leave it without closing either tab.
+#[gpui::test]
+fn separate_all_tabs_leaves_the_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    open_tab_strip_menu(&h, vcx, "p2");
+    click(vcx, "tab-menu-separate");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "Separate All Tabs left the split on screen"
+    );
+}
+
+/// Convert to Vertical Split View turns the well into a column. The
+/// handle's long axis is the proof: a row-resize handle is wide and short.
+#[gpui::test]
+fn convert_to_vertical_split_turns_the_handle(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let before = vcx.debug_bounds("split-handle").expect("handle");
+    open_tab_strip_menu(&h, vcx, "p1");
+    click(vcx, "tab-menu-convert-axis");
+    vcx.run_until_parked();
+    let after = vcx.debug_bounds("split-handle").expect("handle after");
+    assert!(
+        after.size.width > after.size.height,
+        "vertical split handle should be a row, was {:?}",
+        after.size
+    );
+    assert!(
+        before.size.height > before.size.width,
+        "horizontal handle should have been a column first, was {:?}",
+        before.size
+    );
+    assert!(shown(vcx, "split-well"), "converting axis unsplits");
+}
+
+/// The plate paints decoded bytes, not an HTTP URL gpui cannot fetch.
+/// The harness injects a 1×1 PNG the way Chromium's download_image
+/// callback would after a live fetch.
+#[gpui::test]
+fn a_page_tab_paints_its_favicon_when_the_bytes_are_in(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::set_favicon_for_test(
+        "p1",
+        Some(std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            TINY_PNG.to_vec(),
+        ))),
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/"), Some("A"))],
+        Some("p1"),
+    );
+    assert!(
+        shown(vcx, "tab-favicon-p1"),
+        "a page with favicon bytes still drew the globe"
+    );
+    crate::web::set_favicon_for_test("p1", None);
+}
+
+/// Add Split View from the menu is the same act as dropping one tab on
+/// another: the well becomes a view of two existing tabs.
+#[gpui::test]
+fn add_split_view_from_the_menu_splits_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    open_tab_strip_menu(&h, vcx, "p1");
+    click(vcx, "tab-menu-add-split");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "split-well"),
+        "Add Split View did not split the well"
+    );
+}

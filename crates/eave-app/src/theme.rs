@@ -694,6 +694,17 @@ pub fn inverse_hover() -> Hsla {
 pub fn accent() -> Hsla {
     oklch(0.702, 0.183, 293.541)
 }
+
+/// Ring around the focused split pane.
+///
+/// Same pigment and the same job as the composer's draft rim: this is
+/// where input is going next, not a location. A selected tab is a
+/// location and stays on [`selection_rim`]; clicking a pane is an
+/// action, so the ring is the accent's. Always laid out (transparent
+/// when the pane is not focused) so focusing cannot shift the well.
+pub fn pane_focus_ring() -> Hsla {
+    accent()
+}
 /// The armed send button under the pointer — **Tailwind violet-300**,
 /// `oklch(0.811 0.111 293.571)`, one step up the same ramp.
 ///
@@ -1440,6 +1451,16 @@ pub const RAIL_W_MIN: f32 = 180.0;
 /// files rail to escape. 320 is the old 248 plus the same 72 px the floor
 /// sits below it, so the resting width is centred in its own range.
 pub const RAIL_W_MAX: f32 = 320.0;
+
+/// Narrowest fraction a split pane may occupy.
+///
+/// Derived, not chosen: the pane header's three icon buttons (`ICON_TOGGLE`
+/// × 3) plus their gaps need ~100 px to stay usable, and the default well
+/// is `WINDOW_W` − `RAIL_W` − 2×`CARD_GUTTER` = 1080 − 228 − 16 = 836.
+/// 100/836 ≈ 0.12. 0.20 leaves ~167 px so the address still has a slot
+/// after the arrows, matching the rail handle's "a hit target must be
+/// bigger than the seam it marks" reasoning applied to a pane.
+pub const SPLIT_RATIO_MIN: f32 = 0.20;
 
 /// The resize handle straddling the rail's seam.
 ///
