@@ -11791,7 +11791,7 @@ fn japanese_composes_in_the_composer_and_commits(cx: &mut TestAppContext) {
 /// paragraph meant deleting everything after it.
 #[gpui::test]
 fn the_draft_can_be_selected_and_typed_over(cx: &mut TestAppContext) {
-    let (mut h, vcx) = boot(cx);
+    let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
     let field = composer_field(&h, vcx);
     let selection = |vcx: &mut VisualTestContext, field: &Entity<TextField>| {
@@ -11847,7 +11847,7 @@ fn the_draft_can_be_selected_and_typed_over(cx: &mut TestAppContext) {
 /// of the glyphs, and pinning it would be pinning the font.
 #[gpui::test]
 fn a_click_places_the_caret_in_the_draft(cx: &mut TestAppContext) {
-    let (mut h, vcx) = boot(cx);
+    let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
     let field = composer_field(&h, vcx);
 
@@ -11904,7 +11904,7 @@ fn shift_return_breaks_a_line_and_return_still_sends(cx: &mut TestAppContext) {
 /// rather than the letter. eave had no undo at all.
 #[gpui::test]
 fn the_draft_undoes_a_word_at_a_time(cx: &mut TestAppContext) {
-    let (mut h, vcx) = boot(cx);
+    let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
 
     vcx.simulate_input("hello");
@@ -11928,7 +11928,7 @@ fn the_draft_undoes_a_word_at_a_time(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_palette_borrows_the_arrows_and_returns_them(cx: &mut TestAppContext) {
     let project = SlashProject::new("borrow");
-    let (mut h, vcx) = boot(cx);
+    let (h, vcx) = boot(cx);
     open_session_in(&h, vcx, &project);
     let field = composer_field(&h, vcx);
 
