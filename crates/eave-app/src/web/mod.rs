@@ -259,6 +259,13 @@ thread_local! {
     /// which renders the same as 100% but is not the same state: the pane
     /// header states zoom only when it is not the default, and that is the
     /// difference between a fact and a decoration.
+    ///
+    /// **This is the second of two sources of truth, and the other one is
+    /// durable.** Chromium stores zoom per *host* and writes it to
+    /// `Preferences` on every ⌘+ — measured, see `web/zoom.rs`. This map is
+    /// keyed by tab and starts empty each launch, so a fresh tab on a
+    /// previously-zoomed origin should render zoomed while this says 100%.
+    /// G5 is the reconciliation.
     static ZOOMS: std::cell::RefCell<std::collections::HashMap<String, usize>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 
