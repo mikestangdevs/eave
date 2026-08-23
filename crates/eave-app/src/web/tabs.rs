@@ -870,6 +870,7 @@ wrap_life_span_handler! {
             // releasing one unanswered is the difference between a clean
             // teardown and a hang.
             super::dialogs::forget(&self.tab_id);
+            super::policy::forget(&self.tab_id);
             // Slice E1. A find that outlived its page would state a count
             // about a document that is gone; the zoom is dropped for the
             // same reason `close_browser` is reached at all, which is that
@@ -954,14 +955,41 @@ wrap_load_handler! {
             &self,
             browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
-            _error_code: Errorcode,
+            error_code: Errorcode,
             error_text: Option<&CefString>,
-            _failed_url: Option<&CefString>,
+            failed_url: Option<&CefString>,
         ) {
             if std::env::var("EAVE_WEB_TRACE").is_ok() {
                 eprintln!("[web] on_load_error {:?}", error_text.map(|t| t.to_string()));
             }
             if frame.map(|f| f.is_main()) != Some(1) {
+                return;
+            }
+            // E2's fallback. An upgrade eave made that could not connect
+            // goes back to http rather than showing the operator a
+            // connection error for a site that was working before.
+            //
+            // `ERR_ABORTED` is excluded inside `policy::fallback`, and it
+            // has to be: an upgrade is performed BY CANCELLING the http
+            // navigation, so an abort arrives on every upgrade eave makes.
+            let why = if error_code == Errorcode::ABORTED {
+                super::policy::Failure::Aborted
+            } else {
+                super::policy::Failure::Unreachable
+            };
+            let failed = failed_url.map(|u| u.to_string()).unwrap_or_default();
+            if let Some(http_url) = super::policy::fallback(&self.tab_id, &failed, why) {
+                if trace() {
+                    eprintln!("[web] policy: fell back {failed} -> {http_url}");
+                }
+                request(super::PageRequest::Navigate {
+                    tab_id: self.tab_id.clone(),
+                    url: http_url,
+                });
+                // Not reported as a failure: the tab is not failing, it is
+                // taking the other route. Reporting `LoadState::Failed`
+                // here would flash an error state that the very next
+                // navigation replaces.
                 return;
             }
             // The engine's own words, rendered verbatim — `LoadState::Failed`
@@ -1189,7 +1217,7 @@ wrap_request_handler! {
         fn on_before_browse(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             // Named `incoming`, not `request`: this module has a free
             // `request()` that posts to the sink, and a parameter of that
             // name silently shadows it.
@@ -1200,6 +1228,7 @@ wrap_request_handler! {
             let Some(req) = incoming else {
                 return 0;
             };
+            let is_main_frame = frame.map(|f| f.is_main()) == Some(1);
             // `url()` hands back a userfree string, which has no `Display`
             // of its own — the utf16 view does.
             let url = CefStringUtf16::from(&req.url()).to_string();
@@ -1208,12 +1237,19 @@ wrap_request_handler! {
             // navigation, and `LAST_URL` already tracks it per tab for the
             // address dedup.
             let from = last_url(&self.tab_id);
-            let decision = super::policy::decide(
-                &url,
-                from.as_deref(),
-                &method,
-                is_redirect != 0,
-            );
+            // E2 consults what this session has already learned: a host
+            // that failed TLS once is not tried again.
+            let allow_upgrade = super::policy::host(&url)
+                .map(|h| super::policy::may_upgrade(&h))
+                .unwrap_or(false);
+            let decision = super::policy::decide(super::policy::Nav {
+                url: &url,
+                from: from.as_deref(),
+                method: &method,
+                is_redirect: is_redirect != 0,
+                is_main_frame,
+                allow_upgrade,
+            });
             match decision {
                 super::policy::Decision::Allow => 0,
                 super::policy::Decision::Rewrite(clean) => {
@@ -1223,6 +1259,20 @@ wrap_request_handler! {
                     request(super::PageRequest::Navigate {
                         tab_id: self.tab_id.clone(),
                         url: clean,
+                    });
+                    1
+                }
+                super::policy::Decision::Upgrade { to, fallback } => {
+                    if trace() {
+                        eprintln!("[web] policy: upgraded {url} -> {to}");
+                    }
+                    // Recorded BEFORE the navigation is asked for. The
+                    // failure that needs this record can arrive as soon as
+                    // the navigation starts.
+                    super::policy::note_upgrade(&self.tab_id, &to, &fallback);
+                    request(super::PageRequest::Navigate {
+                        tab_id: self.tab_id.clone(),
+                        url: to,
                     });
                     1
                 }

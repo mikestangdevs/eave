@@ -41,6 +41,14 @@ pub enum Decision {
     Rewrite(String),
     /// Not a page. Hand it to the operating system.
     External(String),
+    /// The same page, over TLS (E2).
+    ///
+    /// Separate from [`Self::Rewrite`] because the caller has an obligation
+    /// a plain rewrite does not carry: it must **remember** the upgrade, so
+    /// that a failure can go back. `fallback` is the http URL to return to
+    /// — already query-stripped, so falling back does not reintroduce a
+    /// tracker that was removed on the way up.
+    Upgrade { to: String, fallback: String },
     /// A scheme eave will neither render nor hand to the OS.
     ///
     /// This is the same posture `ui::open_url` already takes for markdown
@@ -49,6 +57,25 @@ pub enum Decision {
     /// An allow-list is the security boundary; a deny-list would be a
     /// guess about every app installed on the machine.
     Block,
+}
+
+/// One navigation, and everything a decision needs to know about it.
+///
+/// A struct rather than six positional arguments because the list grows:
+/// strict mode and a per-site shields-down toggle are both settings eave
+/// does not have yet, and both belong here when it does.
+#[derive(Debug, Clone, Copy)]
+pub struct Nav<'a> {
+    pub url: &'a str,
+    /// Where the tab is now — the initiator of a top-level navigation.
+    pub from: Option<&'a str>,
+    pub method: &'a str,
+    pub is_redirect: bool,
+    pub is_main_frame: bool,
+    /// False once this host has already failed over TLS this session, which
+    /// is what stops eave upgrading the same host on every navigation and
+    /// paying a failed connection each time.
+    pub allow_upgrade: bool,
 }
 
 /// Schemes eave will hand to the OS.
@@ -199,6 +226,105 @@ const CONDITIONAL_TRACKERS: &[(&str, &[&str])] = &[
 /// `urldefense.com` rewrites a whole URL into its own path, so "strip a
 /// parameter" there means corrupting somebody else's encoding.
 const EXEMPT_HOSTS: &[&str] = &["urldefense.com"];
+
+/// Hosts and host shapes that are never upgraded to HTTPS.
+///
+/// **This list is the feature.** An upgrade with no exclusions breaks every
+/// host that genuinely has no TLS, and breaks it as a *connection error* —
+/// which reads to the operator as "eave is broken", not "that site is
+/// http". Each entry below is a class of host where https is not merely
+/// unlikely but wrong.
+fn upgradable_host(host: &str) -> bool {
+    // Loopback. A dev server on http://localhost is the single most common
+    // http URL an eave operator will ever type.
+    if host == "localhost" || host.ends_with(".localhost") {
+        return false;
+    }
+    // Literal addresses never have a certificate that validates.
+    if is_ip_literal(host) {
+        return false;
+    }
+    // mDNS and Tor: `.local` is a LAN name, `.onion` is not reachable over
+    // TLS in the ordinary way and upgrading it leaks intent.
+    if host.ends_with(".local") || host.ends_with(".onion") {
+        return false;
+    }
+    // A single label is an intranet name — `http://wiki`, `http://build`.
+    // There is no public CA that will have issued for it.
+    if !host.contains('.') {
+        return false;
+    }
+    true
+}
+
+/// Whether a host is an IPv4 or IPv6 literal rather than a name.
+///
+/// The v6 case arrives here already unbracketed, because [`host`] strips
+/// the brackets — so "contains a colon" is enough to recognise it.
+fn is_ip_literal(host: &str) -> bool {
+    if host.contains(':') {
+        return true; // v6 literal
+    }
+    let mut labels = 0;
+    for label in host.split('.') {
+        if label.is_empty() || !label.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        labels += 1;
+    }
+    labels == 4
+}
+
+/// The port a URL states, or `None` when it states none.
+fn port(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?;
+    // An IPv6 literal's colons are inside the brackets; the port, if any,
+    // is after them.
+    let after = match hostport.split_once(']') {
+        Some((_, tail)) => tail,
+        None => hostport,
+    };
+    after
+        .split_once(':')
+        .map(|(_, p)| p)
+        .filter(|p| !p.is_empty())
+}
+
+/// `http://…` as `https://…`, if this navigation should be upgraded.
+///
+/// Pure — the session's memory of what has already failed arrives as
+/// [`Nav::allow_upgrade`].
+///
+/// # Two deliberate refusals
+/// **A non-default port is never upgraded.** `http://host:8080` is a dev
+/// server or an appliance, and https on the same port is a different
+/// service or nothing at all. Chrome's HTTPS-Upgrades declines these too.
+///
+/// **A redirect target is never upgraded.** A site that deliberately
+/// redirects https → http would otherwise be upgraded straight back, and
+/// the two would trade the navigation forever. Only a navigation somebody
+/// asked for is a candidate.
+pub fn upgrade_target(nav: &Nav<'_>) -> Option<String> {
+    if !nav.allow_upgrade || !nav.is_main_frame || nav.is_redirect {
+        return None;
+    }
+    // A POST re-issued over a different scheme is a second submission.
+    if !nav.method.eq_ignore_ascii_case("GET") {
+        return None;
+    }
+    if scheme(nav.url)?.as_str() != "http" {
+        return None;
+    }
+    if port(nav.url).is_some_and(|p| p != "80") {
+        return None;
+    }
+    if !upgradable_host(&host(nav.url)?) {
+        return None;
+    }
+    Some(format!("https://{}", nav.url.strip_prefix("http://")?))
+}
 
 /// The scheme of a URL, lower-cased, or `None` if it has none.
 ///
@@ -356,80 +482,188 @@ fn parts(url: &str) -> (&str, Option<&str>, &str) {
 
 /// What to do with a navigation.
 ///
-/// `from` is the URL the tab is currently on — the initiator, for a
-/// top-level navigation. `None` means eave does not know, which happens for
-/// the first load of a tab; an unknown initiator is treated as cross-site,
-/// which is Brave's behaviour and the stripping one.
-pub fn decide(url: &str, from: Option<&str>, method: &str, is_redirect: bool) -> Decision {
-    let Some(scheme) = scheme(url) else {
+/// The order matters and is not arbitrary: scheme first (a `mailto:` is not
+/// a page and nothing else applies to it), then the query filter, then the
+/// upgrade. Stripping before upgrading means the fallback URL is already
+/// clean, so a site that fails over TLS does not get its trackers back on
+/// the way down.
+pub fn decide(nav: Nav<'_>) -> Decision {
+    let Some(scheme) = scheme(nav.url) else {
         // No scheme at all. Not this module's problem to fix.
         return Decision::Allow;
     };
     if EXTERNAL_SCHEMES.contains(&scheme.as_str()) {
-        return Decision::External(url.to_string());
+        return Decision::External(nav.url.to_string());
     }
     if !WEB_SCHEMES.contains(&scheme.as_str()) {
         return Decision::Block;
     }
 
-    // ── From here down it is only the query filter ────────────────────
-    //
-    // Every gate below is Brave's, and each one exists because removing it
-    // breaks a real site rather than because it is tidy.
+    let stripped = stripped_url(&nav);
+    let http_url = stripped.as_deref().unwrap_or(nav.url);
 
+    // E2. Asked of the stripped URL, so `fallback` is the clean one.
+    let upgraded = {
+        let on_clean = Nav {
+            url: http_url,
+            ..nav
+        };
+        upgrade_target(&on_clean)
+    };
+    if let Some(to) = upgraded {
+        return Decision::Upgrade {
+            to,
+            fallback: http_url.to_string(),
+        };
+    }
+    match stripped {
+        Some(clean) => Decision::Rewrite(clean),
+        None => Decision::Allow,
+    }
+}
+
+/// The URL with its tracking parameters removed, or `None` if it had none.
+///
+/// Every gate here is Brave's, and each one exists because removing it
+/// breaks a real site rather than because it is tidy.
+fn stripped_url(nav: &Nav<'_>) -> Option<String> {
     // Only GET. A POST carries its payload separately and rewriting the
     // URL would re-issue it as a different request.
-    if !method.eq_ignore_ascii_case("GET") {
-        return Decision::Allow;
+    if !nav.method.eq_ignore_ascii_case("GET") {
+        return None;
     }
-    let (head, Some(query), frag) = parts(url) else {
-        return Decision::Allow;
-    };
+    let (head, query, frag) = parts(nav.url);
+    let query = query?;
     if query.is_empty() {
-        return Decision::Allow;
+        return None;
     }
-    let Some(host) = host(url) else {
-        return Decision::Allow;
-    };
+    let host = host(nav.url)?;
     if EXEMPT_HOSTS.iter().any(|h| host_is(&host, h)) {
-        return Decision::Allow;
+        return None;
     }
     // Same-site navigation: the parameters are the site's own business.
     // This is the gate that keeps analytics-driven site features working,
     // and dropping it is how a query filter earns a reputation for breaking
-    // logins.
-    if let Some(from) = from {
+    // logins. A redirect within a site is the same case — the site's own
+    // plumbing.
+    if let Some(from) = nav.from {
         if let Some(from_host) = self::host(from) {
             if same_site(&host, &from_host) {
-                return Decision::Allow;
+                return None;
             }
         }
     }
-    // A redirect eave did not cause is still a navigation somebody asked
-    // for; a redirect within a site is the site's own plumbing.
-    if is_redirect {
-        if let Some(from) = from {
-            if let Some(from_host) = self::host(from) {
-                if same_site(&host, &from_host) {
-                    return Decision::Allow;
-                }
-            }
-        }
-    }
+    let _ = nav.is_redirect;
 
-    let Some(clean) = strip_query(query, url, &host) else {
-        return Decision::Allow;
-    };
+    let clean = strip_query(query, nav.url, &host)?;
     // Brave's last gate: only rewrite if the query actually got shorter.
     if clean.len() >= query.len() {
-        return Decision::Allow;
+        return None;
     }
-    let rebuilt = if clean.is_empty() {
+    Some(if clean.is_empty() {
         format!("{head}{frag}")
     } else {
         format!("{head}?{clean}{frag}")
-    };
-    Decision::Rewrite(rebuilt)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The session's memory (E2)
+// ---------------------------------------------------------------------------
+//
+// Two pieces of state, both here rather than behind the feature gate, for
+// the reason the rest of this file is here: the suite runs with the feature
+// OFF, and a fallback that has never been asserted is a fallback nobody
+// should trust.
+
+thread_local! {
+    /// Hosts that have already failed over TLS in this session.
+    ///
+    /// Without this, every navigation to an http-only host pays a failed
+    /// TLS connection first — so the site works, but every page load on it
+    /// is slower than it was before eave "improved" it.
+    static DOWNGRADED: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// The upgrade a tab is currently attempting: the https URL in flight,
+    /// and the http URL to go back to.
+    ///
+    /// One slot per tab, not a queue. A second navigation replaces the
+    /// first, because the first is no longer happening.
+    static IN_FLIGHT: std::cell::RefCell<std::collections::HashMap<String, (String, String)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether this host may still be upgraded.
+pub fn may_upgrade(host: &str) -> bool {
+    DOWNGRADED.with(|d| !d.borrow().contains(host))
+}
+
+/// Remember that this host does not serve TLS, so eave stops trying.
+pub fn note_downgrade(host: &str) {
+    DOWNGRADED.with(|d| {
+        d.borrow_mut().insert(host.to_string());
+    });
+}
+
+/// Record an upgrade this tab is attempting.
+pub fn note_upgrade(tab_id: &str, to: &str, fallback: &str) {
+    IN_FLIGHT.with(|f| {
+        f.borrow_mut()
+            .insert(tab_id.to_string(), (to.to_string(), fallback.to_string()));
+    });
+}
+
+/// Why a load ended without a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The navigation was cancelled — by eave, or by the operator pressing
+    /// stop. **Never a reason to fall back**, and this is the trap the whole
+    /// enum exists to avoid: eave performs an upgrade *by cancelling* the
+    /// http navigation, so `ERR_ABORTED` arrives on every single upgrade. A
+    /// fallback that fired on it would undo every upgrade it ever made,
+    /// instantly and invisibly.
+    Aborted,
+    /// The connection failed, the name did not resolve, the certificate was
+    /// rejected. The site is not reachable this way.
+    Unreachable,
+}
+
+/// A load failed. If it was an upgrade eave made, returns the http URL to
+/// go back to — and remembers not to upgrade that host again.
+///
+/// # An HTTP error status is not a failure
+/// A 404 or a 500 over https is a **successful connection** to a site that
+/// has TLS, and Brave's own test pins this: `broken2.com` serves a 404 over
+/// https and the expected result is that the page stays on https. CEF makes
+/// this easy to get right — `on_load_error` does not fire for an HTTP error
+/// status, only for a load that produced no response at all.
+pub fn fallback(tab_id: &str, failed_url: &str, why: Failure) -> Option<String> {
+    if why == Failure::Aborted {
+        return None;
+    }
+    let (in_flight, http_url) = IN_FLIGHT.with(|f| f.borrow().get(tab_id).cloned())?;
+    if in_flight != failed_url {
+        // A different navigation failed. The upgrade, if any, is still
+        // outstanding and is not answered by this.
+        return None;
+    }
+    // Taken, not read: if the http attempt fails too, there is no record
+    // left and nothing to loop on.
+    IN_FLIGHT.with(|f| {
+        f.borrow_mut().remove(tab_id);
+    });
+    if let Some(h) = host(failed_url) {
+        note_downgrade(&h);
+    }
+    Some(http_url)
+}
+
+/// A tab went away.
+pub fn forget(tab_id: &str) {
+    IN_FLIGHT.with(|f| {
+        f.borrow_mut().remove(tab_id);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -450,8 +684,30 @@ mod tests {
     /// Cross-site, so the filter is actually reached.
     const FROM: Option<&str> = Some("https://example.net/");
 
+    /// An ordinary top-level GET, upgrades allowed.
+    fn nav(url: &str) -> Nav<'_> {
+        Nav {
+            url,
+            from: FROM,
+            method: "GET",
+            is_redirect: false,
+            is_main_frame: true,
+            allow_upgrade: true,
+        }
+    }
+
+    /// The query filter in isolation.
+    ///
+    /// `allow_upgrade: false` on purpose — several of Brave's cases are
+    /// `http://` URLs, and with E2 in play they would come back as
+    /// [`Decision::Upgrade`] and prove nothing about the filter. The two
+    /// features are tested separately because they are separate decisions;
+    /// `an_http_url_is_stripped_and_upgraded_in_one_step` is where they meet.
     fn filtered(url: &str) -> Decision {
-        decide(url, FROM, "GET", false)
+        decide(Nav {
+            allow_upgrade: false,
+            ..nav(url)
+        })
     }
 
     #[test]
@@ -486,11 +742,11 @@ mod tests {
     #[test]
     fn mail_and_phone_links_leave_the_browser() {
         assert_eq!(
-            decide("mailto:a@b.test", FROM, "GET", false),
+            decide(nav("mailto:a@b.test")),
             Decision::External("mailto:a@b.test".into())
         );
         assert_eq!(
-            decide("tel:+15551234", FROM, "GET", false),
+            decide(nav("tel:+15551234")),
             Decision::External("tel:+15551234".into())
         );
     }
@@ -499,23 +755,14 @@ mod tests {
     /// whatever registered for a scheme, and this string came from a page.
     #[test]
     fn an_unknown_scheme_is_refused_rather_than_handed_to_the_os() {
-        assert_eq!(
-            decide("zoommtg://zoom.us/join", FROM, "GET", false),
-            Decision::Block
-        );
-        assert_eq!(
-            decide("javascript:alert(1)", FROM, "GET", false),
-            Decision::Block
-        );
+        assert_eq!(decide(nav("zoommtg://zoom.us/join")), Decision::Block);
+        assert_eq!(decide(nav("javascript:alert(1)")), Decision::Block);
     }
 
     #[test]
     fn ordinary_pages_are_allowed() {
-        assert_eq!(
-            decide("https://a.test/", FROM, "GET", false),
-            Decision::Allow
-        );
-        assert_eq!(decide("about:blank", FROM, "GET", false), Decision::Allow);
+        assert_eq!(decide(nav("https://a.test/")), Decision::Allow);
+        assert_eq!(decide(nav("about:blank")), Decision::Allow);
     }
 
     // ── E5: Brave's `QueryStringUntouched`, ported ────────────────────
@@ -672,7 +919,10 @@ mod tests {
             "https://sub.example.com/path", // same site
         ] {
             assert_eq!(
-                decide("https://example.com/?fbclid=1", Some(from), "GET", false),
+                decide(Nav {
+                    from: Some(from),
+                    ..nav("https://example.com/?fbclid=1")
+                }),
                 Decision::Allow,
                 "stripped a same-site navigation from {from}"
             );
@@ -682,7 +932,10 @@ mod tests {
     #[test]
     fn only_get_is_filtered() {
         assert_eq!(
-            decide("https://example.com/?fbclid=1", FROM, "POST", false),
+            decide(Nav {
+                method: "POST",
+                ..nav("https://example.com/?fbclid=1")
+            }),
             Decision::Allow
         );
     }
@@ -690,21 +943,19 @@ mod tests {
     #[test]
     fn a_same_site_redirect_is_exempt_and_a_cross_site_one_is_not() {
         assert_eq!(
-            decide(
-                "https://example.com/?fbclid=1",
-                Some("https://sub.example.com/"),
-                "GET",
-                true
-            ),
+            decide(Nav {
+                from: Some("https://sub.example.com/"),
+                is_redirect: true,
+                ..nav("https://example.com/?fbclid=1")
+            }),
             Decision::Allow
         );
         assert_eq!(
-            decide(
-                "https://example.com/?fbclid=1",
-                Some("https://other.test/"),
-                "GET",
-                true
-            ),
+            decide(Nav {
+                from: Some("https://other.test/"),
+                is_redirect: true,
+                ..nav("https://example.com/?fbclid=1")
+            }),
             Decision::Rewrite("https://example.com/".into())
         );
     }
@@ -722,8 +973,195 @@ mod tests {
     #[test]
     fn an_unknown_initiator_still_strips() {
         assert_eq!(
-            decide("https://example.com/?fbclid=1", None, "GET", false),
+            decide(Nav {
+                from: None,
+                ..nav("https://example.com/?fbclid=1")
+            }),
             Decision::Rewrite("https://example.com/".into())
+        );
+    }
+
+    // ── E2: the upgrade ───────────────────────────────────────────────
+
+    #[test]
+    fn an_ordinary_http_page_is_upgraded() {
+        assert_eq!(
+            decide(nav("http://example.com/page")),
+            Decision::Upgrade {
+                to: "https://example.com/page".into(),
+                fallback: "http://example.com/page".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn https_is_left_alone() {
+        assert_eq!(decide(nav("https://example.com/page")), Decision::Allow);
+    }
+
+    /// **The list that keeps this feature from being a bug.** Every one of
+    /// these is a host where https is not merely unlikely but wrong, and
+    /// upgrading it fails as a connection error — which reads as "eave is
+    /// broken" rather than "that site is http".
+    #[test]
+    fn the_hosts_that_have_no_tls_are_never_upgraded() {
+        for url in [
+            "http://localhost/",
+            "http://localhost:80/",
+            "http://app.localhost/",
+            "http://127.0.0.1/",
+            "http://192.168.1.10/",
+            "http://[::1]/",
+            "http://printer.local/",
+            "http://abcdefgh.onion/",
+            "http://wiki/",
+        ] {
+            assert_eq!(decide(nav(url)), Decision::Allow, "upgraded {url}");
+        }
+    }
+
+    /// A dev server. https on the same port is a different service or
+    /// nothing at all.
+    #[test]
+    fn a_non_default_port_is_never_upgraded() {
+        assert_eq!(decide(nav("http://example.com:8080/")), Decision::Allow);
+        assert_eq!(
+            decide(nav("http://example.com:80/")),
+            Decision::Upgrade {
+                to: "https://example.com:80/".into(),
+                fallback: "http://example.com:80/".into(),
+            },
+            "port 80 is the default, and stated or not it is the same URL"
+        );
+    }
+
+    /// A site that deliberately redirects https → http would otherwise be
+    /// upgraded straight back, and the two would trade the navigation
+    /// forever.
+    #[test]
+    fn a_redirect_target_is_never_upgraded() {
+        assert_eq!(
+            decide(Nav {
+                is_redirect: true,
+                ..nav("http://example.com/")
+            }),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn a_post_is_never_upgraded_because_that_is_a_second_submission() {
+        assert_eq!(
+            decide(Nav {
+                method: "POST",
+                ..nav("http://example.com/")
+            }),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn a_subframe_is_not_a_navigation_this_decides() {
+        assert_eq!(
+            decide(Nav {
+                is_main_frame: false,
+                ..nav("http://example.com/")
+            }),
+            Decision::Allow
+        );
+    }
+
+    /// Stripping happens BEFORE upgrading, so the URL eave falls back to is
+    /// the clean one. Falling back must not hand the trackers back.
+    #[test]
+    fn an_http_url_is_stripped_and_upgraded_in_one_step() {
+        assert_eq!(
+            decide(nav("http://example.com/?fbclid=1&foo=2")),
+            Decision::Upgrade {
+                to: "https://example.com/?foo=2".into(),
+                fallback: "http://example.com/?foo=2".into(),
+            }
+        );
+    }
+
+    // ── E2: the fallback ──────────────────────────────────────────────
+
+    /// **The trap this whole feature turns on.** eave performs an upgrade
+    /// BY CANCELLING the http navigation, so `ERR_ABORTED` arrives on every
+    /// single upgrade. A fallback that fired on it would undo every upgrade
+    /// it ever made, instantly and invisibly — the feature would appear to
+    /// do nothing at all.
+    #[test]
+    fn an_abort_never_falls_back() {
+        note_upgrade("t-abort", "https://a.test/", "http://a.test/");
+        assert_eq!(
+            fallback("t-abort", "https://a.test/", Failure::Aborted),
+            None
+        );
+        assert!(
+            may_upgrade("a.test"),
+            "an abort must not blacklist the host either"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_upgrade_goes_back_to_http_and_stops_retrying() {
+        note_upgrade("t-fail", "https://b.test/", "http://b.test/");
+        assert!(may_upgrade("b.test"));
+        assert_eq!(
+            fallback("t-fail", "https://b.test/", Failure::Unreachable),
+            Some("http://b.test/".to_string())
+        );
+        assert!(
+            !may_upgrade("b.test"),
+            "a host that has failed TLS once must not be retried on every load"
+        );
+        assert_eq!(
+            decide(Nav {
+                allow_upgrade: may_upgrade("b.test"),
+                ..nav("http://b.test/")
+            }),
+            Decision::Allow,
+            "and the decision must actually consult that memory"
+        );
+    }
+
+    /// If the http attempt fails too there is no record left, so nothing
+    /// loops.
+    #[test]
+    fn a_fallback_is_taken_once() {
+        note_upgrade("t-once", "https://c.test/", "http://c.test/");
+        assert!(fallback("t-once", "https://c.test/", Failure::Unreachable).is_some());
+        assert_eq!(
+            fallback("t-once", "http://c.test/", Failure::Unreachable),
+            None,
+            "the http failure must find no record to fall back to"
+        );
+    }
+
+    /// A failure on some other URL is not an answer to the outstanding
+    /// upgrade — a subresource or a stale navigation must not consume it.
+    #[test]
+    fn a_different_urls_failure_does_not_consume_the_upgrade() {
+        note_upgrade("t-other", "https://d.test/", "http://d.test/");
+        assert_eq!(
+            fallback("t-other", "https://elsewhere.test/", Failure::Unreachable),
+            None
+        );
+        assert_eq!(
+            fallback("t-other", "https://d.test/", Failure::Unreachable),
+            Some("http://d.test/".to_string()),
+            "the real failure still answers it"
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_forgets_its_upgrade() {
+        note_upgrade("t-gone", "https://e.test/", "http://e.test/");
+        forget("t-gone");
+        assert_eq!(
+            fallback("t-gone", "https://e.test/", Failure::Unreachable),
+            None
         );
     }
 
@@ -733,12 +1171,10 @@ mod tests {
     #[test]
     fn multi_label_public_suffixes_are_treated_as_one_site_and_under_strip() {
         assert_eq!(
-            decide(
-                "https://a.co.uk/?fbclid=1",
-                Some("https://b.co.uk/"),
-                "GET",
-                false
-            ),
+            decide(Nav {
+                from: Some("https://b.co.uk/"),
+                ..nav("https://a.co.uk/?fbclid=1")
+            }),
             Decision::Allow,
             "documented under-strip: `same_site` has no public-suffix list"
         );
