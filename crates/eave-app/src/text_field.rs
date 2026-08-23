@@ -60,13 +60,13 @@
 //! 8. **`TextField::insert`** — the edit `replace_text_in_range` performs,
 //!    reachable without a `Window`. eave's ⌘V has none to give by the time it
 //!    has text; see the method.
+//! 9. **`Paste` is left unbound** by [`init`]. eave's ⌘V has to answer an
+//!    image and a dropped file path too, so the chord has exactly one reader
+//!    and it is eave's.
 //! 10. **`enter` is left unbound** by [`init`] too, and for a sharper reason:
 //!     two bindings on one chord at the same dispatch depth are resolved by
 //!     registration order, which nothing in either file declares. eave binds
 //!     both `enter` and `shift-enter` on its own context.
-//! 9. **`Paste` is left unbound** by [`init`]. eave's ⌘V has to answer an
-//!    image and a dropped file path too, so the chord has exactly one reader
-//!    and it is eave's.
 //!
 //! # Re-vendoring
 //!
