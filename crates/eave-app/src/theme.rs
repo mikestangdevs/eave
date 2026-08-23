@@ -1190,6 +1190,18 @@ pub const MODEL_CHIP_MAX_W: f32 = 168.0;
 pub const CHIP_THUMB: f32 = 56.0;
 pub const STATE_DOT: f32 = 6.0;
 pub const TOOL_DOT: f32 = 5.0;
+// The tool row's disclosure chevron was an eave token for one commit and is
+// gone again: bezel's `step_row` draws it from `expanded`, so a token here
+// would name a value nothing reads. See docs/reports/stage-bz-bezel.md §5.
+
+/// The diff's `+`/`-` column.
+///
+/// Slice BZ, extracted from bezel's diff pattern. eave told add from remove by
+/// a wash at DIFF_WASH_ALPHA (0.10) and nothing else — weak at that alpha, and
+/// nothing at all to a reader who cannot separate the two hues. A glyph in its
+/// own fixed column survives both, and being fixed is what keeps the text
+/// left edges aligned down the pane whatever the sign is.
+pub const DIFF_SIGN_W: f32 = 10.0;
 
 // ---------------------------------------------------------------------------
 // Icons (Slices P3, Q1) — the box a glyph is drawn into.

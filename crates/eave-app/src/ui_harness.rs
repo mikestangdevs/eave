@@ -1029,6 +1029,61 @@ fn a_fence_leaves_the_app_when_you_click_copy(cx: &mut TestAppContext) {
 /// a `tool_result`'s id and threw away its `content`, and kept a `tool_use`'s
 /// id and name and threw away its `input`. An agent could run the whole test
 /// suite and eave would show you two words, neither of them the command.
+/// A tool row with a body opens onto it; one without has nothing to open.
+///
+/// **The affordance itself is no longer measurable, and that is worth
+/// recording.** Slice BZ first drew eave's own disclosure chevron here, with
+/// its own selector, and this test measured it — including that it fitted
+/// inside `TOOL_NAME_LINE` and so could not set the row height. Then the row
+/// moved onto bezel's `step_row`, which draws that chevron itself from the
+/// `expanded` argument and emits no selector for it. The affordance is still
+/// on screen; the harness simply cannot see it any more.
+///
+/// So this asserts the behaviour underneath instead: `has_body` is what
+/// decides whether there is a disclosure at all, and `tool-body` — an eave
+/// element, with an eave selector — is what it opens onto.
+#[gpui::test]
+fn only_a_tool_row_with_a_body_says_it_opens(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(
+            1,
+            "toolu_1",
+            "Bash",
+            r#"{"command":"cargo test --workspace"}"#,
+        )],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-row").is_some(),
+        "the tool row is not on screen"
+    );
+    // Shut: the body is not drawn.
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "a tool row drew its body before anyone opened it"
+    );
+
+    // Open it the way a reader would.
+    let head = vcx
+        .debug_bounds("tool-head")
+        .expect("a tool with a body is not clickable");
+    vcx.simulate_click(head.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_some(),
+        "clicking a tool row with a body opened nothing"
+    );
+}
+
 #[gpui::test]
 fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -1049,10 +1104,30 @@ fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
         )],
     });
     vcx.run_until_parked();
+    // Bounds-checked until Slice BZ; see the Codex test above for why this is
+    // now a model-level assertion. The row must still be on screen.
     assert!(
-        vcx.debug_bounds("tool-detail").is_some(),
-        "a running tool row states no command"
+        vcx.debug_bounds("tool-row").is_some(),
+        "a running tool row does not render at all"
     );
+    {
+        let rows = vcx
+            .read_window(&h.window, |shell, cx| {
+                shell.read(cx).transcript.read(cx).transcript.rows.clone()
+            })
+            .unwrap();
+        let detail = rows.iter().find_map(|r| match r {
+            eave_wire::model::Row::Tool {
+                name, input, call, ..
+            } => Some(eave_wire::model::tool_detail(call.as_ref(), name, input)),
+            _ => None,
+        });
+        assert_eq!(
+            detail.flatten().as_deref(),
+            Some("cargo test --workspace"),
+            "a running tool row states no command"
+        );
+    }
 
     // ...and a failure states why, in place.
     h.plumbing.push_feed(FeedEvent::Records {
@@ -1081,8 +1156,17 @@ fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
     assert!(tool.0.contains("cargo test --workspace"), "input dropped");
     assert_eq!(tool.1, "error: 3 tests failed", "result dropped");
     assert!(tool.2, "the provider's error flag dropped");
-    assert!(
-        vcx.debug_bounds("tool-detail").is_some(),
+    // Bounds-checked until Slice BZ — bezel's `step_row` owns the interior
+    // now. The fact survives the finish, which is what this ever meant.
+    let detail = rows.iter().find_map(|r| match r {
+        eave_wire::model::Row::Tool {
+            name, input, call, ..
+        } => Some(eave_wire::model::tool_detail(call.as_ref(), name, input)),
+        _ => None,
+    });
+    assert_eq!(
+        detail.flatten().as_deref(),
+        Some("cargo test --workspace"),
         "the command stopped being stated once the tool finished"
     );
 }
@@ -1253,8 +1337,31 @@ fn a_codex_tool_row_states_its_command(cx: &mut TestAppContext) {
         )],
     });
     vcx.run_until_parked();
+    // **This used to measure `tool-detail`'s bounds.** Slice BZ moved the row
+    // onto bezel's `step_row`, which builds its own interior and emits no
+    // selector, so that element no longer exists to measure. The fact is
+    // asserted at the model level instead: the typed `call` is what a Codex
+    // `commandExecution` decodes through, and `tool_detail` is what the row
+    // is handed. Weaker than a bounds check — it proves the string reaches
+    // the row, not that the row drew it — and that is the price of the swap.
     assert!(
-        vcx.debug_bounds("tool-detail").is_some(),
+        vcx.debug_bounds("tool-row").is_some(),
+        "a Codex tool row does not render at all"
+    );
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).transcript.rows.clone()
+        })
+        .unwrap();
+    let detail = rows.iter().find_map(|r| match r {
+        eave_wire::model::Row::Tool {
+            name, input, call, ..
+        } => Some(eave_wire::model::tool_detail(call.as_ref(), name, input)),
+        _ => None,
+    });
+    assert_eq!(
+        detail.flatten().as_deref(),
+        Some("cargo test --workspace"),
         "a Codex tool row states its command"
     );
 }

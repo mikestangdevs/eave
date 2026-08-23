@@ -1711,40 +1711,85 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                     )));
                 }
                 let mut budget = theme::DIFF_PANE_MAX_LINES;
+                // ── Slice BZ: the diff is bezel's composition ────────
+                // Two decisions taken from `apps/gallery/src/patterns/diff.rs`
+                // and rebuilt here rather than linked, because bezel has no
+                // diff COMPONENT — that file is a demonstration:
+                //
+                //  1. A **sign column**. eave distinguished add from remove by
+                //     a 0.10 wash and nothing else, which is a weak signal at
+                //     that alpha and no signal at all to a colour-blind
+                //     reader. `+`/`-` is unambiguous and survives both.
+                //  2. A hunk header that is a **header** — its own padding and
+                //     a rule under it, not a dim line of text in the flow.
+                //
+                // What it costs: `diff_runs` coalesced a run of same-op lines
+                // into ONE element, and a sign per line cannot. Element count
+                // now scales with lines, not runs. It is bounded by
+                // `DIFF_PANE_MAX_LINES` either way, which is why this is
+                // affordable here and would not be in the transcript.
+                //
+                // Line NUMBERS are bezel's third decision and are not taken:
+                // `DiffLine` carries `op` and `text` and no number, so they
+                // would have to be invented. That is a wire change, not a
+                // styling one.
+                let bz = crate::bezel_theme::theme();
                 'hunks: for hunk in hunks {
                     children.push(
                         div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACE_2))
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .border_b_1()
+                            .border_color(bz.border)
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(bz.text_muted)
                             .truncate()
                             .child(SharedString::from(hunk.header.clone()))
                             .into_any_element(),
                     );
-                    // Consecutive same-op lines render as ONE element (a
-                    // multi-line text under one wash): element count
-                    // scales with runs, not lines.
-                    for (op, text, count) in diff_runs(&hunk.lines, budget) {
-                        budget -= count;
-                        let styled = div()
-                            .px(px(theme::SPACE_1))
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::DIFF_SIZE))
-                            .line_height(px(theme::DIFF_LINE))
-                            .child(SharedString::from(text));
+                    for line in hunk.lines.iter().take(budget) {
+                        let (wash, mark, sign) = match line.op {
+                            DiffOp::Add => (theme::diff_add_bg(), bz.success, "+"),
+                            DiffOp::Del => (theme::diff_del_bg(), bz.danger, "-"),
+                            DiffOp::Ctx => (gpui::transparent_black(), bz.text_faint, " "),
+                        };
                         children.push(
-                            match op {
-                                DiffOp::Add => styled
-                                    .bg(theme::diff_add_bg())
-                                    .text_color(theme::text_secondary_on_wash()),
-                                DiffOp::Del => styled
-                                    .bg(theme::diff_del_bg())
-                                    .text_color(theme::text_secondary_on_wash()),
-                                DiffOp::Ctx => styled.text_color(theme::text_tertiary()),
-                            }
-                            .into_any_element(),
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_start()
+                                .gap(px(theme::SPACE_2))
+                                .px(px(theme::SPACE_2))
+                                .bg(wash)
+                                .font_family(theme::MONO)
+                                .text_size(px(theme::DIFF_SIZE))
+                                .line_height(px(theme::DIFF_LINE))
+                                .child(
+                                    div()
+                                        .w(px(theme::DIFF_SIGN_W))
+                                        .flex_none()
+                                        .text_color(mark)
+                                        .child(sign),
+                                )
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .text_color(if line.op == DiffOp::Ctx {
+                                            bz.text_muted
+                                        } else {
+                                            theme::text_secondary_on_wash()
+                                        })
+                                        .child(SharedString::from(line.text.clone())),
+                                )
+                                .into_any_element(),
                         );
+                        budget -= 1;
                         if budget == 0 {
                             break 'hunks;
                         }
@@ -1780,24 +1825,10 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
         .into_any_element()
 }
 
-/// Group consecutive same-op diff lines into one multi-line string per
-/// run, taking at most `budget` lines (the render cap): element count
-/// scales with runs, line count is bounded, and each run reports how
-/// many lines it holds so the caller can spend the budget.
-fn diff_runs(lines: &[DiffLine], budget: usize) -> Vec<(DiffOp, String, usize)> {
-    let mut runs: Vec<(DiffOp, String, usize)> = Vec::new();
-    for l in lines.iter().take(budget) {
-        match runs.last_mut() {
-            Some((op, buf, count)) if *op == l.op => {
-                buf.push('\n');
-                buf.push_str(&l.text);
-                *count += 1;
-            }
-            _ => runs.push((l.op, l.text.clone(), 1)),
-        }
-    }
-    runs
-}
+// `diff_runs` — which coalesced a run of same-op lines into one element —
+// was retired by Slice BZ. The diff draws a sign per LINE now, and a sign
+// cannot be shared by a run. See docs/reports/stage-bz-bezel.md §5 for what
+// that costs and why it is affordable inside DIFF_PANE_MAX_LINES.
 
 /// Quiet escalates from a subtle line to a prominent bar at 10 min
 /// (build directive 2026-08-16: "subtle at threshold, prominent at 10min,
@@ -2675,6 +2706,23 @@ fn short_cwd(cwd: &str, home: Option<&str>) -> String {
 ///
 /// Same rule as [`fence_view`] and the diff pane: a row inside a
 /// virtualized list may not have a height the agent chooses.
+/// Which glyph stands for a tool's state.
+///
+/// eave drew an animated dot here and bezel's row draws an icon, so the
+/// running case is the one that loses information: a dot that moves says
+/// "still going" without being read, and a static arrow has to be. The glyphs
+/// come from one family — bezel vendors the same Solar Icons set eave does,
+/// and `check` is one eave never had, reached through the composite asset
+/// source in `bezel_theme` rather than added to eave's own assets.
+fn tool_status_icon(status: &ToolStatus, is_error: bool) -> &'static str {
+    match status {
+        ToolStatus::Running => "icons/refresh.svg",
+        ToolStatus::Finished if is_error => "icons/close-circle.svg",
+        ToolStatus::Finished => "icons/check.svg",
+        ToolStatus::Interrupted => "icons/danger-triangle.svg",
+    }
+}
+
 fn tool_body_view(text: &str, max: usize) -> String {
     let total = text.lines().count();
     if total <= max {
@@ -9765,11 +9813,14 @@ impl Shell {
                 // Slice V's rule stands, this only adds the other half.
                 let has_body = !input.trim().is_empty() || !result.trim().is_empty();
                 let open = state.open_tools.contains(tool_id);
-                let (label, dot) = match status {
-                    ToolStatus::Running => ("running…", theme::live()),
-                    ToolStatus::Finished if *is_error => ("failed", theme::danger()),
-                    ToolStatus::Finished => ("done", theme::text_tertiary()),
-                    ToolStatus::Interrupted => ("interrupted", theme::danger()),
+                // The colour that went with each word tinted the animated
+                // dot; bezel's row takes `failed` and colours its own icon,
+                // so only the word is still eave's to choose.
+                let label = match status {
+                    ToolStatus::Running => "running…",
+                    ToolStatus::Finished if *is_error => "failed",
+                    ToolStatus::Finished => "done",
+                    ToolStatus::Interrupted => "interrupted",
                 };
                 // What the tool was ASKED to do. Until Slice V a row was
                 // the tool's name and a status word, so an agent running
@@ -9802,73 +9853,53 @@ impl Shell {
                     }
                     text
                 });
-                let head = div()
-                    .id(SharedString::from(format!("tool-{tool_id}")))
-                    .when(has_body, |d| {
-                        let tid = tool_id.clone();
-                        let shell = state.shell.clone();
-                        d.cursor_pointer()
-                            .debug_selector(|| "tool-head".into())
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
-                                    let tid = tid.clone();
-                                    shell.update(cx, |shell, cx| {
-                                        shell.transcript.update(cx, |t, cx| {
-                                            if !t.open_tools.remove(&tid) {
-                                                t.open_tools.insert(tid.clone());
-                                            }
-                                            t.remeasure_tool(&tid);
-                                            cx.notify();
-                                        });
-                                    });
-                                }
-                            })
-                    })
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(loaders::work_dot(
-                        theme::TOOL_DOT,
-                        dot,
-                        // Only while it is actually running: `done` and
-                        // `interrupted` are settled facts.
-                        phase.filter(|_| matches!(status, ToolStatus::Running)),
-                    ))
-                    .child(
-                        div()
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::TOOL_NAME_SIZE))
-                            .line_height(px(theme::TOOL_NAME_LINE))
-                            .font_weight(theme::WEIGHT_LABEL)
-                            .text_color(theme::text_secondary())
-                            .child(SharedString::from(name.clone())),
+                // ── Slice BZ: this row is bezel's ────────────────────
+                // `step_row` draws the head, `step_output` the body it
+                // opens onto, `error_strip` a failure. eave still decides
+                // every FACT — the typed `call` decode, the status word,
+                // the caps — and bezel decides how they are laid out.
+                //
+                // What this costs, stated once: bezel's icon slot takes a
+                // path, not an element, so the animated `work_dot` is gone
+                // and a running tool is a static glyph. And bezel builds
+                // the interior of its rows itself, so the `tool-detail`
+                // handle the harness measured no longer exists — the two
+                // tests that asserted it now assert the fact at the model
+                // level instead, and say so.
+                let bz = crate::bezel_theme::theme();
+                let head = {
+                    use bezel::ui::widgets::Status as _;
+                    bz.step_row(
+                        tool_status_icon(status, *is_error),
+                        SharedString::from(name.clone()),
+                        detail.map(SharedString::from),
+                        Some(SharedString::from(label)),
+                        *is_error,
+                        has_body.then_some(open),
                     )
-                    .children(detail.map(|d| {
-                        div()
-                            .debug_selector(|| "tool-detail".into())
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::TOOL_NAME_SIZE))
-                            .line_height(px(theme::TOOL_NAME_LINE))
-                            .text_color(theme::text_tertiary())
-                            .child(SharedString::from(d))
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(if *is_error {
-                                theme::danger()
-                            } else {
-                                theme::text_tertiary()
-                            })
-                            .child(label),
-                    );
+                    .id(SharedString::from(format!("tool-{tool_id}")))
+                }
+                .when(has_body, |d| {
+                    let tid = tool_id.clone();
+                    let shell = state.shell.clone();
+                    d.cursor_pointer()
+                        .debug_selector(|| "tool-head".into())
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                                let tid = tid.clone();
+                                shell.update(cx, |shell, cx| {
+                                    shell.transcript.update(cx, |t, cx| {
+                                        if !t.open_tools.remove(&tid) {
+                                            t.open_tools.insert(tid.clone());
+                                        }
+                                        t.remeasure_tool(&tid);
+                                        cx.notify();
+                                    });
+                                });
+                            }
+                        })
+                });
                 div()
                     .debug_selector(|| "tool-row".into())
                     .pt(px(theme::SPACE_2))
@@ -9880,9 +9911,11 @@ impl Shell {
                     .child(head)
                     .children(open.then(|| {
                         // Opened: what it was asked, and what came back.
-                        // Both verbatim, both bounded, each labelled —
-                        // an unlabelled pair of blobs would make the
-                        // reader guess which is which.
+                        // Both verbatim, both bounded, each labelled — an
+                        // unlabelled pair of blobs would make the reader
+                        // guess which is which. bezel's `step_output` is
+                        // the plate; the label above it stays eave's,
+                        // because bezel has no slot for one.
                         let mut parts: Vec<(&str, String)> = Vec::new();
                         if !input.trim().is_empty() {
                             parts
@@ -9901,16 +9934,10 @@ impl Shell {
                             .flex_col()
                             .gap(px(theme::SPACE_1))
                             .children(parts.into_iter().map(|(label, body)| {
+                                use bezel::ui::widgets::Status as _;
                                 div()
-                                    .rounded(px(theme::RADIUS_CODE))
-                                    .border_1()
-                                    .border_color(theme::border())
-                                    .bg(theme::inset())
-                                    .px(px(theme::SPACE_2))
-                                    .py(px(theme::SPACE_1))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(theme::SPACE_1))
                                     .child(
                                         div()
                                             .text_size(px(theme::MICRO_SIZE))
@@ -9919,30 +9946,18 @@ impl Shell {
                                             .text_color(theme::text_tertiary())
                                             .child(label),
                                     )
-                                    .child(
-                                        div()
-                                            .font_family(theme::MONO)
-                                            .text_size(px(theme::DETAIL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
-                                            .child(SharedString::from(body)),
-                                    )
+                                    .child(bz.step_output(
+                                        SharedString::from(format!("tool-out-{tool_id}-{label}")),
+                                        SharedString::from(body),
+                                    ))
                             }))
                     }))
                     .children(failure.map(|f| {
+                        use bezel::ui::widgets::Status as _;
                         div()
+                            .debug_selector(|| "tool-failure".into())
                             .ml(px(theme::TOOL_INDENT))
-                            .rounded(px(theme::RADIUS_CODE))
-                            .border_1()
-                            .border_color(theme::border())
-                            .bg(theme::inset())
-                            .px(px(theme::SPACE_2))
-                            .py(px(theme::SPACE_1))
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::DETAIL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_secondary())
-                            .child(SharedString::from(f))
+                            .child(bz.error_strip(SharedString::from(f)))
                     }))
                     .into_any_element()
             }

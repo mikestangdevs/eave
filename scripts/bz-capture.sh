@@ -87,6 +87,16 @@ shot() {
 # perfectly good pictures of the wrong surface.
 sleep 7
 shot "tools"
+
+# Open a diff. The changed-file list is in the rail's lower half and a file
+# row toggles its diff pane — without this, the diff surface is never on
+# screen and a "before/after" pair of the diff is two pictures of a file
+# LIST. Coordinates are window-relative; the rail is 228 wide and the first
+# file row sits just under the `changes` header.
+raise
+python3 "$ROOT/scripts/as-click.py" "$((WX + 90))" "$((WY + 565))" || true
+sleep 2
+shot "diff"
 sleep 8
 shot "transcript-a"
 sleep 8
