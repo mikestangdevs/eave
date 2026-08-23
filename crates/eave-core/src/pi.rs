@@ -601,7 +601,16 @@ impl AgentSession for PiSession {
     /// delivers after the current tool calls finish and before the next
     /// model call, which is the closest thing Pi has to Claude's queued
     /// user message.
-    async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {
+    async fn send_user_message(
+        &mut self,
+        text: &str,
+        _images: &[crate::media::ImageRef],
+    ) -> Result<(), SessionError> {
+        // Pi's prompt is a string (`{type:prompt, message}`). There is no
+        // content array and T3 has no Pi image encoder. Images still
+        // arrive here so this adapter cannot silently drop them — they
+        // live in `text` as `@mentions`, which is the path the agent
+        // `Read`s.
         self.await_posture().await?;
         let line = serde_json::json!({
             "type": "prompt",

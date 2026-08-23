@@ -522,7 +522,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
     ));
     wait_for_file(&jpath, |c| c.contains("init")).await;
 
-    let refusal = send_and_journal(&mut *session, &extra_tx, "into the void")
+    let refusal = send_and_journal(&mut *session, &extra_tx, "into the void", &[])
         .await
         .unwrap();
     // The reason is now kept, so this asserts the failure AND that the
@@ -580,7 +580,7 @@ async fn journaled_but_undelivered_send_is_distinct_from_sent() {
         None,
     ));
     assert!(
-        send_and_journal(&mut *session2, &extra_tx2, "hello there")
+        send_and_journal(&mut *session2, &extra_tx2, "hello there", &[])
             .await
             .unwrap()
             .is_none(),
@@ -643,7 +643,7 @@ async fn a_send_into_a_dead_agent_says_so() {
     // The receiver is held, not dropped: a closed recorder is a different
     // failure (`Err`), and this test is about the `Ok(Some(reason))` path.
     let (extra_tx, _extra_rx) = mpsc::channel(8);
-    let why = send_and_journal(&mut *session, &extra_tx, "into a dead agent")
+    let why = send_and_journal(&mut *session, &extra_tx, "into a dead agent", &[])
         .await
         .expect("a dead agent is not a recorder failure")
         .expect("a write into a dead agent must not report delivery");
@@ -730,7 +730,7 @@ async fn kill9_engine_mid_turn_repairs_and_resumes_same_session() {
     // resume-probe answers the continuation message, like the real CLI —
     // cold resume is always user-initiated (spec 02: no auto-redispatch).
     session
-        .send_user_message("continue")
+        .send_user_message("continue", &[])
         .await
         .expect("send continuation message");
     let probe = tokio::time::timeout(TEST_TIMEOUT, async {
@@ -965,7 +965,7 @@ async fn real_claude_journal_and_cold_resume() {
         .send(JournalEvent::UserSent { text: msg.clone() })
         .await
         .unwrap();
-    session.send_user_message(&msg).await.unwrap();
+    session.send_user_message(&msg, &[]).await.unwrap();
     drop(extra_tx);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -995,7 +995,7 @@ async fn real_claude_journal_and_cold_resume() {
     cfg2.resume = Some(sid2);
     let (mut session2, mut rx2) = spawn_agent(&cfg2).unwrap();
     session2
-        .send_user_message("What is the codeword? Reply with the codeword only.")
+        .send_user_message("What is the codeword? Reply with the codeword only.", &[])
         .await
         .unwrap();
     let recalled = tokio::time::timeout(Duration::from_secs(120), async {

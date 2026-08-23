@@ -14,7 +14,7 @@ use tokio::time::MissedTickBehavior;
 use crate::events::SessionEvent;
 use crate::journal::{classify_exit, JournalEvent, JournalWriter, Outcome, Record};
 use crate::proc;
-use crate::session::AgentSession;
+use crate::session::{AgentSession, ImageRef};
 use crate::store::Meta;
 use crate::thresholds::JOURNAL_FLUSH_INTERVAL;
 
@@ -32,13 +32,14 @@ pub async fn send_and_journal<S: AgentSession + ?Sized>(
     session: &mut S,
     extra: &mpsc::Sender<JournalEvent>,
     text: &str,
+    images: &[ImageRef],
 ) -> io::Result<Option<String>> {
     let gone = |_| io::Error::new(io::ErrorKind::BrokenPipe, "recorder is gone");
     extra
         .send(JournalEvent::UserSent { text: text.into() })
         .await
         .map_err(gone)?;
-    match session.send_user_message(text).await {
+    match session.send_user_message(text, images).await {
         Ok(()) => {
             extra
                 .send(JournalEvent::UserDelivered {})

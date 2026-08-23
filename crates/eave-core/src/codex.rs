@@ -480,16 +480,24 @@ impl AgentSession for CodexSession {
         )
     }
 
-    async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {
+    async fn send_user_message(
+        &mut self,
+        text: &str,
+        images: &[crate::media::ImageRef],
+    ) -> Result<(), SessionError> {
         let thread_id = self.thread_id().await?;
         let id = self.next_turn_id.fetch_add(1, Ordering::SeqCst);
+        let mut input = vec![json!({ "type": "text", "text": text })];
+        for img in crate::media::encode_all(images)? {
+            input.push(crate::media::codex_image_item(&img));
+        }
         let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "turn/start",
             "params": {
                 "threadId": thread_id,
-                "input": [{ "type": "text", "text": text }],
+                "input": input,
             },
         });
         write_frame(&self.stdin, &frame.to_string()).await

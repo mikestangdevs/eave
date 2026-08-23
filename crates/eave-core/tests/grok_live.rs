@@ -83,7 +83,7 @@ async fn real_grok_states_a_posture_that_eave_can_gate_on() {
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn real grok");
 
     session
-        .send_user_message("Reply with just the word ok. Do not use any tools.")
+        .send_user_message("Reply with just the word ok. Do not use any tools.", &[])
         .await
         .expect("send");
     let events = drain_until(&mut rx, |e| matches!(e, SessionEvent::Init { .. })).await;
@@ -133,10 +133,13 @@ async fn real_grok_asks_before_it_writes() {
 
     let target = dir.join("live-denied.txt");
     session
-        .send_user_message(&format!(
-            "Create a file at {} containing the word nope. Then stop.",
-            target.display()
-        ))
+        .send_user_message(
+            &format!(
+                "Create a file at {} containing the word nope. Then stop.",
+                target.display()
+            ),
+            &[],
+        )
         .await
         .expect("send");
 
@@ -228,7 +231,7 @@ async fn real_grok_still_advertises_the_capabilities_slice_cl_measured() {
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn real grok");
 
     session
-        .send_user_message("Reply with just the word ok. Do not use any tools.")
+        .send_user_message("Reply with just the word ok. Do not use any tools.", &[])
         .await
         .expect("send");
     let events = drain_until(&mut rx, |e| matches!(e, SessionEvent::Init { .. })).await;

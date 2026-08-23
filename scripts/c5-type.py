@@ -38,6 +38,10 @@ KEYCODES = {
     "5": 23, "9": 25, "7": 26, "8": 28, "0": 29, "o": 31, "u": 32,
     "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
     ".": 47, "/": 44, "-": 27, " ": 49,
+    # Slice E2 — ⌘[ / ⌘]. Positional ANSI bracket keys (`kVK_ANSI_LeftBracket`
+    # / `kVK_ANSI_RightBracket`), not the characters, same as every other
+    # entry here.
+    "[": 33, "]": 30,
 }
 
 MODIFIERS = {

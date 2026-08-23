@@ -155,6 +155,17 @@ pub struct PendingNav {
     /// Increases per request, engine-wide. Only ever compared for
     /// inequality against the last one a renderer acted on.
     pub seq: u64,
+    /// A back/forward walk the page engine should issue as Chromium
+    /// `go_back` / `go_forward`, not as `load_url`.
+    ///
+    /// Absent means "load `url`". Present is Slice E2: `TabGo` already
+    /// moved the engine stack, and a `load_url` of the walked address
+    /// would push a fresh Chromium entry — so the next CEF
+    /// `can_go_back` would disagree with the stack the arrows read.
+    /// `None` from an older engine is a plain navigation, which is
+    /// what those engines actually produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<i32>,
 }
 
 /// One entry in a tab's back/forward stack.
@@ -282,6 +293,19 @@ pub struct Tab {
     /// operator asks; cleared by the commit that answers it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingNav>,
+    /// Last page-engine report of the back arrow. Transient, like
+    /// [`Self::load`]: never journaled, cleared on a walk or a commit so
+    /// the nav stack is what a snapshot reads until the next `Load` fact.
+    ///
+    /// `None` = nobody has stated it this run, and the snapshot uses
+    /// [`NavStack::can_go_back`]. A `Some` overlays that, which is how CEF
+    /// history flags travel through `tab_stated` onto the same
+    /// `TabInfo::can_go_back` the pane header and the chords already read.
+    #[serde(skip)]
+    pub page_can_go_back: Option<bool>,
+    /// Symmetric with [`Self::page_can_go_back`].
+    #[serde(skip)]
+    pub page_can_go_forward: Option<bool>,
     /// The tab this one was opened from, when it was opened from one.
     /// Stated so a client can place a child tab beside its parent; nothing
     /// in this crate acts on it.
@@ -555,6 +579,8 @@ impl TabsState {
                     // it is not waiting on anything. A tab opened at nothing
                     // is not waiting either.
                     pending: None,
+                    page_can_go_back: None,
+                    page_can_go_forward: None,
                     opener: opener.clone(),
                     created_ts_ms: *ts_ms,
                 };

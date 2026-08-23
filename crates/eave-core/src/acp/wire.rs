@@ -142,14 +142,23 @@ pub fn session_frame(resume_id: Option<&str>, cwd: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": RPC_SESSION, "method": method, "params": params })
 }
 
-pub fn prompt_frame(id: i64, session_id: &str, text: &str) -> Value {
+pub fn prompt_frame(
+    id: i64,
+    session_id: &str,
+    text: &str,
+    images: &[crate::media::EncodedImage],
+) -> Value {
+    let mut prompt = vec![json!({ "type": "text", "text": text })];
+    for img in images {
+        prompt.push(crate::media::acp_image_block(img));
+    }
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "session/prompt",
         "params": {
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": text }],
+            "prompt": prompt,
         },
     })
 }

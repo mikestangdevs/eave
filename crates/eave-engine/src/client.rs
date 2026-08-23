@@ -287,9 +287,25 @@ impl Client {
     /// is precisely how an undelivered send stayed unexplained across
     /// several slices.
     pub async fn send_detailed(&self, session_id: &str, text: &str) -> Result<SendOk, ClientError> {
+        self.send_parts(session_id, text, &[] as &[&str]).await
+    }
+
+    /// [`send_detailed`](Self::send_detailed) carrying local image paths
+    /// the engine encodes as native content blocks. Empty `images` is a
+    /// text-only send.
+    pub async fn send_parts(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[impl AsRef<std::path::Path>],
+    ) -> Result<SendOk, ClientError> {
         self.request::<SendOk>(Request::Send {
             session_id: session_id.into(),
             text: text.into(),
+            images: images
+                .iter()
+                .map(|p| p.as_ref().display().to_string())
+                .collect(),
         })
         .await
     }

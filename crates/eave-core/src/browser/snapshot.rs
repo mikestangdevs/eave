@@ -150,8 +150,10 @@ impl TabsState {
                 favicon_url: t.favicon_url.clone(),
                 load: t.load.clone(),
                 pending: t.pending.clone(),
-                can_go_back: t.nav.can_go_back(),
-                can_go_forward: t.nav.can_go_forward(),
+                can_go_back: t.page_can_go_back.unwrap_or_else(|| t.nav.can_go_back()),
+                can_go_forward: t
+                    .page_can_go_forward
+                    .unwrap_or_else(|| t.nav.can_go_forward()),
                 history_len: t.nav.entries.len(),
                 opener: t.opener.clone(),
                 created_ts_ms: t.created_ts_ms,

@@ -151,7 +151,7 @@ async fn an_open_question_and_an_in_flight_tool_are_separate_counts() {
     let cfg = fake_cfg("approval-hang", &[]);
     let (mut session, mut rx) = spawn_agent(&cfg).unwrap();
     recv_until(&mut rx, |e| matches!(e, SessionEvent::Init { .. })).await;
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -376,7 +376,7 @@ async fn a_panicking_test_still_reaps_its_agent() {
     // stop touching its pipes, which is what let 34 of them survive their
     // parents indefinitely — one that is still blocked on its first
     // stdin read dies on its own when the run ends, and would prove less.
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -485,7 +485,7 @@ async fn deliberately_leaks_an_agent() {
     // neither pipe again, so it survives this process rather than dying
     // of EPIPE when the run ends. A specimen that cleans itself up would
     // make the guard look stronger than it is.
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -507,7 +507,7 @@ async fn claude_real_smoke() {
     );
     let (mut session, mut rx) = spawn_agent(&cfg).unwrap();
     session
-        .send_user_message("Reply with exactly the word: pineapple")
+        .send_user_message("Reply with exactly the word: pineapple", &[])
         .await
         .unwrap();
 
@@ -554,7 +554,7 @@ async fn real_claude_resume_with_model() {
     first.model = Some(model.clone());
     let (mut session, mut rx) = spawn_agent(&first).expect("spawn 1");
     session
-        .send_user_message("Remember the word pineapple. Reply with just: ok")
+        .send_user_message("Remember the word pineapple. Reply with just: ok", &[])
         .await
         .expect("send 1");
     let init_mode = wait_turn(&mut rx).await;
@@ -570,7 +570,10 @@ async fn real_claude_resume_with_model() {
     second.resume = Some(id.clone());
     let (mut session, mut rx) = spawn_agent(&second).expect("spawn 2 (--resume)");
     session
-        .send_user_message("What word did I ask you to remember? Reply with just that word.")
+        .send_user_message(
+            "What word did I ask you to remember? Reply with just that word.",
+            &[],
+        )
         .await
         .expect("send 2");
 

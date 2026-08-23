@@ -37,9 +37,10 @@ async fn main() {
     println!("spawned: identity {:?}", session.identity());
 
     session
-        .send_user_message(&format!(
-            "Remember the codeword: {CODEWORD}. Reply with exactly: noted"
-        ))
+        .send_user_message(
+            &format!("Remember the codeword: {CODEWORD}. Reply with exactly: noted"),
+            &[],
+        )
         .await
         .expect("send");
     println!("[{:7.3}s] >> user message sent", t0.elapsed().as_secs_f64());
@@ -78,7 +79,7 @@ async fn main() {
     let (mut session2, mut rx2) = ClaudeCodeSession::spawn(&cfg2).expect("spawn resume");
     let t1 = Instant::now();
     session2
-        .send_user_message("What is the codeword? Reply with the codeword only.")
+        .send_user_message("What is the codeword? Reply with the codeword only.", &[])
         .await
         .expect("send");
 

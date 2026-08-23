@@ -254,25 +254,54 @@ impl Browser {
             id: tab_id.clone(),
             delta,
         })?;
-        if changed {
-            // Walking the stack is a visit of its own kind: the page is
-            // seen again, but the person did not choose the address, so it
-            // must not inflate the typeahead ranking.
-            let (url, title) = {
-                let s = self.store.lock().unwrap();
-                match s.tabs.tabs.get(&tab_id).and_then(|t| t.nav.current_entry()) {
-                    Some(e) => (e.url.clone(), e.title.clone()),
-                    None => return Ok(changed),
-                }
-            };
-            self.history(HistoryEvent::Visited {
-                url,
-                title,
-                ts_ms: now_ms(),
-                transition: Transition::Restore,
-            })?;
+        if !changed {
+            return Ok(false);
         }
-        Ok(changed)
+        // Walking the stack is a visit of its own kind: the page is
+        // seen again, but the person did not choose the address, so it
+        // must not inflate the typeahead ranking.
+        let (url, title) = {
+            let s = self.store.lock().unwrap();
+            match s.tabs.tabs.get(&tab_id).and_then(|t| t.nav.current_entry()) {
+                Some(e) => (e.url.clone(), e.title.clone()),
+                None => return Ok(true),
+            }
+        };
+        // Drive the page engine the same way `tab_navigate` does: a
+        // pending the renderer watches. `delta` tells it to walk
+        // Chromium's stack rather than `load_url` the walked address —
+        // a load would push, and the next `on_load_start` `Committed`
+        // would then look like a new navigation. After this traverse,
+        // that commit is a refresh of the current entry
+        // (`is_refresh_of_current`), so it does not push even if the
+        // renderer falls back to a load (a restored tab whose Chromium
+        // stack is empty).
+        let seq = self.nav_seq.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut s = self.store.lock().unwrap();
+            if let Some(t) = s.tabs.tabs.get_mut(&tab_id) {
+                t.pending = Some(PendingNav {
+                    url: url.clone(),
+                    seq,
+                    delta: Some(delta),
+                });
+                t.load = LoadState::Loading;
+                // Until the page engine restates the arrows, the
+                // snapshot falls back to the stack this traverse just
+                // moved — so ⌘[ is live on the next frame, not after
+                // Chromium catches up.
+                t.page_can_go_back = None;
+                t.page_can_go_forward = None;
+            }
+        }
+        let _ = self.poke_tabs(TabPoke::Structural);
+        self.history(HistoryEvent::Visited {
+            url,
+            title,
+            ts_ms: now_ms(),
+            transition: Transition::Restore,
+        })?;
+        Ok(true)
     }
 
     /// A navigation the operator asked for. **A request, not a commit.**
@@ -301,7 +330,11 @@ impl Browser {
             let mut s = self.store.lock().unwrap();
             match s.tabs.tabs.get_mut(&tab_id) {
                 Some(t) => {
-                    t.pending = Some(PendingNav { url, seq });
+                    t.pending = Some(PendingNav {
+                        url,
+                        seq,
+                        delta: None,
+                    });
                     // Asking is itself a load state: the omnibox commits,
                     // and the tab should say so before any engine answers.
                     t.load = LoadState::Loading;
@@ -341,12 +374,22 @@ impl Browser {
                     }
                 };
                 let changed = self.tab(TabEvent::Navigated {
-                    id: tab_id,
+                    id: tab_id.clone(),
                     url: url.clone(),
                     title: title.clone(),
                     ts_ms,
                 })?;
                 if changed {
+                    // The stack just moved (or refreshed). Drop any CEF
+                    // overlay so the snapshot reads that stack until the
+                    // matching Load fact restates the arrows.
+                    {
+                        let mut s = self.store.lock().unwrap();
+                        if let Some(t) = s.tabs.tabs.get_mut(&tab_id) {
+                            t.page_can_go_back = None;
+                            t.page_can_go_forward = None;
+                        }
+                    }
                     self.history(HistoryEvent::Visited {
                         url,
                         title,
@@ -400,22 +443,48 @@ impl Browser {
             // Transient: applied to the in-memory tab and broadcast, and
             // deliberately NOT journaled. A restart must not restore a
             // strip of tabs claiming to be loading.
-            PageFact::Load { load } => Ok(self.set_load(tab_id, load)),
+            PageFact::Load {
+                load,
+                can_go_back,
+                can_go_forward,
+            } => Ok(self.set_load(tab_id, load, can_go_back, can_go_forward)),
         }
     }
 
     /// Set a tab's load state without journaling it. The one mutation that
     /// bypasses the log, and the reason is the whole durability split: see
     /// `eave_core::browser::tabs`'s module docs.
-    fn set_load(&self, tab_id: TabId, load: LoadState) -> bool {
+    ///
+    /// Slice E2: optional history flags ride the same fact. Absent leaves
+    /// the snapshot on the nav stack (D1). Present overlays
+    /// `TabInfo::can_go_back` / `can_go_forward` so the pane header and
+    /// the chords read what the page engine just reported.
+    fn set_load(
+        &self,
+        tab_id: TabId,
+        load: LoadState,
+        can_go_back: Option<bool>,
+        can_go_forward: Option<bool>,
+    ) -> bool {
         let changed = {
             let mut s = self.store.lock().unwrap();
             match s.tabs.tabs.get_mut(&tab_id) {
-                Some(t) if t.load != load => {
-                    t.load = load;
-                    true
+                Some(t) => {
+                    let mut changed = t.load != load;
+                    if changed {
+                        t.load = load;
+                    }
+                    if can_go_back.is_some() && t.page_can_go_back != can_go_back {
+                        t.page_can_go_back = can_go_back;
+                        changed = true;
+                    }
+                    if can_go_forward.is_some() && t.page_can_go_forward != can_go_forward {
+                        t.page_can_go_forward = can_go_forward;
+                        changed = true;
+                    }
+                    changed
                 }
-                _ => false,
+                None => false,
             }
         };
         if changed {

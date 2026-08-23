@@ -242,6 +242,8 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
             tab_id: grouped.clone(),
             fact: PageFact::Load {
                 load: LoadState::Loading,
+                can_go_back: None,
+                can_go_forward: None,
             },
         })
         .await
@@ -1294,6 +1296,8 @@ async fn load_state_folds_but_a_structural_change_cuts_the_line() {
                     } else {
                         LoadState::Complete
                     },
+                    can_go_back: None,
+                    can_go_forward: None,
                 },
             })
             .await
@@ -1338,5 +1342,78 @@ async fn load_state_folds_but_a_structural_change_cuts_the_line() {
         pinned_at.elapsed() < Duration::from_millis(120),
         "an operator action waited behind the spinner fold ({:?})",
         pinned_at.elapsed()
+    );
+}
+
+/// Slice E2 — `can_go_back` / `can_go_forward` are engine facts, not a
+/// hardcoded false. After two commits and a walk they match the stack;
+/// a Load fact that carries the two bools overlays them onto the same
+/// snapshot the pane header and the chords read.
+#[tokio::test]
+async fn load_facts_carry_history_flags_onto_the_snapshot() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+
+    let tab = client.tab_open(None, true).await.unwrap();
+    land(&client, &tab, "https://a.example/").await;
+    land(&client, &tab, "https://b.example/").await;
+
+    let mut rx = client.watch_tabs().await.unwrap();
+    let snap = tabs_until(&mut rx, "two commits", |s| {
+        s.tabs.iter().any(|t| t.history_len == 2 && t.can_go_back)
+    })
+    .await;
+    let t = snap.tabs.iter().find(|t| t.id == tab).unwrap();
+    assert!(t.can_go_back, "two commits left the back arrow dead");
+    assert!(!t.can_go_forward, "two commits invented a forward arrow");
+
+    assert!(client
+        .browser_do(Request::TabGo {
+            tab_id: tab.clone(),
+            delta: -1
+        })
+        .await
+        .unwrap());
+    let walked = tabs_until(&mut rx, "the walk", |s| {
+        s.tabs.iter().any(|t| t.id == tab && t.can_go_forward)
+    })
+    .await;
+    let t = walked.tabs.iter().find(|t| t.id == tab).unwrap();
+    assert_eq!(t.url.as_deref(), Some("https://a.example/"));
+    assert!(
+        !t.can_go_back && t.can_go_forward,
+        "the walk did not restate the stack on the snapshot: back={} fwd={}",
+        t.can_go_back,
+        t.can_go_forward
+    );
+
+    // Overlay: the page engine's flags survive onto the snapshot even
+    // when they differ from the stack. The header and the chords read
+    // this field, not a second copy.
+    assert!(client
+        .browser_do(Request::TabStated {
+            tab_id: tab.clone(),
+            fact: PageFact::Load {
+                load: LoadState::Complete,
+                can_go_back: Some(true),
+                can_go_forward: Some(false),
+            },
+        })
+        .await
+        .unwrap());
+    let overlay = tabs_until(&mut rx, "the overlay", |s| {
+        s.tabs
+            .iter()
+            .any(|t| t.id == tab && t.can_go_back && !t.can_go_forward)
+    })
+    .await;
+    let t = overlay.tabs.iter().find(|t| t.id == tab).unwrap();
+    assert!(
+        t.can_go_back && !t.can_go_forward,
+        "Load history flags did not land on the snapshot the chords read: \
+         back={} fwd={}",
+        t.can_go_back,
+        t.can_go_forward
     );
 }

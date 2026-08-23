@@ -344,10 +344,18 @@ impl AgentSession for GrokSession {
         self.child.watch()
     }
 
-    async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {
+    async fn send_user_message(
+        &mut self,
+        text: &str,
+        images: &[crate::media::ImageRef],
+    ) -> Result<(), SessionError> {
         let session_id = self.await_session().await?;
         let id = self.shared.proto.lock().unwrap().next_prompt_id();
-        wire::write_frame(self.stdin(), &wire::prompt_frame(id, &session_id, text)).await
+        wire::write_frame(
+            self.stdin(),
+            &wire::prompt_frame(id, &session_id, text, &crate::media::encode_all(images)?),
+        )
+        .await
     }
 
     fn pending_approvals(&self) -> usize {
@@ -412,8 +420,11 @@ impl AgentSession for GrokSession {
             if !message.trim().is_empty() {
                 let session_id = self.await_session().await?;
                 let id = self.shared.proto.lock().unwrap().next_prompt_id();
-                wire::write_frame(self.stdin(), &wire::prompt_frame(id, &session_id, message))
-                    .await?;
+                wire::write_frame(
+                    self.stdin(),
+                    &wire::prompt_frame(id, &session_id, message, &[]),
+                )
+                .await?;
             }
         }
         Ok(true)

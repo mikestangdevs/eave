@@ -11,7 +11,7 @@
 
 use super::*;
 use eave_wire::{TabInfo, TabsSnapshot};
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
 
 /// The test's end of the plumbing: push engine-shaped events in through
 /// `plumbing`, read emitted intent out of `commands`.
@@ -1448,7 +1448,7 @@ fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("enter");
     let cmds = h.drain();
     assert!(
-        matches!(cmds.as_slice(), [Command::Send(t)] if t == "run the tests"),
+        matches!(cmds.as_slice(), [Command::Send { text, images }] if text == "run the tests" && images.is_empty()),
         "return sends the draft, got {cmds:?}"
     );
     assert_eq!(draft(vcx, &h), "", "a sent draft is cleared");
@@ -1461,6 +1461,259 @@ fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
         "return on an empty draft is not a send"
     );
 }
+
+/// The + control opens the platform picker; chosen paths become chips and
+/// ride the send as `@mentions`. A send of files with no typed words is
+/// still a send — the paths are the message.
+#[gpui::test]
+fn attaching_a_file_stages_a_chip_and_sends_the_mention(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    assert!(
+        shown(vcx, "composer-attach"),
+        "a live composer offered no + control"
+    );
+    assert!(
+        !shown(vcx, "composer-files"),
+        "the chip row mounted with nothing staged"
+    );
+
+    click(vcx, "composer-attach");
+    vcx.run_until_parked();
+    assert!(
+        cx.did_prompt_for_paths(),
+        "the + control never opened a picker"
+    );
+    cx.simulate_path_prompt_response(|_| {
+        Some(vec![PathBuf::from("/tmp/eave-harness/repo/src/main.rs")])
+    });
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "composer-file-0"),
+        "the picked path never became a chip"
+    );
+    assert!(
+        shown(vcx, "composer-files"),
+        "the chip row stayed down after a pick"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Send { text, images }] if text == "@src/main.rs" && images.is_empty()),
+        "a files-only send must be the mention, got {cmds:?}"
+    );
+    assert!(
+        !shown(vcx, "composer-file-0"),
+        "a sent chip stayed on the composer"
+    );
+}
+
+/// Dropped paths take the same stage as the picker. A duplicate of a
+/// path already on the row is not a second chip.
+#[gpui::test]
+fn dropping_the_same_path_twice_keeps_one_chip(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let path = PathBuf::from("/tmp/eave-harness/repo/README.md");
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.stage_paths(vec![path.clone(), path], cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-file-0"));
+    assert!(
+        !shown(vcx, "composer-file-1"),
+        "the same path staged twice drew two chips"
+    );
+}
+
+/// Removing a chip takes it off the send. The + control stays.
+#[gpui::test]
+fn removing_a_chip_drops_it_from_the_send(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.stage_paths(
+                vec![
+                    PathBuf::from("/tmp/eave-harness/repo/a.rs"),
+                    PathBuf::from("/tmp/eave-harness/repo/b.rs"),
+                ],
+                cx,
+            );
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    click(vcx, "composer-file-0-remove");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "composer-file-1"),
+        "removing the first chip left a hole rather than collapsing"
+    );
+    assert!(shown(vcx, "composer-file-0"), "the surviving file vanished");
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Send { text, images }] if text == "@b.rs" && images.is_empty()),
+        "the removed file still rode the send, got {cmds:?}"
+    );
+}
+
+/// Typed words and staged files compose in that order, and a session
+/// switch parks the files the way it parks the draft.
+#[gpui::test]
+fn attachments_travel_with_the_session_they_were_staged_on(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.stage_paths(vec![PathBuf::from("/tmp/eave-harness/a.rs")], cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-file-0"));
+
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "composer-file-0"),
+        "B opened still wearing A's files"
+    );
+
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "composer-file-0"),
+        "A's files did not come back with A"
+    );
+
+    vcx.simulate_input("look");
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Send { text, images }] if text == "look @/tmp/eave-harness/a.rs" && images.is_empty()),
+        "text and mention did not compose, got {cmds:?}"
+    );
+}
+
+/// A ninth path is refused, and the composer states the overflow instead
+/// of letting the file vanish.
+#[gpui::test]
+fn the_composer_states_a_ninth_file_was_not_attached(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let incoming: Vec<PathBuf> = (0..9)
+        .map(|i| PathBuf::from(format!("/tmp/eave-harness/repo/f{i}.rs")))
+        .collect();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.stage_paths(incoming, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-file-7"));
+    assert!(
+        !shown(vcx, "composer-file-8"),
+        "the ninth path drew a chip the cap forbids"
+    );
+    let overflow = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).composer.read(cx).overflow
+        })
+        .unwrap();
+    assert_eq!(overflow, 1);
+    let hint = vcx
+        .read_window(&h.window, |shell, cx| {
+            composer_hint(0, true, shell.read(cx).composer.read(cx).overflow)
+        })
+        .unwrap();
+    assert!(
+        hint.contains("not attached"),
+        "the overflow was computed and then not stated: {hint:?}"
+    );
+}
+
+/// A png rides the send as both an `@mention` and an image path the
+/// engine will encode. A `.rs` does not.
+#[gpui::test]
+fn an_image_chip_sends_the_path_on_the_image_channel(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let png = PathBuf::from("/tmp/eave-harness/repo/shot.png");
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.stage_paths(vec![png.clone()], cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-file-0"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    match cmds.as_slice() {
+        [Command::Send { text, images }] => {
+            assert_eq!(text, "@shot.png");
+            assert_eq!(images.len(), 1, "the png never rode the image channel");
+            assert!(images[0].ends_with("shot.png"), "image path was {images:?}");
+        }
+        other => panic!("expected a send with an image, got {other:?}"),
+    }
+}
+
+/// ⌘V of a clipboard image writes a temp file and stages it. Text paste
+/// is unchanged (the composer types/pastes/sends test).
+#[gpui::test]
+fn pasting_a_screenshot_stages_a_chip(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    vcx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        TINY_PNG.to_vec(),
+    )));
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "composer-file-0"),
+        "a pasted screenshot never became a chip"
+    );
+    let name = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .attachments
+                .first()
+                .map(|f| f.name.clone())
+        })
+        .unwrap();
+    let name = name.expect("no staged file after paste");
+    assert!(
+        name.starts_with("pasted-image-") && name.ends_with(".png"),
+        "pasted screenshot was named {name:?}"
+    );
+}
+
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
 
 /// A draft belongs to the session it was typed into.
 ///
@@ -1507,7 +1760,7 @@ fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("enter");
     let cmds = h.drain();
     assert!(
-        matches!(cmds.as_slice(), [Command::Send(t)] if t == "for aaaa"),
+        matches!(cmds.as_slice(), [Command::Send { text, images }] if text == "for aaaa" && images.is_empty()),
         "the wrong draft was sent, got {cmds:?}"
     );
 
@@ -2623,12 +2876,30 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
     let cursors_in_helper = helper_body.matches(".cursor_pointer()").count()
         + helper_body.matches(".cursor_text()").count();
     let via_helper = src.matches("row_action(").count() - 1; // minus the definition
+    let model_chip_body = {
+        let from = &src[src.find("fn model_chip(").unwrap()..];
+        &from[..from.find("\n}\n").unwrap()]
+    };
+    let cursors_in_model_chip = model_chip_body.matches(".cursor_pointer()").count()
+        + model_chip_body.matches(".cursor_text()").count();
+    let via_model_chip = src.matches("model_chip(").count() - 1;
+    let attach_button_body = {
+        let from = &src[src.find("fn attach_button(").unwrap()..];
+        &from[..from.find("\n}\n").unwrap()]
+    };
+    let cursors_in_attach_button = attach_button_body.matches(".cursor_pointer()").count()
+        + attach_button_body.matches(".cursor_text()").count();
+    let via_attach_button = src.matches("attach_button(").count() - 1;
     assert_eq!(
         clicks,
-        cursors - cursors_in_helper + via_helper,
+        cursors - cursors_in_helper - cursors_in_model_chip - cursors_in_attach_button
+            + via_helper
+            + via_model_chip
+            + via_attach_button,
         "every .on_click site needs a .cursor_pointer or .cursor_text, \
-         directly or through row_action — eave had 84 fewer cursor calls \
-         than comet and every one of them was the default arrow"
+         directly or through row_action / model_chip / attach_button — eave \
+         had 84 fewer cursor calls than comet and every one of them was the \
+         default arrow"
     );
 
     // Hover coverage, all thirteen controls. Before Slice M five of them
@@ -2648,7 +2919,8 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         ("files-toggle", "wash_rest"),
         ("new-session", "wash_rest"),
         ("attn-kill", "danger_wash_hover"),
-        ("send", "accent_hover"),
+        ("send", "inverse_hover"),
+        ("composer-attach", "overlay"),
         ("to-bottom", "chrome_glass_hover"),
     ] {
         // **Anchored on the FADE's key, not on proximity to the selector.**
@@ -6040,6 +6312,41 @@ fn click_at(vcx: &mut VisualTestContext, selector: &'static str, dx: f32, dy: f3
     vcx.simulate_click(p, Modifiers::none());
 }
 
+#[track_caller]
+fn click_at_with(
+    vcx: &mut VisualTestContext,
+    selector: &'static str,
+    dx: f32,
+    dy: f32,
+    modifiers: Modifiers,
+) {
+    let bounds = vcx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("element {selector} did not render"));
+    let p = gpui::point(bounds.origin.x + px(dx), bounds.origin.y + px(dy));
+    assert!(
+        p.x >= px(0.) && p.y >= px(0.),
+        "element {selector} is off-screen at {p:?} — a click there hits \
+         nothing and asserts nothing"
+    );
+    vcx.simulate_click(p, modifiers);
+}
+
+/// Middle-click the centre of the element. The tab strip's close path
+/// listens on `MouseButton::Middle` down, not on `on_click`.
+#[track_caller]
+fn middle_click(vcx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = vcx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("element {selector} did not render"));
+    let c = bounds.center();
+    assert!(
+        c.x >= px(0.) && c.y >= px(0.),
+        "element {selector} is off-screen at {c:?}"
+    );
+    vcx.simulate_mouse_down(c, MouseButton::Middle, Modifiers::none());
+}
+
 /// Every URL the shell asked the system to open since the last drain.
 fn opened_urls() -> Vec<String> {
     OPENED_URLS.with(|o| std::mem::take(&mut *o.borrow_mut()))
@@ -8543,7 +8850,7 @@ fn return_still_sends_a_slash_command_typed_in_full(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("enter");
     let cmds = h.drain();
     assert!(
-        matches!(cmds.as_slice(), [Command::Send(t)] if t == "/shipit"),
+        matches!(cmds.as_slice(), [Command::Send { text, images }] if text == "/shipit" && images.is_empty()),
         "Return over an un-navigated palette must send the text as typed, \
          got {cmds:?}"
     );
@@ -9509,16 +9816,305 @@ fn reload_goes_where_the_tab_already_is(cx: &mut TestAppContext) {
     );
 }
 
-/// **The rail owns the window's left edge, and the content region owns the
-/// other three.**
+/// Slice E2 — the chords ride the same snapshot the pane header already
+/// reads. `simulate_keystrokes` the **bound** actions, not a parallel
+/// handler: gpui dispatches a matched action before bubble-phase `on_key`.
+#[gpui::test]
+fn cmd_bracket_walks_when_the_engine_says_it_can_and_is_silent_when_it_cannot(
+    cx: &mut TestAppContext,
+) {
+    let (mut h, vcx) = boot(cx);
+    let fresh = page_tab("p1", Some("https://example.com/"), Some("Example Domain"));
+    strip_tabs(&h, vcx, vec![fresh.clone()], Some("p1"));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-[");
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
+        "⌘[ walked a stack the engine says is empty"
+    );
+
+    let mut visited = fresh;
+    visited.can_go_back = true;
+    visited.history_len = 2;
+    strip_tabs(&h, vcx, vec![visited], Some("p1"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-[");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Go { tab_id, delta }) if tab_id == "p1" && *delta == -1
+        )),
+        "⌘[ did not walk the stack: {cmds:?}"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-]");
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
+        "⌘] walked a stack the engine says is empty"
+    );
+}
+
+#[gpui::test]
+fn cmd_r_re_navigates_the_active_page_and_is_silent_without_a_url(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://example.com/"), None)],
+        Some("p1"),
+    );
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-r");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Navigate { tab_id, url })
+                if tab_id == "p1" && url == "https://example.com/"
+        )),
+        "⌘R did not re-navigate to the current address: {cmds:?}"
+    );
+
+    strip_tabs(&h, vcx, vec![page_tab("p2", None, None)], Some("p2"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-r");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "⌘R fired on a tab with no committed url"
+    );
+
+    // A session tab has no url to reload. Silent, not an error.
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-r");
+    vcx.run_until_parked();
+    assert!(h.drain().is_empty(), "⌘R fired on a session tab");
+    vcx.simulate_keystrokes("cmd-[");
+    vcx.run_until_parked();
+    assert!(h.drain().is_empty(), "⌘[ fired on a session tab");
+}
+
+#[gpui::test]
+fn cmd_digits_jump_the_strip_and_overflow_is_silent(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let tabs = || {
+        vec![
+            page_tab("p1", Some("https://a.test/"), None),
+            page_tab("p2", Some("https://b.test/"), None),
+            page_tab("p3", Some("https://c.test/"), None),
+        ]
+    };
+    strip_tabs(&h, vcx, tabs(), Some("p2"));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-1");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p1"
+        )),
+        "⌘1 did not activate the first tab: {cmds:?}"
+    );
+
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-9");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p3"
+        )),
+        "⌘9 did not activate the last tab: {cmds:?}"
+    );
+
+    let eight: Vec<_> = (1..=8)
+        .map(|i| page_tab(&format!("t{i}"), Some(&format!("https://{i}.test/")), None))
+        .collect();
+    strip_tabs(&h, vcx, eight, Some("t1"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-8");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "t8"
+        )),
+        "⌘8 did not activate the 8th tab: {cmds:?}"
+    );
+
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-5");
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Activate(_)))),
+        "⌘5 on a 3-tab strip jumped"
+    );
+}
+
+#[gpui::test]
+fn cmd_shift_t_reopens_a_closed_page_tab_and_not_a_session_tab(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://closed.test/"), Some("Closed")),
+            session_tab("aaaa1111"),
+        ],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-w");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Close(id)) if id == "p1"
+        )),
+        "⌘W did not close the page tab: {cmds:?}"
+    );
+
+    vcx.simulate_keystrokes("cmd-shift-t");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenAt { url }) if url == "https://closed.test/"
+        )),
+        "⌘⇧T did not reopen the closed page tab: {cmds:?}"
+    );
+
+    // Closing only a session tab leaves nothing to reopen.
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+    // A prior reopen consumed the stack; closing a session must not push.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-w");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-shift-t");
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::OpenAt { .. }))),
+        "⌘⇧T reopened after only a session tab closed"
+    );
+}
+
+#[gpui::test]
+fn cmd_click_a_link_opens_a_background_tab_and_does_not_steal_focus(cx: &mut TestAppContext) {
+    let (mut h, vcx) = transcript_of(cx, "[click me](https://eave.sh/ok)");
+    // The transcript is the surface that has a link to ⌘-click, so the
+    // active tab has to stay the session — a page tab would hide it.
+    // The already-active tab is the thing that must not move.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            page_tab("p1", Some("https://already.test/"), None),
+        ],
+        Some("aaaa1111"),
+    );
+    let _ = opened_urls();
+    let _ = h.drain();
+    click_at_with(
+        vcx,
+        "md-para",
+        4.0,
+        theme::BODY_LINE / 2.0,
+        Modifiers {
+            platform: true,
+            ..Modifiers::none()
+        },
+    );
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenBackground { url, .. })
+                if url == "https://eave.sh/ok"
+        )),
+        "⌘-click did not open a background tab: {cmds:?}"
+    );
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Activate(_)))),
+        "⌘-click stole focus: {cmds:?}"
+    );
+    assert!(
+        opened_urls().is_empty(),
+        "⌘-click also handed the link to the system opener"
+    );
+}
+
+#[gpui::test]
+fn middle_click_closes_a_tab_without_activating_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), None),
+            page_tab("p2", Some("https://b.test/"), None),
+            page_tab("p3", Some("https://c.test/"), None),
+        ],
+        Some("p1"),
+    );
+    let _ = h.drain();
+    middle_click(vcx, "tab-p2");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Close(id)) if id == "p2"
+        )),
+        "middle-click did not close the tab: {cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Activate(id)) if id == "p2"
+        )),
+        "middle-click activated the tab on its way to closing it: {cmds:?}"
+    );
+}
+
+/// **The window surface is the sidebar; the content is a floating card.**
 ///
-/// The frame's whole diagnosis in one measurement. Before A′ nothing owned
-/// any edge: both rails painted no surface, so the outer 248 px each side was
-/// bare ground with text floating in it, and the only outlined object was an
-/// inset card in the middle. Asserted as geometry rather than as colour,
-/// because colour is `theme.rs`'s to prove
-/// (`every_rung_is_a_step_you_can_see` sweeps the rail's seam over 52
-/// backdrops) and placement is this file's.
+/// Rail content sits on the glass, edge to edge. Everything right of the
+/// rail lives in one rounded card inset by [`theme::CARD_GUTTER`]. A
+/// full-height seam between them, or a card that reaches a window edge,
+/// is the wrong frame.
 #[gpui::test]
 fn the_rail_owns_the_left_edge_and_the_content_owns_the_rest(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -9529,35 +10125,42 @@ fn the_rail_owns_the_left_edge_and_the_content_owns_the_rest(cx: &mut TestAppCon
         .debug_bounds("content-well")
         .expect("the content region");
     let header = vcx.debug_bounds("pane-header").expect("the pane header");
+    let root = vcx.debug_bounds("shell-root").expect("the root");
+    let gutter = px(theme::CARD_GUTTER);
 
     assert_eq!(
-        rail.origin.x,
-        px(0.),
+        rail.origin.x, root.origin.x,
         "the rail does not start at the window's left edge"
     );
     assert_eq!(
-        rail.origin.y,
-        px(0.),
+        rail.origin.y, root.origin.y,
         "the rail does not reach the titlebar line — the traffic lights are \
          sitting on whatever is behind it"
     );
-    // No margin between them: the content region is full-bleed, so the
-    // seam is the rail's own hairline and nothing else.
-    assert!(
-        well.origin.x - (rail.origin.x + rail.size.width) <= px(1.),
-        "there is {:?} of ground between the rail and the content region — \
-         an inset card is what you draw when nothing owns the edges",
+    assert_eq!(
+        well.origin.x,
+        rail.origin.x + rail.size.width + gutter,
+        "the card is not inset from the rail by the gutter — {:?} of air",
         well.origin.x - (rail.origin.x + rail.size.width)
     );
     assert_eq!(
         well.origin.y,
-        px(0.),
-        "the content region does not own the top edge"
+        root.origin.y + gutter,
+        "the card does not sit a gutter below the top of the window"
     );
-    // The header is the content region's top edge, not a floating band.
+    assert_eq!(
+        well.origin.x + well.size.width,
+        root.origin.x + root.size.width - gutter,
+        "the card does not sit a gutter in from the window's right edge"
+    );
+    assert_eq!(
+        well.origin.y + well.size.height,
+        root.origin.y + root.size.height - gutter,
+        "the card does not sit a gutter above the window's bottom edge"
+    );
     assert_eq!(
         header.origin.y, well.origin.y,
-        "the pane header is not flush with the top of the region it heads"
+        "the pane header is not the top strip of the card"
     );
     assert_eq!(
         header.size.height,
@@ -9623,27 +10226,21 @@ fn the_changes_list_is_a_section_of_the_rail_not_a_second_column(cx: &mut TestAp
         files.origin.y >= rows.origin.y,
         "the changes section sits above the sessions it describes"
     );
-    // The content region reaches the window's right edge, which is the half
-    // that a merely-relocated column would fail.
+    // The card sits a gutter in from the window's right edge — a second
+    // column would fail this, and a full-bleed well would too.
     let window = vcx.debug_bounds("shell-root").expect("the root");
     assert_eq!(
         well.origin.x + well.size.width,
-        window.origin.x + window.size.width,
-        "something is between the content region and the window's right edge"
+        window.origin.x + window.size.width - px(theme::CARD_GUTTER),
+        "the card does not sit a gutter in from the window's right edge"
     );
 }
 
-/// **Closing the menu gives the window to the content.**
+/// **Closing the menu leaves the card floating on the window surface.**
 ///
-/// The operator's ruling, 2026-08-21: *"i dont want the border on left side
-/// or on top on menu close. we should close to full screen and the top close
-/// icon stay on the top."*
-///
-/// Geometry is what this file can prove: the content region starts at the
-/// window's own left edge, and the only thing above it is the header's own
-/// height. Whether that header still PAINTS a band is a colour question and
-/// belongs to a capture — `Shell::pane_header` drops its `bg` and its bottom
-/// rule in this state and the shots in the report show it.
+/// The rail unmounts; the card keeps its gutter on all four sides,
+/// including the left. Traffic lights stay. A card that went full-bleed
+/// on close would put square page corners on the window edge.
 #[gpui::test]
 fn closing_the_menu_gives_the_window_to_the_content(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -9664,18 +10261,26 @@ fn closing_the_menu_gives_the_window_to_the_content(cx: &mut TestAppContext) {
     let shut = vcx
         .debug_bounds("content-well")
         .expect("the content region");
+    let root = vcx.debug_bounds("shell-root").expect("the root");
+    let gutter = px(theme::CARD_GUTTER);
     assert_eq!(
         shut.origin.x,
-        px(0.),
-        "the content region starts at {:?} with the menu shut — something is \
-         still holding the window's left edge",
+        root.origin.x + gutter,
+        "the card starts at {:?} with the menu shut — it should keep its \
+         left gutter",
         shut.origin.x
     );
-    let root = vcx.debug_bounds("shell-root").expect("the root");
     assert_eq!(
-        shut.size.width, root.size.width,
-        "the content region is {:?} wide in a {:?} window",
-        shut.size.width, root.size.width
+        shut.size.width,
+        root.size.width - gutter - gutter,
+        "the card is {:?} wide in a {:?} window",
+        shut.size.width,
+        root.size.width
+    );
+    assert_eq!(
+        shut.origin.y,
+        root.origin.y + gutter,
+        "closing the rail dropped the card's top gutter"
     );
 
     // The one thing that may not go with the borders: the way back. A

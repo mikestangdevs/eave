@@ -243,7 +243,7 @@ async fn a_turn_streams_text_and_completes() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "normal")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("hi").await.unwrap();
+    session.send_user_message("hi", &[]).await.unwrap();
     let events = recv_until(&mut rx, is_turn_done).await;
 
     assert!(
@@ -283,7 +283,7 @@ async fn a_tool_call_that_never_finishes_stays_in_flight() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "tool-pending")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("build it").await.unwrap();
+    session.send_user_message("build it", &[]).await.unwrap();
     recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ToolUseStarted { .. })
     })
@@ -305,7 +305,7 @@ async fn a_tool_call_round_trip_reports_both_ends() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "tools")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("build it").await.unwrap();
+    session.send_user_message("build it", &[]).await.unwrap();
 
     let started = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ToolUseStarted { .. })
@@ -360,7 +360,7 @@ async fn a_tool_left_open_at_turn_end_is_closed_with_the_reason() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "orphan-tool")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let events = recv_until(&mut rx, is_turn_done).await;
 
     assert!(
@@ -381,7 +381,7 @@ async fn malformed_input_is_surfaced_and_the_session_keeps_going() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "malformed")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let events = recv_until(&mut rx, is_turn_done).await;
 
     assert_eq!(
@@ -415,7 +415,7 @@ async fn an_allow_reaches_hermes_and_hermes_says_which_option_it_got() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "approval")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("clean up").await.unwrap();
+    session.send_user_message("clean up", &[]).await.unwrap();
 
     let asked = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
@@ -472,7 +472,7 @@ async fn a_deny_is_delivered_as_a_chosen_option() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "approval")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("clean up").await.unwrap();
+    session.send_user_message("clean up", &[]).await.unwrap();
     let asked = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -508,7 +508,7 @@ async fn a_decision_for_a_question_that_is_not_open_is_a_race_not_an_error() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "approval")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("clean up").await.unwrap();
+    session.send_user_message("clean up", &[]).await.unwrap();
     let asked = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -542,7 +542,7 @@ async fn an_unanswerable_option_set_is_refused_rather_than_guessed() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "approval-odd-options")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let asked = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -574,7 +574,7 @@ async fn a_client_method_eave_does_not_serve_is_refused_immediately() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "client-request")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("read a file").await.unwrap();
+    session.send_user_message("read a file", &[]).await.unwrap();
     let events = recv_until(&mut rx, is_turn_done).await;
 
     assert!(
@@ -666,7 +666,7 @@ async fn a_refused_session_will_not_accept_a_prompt() {
     .await;
 
     let err = session
-        .send_user_message("write a file")
+        .send_user_message("write a file", &[])
         .await
         .expect_err("a refused session must not be promptable");
     assert!(
@@ -688,7 +688,7 @@ async fn a_hermes_that_dies_before_the_handshake_fails_the_next_send() {
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, |e| matches!(e, SessionEvent::Exited { .. })).await;
 
-    let err = tokio::time::timeout(TEST_TIMEOUT, session.send_user_message("hello"))
+    let err = tokio::time::timeout(TEST_TIMEOUT, session.send_user_message("hello", &[]))
         .await
         .expect("send must not hang on a session that will never open")
         .expect_err("and it must not silently succeed either");
@@ -706,7 +706,7 @@ async fn a_mode_change_mid_session_is_refused() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "mode-flip")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let events = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::PostureRefused { .. })
     })
@@ -963,7 +963,7 @@ async fn the_two_token_facts_arrive_separately_and_stay_separate() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "usage")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("count").await.unwrap();
+    session.send_user_message("count", &[]).await.unwrap();
     let events = recv_until(&mut rx, is_turn_done).await;
 
     let usage: Vec<_> = events
@@ -1016,7 +1016,7 @@ async fn a_turn_with_no_usage_on_the_wire_reports_no_tokens() {
     let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "normal")]);
     let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
     recv_until(&mut rx, is_init).await;
-    session.send_user_message("hi").await.unwrap();
+    session.send_user_message("hi", &[]).await.unwrap();
     let events = recv_until(&mut rx, is_turn_done).await;
     assert!(
         !events

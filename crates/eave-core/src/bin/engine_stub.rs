@@ -96,7 +96,7 @@ async fn main() {
     if let Some(text) = message {
         // Journal-then-send; a failed pipe write leaves the message in the
         // journaled-but-undelivered state (spec 02 §Delivery state).
-        let _delivered = send_and_journal(&mut session, &extra_tx, &text)
+        let _delivered = send_and_journal(&mut session, &extra_tx, &text, &[])
             .await
             .expect("recorder must be alive");
     }

@@ -32,6 +32,12 @@ mod icons;
 /// its neighbours: it renders.
 mod launcher;
 
+/// Composer attachments: local paths staged onto a send, mentioned as
+/// `@path` when the draft goes out. Public for the same reason `slash` is
+/// — pure logic over paths, no gpui, so the headless suite can prove the
+/// cap, the mention form and the compose rule without a window.
+pub mod attach;
+
 /// The overlay layer (Slice P1): the anchored popover surface, the
 /// `Popup` state machine and the menu-row primitive. Private for the same
 /// reason as `loaders` and `motion` — it renders, and it has no product

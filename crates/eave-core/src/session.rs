@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::proc::ProcIdentity;
 
+pub use crate::media::ImageRef;
+
 /// What agent a SESSION runs, as opposed to what agent the engine
 /// defaults to (Slice P2). Carried on the session, persisted in its
 /// journal header at open, and therefore the same across a restart and a
@@ -293,8 +295,20 @@ pub trait AgentSession: Send {
     /// Clonable OS-facts window for the attention monitor (spec 01).
     fn watch(&self) -> SessionWatch;
 
-    /// Send one user message into the running session.
-    async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError>;
+    /// Send one user turn into the running session.
+    ///
+    /// `text` is the composed prompt (including `@mentions`) and is what
+    /// the journal records. `images` are local paths to encode as native
+    /// image blocks at send time — empty for every text-only send that
+    /// already existed. Adapters that have no image slot (Pi) still
+    /// receive the slice so a file cannot be dropped by one provider
+    /// while another encodes it; they leave the bytes off the pipe and
+    /// keep the mention in `text`.
+    async fn send_user_message(
+        &mut self,
+        text: &str,
+        images: &[ImageRef],
+    ) -> Result<(), SessionError>;
 
     /// Permission questions this session is parked on right now (Slice K).
     fn pending_approvals(&self) -> usize;

@@ -29,6 +29,7 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
 
 use crate::events::SessionEvent;
+use crate::media::{self, EncodedImage, ImageRef};
 use crate::proc::{self, ProcIdentity};
 use crate::process;
 use crate::session::{
@@ -379,15 +380,12 @@ impl AgentSession for ClaudeCodeSession {
         )
     }
 
-    async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {
-        let line = serde_json::json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [{ "type": "text", "text": text }],
-            },
-        });
-        write_frame(&self.stdin, &line.to_string()).await
+    async fn send_user_message(
+        &mut self,
+        text: &str,
+        images: &[ImageRef],
+    ) -> Result<(), SessionError> {
+        write_frame(&self.stdin, &user_frame(text, &media::encode_all(images)?)).await
     }
 
     fn pending_approvals(&self) -> usize {
@@ -550,6 +548,23 @@ fn refusal_frame(request_id: &str, kind: &str) -> String {
                  tool; ask in your reply text instead and the operator will answer there."
             ),
         },
+    })
+    .to_string()
+}
+
+/// Claude stream-json user turn. Image blocks are T3's
+/// `buildClaudeImageContentBlock` (base64 source object).
+fn user_frame(text: &str, images: &[EncodedImage]) -> String {
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for img in images {
+        content.push(media::claude_image_block(img));
+    }
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
     })
     .to_string()
 }

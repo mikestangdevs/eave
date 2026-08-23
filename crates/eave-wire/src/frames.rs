@@ -108,6 +108,13 @@ pub enum Request {
     Send {
         session_id: String,
         text: String,
+        /// Absolute paths of images to encode as native content blocks
+        /// at send time. Empty (and omitted on the wire) for text-only
+        /// sends. Bytes never travel this socket — the engine reads the
+        /// file. `#[serde(default)]` so a client predating the field
+        /// still parses as a text send.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     /// Kill the session's live process (verified kill ladder, spec 01).
     Kill {
@@ -475,9 +482,20 @@ pub enum PageFact {
     },
     /// Loading state. **Never journaled** — a restored tab is
     /// [`LoadState::Unloaded`], because that is what it is.
+    ///
+    /// Slice E2: the page engine reports the back/forward arrows on every
+    /// load-state change, on this same fact, so they travel through
+    /// `tab_stated` onto the snapshot the pane header and the chords read.
+    /// Absent (an older engine, a test that is not about history) leaves
+    /// the snapshot on the nav stack — the D1 default, not a hardcoded
+    /// false.
     Load {
         #[serde(flatten)]
         load: LoadState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        can_go_back: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        can_go_forward: Option<bool>,
     },
 }
 
@@ -1227,6 +1245,32 @@ mod tests {
     }
 
     #[test]
+    fn a_text_only_send_omits_images_and_an_old_frame_still_parses() {
+        let req = Request::Send {
+            session_id: "s1".into(),
+            text: "go".into(),
+            images: vec![],
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(
+            !line.contains("images"),
+            "empty images must skip_serializing: {line}"
+        );
+        let old = r#"{"method":"send","params":{"session_id":"s1","text":"go"}}"#;
+        let back: Request = serde_json::from_str(old).unwrap();
+        assert_eq!(back, req);
+
+        let with = Request::Send {
+            session_id: "s1".into(),
+            text: "look".into(),
+            images: vec!["/tmp/shot.png".into()],
+        };
+        let line = serde_json::to_string(&with).unwrap();
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, with);
+    }
+
+    #[test]
     fn unsubscribe_round_trips_with_distinct_ids() {
         // The envelope id and the TARGET id are different fields on the
         // same line — the wire shape must keep them apart.
@@ -1646,6 +1690,8 @@ mod tests {
                     load: LoadState::Failed {
                         reason: "net::ERR_NAME_NOT_RESOLVED".into(),
                     },
+                    can_go_back: None,
+                    can_go_forward: None,
                 },
             },
             Request::GroupUpdate {
@@ -1723,6 +1769,29 @@ mod tests {
         assert!(!t.pinned);
         assert!(!t.can_go_back && !t.can_go_forward);
         assert_eq!(t.history_len, 0);
+
+        // An older page engine's load fact has no history flags. Absent
+        // is `None`, not `Some(false)` — collapsing those is how the
+        // arrows got hardcoded.
+        let fact: PageFact = serde_json::from_str(r#"{"fact":"load","state":"complete"}"#).unwrap();
+        assert_eq!(
+            fact,
+            PageFact::Load {
+                load: LoadState::Complete,
+                can_go_back: None,
+                can_go_forward: None,
+            }
+        );
+        let fact = PageFact::Load {
+            load: LoadState::Complete,
+            can_go_back: Some(true),
+            can_go_forward: Some(false),
+        };
+        let line = serde_json::to_string(&fact).unwrap();
+        assert!(
+            line.contains("can_go_back") && line.contains("can_go_forward"),
+            "a load fact that stated history dropped the keys: {line}"
+        );
         assert_eq!(t.content, TabContent::Page, "an absent content is a page");
         assert!(!snap.read_only, "an absent read_only must not lock the UI");
 

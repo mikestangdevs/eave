@@ -1054,10 +1054,18 @@ impl AgentSession for HermesSession {
         self.child.watch()
     }
 
-    async fn send_user_message(&mut self, text: &str) -> Result<(), SessionError> {
+    async fn send_user_message(
+        &mut self,
+        text: &str,
+        images: &[crate::media::ImageRef],
+    ) -> Result<(), SessionError> {
         let session_id = self.acp_session_id().await?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        wire::write_frame(self.stdin(), &wire::prompt_frame(id, &session_id, text)).await
+        wire::write_frame(
+            self.stdin(),
+            &wire::prompt_frame(id, &session_id, text, &crate::media::encode_all(images)?),
+        )
+        .await
     }
 
     fn pending_approvals(&self) -> usize {

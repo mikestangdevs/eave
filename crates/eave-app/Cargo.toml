@@ -126,6 +126,10 @@ objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef"], optional = tr
 #           content mask and z-order untouched — which is the whole
 #           point, because it means BackdropBlur sees the page.
 #           (Was spike/gpui-bgra-surface.patch; the patch file retired.)
+#   7910388 clip PaintSurface to corner_radii (SDF). Local `eave-line`
+#           on `spike/zed-fork`; the 8521fc1 checkout carries it until
+#           the pin is bumped. Without it the page's square corners
+#           overpaint the card radius.
 # `runtime_shaders` avoids a build-time Metal toolchain dependency;
 # `font-kit` is the macOS text system.
 gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27" }

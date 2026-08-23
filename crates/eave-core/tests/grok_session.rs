@@ -77,7 +77,7 @@ async fn a_grok_session_announces_itself_and_streams_a_reply() {
     let cfg = fake_cfg("acp-asks", &[]);
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
 
-    session.send_user_message("ping").await.expect("send");
+    session.send_user_message("ping", &[]).await.expect("send");
     let events = drain_until(&mut rx, |e| matches!(e, SessionEvent::TurnCompleted { .. })).await;
 
     let init = events
@@ -120,7 +120,7 @@ async fn a_session_that_auto_approves_is_refused_with_a_reason() {
     let cfg = fake_cfg("acp-yolo", &[]);
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
 
-    session.send_user_message("go").await.expect("send");
+    session.send_user_message("go", &[]).await.expect("send");
     let events = drain_until(&mut rx, |e| {
         matches!(e, SessionEvent::PostureRefused { .. })
     })
@@ -149,7 +149,7 @@ async fn a_tool_that_runs_without_a_stated_posture_is_refused() {
     let cfg = fake_cfg("acp-no-posture", &[]);
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
 
-    session.send_user_message("go").await.expect("send");
+    session.send_user_message("go", &[]).await.expect("send");
     let events = drain_until(&mut rx, |e| {
         matches!(e, SessionEvent::PostureRefused { .. })
     })
@@ -171,7 +171,10 @@ async fn a_tool_that_runs_without_a_stated_posture_is_refused() {
 async fn an_allow_reaches_the_agent_as_the_once_option() {
     let cfg = fake_cfg("acp-approval", &[]);
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
-    session.send_user_message("write it").await.expect("send");
+    session
+        .send_user_message("write it", &[])
+        .await
+        .expect("send");
 
     let events = drain_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
@@ -211,7 +214,10 @@ async fn an_allow_reaches_the_agent_as_the_once_option() {
 async fn a_denial_stops_the_tool_and_its_message_follows_as_a_prompt() {
     let cfg = fake_cfg("acp-approval", &[]);
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
-    session.send_user_message("write it").await.expect("send");
+    session
+        .send_user_message("write it", &[])
+        .await
+        .expect("send");
 
     let events = drain_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
@@ -259,7 +265,10 @@ async fn a_denial_stops_the_tool_and_its_message_follows_as_a_prompt() {
 async fn answering_the_same_question_twice_is_a_race_not_an_error() {
     let cfg = fake_cfg("acp-approval", &[]);
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
-    session.send_user_message("write it").await.expect("send");
+    session
+        .send_user_message("write it", &[])
+        .await
+        .expect("send");
 
     let events = drain_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
@@ -308,7 +317,7 @@ async fn a_resumed_session_loads_the_providers_id_not_eaves() {
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
 
     session
-        .send_user_message("still there?")
+        .send_user_message("still there?", &[])
         .await
         .expect("send");
     drain_until(&mut rx, |e| matches!(e, SessionEvent::TurnCompleted { .. })).await;
@@ -357,9 +366,12 @@ async fn a_send_on_a_dead_session_reports_instead_of_hanging() {
     let (mut session, _rx) = spawn_grok_agent(&cfg).expect("spawn");
     session.kill().await.expect("kill");
 
-    let err = tokio::time::timeout(TEST_TIMEOUT, session.send_user_message("anyone there?"))
-        .await
-        .expect("send must not hang once the agent is gone");
+    let err = tokio::time::timeout(
+        TEST_TIMEOUT,
+        session.send_user_message("anyone there?", &[]),
+    )
+    .await
+    .expect("send must not hang once the agent is gone");
     assert!(
         err.is_err(),
         "sending into a dead session must fail loudly, got {err:?}"
@@ -384,7 +396,7 @@ async fn the_handshake_records_what_grok_said_it_could_do() {
     let cfg = fake_cfg("acp-asks", &[]);
     let (mut session, mut rx) = spawn_grok_agent(&cfg).expect("spawn");
 
-    session.send_user_message("ping").await.expect("send");
+    session.send_user_message("ping", &[]).await.expect("send");
     let events = drain_until(&mut rx, |e| matches!(e, SessionEvent::TurnCompleted { .. })).await;
     let raw = events
         .iter()

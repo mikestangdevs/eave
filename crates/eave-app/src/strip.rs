@@ -557,6 +557,7 @@ mod tests {
         t.pending = Some(PendingNav {
             url: "https://b.test/".into(),
             seq: 1,
+            delta: None,
         });
         t.load = LoadState::Complete;
         let s = snap(vec![t], Some("a"));

@@ -1059,7 +1059,12 @@ impl Engine {
 
     /// Send one user message, spawning the agent first if the session is
     /// not live. Returns delivery per spec 02 §Delivery state.
-    async fn send(self: &Arc<Self>, id: &str, text: &str) -> Result<Option<String>, String> {
+    async fn send(
+        self: &Arc<Self>,
+        id: &str,
+        text: &str,
+        images: &[String],
+    ) -> Result<Option<String>, String> {
         let handle = self.session(id)?;
         let mut live = handle.live.lock().await;
         // Slice AA: the turn's basis is collected HERE — inside the send
@@ -1084,7 +1089,19 @@ impl Engine {
         // `&mut *` unsizes the box to `dyn AgentSession`; `send_and_journal`
         // has always been `?Sized`, so nothing about it had to change to
         // accept a provider it does not know.
-        send_and_journal(&mut *l.session, &l.extra_tx, text)
+        let image_refs: Vec<eave_core::media::ImageRef> = images
+            .iter()
+            .filter_map(|p| {
+                let path = PathBuf::from(p);
+                eave_core::media::send_media_type(&path).map(|media_type| {
+                    eave_core::media::ImageRef {
+                        path,
+                        media_type: media_type.to_string(),
+                    }
+                })
+            })
+            .collect();
+        send_and_journal(&mut *l.session, &l.extra_tx, text, &image_refs)
             .await
             .map_err(|e| format!("recorder gone: {e}"))
     }
@@ -2094,7 +2111,11 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Ok(h) => ok_value(&OpenOk { info: h.info() }),
                 Err(message) => ResponseBody::Err { message },
             },
-            Request::Send { session_id, text } => match engine.send(&session_id, &text).await {
+            Request::Send {
+                session_id,
+                text,
+                images,
+            } => match engine.send(&session_id, &text, &images).await {
                 Ok(reason) => ok_value(&SendOk {
                     delivered: reason.is_none(),
                     reason,

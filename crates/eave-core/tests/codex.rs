@@ -122,7 +122,7 @@ fn refusal(events: &[SessionEvent]) -> (String, String) {
 async fn the_handshake_asks_for_the_strict_posture() {
     let cfg = fake_cfg("handshake-report", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let events = collect_until_exit(&mut rx).await;
     let report = said(&events);
 
@@ -153,7 +153,7 @@ async fn a_configured_model_reaches_the_thread_not_the_command_line() {
     let mut cfg = fake_cfg("handshake-report", &[]);
     cfg.model = Some("gpt-5.6-terra".into());
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let report = said(&collect_until_exit(&mut rx).await);
     assert!(report.contains(r#""model":"gpt-5.6-terra""#), "{report}");
 }
@@ -165,7 +165,7 @@ async fn a_configured_model_reaches_the_thread_not_the_command_line() {
 async fn argv_names_the_app_server_and_its_transport() {
     let cfg = fake_cfg("argv-report", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let report = said(&collect_until_exit(&mut rx).await);
     assert_eq!(report, "ARGV:app-server --stdio", "{report}");
 }
@@ -177,7 +177,7 @@ async fn no_eave_vars_reach_the_child() {
     std::env::set_var("EAVE_CODEX_LEAK_PROBE", "1");
     let cfg = fake_cfg("env-report", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let report = said(&collect_until_exit(&mut rx).await);
     std::env::remove_var("EAVE_CODEX_LEAK_PROBE");
     assert_eq!(report, "ENV:no EAVE_ vars", "{report}");
@@ -230,7 +230,7 @@ async fn a_resume_names_the_thread_it_is_continuing() {
     cfg.session_id = "eave-side-id-that-codex-never-issued".into();
     cfg.resume = Some("01a020c6-2222-7000-8000-resumeme".into());
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let events = collect_until_exit(&mut rx).await;
     let report = said(&events);
 
@@ -254,7 +254,7 @@ async fn a_resume_names_the_thread_it_is_continuing() {
 async fn a_normal_turn_streams_text_and_exits_cleanly() {
     let cfg = fake_cfg("normal", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("say hello").await.unwrap();
+    session.send_user_message("say hello", &[]).await.unwrap();
     let events = collect_until_exit(&mut rx).await;
 
     assert!(
@@ -461,7 +461,7 @@ async fn an_ordinary_flag_still_reaches_the_child() {
 async fn tool_calls_count_in_and_back_out_and_reasoning_does_not() {
     let cfg = fake_cfg("tool-cycle", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("run it").await.unwrap();
+    session.send_user_message("run it", &[]).await.unwrap();
 
     let mut events = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ToolUseStarted { .. })
@@ -524,7 +524,7 @@ async fn tool_calls_count_in_and_back_out_and_reasoning_does_not() {
 async fn a_tool_that_never_resolves_stays_in_flight() {
     let cfg = fake_cfg("tool-hang", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("run it").await.unwrap();
+    session.send_user_message("run it", &[]).await.unwrap();
     recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ToolUseStarted { .. })
     })
@@ -546,7 +546,7 @@ async fn a_tool_that_never_resolves_stays_in_flight() {
 async fn a_failed_tool_reports_the_providers_own_status() {
     let cfg = fake_cfg("tool-fail", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("run it").await.unwrap();
+    session.send_user_message("run it", &[]).await.unwrap();
     let events = collect_until_exit(&mut rx).await;
 
     assert!(events.iter().any(|e| matches!(
@@ -570,7 +570,7 @@ async fn a_failed_tool_reports_the_providers_own_status() {
 async fn an_approval_parks_the_session_and_an_allow_reaches_the_wire() {
     let cfg = fake_cfg("approval-cycle", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("run it").await.unwrap();
+    session.send_user_message("run it", &[]).await.unwrap();
 
     let events = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
@@ -622,7 +622,7 @@ async fn an_approval_parks_the_session_and_an_allow_reaches_the_wire() {
 async fn a_denied_command_is_declined_and_the_operators_words_do_not_travel() {
     let cfg = fake_cfg("approval-cycle", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("run it").await.unwrap();
+    session.send_user_message("run it", &[]).await.unwrap();
     let events = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -658,7 +658,7 @@ async fn a_denied_command_is_declined_and_the_operators_words_do_not_travel() {
 async fn a_stale_or_unknown_decision_never_reaches_the_pipe() {
     let cfg = fake_cfg("approval-hang", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("run it").await.unwrap();
+    session.send_user_message("run it", &[]).await.unwrap();
     let events = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -692,7 +692,7 @@ async fn a_stale_or_unknown_decision_never_reaches_the_pipe() {
 async fn a_withdrawn_request_stops_being_pending() {
     let cfg = fake_cfg("approval-withdraw", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("run it").await.unwrap();
+    session.send_user_message("run it", &[]).await.unwrap();
     let events = collect_until_exit(&mut rx).await;
 
     assert!(events
@@ -716,7 +716,7 @@ async fn a_withdrawn_request_stops_being_pending() {
 async fn a_file_change_approval_names_the_paths_its_request_did_not() {
     let cfg = fake_cfg("file-approval", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("write it").await.unwrap();
+    session.send_user_message("write it", &[]).await.unwrap();
     let events = recv_until(&mut rx, |e| {
         matches!(e, SessionEvent::ApprovalRequested { .. })
     })
@@ -746,7 +746,7 @@ async fn a_file_change_approval_names_the_paths_its_request_did_not() {
 async fn a_dialog_eave_cannot_present_is_refused_on_the_wire() {
     let cfg = fake_cfg("dialog-request", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("ask me").await.unwrap();
+    session.send_user_message("ask me", &[]).await.unwrap();
     let events = collect_until_exit(&mut rx).await;
 
     assert!(
@@ -794,7 +794,7 @@ async fn an_unimplemented_server_request_is_answered_method_not_found() {
 async fn malformed_lines_surface_without_breaking_the_parser() {
     let cfg = fake_cfg("malformed", &[]);
     let (mut session, mut rx, _guard) = spawn_codex(&cfg).unwrap();
-    session.send_user_message("go").await.unwrap();
+    session.send_user_message("go", &[]).await.unwrap();
     let events = collect_until_exit(&mut rx).await;
 
     assert!(
@@ -846,7 +846,7 @@ async fn a_server_that_dies_before_opening_a_thread_says_why() {
     session.kill().await.unwrap();
 
     let err = session
-        .send_user_message("anyone there?")
+        .send_user_message("anyone there?", &[])
         .await
         .expect_err("there is no thread to send a turn to");
     assert!(
