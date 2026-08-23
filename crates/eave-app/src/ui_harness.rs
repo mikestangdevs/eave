@@ -3456,18 +3456,40 @@ fn the_empty_note_enters_once_and_does_not_replay_on_later_frames(cx: &mut TestA
     }
 }
 
-/// The caret's drive, which is the one tween in the slice that never
-/// settles — so it is the one that could quietly cost forever.
+/// The caret's drive, which is the one tween in eave that never settles —
+/// so it is the one that could quietly cost forever.
 ///
-/// **An empty composer takes no lease.** That is a deliberate gate, not an
-/// oversight: eave's caret is on screen always, and a caret that blinked
-/// always would mean a window redrawing 30 times a second for the life of
-/// the process, which is precisely the invariant N1 was built to hold — *a
-/// window with nothing mid-flight schedules nothing at all*. See
-/// `Shell::caret_lit`.
+/// **A focused field takes a lease; a window with no field takes none.**
+/// That is a different trade from the one N3 shipped, and the reason it
+/// could be made is that a caret costs a different rate now.
+///
+/// N3 gated the blink on the composer holding a draft. With one clock at
+/// 30 fps that was the only way to keep N1's invariant — a caret is on
+/// screen always, so an always-blinking one is a window redrawing thirty
+/// times a second for the life of the process. The gate held the floor and
+/// cost the feature twice over: an empty composer drew a **static** glyph,
+/// and the omnibox, which called the same gate, was gated on the
+/// *composer's* draft — empty by definition while somebody types a url —
+/// so it could never blink at all.
+///
+/// The floor is held by the RATE now. A caret leases at
+/// `motion::CARET_TICK` and everything else at `PULSE_TICK`, so "is a timer
+/// pending" and "is anything animating" are two questions. Both are
+/// asserted at every step below, because they fail in opposite directions:
+/// a parked clock is a caret that stopped blinking, and `PULSE_TICK` is a
+/// caret that pinned the window at the frame rate.
 #[gpui::test]
-fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
+fn a_focused_field_puts_the_caret_on_the_clock_and_a_launcher_does_not(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    drive(&h, vcx, Duration::from_millis(10));
+    // The floor, and the half that has not moved: no session, no composer,
+    // no field, no lease, no timer. `caret_field` returns `None` here, and
+    // `a_window_with_nothing_in_flight_never_starts_the_pulse_clock` holds
+    // it from the other side.
+    assert!(
+        !clock_running(vcx),
+        "a launcher with no field in it constructed the pulse clock"
+    );
     // A session, because the caret is a property of a composer and there is
     // no composer at the launcher. This test used to type straight into a
     // bare boot and pass, which is the defect
@@ -3502,32 +3524,47 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
     ));
     vcx.run_until_parked();
     // Past every entrance: a session that just mounted is animating. The
-    // assertion is about a SETTLED shell, which is what the invariant is
-    // about — a window with nothing mid-flight schedules nothing at all.
+    // assertions are about a SETTLED shell.
     vcx.executor().advance_clock(Duration::from_secs(1));
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(10));
     assert!(
-        !vcx.update(|_, cx| motion::clock_running(cx)),
-        "an idle shell with an empty composer had the pulse clock running"
+        caret_only(vcx),
+        "an empty composer is not blinking — this is the state the operator \
+         reported as a dead-looking app, and a static glyph in a text box \
+         reads as decoration rather than as an insertion point"
+    );
+    assert!(
+        !animating(vcx),
+        "a settled shell with one blinking caret was driving the clock at \
+         the frame rate"
     );
 
     vcx.simulate_keystrokes("h i");
     vcx.run_until_parked();
+    assert!(caret_only(vcx), "a draft took the caret off the clock");
     assert!(
-        vcx.update(|_, cx| motion::clock_running(cx)),
-        "a draft did not put the caret on the clock"
+        !animating(vcx),
+        "typing pinned the window at the frame rate"
     );
 
-    // Sending empties the composer; the lease lapses and the clock parks.
-    // PULSE_LEASE is 300 ms, so a second of clock is comfortably past it.
+    // Sending empties the composer, and the caret stays. **This is the
+    // assertion that reverses**: it used to read "the lease lapses and the
+    // clock parks", which was the gate working as designed and was also the
+    // whole defect — an empty composer is exactly where a person looks to
+    // find out whether the app is alive.
     vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     vcx.executor().advance_clock(Duration::from_secs(1));
     vcx.run_until_parked();
     assert!(
-        !vcx.update(|_, cx| motion::clock_running(cx)),
-        "the clock kept ticking after the draft was sent"
+        caret_only(vcx),
+        "sending stopped the caret — an empty composer is a field waiting \
+         for the next message, not a window with nothing in it"
+    );
+    assert!(
+        !animating(vcx),
+        "an empty composer cost more than its caret"
     );
     // Drain the entrances the send itself armed (the pin flip re-asserts
     // scroll, and the fade store ages in RENDERS, not wall time — so the
@@ -3538,6 +3575,118 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
             .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
             .unwrap(),
         0
+    );
+}
+
+/// **The caret actually blinks.**
+///
+/// The assertion this slice exists for, and there was no test under it
+/// before — every caret in eave was a static glyph, and a static glyph is
+/// indistinguishable from a decorative bar. That is what "the app looks
+/// dead" describes.
+///
+/// `ui_harness` cannot read colour, so the lit state is in the selector
+/// (`caret_glyph`): `caret-omnibox-lit` and `caret-omnibox-dark` are two
+/// elements to this test and one element to a reader.
+///
+/// Walked as two full cycles rather than sampled once, because a caret that
+/// went dark and stayed dark would pass a single sample and is a worse
+/// defect than one that never blinks at all. The step is the caret's own
+/// tick, so every sample is one the clock actually produced rather than one
+/// this test invented.
+#[gpui::test]
+fn a_caret_blinks_in_the_field_that_owns_the_keyboard(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "omnibox"), "\u{2318}L did not open the omnibox");
+    // Solid through the first half-period. Opening a field counts as "the
+    // typist is still here", which is the same anchor rule a keystroke gets.
+    assert!(
+        shown(vcx, "caret-omnibox-lit"),
+        "the omnibox opened with no caret in it"
+    );
+
+    let (mut lit, mut dark) = (0, 0);
+    for _ in 0..20 {
+        vcx.executor().advance_clock(motion::caret_tick());
+        vcx.run_until_parked();
+        if shown(vcx, "caret-omnibox-lit") {
+            lit += 1;
+        }
+        if shown(vcx, "caret-omnibox-dark") {
+            dark += 1;
+        }
+    }
+    assert!(
+        dark > 0,
+        "the omnibox caret never went dark across two full cycles — it is a \
+         static bar, which is the defect this slice is fixing"
+    );
+    assert!(lit > 0, "the omnibox caret went dark and stayed dark");
+    assert_eq!(lit + dark, 20, "some sample drew no caret at all");
+}
+
+/// **One caret, and it is in the box the next key lands in.**
+///
+/// A caret answers exactly one question — *where does what I type go?* — so
+/// two lit at once is a window giving two answers, and a lit caret in a box
+/// that is not consuming keys is a confident wrong one. Before this slice
+/// the omnibox could not answer it at all: its caret read the COMPOSER's
+/// draft, which is empty by definition while somebody is typing a url, so
+/// it was pinned solid for the entire time it was on screen.
+///
+/// This is also what keeps `Shell::caret_field`'s ladder honest against
+/// `Shell::on_key`'s. The two lists have to agree about where a keystroke
+/// goes, and the agreement is asserted by pressing keys rather than by
+/// re-reading either list — `hi` has to land in the omnibox and not in the
+/// draft behind it.
+#[gpui::test]
+fn the_lit_caret_is_in_the_field_that_takes_the_next_key(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    drive(&h, vcx, Duration::from_millis(10));
+    // Either state: `drive` spends however many frames the entrances need,
+    // which is drawn time the blink is free to cross. What is asserted here
+    // is that the composer has a caret at all — the *lit* one is asserted
+    // after a keystroke below, where the anchor is known.
+    assert!(
+        shown(vcx, "caret-composer-lit") || shown(vcx, "caret-composer-dark"),
+        "an empty composer drew no caret"
+    );
+
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "caret-omnibox-lit"),
+        "\u{2318}L moved the keyboard and left the caret behind"
+    );
+    assert!(
+        shown(vcx, "caret-composer-dark"),
+        "the composer's caret is still lit under an open omnibox"
+    );
+
+    // Where the keys actually went, which is the half that makes the two
+    // assertions above mean something.
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    assert_eq!(
+        omni_text(&h, vcx),
+        "hi",
+        "the omnibox did not take the keys"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "omnibox"), "escape did not close the omnibox");
+    assert!(
+        !shown(vcx, "caret-omnibox-lit") && !shown(vcx, "caret-omnibox-dark"),
+        "a closed omnibox is still drawing a caret"
+    );
+    assert!(
+        shown(vcx, "caret-composer-lit"),
+        "the keyboard came back to the composer and the caret did not"
     );
 }
 
@@ -3729,6 +3878,28 @@ fn turn_completed_record(seq: u64) -> eave_core::journal::Record {
 
 fn clock_running(vcx: &mut VisualTestContext) -> bool {
     vcx.update(|_, cx| motion::clock_running(cx))
+}
+
+/// Is anything but a **caret** driving the clock?
+///
+/// Every test below whose subject is a moving shape — a skeleton, a loader,
+/// a working dot — reads "is the window still drawing this thing", and that
+/// stopped being the same question as `clock_running` when the caret got a
+/// rate of its own. A blinking caret in a box somebody is typing into is
+/// not a skeleton that forgot to stop.
+fn animating(vcx: &mut VisualTestContext) -> bool {
+    vcx.update(|_, cx| motion::animating(cx))
+}
+
+/// Is the clock running, and running at the caret's rate and no faster?
+///
+/// The positive half of the same split: "this window costs exactly one
+/// blinking caret". Both halves are asserted wherever it appears, because
+/// they fail in opposite directions — a `false` from a parked clock is a
+/// caret that stopped blinking, and a `false` from `PULSE_TICK` is a caret
+/// that pinned the window at the frame rate.
+fn caret_only(vcx: &mut VisualTestContext) -> bool {
+    vcx.update(|_, cx| motion::clock_tick(cx)) == Some(motion::caret_tick())
 }
 
 /// N1's invariant, now that something in the tree actually asks. A shell
@@ -6027,6 +6198,61 @@ fn opening_the_rename_field_moves_no_row(cx: &mut TestAppContext) {
     );
 }
 
+/// A long name clips inside the field instead of growing the row — **and
+/// the caret survives the clipping.**
+///
+/// This is the risk the field's shape carries now. The caret used to be the
+/// last character of the title's own string, so `truncate` clipped the two
+/// together and the row could not grow; it is a SIBLING now, because a
+/// caret inside a clipped string is the first thing to disappear exactly
+/// when the operator most needs it — at the end of a name too long for the
+/// box. A sibling has to be paid for with a title that shrinks, and this is
+/// the assertion that it does.
+#[gpui::test]
+fn a_long_name_clips_inside_the_rename_field_and_keeps_its_caret(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    let row_w = vcx.debug_bounds("rail-aaaa1111").expect("row").size.width;
+
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    let field_w = vcx
+        .debug_bounds("rename-aaaa1111")
+        .expect("field")
+        .size
+        .width;
+
+    vcx.simulate_input(&"a name far longer than any rail is wide ".repeat(6));
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").expect("row").size.width,
+        row_w,
+        "a long name grew the rail row — the title inside the field is not \
+         shrinking, so it is pushing the caret and everything after it off \
+         the end"
+    );
+    assert_eq!(
+        vcx.debug_bounds("rename-aaaa1111")
+            .expect("field")
+            .size
+            .width,
+        field_w,
+        "the field itself grew with its contents"
+    );
+    assert!(
+        shown(vcx, "caret-rename-lit") || shown(vcx, "caret-rename-dark"),
+        "the caret was clipped out of the field by a long name — which is \
+         the state it exists to be visible in"
+    );
+}
+
 /// Selecting another row closes the field rather than leaving a keyboard
 /// grab on a row the operator has walked away from.
 #[gpui::test]
@@ -6359,15 +6585,22 @@ fn an_archived_session_parked_on_a_question_keeps_its_row(cx: &mut TestAppContex
     );
 }
 
-/// N4's floor, applied to the one surface in this slice that could break
-/// it: **a rename field sitting open costs nothing.**
+/// N4's floor, applied to the rail's rename field: **an open one costs one
+/// caret and nothing else.**
 ///
-/// The composer's caret blinks, and a blink never settles — its consumer
-/// holds a pulse lease for as long as it is on screen (`caret_lit`, and
-/// the divergence is documented there). This field draws a SOLID caret
-/// precisely so that the idle floor stays reachable with a text box open.
+/// This used to read "costs nothing", and the field paid for that with a
+/// **solid** caret — a comment at the mount site said so in as many words,
+/// and traded the blink for the floor because the only clock there was ran
+/// at 30 fps. A caret has its own rate now, so the trade is off: the field
+/// blinks, at `motion::CARET_TICK`, and the floor is asserted as "nothing
+/// is animating" rather than as "no timer exists".
+///
+/// The second half is the one worth having. **Exactly one caret is lit at a
+/// time**, and it is the one in the box the next key lands in — a composer
+/// still blinking behind an open rename field would be a confident wrong
+/// answer to the only question a caret is asked.
 #[gpui::test]
-fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
+fn an_open_rename_field_costs_one_caret_and_owns_it(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     // A files snapshot has to arrive before ANY selected session can
@@ -6391,9 +6624,15 @@ fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
     assert!(
-        !clock_running(vcx),
-        "the shell was already leasing the clock before the field opened — \
-         then nothing below is measuring the field"
+        !animating(vcx),
+        "the shell was already animating before the field opened — then \
+         nothing below is measuring the field"
+    );
+    // The composer owns the keyboard at this point, so its caret is the lit
+    // one. Stated before the field opens so the flip below means something.
+    assert!(
+        shown(vcx, "caret-composer-lit") || shown(vcx, "caret-composer-dark"),
+        "the composer drew no caret at all"
     );
 
     hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
@@ -6416,10 +6655,24 @@ fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
         "an open rename field is still asking for frames",
     );
     assert!(
-        !clock_running(vcx),
-        "the rename caret leased the pulse clock — the whole reason it is \
-         drawn solid is that a blink here would pin the window at the \
-         frame rate for as long as somebody is naming something",
+        !animating(vcx),
+        "an open rename field drove the clock at the frame rate — the \
+         reason a caret has a rate of its own is so that a text box can \
+         blink without costing one",
+    );
+    assert!(
+        caret_only(vcx),
+        "the rename field is open and nothing is blinking in it",
+    );
+    // The keyboard moved, and so did the only lit caret in the window.
+    assert!(
+        shown(vcx, "caret-rename-lit") || shown(vcx, "caret-rename-dark"),
+        "the rename field drew no caret",
+    );
+    assert!(
+        shown(vcx, "caret-composer-dark"),
+        "the composer's caret is still lit behind an open rename field — \
+         two carets is a window that cannot say where the next key goes",
     );
 }
 
@@ -7117,14 +7370,30 @@ fn the_boot_hook_presses_start_once_against_an_empty_engine(cx: &mut TestAppCont
 // reports a pulsing window as settled. (It reported one to me first.)
 // ---------------------------------------------------------------------------
 
-/// Advance drawn time in 100 ms steps until the pulse clock parks, and
+/// What ten seconds of a settled window with one text box in it costs.
+///
+/// A literal, and deliberately not `10_000 / CARET_TICK.as_millis()` —
+/// deriving it from the constant would make the assertion pass at any rate
+/// including the frame rate, which is the defective-test shape N1 shipped
+/// and mutation testing caught (progress.md §Traps). 100 redraws over 10 s
+/// is one blinking caret at `motion::CARET_TICK`. Anything above it is
+/// something else driving the window; below it is a caret that stopped.
+const CARET_REDRAWS_PER_10S: usize = 100;
+
+/// Advance drawn time in 100 ms steps until nothing is animating, and
 /// report how many steps that took. Panics past `cap` rather than
 /// spinning — an eternal skeleton is precisely a loop that never ends,
 /// and it must fail as a test rather than as a hung suite.
+///
+/// **`animating`, not `clock_running`.** Every caller here selects a
+/// session, and a selected session mounts a composer whose caret blinks for
+/// as long as it is on screen — so the clock in these tests never parks,
+/// and it is not supposed to. What must stop is the skeleton, and the
+/// skeleton is the thing that asks for `PULSE_TICK`.
 #[track_caller]
 fn steps_until_parked(vcx: &mut VisualTestContext, cap: usize, what: &str) -> usize {
     let mut steps = 0usize;
-    while clock_running(vcx) {
+    while animating(vcx) {
         steps += 1;
         assert!(steps < cap, "{what}");
         vcx.executor().advance_clock(Duration::from_millis(100));
@@ -7169,7 +7438,7 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
         "a list that has just been asked for should still say one is coming"
     );
     assert!(
-        clock_running(vcx),
+        animating(vcx),
         "the skeleton is not moving at all — then nothing below is \
          measuring the lease this slice bounds"
     );
@@ -7197,7 +7466,9 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
     );
 
     // The idle floor, applied to the state that used to defeat it: ten
-    // more seconds, and the window is told to draw itself zero times.
+    // more seconds, and the only thing left drawing is the caret in the
+    // composer. It used to be zero, and the difference is the whole of what
+    // a blinking caret costs — see `CARET_REDRAWS_PER_10S`.
     let settled = watch_redraws(&h, vcx);
     for _ in 0..10 {
         vcx.executor().advance_clock(Duration::from_secs(1));
@@ -7205,9 +7476,9 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
     }
     assert_eq!(
         settled.get(),
-        0,
-        "a window whose file list is never coming still redrew itself while \
-         the operator was away from the desk"
+        CARET_REDRAWS_PER_10S,
+        "a window whose file list is never coming redrew itself at a rate \
+         that is not its caret's while the operator was away from the desk"
     );
 
     assert!(
@@ -7278,7 +7549,7 @@ fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
         .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     assert!(shown(vcx, "files-skeleton"), "nothing was ever waiting");
-    assert!(clock_running(vcx), "nothing was ever moving");
+    assert!(animating(vcx), "nothing was ever moving");
 
     h.plumbing.push_conn(ConnEvent::Failed {
         message: "engine unreachable after 5 attempts: connection refused".into(),
@@ -7319,8 +7590,9 @@ fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
     }
     assert_eq!(
         settled.get(),
-        0,
-        "a window that knows no answer is coming still redrew itself"
+        CARET_REDRAWS_PER_10S,
+        "a window that knows no answer is coming redrew itself at a rate \
+         that is not its caret's"
     );
 }
 
