@@ -23,14 +23,15 @@ use futures::StreamExt;
 use gpui::Animation;
 use gpui::AnimationExt as _;
 use gpui::{
-    actions, div, img, list, point, prelude::*, px, quad, relative, size, AnyElement, App,
-    BorderStyle, Bounds, ClickEvent, ClipboardEntry, Context, Corners, CursorStyle, DispatchPhase,
-    Edges, Element, Entity, ExternalPaths, FocusHandle, Font, FontStyle, FontWeight,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image, ImageFormat, InspectorElementId,
-    KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
-    ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextLayout,
-    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
+    actions, deferred, div, img, list, point, prelude::*, px, quad, relative, size, AnyElement,
+    App, BorderStyle, Bounds, ClickEvent, ClipboardEntry, Context, Corners, CursorStyle,
+    DispatchPhase, DragMoveEvent, Edges, Element, Entity, ExternalPaths, FocusHandle, Font,
+    FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image, ImageFormat,
+    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
+    Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
+    TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance,
+    WindowBounds,
     WindowControlArea, WindowHandle, WindowOptions,
 };
 use gpui_platform::application;
@@ -691,6 +692,8 @@ async fn feed_loop(
                 // not a capture of anything. It is also what makes the
                 // screenshot in the slice report reproducible.
                 let mut boot_url = std::env::var("EAVE_WEB_AT_BOOT").ok();
+                // Whether any page can still report. See the `fact` arm.
+                let mut facts_open = true;
                 loop {
                     if let Some(url) = boot_url.clone() {
                         // Only once, and only if nothing is there: a
@@ -744,13 +747,41 @@ async fn feed_loop(
                         // reports, not requests, and sending them as
                         // requests is precisely the double-journal Slice
                         // B1 warned about.
-                        fact = fact_rx.recv() => match fact {
+                        //
+                        // **The guard is the fix for "eave renders no tabs
+                        // at all" (Slice D3).** This arm used to `return` on
+                        // `None`, and `None` here means only "every sender
+                        // is gone" — which in a build without `--features
+                        // web` is true on the FIRST poll, because that
+                        // build's `install_fact_sink` takes the sender and
+                        // drops it (nothing reports, so there is nothing to
+                        // hold). So the task returned immediately, `rx` went
+                        // with it, and the engine's first tab snapshot
+                        // arrived at a dropped receiver: the client's read
+                        // loop found the stream, failed to send, and removed
+                        // the subscription. Every later snapshot was
+                        // discarded against `pending=None`, silently, at a
+                        // layer with no logging.
+                        //
+                        // Traced end to end before it was believed: the
+                        // engine reported `run_tabs id=4 order=9
+                        // sent_ok=true` five times over while the app
+                        // reported `watch_tabs ok=true` and nothing after
+                        // it. Slice D1 saw the symptom, checked that the
+                        // journal held twelve tabs and that `main` did the
+                        // same thing, and filed it as unexplained.
+                        //
+                        // A closed fact channel means "no page will ever
+                        // report", not "stop watching the strip". The guard
+                        // retires the arm and leaves the loop alive.
+                        fact = fact_rx.recv(), if facts_open => match fact {
                             Some((tab_id, fact)) => {
                                 let _ = client
                                     .browser_do(eave_wire::Request::TabStated { tab_id, fact })
                                     .await;
                             }
-                            None => return,
+                            // Not `return`. See above.
+                            None => facts_open = false,
                         },
                         // A page asking for something only the engine can
                         // grant. `TabOpen` then `TabNavigate` — two
@@ -1817,7 +1848,12 @@ fn spine_dot(tab: &strip::StripTab) -> (Hsla, bool) {
 /// every state.
 fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
     div()
-        .size(px(theme::PROVIDER_CHIP))
+        // `RAIL_MARK`, not `PROVIDER_CHIP` (Slice D3). The rail row's leading
+        // slot is one size whatever fills it — a provider chip here, a
+        // favicon from stage 2 — because the references' rails read as ONE
+        // list precisely because the marks line up. The 12 px glyph inside is
+        // unchanged; it just sits on a 2 px inset instead of a 3 px one.
+        .size(px(theme::RAIL_MARK))
         .flex_none()
         .rounded(px(theme::RADIUS_CHIP))
         .bg(theme::chip_plate())
@@ -2133,8 +2169,32 @@ fn resource_line(
     if !reporting.is_empty() {
         let n = reporting.len();
         let noun = if n == 1 { "agent" } else { "agents" };
-        lines.push(match physical {
-            Some(phys) if phys > 0 => format!("{n} {noun} · {} of {}", gib(agents), gib(phys)),
+        // Slice D3 took the DENOMINATOR off this line, and it fixed a fact
+        // that was wrong as well as one that did not fit.
+        //
+        // Wrong: `over` below is computed on agents **plus web**, but this
+        // line's numerator counted agents alone. With a browser running, the
+        // rail could say "120.0 GB of 512.0 GB" — 23% — in warning ink,
+        // because the number it warned on was 132. The stated ratio and the
+        // colour it was stated in disagreed.
+        //
+        // Did not fit: at 32 characters the combined line needs 173.4 px and
+        // a 220 px rail gives its footer 171 — and the rail is draggable to
+        // 180 now, where it is hopeless. C1 hit this exact wall and wrote the
+        // rule down: "A SECOND LINE, not a longer one ... a ceiling stated
+        // half way is not stated." This applies that rule one clause deeper.
+        lines.push(match (physical, web) {
+            // No web: the total IS the agents' sum, so one line states it
+            // whole and a separate ceiling line would repeat the numerator
+            // back to the operator ("2 agents · 0.5 GB" / "0.5 GB of 32.0
+            // GB"). The harness caught that redundancy the moment it was
+            // written.
+            (Some(phys), None) if phys > 0 => {
+                format!("{n} {noun} · {} of {}", gib(agents), gib(phys))
+            }
+            // With web, the denominator moves to its own line below — see
+            // there for why.
+            (_, Some(_)) => format!("{n} {noun} · {}", gib(agents)),
             // No denominator rather than an invented one: the sum alone is
             // still a true fact, and a fabricated machine size would not be.
             _ => format!("{n} {noun} · {} resident", gib(agents)),
@@ -2170,6 +2230,24 @@ fn resource_line(
         Some(phys) if phys > 0 => total as f64 / phys as f64 >= AGENT_MEMORY_WARN_FRACTION,
         _ => false,
     };
+    // **The ceiling gets its own line WHEN a browser is running, because
+    // that is the only case where the old line was wrong.**
+    //
+    // `over` is computed on agents plus web, but the agents line's numerator
+    // counted agents alone — so with a browser holding 12 GB the rail could
+    // say "120.0 GB of 512.0 GB" (23%) in warning ink, because the number it
+    // warned on was 132. The stated ratio and the colour it was stated in
+    // disagreed. This states the number `over` is actually about.
+    //
+    // Only when BOTH halves are reporting: with one of them, the total IS
+    // that half's figure and a ceiling row would repeat the numerator back
+    // ("web · 0.5 GB in 6" / "0.5 GB of 32.0 GB"). The harness caught that
+    // twice while this was being written, once per half.
+    if !reporting.is_empty() && web.is_some() {
+        if let Some(phys) = physical.filter(|p| *p > 0) {
+            lines.push(format!("{} of {}", gib(total), gib(phys)));
+        }
+    }
     Some((lines, over))
 }
 
@@ -3821,6 +3899,40 @@ struct DemoOverlay {
     chosen: Option<SharedString>,
 }
 
+/// A rail resize in flight (Slice D3).
+///
+/// It records the grab, not the current width, so the handle never JUMPS
+/// under the pointer: the new width is `start_w + (x − grab_x)`. Deriving it
+/// from the pointer's x alone would be one line shorter and would snap the
+/// seam to the cursor on mouse-down by up to half the handle's width — and
+/// would silently assume the rail's left edge is at window x=0, which is true
+/// in A′ today and is exactly the kind of assumption that stops being true.
+#[derive(Clone, Copy, Debug)]
+struct RailDrag {
+    grab_x: f32,
+    start_w: f32,
+}
+
+/// The dragged VALUE for a rail resize — gpui's drag machinery keys on the
+/// payload's type, so this exists to be that type and carries nothing.
+///
+/// The geometry lives in [`RailDrag`] on the shell instead, because
+/// `on_drag` builds its payload at RENDER time and the grab point is only
+/// known at mouse-DOWN. Zed's dock gets away with a payload-only drag because
+/// it snaps the divider to the cursor; this keeps the grab offset.
+///
+/// It renders nothing on purpose: the drag preview for a divider is the
+/// divider moving, and a ghost element following the pointer would be a
+/// second thing to look at.
+#[derive(Clone, Copy, Debug)]
+struct RailResize;
+
+impl Render for RailResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 struct Shell {
     focus: FocusHandle,
     conn: Entity<ConnectionState>,
@@ -3850,6 +3962,17 @@ struct Shell {
     /// holds no authoritative state).
     rail_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
+    /// **The rail's live width (Slice D3).** `theme::RAIL_W` is only the
+    /// value a data dir with no saved width starts at; this is the one the
+    /// frame draws, and every measurement of "how much room does a name
+    /// get" has to come from the rendered row rather than from the token.
+    rail_w: f32,
+    /// The resize drag in progress, or `None`.
+    ///
+    /// Held on the shell rather than in a model for `rename`'s reason: it is
+    /// a *choice in progress*, not a fact about anything, and it must survive
+    /// the feed events that rebuild the rail underneath the pointer.
+    rail_drag: Option<RailDrag>,
     /// Slice AS — the session-tab strip's scroll offset.
     ///
     /// Unlike the two above, this one is *written* as well as read: the
@@ -4173,6 +4296,97 @@ fn resolve_friction_log(override_path: Option<String>, data_dir: Option<PathBuf>
         _ => data_dir
             .unwrap_or_else(default_data_dir)
             .join("dogfood-log.md"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame preferences (Slice D3).
+//
+// **The first thing about the FRAME eave has ever remembered.** Everything
+// persisted until now was a fact about the work — sessions, journals, tabs —
+// and every view preference (`SessionsState::collapsed`, the files section's
+// fold, the archived filter) is deliberately per-run. A dragged width is
+// different in kind: the operator did not express a preference about a
+// session, they resized their window’s furniture, and furniture that springs
+// back on relaunch reads as a bug rather than as a policy.
+//
+// It is a merged read-modify-write over a JSON object rather than a typed
+// struct, for one reason: eave runs several checkouts against one data dir
+// (`~/Library/Application Support/eave`), so a build that knows one key must
+// not drop a key some other build wrote. Unknown keys survive a round trip.
+
+/// `<data_dir>/frame.json` — nothing when the process never called [`run`],
+/// which is every test.
+fn frame_prefs_path() -> Option<PathBuf> {
+    DATA_DIR.get().map(|d| d.join("frame.json"))
+}
+
+/// The rail's width, held to its bounds.
+///
+/// Pure and separate from the IO so the bounds are testable without a data
+/// dir, and because it runs in two places that must agree: once on the value
+/// read from disk and once per mouse-move while dragging. A saved width
+/// written by a build with wider bounds is clamped rather than rejected —
+/// the frame should open narrow, not refuse to open.
+fn clamp_rail_w(w: f32) -> f32 {
+    if !w.is_finite() {
+        return theme::RAIL_W;
+    }
+    w.clamp(theme::RAIL_W_MIN, theme::RAIL_W_MAX)
+}
+
+/// Read the saved rail width, or [`theme::RAIL_W`] if there is nothing
+/// readable to read. Every failure path lands on the default deliberately:
+/// a corrupt preference file may not stop the window opening.
+fn load_rail_w() -> f32 {
+    let Some(path) = frame_prefs_path() else {
+        return theme::RAIL_W;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return theme::RAIL_W;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        eprintln!(
+            "eave: {} is not valid JSON; using the default rail width",
+            path.display()
+        );
+        return theme::RAIL_W;
+    };
+    v.get("rail_w")
+        .and_then(|v| v.as_f64())
+        .map(|w| clamp_rail_w(w as f32))
+        .unwrap_or(theme::RAIL_W)
+}
+
+/// Write the rail width back, keeping every other key in the file.
+///
+/// Called on mouse-UP, never per mouse-move: a drag is one decision, and a
+/// write per frame would put ~120 fsyncs through a 4 px adjustment.
+///
+/// A failed write is stated on stderr rather than swallowed — it is not
+/// worth a footer notice (the width is already applied and the session is
+/// unharmed), but a preference that silently never persists is exactly the
+/// kind of thing that gets rediscovered as "the drag doesn't work".
+fn save_rail_w(w: f32) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    doc["rail_w"] = serde_json::json!(w);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!(
+                    "eave: cannot save the rail width to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("eave: cannot encode frame preferences: {e}"),
     }
 }
 
@@ -6793,6 +7007,61 @@ impl Shell {
     /// It used to sit in the titlebar next to a wordmark. A′ deleted that bar
     /// — the rail owns the titlebar line now — so the control moved to the
     /// thing it acts on, which is where it should always have been.
+    /// **The rail's resize handle (Slice D3).**
+    ///
+    /// A transparent 8 px column straddling the seam — no fill of its own,
+    /// because the thing it resizes is already drawn and a visible grip would
+    /// be a third vertical line in a frame that just spent a slice getting
+    /// down to one.
+    ///
+    /// It uses gpui's DRAG machinery rather than mouse-down + a hand-rolled
+    /// move listener, which is what Zed's dock divider does
+    /// (`workspace/src/dock.rs`): `on_drag` starts it, and `on_drag_move` on
+    /// the frame row keeps receiving moves in the CAPTURE phase no matter
+    /// what the pointer is over. That last part is the whole reason not to
+    /// hand-roll it — a plain `on_mouse_move` on this element stops firing
+    /// the moment the pointer outruns the 8 px column, which it does
+    /// immediately.
+    ///
+    /// `deferred` because the handle overhangs 4 px into the content region,
+    /// and the rail is painted BEFORE the content: without it the overhanging
+    /// half is covered and the grab target is silently 4 px, not 8.
+    ///
+    /// `occlude` so the hover wash of whatever is under the seam does not
+    /// light up while the pointer is on the divider.
+    fn rail_handle(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        deferred(
+            div()
+                .id("rail-handle")
+                .debug_selector(|| "rail-handle".into())
+                .absolute()
+                .top_0()
+                .h_full()
+                .right(px(-theme::RAIL_HANDLE_W / 2.0))
+                .w(px(theme::RAIL_HANDLE_W))
+                .cursor_col_resize()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, e: &MouseDownEvent, _window, cx| {
+                        // Recorded here and not in the drag payload: the grab
+                        // point is a fact about this press, and `on_drag`
+                        // built its value one frame ago.
+                        this.rail_drag = Some(RailDrag {
+                            grab_x: f32::from(e.position.x),
+                            start_w: this.rail_w,
+                        });
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_drag(RailResize, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| RailResize)
+                }),
+        )
+        .into_any_element()
+    }
+
     fn rail_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
             .id("rail-toggle")
@@ -7296,7 +7565,31 @@ impl Shell {
             .collect();
         // The second line aligns under the session name: dot + gap +
         // chip + gap.
-        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
+        // **Slice D3: the row's lower lines indent past the STATE DOT, not
+        // past the name.**
+        //
+        // They used to start under the session name — dot + gap + chip + gap
+        // = 40 px — and that 40 px is what pinned the rail wide. The floor
+        // measured out at ~237 px: `a_marked_row_still_shows_its_folder`
+        // holds the path to 80 px (what `~/Desktop/eave` needs to stay
+        // recognisable), the marks group is capped at 70, and 80 + 8 + 70 +
+        // 40 + 25 of gutters is 223 before the layout's own rounding. Every
+        // other candidate for the width came in under that, so the indent was
+        // the binding constraint — not the facts, not the type.
+        //
+        // `RAIL_STRIP_W` is the replacement and it is not a new number: it is
+        // the dot's own column, already named and already documented as "the
+        // bare column, outside the row's washed card, that carries the
+        // selection bar and the state mark". Indenting past it keeps that
+        // column clean — which is the whole reason it exists — and gives
+        // every line below the name the rail's ONE left edge, which is what
+        // `RAIL_GUTTER` says every direct child of a rail should have had all
+        // along ("the header label, a row's TEXT, the empty state, the footer
+        // line"). The old indent was the exception to that rule.
+        //
+        // It buys 26 px, which is what makes a 220 px rail state its facts
+        // whole instead of at 237.
+        let meta_indent = theme::RAIL_STRIP_W;
         let rows: Vec<AnyElement> = sessions
             .into_iter()
             .map(|info| {
@@ -7667,6 +7960,18 @@ impl Shell {
                     // truncates against them, because a path can be
                     // half-read from its tail and a count cannot be
                     // half-read at all.
+                    //
+                    // **Slice D3 tried to give the marks their own line so a
+                    // narrow rail could state both whole, and
+                    // `a_session_row_is_two_lines` refused it at 79 px
+                    // against a 64 px ceiling.** That ceiling is AO's entire
+                    // point — "the rail's whole problem was rows that cost
+                    // four lines apiece" — so height is not available to buy
+                    // width with, and the two facts keep sharing this line.
+                    // What that costs is written down in
+                    // `theme::RAIL_W_MIN`: it is the reason the rail's floor
+                    // is where it is rather than at the 180 the directive
+                    // asked for.
                     .child(
                         div()
                             .pl(px(meta_indent))
@@ -7965,9 +8270,19 @@ impl Shell {
         // between the rail and the card would mean the frame is wrong.
         div()
             .debug_selector(|| "rail".into())
-            .w(px(theme::RAIL_W))
+            // Slice D3: the LIVE width, not the token. `theme::RAIL_W` is the
+            // launch default; the operator's dragged width lives on the shell
+            // and is restored from `frame.json`.
+            .w(px(self.rail_w))
             .h_full()
             .flex_none()
+            // The handle is absolutely positioned against this box, and it
+            // overhangs the seam by half its width — so this has to establish
+            // the containing block or the handle would anchor to the window.
+            .relative()
+            .bg(theme::rail_plate())
+            .border_r_1()
+            .border_color(theme::border())
             .flex()
             .flex_col()
             .child(
@@ -7984,6 +8299,7 @@ impl Shell {
                     .pr(px(theme::RAIL_GUTTER)),
             )
             .child(self.rail_tabs(cx, phase))
+            .child(self.rail_handle(cx))
             .child(
                 div()
                     .px(px(theme::RAIL_GUTTER))
@@ -12455,6 +12771,46 @@ impl Render for Shell {
                     .min_w(px(0.))
                     .flex()
                     .flex_row()
+                    // **The rail resize lives HERE, not on the handle
+                    // (Slice D3).** `on_drag_move` fires in the CAPTURE
+                    // phase for whatever the pointer is over, so it has to be
+                    // bound to a box the pointer stays inside — the frame
+                    // row — rather than to the 8 px column it grabbed. The
+                    // handle only starts the drag.
+                    .on_drag_move(cx.listener(
+                        |this, e: &DragMoveEvent<RailResize>, _window, cx| {
+                            let Some(drag) = this.rail_drag else {
+                                return;
+                            };
+                            let w = drag.start_w + (f32::from(e.event.position.x) - drag.grab_x);
+                            let w = clamp_rail_w(w);
+                            // Only notify on an actual change: a drag emits a
+                            // move per frame even when the pointer has not
+                            // crossed a pixel, and a notify per frame is the
+                            // defect N4's idle floor exists to prevent.
+                            if (w - this.rail_w).abs() >= 0.5 {
+                                this.rail_w = w;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    // The drag's END, and the only place the width is
+                    // written. Per-move writes would put ~120 file writes
+                    // through one 4 px adjustment; a drag is one decision.
+                    //
+                    // If a release ever lands outside the window and this is
+                    // missed, the width still holds for the run and simply is
+                    // not saved — a preference that fails to persist, not a
+                    // frame that breaks.
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                            if this.rail_drag.take().is_some() {
+                                save_rail_w(this.rail_w);
+                                cx.notify();
+                            }
+                        }),
+                    )
                     // **Collapsed means GONE, on the operator's ruling
                     // (2026-08-21): "i dont want the border on left side or
                     // on top on menu close. we should close to full screen
@@ -13709,6 +14065,12 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         friction_gen: 0,
                         friction_path_stated: false,
                         rail_scroll: ScrollHandle::new(),
+                        // Read once, here, rather than per frame: the file is
+                        // the launch value and the shell is the live one from
+                        // then on. A per-frame read would also make an
+                        // external edit fight the pointer mid-drag.
+                        rail_w: load_rail_w(),
+                        rail_drag: None,
                         files_scroll: ScrollHandle::new(),
                         tabs_scroll: ScrollHandle::new(),
                         tab_scrolled_to: RefCell::new(None),

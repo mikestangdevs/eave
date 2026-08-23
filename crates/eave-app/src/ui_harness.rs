@@ -259,10 +259,12 @@ fn real_text_width_at(text: &str, family: &str, size: f32, weight: gpui::FontWei
 /// The width `text` occupies **as a session name** — the size and weight the
 /// rail row and a session tab both draw one at.
 ///
-/// The 13.0 is a literal rather than [`theme::RAIL_NAME_SIZE`] (§7: never
+/// The 12.5 is a literal rather than [`theme::RAIL_NAME_SIZE`] (§7: never
 /// derive a test's expectation from the constant under test), and the guard
 /// is what makes moving that constant fail loudly here instead of sliding
-/// every name measurement in this file along with it.
+/// every name measurement in this file along with it. **It has now done that
+/// once for real** — Slice D3 stepped the rail's type down and three tests
+/// stopped, which is the outcome this shape exists to produce.
 ///
 /// It exists because three places described the same glyphs and all three
 /// disagreed: `ui.rs` drew `px(13.0)`, `theme::BODY_SIZE` had moved to 13.5
@@ -273,9 +275,9 @@ fn real_text_width_at(text: &str, family: &str, size: f32, weight: gpui::FontWei
 fn real_name_width(text: &str) -> Pixels {
     assert_eq!(
         theme::RAIL_NAME_SIZE,
-        13.0,
-        "a session name is no longer 13 px, so every width measured through \
-         this helper is measuring the wrong font"
+        12.5,
+        "a session name is no longer 12.5 px, so every width measured \
+         through this helper is measuring the wrong font"
     );
     assert_eq!(
         theme::WEIGHT_STRONG,
@@ -283,7 +285,7 @@ fn real_name_width(text: &str) -> Pixels {
         "a session name is no longer semibold; semibold is wider than \
          regular and these are FIT assertions"
     );
-    real_text_width_at(text, theme::SANS, 13.0, gpui::FontWeight::SEMIBOLD)
+    real_text_width_at(text, theme::SANS, 12.5, gpui::FontWeight::SEMIBOLD)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,8 +400,21 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     // one number would say neither which to do nor that there was a choice.
     // Two ROWS, not one longer line: both clauses side by side measured
     // 283 px against the 188 px the rail gives, so it would have truncated.
+    //
+    // **Slice D3 moved the denominator to a THIRD row, and the number on it
+    // is the one `over` is computed from.** Before this, the agents row read
+    // "0.5 GB of 32.0 GB" while `over` measured agents PLUS web — so with a
+    // browser holding memory eave could state one ratio and colour it by
+    // another. The ceiling row states the total it actually warns on.
     let (both, over) = resource_line(&all, Some(32 * GB), Some((6, 490 * MB))).unwrap();
-    assert_eq!(both, ["2 agents · 0.5 GB of 32.0 GB", "web · 0.5 GB in 6"]);
+    assert_eq!(
+        both,
+        [
+            "2 agents · 0.5 GB",
+            "web · 0.5 GB in 6",
+            "1.0 GB of 32.0 GB"
+        ]
+    );
     assert!(!over);
 
     // A browser with no agents still reports. The rail's memory line is
@@ -455,6 +470,10 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
         .collect();
     let (widest, _) = resource_line(&fleet, Some(512 * GB), None).unwrap();
     assert_eq!(widest, ["30 agents · 120.0 GB of 512.0 GB"]);
+    // Slice D3: with a browser running the denominator moves to its own
+    // line, and the number on it is agents PLUS web — which is the number
+    // `over` warns on. The old single line put an agents-only numerator
+    // against the machine total, so eave could state 23% in warning ink.
     // Slice C1 made the line longer: a browser adds a second clause. The
     // worst case is now agents AND web at their widest, and it is the one
     // that has to clear the rail.
@@ -11139,5 +11158,264 @@ fn the_page_menu_disables_history_rows_rather_than_dropping_them(cx: &mut TestAp
             .iter()
             .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
         "a disabled Back row walked the history anyway: {cmds:?}"
+    );
+}
+
+// Slice D3 stage 1 — the rail's geometry, and the fact that it moves.
+
+/// **The rail may never be dragged narrower than the traffic lights it
+/// contains.**
+///
+/// A′ gave the rail the window's left edge, so the macOS window buttons sit
+/// INSIDE it — and they sit at a window-fixed x that no layout of ours moves.
+/// A rail narrower than that clearance would have them hanging off its right
+/// edge onto the page: not a squeeze, a frame that is wrong.
+///
+/// The floor is asserted against `TRAFFIC_CLEARANCE` rather than against a
+/// literal because this one really is a derivation — if the clearance ever
+/// changes, the drag's floor has to move with it, and silently.
+#[gpui::test]
+fn the_rail_never_narrows_past_its_own_traffic_lights(_cx: &mut TestAppContext) {
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(
+            theme::RAIL_W_MIN >= theme::TRAFFIC_CLEARANCE,
+            "the rail may be dragged to {} px and the traffic lights need \
+             {} — at that width they hang off the rail onto the page",
+            theme::RAIL_W_MIN,
+            theme::TRAFFIC_CLEARANCE
+        );
+        assert!(
+            theme::RAIL_W_MIN < theme::RAIL_W && theme::RAIL_W < theme::RAIL_W_MAX,
+            "the resting width {} is outside its own drag range {}..{} — a \
+             rail that opens outside the range it can be dragged to is a \
+             frame that cannot return to its own default",
+            theme::RAIL_W,
+            theme::RAIL_W_MIN,
+            theme::RAIL_W_MAX
+        );
+    }
+}
+
+/// **A width from disk is held to the bounds, and a corrupt one opens the
+/// window anyway.**
+///
+/// The bounds are enforced on the value read from the file and not only on
+/// the pointer, because the file is the one input eave does not control: a
+/// build with wider bounds, a hand edit, a half-written file. Clamping rather
+/// than rejecting is the deliberate half of it — the frame should open
+/// narrow, not refuse to open.
+///
+/// `NaN` is called out separately because it is the one value that makes
+/// `clamp` itself misbehave: `f32::clamp` panics on a NaN bound and returns
+/// NaN for a NaN input, and a NaN width lays out as a rail of zero px with no
+/// error anywhere.
+#[gpui::test]
+fn a_saved_rail_width_is_held_to_the_bounds(_cx: &mut TestAppContext) {
+    assert_eq!(clamp_rail_w(theme::RAIL_W), theme::RAIL_W);
+    assert_eq!(clamp_rail_w(10.0), theme::RAIL_W_MIN, "far under the floor");
+    assert_eq!(
+        clamp_rail_w(9000.0),
+        theme::RAIL_W_MAX,
+        "far over the ceiling"
+    );
+    assert_eq!(
+        clamp_rail_w(f32::NAN),
+        theme::RAIL_W,
+        "a NaN width lays out as a zero-px rail and reports nothing — it has \
+         to land on the default, not on a bound"
+    );
+    assert_eq!(clamp_rail_w(f32::INFINITY), theme::RAIL_W);
+}
+
+/// **The seam is grabbable, and the grab target is wider than the seam.**
+///
+/// The handle is transparent, so nothing else in the harness can tell it
+/// exists; this is the only assertion that it is mounted at all. It also
+/// pins the two facts that make it usable rather than decorative: it is as
+/// tall as the rail (a divider you can only grab in the middle is a divider
+/// you hunt for), and it straddles the seam rather than sitting inside the
+/// rail, so the pointer finds it coming from either side.
+#[gpui::test]
+fn the_rail_seam_is_a_grab_target_on_both_sides_of_itself(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+
+    let rail = vcx.debug_bounds("rail").expect("the rail renders");
+    let grab = vcx.debug_bounds("rail-handle").expect("the resize handle");
+
+    assert_eq!(
+        grab.size.height, rail.size.height,
+        "the handle is {:?} tall against a {:?} rail — a divider you can \
+         only grab in the middle is one you hunt for",
+        grab.size.height, rail.size.height
+    );
+    assert!(
+        grab.size.width >= px(theme::RAIL_HANDLE_W),
+        "the grab target is {:?}; the seam it covers is a hairline",
+        grab.size.width
+    );
+    // Straddling, not inset: the handle's box crosses the rail's right edge,
+    // so half of it is over the content. `deferred` is what keeps that half
+    // paintable — without it the content region covers it and the target is
+    // silently half as wide as this asserts.
+    let seam = rail.origin.x + rail.size.width;
+    assert!(
+        grab.origin.x < seam && grab.origin.x + grab.size.width > seam,
+        "the handle spans {:?}..{:?} and the seam is at {seam:?} — it has to \
+         cross it, or the pointer only finds it from one side",
+        grab.origin.x,
+        grab.origin.x + grab.size.width
+    );
+}
+
+/// **The rail's width is the shell's, not the token's.**
+///
+/// The token is the launch default and the shell holds what the operator
+/// dragged to. This is the assertion that the layout actually reads the
+/// second one — a frame that draws `theme::RAIL_W` would pass every other
+/// test in this file and ignore every drag.
+#[gpui::test]
+fn the_rail_draws_the_width_it_was_dragged_to(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("rail").unwrap().size.width,
+        px(theme::RAIL_W),
+        "a fresh shell opens at the default"
+    );
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.rail_w = theme::RAIL_W_MAX;
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("rail").unwrap().size.width,
+        px(theme::RAIL_W_MAX),
+        "the rail did not follow the shell's width, so it is drawing the \
+         token and no drag will ever move it"
+    );
+}
+
+/// **The content takes the whole delta, and the reading column moves with
+/// the seam rather than under it.**
+///
+/// The directive's words were "the gutter between rail and card stays
+/// constant — the CARD absorbs the delta". There is no card: Slice D1's A′
+/// made the content region full-bleed on its other three edges, on the
+/// operator's border ruling, so the gutter is zero and stays zero. What
+/// survives of the requirement is the part that matters — every pixel the
+/// rail gains comes out of the content and none of it comes out of the
+/// window, and the two regions still meet exactly at the seam with no gap
+/// and no overlap.
+#[gpui::test]
+fn widening_the_rail_costs_the_content_and_nothing_else(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+
+    let rail0 = vcx.debug_bounds("rail").unwrap();
+    let well0 = vcx.debug_bounds("content-well").unwrap();
+    let window_w = rail0.size.width + well0.size.width;
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.rail_w = theme::RAIL_W + 60.0;
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    let rail1 = vcx.debug_bounds("rail").unwrap();
+    let well1 = vcx.debug_bounds("content-well").unwrap();
+
+    assert_eq!(
+        rail1.size.width - rail0.size.width,
+        well0.size.width - well1.size.width,
+        "the rail grew by {:?} and the content gave up {:?} — the difference \
+         went somewhere, and the only somewhere is off the window",
+        rail1.size.width - rail0.size.width,
+        well0.size.width - well1.size.width
+    );
+    assert_eq!(
+        rail1.size.width + well1.size.width,
+        window_w,
+        "the two regions no longer fill the window between them"
+    );
+    // **Slice R1 changed what this asserts, and the change is the point.**
+    //
+    // D3 wrote it as `well1.origin.x == rail1.origin.x + rail1.size.width`
+    // — no gap at all — because on D3's branch A′ had deleted the inset
+    // card and any gap really was a rounding error. The consolidated tree
+    // brings a card BACK, on purpose: the content is a floating plate with
+    // a uniform `CARD_GUTTER` on every side (see `content_card` in
+    // `ui.rs`). Those two frames disagree, and this test is where the
+    // disagreement showed up.
+    //
+    // Weakening it to `>=` would have made it stop failing and stop
+    // testing. Asserting the gutter EXACTLY keeps everything D3 wanted —
+    // a stray pixel still fails — and adds a guard D3 could not have
+    // written: the gutter changing silently now fails too.
+    assert_eq!(
+        well1.origin.x,
+        rail1.origin.x + rail1.size.width + px(theme::CARD_GUTTER),
+        "the content no longer starts one CARD_GUTTER after the rail ends. \
+         Either the gutter moved, or the inset card is drifting — both are \
+         frame regressions and neither is a rounding error"
+    );
+}
+
+/// **A build with no page engine closes the fact channel on the first poll,
+/// and that closure must not be read as a signal.**
+///
+/// This is the trigger for "eave renders no tabs at all" — the defect Slice
+/// D1 photographed, verified against `main`, and filed as unexplained, and
+/// which Slice D3 traced end to end.
+///
+/// The subscription task in `feed_loop` selects over two channels: the tab
+/// snapshots coming from the engine, and the facts a page reports on its way
+/// back. Its fact arm used to `return` on `None`. `None` on an
+/// `UnboundedReceiver` means only "every sender has been dropped" — and in a
+/// build without `--features web` that is true *immediately*, because this
+/// sink is the one below and it takes the sender by value with nothing to
+/// hold it. So the task ended before its first `select!` could favour the
+/// other arm, `rx` was dropped with it, and the engine's first tab snapshot
+/// arrived at a dead receiver. The client's read loop found the stream,
+/// failed to send, removed the subscription, and discarded every later
+/// snapshot against an absent entry — silently, at a layer with no logging.
+/// The engine was reporting `run_tabs order=9 sent_ok=true` the whole time.
+///
+/// The fix is a guard on that arm, which retires it instead of returning.
+/// **This test pins the TRIGGER rather than the fix**, deliberately: the
+/// guard lives in a spawned async task inside `feed_loop` and this harness
+/// drives the shell through `Plumbing` fakes that never build a `Client`, so
+/// there is no seam here to assert it through. What this holds is the fact
+/// that made the guard necessary — so that a later tidy-up which makes this
+/// sink *hold* its sender cannot quietly remove the reason the guard is
+/// there, and so that anyone who deletes the guard finds this explanation
+/// attached to the thing that will bite them.
+///
+/// Verified in the product rather than here: with the guard, the strip
+/// renders seven tabs and the pane header states an address
+/// (`docs/shots/d3-rail-rest.png`); without it, both are empty.
+#[cfg(not(feature = "web"))]
+#[gpui::test]
+fn a_build_with_no_page_engine_closes_the_fact_channel_at_once(_cx: &mut TestAppContext) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::web::Fact>();
+    crate::web::install_fact_sink(tx);
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "this build's fact sink now keeps its sender alive. That is not a \
+         bug, but the tab subscription's fact arm is guarded on the \
+         assumption that a closed channel is NORMAL here rather than fatal \
+         — read that guard before relying on this staying open."
     );
 }
