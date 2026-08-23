@@ -467,6 +467,20 @@ fn content_type(kind: &PermissionKind) -> Option<ContentSettingTypes> {
 /// Verified against the pinned trees — Chromium 151.0.7922.174 and CEF
 /// branch `cef-151`, the pair the lockfile's `cef 151.6.0+151.3.18` names.
 fn sync_to_chromium(origin: &str, kinds: &[PermissionKind], value: ContentSettingValues) {
+    // **Not a tidiness guard — CEF is not merely absent before
+    // `CefInitialize`, it is unsafe to call.** `request_context_get_global_context`
+    // dereferences a global the framework has not built yet, so reaching it
+    // from a process that never initialised CEF is a SIGSEGV rather than a
+    // `None`.
+    //
+    // That is not hypothetical: this crate's own `--features web` test
+    // binary links Chromium and never starts it, and the harness reaches
+    // this through `permissions::forget_origin`. It segfaulted the whole
+    // lib-test process — no assertion, no failing test name, just signal 11
+    // — the first time the suite ran in that feature state.
+    if !super::host::running() {
+        return;
+    }
     let Some(context) = request_context_get_global_context() else {
         return;
     };

@@ -283,7 +283,7 @@ mod tests {
     fn staging_the_same_path_twice_keeps_one() {
         let mut files = Vec::new();
         let p = PathBuf::from("/tmp/eave-attach-once.rs");
-        let first = stage(&mut files, &[p.clone()], None);
+        let first = stage(&mut files, std::slice::from_ref(&p), None);
         let second = stage(&mut files, &[p], None);
         assert_eq!(
             first,

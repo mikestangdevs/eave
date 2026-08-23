@@ -65,6 +65,11 @@ pub mod omnibox;
 /// behaviour worth asserting lives.
 pub mod strip;
 
+/// The bookmarks bar's model half (Slice T1): B1's flat, depth-first
+/// `BookmarksSnapshot` read as a bar of top-level chips and the runs of
+/// children each folder opens. Public for the same reason `strip` is.
+pub mod bookmarks;
+
 /// The macOS menu bar (Slice Y). Private: it is wiring, not part of the
 /// headless surface the acceptance runs use.
 mod app_menus;
@@ -72,6 +77,13 @@ pub mod display;
 pub mod fixture;
 pub mod markdown;
 pub mod theme;
+
+// Slice BZ: bezel's tokens, built from ours. The only place in the tree
+// allowed to write a bezel token — see the module doc for why that matters.
+pub mod bezel_theme;
+/// bezel's `TextField`, vendored — the editing engine eave never had. See the
+/// module doc for the provenance and the enumerated delta.
+pub mod text_field;
 
 pub mod ui;
 

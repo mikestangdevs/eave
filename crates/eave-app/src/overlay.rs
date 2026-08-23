@@ -569,6 +569,35 @@ pub fn menu_row(
     }
 }
 
+/// A hairline between groups. Not a row: it does not take a click and
+/// keyboard navigation must skip it (pass `enabled: false` for its index).
+pub fn menu_separator() -> AnyElement {
+    div()
+        .debug_selector(|| "menu-separator".into())
+        .h(px(theme::HAIRLINE))
+        .mx(px(theme::MENU_ROW_PAD_X))
+        .my(px(theme::SPACE_1))
+        .bg(theme::border())
+        .into_any_element()
+}
+
+/// A section label inside a menu ("Tab Options"). Same height as a row so
+/// the surface does not jump; quiet ink, no handler.
+pub fn menu_header(label: impl Into<SharedString>) -> AnyElement {
+    div()
+        .debug_selector(|| "menu-header".into())
+        .h(px(theme::MENU_ROW_H))
+        .mx(px(theme::MENU_ROW_INSET))
+        .px(px(theme::MENU_ROW_PAD_X))
+        .flex()
+        .items_center()
+        .text_size(px(theme::DETAIL_SIZE))
+        .line_height(px(theme::DETAIL_LINE))
+        .text_color(theme::text_tertiary())
+        .child(label.into())
+        .into_any_element()
+}
+
 // ---------------------------------------------------------------------------
 // The surface
 
@@ -742,7 +771,18 @@ mod tests {
     fn a_menu_row_declares_its_type_size_once() {
         let src = include_str!("overlay.rs");
         let at = src.find("pub fn menu_row(").expect("menu_row");
-        let end = at + src[at..].find("\n// ---").expect("end of the row section");
+        // **`menu_row`'s own body, and nothing after it.** This used to
+        // scan as far as the next `// ---` divider, which meant it
+        // indicted whatever happened to be written between the function
+        // and that divider. `menu_separator` and `menu_header` landed
+        // there, and `menu_header` sets a type size legitimately — it is a
+        // section label, not a row, and the rule below is about rows. The
+        // test failed on a design decision it was never about.
+        //
+        // A function's closing brace is the only `}` at column zero inside
+        // it, so this ends exactly where `menu_row` does and a neighbour
+        // can be added without re-opening this argument.
+        let end = at + src[at..].find("\n}\n").expect("end of menu_row") + 2;
         let body = &src[at..end];
         assert_eq!(
             body.matches(".text_size(").count(),

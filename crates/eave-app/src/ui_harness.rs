@@ -259,10 +259,12 @@ fn real_text_width_at(text: &str, family: &str, size: f32, weight: gpui::FontWei
 /// The width `text` occupies **as a session name** — the size and weight the
 /// rail row and a session tab both draw one at.
 ///
-/// The 13.0 is a literal rather than [`theme::RAIL_NAME_SIZE`] (§7: never
+/// The 12.5 is a literal rather than [`theme::RAIL_NAME_SIZE`] (§7: never
 /// derive a test's expectation from the constant under test), and the guard
 /// is what makes moving that constant fail loudly here instead of sliding
-/// every name measurement in this file along with it.
+/// every name measurement in this file along with it. **It has now done that
+/// once for real** — Slice D3 stepped the rail's type down and three tests
+/// stopped, which is the outcome this shape exists to produce.
 ///
 /// It exists because three places described the same glyphs and all three
 /// disagreed: `ui.rs` drew `px(13.0)`, `theme::BODY_SIZE` had moved to 13.5
@@ -273,9 +275,9 @@ fn real_text_width_at(text: &str, family: &str, size: f32, weight: gpui::FontWei
 fn real_name_width(text: &str) -> Pixels {
     assert_eq!(
         theme::RAIL_NAME_SIZE,
-        13.0,
-        "a session name is no longer 13 px, so every width measured through \
-         this helper is measuring the wrong font"
+        12.5,
+        "a session name is no longer 12.5 px, so every width measured \
+         through this helper is measuring the wrong font"
     );
     assert_eq!(
         theme::WEIGHT_STRONG,
@@ -283,7 +285,7 @@ fn real_name_width(text: &str) -> Pixels {
         "a session name is no longer semibold; semibold is wider than \
          regular and these are FIT assertions"
     );
-    real_text_width_at(text, theme::SANS, 13.0, gpui::FontWeight::SEMIBOLD)
+    real_text_width_at(text, theme::SANS, 12.5, gpui::FontWeight::SEMIBOLD)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,8 +400,21 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     // one number would say neither which to do nor that there was a choice.
     // Two ROWS, not one longer line: both clauses side by side measured
     // 283 px against the 188 px the rail gives, so it would have truncated.
+    //
+    // **Slice D3 moved the denominator to a THIRD row, and the number on it
+    // is the one `over` is computed from.** Before this, the agents row read
+    // "0.5 GB of 32.0 GB" while `over` measured agents PLUS web — so with a
+    // browser holding memory eave could state one ratio and colour it by
+    // another. The ceiling row states the total it actually warns on.
     let (both, over) = resource_line(&all, Some(32 * GB), Some((6, 490 * MB))).unwrap();
-    assert_eq!(both, ["2 agents · 0.5 GB of 32.0 GB", "web · 0.5 GB in 6"]);
+    assert_eq!(
+        both,
+        [
+            "2 agents · 0.5 GB",
+            "web · 0.5 GB in 6",
+            "1.0 GB of 32.0 GB"
+        ]
+    );
     assert!(!over);
 
     // A browser with no agents still reports. The rail's memory line is
@@ -455,6 +470,10 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
         .collect();
     let (widest, _) = resource_line(&fleet, Some(512 * GB), None).unwrap();
     assert_eq!(widest, ["30 agents · 120.0 GB of 512.0 GB"]);
+    // Slice D3: with a browser running the denominator moves to its own
+    // line, and the number on it is agents PLUS web — which is the number
+    // `over` warns on. The old single line put an agents-only numerator
+    // against the machine total, so eave could state 23% in warning ink.
     // Slice C1 made the line longer: a browser adds a second clause. The
     // worst case is now agents AND web at their widest, and it is the one
     // that has to clear the rail.
@@ -1010,6 +1029,61 @@ fn a_fence_leaves_the_app_when_you_click_copy(cx: &mut TestAppContext) {
 /// a `tool_result`'s id and threw away its `content`, and kept a `tool_use`'s
 /// id and name and threw away its `input`. An agent could run the whole test
 /// suite and eave would show you two words, neither of them the command.
+/// A tool row with a body opens onto it; one without has nothing to open.
+///
+/// **The affordance itself is no longer measurable, and that is worth
+/// recording.** Slice BZ first drew eave's own disclosure chevron here, with
+/// its own selector, and this test measured it — including that it fitted
+/// inside `TOOL_NAME_LINE` and so could not set the row height. Then the row
+/// moved onto bezel's `step_row`, which draws that chevron itself from the
+/// `expanded` argument and emits no selector for it. The affordance is still
+/// on screen; the harness simply cannot see it any more.
+///
+/// So this asserts the behaviour underneath instead: `has_body` is what
+/// decides whether there is a disclosure at all, and `tool-body` — an eave
+/// element, with an eave selector — is what it opens onto.
+#[gpui::test]
+fn only_a_tool_row_with_a_body_says_it_opens(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started(
+            1,
+            "toolu_1",
+            "Bash",
+            r#"{"command":"cargo test --workspace"}"#,
+        )],
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-row").is_some(),
+        "the tool row is not on screen"
+    );
+    // Shut: the body is not drawn.
+    assert!(
+        vcx.debug_bounds("tool-body").is_none(),
+        "a tool row drew its body before anyone opened it"
+    );
+
+    // Open it the way a reader would.
+    let head = vcx
+        .debug_bounds("tool-head")
+        .expect("a tool with a body is not clickable");
+    vcx.simulate_click(head.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("tool-body").is_some(),
+        "clicking a tool row with a body opened nothing"
+    );
+}
+
 #[gpui::test]
 fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -1030,10 +1104,30 @@ fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
         )],
     });
     vcx.run_until_parked();
+    // Bounds-checked until Slice BZ; see the Codex test above for why this is
+    // now a model-level assertion. The row must still be on screen.
     assert!(
-        vcx.debug_bounds("tool-detail").is_some(),
-        "a running tool row states no command"
+        vcx.debug_bounds("tool-row").is_some(),
+        "a running tool row does not render at all"
     );
+    {
+        let rows = vcx
+            .read_window(&h.window, |shell, cx| {
+                shell.read(cx).transcript.read(cx).transcript.rows.clone()
+            })
+            .unwrap();
+        let detail = rows.iter().find_map(|r| match r {
+            eave_wire::model::Row::Tool {
+                name, input, call, ..
+            } => Some(eave_wire::model::tool_detail(call.as_ref(), name, input)),
+            _ => None,
+        });
+        assert_eq!(
+            detail.flatten().as_deref(),
+            Some("cargo test --workspace"),
+            "a running tool row states no command"
+        );
+    }
 
     // ...and a failure states why, in place.
     h.plumbing.push_feed(FeedEvent::Records {
@@ -1062,8 +1156,17 @@ fn a_tool_row_states_its_command_and_its_failure(cx: &mut TestAppContext) {
     assert!(tool.0.contains("cargo test --workspace"), "input dropped");
     assert_eq!(tool.1, "error: 3 tests failed", "result dropped");
     assert!(tool.2, "the provider's error flag dropped");
-    assert!(
-        vcx.debug_bounds("tool-detail").is_some(),
+    // Bounds-checked until Slice BZ — bezel's `step_row` owns the interior
+    // now. The fact survives the finish, which is what this ever meant.
+    let detail = rows.iter().find_map(|r| match r {
+        eave_wire::model::Row::Tool {
+            name, input, call, ..
+        } => Some(eave_wire::model::tool_detail(call.as_ref(), name, input)),
+        _ => None,
+    });
+    assert_eq!(
+        detail.flatten().as_deref(),
+        Some("cargo test --workspace"),
         "the command stopped being stated once the tool finished"
     );
 }
@@ -1234,8 +1337,31 @@ fn a_codex_tool_row_states_its_command(cx: &mut TestAppContext) {
         )],
     });
     vcx.run_until_parked();
+    // **This used to measure `tool-detail`'s bounds.** Slice BZ moved the row
+    // onto bezel's `step_row`, which builds its own interior and emits no
+    // selector, so that element no longer exists to measure. The fact is
+    // asserted at the model level instead: the typed `call` is what a Codex
+    // `commandExecution` decodes through, and `tool_detail` is what the row
+    // is handed. Weaker than a bounds check — it proves the string reaches
+    // the row, not that the row drew it — and that is the price of the swap.
     assert!(
-        vcx.debug_bounds("tool-detail").is_some(),
+        vcx.debug_bounds("tool-row").is_some(),
+        "a Codex tool row does not render at all"
+    );
+    let rows = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell.read(cx).transcript.read(cx).transcript.rows.clone()
+        })
+        .unwrap();
+    let detail = rows.iter().find_map(|r| match r {
+        eave_wire::model::Row::Tool {
+            name, input, call, ..
+        } => Some(eave_wire::model::tool_detail(call.as_ref(), name, input)),
+        _ => None,
+    });
+    assert_eq!(
+        detail.flatten().as_deref(),
+        Some("cargo test --workspace"),
         "a Codex tool row states its command"
     );
 }
@@ -1429,7 +1555,14 @@ fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -1730,7 +1863,14 @@ fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -1854,7 +1994,14 @@ fn the_launcher_reaches_no_composer(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -2202,7 +2349,14 @@ fn denying_carries_the_operators_reason_and_clears_the_composer(cx: &mut TestApp
     );
     let draft = vcx
         .read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap();
     assert!(
@@ -3302,18 +3456,40 @@ fn the_empty_note_enters_once_and_does_not_replay_on_later_frames(cx: &mut TestA
     }
 }
 
-/// The caret's drive, which is the one tween in the slice that never
-/// settles — so it is the one that could quietly cost forever.
+/// The caret's drive, which is the one tween in eave that never settles —
+/// so it is the one that could quietly cost forever.
 ///
-/// **An empty composer takes no lease.** That is a deliberate gate, not an
-/// oversight: eave's caret is on screen always, and a caret that blinked
-/// always would mean a window redrawing 30 times a second for the life of
-/// the process, which is precisely the invariant N1 was built to hold — *a
-/// window with nothing mid-flight schedules nothing at all*. See
-/// `Shell::caret_lit`.
+/// **A focused field takes a lease; a window with no field takes none.**
+/// That is a different trade from the one N3 shipped, and the reason it
+/// could be made is that a caret costs a different rate now.
+///
+/// N3 gated the blink on the composer holding a draft. With one clock at
+/// 30 fps that was the only way to keep N1's invariant — a caret is on
+/// screen always, so an always-blinking one is a window redrawing thirty
+/// times a second for the life of the process. The gate held the floor and
+/// cost the feature twice over: an empty composer drew a **static** glyph,
+/// and the omnibox, which called the same gate, was gated on the
+/// *composer's* draft — empty by definition while somebody types a url —
+/// so it could never blink at all.
+///
+/// The floor is held by the RATE now. A caret leases at
+/// `motion::CARET_TICK` and everything else at `PULSE_TICK`, so "is a timer
+/// pending" and "is anything animating" are two questions. Both are
+/// asserted at every step below, because they fail in opposite directions:
+/// a parked clock is a caret that stopped blinking, and `PULSE_TICK` is a
+/// caret that pinned the window at the frame rate.
 #[gpui::test]
-fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
+fn a_focused_field_puts_the_caret_on_the_clock_and_a_launcher_does_not(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    drive(&h, vcx, Duration::from_millis(10));
+    // The floor, and the half that has not moved: no session, no composer,
+    // no field, no lease, no timer. `caret_field` returns `None` here, and
+    // `a_window_with_nothing_in_flight_never_starts_the_pulse_clock` holds
+    // it from the other side.
+    assert!(
+        !clock_running(vcx),
+        "a launcher with no field in it constructed the pulse clock"
+    );
     // A session, because the caret is a property of a composer and there is
     // no composer at the launcher. This test used to type straight into a
     // bare boot and pass, which is the defect
@@ -3348,32 +3524,47 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
     ));
     vcx.run_until_parked();
     // Past every entrance: a session that just mounted is animating. The
-    // assertion is about a SETTLED shell, which is what the invariant is
-    // about — a window with nothing mid-flight schedules nothing at all.
+    // assertions are about a SETTLED shell.
     vcx.executor().advance_clock(Duration::from_secs(1));
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(10));
     assert!(
-        !vcx.update(|_, cx| motion::clock_running(cx)),
-        "an idle shell with an empty composer had the pulse clock running"
+        caret_only(vcx),
+        "an empty composer is not blinking — this is the state the operator \
+         reported as a dead-looking app, and a static glyph in a text box \
+         reads as decoration rather than as an insertion point"
+    );
+    assert!(
+        !animating(vcx),
+        "a settled shell with one blinking caret was driving the clock at \
+         the frame rate"
     );
 
     vcx.simulate_keystrokes("h i");
     vcx.run_until_parked();
+    assert!(caret_only(vcx), "a draft took the caret off the clock");
     assert!(
-        vcx.update(|_, cx| motion::clock_running(cx)),
-        "a draft did not put the caret on the clock"
+        !animating(vcx),
+        "typing pinned the window at the frame rate"
     );
 
-    // Sending empties the composer; the lease lapses and the clock parks.
-    // PULSE_LEASE is 300 ms, so a second of clock is comfortably past it.
+    // Sending empties the composer, and the caret stays. **This is the
+    // assertion that reverses**: it used to read "the lease lapses and the
+    // clock parks", which was the gate working as designed and was also the
+    // whole defect — an empty composer is exactly where a person looks to
+    // find out whether the app is alive.
     vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     vcx.executor().advance_clock(Duration::from_secs(1));
     vcx.run_until_parked();
     assert!(
-        !vcx.update(|_, cx| motion::clock_running(cx)),
-        "the clock kept ticking after the draft was sent"
+        caret_only(vcx),
+        "sending stopped the caret — an empty composer is a field waiting \
+         for the next message, not a window with nothing in it"
+    );
+    assert!(
+        !animating(vcx),
+        "an empty composer cost more than its caret"
     );
     // Drain the entrances the send itself armed (the pin flip re-asserts
     // scroll, and the fade store ages in RENDERS, not wall time — so the
@@ -3384,6 +3575,118 @@ fn only_a_draft_puts_the_caret_on_the_clock(cx: &mut TestAppContext) {
             .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
             .unwrap(),
         0
+    );
+}
+
+/// **The caret actually blinks.**
+///
+/// The assertion this slice exists for, and there was no test under it
+/// before — every caret in eave was a static glyph, and a static glyph is
+/// indistinguishable from a decorative bar. That is what "the app looks
+/// dead" describes.
+///
+/// `ui_harness` cannot read colour, so the lit state is in the selector
+/// (`caret_glyph`): `caret-omnibox-lit` and `caret-omnibox-dark` are two
+/// elements to this test and one element to a reader.
+///
+/// Walked as two full cycles rather than sampled once, because a caret that
+/// went dark and stayed dark would pass a single sample and is a worse
+/// defect than one that never blinks at all. The step is the caret's own
+/// tick, so every sample is one the clock actually produced rather than one
+/// this test invented.
+#[gpui::test]
+fn a_caret_blinks_in_the_field_that_owns_the_keyboard(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "omnibox"), "\u{2318}L did not open the omnibox");
+    // Solid through the first half-period. Opening a field counts as "the
+    // typist is still here", which is the same anchor rule a keystroke gets.
+    assert!(
+        shown(vcx, "caret-omnibox-lit"),
+        "the omnibox opened with no caret in it"
+    );
+
+    let (mut lit, mut dark) = (0, 0);
+    for _ in 0..20 {
+        vcx.executor().advance_clock(motion::caret_tick());
+        vcx.run_until_parked();
+        if shown(vcx, "caret-omnibox-lit") {
+            lit += 1;
+        }
+        if shown(vcx, "caret-omnibox-dark") {
+            dark += 1;
+        }
+    }
+    assert!(
+        dark > 0,
+        "the omnibox caret never went dark across two full cycles — it is a \
+         static bar, which is the defect this slice is fixing"
+    );
+    assert!(lit > 0, "the omnibox caret went dark and stayed dark");
+    assert_eq!(lit + dark, 20, "some sample drew no caret at all");
+}
+
+/// **One caret, and it is in the box the next key lands in.**
+///
+/// A caret answers exactly one question — *where does what I type go?* — so
+/// two lit at once is a window giving two answers, and a lit caret in a box
+/// that is not consuming keys is a confident wrong one. Before this slice
+/// the omnibox could not answer it at all: its caret read the COMPOSER's
+/// draft, which is empty by definition while somebody is typing a url, so
+/// it was pinned solid for the entire time it was on screen.
+///
+/// This is also what keeps `Shell::caret_field`'s ladder honest against
+/// `Shell::on_key`'s. The two lists have to agree about where a keystroke
+/// goes, and the agreement is asserted by pressing keys rather than by
+/// re-reading either list — `hi` has to land in the omnibox and not in the
+/// draft behind it.
+#[gpui::test]
+fn the_lit_caret_is_in_the_field_that_takes_the_next_key(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    drive(&h, vcx, Duration::from_millis(10));
+    // Either state: `drive` spends however many frames the entrances need,
+    // which is drawn time the blink is free to cross. What is asserted here
+    // is that the composer has a caret at all — the *lit* one is asserted
+    // after a keystroke below, where the anchor is known.
+    assert!(
+        shown(vcx, "caret-composer-lit") || shown(vcx, "caret-composer-dark"),
+        "an empty composer drew no caret"
+    );
+
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "caret-omnibox-lit"),
+        "\u{2318}L moved the keyboard and left the caret behind"
+    );
+    assert!(
+        shown(vcx, "caret-composer-dark"),
+        "the composer's caret is still lit under an open omnibox"
+    );
+
+    // Where the keys actually went, which is the half that makes the two
+    // assertions above mean something.
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    assert_eq!(
+        omni_text(&h, vcx),
+        "hi",
+        "the omnibox did not take the keys"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "omnibox"), "escape did not close the omnibox");
+    assert!(
+        !shown(vcx, "caret-omnibox-lit") && !shown(vcx, "caret-omnibox-dark"),
+        "a closed omnibox is still drawing a caret"
+    );
+    assert!(
+        shown(vcx, "caret-composer-lit"),
+        "the keyboard came back to the composer and the caret did not"
     );
 }
 
@@ -3575,6 +3878,28 @@ fn turn_completed_record(seq: u64) -> eave_core::journal::Record {
 
 fn clock_running(vcx: &mut VisualTestContext) -> bool {
     vcx.update(|_, cx| motion::clock_running(cx))
+}
+
+/// Is anything but a **caret** driving the clock?
+///
+/// Every test below whose subject is a moving shape — a skeleton, a loader,
+/// a working dot — reads "is the window still drawing this thing", and that
+/// stopped being the same question as `clock_running` when the caret got a
+/// rate of its own. A blinking caret in a box somebody is typing into is
+/// not a skeleton that forgot to stop.
+fn animating(vcx: &mut VisualTestContext) -> bool {
+    vcx.update(|_, cx| motion::animating(cx))
+}
+
+/// Is the clock running, and running at the caret's rate and no faster?
+///
+/// The positive half of the same split: "this window costs exactly one
+/// blinking caret". Both halves are asserted wherever it appears, because
+/// they fail in opposite directions — a `false` from a parked clock is a
+/// caret that stopped blinking, and a `false` from `PULSE_TICK` is a caret
+/// that pinned the window at the frame rate.
+fn caret_only(vcx: &mut VisualTestContext) -> bool {
+    vcx.update(|_, cx| motion::clock_tick(cx)) == Some(motion::caret_tick())
 }
 
 /// N1's invariant, now that something in the tree actually asks. A shell
@@ -4558,7 +4883,14 @@ fn an_open_menu_swallows_typing(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -5459,7 +5791,14 @@ fn rename_buffer(vcx: &mut VisualTestContext, h: &Harness) -> Option<String> {
 
 fn composer_draft(vcx: &mut VisualTestContext, h: &Harness) -> String {
     vcx.read_window(&h.window, |shell, cx| {
-        shell.read(cx).composer.read(cx).text.clone()
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .field
+            .read(cx)
+            .content()
+            .to_string()
     })
     .unwrap()
 }
@@ -5859,6 +6198,61 @@ fn opening_the_rename_field_moves_no_row(cx: &mut TestAppContext) {
     );
 }
 
+/// A long name clips inside the field instead of growing the row — **and
+/// the caret survives the clipping.**
+///
+/// This is the risk the field's shape carries now. The caret used to be the
+/// last character of the title's own string, so `truncate` clipped the two
+/// together and the row could not grow; it is a SIBLING now, because a
+/// caret inside a clipped string is the first thing to disappear exactly
+/// when the operator most needs it — at the end of a name too long for the
+/// box. A sibling has to be paid for with a title that shrinks, and this is
+/// the assertion that it does.
+#[gpui::test]
+fn a_long_name_clips_inside_the_rename_field_and_keeps_its_caret(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    let row_w = vcx.debug_bounds("rail-aaaa1111").expect("row").size.width;
+
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    let field_w = vcx
+        .debug_bounds("rename-aaaa1111")
+        .expect("field")
+        .size
+        .width;
+
+    vcx.simulate_input(&"a name far longer than any rail is wide ".repeat(6));
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").expect("row").size.width,
+        row_w,
+        "a long name grew the rail row — the title inside the field is not \
+         shrinking, so it is pushing the caret and everything after it off \
+         the end"
+    );
+    assert_eq!(
+        vcx.debug_bounds("rename-aaaa1111")
+            .expect("field")
+            .size
+            .width,
+        field_w,
+        "the field itself grew with its contents"
+    );
+    assert!(
+        shown(vcx, "caret-rename-lit") || shown(vcx, "caret-rename-dark"),
+        "the caret was clipped out of the field by a long name — which is \
+         the state it exists to be visible in"
+    );
+}
+
 /// Selecting another row closes the field rather than leaving a keyboard
 /// grab on a row the operator has walked away from.
 #[gpui::test]
@@ -6191,15 +6585,22 @@ fn an_archived_session_parked_on_a_question_keeps_its_row(cx: &mut TestAppContex
     );
 }
 
-/// N4's floor, applied to the one surface in this slice that could break
-/// it: **a rename field sitting open costs nothing.**
+/// N4's floor, applied to the rail's rename field: **an open one costs one
+/// caret and nothing else.**
 ///
-/// The composer's caret blinks, and a blink never settles — its consumer
-/// holds a pulse lease for as long as it is on screen (`caret_lit`, and
-/// the divergence is documented there). This field draws a SOLID caret
-/// precisely so that the idle floor stays reachable with a text box open.
+/// This used to read "costs nothing", and the field paid for that with a
+/// **solid** caret — a comment at the mount site said so in as many words,
+/// and traded the blink for the floor because the only clock there was ran
+/// at 30 fps. A caret has its own rate now, so the trade is off: the field
+/// blinks, at `motion::CARET_TICK`, and the floor is asserted as "nothing
+/// is animating" rather than as "no timer exists".
+///
+/// The second half is the one worth having. **Exactly one caret is lit at a
+/// time**, and it is the one in the box the next key lands in — a composer
+/// still blinking behind an open rename field would be a confident wrong
+/// answer to the only question a caret is asked.
 #[gpui::test]
-fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
+fn an_open_rename_field_costs_one_caret_and_owns_it(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     // A files snapshot has to arrive before ANY selected session can
@@ -6223,9 +6624,15 @@ fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
     assert!(
-        !clock_running(vcx),
-        "the shell was already leasing the clock before the field opened — \
-         then nothing below is measuring the field"
+        !animating(vcx),
+        "the shell was already animating before the field opened — then \
+         nothing below is measuring the field"
+    );
+    // The composer owns the keyboard at this point, so its caret is the lit
+    // one. Stated before the field opens so the flip below means something.
+    assert!(
+        shown(vcx, "caret-composer-lit") || shown(vcx, "caret-composer-dark"),
+        "the composer drew no caret at all"
     );
 
     hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
@@ -6248,10 +6655,24 @@ fn an_open_rename_field_asks_for_no_frames(cx: &mut TestAppContext) {
         "an open rename field is still asking for frames",
     );
     assert!(
-        !clock_running(vcx),
-        "the rename caret leased the pulse clock — the whole reason it is \
-         drawn solid is that a blink here would pin the window at the \
-         frame rate for as long as somebody is naming something",
+        !animating(vcx),
+        "an open rename field drove the clock at the frame rate — the \
+         reason a caret has a rate of its own is so that a text box can \
+         blink without costing one",
+    );
+    assert!(
+        caret_only(vcx),
+        "the rename field is open and nothing is blinking in it",
+    );
+    // The keyboard moved, and so did the only lit caret in the window.
+    assert!(
+        shown(vcx, "caret-rename-lit") || shown(vcx, "caret-rename-dark"),
+        "the rename field drew no caret",
+    );
+    assert!(
+        shown(vcx, "caret-composer-dark"),
+        "the composer's caret is still lit behind an open rename field — \
+         two carets is a window that cannot say where the next key goes",
     );
 }
 
@@ -6979,14 +7400,30 @@ fn the_boot_hook_presses_start_once_against_an_empty_engine(cx: &mut TestAppCont
 // reports a pulsing window as settled. (It reported one to me first.)
 // ---------------------------------------------------------------------------
 
-/// Advance drawn time in 100 ms steps until the pulse clock parks, and
+/// What ten seconds of a settled window with one text box in it costs.
+///
+/// A literal, and deliberately not `10_000 / CARET_TICK.as_millis()` —
+/// deriving it from the constant would make the assertion pass at any rate
+/// including the frame rate, which is the defective-test shape N1 shipped
+/// and mutation testing caught (progress.md §Traps). 100 redraws over 10 s
+/// is one blinking caret at `motion::CARET_TICK`. Anything above it is
+/// something else driving the window; below it is a caret that stopped.
+const CARET_REDRAWS_PER_10S: usize = 100;
+
+/// Advance drawn time in 100 ms steps until nothing is animating, and
 /// report how many steps that took. Panics past `cap` rather than
 /// spinning — an eternal skeleton is precisely a loop that never ends,
 /// and it must fail as a test rather than as a hung suite.
+///
+/// **`animating`, not `clock_running`.** Every caller here selects a
+/// session, and a selected session mounts a composer whose caret blinks for
+/// as long as it is on screen — so the clock in these tests never parks,
+/// and it is not supposed to. What must stop is the skeleton, and the
+/// skeleton is the thing that asks for `PULSE_TICK`.
 #[track_caller]
 fn steps_until_parked(vcx: &mut VisualTestContext, cap: usize, what: &str) -> usize {
     let mut steps = 0usize;
-    while clock_running(vcx) {
+    while animating(vcx) {
         steps += 1;
         assert!(steps < cap, "{what}");
         vcx.executor().advance_clock(Duration::from_millis(100));
@@ -7031,7 +7468,7 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
         "a list that has just been asked for should still say one is coming"
     );
     assert!(
-        clock_running(vcx),
+        animating(vcx),
         "the skeleton is not moving at all — then nothing below is \
          measuring the lease this slice bounds"
     );
@@ -7059,7 +7496,9 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
     );
 
     // The idle floor, applied to the state that used to defeat it: ten
-    // more seconds, and the window is told to draw itself zero times.
+    // more seconds, and the only thing left drawing is the caret in the
+    // composer. It used to be zero, and the difference is the whole of what
+    // a blinking caret costs — see `CARET_REDRAWS_PER_10S`.
     let settled = watch_redraws(&h, vcx);
     for _ in 0..10 {
         vcx.executor().advance_clock(Duration::from_secs(1));
@@ -7067,9 +7506,9 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
     }
     assert_eq!(
         settled.get(),
-        0,
-        "a window whose file list is never coming still redrew itself while \
-         the operator was away from the desk"
+        CARET_REDRAWS_PER_10S,
+        "a window whose file list is never coming redrew itself at a rate \
+         that is not its caret's while the operator was away from the desk"
     );
 
     assert!(
@@ -7140,7 +7579,7 @@ fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
         .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     assert!(shown(vcx, "files-skeleton"), "nothing was ever waiting");
-    assert!(clock_running(vcx), "nothing was ever moving");
+    assert!(animating(vcx), "nothing was ever moving");
 
     h.plumbing.push_conn(ConnEvent::Failed {
         message: "engine unreachable after 5 attempts: connection refused".into(),
@@ -7181,8 +7620,9 @@ fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
     }
     assert_eq!(
         settled.get(),
-        0,
-        "a window that knows no answer is coming still redrew itself"
+        CARET_REDRAWS_PER_10S,
+        "a window that knows no answer is coming redrew itself at a rate \
+         that is not its caret's"
     );
 }
 
@@ -8730,7 +9170,14 @@ fn omni_text(h: &Harness, vcx: &mut VisualTestContext) -> String {
 
 fn draft_of(h: &Harness, vcx: &mut VisualTestContext) -> String {
     vcx.read_window(&h.window, |shell, cx| {
-        shell.read(cx).composer.read(cx).text.clone()
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .field
+            .read(cx)
+            .content()
+            .to_string()
     })
     .unwrap()
 }
@@ -9589,6 +10036,21 @@ fn the_gauge_names_the_quietest_rank_rather_than_a_number() {
 fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    // **Both pages resident, said out loud.** This test predates E3, which
+    // split the page chip's selector on residency — so with no override it
+    // asserted `tab-chip-p1` and got whatever `page_resident` happened to
+    // answer. That is not the same answer in both feature states: a build
+    // with no page engine reports every tab resident by design, and a
+    // `--features web` build asks a Chromium that this harness does not
+    // run, gets `false`, and draws the unloaded globe. So the test passed
+    // without the browser and failed with it, for a reason that has nothing
+    // to do with what it is about.
+    //
+    // Declared rather than tolerated: this test is about ONE STRIP holding
+    // TWO KINDS, so it should pin residency to something and say which,
+    // not accept either mark. Which mark goes with which state is
+    // `an_unloaded_page_tab_does_not_look_like_a_loaded_one`'s claim.
+    set_resident_for_test(Some(&["p1", "p2"]));
     strip_tabs(
         &h,
         vcx,
@@ -9641,6 +10103,99 @@ fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     for sel in ["tab-close-p1", "tab-close-aaaa1111", "tab-close-p2"] {
         assert!(shown(vcx, sel), "{sel} — a tab you cannot close");
     }
+
+    // Cleared, because the `thread_local` outlives the test on a reused
+    // thread and a leaked override would make an unrelated test's tabs
+    // recede for reasons its author never wrote down.
+    set_resident_for_test(None);
+}
+
+/// Slice E3. A tab whose page eave has thrown away must not look like one
+/// holding a live page — otherwise the strip is claiming something it cannot
+/// back up, and the operator has no way to know why clicking costs a reload.
+///
+/// **Asserted on the selector, not on the colour**, because this harness can
+/// find what was painted and cannot read what ink it came out in. The globe
+/// carries the state in its `debug_selector` for exactly that reason: a
+/// treatment the suite cannot see is a treatment that rots.
+#[gpui::test]
+fn an_unloaded_page_tab_does_not_look_like_a_loaded_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // `p2` is the evicted one. Set before the strip renders — the residency
+    // is read during paint.
+    set_resident_for_test(Some(&["p1"]));
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://example.com/"), Some("Example")),
+            page_tab("p2", Some("https://docs.rs/gpui"), Some("gpui")),
+        ],
+        Some("p1"),
+    );
+
+    assert!(
+        shown(vcx, "tab-chip-p1"),
+        "the resident tab lost its ordinary globe"
+    );
+    assert!(
+        !shown(vcx, "tab-chip-unloaded-p1"),
+        "a tab holding a live page is drawn as unloaded"
+    );
+    assert!(
+        shown(vcx, "tab-chip-unloaded-p2"),
+        "an evicted tab is drawn exactly like a loaded one — the whole point \
+         of the slice is that these differ"
+    );
+    assert!(
+        !shown(vcx, "tab-chip-p2"),
+        "the evicted tab still draws the loaded globe as well"
+    );
+
+    // **The treatment must not move anything.** A tab that changed size when
+    // its page was evicted would make the strip twitch under the pointer on
+    // a clock nobody can see, twenty minutes after they last touched it.
+    let b = |vcx: &mut VisualTestContext, sel: &'static str| vcx.debug_bounds(sel).expect(sel);
+    let (one, two) = (b(vcx, "tab-p1"), b(vcx, "tab-p2"));
+    assert_eq!(
+        one.size, two.size,
+        "an evicted tab is a different size from a loaded one"
+    );
+
+    set_resident_for_test(None);
+}
+
+/// The other half, and the one that would rot silently: a SESSION tab has no
+/// browser, so nothing about eviction may touch it. Without this, a build
+/// with no page engine — which is the build this suite runs — would recede
+/// every session row in the rail.
+#[gpui::test]
+fn eviction_never_recedes_a_session_tab(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    // Nothing is resident, page engine or not.
+    set_resident_for_test(Some(&[]));
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        Some("aaaa1111"),
+    );
+
+    assert!(
+        shown(vcx, "tab-chip-aaaa1111"),
+        "the session tab lost its provider mark to a page-engine rule"
+    );
+    assert!(
+        !shown(vcx, "tab-chip-unloaded-aaaa1111"),
+        "a session tab was drawn as an unloaded PAGE"
+    );
+    assert!(
+        shown(vcx, "tab-chip-unloaded-p1"),
+        "the page tab should be the one that recedes"
+    );
+
+    set_resident_for_test(None);
 }
 
 // ---------------------------------------------------------------------------
@@ -10034,10 +10589,8 @@ fn cmd_shift_t_reopens_a_closed_page_tab_and_not_a_session_tab(cx: &mut TestAppC
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt {
-                url,
-                activate: true
-            }) if url == "https://closed.test/"
+            Command::Browser(BrowserCmd::OpenAt { url, activate: true })
+                if url == "https://closed.test/"
         )),
         "⌘⇧T did not reopen the closed page tab: {cmds:?}"
     );
@@ -10341,14 +10894,26 @@ fn closing_the_menu_gives_the_window_to_the_content(cx: &mut TestAppContext) {
 /// this guards: before C5, `showing_page` meant "there are page pixels", so
 /// a page tab in a non-web build rendered the TRANSCRIPT — an agent's
 /// conversation sitting in the well where a document was asked for.
+///
+/// **Slice T1 split the two absences.** A page tab that has BEEN somewhere
+/// and cannot draw is still `page-absence`; a tab that has never been
+/// anywhere gets the launcher instead, because "the browser has not handed
+/// this tab one yet" is not what somebody who pressed ⌘T wanted to read.
+/// The invariant this test actually guards is unchanged and is asserted in
+/// both cases: **the transcript never draws under a page tab.**
 #[gpui::test]
 fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    let visited = || {
+        let mut t = page_tab("p1", Some("https://docs.rs/"), Some("docs.rs"));
+        t.history_len = 1;
+        t
+    };
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     strip_tabs(
         &h,
         vcx,
-        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        vec![session_tab("aaaa1111"), visited()],
         Some("aaaa1111"),
     );
     assert!(
@@ -10357,11 +10922,12 @@ fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext)
     );
     assert!(!shown(vcx, "page-absence"), "no page tab is active");
 
-    // Now the page.
+    // Now the page — one that has been somewhere, so its emptiness is the
+    // browser's and the well has to say so.
     strip_tabs(
         &h,
         vcx,
-        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        vec![session_tab("aaaa1111"), visited()],
         Some("p1"),
     );
     assert!(
@@ -10371,6 +10937,25 @@ fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext)
     // The agent's chrome is gone with the transcript. A prompt box floating
     // on somebody else's document is not a browser.
     assert!(!shown(vcx, "send"), "the composer drew over a page tab");
+
+    // A tab that has never been anywhere is the OTHER absence: nothing has
+    // gone wrong and nothing is starting, so it gets the launcher — and the
+    // transcript still does not draw.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("blank", None, None)],
+        Some("blank"),
+    );
+    assert!(
+        !shown(vcx, "page-absence"),
+        "a fresh tab explained the browser instead of offering a chat"
+    );
+    assert!(shown(vcx, "launcher"));
+    assert!(
+        !shown(vcx, "send"),
+        "the composer drew under the launcher on a blank tab"
+    );
 }
 
 /// **⌘L opens the omnibox over the page, and row zero says what Return will
@@ -10540,6 +11125,635 @@ fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
         cmds.iter()
             .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
         "the strip's + is not ⌘T: {cmds:?}"
+    );
+}
+
+/// Slice T1 — seed a strip that has one project in it.
+///
+/// `workspace` is the checkout the project is bound to, which is the whole
+/// point of the group: `TabGroup::workspace` has recorded that binding since
+/// B1 and Slice T1 is what made anything act on it.
+fn strip_with_project(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    workspace: Option<&str>,
+    grouped: Vec<TabInfo>,
+    loose: Vec<TabInfo>,
+    active: Option<&str>,
+) {
+    let group_ids: Vec<String> = grouped.iter().map(|t| t.id.clone()).collect();
+    let mut order: Vec<eave_wire::Slot> = loose
+        .iter()
+        .map(|t| eave_wire::Slot::Tab { id: t.id.clone() })
+        .collect();
+    // The group goes LAST on the wire on purpose: the drawn order must be
+    // the strip's doing, not the fixture's.
+    order.push(eave_wire::Slot::Group { id: "grp".into() });
+    let mut tabs = loose;
+    tabs.extend(grouped);
+    h.plumbing.push_tabs(TabsSnapshot {
+        order,
+        tabs,
+        groups: vec![eave_wire::TabGroup {
+            id: "grp".into(),
+            title: Some("eave".into()),
+            color: None,
+            collapsed: false,
+            workspace: workspace.map(str::to_string),
+            last_active: None,
+            created_ts_ms: 0,
+        }],
+        group_tabs: vec![("grp".into(), group_ids)],
+        active: active.map(str::to_string),
+        read_only: false,
+    });
+    vcx.run_until_parked();
+}
+
+/// A project is drawn ABOVE the loose tabs, whatever order the engine keeps
+/// them in, with the `TABS` divider marking where it stops.
+///
+/// The fixture puts the group LAST on the wire, so a strip that simply drew
+/// `snapshot.order` would fail this — which is the point. B1's interleaved
+/// ordering is still the operator's ordering and is untouched; Slice T1 lays
+/// one presentation rule over it, in `strip::drawn_order`, where `items` and
+/// `cycle_order` both read it.
+#[gpui::test]
+fn a_project_is_drawn_above_the_loose_tabs_with_the_divider_between_them(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/tmp/eave-harness/repo"),
+        vec![session_tab("aaaa1111")],
+        vec![page_tab(
+            "loose",
+            Some("https://loose.test/"),
+            Some("loose"),
+        )],
+        Some("aaaa1111"),
+    );
+
+    let head = vcx
+        .debug_bounds("group-grp")
+        .expect("the project's head never drew");
+    let divider = vcx
+        .debug_bounds("tabs-divider")
+        .expect("nothing marked where the projects stop");
+    let grouped = vcx
+        .debug_bounds("tab-aaaa1111")
+        .expect("the project's tab never drew");
+    let loose = vcx
+        .debug_bounds("tab-loose")
+        .expect("the loose tab never drew");
+
+    assert!(
+        head.origin.y < grouped.origin.y,
+        "a project's head has to sit above the tabs it holds"
+    );
+    assert!(
+        grouped.origin.y < divider.origin.y,
+        "the divider landed inside the project instead of under it"
+    );
+    assert!(
+        divider.origin.y < loose.origin.y,
+        "the loose tab drew above the divider, so the sections are inverted"
+    );
+}
+
+/// Clicking a project's head folds it, and folding is an engine fact.
+///
+/// `collapsed` has been on the group since B1 and `strip.rs` has always
+/// drawn a collapsed one as a head plus a count. Nothing ever SET it, so
+/// every project was permanently open and the count was unreachable.
+#[gpui::test]
+fn folding_a_project_asks_the_engine_to_collapse_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/tmp/eave-harness/repo"),
+        vec![session_tab("aaaa1111")],
+        Vec::new(),
+        Some("aaaa1111"),
+    );
+
+    let _ = h.drain();
+    click(vcx, "group-grp");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::GroupSetCollapsed {
+                group_id,
+                collapsed: true
+            }) if group_id == "grp"
+        )),
+        "clicking the head did not fold the project: {cmds:?}"
+    );
+}
+
+/// A session in a checkout that has no project mints one, and its tab is
+/// asked for INSIDE it.
+///
+/// This is Slice T1 turning on the first of the three things
+/// `TabGroup::workspace`'s own doc comment says nobody does — *the engine
+/// never creates a group for a worktree*. It still does not: the client
+/// does, because the client is where the snapshot is.
+#[gpui::test]
+fn a_session_in_an_unclaimed_checkout_mints_a_project_for_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut info = session("aaaa1111");
+    info.checkout_root = Some("/tmp/eave-harness/repo".into());
+
+    // Drain BEFORE the rail arrives. `reconcile_strip` runs in the render
+    // pass, so the ask is already out by the time the rail push has parked
+    // — draining after it would throw away the very command under test.
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![info], "aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenSessionTab {
+                session_id,
+                workspace: Some(workspace),
+                group: None,
+                ..
+            }) if session_id == "aaaa1111" && workspace == "/tmp/eave-harness/repo"
+        )),
+        "the session's tab was asked for with no project to put it in: {cmds:?}"
+    );
+}
+
+/// A session whose checkout ALREADY has a project joins it rather than
+/// minting a second one.
+#[gpui::test]
+fn a_session_joins_the_project_its_checkout_already_has(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/tmp/eave-harness/repo".into());
+    let mut b = session("bbbb2222");
+    b.checkout_root = Some("/tmp/eave-harness/repo".into());
+
+    // The project exists FIRST, holding one of the two sessions. With no
+    // rail yet, `sessions_without_tabs` has nothing to ask for, so this
+    // pushes no commands of its own.
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/tmp/eave-harness/repo"),
+        vec![session_tab("aaaa1111")],
+        Vec::new(),
+        Some("aaaa1111"),
+    );
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![a, b], "aaaa1111");
+    let cmds = h.drain();
+    let asked: Vec<_> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::OpenSessionTab {
+                session_id,
+                group,
+                workspace,
+                ..
+            }) => Some((session_id.clone(), group.clone(), workspace.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![("bbbb2222".to_string(), Some("grp".to_string()), None)],
+        "the second session should have joined `grp`, minting nothing: {cmds:?}"
+    );
+}
+
+/// Slice T1 — ⌘T's tab is a **chat you can click into**, not a blank page
+/// you have to aim first.
+///
+/// A page tab that has never been anywhere used to draw `PAGE_STARTING` —
+/// "the browser exists and this tab has not been handed one yet". True, and
+/// no use to somebody who did not ask for a browser. The well gets the
+/// launcher instead: *which agent, in which folder*. So dismissing the
+/// omnibox lands in a chat rather than on an explanation.
+#[gpui::test]
+fn a_blank_tab_offers_a_chat_rather_than_explaining_the_browser(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("blank", None, None)],
+        Some("blank"),
+    );
+
+    assert!(
+        shown(vcx, "launcher"),
+        "a blank tab left the operator looking at the browser's excuses"
+    );
+}
+
+/// ...and a page tab that HAS been somewhere still belongs to the page.
+///
+/// The counter-case matters more than the case: a launcher drawn over a
+/// loaded page would be the floating-surface defect `showing_page` exists
+/// to catch, and it is the launcher specifically that was photographed
+/// drawing straight through docs.rs once already.
+#[gpui::test]
+fn a_page_that_has_been_somewhere_keeps_its_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let mut visited = page_tab("visited", Some("https://docs.rs/"), Some("docs.rs"));
+    visited.history_len = 1;
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), visited],
+        Some("visited"),
+    );
+
+    assert!(
+        !shown(vcx, "launcher"),
+        "the launcher drew over a page that had been somewhere"
+    );
+}
+
+/// Slice T1 — a session started from a blank ⌘T tab lands **in that tab**.
+///
+/// The operator made one tab and must end with one tab. Before this, the
+/// launcher's session arrived as a new tab appended to the strip and the
+/// blank one sat there forever — ⌘T, start a chat, and you owned two tabs,
+/// one of them permanently empty.
+#[gpui::test]
+fn a_session_started_from_a_blank_tab_takes_that_tabs_place(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // No session selected, one blank page tab active: the launcher is up
+    // and it is up *because of that tab*.
+    strip_tabs(&h, vcx, vec![page_tab("blank", None, None)], Some("blank"));
+    assert!(shown(vcx, "launcher"), "the launcher is not up");
+
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+
+    // The session the launch asked for now arrives on the rail.
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::ReplaceWithSessionTab {
+                closing,
+                session_id,
+                index: 0,
+                ..
+            }) if closing == "blank" && session_id == "aaaa1111"
+        )),
+        "the session did not take the blank tab's place: {cmds:?}"
+    );
+}
+
+/// ...and a session that arrives on its own does NOT evict somebody's tab.
+///
+/// The note is taken, not read: only the first session after a launch from
+/// a blank tab claims it, and a session nobody launched from a tab claims
+/// nothing.
+#[gpui::test]
+fn a_session_nobody_launched_from_a_tab_replaces_nothing(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(&h, vcx, vec![page_tab("blank", None, None)], Some("blank"));
+
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::ReplaceWithSessionTab { .. })
+        )),
+        "a session arriving on its own took a tab that was not offered: {cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenSessionTab { session_id, .. })
+                if session_id == "aaaa1111"
+        )),
+        "it should still get an ordinary tab of its own: {cmds:?}"
+    );
+}
+
+/// Slice T1 — seed the bookmark tree. `(id, depth, title, url)`; a `None`
+/// url makes a folder, exactly as `BookmarkAdd` means it.
+fn push_bookmarks(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    nodes: &[(&str, usize, Option<&str>, Option<&str>)],
+) {
+    h.plumbing.push_bookmarks(eave_wire::BookmarksSnapshot {
+        nodes: nodes
+            .iter()
+            .map(|(id, depth, title, url)| eave_wire::BookmarkNode {
+                bookmark: eave_wire::Bookmark {
+                    id: (*id).into(),
+                    parent: None,
+                    title: title.map(str::to_string),
+                    kind: match url {
+                        Some(u) => eave_wire::BookmarkKind::Link { url: (*u).into() },
+                        None => eave_wire::BookmarkKind::Folder,
+                    },
+                    created_ts_ms: 0,
+                },
+                depth: *depth,
+                children: 0,
+            })
+            .collect(),
+        ..Default::default()
+    });
+    vcx.run_until_parked();
+}
+
+/// A page tab with a real address, so the bar has something to be over.
+fn visited_tab(id: &str, url: &str) -> TabInfo {
+    let mut t = page_tab(id, Some(url), Some("a page"));
+    t.history_len = 1;
+    t
+}
+
+/// Slice T1 — bookmarks sit **on top of pages**, which means they are not
+/// there in a chat.
+///
+/// That is the operator's own ruling and it has a real cost: the bar
+/// vanishes when the well holds a session. Asserted in both directions so
+/// the cost stays a decision rather than becoming a surprise.
+#[gpui::test]
+fn the_bookmarks_bar_is_over_a_page_and_absent_in_a_chat(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://docs.rs/"),
+        ],
+        Some("p1"),
+    );
+    assert!(shown(vcx, "bookmarks-bar"), "no bar over a page");
+    assert!(shown(vcx, "bookmark-gh"), "the bar drew none of its chips");
+
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://docs.rs/"),
+        ],
+        Some("aaaa1111"),
+    );
+    assert!(
+        !shown(vcx, "bookmarks-bar"),
+        "the bar drew over an agent's conversation"
+    );
+}
+
+/// A folder opens its children under it, and only its DIRECT children.
+#[gpui::test]
+fn a_bookmark_folder_opens_its_children_under_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("dev"), None),
+            ("rs", 1, None, Some("https://docs.rs/")),
+            ("inner", 1, Some("inner"), None),
+            ("deep", 2, None, Some("https://deep.test/")),
+        ],
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    assert!(shown(vcx, "bookmark-folder-dev"), "the folder never drew");
+    assert!(!shown(vcx, "bookmark-child-rs"), "the folder opened itself");
+
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "bookmark-child-rs"), "the folder opened empty");
+    assert!(
+        !shown(vcx, "bookmark-child-deep"),
+        "a grandchild drew as a child — the run did not stop at the folder's depth"
+    );
+
+    // Clicking it again shuts it. One folder open at a time, and a
+    // disclosure that only opens is a trap.
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "bookmark-child-rs"),
+        "the folder would not shut"
+    );
+}
+
+/// Clicking a bookmark sends the tab you are looking at, which is what a
+/// bookmarks bar has meant in every browser.
+#[gpui::test]
+fn clicking_a_bookmark_sends_the_active_tab_to_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    click(vcx, "bookmark-gh");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Navigate { tab_id, url })
+                if tab_id == "p1" && url == "https://github.com/"
+        )),
+        "the bookmark opened somewhere other than the tab in front of you: {cmds:?}"
+    );
+}
+
+/// Dropping the address into a folder files it INSIDE, and onto the bar
+/// files it on the bar.
+///
+/// The drop handlers are driven directly rather than through a synthetic
+/// drag, which is what `the_rail_draws_the_width_it_was_dragged_to` does
+/// for the divider: gpui's drag is a multi-frame gesture and the thing
+/// worth pinning is what the handler ASKS the engine for.
+#[gpui::test]
+fn dropping_an_address_files_it_where_it_landed(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("dev", 0, Some("dev"), None)]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            let drag = AddressDrag {
+                url: "https://docs.rs/".into(),
+                title: Some("docs.rs".into()),
+            };
+            shell.add_bookmark(Some("dev".into()), None, &drag, cx);
+            shell.add_bookmark(None, Some(0), &drag, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    let adds: Vec<_> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::BookmarkAdd {
+                parent,
+                index,
+                url,
+                title,
+            }) => Some((parent.clone(), *index, url.clone(), title.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        adds,
+        vec![
+            (
+                Some("dev".to_string()),
+                None,
+                Some("https://docs.rs/".to_string()),
+                Some("docs.rs".to_string())
+            ),
+            (
+                None,
+                Some(0),
+                Some("https://docs.rs/".to_string()),
+                Some("docs.rs".to_string())
+            ),
+        ],
+        "a drop did not land where it was aimed: {cmds:?}"
+    );
+}
+
+/// A bookmark dragged onto a folder goes in it; dragged onto a chip, it
+/// takes that chip's place.
+#[gpui::test]
+fn moving_a_bookmark_reparents_or_reorders(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("gh", 0, None, Some("https://github.com/")),
+            ("dev", 0, Some("dev"), None),
+        ],
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.move_bookmark("gh".into(), Some("dev".into()), 0, cx);
+            shell.move_bookmark("gh".into(), None, 1, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    let moves: Vec<_> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::BookmarkMove {
+                bookmark_id,
+                parent,
+                index,
+            }) => Some((bookmark_id.clone(), parent.clone(), *index)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves,
+        vec![
+            ("gh".to_string(), Some("dev".to_string()), 0),
+            ("gh".to_string(), None, 1),
+        ],
+        "{cmds:?}"
+    );
+}
+
+/// Slice T1 — the bar makes folders, and names them so two are told apart.
+///
+/// A folder created unnamed would draw as an empty chip: eave has no
+/// inline rename for a bookmark yet (`BookmarkRename` is on the wire and
+/// nothing calls it), so the operator could open it and fill it but never
+/// identify it.
+#[gpui::test]
+fn the_bar_makes_folders_and_names_them_apart(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let _ = h.drain();
+    click(vcx, "bookmark-new-folder");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::BookmarkAdd { url: None, title: Some(t), .. })
+                if t == "new folder"
+        )),
+        "the bar's folder button made no folder: {cmds:?}"
+    );
+
+    // With one already there, the next is distinguishable from it.
+    push_bookmarks(&h, vcx, &[("f1", 0, Some("new folder"), None)]);
+    let _ = h.drain();
+    click(vcx, "bookmark-new-folder");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::BookmarkAdd { url: None, title: Some(t), .. })
+                if t == "new folder 2"
+        )),
+        "a second folder was made indistinguishable from the first: {cmds:?}"
     );
 }
 
@@ -11258,5 +12472,1072 @@ fn the_page_menu_disables_history_rows_rather_than_dropping_them(cx: &mut TestAp
             .iter()
             .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
         "a disabled Back row walked the history anyway: {cmds:?}"
+    );
+}
+
+// Slice D3 stage 1 — the rail's geometry, and the fact that it moves.
+
+/// **The rail may never be dragged narrower than the traffic lights it
+/// contains.**
+///
+/// A′ gave the rail the window's left edge, so the macOS window buttons sit
+/// INSIDE it — and they sit at a window-fixed x that no layout of ours moves.
+/// A rail narrower than that clearance would have them hanging off its right
+/// edge onto the page: not a squeeze, a frame that is wrong.
+///
+/// The floor is asserted against `TRAFFIC_CLEARANCE` rather than against a
+/// literal because this one really is a derivation — if the clearance ever
+/// changes, the drag's floor has to move with it, and silently.
+#[gpui::test]
+fn the_rail_never_narrows_past_its_own_traffic_lights(_cx: &mut TestAppContext) {
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(
+            theme::RAIL_W_MIN >= theme::TRAFFIC_CLEARANCE,
+            "the rail may be dragged to {} px and the traffic lights need \
+             {} — at that width they hang off the rail onto the page",
+            theme::RAIL_W_MIN,
+            theme::TRAFFIC_CLEARANCE
+        );
+        assert!(
+            theme::RAIL_W_MIN < theme::RAIL_W && theme::RAIL_W < theme::RAIL_W_MAX,
+            "the resting width {} is outside its own drag range {}..{} — a \
+             rail that opens outside the range it can be dragged to is a \
+             frame that cannot return to its own default",
+            theme::RAIL_W,
+            theme::RAIL_W_MIN,
+            theme::RAIL_W_MAX
+        );
+    }
+}
+
+/// **A width from disk is held to the bounds, and a corrupt one opens the
+/// window anyway.**
+///
+/// The bounds are enforced on the value read from the file and not only on
+/// the pointer, because the file is the one input eave does not control: a
+/// build with wider bounds, a hand edit, a half-written file. Clamping rather
+/// than rejecting is the deliberate half of it — the frame should open
+/// narrow, not refuse to open.
+///
+/// `NaN` is called out separately because it is the one value that makes
+/// `clamp` itself misbehave: `f32::clamp` panics on a NaN bound and returns
+/// NaN for a NaN input, and a NaN width lays out as a rail of zero px with no
+/// error anywhere.
+#[gpui::test]
+fn a_saved_rail_width_is_held_to_the_bounds(_cx: &mut TestAppContext) {
+    assert_eq!(clamp_rail_w(theme::RAIL_W), theme::RAIL_W);
+    assert_eq!(clamp_rail_w(10.0), theme::RAIL_W_MIN, "far under the floor");
+    assert_eq!(
+        clamp_rail_w(9000.0),
+        theme::RAIL_W_MAX,
+        "far over the ceiling"
+    );
+    assert_eq!(
+        clamp_rail_w(f32::NAN),
+        theme::RAIL_W,
+        "a NaN width lays out as a zero-px rail and reports nothing — it has \
+         to land on the default, not on a bound"
+    );
+    assert_eq!(clamp_rail_w(f32::INFINITY), theme::RAIL_W);
+}
+
+/// **The seam is grabbable, and the grab target is wider than the seam.**
+///
+/// The handle is transparent, so nothing else in the harness can tell it
+/// exists; this is the only assertion that it is mounted at all. It also
+/// pins the two facts that make it usable rather than decorative: it is as
+/// tall as the rail (a divider you can only grab in the middle is a divider
+/// you hunt for), and it straddles the seam rather than sitting inside the
+/// rail, so the pointer finds it coming from either side.
+#[gpui::test]
+fn the_rail_seam_is_a_grab_target_on_both_sides_of_itself(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+
+    let rail = vcx.debug_bounds("rail").expect("the rail renders");
+    let grab = vcx.debug_bounds("rail-handle").expect("the resize handle");
+
+    assert_eq!(
+        grab.size.height, rail.size.height,
+        "the handle is {:?} tall against a {:?} rail — a divider you can \
+         only grab in the middle is one you hunt for",
+        grab.size.height, rail.size.height
+    );
+    assert!(
+        grab.size.width >= px(theme::RAIL_HANDLE_W),
+        "the grab target is {:?}; the seam it covers is a hairline",
+        grab.size.width
+    );
+    // Straddling, not inset: the handle's box crosses the rail's right edge,
+    // so half of it is over the content. `deferred` is what keeps that half
+    // paintable — without it the content region covers it and the target is
+    // silently half as wide as this asserts.
+    let seam = rail.origin.x + rail.size.width;
+    assert!(
+        grab.origin.x < seam && grab.origin.x + grab.size.width > seam,
+        "the handle spans {:?}..{:?} and the seam is at {seam:?} — it has to \
+         cross it, or the pointer only finds it from one side",
+        grab.origin.x,
+        grab.origin.x + grab.size.width
+    );
+}
+
+/// **The rail's width is the shell's, not the token's.**
+///
+/// The token is the launch default and the shell holds what the operator
+/// dragged to. This is the assertion that the layout actually reads the
+/// second one — a frame that draws `theme::RAIL_W` would pass every other
+/// test in this file and ignore every drag.
+#[gpui::test]
+fn the_rail_draws_the_width_it_was_dragged_to(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("rail").unwrap().size.width,
+        px(theme::RAIL_W),
+        "a fresh shell opens at the default"
+    );
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.rail_w = theme::RAIL_W_MAX;
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("rail").unwrap().size.width,
+        px(theme::RAIL_W_MAX),
+        "the rail did not follow the shell's width, so it is drawing the \
+         token and no drag will ever move it"
+    );
+}
+
+/// **The content takes the whole delta, and the reading column moves with
+/// the seam rather than under it.**
+///
+/// The directive's words were "the gutter between rail and card stays
+/// constant — the CARD absorbs the delta". There is no card: Slice D1's A′
+/// made the content region full-bleed on its other three edges, on the
+/// operator's border ruling, so the gutter is zero and stays zero. What
+/// survives of the requirement is the part that matters — every pixel the
+/// rail gains comes out of the content and none of it comes out of the
+/// window, and the two regions still meet exactly at the seam with no gap
+/// and no overlap.
+#[gpui::test]
+fn widening_the_rail_costs_the_content_and_nothing_else(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+
+    let rail0 = vcx.debug_bounds("rail").unwrap();
+    let well0 = vcx.debug_bounds("content-well").unwrap();
+    let window_w = rail0.size.width + well0.size.width;
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.rail_w = theme::RAIL_W + 60.0;
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    let rail1 = vcx.debug_bounds("rail").unwrap();
+    let well1 = vcx.debug_bounds("content-well").unwrap();
+
+    assert_eq!(
+        rail1.size.width - rail0.size.width,
+        well0.size.width - well1.size.width,
+        "the rail grew by {:?} and the content gave up {:?} — the difference \
+         went somewhere, and the only somewhere is off the window",
+        rail1.size.width - rail0.size.width,
+        well0.size.width - well1.size.width
+    );
+    assert_eq!(
+        rail1.size.width + well1.size.width,
+        window_w,
+        "the two regions no longer fill the window between them"
+    );
+    // **Slice R1 changed what this asserts, and the change is the point.**
+    //
+    // D3 wrote it as `well1.origin.x == rail1.origin.x + rail1.size.width`
+    // — no gap at all — because on D3's branch A′ had deleted the inset
+    // card and any gap really was a rounding error. The consolidated tree
+    // brings a card BACK, on purpose: the content is a floating plate with
+    // a uniform `CARD_GUTTER` on every side (see `content_card` in
+    // `ui.rs`). Those two frames disagree, and this test is where the
+    // disagreement showed up.
+    //
+    // Weakening it to `>=` would have made it stop failing and stop
+    // testing. Asserting the gutter EXACTLY keeps everything D3 wanted —
+    // a stray pixel still fails — and adds a guard D3 could not have
+    // written: the gutter changing silently now fails too.
+    assert_eq!(
+        well1.origin.x,
+        rail1.origin.x + rail1.size.width + px(theme::CARD_GUTTER),
+        "the content no longer starts one CARD_GUTTER after the rail ends. \
+         Either the gutter moved, or the inset card is drifting — both are \
+         frame regressions and neither is a rounding error"
+    );
+}
+
+/// **A build with no page engine closes the fact channel on the first poll,
+/// and that closure must not be read as a signal.**
+///
+/// This is the trigger for "eave renders no tabs at all" — the defect Slice
+/// D1 photographed, verified against `main`, and filed as unexplained, and
+/// which Slice D3 traced end to end.
+///
+/// The subscription task in `feed_loop` selects over two channels: the tab
+/// snapshots coming from the engine, and the facts a page reports on its way
+/// back. Its fact arm used to `return` on `None`. `None` on an
+/// `UnboundedReceiver` means only "every sender has been dropped" — and in a
+/// build without `--features web` that is true *immediately*, because this
+/// sink is the one below and it takes the sender by value with nothing to
+/// hold it. So the task ended before its first `select!` could favour the
+/// other arm, `rx` was dropped with it, and the engine's first tab snapshot
+/// arrived at a dead receiver. The client's read loop found the stream,
+/// failed to send, removed the subscription, and discarded every later
+/// snapshot against an absent entry — silently, at a layer with no logging.
+/// The engine was reporting `run_tabs order=9 sent_ok=true` the whole time.
+///
+/// The fix is a guard on that arm, which retires it instead of returning.
+/// **This test pins the TRIGGER rather than the fix**, deliberately: the
+/// guard lives in a spawned async task inside `feed_loop` and this harness
+/// drives the shell through `Plumbing` fakes that never build a `Client`, so
+/// there is no seam here to assert it through. What this holds is the fact
+/// that made the guard necessary — so that a later tidy-up which makes this
+/// sink *hold* its sender cannot quietly remove the reason the guard is
+/// there, and so that anyone who deletes the guard finds this explanation
+/// attached to the thing that will bite them.
+///
+/// Verified in the product rather than here: with the guard, the strip
+/// renders seven tabs and the pane header states an address
+/// (`docs/shots/d3-rail-rest.png`); without it, both are empty.
+#[cfg(not(feature = "web"))]
+#[gpui::test]
+fn a_build_with_no_page_engine_closes_the_fact_channel_at_once(_cx: &mut TestAppContext) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::web::Fact>();
+    crate::web::install_fact_sink(tx);
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "this build's fact sink now keeps its sender alive. That is not a \
+         bug, but the tab subscription's fact arm is guarded on the \
+         assumption that a closed channel is NORMAL here rather than fatal \
+         — read that guard before relying on this staying open."
+    );
+}
+
+/// Two page tabs in the well, side by side. Dropping one tab onto another
+/// is the Arc/Brave gesture; the engine still has one `active`, the well
+/// paints both.
+#[gpui::test]
+fn dropping_a_tab_on_another_tab_splits_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    assert!(
+        !shown(vcx, "split-well"),
+        "a single tab must not draw a split"
+    );
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "split-well"), "the well did not split");
+    assert!(shown(vcx, "split-pane-left"), "left pane missing");
+    assert!(shown(vcx, "split-pane-right"), "right pane missing");
+    assert!(shown(vcx, "split-handle"), "no divider between panes");
+}
+
+/// Dragging a tab onto itself is not a split — that would be a pane of
+/// the same tab twice, and the only honest answer is to do nothing.
+#[gpui::test]
+fn dropping_a_tab_on_itself_does_not_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/"), Some("A"))],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p1", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "a tab dropped on itself opened a split"
+    );
+}
+
+/// Two sessions cannot share the well: this shell has one transcript
+/// subscription, and a second session pane would be a caption over an
+/// empty log. The drop is refused rather than drawn dishonestly.
+#[gpui::test]
+fn two_session_tabs_do_not_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("s1"), session_tab("s2")],
+        Some("s1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("s2", "s1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "two sessions opened a split this shell cannot back"
+    );
+}
+
+/// Clicking a tab that is not in the split leaves it — the well is a view
+/// of two tabs, not a lock. The third tab fills the card.
+#[gpui::test]
+fn clicking_a_third_tab_leaves_the_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"));
+
+    click(vcx, "tab-p3");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "clicking a third tab left the split on screen"
+    );
+}
+
+/// Dropping a background tab onto the well (the document currently in
+/// front) splits with that document. Left/right is which half of the
+/// card the pointer was over.
+#[gpui::test]
+fn dropping_a_tab_on_the_well_splits_with_the_page_in_front(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p2", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"), "well drop did not split");
+    assert!(shown(vcx, "split-pane-left"));
+    assert!(shown(vcx, "split-pane-right"));
+}
+
+/// The actual gesture: mouse-down on one tab, move past gpui's 2px drag
+/// threshold, mouse-up on another. If this fails, `on_drag`/`on_drop` on
+/// the rail tab is not wired, and calling `split_tabs` from a test is not
+/// the same as the operator dragging.
+#[gpui::test]
+fn dragging_one_tab_onto_another_splits_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    let from = vcx.debug_bounds("tab-p2").expect("tab-p2");
+    let onto = vcx.debug_bounds("tab-p1").expect("tab-p1");
+    vcx.simulate_mouse_down(from.center(), MouseButton::Left, Modifiers::none());
+    let mut mid = from.center();
+    mid.y += px(8.);
+    vcx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_mouse_move(onto.center(), Some(MouseButton::Left), Modifiers::none());
+    vcx.simulate_mouse_up(onto.center(), MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "split-well"),
+        "dragging tab-p2 onto tab-p1 did not split the well — on_drag/on_drop \
+         on the rail tab is not firing"
+    );
+}
+
+/// Split tabs share one rail pill, side by side, matching the well.
+/// Stacked full-width rows would mean the strip is silent about the split.
+#[gpui::test]
+fn split_tabs_sit_side_by_side_on_the_rail(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ],
+        Some("p1"),
+    );
+    assert!(
+        !shown(vcx, "split-tabs"),
+        "a single page must not draw the combined pill"
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "split-tabs"),
+        "split tabs must share one rail pill"
+    );
+    let a = vcx.debug_bounds("tab-p1").expect("tab-p1");
+    let b = vcx.debug_bounds("tab-p2").expect("tab-p2");
+    assert_eq!(
+        a.origin.y, b.origin.y,
+        "split tabs must sit on one row, not stack: p1 {a:?} p2 {b:?}"
+    );
+    assert!(
+        a.origin.x < b.origin.x,
+        "left pane's tab should be the left chip"
+    );
+    let c = vcx.debug_bounds("tab-p3").expect("tab-p3");
+    assert!(
+        c.origin.y > a.origin.y,
+        "a tab that is not in the split stays a row under the pill"
+    );
+}
+
+/// `flex_basis(0)` plus the grow factor is the ratio. Without the zero
+/// basis, a pane whose page had not reflowed kept its old content width
+/// and the other pane got leftovers.
+#[gpui::test]
+fn both_split_panes_take_a_share_of_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    let left = vcx.debug_bounds("split-pane-left").expect("left");
+    let right = vcx.debug_bounds("split-pane-right").expect("right");
+    assert!(
+        left.size.width > px(200.) && right.size.width > px(200.),
+        "a 50/50 split collapsed a pane: left {:?} right {:?}",
+        left.size.width,
+        right.size.width
+    );
+}
+
+/// Clicking a pane focuses it (the ring) and does not leave the split.
+#[gpui::test]
+fn clicking_a_split_pane_focuses_it_without_leaving(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    h.drain();
+
+    click(vcx, "split-pane-left");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"), "clicking a pane left the split");
+    assert!(
+        h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Activate(id)) if id == "p1")),
+        "clicking the left pane did not activate it"
+    );
+}
+
+/// Clicking a chip in the combined pill focuses that pane, same as
+/// clicking the pane itself. It must not unsplit — that is reserved for
+/// a tab that is not in the well.
+#[gpui::test]
+fn clicking_a_chip_in_the_combined_row_keeps_the_split(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    h.drain();
+
+    click(vcx, "tab-p1");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "split-well") && shown(vcx, "split-tabs"),
+        "clicking a split chip unsplits the well"
+    );
+    assert!(
+        h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Activate(id)) if id == "p1")),
+        "clicking the left chip did not activate that pane"
+    );
+}
+
+fn open_tab_strip_menu(h: &Harness, vcx: &mut VisualTestContext, tab_id: &str) {
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.open_tab_menu(tab_id, gpui::point(px(240.), px(180.)), cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+}
+
+/// Two-finger click on a rail tab opens the single-tab menu, not the
+/// page's Chromium menu.
+#[gpui::test]
+fn a_right_click_on_a_tab_opens_the_single_tab_menu(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    let from = vcx.debug_bounds("tab-p1").expect("tab-p1");
+    vcx.simulate_mouse_down(from.center(), MouseButton::Right, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-menu-copy-link"),
+        "right-clicking a tab did not open Copy Link"
+    );
+    assert!(
+        shown(vcx, "tab-menu-add-split"),
+        "Add Split View missing on a tab that has a partner"
+    );
+    assert!(
+        !shown(vcx, "tab-menu-separate"),
+        "a single tab offered the split menu"
+    );
+}
+
+/// Right-clicking a tab that is in the well opens the split menu.
+#[gpui::test]
+fn a_right_click_on_a_split_tab_opens_the_split_menu(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    open_tab_strip_menu(&h, vcx, "p1");
+    assert!(
+        shown(vcx, "tab-menu-separate"),
+        "split tab menu missing Separate All Tabs"
+    );
+    assert!(
+        shown(vcx, "tab-menu-convert-axis"),
+        "Convert to Vertical Split View missing"
+    );
+    assert!(shown(vcx, "menu-header"), "Tab Options header missing");
+}
+
+/// Copy Link writes the tab's url, which is the one thing Share and
+/// Copy Link can honestly do without a share sheet.
+#[gpui::test]
+fn copy_link_from_the_tab_menu_writes_the_url(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/path"), Some("A"))],
+        Some("p1"),
+    );
+    open_tab_strip_menu(&h, vcx, "p1");
+    click(vcx, "tab-menu-copy-link");
+    vcx.run_until_parked();
+    let text = vcx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("clipboard empty after Copy Link");
+    assert_eq!(text, "https://a.test/path");
+}
+
+/// Separate All Tabs is the split menu's unsplit — the well is a view,
+/// and this is how you leave it without closing either tab.
+#[gpui::test]
+fn separate_all_tabs_leaves_the_split(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    open_tab_strip_menu(&h, vcx, "p2");
+    click(vcx, "tab-menu-separate");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "split-well"),
+        "Separate All Tabs left the split on screen"
+    );
+}
+
+/// Convert to Vertical Split View turns the well into a column. The
+/// handle's long axis is the proof: a row-resize handle is wide and short.
+#[gpui::test]
+fn convert_to_vertical_split_turns_the_handle(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let before = vcx.debug_bounds("split-handle").expect("handle");
+    open_tab_strip_menu(&h, vcx, "p1");
+    click(vcx, "tab-menu-convert-axis");
+    vcx.run_until_parked();
+    let after = vcx.debug_bounds("split-handle").expect("handle after");
+    assert!(
+        after.size.width > after.size.height,
+        "vertical split handle should be a row, was {:?}",
+        after.size
+    );
+    assert!(
+        before.size.height > before.size.width,
+        "horizontal handle should have been a column first, was {:?}",
+        before.size
+    );
+    assert!(shown(vcx, "split-well"), "converting axis unsplits");
+}
+
+/// The plate paints decoded bytes, not an HTTP URL gpui cannot fetch.
+/// The harness injects a 1×1 PNG the way Chromium's download_image
+/// callback would after a live fetch.
+#[gpui::test]
+fn a_page_tab_paints_its_favicon_when_the_bytes_are_in(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::set_favicon_for_test(
+        "p1",
+        Some(std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            TINY_PNG.to_vec(),
+        ))),
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/"), Some("A"))],
+        Some("p1"),
+    );
+    assert!(
+        shown(vcx, "tab-favicon-p1"),
+        "a page with favicon bytes still drew the globe"
+    );
+    crate::web::set_favicon_for_test("p1", None);
+}
+
+/// Add Split View from the menu is the same act as dropping one tab on
+/// another: the well becomes a view of two existing tabs.
+#[gpui::test]
+fn add_split_view_from_the_menu_splits_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    open_tab_strip_menu(&h, vcx, "p1");
+    click(vcx, "tab-menu-add-split");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "split-well"),
+        "Add Split View did not split the well"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice CM — the capability the composer did not have
+//
+// Everything above this line is the composer eave already had, re-proved
+// against a different buffer. These are the things that were **impossible**
+// before it: there was no `EntityInputHandler` anywhere in the application, so
+// no IME, no selection and no mouse caret, and a CJK operator could not type
+// into eave at all.
+//
+// They drive the field the way macOS drives it — through the trait, not
+// through a convenience wrapper — because the trait is the part that was
+// missing and a test that went around it would prove nothing.
+
+/// In scope so the tests below can drive the field the way macOS does — every
+/// IME method is a trait method, and reaching them any other way would be
+/// testing a wrapper instead of the thing that was missing.
+use gpui::EntityInputHandler as _;
+
+/// The composer's field, for tests that need to reach past the draft string.
+fn composer_field(h: &Harness, vcx: &mut VisualTestContext) -> Entity<TextField> {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell.read(cx).composer.read(cx).field.clone()
+    })
+    .unwrap()
+}
+
+/// **The slice's reason for existing.** Japanese input composes in the
+/// composer, and the provisional text is marked while it does.
+///
+/// This is the exact path macOS's input method takes: `replace_and_mark_text_in
+/// _range` for each keystroke of the composition, then `replace_text_in_range`
+/// when the operator picks a candidate. Before Slice CM eave implemented
+/// neither, so the system had nowhere to put composing text and the characters
+/// were simply lost.
+///
+/// The marked range matters as much as the text: it is what the field
+/// underlines, and it is what tells the operator which characters are still
+/// provisional. A composition that inserted text with no mark would look
+/// committed when it is not.
+#[gpui::test]
+fn japanese_composes_in_the_composer_and_commits(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let field = composer_field(&h, vcx);
+
+    // Typing `nihon` on a Japanese IME: the romaji are provisional, and the
+    // input method rewrites the same marked range on every keystroke.
+    //
+    // **The ranges are UTF-16, not bytes** — that is the IME's own coordinate
+    // system, and each of these kana is 1 unit and 3 bytes. It is also the
+    // reason the old composer could never have grown IME support by accident:
+    // it indexed a `String` by byte and had no mapping between the two.
+    // bezel's `offset_to_utf16`/`offset_from_utf16` (and the round-trip test
+    // vendored beside them) exist for exactly this boundary.
+    for (partial, mark) in [("に", 0..1), ("にほ", 0..2), ("にほん", 0..3)] {
+        let units = partial.encode_utf16().count();
+        vcx.update(|window, cx| {
+            field.update(cx, |f, cx| {
+                f.replace_and_mark_text_in_range(None, partial, Some(0..units), window, cx);
+            });
+        });
+        assert_eq!(
+            draft_of(&h, vcx),
+            partial,
+            "the composition did not reach the draft"
+        );
+        let marked = vcx
+            .update(|window, cx| field.update(cx, |f, cx| f.marked_text_range(window, cx)))
+            .expect("composing text was not marked, so nothing underlines it");
+        assert_eq!(
+            marked, mark,
+            "the marked range does not cover what is provisional"
+        );
+    }
+
+    // Picking the candidate commits it: the kanji replace the kana and the
+    // mark is gone, because nothing is provisional any more.
+    vcx.update(|window, cx| {
+        field.update(cx, |f, cx| {
+            f.replace_text_in_range(None, "日本", window, cx);
+        });
+    });
+    assert_eq!(draft_of(&h, vcx), "日本", "the candidate did not commit");
+    assert!(
+        vcx.update(|window, cx| field.update(cx, |f, cx| f.marked_text_range(window, cx)))
+            .is_none(),
+        "committed text is still marked provisional"
+    );
+
+    // And it sends like any other draft — the point being that the whole
+    // composer works for it, not just the field.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Send { text, .. }] if text == "日本"),
+        "a composed message did not send"
+    );
+}
+
+/// Text can be selected, and typing replaces the selection.
+///
+/// The old composer had one position — the end — and no notion of a range at
+/// all: `⌘A` did nothing, shift-arrow did nothing, and the only edit available
+/// was to delete backwards from the end. Correcting a word in the middle of a
+/// paragraph meant deleting everything after it.
+#[gpui::test]
+fn the_draft_can_be_selected_and_typed_over(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let field = composer_field(&h, vcx);
+    let selection = |vcx: &mut VisualTestContext, field: &Entity<TextField>| {
+        vcx.update(|window, cx| field.update(cx, |f, cx| f.selected_text_range(false, window, cx)))
+            .map(|s| s.range)
+    };
+
+    vcx.simulate_input("hello world");
+    assert_eq!(
+        selection(vcx, &field),
+        Some(11..11),
+        "the caret is at the end"
+    );
+
+    // Shift-left five times selects `world` backwards from the end.
+    vcx.simulate_keystrokes("shift-left shift-left shift-left shift-left shift-left");
+    assert_eq!(
+        selection(vcx, &field),
+        Some(6..11),
+        "shift-left did not extend a selection"
+    );
+
+    // Typing replaces it — the behaviour every text field has and eave's had
+    // no way to express.
+    vcx.simulate_input("there");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "hello there",
+        "typing over a selection did not replace it"
+    );
+
+    // ⌘A takes the lot, and backspace on a selection deletes the range rather
+    // than one character.
+    vcx.simulate_keystrokes("cmd-a");
+    assert_eq!(
+        selection(vcx, &field),
+        Some(0..11),
+        "cmd-A selected nothing"
+    );
+    vcx.simulate_keystrokes("backspace");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "",
+        "backspace did not delete the selection"
+    );
+}
+
+/// Clicking in the middle of a draft puts the caret there.
+///
+/// Not a nicety: with no mouse caret the only way to reach a character was to
+/// delete every character after it. This asserts the caret **moved off the
+/// end**, not a particular offset — the exact one depends on the shaped width
+/// of the glyphs, and pinning it would be pinning the font.
+#[gpui::test]
+fn a_click_places_the_caret_in_the_draft(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let field = composer_field(&h, vcx);
+
+    vcx.simulate_input("the quick brown fox");
+    let end = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    assert_eq!(end, 19, "precondition: typing leaves the caret at the end");
+
+    // A few characters in from the left edge of the field, vertically centred.
+    click_at(vcx, "composer-text", 12.0, 8.0);
+    vcx.run_until_parked();
+
+    let after = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    assert!(
+        after < end,
+        "clicking near the start of the draft left the caret at the end ({after})"
+    );
+}
+
+/// Shift-Return breaks a line; Return still sends.
+///
+/// The composer is `Shape::Grow`, so a multi-line draft is a real thing now.
+/// Both halves are asserted together because they are one decision: eave binds
+/// `enter` to its own send on the composer's key context, which is exactly why
+/// `shift-enter` had to be bound back to a newline by hand (delta item 10).
+#[gpui::test]
+fn shift_return_breaks_a_line_and_return_still_sends(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+
+    vcx.simulate_input("first");
+    vcx.simulate_keystrokes("shift-enter");
+    vcx.simulate_input("second");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "first\nsecond",
+        "shift-return did not break the line"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Send { text, .. }] if text == "first\nsecond"),
+        "return did not send the multi-line draft"
+    );
+}
+
+/// A run of typing undoes as one step, and redo puts it back.
+///
+/// bezel groups adjacent edits of the same kind, so ⌘Z gives back the word
+/// rather than the letter. eave had no undo at all.
+#[gpui::test]
+fn the_draft_undoes_a_word_at_a_time(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+
+    vcx.simulate_input("hello");
+    vcx.simulate_keystrokes("cmd-z");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "",
+        "undo gave back a letter instead of the run"
+    );
+    vcx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(draft_of(&h, vcx), "hello", "redo did not restore the run");
+}
+
+/// The `/` palette borrows `up`/`down` and gives them back.
+///
+/// The mechanism the slice turns on: while the palette is live the field
+/// claims a second key context and the arrows steer the menu; the moment it
+/// closes the claim is dropped and the same keys are vertical caret motion
+/// again. Both halves matter — a permanent claim would have taken the arrows
+/// away from a multi-line draft for good.
+#[gpui::test]
+fn the_palette_borrows_the_arrows_and_returns_them(cx: &mut TestAppContext) {
+    let project = SlashProject::new("borrow");
+    let (h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+    let field = composer_field(&h, vcx);
+
+    // A two-line draft with no palette: `up` is caret motion.
+    vcx.simulate_input("alpha");
+    vcx.simulate_keystrokes("shift-enter");
+    vcx.simulate_input("beta");
+    let at_end = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    vcx.simulate_keystrokes("up");
+    let after_up = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    assert!(
+        after_up < at_end,
+        "with no palette up must move the caret to the previous line"
+    );
+
+    // Now open the palette. The same key steers the menu and leaves the caret
+    // where it is.
+    vcx.simulate_keystrokes("cmd-a backspace");
+    vcx.simulate_input("/ship");
+    settle_palette(&h, vcx);
+    let before = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    vcx.simulate_keystrokes("down");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        vcx.read_window(&h.window, |_, cx| field.read(cx).cursor())
+            .unwrap(),
+        before,
+        "the palette's down key also moved the caret"
     );
 }

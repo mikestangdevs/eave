@@ -50,6 +50,10 @@
 //! though it were only about `RefCell`s. It never was. An abort and a hang;
 //! one rule. Anything added here that takes a CEF callback inherits it.
 //!
+//! The general form, which is what to carry to anything new here: **do not
+//! hold anything of your own — a borrow, a lock, a continuation — across a
+//! call into a foreign event loop that will call you back on this stack.**
+//!
 //! # Diagnostics
 //! `EAVE_WEB_TRACE=1` narrates the page engine's lifecycle on stderr: every
 //! reconciliation, every browser created, the load callbacks, the pump, and
@@ -73,11 +77,18 @@
 /// URL string, and `cargo test` runs with the feature OFF. Same bargain as
 /// the shared half further down this file. The gated caller is four lines
 /// in `tabs.rs`'s `on_before_browse`.
-pub mod policy;
+///
+/// # It was called `policy`, and so was something else
+/// E3 landed a `web/policy.rs` deciding **eviction** on the same day this
+/// one landed deciding **navigation**, on two branches, and they collided
+/// as an add/add when the branches met. Both are real, both are ungated
+/// for the same testability reason, and neither is "the" policy — so
+/// neither keeps the bare name. See [`evict_policy`].
+pub mod nav_policy;
 
 /// What a person has already answered, per origin (G1).
 ///
-/// **Ungated for the same reason as [`policy`]** — it is a lock around a
+/// **Ungated for the same reason as [`nav_policy`]** — it is a lock around a
 /// map and a pure function of it, and the suite runs with the feature off.
 /// The gated caller is a handful of lines in `dialogs.rs`.
 pub mod permissions;
@@ -92,6 +103,19 @@ pub mod quarantine;
 
 #[cfg(feature = "web")]
 mod dialogs;
+#[cfg(feature = "web")]
+mod evict;
+/// The eviction DECISION, compiled in both feature states so the default
+/// test run exercises it. See its module docs.
+///
+/// With the feature OFF nothing calls it — `evict` is the only consumer and
+/// `evict` is gated — so its methods are dead in that build and only its
+/// tests run. The allow is scoped to exactly that state rather than blanket,
+/// so genuinely dead code in the `web` build is still caught.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+mod evict_policy;
+#[cfg(feature = "web")]
+mod favicon;
 #[cfg(feature = "web")]
 mod find;
 #[cfg(feature = "web")]
@@ -110,7 +134,6 @@ mod tabs;
 mod zoom;
 
 #[cfg(feature = "web")]
-#[cfg(feature = "web")]
 pub use dialogs::{answer, any_pending, pending, Answer, Ask, Pending};
 #[cfg(feature = "web")]
 pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
@@ -118,8 +141,8 @@ pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 pub use page::page_element;
 #[cfg(feature = "web")]
 pub use tabs::{
-    chrome, copy_selection, downloads, drive, install_fact_sink, install_request_sink, web_memory,
-    Download, Fact, PageChrome, PageRequest,
+    chrome, copy_selection, downloads, drive, install_fact_sink, install_request_sink,
+    is_on_screen, set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
 };
 
 /// Clear Chromium's own copy of an origin's permission answers (G1).
@@ -445,6 +468,50 @@ pub fn take_menu_request() -> Option<PageMenu> {
     MENU.with(|m| m.borrow_mut().take())
 }
 
+/// The decoded favicon for a page tab, if Chromium has handed us one.
+///
+/// The snapshot carries the URL; the pixels live here. A globe on the
+/// strip is "we do not have bytes yet", not "this page has no icon".
+pub fn favicon_image(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    #[cfg(test)]
+    {
+        if let Some(image) = TEST_FAVICONS.with(|m| m.borrow().get(tab_id).cloned()) {
+            return Some(image);
+        }
+    }
+    cef_favicon(tab_id)
+}
+
+#[cfg(feature = "web")]
+fn cef_favicon(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    favicon::get(tab_id)
+}
+
+#[cfg(not(feature = "web"))]
+fn cef_favicon(_tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FAVICONS: std::cell::RefCell<
+        std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Test seam: put bytes on a tab the harness never created a browser for.
+#[cfg(test)]
+pub fn set_favicon_for_test(tab_id: &str, image: Option<std::sync::Arc<gpui::Image>>) {
+    TEST_FAVICONS.with(|m| match image {
+        Some(image) => {
+            m.borrow_mut().insert(tab_id.to_string(), image);
+        }
+        None => {
+            m.borrow_mut().remove(tab_id);
+        }
+    });
+}
+
 /// Chromium asked for a menu. Called by the gated context-menu handler —
 /// and by the harness, which is the point of it living here.
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
@@ -493,6 +560,11 @@ pub(crate) fn forget_page(tab_id: &str) {
             *m = None;
         }
     });
+    // An eviction keeps the pixels: the tab is still on the strip.
+    #[cfg(feature = "web")]
+    if !page_was_evicted(tab_id) {
+        favicon::forget(tab_id);
+    }
 }
 
 // ── The four shims: everything above this line is eave's, everything
@@ -518,6 +590,29 @@ fn cef_set_zoom(tab_id: &str, percent: u32) {
 }
 #[cfg(not(feature = "web"))]
 fn cef_set_zoom(_tab_id: &str, _percent: u32) {}
+
+/// Whether this tab's page is in memory right now — i.e. whether there is a
+/// live browser behind it.
+///
+/// **The hook Slice E3 leaves for the strip and the rail.** An evicted tab
+/// and a never-visited tab are the same thing to the person looking at the
+/// strip — a tab whose page is not loaded and will load when they click it
+/// — so this is the broad fact, and it is the one worth drawing. Dim the
+/// favicon on `!page_is_resident`.
+#[cfg(feature = "web")]
+pub fn page_is_resident(tab_id: &str) -> bool {
+    tabs::has_browser(tab_id)
+}
+
+/// Whether eave took this tab's browser back to reclaim memory (Slice E3).
+///
+/// The narrow fact, kept separate because the two are genuinely different
+/// events even where they look alike: this one is eave acting on the
+/// operator's memory rather than the operator never having opened the tab.
+#[cfg(feature = "web")]
+pub fn page_was_evicted(tab_id: &str) -> bool {
+    evict::was_evicted(tab_id)
+}
 
 // ---------------------------------------------------------------------------
 // The feature-off half
@@ -756,10 +851,33 @@ pub fn page_element(_tab_id: &str, _cx: &mut gpui::App) -> Option<gpui::AnyEleme
     None
 }
 
+/// No page engine, so nothing is on screen as a page.
+#[cfg(not(feature = "web"))]
+pub fn set_shown_pages(_ids: impl IntoIterator<Item = impl AsRef<str>>) {}
+
+#[cfg(not(feature = "web"))]
+pub fn is_on_screen(_tab_id: &str) -> bool {
+    false
+}
+
 #[cfg(not(feature = "web"))]
 pub fn copy_selection(_tab_id: &str) {}
 
 // ---------------------------------------------------------------------------
+
+/// Whether this tab's page is in memory. Never, in a build with no
+/// Chromium in it — which is honest rather than convenient: the strip's
+/// "not loaded" treatment is then true of every page tab, because it is.
+#[cfg(not(feature = "web"))]
+pub fn page_is_resident(_tab_id: &str) -> bool {
+    false
+}
+
+/// Whether eave evicted this tab's browser. Nothing to evict here.
+#[cfg(not(feature = "web"))]
+pub fn page_was_evicted(_tab_id: &str) -> bool {
+    false
+}
 
 #[cfg(test)]
 mod tests {

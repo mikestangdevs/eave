@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType};
+use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType, PaintElementType};
 use gpui::{
     div, prelude::*, px, size, App, Bounds, ContentMask, Corners, Element, ElementId, FocusHandle,
     GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
@@ -446,6 +446,13 @@ impl Element for PageSurface {
                         host.notify_screen_info_changed();
                     }
                     host.was_resized();
+                    // A split pane that is not engine-`active` still has to
+                    // layout. WasResized alone is enough for the focused
+                    // browser; an unfocused OSR compositor often keeps the
+                    // last frame until it is invalidated. Without this,
+                    // dragging the window (or the divider) reflows one
+                    // pane and leaves the other stretched or clipped.
+                    host.invalidate(PaintElementType::VIEW);
                 }
             });
             // **Belt and braces, and the measurement says so.** The
@@ -472,65 +479,92 @@ impl Element for PageSurface {
             if !stretch_for_measurement() {
                 super::host::note_activity();
                 super::host::request_pump();
+                // Live window resize runs AppKit's tracking loop; the async
+                // pump does not. Pump here so Chromium answers on this frame
+                // rather than after mouse-up. See `host::pump_now`.
+                super::host::pump_now();
             }
         }
 
-        if let Some(frame) = osr::frame(&self.tab_id) {
-            // ── THE RESIZE TRANSIENT (Slice E1) ──────────────────────────
-            //
-            // `paint_surface` scales its buffer to fill the bounds it is
-            // given, which is right in the steady state and a **stretch** in
-            // every frame between "the window changed size" and "Chromium
-            // answered". A page is not a video: it has a layout, and a
-            // layout stretched horizontally is not a smaller rendering of
-            // the same thing, it is the wrong picture.
-            //
-            // So: paint the stale frame at one device pixel per device
-            // pixel, anchored top-left, clipped to the space the element
-            // actually has. Growing, the new strip of the well shows what is
-            // under it for a frame or two; shrinking, the overhang is
-            // clipped. Both are *the page, correct, and momentarily the
-            // wrong size* — which is what every browser on this platform
-            // does while you drag its corner, and is honest in a way that
-            // stretching is not.
+        // ── THE RESIZE TRANSIENT (Slice E1) ──────────────────────────────
+        //
+        // `paint_surface` scales its buffer to fill the bounds it is given,
+        // which is right in the steady state and a **stretch** in every
+        // frame between "the window changed size" and "Chromium answered".
+        // A page is not a video: it has a layout, and a layout stretched
+        // horizontally is not a smaller rendering of the same thing, it is
+        // the wrong picture.
+        //
+        // So: paint the stale frame at one device pixel per device pixel,
+        // anchored top-left, clipped to the space the element actually has.
+        // Growing, the new strip of the well shows what is under it for a
+        // frame or two; shrinking, the overhang is clipped. Both are *the
+        // page, correct, and momentarily the wrong size* — which is what
+        // every browser on this platform does while you drag its corner,
+        // and is honest in a way that stretching is not.
+        //
+        // Bottom corners match the card; the header owns the top of the
+        // card so the page's top edge is square against it.
+        let corners = Corners {
+            top_left: px(0.),
+            top_right: px(0.),
+            bottom_right: px(theme::RADIUS_PANEL),
+            bottom_left: px(theme::RADIUS_PANEL),
+        };
+        let want_w = f32::from(bounds.size.width);
+        let want_h = f32::from(bounds.size.height);
+        let fit_of = |frame: &osr::Frame| {
             let (fw, fh) = frame.logical(scale);
-            let want_w = f32::from(bounds.size.width);
-            let want_h = f32::from(bounds.size.height);
-            // Half a logical pixel of slack: the coded size is a rounded
-            // count of device pixels, so exact float equality is the wrong
-            // test and would put the steady state on the transient path at
-            // odd scales.
             let fits = (fw - want_w).abs() < 0.5 && (fh - want_h).abs() < 0.5;
-
-            note_fit(&self.tab_id, fits, fw, fh, want_w, want_h);
-
-            if fits || stretch_for_measurement() {
-                // Bottom corners match the card; the header owns the top of
-                // the card so the page's top edge is square against it.
-                window.paint_surface_with_corners(
-                    bounds,
-                    frame.buffer,
-                    Corners {
-                        top_left: px(0.),
-                        top_right: px(0.),
-                        bottom_right: px(theme::RADIUS_PANEL),
-                        bottom_left: px(theme::RADIUS_PANEL),
-                    },
-                );
-            } else {
-                let at = Bounds {
-                    origin: bounds.origin,
-                    size: size(px(fw), px(fh)),
-                };
-                // Square corners on the transient, deliberately. The surface
-                // is anchored top-left and does not end where the card does,
-                // so the card's radius would round the wrong edge; the mask
-                // cuts it square instead for the frame or two a resize
-                // lasts. A momentarily square corner beats a rounded one in
-                // the wrong place.
-                window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    window.paint_surface(at, frame.buffer);
+            (fw, fh, fits)
+        };
+        let mut frame = osr::frame(&self.tab_id);
+        if let Some(ref f) = frame {
+            let (fw, fh, mut fits) = fit_of(f);
+            // Still the wrong size: keep pumping on this stack for as long
+            // as the drag is producing paints. `change == Same` after the
+            // first live-resize tick, so the branch above does not run
+            // again until the view actually moves.
+            //
+            // Two pumps is a ceiling, not a delay: Invalidate queues a
+            // compositor frame, the first `CefDoMessageLoopWork` often runs
+            // the resize task, the second collects the frame. Stop early
+            // when it fits. Needed for the unfocused split pane, which
+            // otherwise stays one drag behind the focused one.
+            if !fits && !stretch_for_measurement() {
+                super::tabs::with_browser(&self.tab_id, |b| {
+                    if let Some(host) = b.host() {
+                        host.invalidate(PaintElementType::VIEW);
+                    }
                 });
+                for _ in 0..2 {
+                    super::host::pump_now();
+                    frame = osr::frame(&self.tab_id);
+                    if let Some(ref f) = frame {
+                        let next = fit_of(f);
+                        fits = next.2;
+                        note_fit(&self.tab_id, fits, next.0, next.1, want_w, want_h);
+                        if fits {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                note_fit(&self.tab_id, fits, fw, fh, want_w, want_h);
+            }
+            if let Some(frame) = frame {
+                let (fw, fh, fits) = fit_of(&frame);
+                if fits || stretch_for_measurement() {
+                    window.paint_surface_with_corners(bounds, frame.buffer, corners);
+                } else {
+                    let at = Bounds {
+                        origin: bounds.origin,
+                        size: size(px(fw), px(fh)),
+                    };
+                    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                        window.paint_surface_with_corners(at, frame.buffer, corners);
+                    });
+                }
             }
         }
 
@@ -543,9 +577,11 @@ impl Element for PageSurface {
         // the rect CEF gave, which is already in view coordinates, so the
         // element's own origin is the only conversion.
         //
-        // Outside the `if let` above, not inside it: a popup is its own
-        // surface and does not stop existing because the page frame is
-        // momentarily absent.
+        // **Deliberately NOT through the resize-transient path above.** A
+        // popup is placed by a rect Chromium computed for the CURRENT view;
+        // it has no stale-size problem to solve, and clipping it to the
+        // page's bounds or anchoring it top-left would move a menu that is
+        // already where it belongs.
         //
         // Square corners, deliberately: this is a menu sitting ON the page,
         // not the page itself, and rounding it to the card's radius would
@@ -554,7 +590,7 @@ impl Element for PageSurface {
         if let Some((buffer, rect)) = osr::popup(&self.tab_id) {
             let at = Bounds {
                 origin: gpui::point(bounds.origin.x + px(rect.x), bounds.origin.y + px(rect.y)),
-                size: size(px(rect.width), px(rect.height)),
+                size: gpui::size(px(rect.width), px(rect.height)),
             };
             window.paint_surface(at, buffer);
         }

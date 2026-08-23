@@ -16,7 +16,7 @@
 //! `tab_navigate` and `tab_stated` as different frames, and the reason C1
 //! could attach a page engine without the engine learning what Chromium is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use cef::*;
@@ -49,11 +49,62 @@ fn report(tab_id: &str, fact: PageFact) {
     }
 }
 
+/// Chromium lists icons best-first, but "best" is often a 16×16 ICO.
+/// gpui's `img` decodes PNG/SVG/WEBP more reliably, so those win; an ICO
+/// is still taken over drawing nothing. The plate falls back to the globe
+/// if decode fails.
+fn pick_favicon_url(urls: &[String]) -> Option<String> {
+    let score = |u: &str| {
+        let l = u.to_ascii_lowercase();
+        if l.contains(".svg") {
+            0
+        } else if l.contains(".png") || l.contains(".webp") {
+            1
+        } else if l.contains(".jpg") || l.contains(".jpeg") {
+            2
+        } else if l.contains(".ico") {
+            4
+        } else {
+            3
+        }
+    };
+    urls.iter()
+        .filter(|u| !u.is_empty())
+        .min_by_key(|u| score(u))
+        .cloned()
+}
+
 /// CEF caps a windowless browser at `windowless_frame_rate`, and **its
 /// default is 30** — not the display's rate, not the page's. The spike
 /// located this by finding a hard 30 Hz ceiling on a page that could
 /// produce far more. Set explicitly, so the number is a decision.
 const FRAME_RATE: i32 = 60;
+
+#[cfg(test)]
+mod favicon_pick {
+    use super::pick_favicon_url;
+
+    #[test]
+    fn prefers_png_over_ico() {
+        let urls = [
+            "https://a.test/favicon.ico".into(),
+            "https://a.test/icon.png".into(),
+        ];
+        assert_eq!(
+            pick_favicon_url(&urls).as_deref(),
+            Some("https://a.test/icon.png")
+        );
+    }
+
+    #[test]
+    fn takes_an_ico_when_that_is_all_there_is() {
+        let urls = ["https://a.test/favicon.ico".into()];
+        assert_eq!(
+            pick_favicon_url(&urls).as_deref(),
+            Some("https://a.test/favicon.ico")
+        );
+    }
+}
 
 thread_local! {
     /// Live browsers by tab id. Main thread only: every CEF UI callback
@@ -76,6 +127,22 @@ pub fn any_browser() -> bool {
 /// Whether a tab has a live browser.
 pub fn has_browser(tab_id: &str) -> bool {
     BROWSERS.with(|b| b.borrow().contains_key(tab_id))
+}
+
+/// Page tabs the well is painting this frame. Not the engine's `active`:
+/// a split shows two, and the one that is not `active` still has to stay
+/// composited and ineligible for eviction.
+pub fn set_shown_pages(ids: impl IntoIterator<Item = impl AsRef<str>>) {
+    SHOWN.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.extend(ids.into_iter().map(|id| id.as_ref().to_string()));
+    });
+}
+
+/// Whether this page tab is on screen, split pane or not.
+pub fn is_on_screen(tab_id: &str) -> bool {
+    SHOWN.with(|s| s.borrow().contains(tab_id))
 }
 
 /// Do something with a tab's browser, if it has one.
@@ -124,7 +191,7 @@ pub enum PageRequest {
         activate: bool,
     },
     /// A navigation eave rewrote before it started — a tracked link with
-    /// its trackers removed (`policy::Decision::Rewrite`).
+    /// its trackers removed (`nav_policy::Decision::Rewrite`).
     ///
     /// **Asked for rather than performed**, and that is the borrow rule in
     /// `web/mod.rs` being obeyed rather than a style choice: the decision
@@ -216,6 +283,12 @@ thread_local! {
     /// not re-sent on every snapshot fold.
     static VISIBLE: std::cell::RefCell<HashMap<String, bool>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// Page tabs the shell is currently painting, which may be more than
+    /// the engine's `active` when two tabs share the well. Drive and
+    /// eviction both read this so a split pane does not go hidden or get
+    /// discarded for not being `active`.
+    static SHOWN: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
 
     /// The last url REPORTED per tab, so `on_address_change` can tell a
     /// real move from the echo of a load it already reported. See
@@ -310,7 +383,7 @@ fn note_url(tab_id: &str, url: &str) -> bool {
 /// The address this tab is on, as last reported.
 ///
 /// The initiator of a top-level navigation, for
-/// [`super::policy::decide`] — `None` on a tab's very first load, which
+/// [`super::nav_policy::decide`] — `None` on a tab's very first load, which
 /// the policy treats as cross-site.
 fn last_url(tab_id: &str) -> Option<String> {
     LAST_URL.with(|u| u.borrow().get(tab_id).cloned())
@@ -346,6 +419,55 @@ fn cursor_style(type_: CursorType) -> gpui::CursorStyle {
     }
 }
 
+/// Ask a tab's browser to close. **The only place in eave that calls
+/// `close_browser` on a page.**
+///
+/// Three callers now — the departed-tab reaper, [`close_all`] on the way to
+/// `CefShutdown`, and Slice E3's eviction clock — and they were three
+/// open-coded copies of the same six lines before this existed. That is
+/// worth one function for the reason C7 gives about [`with_browser`]: a
+/// discipline that has to be re-applied at each call site is a discipline
+/// that will be missed at the next one, and the C7 audit found the missed
+/// one by reading nine call sites rather than one.
+///
+/// FORCED, and the argument is the reaper's: the unforced form runs the
+/// page's `beforeunload`, and eave has no dialog surface to ask the question
+/// on — so an unforced close would be refusable by a page with nowhere for
+/// the refusal to be seen, and the caller would re-issue it forever. For a
+/// departed tab the decision has already been made. For an eviction it is
+/// eave's own decision about eave's own memory, which is not a question to
+/// put to the page either. A `beforeunload` a person can actually answer
+/// needs the dialog surface first, and that is the same missing surface
+/// `<select>` needs.
+///
+/// Closing is ASYNCHRONOUS even when forced. This only asks; the entry
+/// disappears in `on_before_close`, on a later pump.
+pub fn close_browser_for(tab_id: &str) {
+    // **C7's rule, asserted rather than remembered.** Every close path in
+    // eave funnels through here, so this is the one place that can check
+    // the invariant for all of them: no cell in the `web` module may be
+    // borrowed when Chromium is about to run our handlers on this stack.
+    // A `debug_assert` because it costs nothing in a release build and
+    // because the failure it replaces — `already borrowed`, unwinding
+    // through Objective-C frames, aborting the process — is one nobody can
+    // debug from the crash report (C6 spent a slice on it).
+    debug_assert!(
+        BROWSERS.with(|b| b.try_borrow_mut().is_ok()),
+        "close_browser_for({tab_id}) with BROWSERS borrowed — see `with_browser`"
+    );
+    debug_assert!(
+        super::evict::borrows_clear(),
+        "close_browser_for({tab_id}) with an eviction cell borrowed — see `evict::tick`"
+    );
+    // Through `with_browser`, so the borrow is dropped before CEF is
+    // entered. See its doc comment for what holding it costs.
+    with_browser(tab_id, |b| {
+        if let Some(host) = b.host() {
+            host.close_browser(1);
+        }
+    });
+}
+
 /// Reconcile the page engine against the tab strip.
 ///
 /// Called on every snapshot, and cheap when nothing changed — which is the
@@ -364,6 +486,10 @@ pub fn drive(snapshot: &TabsSnapshot) {
     if !super::host::running() {
         return;
     }
+    // The eviction clock reads the strip between snapshots — which tab is
+    // active, which tabs are pages, which are pinned — so it is handed the
+    // strip here, at the one place that knows a fold has finished.
+    super::evict::note_snapshot(snapshot);
     // ── THE ANSWER TO "WHAT HAPPENS BEHIND A SESSION TAB?" (Slice C5) ──
     //
     // C1 drove exactly one tab — the active one, when it was a page — and
@@ -380,15 +506,25 @@ pub fn drive(snapshot: &TabsSnapshot) {
     // is what every browser does, and it is the only answer under which the
     // load state in the strip is a fact rather than a decoration.
     //
-    // **Creation still requires activation**, and that is the whole of the
-    // memory policy. A live browser is ~322 MB of helper processes, so
-    // opening twenty tabs must not cost 6 GB — a tab that has never been
-    // looked at has no browser and costs nothing. This is a deliberately
-    // conservative floor and not a resident-set policy: nothing here evicts
-    // a browser once created, so the ceiling is "tabs you have actually
-    // visited this run". Eviction is a policy question with its own tradeoffs
-    // (a discarded tab loses scroll, form state and JS heap) and it deserves
-    // its own slice; see the report.
+    // **Creation still requires activation**, and it is half of the memory
+    // policy. A tab that has never been looked at has no browser and costs
+    // nothing. (The other half of this sentence used to read "a live
+    // browser is ~322 MB of helper processes, so opening twenty tabs must
+    // not cost 6 GB". E3 measured that and it is wrong in an interesting
+    // way: ~322 MB is almost exactly eave's floor with NO page resident,
+    // and the marginal cost of a tab is far smaller. See
+    // `thresholds::PAGE_IDLE_EVICT_AFTER` for the table. The rule survives
+    // its bad justification — not creating a browser nobody asked to look
+    // at is still right — but the arithmetic behind it does not.) This is a
+    // deliberately
+    // conservative floor, and it is no longer the whole policy: Slice E3
+    // added the other half in `evict`, so a page tab nobody has looked at
+    // for `thresholds::PAGE_IDLE_EVICT_AFTER` gives its browser back and
+    // the ceiling stops being "tabs you have actually visited this run".
+    // The tradeoff C5 named is real and is paid rather than avoided — a
+    // discarded tab loses scroll, form state and JS heap — and the reason
+    // it is affordable is that the back/forward stack was never in
+    // Chromium to begin with (B1 put it in the engine). See `evict`.
     //
     // There is therefore ONE notion of active in eave, and it is
     // `TabsState::active`. It decides which tab's frames are painted and
@@ -401,20 +537,22 @@ pub fn drive(snapshot: &TabsSnapshot) {
         .filter(|t| t.content == TabContent::Page)
     {
         let is_active = Some(tab.id.as_str()) == active;
-        if !has_browser(&tab.id) && !is_active {
+        let shown = is_active || is_on_screen(&tab.id);
+        if !has_browser(&tab.id) && !shown {
             // Never looked at. No browser, no cost, and nothing to drive —
             // its `pending` is still on the tab and will be issued as the
-            // start url the moment it is activated.
+            // start url the moment it is activated. A split pane counts as
+            // looked at even when it is not `active`.
             continue;
         }
         drive_tab(tab);
-        set_visibility(&tab.id, is_active);
+        set_visibility(&tab.id, shown);
     }
 
     // A tab that left the strip takes its browser with it. Nothing did this
     // before C5 because nothing could close a tab — `EAVE_WEB_AT_BOOT` opens
     // one and never removes it — and ⌘W is what makes it reachable. Without
-    // this a closed tab keeps ~322 MB of helper processes alive, keeps
+    // this a closed tab keeps its share of the helper processes alive, keeps
     // loading, and keeps reporting facts about a tab the engine has already
     // forgotten (which the engine discards, so the leak is silent).
     //
@@ -431,20 +569,10 @@ pub fn drive(snapshot: &TabsSnapshot) {
         if std::env::var("EAVE_WEB_TRACE").is_ok() {
             eprintln!("[web] closing browser for departed tab {id}");
         }
-        with_browser(&id, |b| {
-            if let Some(host) = b.host() {
-                // FORCED. The unforced form runs the page's
-                // `beforeunload`, and eave has no dialog surface to ask
-                // the question on — so an unforced close would be
-                // refusable by a page with nowhere for the refusal to be
-                // seen, and this loop would re-issue it on every snapshot
-                // forever. The tab is already gone from the model; the
-                // decision has been made. A `beforeunload` that a person
-                // can actually answer needs the dialog surface first, and
-                // that is the same missing surface `<select>` needs.
-                host.close_browser(1);
-            }
-        });
+        close_browser_for(&id);
+        // The tab is gone from the model, so what this module knew about
+        // its idleness is not a fact about anything any more.
+        super::evict::forget(&id);
         super::host::request_pump();
     }
 }
@@ -647,6 +775,9 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
             }
         }
     }
+    if let Some(url) = tab.favicon_url.as_deref() {
+        super::favicon::fetch(&tab.id, url);
+    }
 }
 
 /// Create a windowless browser for a tab.
@@ -705,11 +836,7 @@ pub fn copy_selection(tab_id: &str) {
 pub fn close_all() {
     let ids: Vec<String> = BROWSERS.with(|b| b.borrow().keys().cloned().collect());
     for id in ids {
-        with_browser(&id, |b| {
-            if let Some(host) = b.host() {
-                host.close_browser(1);
-            }
-        });
+        close_browser_for(&id);
     }
     // **Deliberately does NOT clear the map.** Closing is asynchronous even
     // when forced: `close_browser(1)` only asks, and `on_before_close` — which
@@ -745,6 +872,10 @@ pub fn forget_all() {
 /// space. So the figure is the page's own processes, and it is an
 /// **undercount** by whatever Chromium holds in ours — measured at ~141 MB
 /// for the combined app-and-browser process against ~322 MB of helpers.
+/// (That ~322 MB was one tab's total. E3 measured the same set with ten
+/// tabs and with none — 0.90 GB and 0.32 GB — so most of it is a floor
+/// that does not multiply. The undercount this paragraph is about is
+/// unaffected either way; only the sense of scale changes.)
 ///
 /// It also does not count **eave's own engine**, which is a child of this
 /// process too. Filtering on "is a child" alone billed the agent engine to
@@ -866,6 +997,9 @@ wrap_life_span_handler! {
             // size it was left at — after the insert, because `reapply`
             // goes through `with_browser`.
             super::zoom_reapply(&self.tab_id);
+            // This tab is resident again: start its idle clock and clear
+            // any evicted mark. Outside the borrow above, deliberately.
+            super::evict::note_created(&self.tab_id);
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -880,12 +1014,15 @@ wrap_life_span_handler! {
             // releasing one unanswered is the difference between a clean
             // teardown and a hang.
             super::dialogs::forget(&self.tab_id);
-            super::policy::forget(&self.tab_id);
+            super::nav_policy::forget(&self.tab_id);
             // Slice E1. A find that outlived its page would state a count
             // about a document that is gone; the zoom is dropped for the
             // same reason `close_browser` is reached at all, which is that
             // the tab itself has left the strip.
             super::forget_page(&self.tab_id);
+            // If this close was an eviction, the strip may want the tab
+            // back already. Sets a flag; nothing is created on this stack.
+            super::evict::note_closed(&self.tab_id);
         }
     }
 }
@@ -979,16 +1116,16 @@ wrap_load_handler! {
             // goes back to http rather than showing the operator a
             // connection error for a site that was working before.
             //
-            // `ERR_ABORTED` is excluded inside `policy::fallback`, and it
+            // `ERR_ABORTED` is excluded inside `nav_policy::fallback`, and it
             // has to be: an upgrade is performed BY CANCELLING the http
             // navigation, so an abort arrives on every upgrade eave makes.
             let why = if error_code == Errorcode::ABORTED {
-                super::policy::Failure::Aborted
+                super::nav_policy::Failure::Aborted
             } else {
-                super::policy::Failure::Unreachable
+                super::nav_policy::Failure::Unreachable
             };
             let failed = failed_url.map(|u| u.to_string()).unwrap_or_default();
-            if let Some(http_url) = super::policy::fallback(&self.tab_id, &failed, why) {
+            if let Some(http_url) = super::nav_policy::fallback(&self.tab_id, &failed, why) {
                 if trace() {
                     eprintln!("[web] policy: fell back {failed} -> {http_url}");
                 }
@@ -1352,10 +1489,10 @@ wrap_request_handler! {
             let from = last_url(&self.tab_id);
             // E2 consults what this session has already learned: a host
             // that failed TLS once is not tried again.
-            let allow_upgrade = super::policy::host(&url)
-                .map(|h| super::policy::may_upgrade(&h))
+            let allow_upgrade = super::nav_policy::host(&url)
+                .map(|h| super::nav_policy::may_upgrade(&h))
                 .unwrap_or(false);
-            let decision = super::policy::decide(super::policy::Nav {
+            let decision = super::nav_policy::decide(super::nav_policy::Nav {
                 url: &url,
                 from: from.as_deref(),
                 method: &method,
@@ -1364,8 +1501,8 @@ wrap_request_handler! {
                 allow_upgrade,
             });
             match decision {
-                super::policy::Decision::Allow => 0,
-                super::policy::Decision::Rewrite(clean) => {
+                super::nav_policy::Decision::Allow => 0,
+                super::nav_policy::Decision::Rewrite(clean) => {
                     if trace() {
                         eprintln!("[web] policy: rewrote {url} -> {clean}");
                     }
@@ -1375,28 +1512,28 @@ wrap_request_handler! {
                     });
                     1
                 }
-                super::policy::Decision::Upgrade { to, fallback } => {
+                super::nav_policy::Decision::Upgrade { to, fallback } => {
                     if trace() {
                         eprintln!("[web] policy: upgraded {url} -> {to}");
                     }
                     // Recorded BEFORE the navigation is asked for. The
                     // failure that needs this record can arrive as soon as
                     // the navigation starts.
-                    super::policy::note_upgrade(&self.tab_id, &to, &fallback);
+                    super::nav_policy::note_upgrade(&self.tab_id, &to, &fallback);
                     request(super::PageRequest::Navigate {
                         tab_id: self.tab_id.clone(),
                         url: to,
                     });
                     1
                 }
-                super::policy::Decision::External(url) => {
+                super::nav_policy::Decision::External(url) => {
                     if trace() {
                         eprintln!("[web] policy: external {url}");
                     }
                     request(super::PageRequest::External { url });
                     1
                 }
-                super::policy::Decision::Block => {
+                super::nav_policy::Decision::Block => {
                     if trace() {
                         eprintln!("[web] policy: blocked {url}");
                     }
@@ -1553,19 +1690,12 @@ wrap_display_handler! {
             report(&self.tab_id, PageFact::Committed { url, title: None });
         }
 
-        /// Where the page says its icon lives.
+        /// Where the page says its icon lives, and the fetch that follows.
         ///
-        /// `PageFact::Favicon` has existed on the wire since Slice B1 and
-        /// **nothing has ever sent one** — `TabInfo::favicon_url`, the
-        /// engine's `FaviconStated` fold and the strip's globe stand-in
-        /// were all built against a fact that was never raised. This raises
-        /// it. Fetching and decoding the bytes is still ahead (spec
-        /// 06-browser D13); a url the strip can act on is the half that was
-        /// missing from the model rather than from the renderer.
-        ///
-        /// Chromium offers every declared icon, best first. Taking the
-        /// first is the same choice Chrome makes at this stage; choosing by
-        /// size needs the bytes, which is the fetch half.
+        /// The URL is a fact about the tab (journalled). The pixels are a
+        /// cache in `favicon.rs`, fetched through this browser so cookies
+        /// and the proxy are Chromium's. The strip paints those bytes; the
+        /// globe is only "we do not have them yet".
         fn on_favicon_urlchange(
             &self,
             _browser: Option<&mut Browser>,
@@ -1575,14 +1705,28 @@ wrap_display_handler! {
             // The clone is shallow — a `Borrowed` collection, which `Drop`
             // does not free — so this reads the list without taking
             // ownership of Chromium's.
-            let first = icon_urls
+            let urls: Vec<String> = icon_urls
                 .map(|l| l.clone())
-                .and_then(|l| l.into_iter().next())
-                .filter(|u| !u.is_empty());
+                .map(|l| l.into_iter().filter(|u| !u.is_empty()).collect())
+                .unwrap_or_default();
+            // Chromium lists "best first", but "best" is often a 16×16
+            // ICO. The plate paints through gpui's `img`, which prefers a
+            // PNG/SVG/WEBP it can decode without a codec surprise. Fall
+            // back to whatever Chromium offered rather than drawing
+            // nothing.
+            let picked = pick_favicon_url(&urls);
             if trace() {
-                eprintln!("[web] on_favicon_urlchange {first:?}");
+                eprintln!("[web] on_favicon_urlchange {picked:?} from {urls:?}");
             }
-            report(&self.tab_id, PageFact::Favicon { favicon_url: first });
+            report(
+                &self.tab_id,
+                PageFact::Favicon {
+                    favicon_url: picked.clone(),
+                },
+            );
+            if let Some(url) = picked {
+                super::favicon::fetch(&self.tab_id, &url);
+            }
         }
 
         /// 0.0 to 1.0 across a load.
@@ -1659,6 +1803,68 @@ wrap_display_handler! {
                     message.map(|m| m.to_string()).unwrap_or_default(),
                 );
             }
+            0
+        }
+
+        /// Camera and microphone, which is the ONE media signal CEF gives
+        /// eave with both edges (Slice E3). A tab holding a device is in a
+        /// call, and a tab in a call must not be evicted for idleness —
+        /// nobody looks at the tab they are talking through.
+        ///
+        /// This is device CAPTURE, not playback; the two are different
+        /// questions and only this one has an honest answer. See
+        /// `PageAudioHandler` for the other.
+        fn on_media_access_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            has_video_access: ::std::os::raw::c_int,
+            has_audio_access: ::std::os::raw::c_int,
+        ) {
+            let capturing = has_video_access != 0 || has_audio_access != 0;
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] media access {} capturing={capturing}", self.tab_id);
+            }
+            super::evict::note_media_access(&self.tab_id, capturing);
+        }
+    }
+}
+
+wrap_audio_handler! {
+    struct PageAudioHandler {
+        tab_id: String,
+    }
+
+    impl AudioHandler {
+        /// **eave declines the capture, and the return value is the whole
+        /// point of this handler** (Slice E3).
+        ///
+        /// CEF's contract on `get_audio_parameters` is "return true to
+        /// proceed with audio stream capture, or false to cancel it", and
+        /// proceeding means the page's audio is routed to this handler as
+        /// PCM *instead of* to the speakers. eave has nothing to play PCM
+        /// with, so proceeding would silence every page in exchange for
+        /// knowing that it was making noise. Returning 0 leaves playback
+        /// exactly as it was.
+        ///
+        /// What that costs is the stop edge. `on_audio_stream_started` and
+        /// `on_audio_stream_stopped` only fire for a capture we accepted,
+        /// so the ONLY thing eave ever learns is that a stream began —
+        /// which is why the eviction clock treats audio as a hold with a
+        /// timeout rather than as a state. Both failure modes are named on
+        /// `thresholds::PAGE_AUDIO_HOLD`.
+        ///
+        /// If CEF ever grows an `IsAudible` on the browser host, this
+        /// handler and that constant should both go.
+        fn audio_parameters(
+            &self,
+            _browser: Option<&mut Browser>,
+            _params: Option<&mut AudioParameters>,
+        ) -> ::std::os::raw::c_int {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] audio stream starting on {}", self.tab_id);
+            }
+            super::evict::note_audio_started(&self.tab_id);
+            // 0 = do not capture. Playback is untouched.
             0
         }
     }
@@ -1739,6 +1945,18 @@ wrap_client! {
         /// Chromium's.
         fn find_handler(&self) -> Option<FindHandler> {
             Some(super::find::PageFindHandler::new(self.tab_id.clone()))
+        }
+
+        /// Present only so that eave is TOLD about audio (Slice E3). It
+        /// declines every capture it is offered — see `PageAudioHandler`.
+        ///
+        /// Slice R1: this arm was left inside a TEST FUNCTION by the E3
+        /// merge and compiled nowhere, which is why `note_audio_started`
+        /// read as dead code. `cargo check` does not build `#[cfg(test)]`
+        /// under a feature flag; `--all-targets` does, and that is the only
+        /// reason it was caught.
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            Some(PageAudioHandler::new(self.tab_id.clone()))
         }
     }
 }

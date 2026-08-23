@@ -138,6 +138,32 @@ gpui_platform = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc147
     "runtime_shaders",
 ] }
 
+# bezel — a SwiftUI-flavored component library for gpui
+# (github.com/crabtalk/bezel, MIT, © 2026 clearloop; portions extracted from
+# zeronsh/comet © Wing). Slice BZ adopts its presentation for the tool-call,
+# activity, composer, transcript and diff surfaces. Attribution also sits in
+# the module doc of `src/bezel_theme.rs`, which is where the code touches it.
+#
+# REV-PINNED, never a branch — the same rule the gpui pin above states, for
+# the same reason: `cargo update` must not be able to move what eave paints.
+# f86dbbf is `main` at adoption (2026-08-23), the tip of five commits.
+#
+# `default-features = false` drops the bundled Geist faces (~700 KB of TTF).
+# Type is a token, `theme.rs` owns the tokens, and Slice BZ stage 1 builds
+# bezel's Theme global FROM ours — so the families eave paints with are
+# eave's and the embedded fonts would be dead weight in the binary.
+#
+# The facade, not the leaf crates: bezel's members are named `ui`, `theme`
+# and `motion`, and eave already has a `theme` of its own that is the single
+# source of truth. Reached as `bezel::ui` / `bezel::theme`, there is no
+# ambiguity about which theme a line means. It builds against OUR gpui via
+# the `[patch]` in the workspace root — see that comment for why.
+bezel = { git = "https://github.com/crabtalk/bezel", rev = "f86dbbfc84569cc69f3cba6ebb3d99d858dcb259", default-features = false }
+# Slice CM. The one dependency `text_field.rs` carries out of bezel — already
+# in the tree three times over (gpui, cosmic-text and bezel itself all pull it),
+# so this resolves to the same 1.13.3 and adds nothing to the build.
+unicode-segmentation = "1.13"
+
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 futures = "0.3"
 serde_json = "1"

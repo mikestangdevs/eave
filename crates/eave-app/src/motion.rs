@@ -387,6 +387,57 @@ pub fn caret_visible(elapsed: Duration) -> bool {
 /// display rate: matching the panel is what cost comet 36% CPU.
 const PULSE_TICK: Duration = Duration::from_millis(33);
 
+/// Repeat-tick interval for a **caret**, and the reason the clock has two.
+///
+/// A blink is a step function with a 500 ms half-period, so the only thing a
+/// tick has to do is land close enough to an edge that nobody sees it arrive
+/// late. 100 ms bounds that error at a fifth of the half-period — under the
+/// threshold where a blink starts reading as ragged — for **a third of the
+/// redraws [`PULSE_TICK`] costs**.
+///
+/// That ratio is the whole reason this constant exists, and the history is
+/// worth the paragraph. Before it there was one rate, so a caret leased the
+/// same 30 fps drive as a spinner — and eave's answer to "what does a caret
+/// cost at rest" was to not blink one. The composer's went solid whenever
+/// the draft was empty (gated, with a comment saying the gate was there to
+/// keep N4's idle floor reachable); the rail's rename field was solid by a
+/// comment that says so in as many words; and the omnibox's was solid by
+/// accident, because it read the *composer's* draft, which is empty by
+/// definition while somebody is typing somewhere else. Three fields, no
+/// blink, and the operator's report was the obvious one: *I can never tell
+/// where my cursor is.*
+///
+/// A caret is still not free, and this does not pretend otherwise — it is
+/// the one thing in eave that runs while nothing else is happening. That is
+/// the correct trade rather than a regression against N4: the person
+/// sitting in front of a focused text field **is** what is happening, and
+/// the floor N4 asserts is about a window nobody is typing into. It stays
+/// exactly where it was, because a caret leases only while its field owns
+/// the keyboard.
+const CARET_TICK: Duration = Duration::from_millis(100);
+
+/// How fast a leaseholder needs the clock.
+///
+/// The tick is the **fastest live lease's**, so a caret on its own runs the
+/// window at [`CARET_TICK`] and a caret beside a spinner costs the spinner's
+/// rate and nothing on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Cadence {
+    /// Anything with a shape to move: loaders, pulses, spinner phases.
+    Fast,
+    /// A blink, and only a blink.
+    Caret,
+}
+
+impl Cadence {
+    fn tick(self) -> Duration {
+        match self {
+            Cadence::Fast => PULSE_TICK,
+            Cadence::Caret => CARET_TICK,
+        }
+    }
+}
+
 /// How long a view stays on the tick list after its last ask. One lease
 /// outlives a few missed frames, so a consumer that skips a paint does not
 /// stutter; a consumer that unmounts stops renewing and drops off, and with
@@ -399,8 +450,14 @@ struct PulseClock {
     /// still in phase, because phase is a function of this instant and not
     /// of when the consumer appeared.
     epoch: Instant,
-    /// Who still wants ticks, and until when.
-    leases: HashMap<EntityId, Instant>,
+    /// Who still wants ticks, at what cadence, and until when.
+    ///
+    /// Keyed by **both**, because one view leases twice: eave's shell draws
+    /// a caret and a working dot from the same render pass, and a map keyed
+    /// by view alone would let whichever asked last decide the rate for
+    /// both — which is a caret that silently pins the window at 30 fps, or
+    /// a loader that silently drops to 10.
+    leases: HashMap<(EntityId, Cadence), Instant>,
     /// Whether the tick task is alive. The whole point: false means no
     /// timer is pending and the window is scheduling nothing.
     running: bool,
@@ -414,6 +471,42 @@ impl Global for PulseClock {}
 #[cfg(test)]
 pub fn clock_running(cx: &App) -> bool {
     cx.has_global::<PulseClock>() && cx.global::<PulseClock>().running
+}
+
+/// The rate the clock is ticking at, or `None` when no timer is pending.
+///
+/// Test-only, and the instrument that had to arrive with [`CARET_TICK`].
+/// "Is a timer pending" and "is anything animating" were the same question
+/// for as long as there was one rate; a blinking caret is a legitimate
+/// reason for a timer to exist, so they are two questions now. A test that
+/// means the second one asks [`animating`].
+#[cfg(test)]
+pub fn clock_tick(cx: &App) -> Option<Duration> {
+    if !cx.has_global::<PulseClock>() {
+        return None;
+    }
+    let clock = cx.global::<PulseClock>();
+    if !clock.running {
+        return None;
+    }
+    clock.leases.keys().map(|(_, cadence)| cadence.tick()).min()
+}
+
+/// Is anything **but a caret** driving the clock?
+///
+/// The successor to `clock_running` for every test whose subject is a
+/// moving shape — a skeleton, a loader, a working dot. Those tests read
+/// "the window is still drawing this thing", and a caret blinking in a text
+/// box the operator is sitting in front of is not that.
+#[cfg(test)]
+pub fn animating(cx: &App) -> bool {
+    clock_tick(cx) == Some(PULSE_TICK)
+}
+
+/// [`CARET_TICK`], for the tests that pin what a focused field costs.
+#[cfg(test)]
+pub const fn caret_tick() -> Duration {
+    CARET_TICK
 }
 
 /// The clock, created on first use. Deliberately not `default_global`: the
@@ -447,13 +540,33 @@ fn clock_mut(cx: &mut App, now: Instant) -> &mut PulseClock {
 /// things underneath the phase: a lease, and a time. So those are what this
 /// returns, and `pulse_delta` is a thin epoch-relative wrapper over it.
 pub fn pulse_now(view: EntityId, cx: &mut App) -> Option<Instant> {
+    lease(view, Cadence::Fast, cx)
+}
+
+/// Renew `view`'s **caret** lease and hand back the clock's `now`.
+///
+/// [`pulse_now`] for a blink, and the only difference is the rate it asks
+/// the window to wake at — see [`CARET_TICK`] for why a caret gets its own.
+/// Call it from the render of whichever field owns the keyboard; stop
+/// calling it — because the field closed, or the keyboard moved to another
+/// one — and the lease lapses.
+///
+/// `None` under reduced motion, on exactly [`pulse_now`]'s terms. A caller
+/// that gets `None` draws a **solid** caret, which is the resting state and
+/// not a missing one: the preference asked for less motion, not for less
+/// insertion point.
+pub fn caret_now(view: EntityId, cx: &mut App) -> Option<Instant> {
+    lease(view, Cadence::Caret, cx)
+}
+
+fn lease(view: EntityId, cadence: Cadence, cx: &mut App) -> Option<Instant> {
     if cx.reduce_motion() {
         return None;
     }
     let now = cx.background_executor().now();
     let start = {
         let clock = clock_mut(cx, now);
-        clock.leases.insert(view, now + PULSE_LEASE);
+        clock.leases.insert((view, cadence), now + PULSE_LEASE);
         let start = !clock.running;
         clock.running = true;
         start
@@ -487,11 +600,17 @@ fn epoch(cx: &App) -> Instant {
     cx.global::<PulseClock>().epoch
 }
 
-/// The one timer. Wakes every [`PULSE_TICK`], reaps expired leases, notifies
-/// whoever is left, and *breaks* — dropping the task — when nobody is.
+/// The one timer. Wakes at the fastest live lease's rate, reaps expired
+/// leases, notifies whoever is left, and *breaks* — dropping the task —
+/// when nobody is.
 fn spawn_ticker(cx: &mut App) {
     cx.spawn(async move |cx| loop {
-        cx.background_executor().timer(PULSE_TICK).await;
+        // Read the rate BEFORE sleeping, not after. A caret-only clock that
+        // a loader joins has to speed up on the *next* turn; deciding the
+        // interval on the way out instead would play the first tenth of a
+        // second of every loader at the caret's rate.
+        let tick = cx.update(tick_interval);
+        cx.background_executor().timer(tick).await;
         let parked = cx.update(|cx| {
             let now = cx.background_executor().now();
             let clock = cx.global_mut::<PulseClock>();
@@ -500,7 +619,11 @@ fn spawn_ticker(cx: &mut App) {
                 clock.running = false;
                 return true;
             }
-            let views: Vec<EntityId> = clock.leases.keys().copied().collect();
+            // One notify per VIEW, not per lease. A shell holding a caret
+            // lease and a loader lease is still one redraw.
+            let mut views: Vec<EntityId> = clock.leases.keys().map(|(view, _)| *view).collect();
+            views.sort_unstable();
+            views.dedup();
             for view in views {
                 cx.notify(view);
             }
@@ -511,6 +634,23 @@ fn spawn_ticker(cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// The fastest cadence anybody is holding.
+///
+/// [`PULSE_TICK`] when the clock has not been constructed, which is not a
+/// live case — the ticker only exists because a lease was taken — but is
+/// the honest answer rather than a panic.
+fn tick_interval(cx: &mut App) -> Duration {
+    if !cx.has_global::<PulseClock>() {
+        return PULSE_TICK;
+    }
+    cx.global::<PulseClock>()
+        .leases
+        .keys()
+        .map(|(_, cadence)| cadence.tick())
+        .min()
+        .unwrap_or(PULSE_TICK)
 }
 
 // ---------------------------------------------------------------------------

@@ -23,15 +23,15 @@ use futures::StreamExt;
 use gpui::Animation;
 use gpui::AnimationExt as _;
 use gpui::{
-    actions, div, img, list, point, prelude::*, px, quad, relative, size, AnyElement, App,
-    BorderStyle, Bounds, ClickEvent, ClipboardEntry, Context, Corners, CursorStyle, DispatchPhase,
-    Edges, Element, Entity, ExternalPaths, FocusHandle, Font, FontStyle, FontWeight,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image, ImageFormat, InspectorElementId,
-    KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
-    ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextLayout,
-    TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowHandle, WindowOptions,
+    actions, deferred, div, img, list, point, prelude::*, px, quad, relative, size, AnyElement,
+    App, BorderStyle, Bounds, ClickEvent, ClipboardEntry, Context, Corners, CursorStyle,
+    DispatchPhase, Div, DragMoveEvent, Edges, Element, Entity, ExternalPaths, FocusHandle, Font,
+    FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image, ImageFormat,
+    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
+    Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
+    TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
 };
 use gpui_platform::application;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -47,6 +47,7 @@ use eave_wire::{
 };
 
 use crate::attach::{self, StagedFile};
+use crate::bookmarks;
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
 use crate::icons;
@@ -58,6 +59,7 @@ use crate::omnibox;
 use crate::overlay::{self, MenuItem, Popup};
 use crate::slash::{self, SlashEntry};
 use crate::strip;
+use crate::text_field::TextField;
 use crate::theme;
 
 actions!(
@@ -102,8 +104,36 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        /// Slice CM — Return in the composer.
+        ///
+        /// An action rather than an `on_key` arm because the composer's field
+        /// is the deepest node in the focus path, and gpui resolves a chord to
+        /// the deepest matching context: nothing mounted *above* the field can
+        /// take Return back off it, however it is bound. Scoped to
+        /// [`COMPOSER_KEY_CONTEXT`], which only the composer claims.
+        SendMessage,
+        /// Slice CM — the four keys the `/` palette borrows while it is up.
+        ///
+        /// Bound on [`SLASH_KEY_CONTEXT`], which the field claims **only while
+        /// the palette is live** and drops the moment it closes. That gating is
+        /// the whole reason they can be actions at all: `up` and `down` are the
+        /// field's own vertical caret motion the rest of the time, and a
+        /// permanent claim would have taken them away for good.
+        SlashNext,
+        SlashPrev,
+        SlashAccept,
+        SlashDismiss,
     ]
 );
+
+/// The key context eave's composer claims on top of the field's own.
+///
+/// See [`SendMessage`]. `shift-enter` is bound here too, because binding
+/// Return away from the field means putting the newline back by hand.
+const COMPOSER_KEY_CONTEXT: &str = "EaveComposer";
+
+/// Claimed **only while the `/` palette is up**. See [`SlashNext`].
+const SLASH_KEY_CONTEXT: &str = "EaveSlashPalette";
 
 /// How much of a tool's input the approval card shows before it states
 /// that it is holding back (Slice K). A 4 KB `Write` must not push its own
@@ -356,7 +386,77 @@ enum BrowserCmd {
     /// shape this slice exists to remove. The double-ask a fold burst could
     /// otherwise cause is held off by `asked_for_session_tab`, which is
     /// single-threaded render-thread state and cannot race.
-    OpenSessionTab { session_id: String, activate: bool },
+    OpenSessionTab {
+        session_id: String,
+        activate: bool,
+        /// The project this session's tab belongs in, when one already
+        /// exists for its checkout root.
+        group: Option<String>,
+        /// The session's checkout root, when it has one and no project is
+        /// bound to it yet. `Some` here with `group: None` is what makes
+        /// this verb two requests instead of one — mint the project, then
+        /// open the tab inside it. That is Slice T1 turning on the first of
+        /// the three things `TabGroup::workspace` said nobody does: *the
+        /// engine never creates a group for a worktree*. It still does not.
+        /// The client does, because the client is where the snapshot is.
+        workspace: Option<String>,
+    },
+    /// Slice T1 — file a page on the bookmarks bar.
+    ///
+    /// `parent: None` is the bar itself; `Some` is a folder on it. `index:
+    /// None` appends, which is what a drop onto empty bar space means.
+    BookmarkAdd {
+        parent: Option<String>,
+        index: Option<usize>,
+        title: Option<String>,
+        /// Present makes a link, absent makes a **folder** — the wire's own
+        /// rule, kept rather than split into two verbs, because "a bookmark
+        /// with a url" is what every caller actually has in hand.
+        url: Option<String>,
+    },
+    /// Slice T1 — drag a bookmark somewhere else on the bar, or into a
+    /// folder on it.
+    ///
+    /// The engine's `BookmarkMove` is two list edits with the node itself
+    /// untouched, and it refuses a move that would make a cycle — see
+    /// `BookmarkTree::would_cycle`. Neither is this client's problem, which
+    /// is exactly why the drop handler can be this short.
+    BookmarkMove {
+        bookmark_id: String,
+        parent: Option<String>,
+        index: usize,
+    },
+    /// Slice T1 — a session tab taking a blank tab's place.
+    ///
+    /// ⌘T makes a page tab and offers the launcher in it. Starting a
+    /// session from there must land in **that tab**, not in a new one
+    /// beside it with the blank one left over: the operator made one tab
+    /// and should end with one tab.
+    ///
+    /// Open-then-close rather than close-then-open. Closing first would
+    /// leave a window where the strip has neither tab, and `strip::successor`
+    /// would activate some unrelated neighbour in it.
+    ReplaceWithSessionTab {
+        closing: String,
+        session_id: String,
+        group: Option<String>,
+        index: usize,
+    },
+    /// Slice T1 — fold a project open or shut.
+    ///
+    /// The second of the three things `TabGroup::workspace`'s doc says
+    /// nothing does. `collapsed` is already on the group and `strip.rs`
+    /// already draws a collapsed one as a head and a count; nothing had
+    /// ever set it, so every project was permanently open.
+    GroupSetCollapsed { group_id: String, collapsed: bool },
+    /// Slice T1 — a project the operator made by hand, from a folder they
+    /// picked.
+    ///
+    /// Bound to its checkout the same way an auto-created one is, so there
+    /// is no second class of project to keep working: once it exists,
+    /// sessions in that checkout file themselves under it through the same
+    /// `group_for_workspace` lookup.
+    NewProject { workspace: String },
     /// The omnibox asking history what it has, for `for_text`.
     ///
     /// `query` is the typing form (`typing_form`) and `for_text` is what
@@ -384,6 +484,7 @@ struct Queues {
     notes: Mutex<VecDeque<RowNoteEvent>>,
     /// Slice C1. The tab strip, engine-wide like the session watch.
     tabs: Mutex<VecDeque<eave_wire::TabsSnapshot>>,
+    bookmarks: Mutex<VecDeque<eave_wire::BookmarksSnapshot>>,
     /// Slice C5. One typeahead answer: the text it was asked for, and what
     /// came back. The text travels WITH the answer so a reply that lands
     /// after the next keystroke can be discarded rather than shown against
@@ -399,6 +500,16 @@ struct Queues {
 /// so there is nothing to go stale and nothing to resync.
 struct WebTabsState {
     snapshot: eave_wire::TabsSnapshot,
+}
+
+/// Slice T1: the bookmark hierarchy, folded by replacement.
+///
+/// An entity for the same reason [`WebTabsState`] is one — the pump folds
+/// it and the pump exists before the shell does. Bookmarks are ENGINE-WIDE
+/// like tabs and unlike everything session-shaped, so they arrive on their
+/// own subscription and have nothing to do with which session is selected.
+struct BookmarksState {
+    snapshot: eave_wire::BookmarksSnapshot,
 }
 
 /// Slice C5: the last typeahead answer, and the text it answered for.
@@ -450,6 +561,12 @@ impl Plumbing {
     /// other snapshot on this shell.
     fn push_tabs(&self, ev: eave_wire::TabsSnapshot) {
         self.queues.tabs.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
+    /// Slice T1: the whole bookmark tree, folded by replacement like every
+    /// other snapshot on this shell.
+    fn push_bookmarks(&self, ev: eave_wire::BookmarksSnapshot) {
+        self.queues.bookmarks.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
     fn push_diff(&self, ev: DiffEvent) {
@@ -520,6 +637,84 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 })
                 .await;
         }
+        BrowserCmd::BookmarkAdd {
+            parent,
+            index,
+            title,
+            url,
+        } => {
+            let _ = client
+                .browser_create(eave_wire::Request::BookmarkAdd {
+                    parent,
+                    index,
+                    title,
+                    url,
+                })
+                .await;
+        }
+        BrowserCmd::BookmarkMove {
+            bookmark_id,
+            parent,
+            index,
+        } => {
+            let _ = client
+                .browser_do(eave_wire::Request::BookmarkMove {
+                    bookmark_id,
+                    parent,
+                    index,
+                })
+                .await;
+        }
+        BrowserCmd::ReplaceWithSessionTab {
+            closing,
+            session_id,
+            group,
+            index,
+        } => {
+            if client
+                .browser_create(eave_wire::Request::TabOpen {
+                    url: None,
+                    group,
+                    index: Some(index),
+                    content: eave_wire::TabContent::Session { session_id },
+                    opener: None,
+                    activate: true,
+                })
+                .await
+                .is_ok()
+            {
+                // Only once the replacement exists. A failed open that
+                // still closed the blank tab would take the operator's
+                // launcher away and give them nothing back.
+                let _ = client
+                    .browser_do(eave_wire::Request::TabClose { tab_id: closing })
+                    .await;
+            }
+        }
+        BrowserCmd::GroupSetCollapsed {
+            group_id,
+            collapsed,
+        } => {
+            let _ = client
+                .browser_do(eave_wire::Request::GroupUpdate {
+                    group_id,
+                    title: None,
+                    color: None,
+                    workspace: None,
+                    collapsed: Some(collapsed),
+                })
+                .await;
+        }
+        BrowserCmd::NewProject { workspace } => {
+            let _ = client
+                .browser_create(eave_wire::Request::GroupCreate {
+                    title: Some(strip::project_title(&workspace)),
+                    color: None,
+                    workspace: Some(workspace),
+                    index: None,
+                })
+                .await;
+        }
         BrowserCmd::Navigate { tab_id, url } => {
             let _ = client
                 .browser_do(eave_wire::Request::TabNavigate { tab_id, url })
@@ -551,11 +746,34 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
         BrowserCmd::OpenSessionTab {
             session_id,
             activate,
+            group,
+            workspace,
         } => {
+            // Mint the project first when the checkout has none. A failure
+            // here is swallowed like every other failure in this function
+            // and the tab still opens — loose rather than filed, which is
+            // the same place it would have gone before Slice T1 and is a
+            // great deal better than no tab at all.
+            let group = match (group, workspace) {
+                (Some(group), _) => Some(group),
+                (None, Some(workspace)) => client
+                    .browser_create(eave_wire::Request::GroupCreate {
+                        title: Some(strip::project_title(&workspace)),
+                        color: None,
+                        workspace: Some(workspace),
+                        index: None,
+                    })
+                    .await
+                    .ok(),
+                (None, None) => None,
+            };
+            // Not `Client::tab_open_session`, which hardcodes
+            // `activate: false`: this verb carries an `activate` and the
+            // helper would drop it on the floor.
             let _ = client
                 .browser_create(eave_wire::Request::TabOpen {
                     url: None,
-                    group: None,
+                    group,
                     index: None,
                     content: eave_wire::TabContent::Session { session_id },
                     opener: None,
@@ -651,6 +869,28 @@ async fn feed_loop(
             Err(_) => continue 'conn,
         };
 
+        // Slice T1: the bookmark tree.
+        //
+        // Its own task, for the reason the strip's is: bookmarks are
+        // ENGINE-WIDE. They have nothing to do with which session is
+        // selected, so putting them in the select!s below would couple them
+        // to the loop whose whole job is that selection. Dies with the
+        // connection, because it holds a clone of the client.
+        {
+            let client = Arc::clone(&client);
+            let plumbing = plumbing.clone();
+            tokio::spawn(async move {
+                let Ok(mut rx) = client.watch_bookmarks().await else {
+                    return;
+                };
+                while let Some(item) = rx.recv().await {
+                    if let SubscriptionItem::Bookmarks { snapshot } = item {
+                        plumbing.push_bookmarks(snapshot);
+                    }
+                }
+            });
+        }
+
         // Slice C1: the tab strip, and the page facts going the other way.
         //
         // Its own task rather than another arm in the two select!s below,
@@ -684,6 +924,8 @@ async fn feed_loop(
                 // not a capture of anything. It is also what makes the
                 // screenshot in the slice report reproducible.
                 let mut boot_url = std::env::var("EAVE_WEB_AT_BOOT").ok();
+                // Whether any page can still report. See the `fact` arm.
+                let mut facts_open = true;
                 loop {
                     if let Some(url) = boot_url.clone() {
                         // Only once, and only if nothing is there: a
@@ -737,13 +979,41 @@ async fn feed_loop(
                         // reports, not requests, and sending them as
                         // requests is precisely the double-journal Slice
                         // B1 warned about.
-                        fact = fact_rx.recv() => match fact {
+                        //
+                        // **The guard is the fix for "eave renders no tabs
+                        // at all" (Slice D3).** This arm used to `return` on
+                        // `None`, and `None` here means only "every sender
+                        // is gone" — which in a build without `--features
+                        // web` is true on the FIRST poll, because that
+                        // build's `install_fact_sink` takes the sender and
+                        // drops it (nothing reports, so there is nothing to
+                        // hold). So the task returned immediately, `rx` went
+                        // with it, and the engine's first tab snapshot
+                        // arrived at a dropped receiver: the client's read
+                        // loop found the stream, failed to send, and removed
+                        // the subscription. Every later snapshot was
+                        // discarded against `pending=None`, silently, at a
+                        // layer with no logging.
+                        //
+                        // Traced end to end before it was believed: the
+                        // engine reported `run_tabs id=4 order=9
+                        // sent_ok=true` five times over while the app
+                        // reported `watch_tabs ok=true` and nothing after
+                        // it. Slice D1 saw the symptom, checked that the
+                        // journal held twelve tabs and that `main` did the
+                        // same thing, and filed it as unexplained.
+                        //
+                        // A closed fact channel means "no page will ever
+                        // report", not "stop watching the strip". The guard
+                        // retires the arm and leaves the loop alive.
+                        fact = fact_rx.recv(), if facts_open => match fact {
                             Some((tab_id, fact)) => {
                                 let _ = client
                                     .browser_do(eave_wire::Request::TabStated { tab_id, fact })
                                     .await;
                             }
-                            None => return,
+                            // Not `return`. See above.
+                            None => facts_open = false,
                         },
                         // A page asking for something only the engine can
                         // grant. `TabOpen` then `TabNavigate` — two
@@ -1729,40 +1999,85 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                     )));
                 }
                 let mut budget = theme::DIFF_PANE_MAX_LINES;
+                // ── Slice BZ: the diff is bezel's composition ────────
+                // Two decisions taken from `apps/gallery/src/patterns/diff.rs`
+                // and rebuilt here rather than linked, because bezel has no
+                // diff COMPONENT — that file is a demonstration:
+                //
+                //  1. A **sign column**. eave distinguished add from remove by
+                //     a 0.10 wash and nothing else, which is a weak signal at
+                //     that alpha and no signal at all to a colour-blind
+                //     reader. `+`/`-` is unambiguous and survives both.
+                //  2. A hunk header that is a **header** — its own padding and
+                //     a rule under it, not a dim line of text in the flow.
+                //
+                // What it costs: `diff_runs` coalesced a run of same-op lines
+                // into ONE element, and a sign per line cannot. Element count
+                // now scales with lines, not runs. It is bounded by
+                // `DIFF_PANE_MAX_LINES` either way, which is why this is
+                // affordable here and would not be in the transcript.
+                //
+                // Line NUMBERS are bezel's third decision and are not taken:
+                // `DiffLine` carries `op` and `text` and no number, so they
+                // would have to be invented. That is a wire change, not a
+                // styling one.
+                let bz = crate::bezel_theme::theme();
                 'hunks: for hunk in hunks {
                     children.push(
                         div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACE_2))
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .border_b_1()
+                            .border_color(bz.border)
                             .font_family(theme::MONO)
                             .text_size(px(theme::MICRO_SIZE))
                             .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
+                            .text_color(bz.text_muted)
                             .truncate()
                             .child(SharedString::from(hunk.header.clone()))
                             .into_any_element(),
                     );
-                    // Consecutive same-op lines render as ONE element (a
-                    // multi-line text under one wash): element count
-                    // scales with runs, not lines.
-                    for (op, text, count) in diff_runs(&hunk.lines, budget) {
-                        budget -= count;
-                        let styled = div()
-                            .px(px(theme::SPACE_1))
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::DIFF_SIZE))
-                            .line_height(px(theme::DIFF_LINE))
-                            .child(SharedString::from(text));
+                    for line in hunk.lines.iter().take(budget) {
+                        let (wash, mark, sign) = match line.op {
+                            DiffOp::Add => (theme::diff_add_bg(), bz.success, "+"),
+                            DiffOp::Del => (theme::diff_del_bg(), bz.danger, "-"),
+                            DiffOp::Ctx => (gpui::transparent_black(), bz.text_faint, " "),
+                        };
                         children.push(
-                            match op {
-                                DiffOp::Add => styled
-                                    .bg(theme::diff_add_bg())
-                                    .text_color(theme::text_secondary_on_wash()),
-                                DiffOp::Del => styled
-                                    .bg(theme::diff_del_bg())
-                                    .text_color(theme::text_secondary_on_wash()),
-                                DiffOp::Ctx => styled.text_color(theme::text_tertiary()),
-                            }
-                            .into_any_element(),
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_start()
+                                .gap(px(theme::SPACE_2))
+                                .px(px(theme::SPACE_2))
+                                .bg(wash)
+                                .font_family(theme::MONO)
+                                .text_size(px(theme::DIFF_SIZE))
+                                .line_height(px(theme::DIFF_LINE))
+                                .child(
+                                    div()
+                                        .w(px(theme::DIFF_SIGN_W))
+                                        .flex_none()
+                                        .text_color(mark)
+                                        .child(sign),
+                                )
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .text_color(if line.op == DiffOp::Ctx {
+                                            bz.text_muted
+                                        } else {
+                                            theme::text_secondary_on_wash()
+                                        })
+                                        .child(SharedString::from(line.text.clone())),
+                                )
+                                .into_any_element(),
                         );
+                        budget -= 1;
                         if budget == 0 {
                             break 'hunks;
                         }
@@ -1798,24 +2113,10 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
         .into_any_element()
 }
 
-/// Group consecutive same-op diff lines into one multi-line string per
-/// run, taking at most `budget` lines (the render cap): element count
-/// scales with runs, line count is bounded, and each run reports how
-/// many lines it holds so the caller can spend the budget.
-fn diff_runs(lines: &[DiffLine], budget: usize) -> Vec<(DiffOp, String, usize)> {
-    let mut runs: Vec<(DiffOp, String, usize)> = Vec::new();
-    for l in lines.iter().take(budget) {
-        match runs.last_mut() {
-            Some((op, buf, count)) if *op == l.op => {
-                buf.push('\n');
-                buf.push_str(&l.text);
-                *count += 1;
-            }
-            _ => runs.push((l.op, l.text.clone(), 1)),
-        }
-    }
-    runs
-}
+// `diff_runs` — which coalesced a run of same-op lines into one element —
+// was retired by Slice BZ. The diff draws a sign per LINE now, and a sign
+// cannot be shared by a run. See docs/reports/stage-bz-bezel.md §5 for what
+// that costs and why it is affordable inside DIFF_PANE_MAX_LINES.
 
 /// Quiet escalates from a subtle line to a prominent bar at 10 min
 /// (build directive 2026-08-16: "subtle at threshold, prominent at 10min,
@@ -1856,6 +2157,51 @@ fn spine_dot(tab: &strip::StripTab) -> (Hsla, bool) {
     }
 }
 
+thread_local! {
+    /// Test seam (Slice E3): forces which page tabs [`page_resident`]
+    /// reports as holding a live page.
+    ///
+    /// A `thread_local` set by tests, in the same shape as this file's other
+    /// harness seams, because the real answer comes from CEF and the harness
+    /// runs in a build with no Chromium in it — so without this the evicted
+    /// treatment would be a rendering path the suite could never enter, and
+    /// "an evicted tab looks different" would be a claim with no test under
+    /// it.
+    static RESIDENT_OVERRIDE: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: declare exactly which page tabs hold a live page, or hand
+/// residency back to the page engine with `None`.
+///
+/// Every test that sets this must clear it — the `thread_local` outlives the
+/// test on a reused thread, and a leaked override would make an unrelated
+/// test's tabs recede for reasons its author never wrote down.
+#[cfg(test)]
+fn set_resident_for_test(ids: Option<&[&str]>) {
+    RESIDENT_OVERRIDE.with(|o| {
+        *o.borrow_mut() = ids.map(|ids| ids.iter().map(|s| s.to_string()).collect());
+    });
+}
+
+/// Whether this page tab's page is in memory right now (Slice E3).
+///
+/// **A build with no page engine reports every tab resident**, and that is
+/// the honest answer rather than the convenient one: `web::page_is_resident`
+/// says `false` there because there is no Chromium to hold anything, but
+/// "unloaded" on screen means *eave gave this page back and will fetch it
+/// again* — a statement about a browser that exists. A build that has no
+/// browser at all is not making that statement about every tab; it is not
+/// making it at all.
+fn page_resident(tab_id: &str) -> bool {
+    if let Some(forced) =
+        RESIDENT_OVERRIDE.with(|o| o.borrow().as_ref().map(|set| set.contains(tab_id)))
+    {
+        return forced;
+    }
+    !crate::web::available() || crate::web::page_is_resident(tab_id)
+}
+
 /// A tab's 18 px identity plate: the provider's mark for a session, a globe
 /// for a page, on the same `chip_plate` at the same size the rail row uses.
 ///
@@ -1863,9 +2209,32 @@ fn spine_dot(tab: &strip::StripTab) -> (Hsla, bool) {
 /// glass ground measures 2.55:1 at the bright end of the backdrop sweep, under
 /// the 3:1 a non-text mark owes its surface; on `chip_plate` it is 6.01:1 in
 /// every state.
+fn page_globe(id: &str, resident: bool) -> AnyElement {
+    icons::tagged_icon(
+        icons::GLOBAL,
+        12.0,
+        if resident {
+            theme::text_secondary_on_wash()
+        } else {
+            theme::text_tertiary()
+        },
+        if resident {
+            format!("tab-chip-{id}")
+        } else {
+            format!("tab-chip-unloaded-{id}")
+        },
+    )
+    .into_any_element()
+}
+
 fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
     div()
-        .size(px(theme::PROVIDER_CHIP))
+        // `RAIL_MARK`, not `PROVIDER_CHIP` (Slice D3). The rail row's leading
+        // slot is one size whatever fills it — a provider chip here, a
+        // favicon from stage 2 — because the references' rails read as ONE
+        // list precisely because the marks line up. The 12 px glyph inside is
+        // unchanged; it just sits on a 2 px inset instead of a 3 px one.
+        .size(px(theme::RAIL_MARK))
         .flex_none()
         .rounded(px(theme::RADIUS_CHIP))
         .bg(theme::chip_plate())
@@ -1873,13 +2242,31 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
         .items_center()
         .justify_center()
         .child(match &tab.kind {
-            strip::TabKind::Page => icons::tagged_icon(
-                icons::GLOBAL,
-                12.0,
-                theme::text_secondary_on_wash(),
-                format!("tab-chip-{id}"),
-            )
-            .into_any_element(),
+            // A page's mark is its favicon when Chromium has given us a
+            // URL, and the globe when it has not — or when the image fails
+            // to decode. Session rows keep the provider chip. The globe
+            // selector stays on the fallback so an unloaded page still
+            // recedes under `tab-chip-unloaded-*`.
+            strip::TabKind::Page => {
+                let resident = tab.resident;
+                match crate::web::favicon_image(id) {
+                    Some(image) => div()
+                        .debug_selector({
+                            let id = id.to_string();
+                            move || format!("tab-favicon-{id}")
+                        })
+                        .size(px(theme::RAIL_MARK))
+                        .overflow_hidden()
+                        .rounded(px(theme::RADIUS_CHIP))
+                        .child(
+                            img(image)
+                                .size(px(theme::RAIL_MARK))
+                                .object_fit(ObjectFit::Contain),
+                        )
+                        .into_any_element(),
+                    None => page_globe(id, resident),
+                }
+            }
             strip::TabKind::Session { chip, .. } => {
                 let provider = chip
                     .as_ref()
@@ -2125,10 +2512,16 @@ fn take_deny_reason(composer: Option<&Entity<ComposerState>>, cx: &mut App) -> S
     let Some(composer) = composer else {
         return String::new();
     };
-    let text = composer.read(cx).text.trim().to_string();
+    let text = composer
+        .read(cx)
+        .field
+        .read(cx)
+        .content()
+        .trim()
+        .to_string();
     if !text.is_empty() {
         composer.update(cx, |c, cx| {
-            c.text.clear();
+            c.field.update(cx, |f, cx| f.clear(cx));
             cx.notify();
         });
     }
@@ -2187,8 +2580,32 @@ fn resource_line(
     if !reporting.is_empty() {
         let n = reporting.len();
         let noun = if n == 1 { "agent" } else { "agents" };
-        lines.push(match physical {
-            Some(phys) if phys > 0 => format!("{n} {noun} · {} of {}", gib(agents), gib(phys)),
+        // Slice D3 took the DENOMINATOR off this line, and it fixed a fact
+        // that was wrong as well as one that did not fit.
+        //
+        // Wrong: `over` below is computed on agents **plus web**, but this
+        // line's numerator counted agents alone. With a browser running, the
+        // rail could say "120.0 GB of 512.0 GB" — 23% — in warning ink,
+        // because the number it warned on was 132. The stated ratio and the
+        // colour it was stated in disagreed.
+        //
+        // Did not fit: at 32 characters the combined line needs 173.4 px and
+        // a 220 px rail gives its footer 171 — and the rail is draggable to
+        // 180 now, where it is hopeless. C1 hit this exact wall and wrote the
+        // rule down: "A SECOND LINE, not a longer one ... a ceiling stated
+        // half way is not stated." This applies that rule one clause deeper.
+        lines.push(match (physical, web) {
+            // No web: the total IS the agents' sum, so one line states it
+            // whole and a separate ceiling line would repeat the numerator
+            // back to the operator ("2 agents · 0.5 GB" / "0.5 GB of 32.0
+            // GB"). The harness caught that redundancy the moment it was
+            // written.
+            (Some(phys), None) if phys > 0 => {
+                format!("{n} {noun} · {} of {}", gib(agents), gib(phys))
+            }
+            // With web, the denominator moves to its own line below — see
+            // there for why.
+            (_, Some(_)) => format!("{n} {noun} · {}", gib(agents)),
             // No denominator rather than an invented one: the sum alone is
             // still a true fact, and a fabricated machine size would not be.
             _ => format!("{n} {noun} · {} resident", gib(agents)),
@@ -2224,6 +2641,24 @@ fn resource_line(
         Some(phys) if phys > 0 => total as f64 / phys as f64 >= AGENT_MEMORY_WARN_FRACTION,
         _ => false,
     };
+    // **The ceiling gets its own line WHEN a browser is running, because
+    // that is the only case where the old line was wrong.**
+    //
+    // `over` is computed on agents plus web, but the agents line's numerator
+    // counted agents alone — so with a browser holding 12 GB the rail could
+    // say "120.0 GB of 512.0 GB" (23%) in warning ink, because the number it
+    // warned on was 132. The stated ratio and the colour it was stated in
+    // disagreed. This states the number `over` is actually about.
+    //
+    // Only when BOTH halves are reporting: with one of them, the total IS
+    // that half's figure and a ceiling row would repeat the numerator back
+    // ("web · 0.5 GB in 6" / "0.5 GB of 32.0 GB"). The harness caught that
+    // twice while this was being written, once per half.
+    if !reporting.is_empty() && web.is_some() {
+        if let Some(phys) = physical.filter(|p| *p > 0) {
+            lines.push(format!("{} of {}", gib(total), gib(phys)));
+        }
+    }
     Some((lines, over))
 }
 
@@ -2582,6 +3017,23 @@ fn short_cwd(cwd: &str, home: Option<&str>) -> String {
 ///
 /// Same rule as [`fence_view`] and the diff pane: a row inside a
 /// virtualized list may not have a height the agent chooses.
+/// Which glyph stands for a tool's state.
+///
+/// eave drew an animated dot here and bezel's row draws an icon, so the
+/// running case is the one that loses information: a dot that moves says
+/// "still going" without being read, and a static arrow has to be. The glyphs
+/// come from one family — bezel vendors the same Solar Icons set eave does,
+/// and `check` is one eave never had, reached through the composite asset
+/// source in `bezel_theme` rather than added to eave's own assets.
+fn tool_status_icon(status: &ToolStatus, is_error: bool) -> &'static str {
+    match status {
+        ToolStatus::Running => "icons/refresh.svg",
+        ToolStatus::Finished if is_error => "icons/close-circle.svg",
+        ToolStatus::Finished => "icons/check.svg",
+        ToolStatus::Interrupted => "icons/danger-triangle.svg",
+    }
+}
+
 fn tool_body_view(text: &str, max: usize) -> String {
     let total = text.lines().count();
     if total <= max {
@@ -2674,10 +3126,10 @@ fn open_url(raw: &str) {
 /// a future caller cannot route around it by constructing the request
 /// directly.
 fn open_external(raw: &str) {
-    let Some(scheme) = crate::web::policy::scheme(raw) else {
+    let Some(scheme) = crate::web::nav_policy::scheme(raw) else {
         return;
     };
-    if !crate::web::policy::is_external_scheme(&scheme) {
+    if !crate::web::nav_policy::is_external_scheme(&scheme) {
         return;
     }
     #[cfg(test)]
@@ -3460,7 +3912,19 @@ items={count} rows={} frames={} ops={}",
 
 struct ComposerState {
     /// The live buffer: always the draft belonging to `key`.
-    text: String,
+    ///
+    /// **Slice CM.** This was a `String` the shell pushed characters onto from
+    /// a `KeyDownEvent` handler. It is a [`TextField`] now — the same buffer,
+    /// with an `EntityInputHandler` under it — and that swap is the whole
+    /// slice. What it bought: IME (so Japanese, Chinese and Korean input
+    /// compose here at all, which they could not), a selection, a caret you can
+    /// place with the mouse, word motion, and undo. What it cost is written up
+    /// in `docs/reports/stage-cm-composer.md`.
+    ///
+    /// The **field owns the live text** and there is no mirror of it here: the
+    /// same one-draft-one-home rule the parked drafts below already keep. Ask
+    /// it through [`Shell::composer_text`].
+    field: Entity<TextField>,
     /// Which session `text` belongs to; `""` is the launcher, which has no
     /// composer mounted and therefore never accumulates one.
     key: String,
@@ -3476,12 +3940,6 @@ struct ComposerState {
     /// composer hint so a ninth file does not vanish. Cleared on send
     /// and on session switch (the files are the fact that travels).
     overflow: usize,
-    /// When the caret last went solid (inventory §1.20). Every keystroke
-    /// resets it, which is what keeps a typing burst from blinking: the
-    /// cadence is solid through its first half-period, so the caret only
-    /// starts flashing once the typist has stopped. `None` until the first
-    /// keystroke — a caret nobody has typed at has nothing to blink about.
-    caret_anchor: Option<Instant>,
 }
 
 impl ComposerState {
@@ -3495,11 +3953,11 @@ impl ComposerState {
     ///
     /// An empty draft is removed rather than parked: absence and emptiness
     /// are the same fact here, and storing both invites them to disagree.
-    fn switch_to(&mut self, key: String) {
+    fn switch_to(&mut self, key: String, cx: &mut Context<Self>) {
         if key == self.key {
             return;
         }
-        let outgoing = std::mem::take(&mut self.text);
+        let outgoing = self.field.read(cx).content().to_string();
         if outgoing.is_empty() {
             self.drafts.remove(&self.key);
         } else {
@@ -3511,7 +3969,12 @@ impl ComposerState {
         } else {
             self.parked_files.insert(self.key.clone(), outgoing_files);
         }
-        self.text = self.drafts.remove(&key).unwrap_or_default();
+        let incoming = self.drafts.remove(&key).unwrap_or_default();
+        // `set_content` and not an insert: arriving at a session is not an
+        // edit somebody made, so there is no undo history to carry and nothing
+        // here for ⌘Z to walk back past into the *previous* session's words.
+        // bezel's `set_content` clears the history for exactly this reason.
+        self.field.update(cx, |f, cx| f.set_content(incoming, cx));
         self.attachments = self.parked_files.remove(&key).unwrap_or_default();
         self.overflow = 0;
         self.key = key;
@@ -3901,6 +4364,199 @@ struct DemoOverlay {
     chosen: Option<SharedString>,
 }
 
+/// A rail resize in flight (Slice D3).
+///
+/// It records the grab, not the current width, so the handle never JUMPS
+/// under the pointer: the new width is `start_w + (x − grab_x)`. Deriving it
+/// from the pointer's x alone would be one line shorter and would snap the
+/// seam to the cursor on mouse-down by up to half the handle's width — and
+/// would silently assume the rail's left edge is at window x=0, which is true
+/// in A′ today and is exactly the kind of assumption that stops being true.
+#[derive(Clone, Copy, Debug)]
+struct RailDrag {
+    grab_x: f32,
+    start_w: f32,
+}
+
+/// The dragged VALUE for a rail resize — gpui's drag machinery keys on the
+/// payload's type, so this exists to be that type and carries nothing.
+///
+/// The geometry lives in [`RailDrag`] on the shell instead, because
+/// `on_drag` builds its payload at RENDER time and the grab point is only
+/// known at mouse-DOWN. Zed's dock gets away with a payload-only drag because
+/// it snaps the divider to the cursor; this keeps the grab offset.
+///
+/// It renders nothing on purpose: the drag preview for a divider is the
+/// divider moving, and a ghost element following the pointer would be a
+/// second thing to look at.
+#[derive(Clone, Copy, Debug)]
+struct RailResize;
+
+/// Slice T1 — a page being dragged onto the bookmarks bar.
+///
+/// Carries the address and the page's own title rather than a tab id: the
+/// drop files a bookmark, and a bookmark is a url. A tab id would make the
+/// bookmark depend on a tab that may be closed before the drop lands.
+#[derive(Clone, Debug)]
+struct AddressDrag {
+    url: String,
+    title: Option<String>,
+}
+
+/// Slice T1 — a bookmark being dragged along the bar, or into a folder.
+#[derive(Clone, Debug)]
+struct BookmarkDrag {
+    id: String,
+}
+
+/// Both render nothing. gpui draws the dragged element itself when a drag
+/// has no preview, which for a chip is the right ghost — a second thing
+/// following the pointer would be one too many.
+impl Render for AddressDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+impl Render for BookmarkDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+impl Render for RailResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Two tabs painted in one well. Shell-local: the engine still has one
+/// `active`; this is which two the card is showing.
+///
+/// Brave's `split_view` is two pages inside one tab. eave's tabs are
+/// already first-class (page *or* session), so the split is a VIEW of two
+/// existing tabs — which is what lets a page sit next to an agent, the
+/// thing the browser spec named as the reason eave wants this.
+#[derive(Clone, Debug)]
+struct Split {
+    left: String,
+    right: String,
+    /// Left (or top) pane as a fraction of the well. Clamped to
+    /// [`theme::SPLIT_RATIO_MIN`].
+    ratio: f32,
+    /// Top/bottom rather than left/right. The menu's "Convert to Vertical
+    /// Split View" is this bit, not a second split type.
+    vertical: bool,
+}
+
+impl Split {
+    fn contains(&self, id: &str) -> bool {
+        self.left == id || self.right == id
+    }
+
+    fn other(&self, id: &str) -> Option<&str> {
+        if self.left == id {
+            Some(self.right.as_str())
+        } else if self.right == id {
+            Some(self.left.as_str())
+        } else {
+            None
+        }
+    }
+}
+
+/// A split-divider drag in flight. Same shape as [`RailDrag`]: grab offset
+/// rather than snapping the seam to the cursor.
+#[derive(Clone, Copy, Debug)]
+struct SplitDrag {
+    grab_x: f32,
+    start_ratio: f32,
+    well_w: f32,
+}
+
+/// Payload type for the split divider. Carries nothing; geometry lives on
+/// the shell, for the same reason [`RailResize`] does.
+#[derive(Clone, Copy, Debug)]
+struct SplitResize;
+
+impl Render for SplitResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// A rail tab being dragged. Drop on another tab, or on the content well,
+/// opens a split; drop on itself is a no-op.
+#[derive(Clone, Debug)]
+struct TabDrag {
+    id: String,
+    title: String,
+}
+
+impl Render for TabDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .bg(theme::overlay_strong())
+            .text_size(px(theme::DETAIL_SIZE))
+            .text_color(theme::text())
+            .child(SharedString::from(self.title.clone()))
+    }
+}
+
+/// What a right-click on the strip opened a menu about.
+#[derive(Clone, Debug)]
+struct TabMenu {
+    target: TabMenuTarget,
+    at: Point<Pixels>,
+}
+
+#[derive(Clone, Debug)]
+enum TabMenuTarget {
+    /// One tab, not currently in a split.
+    Tab(String),
+    /// The combined pill: the two tabs in the well.
+    Split { left: String, right: String },
+}
+
+/// One choosable row on the tab menu. Separators and headers live beside
+/// these in the rendered list and are not actions.
+#[derive(Clone, Debug)]
+enum TabMenuAction {
+    CopyLink,
+    Share,
+    Mute,
+    Rename,
+    AddSplit,
+    Duplicate,
+    MoveTo,
+    ArchiveTab,
+    ArchiveBelow,
+    ShareSplit,
+    Separate,
+    AddTab,
+    ConvertAxis,
+    SplitMember(String),
+    ArchiveItem,
+}
+
+enum TabMenuEntry {
+    Action(TabMenuAction, MenuItem),
+    Separator,
+    Header(&'static str),
+}
+
+impl TabMenuEntry {
+    fn enabled(&self) -> bool {
+        match self {
+            TabMenuEntry::Action(_, item) => item.enabled,
+            _ => false,
+        }
+    }
+}
+
 struct Shell {
     focus: FocusHandle,
     conn: Entity<ConnectionState>,
@@ -3914,6 +4570,7 @@ struct Shell {
     thumbs: HashMap<PathBuf, Arc<Image>>,
     /// Slice C1: the browser's tab strip.
     web_tabs: Entity<WebTabsState>,
+    bookmarks: Entity<BookmarksState>,
     commands: tokio_mpsc::UnboundedSender<Command>,
     perf: Option<PerfProbe>,
     /// Transient ⌘⇧L confirmation shown in the footer ("logged 14:52:03"
@@ -3930,6 +4587,21 @@ struct Shell {
     /// holds no authoritative state).
     rail_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
+    /// **The rail's live width (Slice D3).** `theme::RAIL_W` is only the
+    /// value a data dir with no saved width starts at; this is the one the
+    /// frame draws, and every measurement of "how much room does a name
+    /// get" has to come from the rendered row rather than from the token.
+    rail_w: f32,
+    /// The resize drag in progress, or `None`.
+    ///
+    /// Held on the shell rather than in a model for `rename`'s reason: it is
+    /// a *choice in progress*, not a fact about anything, and it must survive
+    /// the feed events that rebuild the rail underneath the pointer.
+    rail_drag: Option<RailDrag>,
+    /// Two tabs in the well, or `None` for the ordinary single-tab card.
+    split: Option<Split>,
+    /// The split-divider drag in progress, or `None`.
+    split_drag: Option<SplitDrag>,
     /// Slice AS — the session-tab strip's scroll offset.
     ///
     /// Unlike the two above, this one is *written* as well as read: the
@@ -3961,6 +4633,24 @@ struct Shell {
     /// a session, so it must survive the feed events that rebuild the
     /// rail underneath it.
     rename: Option<RenameEdit>,
+    /// Which field the caret is blinking in, and when it last went solid.
+    ///
+    /// **One anchor for the whole window, carrying the field it belongs
+    /// to.** It lived on `ComposerState` while the composer was the only
+    /// box with a caret in it. Four boxes later, four anchors would be four
+    /// clocks that have to agree about a fact only one of them can observe
+    /// — which key was struck last — so the field travels with the instant
+    /// instead. That makes "the keyboard moved to another box" a change to
+    /// *this* value, which is what lets a caret that has just arrived start
+    /// solid rather than half-way through somebody else's blink.
+    ///
+    /// A `Cell` because the render pass anchors a field nobody has typed
+    /// into yet (⌘L an instant ago), and `render` reaches it through
+    /// `&self`. Same reason `tab_scrolled_to` above is one, and the same
+    /// constraint: no notify, so a write here cannot cost a frame.
+    ///
+    /// `None` until the first keystroke of the run.
+    caret: Cell<Option<(Field, Instant)>>,
     /// Slice Q2 — the launcher's own state. Held on the shell rather than
     /// in `TranscriptState` because it is a *choice in progress*, not a
     /// fact about a session: it survives the feed events that clear the
@@ -4001,6 +4691,10 @@ struct Shell {
     /// editable field), and that has to survive the menu's exit or the rows
     /// would empty out mid-fade.
     page_menu: Popup<crate::web::PageMenu>,
+    /// Right-click on a rail tab (or the combined split pill). Same
+    /// overlay machinery as the page menu; the rows are a function of
+    /// whether that tab is alone in the well or sharing it.
+    tab_menu: Popup<TabMenu>,
     /// Slice C5 — the last typeahead answer the engine sent.
     typeahead: Entity<TypeaheadState>,
     /// Slice C5 — the session this window has already asked to select on
@@ -4029,6 +4723,30 @@ struct Shell {
     /// view comes back on the next launch, which is what session restore
     /// means.
     asked_for_session_tab: RefCell<HashSet<String>>,
+    /// The blank page tab a launch was started from (Slice T1), waiting for
+    /// its session to appear so the session's tab can take its place.
+    ///
+    /// Held rather than acted on immediately because **the session does not
+    /// exist yet when the launcher's button is pressed** — `Command::Launch`
+    /// is a request, and the session arrives later, on the rail. This is the
+    /// same shape as `asked_to_select`: a note of an intention, consumed by
+    /// the reconciler when the thing it was about shows up.
+    ///
+    /// Cleared when consumed, unlike the two `asked_*` sets — this one is a
+    /// pending act, not a record that something was already asked for.
+    launched_from_tab: RefCell<Option<String>>,
+    /// Which bookmark folder is open on the bar (Slice T1). One at a time.
+    bookmark_folder_open: RefCell<Option<String>>,
+    /// Checkout roots a project has already been asked for (Slice T1),
+    /// keyed on the root rather than the session.
+    ///
+    /// Same shape and same reason as `asked_for_session_tab` above: a fold
+    /// burst runs several times before the engine's answer comes back round
+    /// as a snapshot, and two sessions in one new worktree would otherwise
+    /// mint a project each. Never pruned — a project the operator then
+    /// closes stays closed, which is the whole point of firing auto-create
+    /// on a session that needs a view rather than on every snapshot.
+    asked_for_project: RefCell<HashSet<String>>,
     /// Slice E2 — last-closed **page** tabs, newest at the back. ⌘⇧T pops.
     ///
     /// The url is the one the tab last held (B1's own history on the tab,
@@ -4170,6 +4888,59 @@ impl SlashCache {
 /// "nothing sent yet" and a replay still arriving (Slice M).
 const READING: &str = "reading skills…";
 
+/// One of eave's four typed-into surfaces, named so a caret can belong to
+/// one of them.
+///
+/// **Not a focus model.** This shell has none, and inventing one here would
+/// be a second notion of "where the keyboard is" sitting beside the ladder
+/// of gates in [`Shell::on_key`] — which is the one that actually decides,
+/// and the one a keystroke obeys. This is a *name* for a rung of that
+/// ladder, so the caret can be drawn in the box the next character will
+/// land in and in no other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    /// The message composer, at the foot of a selected session.
+    Composer,
+    /// ⌘L's address bar.
+    Omnibox,
+    /// ⌘F's find-in-page query.
+    Find,
+    /// The rail's inline rename box.
+    Rename,
+}
+
+/// The caret glyph. A half-width vertical bar rather than a full block: it
+/// marks a position between two characters, and a block marks a character.
+const CARET: &str = "▏";
+
+/// One caret, for every field whose text does not wrap.
+///
+/// The composer's is not built here and cannot be — its text wraps, so its
+/// caret has to live *inside* the string as a colour-only run or it stops
+/// travelling with the last line. Every other field in eave truncates
+/// instead, and a truncating box has to keep the caret out of the string it
+/// is clipping, or the first thing a long value clips is the insertion
+/// point. So: a sibling, `flex_none`, always in the layout and only
+/// sometimes in the ink.
+///
+/// **Drawn at zero opacity rather than removed**, which is what makes the
+/// blink ink and never layout — nothing on the row moves as it flashes.
+///
+/// **The lit state is in the SELECTOR**, because `ui_harness` asserts what
+/// it can find by `debug_selector` and cannot read colour. A caret that
+/// identified itself as plain `caret-omnibox` would have a test under the
+/// fact that something is there and no test at all under the thing it
+/// exists to do. `caret-omnibox-lit` and `caret-omnibox-dark` are two
+/// elements to a test and one element to a reader. (The find bar's tally
+/// already takes this trick, from Slice E3's evicted tab chip.)
+fn caret_glyph(field: &'static str, lit: bool) -> Div {
+    div()
+        .debug_selector(move || format!("caret-{field}-{}", if lit { "lit" } else { "dark" }))
+        .flex_none()
+        .text_color(theme::text().opacity(if lit { 1.0 } else { 0.0 }))
+        .child(CARET)
+}
+
 /// One open rail rename (Stage AC).
 ///
 /// `rename` has been complete on the wire since Stage AB — method,
@@ -4256,6 +5027,97 @@ fn resolve_friction_log(override_path: Option<String>, data_dir: Option<PathBuf>
     }
 }
 
+// ---------------------------------------------------------------------------
+// Frame preferences (Slice D3).
+//
+// **The first thing about the FRAME eave has ever remembered.** Everything
+// persisted until now was a fact about the work — sessions, journals, tabs —
+// and every view preference (`SessionsState::collapsed`, the files section's
+// fold, the archived filter) is deliberately per-run. A dragged width is
+// different in kind: the operator did not express a preference about a
+// session, they resized their window’s furniture, and furniture that springs
+// back on relaunch reads as a bug rather than as a policy.
+//
+// It is a merged read-modify-write over a JSON object rather than a typed
+// struct, for one reason: eave runs several checkouts against one data dir
+// (`~/Library/Application Support/eave`), so a build that knows one key must
+// not drop a key some other build wrote. Unknown keys survive a round trip.
+
+/// `<data_dir>/frame.json` — nothing when the process never called [`run`],
+/// which is every test.
+fn frame_prefs_path() -> Option<PathBuf> {
+    DATA_DIR.get().map(|d| d.join("frame.json"))
+}
+
+/// The rail's width, held to its bounds.
+///
+/// Pure and separate from the IO so the bounds are testable without a data
+/// dir, and because it runs in two places that must agree: once on the value
+/// read from disk and once per mouse-move while dragging. A saved width
+/// written by a build with wider bounds is clamped rather than rejected —
+/// the frame should open narrow, not refuse to open.
+fn clamp_rail_w(w: f32) -> f32 {
+    if !w.is_finite() {
+        return theme::RAIL_W;
+    }
+    w.clamp(theme::RAIL_W_MIN, theme::RAIL_W_MAX)
+}
+
+/// Read the saved rail width, or [`theme::RAIL_W`] if there is nothing
+/// readable to read. Every failure path lands on the default deliberately:
+/// a corrupt preference file may not stop the window opening.
+fn load_rail_w() -> f32 {
+    let Some(path) = frame_prefs_path() else {
+        return theme::RAIL_W;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return theme::RAIL_W;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        eprintln!(
+            "eave: {} is not valid JSON; using the default rail width",
+            path.display()
+        );
+        return theme::RAIL_W;
+    };
+    v.get("rail_w")
+        .and_then(|v| v.as_f64())
+        .map(|w| clamp_rail_w(w as f32))
+        .unwrap_or(theme::RAIL_W)
+}
+
+/// Write the rail width back, keeping every other key in the file.
+///
+/// Called on mouse-UP, never per mouse-move: a drag is one decision, and a
+/// write per frame would put ~120 fsyncs through a 4 px adjustment.
+///
+/// A failed write is stated on stderr rather than swallowed — it is not
+/// worth a footer notice (the width is already applied and the session is
+/// unharmed), but a preference that silently never persists is exactly the
+/// kind of thing that gets rediscovered as "the drag doesn't work".
+fn save_rail_w(w: f32) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    doc["rail_w"] = serde_json::json!(w);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!(
+                    "eave: cannot save the rail width to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("eave: cannot encode frame preferences: {e}"),
+    }
+}
+
 /// `EAVE_SLASH_DEMO=1` — put a `/` in the composer at boot so the palette
 /// can be photographed. See the call site.
 fn slash_demo_at_boot() -> bool {
@@ -4311,7 +5173,8 @@ impl Shell {
     /// Send the composer draft (enter key and send button share this).
     fn send_current(&mut self, cx: &mut Context<Self>) {
         let (text, files) = self.composer.update(cx, |c, cx| {
-            let text = std::mem::take(&mut c.text);
+            let text = c.field.read(cx).content().to_string();
+            c.field.update(cx, |f, cx| f.clear(cx));
             let files = std::mem::take(&mut c.attachments);
             c.overflow = 0;
             cx.notify();
@@ -4448,8 +5311,11 @@ impl Shell {
             return;
         }
         self.composer.update(cx, |c, cx| {
-            c.text.push_str(&text);
-            cx.notify();
+            // At the caret, replacing the selection — `TextField::insert`, not
+            // the old `push_str`, which appended to the end however far back
+            // the operator had arrowed. Nobody could arrow back before this
+            // slice, so the two agreed; now they do not.
+            c.field.update(cx, |f, cx| f.insert(&text, cx));
         });
         self.sync_slash_palette(cx);
     }
@@ -4634,7 +5500,7 @@ impl Shell {
     fn slash_palette_live(&self, cx: &Context<Self>) -> bool {
         self.slash.popup.is_open()
             && !self.slash.dismissed
-            && slash::palette_query(&self.composer.read(cx).text).is_some()
+            && slash::palette_query(self.composer.read(cx).field.read(cx).content()).is_some()
     }
 
     /// The rows the palette is currently offering, or `None` while the
@@ -4651,7 +5517,7 @@ impl Shell {
     /// itself — it decides whether a read is needed and hands it to the
     /// background executor.
     fn sync_slash_palette(&mut self, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text.clone();
+        let text = self.composer.read(cx).field.read(cx).content().to_string();
         let now = cx.background_executor().now();
         let query = slash::palette_query(&text);
 
@@ -4698,7 +5564,27 @@ impl Shell {
         } else {
             self.slash.popup.open((), enabled, now);
         }
+        self.claim_slash_keys(true, cx);
         cx.notify();
+    }
+
+    /// Take `up`/`down`/`tab`/`escape` for the palette, or give them back.
+    ///
+    /// The claim is a key context on the **field**, not on anything above it,
+    /// and that is forced: gpui resolves a chord to the deepest matching
+    /// context in the focus path, and while the composer is focused nothing is
+    /// deeper than the field. A context on the shell root would lose every
+    /// time.
+    ///
+    /// Held for exactly the palette's lifetime. A permanent claim would have
+    /// taken `up` and `down` away from the caret for good — which nobody would
+    /// have noticed before this slice, because there was no caret to move.
+    fn claim_slash_keys(&mut self, claimed: bool, cx: &mut Context<Self>) {
+        let context = claimed.then(|| SharedString::from(SLASH_KEY_CONTEXT));
+        self.composer.update(cx, |c, cx| {
+            c.field
+                .update(cx, |f, cx| f.set_transient_key_context(context, cx));
+        });
     }
 
     /// Read the disk, **off the UI thread**.
@@ -4741,7 +5627,7 @@ impl Shell {
                 // The row set only existed as `READING` until now, so the
                 // popup is navigating over one dead row. Re-point it at
                 // what actually arrived.
-                let text = shell.composer.read(cx).text.clone();
+                let text = shell.composer.read(cx).field.read(cx).content().to_string();
                 if let Some(q) = slash::palette_query(&text) {
                     if let Some(hits) = shell.slash_matches(q) {
                         shell.slash.popup.resize(vec![true; hits.len()]);
@@ -4754,6 +5640,10 @@ impl Shell {
     }
 
     fn close_slash_palette(&mut self, cx: &mut Context<Self>) {
+        // Released here rather than when the close ANIMATION finishes: the
+        // palette stops steering the moment it is dismissed, and a caret that
+        // could not move for the length of a fade would read as a hang.
+        self.claim_slash_keys(false, cx);
         let now = cx.background_executor().now();
         if self.slash.popup.begin_close(now, cx.reduce_motion()) {
             overlay::reap(cx, move |shell, _| {
@@ -4772,7 +5662,7 @@ impl Shell {
     /// and a space, which is exactly the state the operator is in if they
     /// had typed it, and Return then does what Return has always done.
     fn choose_slash(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text.clone();
+        let text = self.composer.read(cx).field.read(cx).content().to_string();
         let Some(query) = slash::palette_query(&text) else {
             return;
         };
@@ -4783,7 +5673,8 @@ impl Shell {
             return;
         };
         self.composer.update(cx, |c, cx| {
-            c.text = format!("{insertion} ");
+            c.field
+                .update(cx, |f, cx| f.set_content(format!("{insertion} "), cx));
             cx.notify();
         });
         // The trailing space closes the palette through the projection
@@ -4828,7 +5719,7 @@ impl Shell {
             // from the root render pass, which is where this is called.
             motion::mark_active();
         }
-        let text = self.composer.read(cx).text.clone();
+        let text = self.composer.read(cx).field.read(cx).content().to_string();
         let query = slash::palette_query(&text)?;
         let highlighted = self.slash.popup.highlighted();
 
@@ -4997,7 +5888,7 @@ impl Shell {
                             return false;
                         }
                         shell.composer.update(cx, |c, cx| {
-                            c.text = "/".into();
+                            c.field.update(cx, |f, cx| f.set_content("/", cx));
                             cx.notify();
                         });
                         shell.sync_slash_palette(cx);
@@ -5188,7 +6079,7 @@ impl Shell {
                     .id(gpui::SharedString::from(tag.to_string()))
                     .debug_selector({
                         let tag = tag.to_string();
-                        move || tag.clone().into()
+                        move || tag.clone()
                     })
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_2))
@@ -5520,6 +6411,25 @@ impl Shell {
             }
             return;
         }
+        if self.tab_menu.is_open() {
+            match ks.key.as_str() {
+                "escape" => self.close_tab_menu(cx),
+                "down" => {
+                    self.tab_menu.highlight_next();
+                    cx.notify();
+                }
+                "up" => {
+                    self.tab_menu.highlight_prev();
+                    cx.notify();
+                }
+                "enter" => match self.tab_menu.highlighted() {
+                    Some(ix) => self.run_tab_menu(ix, cx),
+                    None => self.close_tab_menu(cx),
+                },
+                _ => {}
+            }
+            return;
+        }
         // Stage AC: an open rename field owns the keyboard, exactly the
         // way P1's menus above do, and for the same reason — a field you
         // can type past is not a field, and every key that fell through
@@ -5588,14 +6498,6 @@ impl Shell {
             }
             return;
         }
-        // §1.20: ANY key resets the blink anchor, not just the ones that
-        // change the text. Backspacing to empty, a rejected ⌘-chord, an
-        // arrow key — they are all "the typist is still here", and a caret
-        // that blinked through them would be flashing at someone who is
-        // actively using the composer.
-        let struck = cx.background_executor().now();
-        self.composer
-            .update(cx, |c, _| c.caret_anchor = Some(struck));
         // Slice AR — the `/` palette takes FOUR keys and no others.
         //
         // Deliberately unlike the overlay gates above, which swallow the
@@ -5644,26 +6546,30 @@ impl Shell {
         // Any key that reaches here and changes the text is the operator
         // typing again, which retracts an escape.
         self.slash.dismissed = false;
+        // ── Slice CM: what is NOT here any more ───────────────────────
+        //
+        // Two arms are gone, and their absence is load-bearing rather than
+        // tidy-up:
+        //
+        //   `_ => push_str(key_char)` — the composer's whole typing path.
+        //   `"backspace" => text.pop()` — its whole deleting path.
+        //
+        // The field handles both now, and it does not see them through this
+        // handler. A character reaches it through the platform's input
+        // handler, which `Window::dispatch_keystroke` runs **after** this
+        // listener has propagated (`window.rs:4932`); backspace reaches it as
+        // a matched action, which fires **before** this listener runs at all.
+        // Leaving either arm in place would not have shadowed the field — it
+        // would have typed every character twice.
+        //
+        // `enter` has moved for a different reason: it is a bound action now
+        // (`SendMessage`, on the composer's own key context) because the field
+        // is the deepest node in the focus path and no container above it can
+        // win a chord back. `composer_enter` is the shared body, so the arm
+        // below and the action are the same code — the arm is what still runs
+        // when a modal owns the keyboard and the field is not focused.
         match ks.key.as_str() {
-            // **Return still sends, exactly as it did before this slice**,
-            // unless the operator has explicitly moved the highlight onto
-            // a row. That ordering is the whole compatibility story: `/`
-            // messages already reached the CLI verbatim
-            // (`send_current` trims and forwards), so an operator who
-            // types `/framer` and hits Return must get what they have
-            // always got. Firing the top match instead would change the
-            // meaning of Return for every slash message ever typed.
-            "enter" => match self.slash.popup.highlighted() {
-                Some(ix) if self.slash_palette_live(cx) => self.choose_slash(ix, cx),
-                _ => self.send_current(cx),
-            },
-            "backspace" => {
-                self.composer.update(cx, |c, cx| {
-                    c.text.pop();
-                    cx.notify();
-                });
-                self.sync_slash_palette(cx);
-            }
+            "enter" => self.composer_enter(cx),
             // ctrl-k: kill the live session (dev affordance; real kill UI
             // is later stage work).
             "k" if ks.modifiers.control => {
@@ -5677,20 +6583,135 @@ impl Shell {
             // because the composer's key handler returns before the action
             // system sees a chord it has an arm for.
             "l" if ks.modifiers.platform && ks.modifiers.shift => self.friction_log(cx),
-            // cmd-v: paste (Stage D build directive; IME stays deferred).
+            // cmd-v: eave's paste, ahead of the field's own.
+            //
+            // bezel's `Paste` action takes text and nothing else. eave's ⌘V has
+            // to answer an image (write it to disk, stage it as an attachment)
+            // and a dropped file path (stage it) as well, and only the text
+            // case ends in an insert. So eave keeps the chord: `Paste` is not
+            // among the actions bound in `bootstrap`, and this arm is the only
+            // reader of ⌘V in the application.
             "v" if ks.modifiers.platform => self.paste_clipboard(cx),
-            _ => {
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ks.modifiers.platform && !ks.modifiers.control {
-                        let ch = ch.clone();
-                        self.composer.update(cx, |c, cx| {
-                            c.text.push_str(&ch);
-                            cx.notify();
-                        });
-                        self.sync_slash_palette(cx);
-                    }
-                }
-            }
+            _ => {}
+        }
+    }
+
+    /// Does the composer own the keyboard right now?
+    ///
+    /// # Why focus has to move at all (Slice CM)
+    ///
+    /// Before this slice every key in the shell arrived at one `on_key`
+    /// handler, and the modal surfaces took their turn by returning early from
+    /// it. A focused [`TextField`] cannot be gated that way, for two reasons
+    /// that fail differently:
+    ///
+    /// - **Characters bypass key handling entirely.** They reach the field
+    ///   through the platform's input handler, which
+    ///   [`gpui::Window::dispatch_keystroke`] runs *after* the key event has
+    ///   propagated. An `on_key` arm that consumed a character would have to
+    ///   stop propagation as well, and every existing arm would need auditing
+    ///   for it.
+    /// - **Editing keys are matched actions**, and a matched action fires
+    ///   *before* any bubble-phase listener. `backspace` with the omnibox open
+    ///   would have deleted a character from a draft nobody can see, and no
+    ///   ordering of `on_key`'s gates could have stopped it, because `on_key`
+    ///   had not run yet.
+    ///
+    /// So the gate is focus, which is what gpui gives us for exactly this. The
+    /// predicate below is the same list of surfaces `on_key` already returns
+    /// early for, in the same order, and it is deliberately written as one
+    /// expression rather than folded into those gates: they answer "who
+    /// handles this key", this answers "who owns the keyboard", and the two
+    /// questions stay legible apart.
+    fn composer_owns_keyboard(&self, mounted: bool, cx: &mut Context<Self>) -> bool {
+        // **First: is the field even on screen?**
+        //
+        // This clause is not a nicety, and finding that out cost twenty-one
+        // tests. Focus follows the *element*, not the entity: focusing a field
+        // that is not in the render tree leaves the window's focus pointing at
+        // a node the dispatch path never reaches, and **every action in the
+        // application stops firing** — ⌘1, ⌘W, ⌘F, all of it, silently. The
+        // symptom looks nothing like a focus bug.
+        //
+        // `mounted` is passed in rather than recomputed, and that is the whole
+        // point: it is the **same boolean** the mount site below uses, so the
+        // two cannot drift. The first cut of this mirrored the condition
+        // instead — `session_id.is_some() && !active_is_page` — which was
+        // right on the day and is exactly the kind of copy that rots. It
+        // already would have been wrong against the split-view work landing in
+        // parallel, where `showing_page` grew a `split.is_some()` term: the
+        // composer unmounts in a split and a mirrored predicate would not have
+        // known, re-opening the silent-dead-keyboard bug it was written to
+        // close.
+        if !mounted {
+            return false;
+        }
+        // Then: is anything else holding the keyboard? A page dialog stops
+        // Chromium mid-callback; the omnibox and the menus were opened
+        // *instead of* typing; the rename field and the find bar are fields of
+        // their own.
+        self.page_ask(cx).is_none()
+            && !self.omnibox_open()
+            && self.find_here(cx).is_none()
+            && !self.launcher.models.is_open()
+            && !self.demo.menu.is_open()
+            && self.rename.is_none()
+    }
+
+    /// Put the keyboard where [`Self::composer_owns_keyboard`] says it belongs.
+    ///
+    /// Called from `render`, which is the one place that has both the window
+    /// and the whole of the state this depends on. It is a no-op whenever the
+    /// answer already holds — `Window::focus` returns early on an unchanged
+    /// handle — so the steady state costs a comparison and schedules nothing.
+    fn sync_composer_focus(&mut self, mounted: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = if self.composer_owns_keyboard(mounted, cx) {
+            gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx)
+        } else {
+            self.focus.clone()
+        };
+        if !wanted.is_focused(window) {
+            window.focus(&wanted, cx);
+        }
+    }
+
+    /// §1.20's blink anchor: the typist is still here.
+    ///
+    /// Capture phase, and it consumes nothing — see the mount site for why the
+    /// bubble phase stopped being enough once backspace became an action.
+    ///
+    /// **ANY key, in WHICHEVER field owns the keyboard.** Not just the keys
+    /// that change the text: backspacing to empty, a rejected ⌘-chord and an
+    /// arrow key are all "the typist is still here", and a caret that blinked
+    /// through them would be flashing at somebody actively using the field.
+    /// And not just the composer's — this stamped the composer's anchor
+    /// unconditionally until the omnibox, the find bar and the rename field
+    /// got carets of their own, which is why the omnibox used to blink on the
+    /// composer's last keystroke rather than on yours.
+    fn note_keystroke(&mut self, _: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = self.caret_field(cx) {
+            self.caret
+                .set(Some((field, cx.background_executor().now())));
+        }
+    }
+
+    /// Return in the composer: choose a slash command, or send.
+    ///
+    /// **Return still sends, exactly as it did before Slice AR**, unless the
+    /// operator has explicitly moved the highlight onto a row. That ordering is
+    /// the whole compatibility story: `/` messages already reached the CLI
+    /// verbatim (`send_current` trims and forwards), so an operator who types
+    /// `/framer` and hits Return must get what they have always got. Firing the
+    /// top match instead would change the meaning of Return for every slash
+    /// message ever typed.
+    ///
+    /// Slice CM gave this two callers — the bound `SendMessage` action, which
+    /// is what runs while the field has focus, and the `on_key` arm, which is
+    /// what runs while a modal has taken it. One body, so they cannot drift.
+    fn composer_enter(&mut self, cx: &mut Context<Self>) {
+        match self.slash.popup.highlighted() {
+            Some(ix) if self.slash_palette_live(cx) => self.choose_slash(ix, cx),
+            _ => self.send_current(cx),
         }
     }
 
@@ -5732,10 +6753,99 @@ impl Shell {
     /// actual state, never a UI-held selection — and it is what makes
     /// `TabsState::active` a single notion rather than a cache.
     fn activate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        // A split is a view of two tabs. Clicking a third one leaves it;
+        // clicking one of the two just focuses that pane.
+        if let Some(s) = &self.split {
+            if !s.contains(tab_id) {
+                self.split = None;
+            }
+        }
         let _ = self
             .commands
             .send(Command::Browser(BrowserCmd::Activate(tab_id.to_string())));
         cx.notify();
+    }
+
+    /// Put `dragged` beside `host` in the well.
+    ///
+    /// `dragged_on_right` is the drop: onto the right half of the well, or
+    /// onto a tab (the host stays left, the dragged tab opens to its right —
+    /// Arc's default). Two session tabs are refused: this shell has one
+    /// transcript subscription, and a second session pane would be a
+    /// caption over an empty log.
+    fn split_tabs(
+        &mut self,
+        dragged: &str,
+        host: &str,
+        dragged_on_right: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged == host {
+            return;
+        }
+        let snapshot = self.strip_snapshot(cx);
+        let kind = |id: &str| {
+            snapshot
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.content.clone())
+        };
+        let Some(a) = kind(dragged) else {
+            return;
+        };
+        let Some(b) = kind(host) else {
+            return;
+        };
+        if matches!(a, eave_wire::TabContent::Session { .. })
+            && matches!(b, eave_wire::TabContent::Session { .. })
+        {
+            return;
+        }
+        let (left, right) = if dragged_on_right {
+            (host.to_string(), dragged.to_string())
+        } else {
+            (dragged.to_string(), host.to_string())
+        };
+        self.split = Some(Split {
+            left,
+            right,
+            ratio: 0.5,
+            vertical: false,
+        });
+        self.activate_tab(dragged, cx);
+    }
+
+    /// Drop a tab onto the content well. The host is the tab already
+    /// showing in that half (the opposite pane of a split, or the active
+    /// tab when the well is single).
+    fn drop_tab_on_well(&mut self, dragged: &str, on_right: bool, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let host = if let Some(s) = &self.split {
+            if on_right {
+                s.left.clone()
+            } else {
+                s.right.clone()
+            }
+        } else {
+            match snapshot.active.clone() {
+                Some(id) if id != dragged => id,
+                _ => return,
+            }
+        };
+        self.split_tabs(dragged, &host, on_right, cx);
+    }
+
+    fn well_drop_is_right(&self, window: &Window, cx: &App) -> bool {
+        let x = f32::from(window.mouse_position().x);
+        let rail = if self.sessions.read(cx).collapsed {
+            0.0
+        } else {
+            self.rail_w
+        };
+        let well_left = rail + theme::CARD_GUTTER;
+        let well_w = f32::from(window.viewport_size().width) - well_left - theme::CARD_GUTTER;
+        x > well_left + well_w.max(1.0) * 0.5
     }
 
     /// Close a tab, and say where the strip should land.
@@ -5765,7 +6875,22 @@ impl Shell {
             }
         }
         let was_active = snapshot.active.as_deref() == Some(tab_id);
-        if was_active {
+        // Closing one side of a split leaves the other filling the card.
+        // Activate that other tab ourselves so the successor walk cannot
+        // land on a third tab and drop the one that was still on screen.
+        let mut skip_successor = false;
+        if let Some(s) = &self.split {
+            if s.contains(tab_id) {
+                if let Some(other) = s.other(tab_id) {
+                    let _ = self
+                        .commands
+                        .send(Command::Browser(BrowserCmd::Activate(other.to_string())));
+                    skip_successor = true;
+                }
+                self.split = None;
+            }
+        }
+        if was_active && !skip_successor {
             if let Some(next) = strip::successor(&snapshot, tab_id) {
                 let _ = self
                     .commands
@@ -5825,10 +6950,15 @@ impl Shell {
         let Some(url) = self.closed_pages.pop_back() else {
             return;
         };
-        let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
-            url,
-            activate: true,
-        }));
+        let _ = self
+            .commands
+            // `activate: true`: ⌘⇧T means "put back what I just lost", and
+            // every browser foregrounds it. E1 added the field for the
+            // context menu's background-open, which is the other answer.
+            .send(Command::Browser(BrowserCmd::OpenAt {
+                url,
+                activate: true,
+            }));
         cx.notify();
     }
 
@@ -5855,7 +6985,22 @@ impl Shell {
     /// answer comes back round as a snapshot. It is never pruned on close,
     /// which is the whole close-a-session-tab story — see the field.
     fn reconcile_strip(&self, snapshot: &eave_wire::TabsSnapshot, cx: &mut App) {
-        if let Some(session_id) = strip::active_session(snapshot) {
+        // A page+session split keeps the session subscribed even while the
+        // focused pane is the page — otherwise the transcript empties the
+        // moment you click the document.
+        let session_id = strip::active_session(snapshot).or_else(|| {
+            self.split.as_ref().and_then(|s| {
+                [&s.left, &s.right].into_iter().find_map(|id| {
+                    snapshot.tabs.iter().find_map(|t| match &t.content {
+                        eave_wire::TabContent::Session { session_id } if t.id == *id => {
+                            Some(session_id.clone())
+                        }
+                        _ => None,
+                    })
+                })
+            })
+        });
+        if let Some(session_id) = session_id {
             let showing = self.transcript.read(cx).session_id.clone();
             let mut asked = self.asked_to_select.borrow_mut();
             if showing.as_deref() == Some(session_id.as_str()) {
@@ -5881,11 +7026,66 @@ impl Shell {
             .map(|s| s.session_id.clone())
             .collect();
 
+        // Slice T1 — where a session's tab goes. Its checkout root is its
+        // project; `TabGroup::workspace` has recorded that binding since B1
+        // and nothing has ever acted on it.
+        //
+        // **Auto-create fires here, on a session that needs a tab, and
+        // nowhere else.** Not on every snapshot: a project the operator
+        // closed would spring back the instant eave noticed its sessions
+        // still exist, and closing something that immediately returns is
+        // not closing it. Reaching this line means a session has no view,
+        // which is the one moment a project genuinely has to exist.
+        let roots: HashMap<&str, &str> = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                s.checkout_root
+                    .as_deref()
+                    .map(|root| (s.session_id.as_str(), root))
+            })
+            .collect();
+
         let mut asked = self.asked_for_session_tab.borrow_mut();
+        let mut minting = self.asked_for_project.borrow_mut();
         for session_id in strip::sessions_without_tabs(snapshot, &rail_order) {
             if !asked.insert(session_id.clone()) {
                 continue;
             }
+            // Slice T1 — a session started from a blank ⌘T tab takes that
+            // tab's place: same project, same row, and the blank one goes.
+            // Only for the FIRST session to arrive after the launch, which
+            // is what taking the note rather than reading it gives us.
+            let replacing = self
+                .launched_from_tab
+                .borrow_mut()
+                .take()
+                .and_then(|tab| strip::tab_slot(snapshot, &tab).map(|slot| (tab, slot)));
+            if let Some((closing, (group, index))) = replacing {
+                let _ = self
+                    .commands
+                    .send(Command::Browser(BrowserCmd::ReplaceWithSessionTab {
+                        closing,
+                        session_id,
+                        group,
+                        index,
+                    }));
+                continue;
+            }
+
+            let root = roots.get(session_id.as_str()).copied();
+            let group = root.and_then(|r| strip::group_for_workspace(snapshot, r));
+            // Ask for a project only when there is not one AND nobody has
+            // already asked for this same checkout. Two sessions in one new
+            // worktree arrive in a single fold burst, and without this they
+            // would mint two projects for one folder — the same double-ask
+            // `asked_for_session_tab` exists to stop, one level up.
+            let workspace = match (&group, root) {
+                (None, Some(root)) if minting.insert(root.to_string()) => Some(root.to_string()),
+                _ => None,
+            };
             let _ = self
                 .commands
                 .send(Command::Browser(BrowserCmd::OpenSessionTab {
@@ -5895,6 +7095,8 @@ impl Shell {
                     // one of them, and a reconciliation is not a request
                     // to go anywhere.
                     activate: false,
+                    group,
+                    workspace,
                 }));
         }
     }
@@ -6319,25 +7521,23 @@ impl Shell {
                                                 text.clone()
                                             })),
                                     )
-                                    // The caret: the composer's own glyph,
-                                    // on the composer's own blink clock.
-                                    // `caret_lit` is ONE clock for the whole
-                                    // window, so eave's two carets can never
-                                    // blink out of phase — the N1 rule about
-                                    // phase-locked indicators, applied to the
-                                    // one other place this app draws a caret.
+                                    // The caret. ONE anchor for the whole
+                                    // window (`Shell::caret`), so eave's four
+                                    // carets can never blink out of phase with
+                                    // each other — the N1 rule about
+                                    // phase-locked indicators, and the reason
+                                    // the field travels with the instant
+                                    // rather than each box timing itself.
                                     //
-                                    // Drawn at zero opacity rather than
-                                    // removed, so the blink never changes the
-                                    // layout of the line it is on.
+                                    // Until this slice the call here read the
+                                    // COMPOSER's draft, which is empty by
+                                    // definition while somebody is typing into
+                                    // an address bar — so the one caret an
+                                    // operator stares at while typing a url
+                                    // was the one that could never blink.
                                     .child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(px(theme::BODY_SIZE))
-                                            .text_color(theme::text().opacity(
-                                                if self.caret_lit(cx) { 1.0 } else { 0.0 },
-                                            ))
-                                            .child("▏"),
+                                        caret_glyph("omnibox", self.caret_lit(Field::Omnibox, cx))
+                                            .text_size(px(theme::BODY_SIZE)),
                                     ),
                             )
                             .when(!row_els.is_empty(), |d| {
@@ -6424,25 +7624,293 @@ impl Shell {
     /// *structure that blurs reads as unanchored* — applies here in exactly
     /// the same words. A′'s glass is the composer and the omnibox dropdown:
     /// the two surfaces that genuinely float.
-    fn pane_header(&self, cx: &mut Context<Self>, rail_collapsed: bool) -> gpui::Div {
+    fn render_split_well(
+        &self,
+        split: &Split,
+        rail_collapsed: bool,
+        transcript_el: AnyElement,
+        composer: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
-        let active = snapshot
-            .active
-            .as_deref()
-            .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a));
+        let is_session = |id: &str| {
+            snapshot
+                .tabs
+                .iter()
+                .any(|t| t.id == id && matches!(t.content, eave_wire::TabContent::Session { .. }))
+        };
+        let (left_tr, right_tr, left_co, right_co) = if is_session(&split.left) {
+            (Some(transcript_el), None, Some(composer), None)
+        } else if is_session(&split.right) {
+            (None, Some(transcript_el), None, Some(composer))
+        } else {
+            (None, None, None, None)
+        };
+        div()
+            .debug_selector(|| "split-well".into())
+            .size_full()
+            .overflow_hidden()
+            .flex()
+            .when(split.vertical, |d| d.flex_col())
+            .when(!split.vertical, |d| d.flex_row())
+            .on_drag_move(
+                cx.listener(|this, e: &DragMoveEvent<SplitResize>, _window, cx| {
+                    let Some(drag) = this.split_drag else {
+                        return;
+                    };
+                    let Some(split) = this.split.as_mut() else {
+                        return;
+                    };
+                    let pos = if split.vertical {
+                        f32::from(e.event.position.y)
+                    } else {
+                        f32::from(e.event.position.x)
+                    };
+                    let delta = (pos - drag.grab_x) / drag.well_w;
+                    let r = (drag.start_ratio + delta)
+                        .clamp(theme::SPLIT_RATIO_MIN, 1.0 - theme::SPLIT_RATIO_MIN);
+                    if (r - split.ratio).abs() >= 0.002 {
+                        split.ratio = r;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                    if this.split_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                let on_right = this.well_drop_is_right(window, cx);
+                this.drop_tab_on_well(&drag.id, on_right, cx);
+            }))
+            .child(self.split_pane(
+                &split.left,
+                "left",
+                split.ratio,
+                true,
+                false,
+                rail_collapsed,
+                left_tr,
+                left_co,
+                cx,
+            ))
+            .child(self.split_handle(split.vertical, cx))
+            .child(self.split_pane(
+                &split.right,
+                "right",
+                1.0 - split.ratio,
+                false,
+                true,
+                rail_collapsed,
+                right_tr,
+                right_co,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn split_handle(&self, vertical: bool, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id("split-handle")
+            .debug_selector(|| "split-handle".into())
+            .flex_none()
+            .when(vertical, |d| {
+                d.h(px(theme::RAIL_HANDLE_W)).w_full().cursor_row_resize()
+            })
+            .when(!vertical, |d| {
+                d.w(px(theme::RAIL_HANDLE_W)).h_full().cursor_col_resize()
+            })
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                    let Some(s) = this.split.as_ref() else {
+                        return;
+                    };
+                    let rail = if this.sessions.read(cx).collapsed {
+                        0.0
+                    } else {
+                        this.rail_w
+                    };
+                    let well_w = if s.vertical {
+                        f32::from(window.viewport_size().height)
+                            - 2.0 * theme::CARD_GUTTER
+                            - theme::RAIL_HANDLE_W
+                    } else {
+                        f32::from(window.viewport_size().width)
+                            - rail
+                            - 2.0 * theme::CARD_GUTTER
+                            - theme::RAIL_HANDLE_W
+                    };
+                    this.split_drag = Some(SplitDrag {
+                        grab_x: if s.vertical {
+                            f32::from(e.position.y)
+                        } else {
+                            f32::from(e.position.x)
+                        },
+                        start_ratio: s.ratio,
+                        well_w: well_w.max(1.0),
+                    });
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(SplitResize, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| SplitResize)
+            })
+            .into_any_element()
+    }
+
+    fn split_pane(
+        &self,
+        tab_id: &str,
+        side: &'static str,
+        ratio: f32,
+        show_rail: bool,
+        show_files: bool,
+        rail_collapsed: bool,
+        transcript_el: Option<AnyElement>,
+        composer: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let snapshot = self.strip_snapshot(cx);
+        let is_page = snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == tab_id && t.content == eave_wire::TabContent::Page);
+        let page_el = if is_page {
+            crate::web::page_element(tab_id, cx)
+        } else {
+            None
+        };
+        // Two statements rather than an `and_then`, because `find_bar`
+        // takes `&mut Context` now (it leases the caret clock) and the
+        // closure would still be holding the reborrow `find_here` took.
+        let find_here = self.find_here(cx).is_some_and(|t| t == *tab_id);
+        let find = if find_here { self.find_bar(cx) } else { None };
+        let absence: Option<&'static str> = if page_el.is_some() || !is_page {
+            None
+        } else if crate::web::available() {
+            Some(PAGE_STARTING)
+        } else {
+            Some(PAGE_NO_ENGINE)
+        };
+        let header_tag = if side == "left" {
+            "pane-header-left"
+        } else {
+            "pane-header-right"
+        };
+        let activate = tab_id.to_string();
+        let drop_id = tab_id.to_string();
+        let on_right = side == "right";
+        let is_focused = snapshot.active.as_deref() == Some(tab_id);
+        div()
+            .id(SharedString::from(format!("split-pane-{side}")))
+            .debug_selector(move || format!("split-pane-{side}"))
+            .flex()
+            .flex_col()
+            // `flex_basis(0)` so the grow factors ARE the pane sizes.
+            // With the default auto basis, a pane whose CEF frame had not
+            // reflowed yet kept its old content width and the other pane
+            // ate the leftover — the well moved, only one page did.
+            .flex_basis(px(0.))
+            .flex_grow(ratio)
+            .flex_shrink(1.)
+            .min_w(px(0.))
+            .h_full()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_PANEL))
+            // Always a 1 px border, colour only changes: a ring that
+            // appeared on focus would shrink the page by 2 px and fire
+            // another WasResized. Same reason the rail's selection rim
+            // is an inset shadow rather than a border.
+            .border_1()
+            .border_color(if is_focused {
+                theme::pane_focus_ring()
+            } else {
+                gpui::transparent_black()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.activate_tab(&activate, cx);
+                }),
+            )
+            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                cx.stop_propagation();
+                this.split_tabs(&drag.id, &drop_id, on_right, cx);
+            }))
+            .child(self.pane_header(
+                cx,
+                rail_collapsed,
+                Some(tab_id),
+                show_rail,
+                show_files,
+                header_tag,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .relative()
+                    .overflow_hidden()
+                    .children(page_el)
+                    .children(find)
+                    .children(absence.map(|note| {
+                        div()
+                            .debug_selector(|| "page-absence".into())
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::BODY_SIZE))
+                            .text_color(theme::text_secondary())
+                            .child(note)
+                    }))
+                    .children(transcript_el.map(|el| {
+                        div()
+                            .size_full()
+                            .pt(px(theme::LOG_TOP_PAD))
+                            .child(el)
+                            .into_any_element()
+                    }))
+                    .children(composer),
+            )
+            .into_any_element()
+    }
+
+    fn pane_header(
+        &self,
+        cx: &mut Context<Self>,
+        rail_collapsed: bool,
+        for_tab: Option<&str>,
+        show_rail: bool,
+        show_files: bool,
+        tag: &'static str,
+    ) -> gpui::Div {
+        let snapshot = self.strip_snapshot(cx);
+        let wanted = for_tab.or(snapshot.active.as_deref());
+        let active = wanted.and_then(|a| snapshot.tabs.iter().find(|t| t.id == a));
 
         // This strip is the card's top, inside the radius. Shut, the card
         // starts at CARD_GUTTER, so the pad is what the traffic lights need
         // minus that gutter — they sit at a fixed window position either
-        // way. Open, the rail already covers them.
-        let lead = if rail_collapsed {
+        // way. Open, the rail already covers them. Only the LEFT-most
+        // header (the one that also carries the rail toggle) keeps that
+        // clearance; a right split pane sits away from the lights.
+        let lead = if rail_collapsed && show_rail {
             theme::TRAFFIC_CLEARANCE - theme::CARD_GUTTER
         } else {
             theme::SPACE_3
         };
 
         let row = div()
-            .debug_selector(|| "pane-header".into())
+            .debug_selector(move || tag.into())
             .w_full()
             .h(px(theme::PANE_HEADER_H))
             .flex_none()
@@ -6452,11 +7920,6 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(theme::SPACE_2));
-
-        // The files toggle rides the trailing edge in EVERY arm, so it does
-        // not move when the active tab's kind changes. Built here rather than
-        // appended per-arm for the same reason.
-        let files = self.files_toggle(cx);
 
         // **The rail toggle lives HERE, not in the rail — and the test is
         // what found that out.** The first cut of this change put it in the
@@ -6470,7 +7933,7 @@ impl Shell {
         // thing it closes.
         let rail = self.rail_toggle(cx);
 
-        let row = row.child(rail);
+        let row = if show_rail { row.child(rail) } else { row };
 
         match active.map(|t| (t, t.content.clone())) {
             // ── a page: the browser toolbar ──────────────────────────────
@@ -6483,99 +7946,133 @@ impl Shell {
                     .as_deref()
                     .map(eave_wire::typing_form)
                     .filter(|t| !t.is_empty());
-                row.child(self.nav_arrow("nav-back", icons::ALT_ARROW_LEFT, back, -1, cx))
-                    .child(self.nav_arrow("nav-fwd", icons::ALT_ARROW_RIGHT, fwd, 1, cx))
-                    .child(
-                        div()
-                            .id("nav-reload")
-                            .debug_selector(|| "nav-reload".into())
-                            .flex_none()
-                            .size(px(theme::ICON_TOGGLE))
-                            .rounded(px(theme::RADIUS_BUTTON))
-                            .when(has_url, |d| {
-                                d.cursor_pointer()
-                                    .hover_fade("nav-reload", theme::wash_rest(), theme::overlay())
-                                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+                let tab_id = tab.id.clone();
+                let back_tag = if tag == "pane-header" {
+                    "nav-back".to_string()
+                } else {
+                    format!("nav-back-{tab_id}")
+                };
+                let fwd_tag = if tag == "pane-header" {
+                    "nav-fwd".to_string()
+                } else {
+                    format!("nav-fwd-{tab_id}")
+                };
+                row.child(self.nav_arrow(
+                    back_tag,
+                    icons::ALT_ARROW_LEFT,
+                    back,
+                    -1,
+                    tab_id.clone(),
+                    cx,
+                ))
+                .child(self.nav_arrow(fwd_tag, icons::ALT_ARROW_RIGHT, fwd, 1, tab_id.clone(), cx))
+                .child(
+                    div()
+                        .id("nav-reload")
+                        .debug_selector(|| "nav-reload".into())
+                        .flex_none()
+                        .size(px(theme::ICON_TOGGLE))
+                        .rounded(px(theme::RADIUS_BUTTON))
+                        .when(has_url, |d| {
+                            let reload_id = tab_id.clone();
+                            d.cursor_pointer()
+                                .hover_fade("nav-reload", theme::wash_rest(), theme::overlay())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reload_tab(&reload_id, cx)
+                                }))
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icons::tagged_icon(
+                            icons::REFRESH,
+                            theme::ICON_SM,
+                            if has_url {
+                                theme::text_secondary()
+                            } else {
+                                theme::text_disabled()
+                            },
+                            "nav-reload-glyph",
+                        )),
+                )
+                .child(
+                    // The address. Clicking it opens the omnibox on it,
+                    // which is the same act ⌘L performs — one path, so
+                    // the field cannot be opened into two different
+                    // states.
+                    div()
+                        .id("pane-address")
+                        .debug_selector(|| "pane-address".into())
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h(px(theme::RAIL_TAB_H - theme::SPACE_1))
+                        .px(px(theme::SPACE_2))
+                        .rounded(px(theme::RADIUS_BUTTON))
+                        .cursor_pointer()
+                        .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
+                        .on_click(cx.listener(|this, _, _, cx| this.open_omnibox(cx)))
+                        // Slice T1 — drag the address onto the bookmarks
+                        // bar to file it. The RAW url, not the typing form
+                        // drawn beside it: `typing_form` drops the scheme
+                        // so the row reads `github.com/eave`, and a
+                        // bookmark stored that way cannot be navigated to.
+                        // What is shown and what is kept are different
+                        // strings, and this is the one place with both.
+                        .when_some(tab.url.clone(), |d, url| {
+                            let title = tab.title.clone();
+                            d.on_drag(AddressDrag { url, title }, |drag, _, _, cx| {
+                                cx.new(|_| drag.clone())
                             })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icons::tagged_icon(
-                                icons::REFRESH,
-                                theme::ICON_SM,
-                                if has_url {
+                        })
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .debug_selector(|| "pane-address-text".into())
+                                .truncate()
+                                .text_size(px(theme::DETAIL_SIZE))
+                                .line_height(px(theme::DETAIL_LINE))
+                                .text_color(if address.is_some() {
                                     theme::text_secondary()
                                 } else {
-                                    theme::text_disabled()
-                                },
-                                "nav-reload-glyph",
-                            )),
-                    )
-                    .child(
-                        // The address. Clicking it opens the omnibox on it,
-                        // which is the same act ⌘L performs — one path, so
-                        // the field cannot be opened into two different
-                        // states.
-                        div()
-                            .id("pane-address")
-                            .debug_selector(|| "pane-address".into())
-                            .flex_1()
-                            .min_w(px(0.))
-                            .h(px(theme::RAIL_TAB_H - theme::SPACE_1))
-                            .px(px(theme::SPACE_2))
-                            .rounded(px(theme::RADIUS_BUTTON))
-                            .cursor_pointer()
-                            .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
-                            .on_click(cx.listener(|this, _, _, cx| this.open_omnibox(cx)))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .debug_selector(|| "pane-address-text".into())
-                                    .truncate()
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
-                                    .text_color(if address.is_some() {
-                                        theme::text_secondary()
-                                    } else {
-                                        theme::text_tertiary()
-                                    })
-                                    // A tab that has never navigated has no
-                                    // address, and says so in the register
-                                    // every other empty state in this shell
-                                    // uses: lower case, one clause, the fact.
-                                    .child(SharedString::from(
-                                        address.unwrap_or_else(|| "no address yet".to_string()),
-                                    )),
-                            ),
-                    )
-                    // ── Slice E1: the zoom fact ──────────────────────────
-                    //
-                    // **Present only when it is not 100%**, which is the
-                    // whole design. A chip reading "100%" on every tab
-                    // forever is a decoration: it states something that is
-                    // true of every page nobody has touched, so it carries
-                    // no information and costs a permanent slot in the one
-                    // line this region has. `web::zoom_percent` answers
-                    // `None` for a tab that has never been zoomed AND for
-                    // one that ⌘0 has put back, because those are the same
-                    // state and must read the same.
-                    //
-                    // A fact, not a control. It has no click handler and no
-                    // hover wash, because ⌘0 is the dismissal and inventing
-                    // a second one would be inventing an affordance this
-                    // slice was not asked for.
-                    .children(crate::web::zoom_percent(&tab.id).map(|pct| {
-                        div()
-                            .debug_selector(|| "pane-zoom".into())
-                            .flex_none()
-                            .px(px(theme::SPACE_1))
-                            .text_size(px(theme::DETAIL_SIZE))
-                            .line_height(px(theme::DETAIL_LINE))
-                            .text_color(theme::text_tertiary())
-                            .child(format!("{pct}%"))
-                    }))
-                    .child(files)
+                                    theme::text_tertiary()
+                                })
+                                // A tab that has never navigated has no
+                                // address, and says so in the register
+                                // every other empty state in this shell
+                                // uses: lower case, one clause, the fact.
+                                .child(SharedString::from(
+                                    address.unwrap_or_else(|| "no address yet".to_string()),
+                                )),
+                        ),
+                )
+                // ── Slice E1: the zoom fact ──────────────────────────
+                //
+                // **Present only when it is not 100%**, which is the
+                // whole design. A chip reading "100%" on every tab
+                // forever is a decoration: it states something that is
+                // true of every page nobody has touched, so it carries
+                // no information and costs a permanent slot in the one
+                // line this region has. `web::zoom_percent` answers
+                // `None` for a tab that has never been zoomed AND for
+                // one that ⌘0 has put back, because those are the same
+                // state and must read the same.
+                //
+                // A fact, not a control. It has no click handler and no
+                // hover wash, because ⌘0 is the dismissal and inventing
+                // a second one would be inventing an affordance this
+                // slice was not asked for.
+                .children(crate::web::zoom_percent(&tab.id).map(|pct| {
+                    div()
+                        .debug_selector(|| "pane-zoom".into())
+                        .flex_none()
+                        .px(px(theme::SPACE_1))
+                        .text_size(px(theme::DETAIL_SIZE))
+                        .line_height(px(theme::DETAIL_LINE))
+                        .text_color(theme::text_tertiary())
+                        .child(format!("{pct}%"))
+                }))
+                .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── a session: the breadcrumb ────────────────────────────────
             Some((_, eave_wire::TabContent::Session { session_id })) => {
@@ -6621,7 +8118,7 @@ impl Shell {
                         .text_color(theme::text_tertiary())
                         .child(SharedString::from(m))
                 }))
-                .child(files)
+                .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── nothing open: the line still exists ───────────────────────
             //
@@ -6629,7 +8126,9 @@ impl Shell {
             // that vanished would move the content region's top edge every
             // time the last tab closed — and the launcher underneath is
             // positioned against that edge.
-            _ => row.child(div().flex_1()).child(files),
+            _ => row
+                .child(div().flex_1())
+                .when(show_files, |d| d.child(self.files_toggle(cx))),
         }
     }
 
@@ -6641,22 +8140,27 @@ impl Shell {
     /// itself the fact that this surface has a history at all.
     fn nav_arrow(
         &self,
-        tag: &'static str,
+        tag: String,
         glyph: &'static str,
         enabled: bool,
         delta: i32,
+        tab_id: String,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let fade_key = tag.clone();
         div()
-            .id(tag)
-            .debug_selector(move || tag.into())
+            .id(SharedString::from(tag.clone()))
+            .debug_selector({
+                let tag = tag.clone();
+                move || tag.clone()
+            })
             .flex_none()
             .size(px(theme::ICON_TOGGLE))
             .rounded(px(theme::RADIUS_BUTTON))
             .when(enabled, |d| {
                 d.cursor_pointer()
-                    .hover_fade(tag, theme::wash_rest(), theme::overlay())
-                    .on_click(cx.listener(move |this, _, _, cx| this.go(delta, cx)))
+                    .hover_fade(fade_key.clone(), theme::wash_rest(), theme::overlay())
+                    .on_click(cx.listener(move |this, _, _, cx| this.go_tab(&tab_id, delta, cx)))
             })
             .flex()
             .items_center()
@@ -6682,10 +8186,18 @@ impl Shell {
     /// remove. `TabGo` clamps at both ends anyway, so a race lands as a no-op.
     fn go(&mut self, delta: i32, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
+        let Some(id) = snapshot.active.clone() else {
+            return;
+        };
+        self.go_tab(&id, delta, cx);
+    }
+
+    fn go_tab(&mut self, tab_id: &str, delta: i32, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
         let Some(tab) = snapshot
-            .active
-            .as_deref()
-            .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a))
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
             .filter(|t| t.content == eave_wire::TabContent::Page)
         else {
             return;
@@ -6716,18 +8228,27 @@ impl Shell {
     /// navigated to the empty string would be worse than one that is inert.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
-        let Some((tab_id, url)) = snapshot
-            .active
-            .as_deref()
-            .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a))
+        let Some(id) = snapshot.active.clone() else {
+            return;
+        };
+        self.reload_tab(&id, cx);
+    }
+
+    fn reload_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let Some(url) = snapshot
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
             .filter(|t| t.content == eave_wire::TabContent::Page)
-            .and_then(|t| t.url.clone().map(|u| (t.id.clone(), u)))
+            .and_then(|t| t.url.clone())
         else {
             return;
         };
-        let _ = self
-            .commands
-            .send(Command::Browser(BrowserCmd::Navigate { tab_id, url }));
+        let _ = self.commands.send(Command::Browser(BrowserCmd::Navigate {
+            tab_id: tab_id.to_string(),
+            url,
+        }));
     }
 
     /// Close the field, sending nothing. Escape, and every path that takes
@@ -6757,38 +8278,95 @@ impl Shell {
         cx.notify();
     }
 
-    /// Is the composer caret drawn this frame? (inventory §1.20 — 500 ms
+    /// Which field the next printable key will land in, or `None` when the
+    /// answer is "nowhere with a caret in it".
+    ///
+    /// **The order mirrors [`Shell::on_key`]'s gates, and it has to.** A
+    /// caret drawn in a box that is not the one consuming keys is worse
+    /// than no caret at all: it is a confident wrong answer to the exact
+    /// question somebody is asking at the moment they look for it. The two
+    /// ladders are kept in step by a test that drives real keystrokes
+    /// through the real shell rather than re-reading this list.
+    ///
+    /// The rungs that own the keyboard **without being fields** — a page
+    /// dialog, an open menu — are deliberately not modelled here. They sit
+    /// over whatever is behind them and they are gone in a keystroke or
+    /// two. What matters is that the four boxes that *do* have carets
+    /// cannot disagree with each other about which of them is live.
+    fn caret_field(&self, cx: &App) -> Option<Field> {
+        if self.omnibox_open() {
+            return Some(Field::Omnibox);
+        }
+        if self.find_here(cx).is_some() {
+            return Some(Field::Find);
+        }
+        if self.rename.is_some() {
+            return Some(Field::Rename);
+        }
+        // The composer is mounted with a session and not before, and that
+        // is what keeps N4's idle floor reachable: a window sitting at the
+        // launcher has no field, so it takes no lease and schedules
+        // nothing. The floor was never about carets — it is about a window
+        // nobody is typing into.
+        self.transcript
+            .read(cx)
+            .session_id
+            .is_some()
+            .then_some(Field::Composer)
+    }
+
+    /// Is `field`'s caret drawn this frame? (inventory §1.20 — 500 ms
     /// half-period, solid through the first half so a typing burst never
     /// blinks.)
     ///
-    /// **Only a draft blinks, and that is a divergence worth reading.** A
-    /// blink is the one tween in this slice that never settles, so its
-    /// consumer holds a pulse lease for as long as it is on screen — and
-    /// eave's caret is on screen always, which would mean a window that
-    /// redraws 30 times a second forever. That directly contradicts the
-    /// invariant N1 was built around and asserts twice: *a window with
-    /// nothing mid-flight schedules nothing at all.* Gating on a draft keeps
-    /// the invariant reachable — an idle eave still schedules nothing — and
-    /// keeps the blink where it means something, marking the insertion point
-    /// in real text rather than decorating a placeholder. Measured cost of
-    /// the ungated version is in `docs/reports/stage-n2-hover.md` §5; if the
-    /// user wants it always, delete the `has_draft` early return and nothing
-    /// else changes.
-    fn caret_lit(&self, cx: &mut Context<Self>) -> bool {
-        let (has_draft, anchor) = {
-            let c = self.composer.read(cx);
-            (!c.text.is_empty(), c.caret_anchor)
-        };
-        if !has_draft {
-            return true;
+    /// **Only the field taking the next key draws one.** The others answer
+    /// `false`, and every caller renders that as zero opacity rather than
+    /// as a missing element — so the answer is ink and never layout, in all
+    /// four boxes.
+    ///
+    /// # What this was, and why the shape changed
+    /// One caret, gated on the composer holding a draft. The gate was there
+    /// for N4's idle floor: a blink is the one tween that never settles, so
+    /// its consumer holds a lease for as long as it is on screen, and a
+    /// caret is on screen always. At the shared clock's 30 fps that is a
+    /// window redrawing forever, which is the invariant N1 asserts twice.
+    ///
+    /// Two things were wrong with the gate rather than one. The visible
+    /// one: an empty composer got a **static** glyph, and a glyph that
+    /// never moves reads as decoration rather than as an insertion point.
+    /// The other was invisible from here — the omnibox called this same
+    /// function, so **it** was gated on the composer's draft too, and the
+    /// composer is empty by definition while somebody is typing into an
+    /// address bar. Its caret could not blink, ever. The rail's rename
+    /// field went solid by hand and said so in a comment. Three fields, no
+    /// blink, and the report that arrived was the obvious one.
+    ///
+    /// The floor is kept a different way now: by making a caret **cheap**
+    /// (`motion::caret_now`, a 100 ms lease instead of 33 ms) and by
+    /// leasing only while a field owns the keyboard — rather than by
+    /// refusing to blink. A window nobody is typing into still schedules
+    /// nothing at all.
+    fn caret_lit(&self, field: Field, cx: &mut Context<Self>) -> bool {
+        if self.caret_field(cx) != Some(field) {
+            return false;
         }
-        // The lease is the whole reason this call is `&mut`: it is what
-        // keeps the clock ticking, and dropping it is what parks the clock.
+        // The lease is what keeps the clock ticking, and not asking for one
+        // is what parks it.
         let view = cx.entity_id();
-        let (Some(now), Some(anchor)) = (motion::pulse_now(view, cx), anchor) else {
-            // Reduced motion, or a draft that arrived without a keystroke
-            // (a paste through the fixture path). Solid.
+        let Some(now) = motion::caret_now(view, cx) else {
+            // Reduced motion. Solid — the resting state, not a missing one.
             return true;
+        };
+        let anchor = match self.caret.get() {
+            Some((f, at)) if f == field => at,
+            // Focused, but nobody has typed here yet: ⌘L an instant ago, or
+            // a session just selected. Anchor now, so the field opens solid
+            // and its first blink is a half-period away instead of wherever
+            // another box's clock had got to.
+            _ => {
+                self.caret.set(Some((field, now)));
+                now
+            }
         };
         motion::caret_visible(now.saturating_duration_since(anchor))
     }
@@ -6893,15 +8471,68 @@ impl Shell {
     /// keeps every tab the same width, which is what makes
     /// [`theme::TAB_NAME_W`] a slot a test can measure a real name against.
     ///
-    /// **There is no favicon.** `PageFact::Favicon` exists on the wire and
-    /// nothing reports one, and a favicon is bytes to fetch, decode and
-    /// cache — none of which exists here. A globe is the honest stand-in;
-    /// see the report's caveats.
+    /// A page tab paints its favicon in the plate when `favicon_url` is
+    /// set; the globe is the fallback, not the product.
     /// The rail's collapse toggle, in the rail it collapses.
     ///
     /// It used to sit in the titlebar next to a wordmark. A′ deleted that bar
     /// — the rail owns the titlebar line now — so the control moved to the
     /// thing it acts on, which is where it should always have been.
+    /// **The rail's resize handle (Slice D3).**
+    ///
+    /// A transparent 8 px column straddling the seam — no fill of its own,
+    /// because the thing it resizes is already drawn and a visible grip would
+    /// be a third vertical line in a frame that just spent a slice getting
+    /// down to one.
+    ///
+    /// It uses gpui's DRAG machinery rather than mouse-down + a hand-rolled
+    /// move listener, which is what Zed's dock divider does
+    /// (`workspace/src/dock.rs`): `on_drag` starts it, and `on_drag_move` on
+    /// the frame row keeps receiving moves in the CAPTURE phase no matter
+    /// what the pointer is over. That last part is the whole reason not to
+    /// hand-roll it — a plain `on_mouse_move` on this element stops firing
+    /// the moment the pointer outruns the 8 px column, which it does
+    /// immediately.
+    ///
+    /// `deferred` because the handle overhangs 4 px into the content region,
+    /// and the rail is painted BEFORE the content: without it the overhanging
+    /// half is covered and the grab target is silently 4 px, not 8.
+    ///
+    /// `occlude` so the hover wash of whatever is under the seam does not
+    /// light up while the pointer is on the divider.
+    fn rail_handle(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        deferred(
+            div()
+                .id("rail-handle")
+                .debug_selector(|| "rail-handle".into())
+                .absolute()
+                .top_0()
+                .h_full()
+                .right(px(-theme::RAIL_HANDLE_W / 2.0))
+                .w(px(theme::RAIL_HANDLE_W))
+                .cursor_col_resize()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, e: &MouseDownEvent, _window, cx| {
+                        // Recorded here and not in the drag payload: the grab
+                        // point is a fact about this press, and `on_drag`
+                        // built its value one frame ago.
+                        this.rail_drag = Some(RailDrag {
+                            grab_x: f32::from(e.position.x),
+                            start_w: this.rail_w,
+                        });
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_drag(RailResize, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| RailResize)
+                }),
+        )
+        .into_any_element()
+    }
+
     fn rail_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
             .id("rail-toggle")
@@ -6989,19 +8620,100 @@ impl Shell {
                 )
             })
             .collect();
-        let items = strip::items(&snapshot, &chips);
+        let items = strip::items(&snapshot, &chips, &page_resident);
+
+        let split_members: Option<(strip::StripTab, strip::StripTab)> =
+            self.split.as_ref().and_then(|s| {
+                let find = |id: &str| {
+                    items.iter().find_map(|item| match item {
+                        strip::StripItem::Tab(t) if t.id == id => Some(t.clone()),
+                        _ => None,
+                    })
+                };
+                Some((find(&s.left)?, find(&s.right)?))
+            });
+
+        // Slice T1 — where the projects stop and the loose tabs start.
+        // `strip::drawn_order` has already hoisted every group above every
+        // loose tab; this only asks the same module where it put the seam,
+        // rather than re-deriving it and risking a different answer from
+        // the one ctrl-tab walks.
+        //
+        // The divider is pushed into `rows` like any other row, and that is
+        // what keeps `active_row` correct for free: it is tracked as
+        // `rows.len()` at push time — machinery split view needed, because
+        // a split draws two tabs as one row — and that absorbs an inserted
+        // divider without knowing it exists.
+        let projects = strip::project_item_count(&items);
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut active_row: Option<usize> = None;
+        let mut emitted_split = false;
+        for (ix, item) in items.iter().enumerate() {
+            if ix == projects {
+                rows.push(self.tabs_divider(cx));
+            }
+            match item {
+                strip::StripItem::Group {
+                    id,
+                    title,
+                    color,
+                    collapsed,
+                    count,
+                    holds_active,
+                } => {
+                    if *holds_active {
+                        active_row = Some(rows.len());
+                    }
+                    rows.push(self.group_head(
+                        id,
+                        title,
+                        color,
+                        *collapsed,
+                        *count,
+                        *holds_active,
+                        cx,
+                    ));
+                }
+                strip::StripItem::Tab(tab) => {
+                    if let Some(s) = &self.split {
+                        if s.contains(&tab.id) {
+                            if !emitted_split {
+                                if let Some((left, right)) = split_members.as_ref() {
+                                    if s.contains(snapshot.active.as_deref().unwrap_or("")) {
+                                        active_row = Some(rows.len());
+                                    }
+                                    rows.push(self.split_tabs_row(&[left, right], phase, cx));
+                                    emitted_split = true;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if tab.active {
+                        active_row = Some(rows.len());
+                    }
+                    rows.push(self.rail_tab(tab, phase, false, cx));
+                }
+            }
+        }
+        // Always drawn, even with nothing loose under it — it carries ⌘T's
+        // `+`, and a control that appears only once you already have what
+        // it makes is not a control.
+        if projects == items.len() {
+            rows.push(self.tabs_divider(cx));
+        }
 
         // Scroll the active tab into view on the EDGE of it changing, never
         // every frame. `scroll_to_item` arms an active item that prepaint
         // consumes, so re-arming it every pass would pin the list and the
-        // operator could never scroll to anything else. (Slice AS's
-        // mechanism, carried through the axis change unchanged — the
-        // question "which item is active" does not depend on the axis.)
+        // operator could never scroll to anything else. Index is the ROW,
+        // not the strip item: a split draws two tabs as one child.
         {
             let mut been = self.tab_scrolled_to.borrow_mut();
             match snapshot.active.as_deref() {
                 Some(active) if been.as_deref() != Some(active) => {
-                    if let Some(ix) = items.iter().position(|i| i.tab_id() == Some(active)) {
+                    if let Some(ix) = active_row {
                         self.tabs_scroll.scroll_to_item(ix);
                         *been = Some(active.to_string());
                     }
@@ -7010,21 +8722,6 @@ impl Shell {
                 _ => {}
             }
         }
-
-        let rows: Vec<AnyElement> = items
-            .iter()
-            .map(|item| match item {
-                strip::StripItem::Group {
-                    id,
-                    title,
-                    color,
-                    collapsed,
-                    count,
-                    holds_active,
-                } => self.group_head(id, title, color, *collapsed, *count, *holds_active, cx),
-                strip::StripItem::Tab(tab) => self.rail_tab(tab, phase, cx),
-            })
-            .collect();
 
         div()
             .debug_selector(|| "rail-tabs".into())
@@ -7048,22 +8745,23 @@ impl Shell {
                             .line_height(px(theme::SECTION_LINE))
                             .font_weight(theme::WEIGHT_STRONG)
                             .text_color(theme::text_tertiary())
-                            .child("OPEN"),
+                            .child("PROJECTS"),
                     )
                     .child(
-                        // ⌘T's affordance. On the section header rather than
-                        // trailing the list: a vertical list grows downward,
-                        // so a `+` after the last row would move every time a
-                        // tab opened.
+                        // Slice T1 — a project by hand. The affordance sits
+                        // on the section header for the same reason ⌘T's
+                        // does below: a vertical list grows downward, so a
+                        // `+` after the last row would move every time
+                        // anything opened.
                         div()
-                            .id("tab-new")
-                            .debug_selector(|| "tab-new".into())
+                            .id("project-new")
+                            .debug_selector(|| "project-new".into())
                             .flex_none()
                             .size(px(theme::TAB_CLOSE))
                             .rounded(px(theme::RADIUS_BUTTON))
-                            .hover_fade("tab-new", theme::wash_rest(), theme::overlay())
+                            .hover_fade("project-new", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                            .on_click(cx.listener(|this, _, _, cx| this.pick_project(cx)))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -7071,7 +8769,7 @@ impl Shell {
                                 icons::ADD_CIRCLE,
                                 theme::ICON_SM,
                                 theme::text_secondary(),
-                                "tab-new-glyph",
+                                "project-new-glyph",
                             )),
                     ),
             )
@@ -7112,6 +8810,440 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Slice T1 — **the bookmarks bar**, under the pane header, on a page.
+    ///
+    /// `None` unless a page tab is showing, and that is the operator's own
+    /// ruling: bookmarks sit *on top of pages*. It follows that the bar is
+    /// not there in a chat, which is a real cost and was accepted when the
+    /// place was chosen.
+    ///
+    /// # Why this is a UI-only slice
+    ///
+    /// The store underneath is complete and was complete before this slice
+    /// started: `Folder | Link`, a node naming its parent, ordered child
+    /// ids, `BookmarkAdd/Move/Rename/Remove/Retarget`, a `WatchBookmarks`
+    /// subscription and a cycle check on moves. 127 mentions in
+    /// `eave-core`, 93 in `eave-engine`, 31 in `eave-wire` — and five in
+    /// this crate, all of them `SubscriptionItem::Bookmarks { .. } => {}`.
+    /// Every bookmark fact eave draws here was already durable; nothing had
+    /// ever asked for it.
+    ///
+    /// # The two drags
+    ///
+    /// Dragging eave's OWN chrome — the address out of the pane header, a
+    /// chip along the bar, a chip into a folder — is gpui drag, which this
+    /// file already uses for the rail divider. Dragging a link out of the
+    /// rendered page is a different animal: CEF windowless mode needs
+    /// `StartDragging` and the `DragTarget*` family plumbed through, and
+    /// eave has none of it. That gesture is deliberately absent rather than
+    /// half-built.
+    fn bookmarks_bar(&self, showing_page: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !showing_page {
+            return None;
+        }
+        let items = bookmarks::bar(&self.bookmarks.read(cx).snapshot);
+        let open = self.bookmark_folder_open.borrow().clone();
+        let end = items.len();
+
+        Some(
+            div()
+                .debug_selector(|| "bookmarks-bar".into())
+                .id("bookmarks-bar")
+                .flex_none()
+                .w_full()
+                .h(px(theme::RAIL_TAB_H))
+                .px(px(theme::SPACE_2))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACE_1))
+                .overflow_x_hidden()
+                // The bar's own empty space is a drop target: past the last
+                // chip means the end, which is where a person aiming at
+                // "not into any of these" naturally lets go.
+                .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
+                .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
+                    this.add_bookmark(None, None, drag, cx)
+                }))
+                .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
+                .on_drop(cx.listener(move |this, drag: &BookmarkDrag, _, cx| {
+                    this.move_bookmark(drag.id.clone(), None, end, cx)
+                }))
+                .children(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, item)| self.bookmark_chip(item, ix, open.as_deref(), cx)),
+                )
+                // New folder. Trailing the chips rather than heading them:
+                // this bar grows to the RIGHT, so a control after the last
+                // chip stays put as bookmarks are added — the opposite of
+                // the vertical tab list, where the `+` had to go in the
+                // header for exactly the same reason.
+                .child(
+                    div()
+                        .id("bookmark-new-folder")
+                        .debug_selector(|| "bookmark-new-folder".into())
+                        .flex_none()
+                        .size(px(theme::TAB_CLOSE))
+                        .rounded(px(theme::RADIUS_BUTTON))
+                        .hover_fade("bookmark-new-folder", theme::wash_rest(), theme::overlay())
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.new_bookmark_folder(cx)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icons::tagged_icon(
+                            icons::FOLDER,
+                            theme::ICON_SM,
+                            theme::text_tertiary(),
+                            "bookmark-new-folder-glyph",
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// One chip on the bar — a link, or a folder that opens under it.
+    fn bookmark_chip(
+        &self,
+        item: &bookmarks::BarItem,
+        index: usize,
+        open: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = item.id.clone();
+        let sel = item.id.clone();
+        let folder = item.is_folder();
+        let url = item.url.clone();
+        let is_open = folder && open == Some(item.id.as_str());
+        let (click_id, drop_id, drag_id) = (id.clone(), id.clone(), id.clone());
+
+        let chip = div()
+            .id(SharedString::from(format!("bookmark-{id}")))
+            .debug_selector(move || {
+                if folder {
+                    format!("bookmark-folder-{sel}")
+                } else {
+                    format!("bookmark-{sel}")
+                }
+            })
+            .flex_none()
+            .h(px(theme::GROUP_HEAD_H))
+            .px(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .when(is_open, |d| d.bg(theme::wash_rest()))
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .child(icons::tagged_icon(
+                if folder { icons::FOLDER } else { icons::GLOBAL },
+                12.0,
+                theme::text_secondary(),
+                "bookmark-glyph",
+            ))
+            .child(
+                div()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .text_color(theme::text())
+                    .child(SharedString::from(item.label.clone())),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                match &url {
+                    // A link goes in the tab you are looking at, which is
+                    // what a bookmarks bar has meant in every browser.
+                    Some(url) => this.open_bookmark(url.clone(), cx),
+                    None => this.toggle_bookmark_folder(&click_id, cx),
+                }
+                cx.notify();
+            }))
+            .on_drag(BookmarkDrag { id: drag_id }, |drag, _, _, cx| {
+                cx.new(|_| drag.clone())
+            })
+            // Dropping ONTO a chip means "put it here", at this chip's
+            // index — except on a folder, where it means "put it inside".
+            .on_drop(cx.listener(move |this, drag: &BookmarkDrag, _, cx| {
+                if drag.id == drop_id {
+                    return;
+                }
+                if folder {
+                    this.move_bookmark(drag.id.clone(), Some(drop_id.clone()), 0, cx)
+                } else {
+                    this.move_bookmark(drag.id.clone(), None, index, cx)
+                }
+            }))
+            .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
+                if folder {
+                    this.add_bookmark(Some(id.clone()), None, drag, cx)
+                } else {
+                    this.add_bookmark(None, Some(index), drag, cx)
+                }
+            }))
+            .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::overlay()))
+            .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::overlay()));
+
+        if !is_open {
+            return chip.into_any_element();
+        }
+        div()
+            .relative()
+            .flex_none()
+            .child(chip)
+            .child(self.bookmark_folder_menu(item, cx))
+            .into_any_element()
+    }
+
+    /// What an open folder shows: its direct children, under it.
+    ///
+    /// `deferred` because it overhangs everything below the bar, and the
+    /// bar is painted before the content well — without it the menu is
+    /// drawn under the page.
+    fn bookmark_folder_menu(
+        &self,
+        folder: &bookmarks::BarItem,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let children = bookmarks::children_of(&self.bookmarks.read(cx).snapshot, &folder.id);
+        let fid = folder.id.clone();
+        deferred(
+            div()
+                .debug_selector(move || format!("bookmark-menu-{fid}"))
+                .absolute()
+                .top(px(theme::GROUP_HEAD_H))
+                .left_0()
+                .min_w(px(theme::DIRECTIVE_MAX_W / 3.))
+                .p(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_PANEL))
+                .bg(theme::overlay())
+                .shadow(theme::selection_rim())
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_1))
+                .children(if children.is_empty() {
+                    // An empty folder is a fact, and saying so beats an
+                    // empty box the operator cannot tell from a failure.
+                    vec![div()
+                        .debug_selector(|| "bookmark-menu-empty".into())
+                        .px(px(theme::SPACE_2))
+                        .text_size(px(theme::MICRO_SIZE))
+                        .text_color(theme::text_tertiary())
+                        .child("empty")
+                        .into_any_element()]
+                } else {
+                    children
+                        .iter()
+                        .map(|child| {
+                            let url = child.url.clone();
+                            let cid = child.id.clone();
+                            div()
+                                .id(SharedString::from(format!("bookmark-child-{}", child.id)))
+                                .debug_selector(move || format!("bookmark-child-{cid}"))
+                                .px(px(theme::SPACE_2))
+                                .h(px(theme::GROUP_HEAD_H))
+                                .rounded(px(theme::RADIUS_BUTTON))
+                                .cursor_pointer()
+                                .hover_fade("bookmark-child", theme::overlay(), theme::wash_rest())
+                                .flex()
+                                .items_center()
+                                .text_size(px(theme::MICRO_SIZE))
+                                .text_color(theme::text())
+                                .child(SharedString::from(child.label.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(url) = url.clone() {
+                                        this.open_bookmark(url, cx);
+                                    }
+                                    this.bookmark_folder_open.replace(None);
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>()
+                }),
+        )
+        .into_any_element()
+    }
+
+    /// Send the active tab to a bookmark. Falls back to opening a tab when
+    /// there is no page tab to send — the same rule the omnibox commits by.
+    fn open_bookmark(&mut self, url: String, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let target = strip::active_is_page(&snapshot)
+            .then(|| snapshot.active.clone())
+            .flatten();
+        let cmd = match target {
+            Some(tab_id) => BrowserCmd::Navigate { tab_id, url },
+            None => BrowserCmd::OpenAt {
+                url,
+                activate: true,
+            },
+        };
+        let _ = self.commands.send(Command::Browser(cmd));
+    }
+
+    fn toggle_bookmark_folder(&mut self, id: &str, _cx: &mut Context<Self>) {
+        let mut open = self.bookmark_folder_open.borrow_mut();
+        if open.as_deref() == Some(id) {
+            *open = None;
+        } else {
+            *open = Some(id.to_string());
+        }
+    }
+
+    fn add_bookmark(
+        &mut self,
+        parent: Option<String>,
+        index: Option<usize>,
+        drag: &AddressDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self
+            .commands
+            .send(Command::Browser(BrowserCmd::BookmarkAdd {
+                parent,
+                index,
+                title: drag.title.clone(),
+                url: Some(drag.url.clone()),
+            }));
+        cx.notify();
+    }
+
+    /// Slice T1 — a folder on the bar.
+    ///
+    /// Named on creation rather than left blank and renamed after. eave has
+    /// no inline rename for a bookmark yet (`BookmarkRename` is on the wire
+    /// and nothing calls it), so a folder created unnamed would draw as an
+    /// empty chip the operator could open and fill but never identify. The
+    /// count makes the second one distinguishable from the first, which is
+    /// the whole job until a rename exists.
+    fn new_bookmark_folder(&mut self, cx: &mut Context<Self>) {
+        let existing = bookmarks::bar(&self.bookmarks.read(cx).snapshot)
+            .iter()
+            .filter(|i| i.is_folder())
+            .count();
+        let title = if existing == 0 {
+            "new folder".to_string()
+        } else {
+            format!("new folder {}", existing + 1)
+        };
+        let _ = self
+            .commands
+            .send(Command::Browser(BrowserCmd::BookmarkAdd {
+                parent: None,
+                index: None,
+                title: Some(title),
+                url: None,
+            }));
+        cx.notify();
+    }
+
+    fn move_bookmark(
+        &mut self,
+        bookmark_id: String,
+        parent: Option<String>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self
+            .commands
+            .send(Command::Browser(BrowserCmd::BookmarkMove {
+                bookmark_id,
+                parent,
+                index,
+            }));
+        cx.notify();
+    }
+
+    /// Slice T1 — the `TABS` divider: where the projects stop.
+    ///
+    /// A row inside the scroll list rather than a second sticky header, and
+    /// that is a layout constraint rather than a preference. The list has a
+    /// **definite** height, `theme::rail_tabs_h(rows.len())`, because a
+    /// scroll container's automatic minimum size is zero and a `max_h`
+    /// alone let it collapse to nothing — Slice D1 shipped exactly that for
+    /// one commit. That height is `rows.len()` times one row, so a divider
+    /// of any other height would put the box and its contents out of step
+    /// and re-open the defect from the other side. It is a full row tall
+    /// because it has to be.
+    ///
+    /// It carries ⌘T's `+`, which is what it is doing down here rather than
+    /// beside `PROJECTS`: the two affordances make different things and
+    /// each belongs next to what it makes.
+    fn tabs_divider(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "tabs-divider".into())
+            .flex_none()
+            .h(px(theme::RAIL_TAB_H))
+            .px(px(theme::SPACE_2))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .debug_selector(|| "tabs-divider-title".into())
+                    .text_size(px(theme::SECTION_SIZE))
+                    .line_height(px(theme::SECTION_LINE))
+                    .font_weight(theme::WEIGHT_STRONG)
+                    .text_color(theme::text_tertiary())
+                    .child("TABS"),
+            )
+            .child(
+                div()
+                    .id("tab-new")
+                    .debug_selector(|| "tab-new".into())
+                    .flex_none()
+                    .size(px(theme::TAB_CLOSE))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .hover_fade("tab-new", theme::wash_rest(), theme::overlay())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icons::tagged_icon(
+                        icons::ADD_CIRCLE,
+                        theme::ICON_SM,
+                        theme::text_secondary(),
+                        "tab-new-glyph",
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// Slice T1 — a project from a folder the operator picks.
+    ///
+    /// `directories: true, files: false`: a project is bound to a checkout
+    /// root, and a root is a directory. Offering files would let somebody
+    /// bind a project to something `group_for_workspace` can never match a
+    /// session against, which fails silently and looks like the project
+    /// simply never collects anything.
+    fn pick_project(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("New project".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = view.update(cx, |shell, _| {
+                let _ = shell
+                    .commands
+                    .send(Command::Browser(BrowserCmd::NewProject {
+                        workspace: path.to_string_lossy().into_owned(),
+                    }));
+            });
+        })
+        .detach();
+    }
+
     /// A group's head on the strip: its colour, its name, and — when it is
     /// collapsed — how many tabs it is holding.
     ///
@@ -7128,9 +9260,10 @@ impl Shell {
         collapsed: bool,
         count: usize,
         holds_active: bool,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
     ) -> AnyElement {
         let gid = id.to_string();
+        let click_id = id.to_string();
         div()
             .id(SharedString::from(format!("group-{id}")))
             .debug_selector(move || format!("group-{gid}"))
@@ -7140,10 +9273,36 @@ impl Shell {
             .rounded(px(theme::RADIUS_BUTTON))
             .when(holds_active, |d| d.shadow(theme::selection_rim()))
             .bg(theme::wash_rest())
+            .cursor_pointer()
+            // Slice T1 — the head folds its project. `collapsed` has been on
+            // the group since B1 and `strip.rs` has always drawn a collapsed
+            // one as a head plus a count; nothing ever set it, so every
+            // project was permanently open and the count was unreachable.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this
+                    .commands
+                    .send(Command::Browser(BrowserCmd::GroupSetCollapsed {
+                        group_id: click_id.clone(),
+                        collapsed: !collapsed,
+                    }));
+                cx.notify();
+            }))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(theme::SPACE_1))
+            // Which way the project is folded, stated before its name.
+            // A disclosure that only reads as a count ("3") says how much
+            // is hidden and not that anything is; the count disappears when
+            // the project is open, so on its own it is a mark that vanishes
+            // rather than a control that changes.
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .text_color(theme::text_tertiary())
+                    .child(if collapsed { "\u{25b8}" } else { "\u{25be}" }),
+            )
             .child(
                 div()
                     .size(px(theme::GROUP_DOT))
@@ -7176,6 +9335,54 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The two (or more) tabs currently in the well, as one pill.
+    ///
+    /// T3 draws split tabs as chips in a single rounded bar rather than as
+    /// two stacked rows, so the strip says "these are on screen together"
+    /// instead of "these happen to be adjacent". Left chip is the left
+    /// pane, right chip the right pane. A third pane later is another
+    /// chip in the same bar, not a new row.
+    fn split_tabs_row(
+        &self,
+        members: &[&strip::StripTab],
+        phase: Option<f32>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("split-tabs")
+            .debug_selector(|| "split-tabs".into())
+            .w_full()
+            .h(px(theme::RAIL_TAB_H))
+            .px(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .bg(theme::overlay())
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = members.first().map(|t| t.id.clone()).unwrap_or_default();
+                    move |this, ev: &MouseDownEvent, _, cx| {
+                        if id.is_empty() {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        this.open_tab_menu(&id, ev.position, cx);
+                    }
+                }),
+            )
+            .children(
+                members
+                    .iter()
+                    .map(|tab| self.rail_tab(tab, phase, true, cx))
+                    .collect::<Vec<_>>(),
+            )
+            .into_any_element()
+    }
+
     /// One tab.
     /// One tab as a **row** (Slice D1), where it used to be a fixed-width chip.
     ///
@@ -7197,14 +9404,23 @@ impl Shell {
     ///   drawn and cost the name 20 px. In a list there is room to keep it out
     ///   of the resting state, and a column of nine identical ⓧ glyphs is
     ///   noise on a surface whose whole job is to be scanned.
+    ///
+    /// `compact` is the split-pill chip: same identity, half the rail, so
+    /// two (or more) tabs read as one group. Selection is only the focused
+    /// pane — the pill itself is the split's mark.
     fn rail_tab(
         &self,
         tab: &strip::StripTab,
         phase: Option<f32>,
+        compact: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let id = tab.id.clone();
-        let is_sel = tab.active;
+        let is_sel = if compact {
+            tab.active
+        } else {
+            tab.active || self.split.as_ref().is_some_and(|s| s.contains(&id))
+        };
         // The dot. On a session tab it is the rail's state pigment; on a
         // page tab it is the LOAD state, and a page that is neither loading
         // nor failed shows nothing — but keeps its width, which is what
@@ -7218,10 +9434,15 @@ impl Shell {
                 let id = id.clone();
                 move || format!("tab-{id}")
             })
-            .flex_none()
-            .w_full()
-            .h(px(theme::RAIL_TAB_H))
-            .px(px(theme::RAIL_CARD_BLEED))
+            .when(compact, |d| d.flex_1().min_w(px(0.)).h_full())
+            .when(!compact, |d| {
+                d.flex_none().w_full().h(px(theme::RAIL_TAB_H))
+            })
+            .px(px(if compact {
+                theme::SPACE_1
+            } else {
+                theme::RAIL_CARD_BLEED
+            }))
             .rounded(px(theme::RADIUS_BUTTON))
             // Slice AS's ruling, unchanged: selection is a NEUTRAL raised
             // fill plus a 1 px INSET rim, never an accent bar. The accent
@@ -7236,6 +9457,8 @@ impl Shell {
                 format!("tab-{id}"),
                 if is_sel {
                     theme::overlay_strong()
+                } else if compact {
+                    gpui::transparent_black()
                 } else {
                     theme::wash_rest()
                 },
@@ -7256,6 +9479,16 @@ impl Shell {
                     }
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = id.clone();
+                    move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_tab_menu(&id, ev.position, cx);
+                    }
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 // The same two lines the rail row runs, and for the same
                 // reason: an open rename field lives in one row's label
@@ -7266,14 +9499,39 @@ impl Shell {
                 this.close_omnibox(cx);
                 this.activate_tab(&activate, cx);
             }))
+            .on_drag(
+                TabDrag {
+                    id: id.clone(),
+                    title: tab.label.clone(),
+                },
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
+            )
+            .drag_over::<TabDrag>({
+                let id = id.clone();
+                move |style, dragged, _, _| {
+                    if dragged.id == id {
+                        style
+                    } else {
+                        style.bg(theme::overlay())
+                    }
+                }
+            })
+            .on_drop(cx.listener({
+                let target = id.clone();
+                move |this, drag: &TabDrag, _, cx| {
+                    cx.stop_propagation();
+                    this.split_tabs(&drag.id, &target, true, cx);
+                }
+            }))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(theme::SPACE_1))
             .child(loaders::work_dot(theme::STATE_DOT, dot, phase.filter(|_| pulsing)).flex_none())
-            // The 18 px identity plate — see `tab_plate`, which is the
-            // one implementation of it: a tab means the same thing at
-            // every width this frame draws it at.
+            // The plate is the site mark — a favicon when Chromium has
+            // given us one, the globe otherwise. Compact chips keep it:
+            // "always display favicons" is the identity of a page tab,
+            // split or not.
             .child(tab_plate(tab, &id))
             .child(
                 // A FIXED slot, not `flex_1`. Every tab is the same width,
@@ -7296,8 +9554,9 @@ impl Shell {
                     // The row's gap is `SPACE_1` (the dot and the plate are
                     // one identity group); the name takes the rail's
                     // `SPACE_2` off the plate, so this is the difference
-                    // and `TAB_CHROME_W` counts both.
-                    .ml(px(theme::SPACE_2 - theme::SPACE_1))
+                    // and `TAB_CHROME_W` counts both. Compact chips have
+                    // no plate, so the row gap is already the whole offset.
+                    .when(!compact, |d| d.ml(px(theme::SPACE_2 - theme::SPACE_1)))
                     // Slice D1: `flex_1`, not `TAB_NAME_W`. A row takes the
                     // rail's width, so the name gets what is left after the
                     // chrome — the same slot a session row gives it — and the
@@ -7375,7 +9634,10 @@ impl Shell {
     /// The highlight is a projection of the feed task's actual
     /// subscription (`TranscriptState::session_id`); clicking only
     /// *requests* a switch.
-    fn rail(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
+    /// `caret_lit` is asked for in the root render pass and passed down,
+    /// because this one takes `&Context` and a lease needs `&mut`. It is
+    /// the rename field's, and it is false unless that field is open.
+    fn rail(&self, cx: &Context<Self>, phase: Option<f32>, caret_lit: bool) -> AnyElement {
         // Already in draw order: `fold_rail` decided it when each row
         // arrived, and deliberately does not re-decide it here (Stage AB).
         let all = self.sessions.read(cx).sessions.clone();
@@ -7405,7 +9667,31 @@ impl Shell {
             .collect();
         // The second line aligns under the session name: dot + gap +
         // chip + gap.
-        let meta_indent = theme::STATE_DOT + theme::SPACE_2 + theme::PROVIDER_CHIP + theme::SPACE_2;
+        // **Slice D3: the row's lower lines indent past the STATE DOT, not
+        // past the name.**
+        //
+        // They used to start under the session name — dot + gap + chip + gap
+        // = 40 px — and that 40 px is what pinned the rail wide. The floor
+        // measured out at ~237 px: `a_marked_row_still_shows_its_folder`
+        // holds the path to 80 px (what `~/Desktop/eave` needs to stay
+        // recognisable), the marks group is capped at 70, and 80 + 8 + 70 +
+        // 40 + 25 of gutters is 223 before the layout's own rounding. Every
+        // other candidate for the width came in under that, so the indent was
+        // the binding constraint — not the facts, not the type.
+        //
+        // `RAIL_STRIP_W` is the replacement and it is not a new number: it is
+        // the dot's own column, already named and already documented as "the
+        // bare column, outside the row's washed card, that carries the
+        // selection bar and the state mark". Indenting past it keeps that
+        // column clean — which is the whole reason it exists — and gives
+        // every line below the name the rail's ONE left edge, which is what
+        // `RAIL_GUTTER` says every direct child of a rail should have had all
+        // along ("the header label, a row's TEXT, the empty state, the footer
+        // line"). The old indent was the exception to that rule.
+        //
+        // It buys 26 px, which is what makes a 220 px rail state its facts
+        // whole instead of at 237.
+        let meta_indent = theme::RAIL_STRIP_W;
         let rows: Vec<AnyElement> = sessions
             .into_iter()
             .map(|info| {
@@ -7660,7 +9946,9 @@ impl Shell {
                                     .debug_selector(|| format!("rename-{}", info.session_id))
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .truncate()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
                                     .border_1()
                                     .border_color(theme::border_strong())
                                     .rounded(px(theme::RADIUS_BUTTON))
@@ -7687,15 +9975,31 @@ impl Shell {
                                     // handler always states a cursor, not
                                     // that every cursor is a pointer.
                                     .cursor_text()
-                                    // A SOLID caret, deliberately. The
-                                    // composer's blink holds a pulse lease
-                                    // for as long as it is on screen
-                                    // (`caret_lit`), and this field is one
-                                    // more surface that would then be
-                                    // pinned at the frame rate. N4's idle
-                                    // floor is worth more than a blink on
-                                    // a box that is open for four seconds.
-                                    .child(SharedString::from(format!("{text}▏")))
+                                    // The title and the caret are SIBLINGS
+                                    // here, unlike the composer's, whose
+                                    // caret is drawn inside the text field
+                                    // because that text wraps. This one
+                                    // truncates instead, and a truncating
+                                    // box has to keep the caret out of the
+                                    // string it is clipping — otherwise the
+                                    // first thing a long title clips is the
+                                    // insertion point.
+                                    //
+                                    // It blinks now. The comment that stood
+                                    // here traded the blink for N4's idle
+                                    // floor at 30 fps, which was the right
+                                    // call against the only clock there was;
+                                    // a caret costs 100 ms ticks now, and
+                                    // only while its field owns the
+                                    // keyboard, so the floor is bought back
+                                    // without spending the caret.
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .child(SharedString::from(text.to_string())),
+                                    )
+                                    .child(caret_glyph("rename", caret_lit))
                                     .into_any_element(),
                                 // Stage AB: `min_w(0)` is what makes
                                 // `truncate` bite inside a flex row — a
@@ -7776,6 +10080,18 @@ impl Shell {
                     // truncates against them, because a path can be
                     // half-read from its tail and a count cannot be
                     // half-read at all.
+                    //
+                    // **Slice D3 tried to give the marks their own line so a
+                    // narrow rail could state both whole, and
+                    // `a_session_row_is_two_lines` refused it at 79 px
+                    // against a 64 px ceiling.** That ceiling is AO's entire
+                    // point — "the rail's whole problem was rows that cost
+                    // four lines apiece" — so height is not available to buy
+                    // width with, and the two facts keep sharing this line.
+                    // What that costs is written down in
+                    // `theme::RAIL_W_MIN`: it is the reason the rail's floor
+                    // is where it is rather than at the 180 the directive
+                    // asked for.
                     .child(
                         div()
                             .pl(px(meta_indent))
@@ -8074,9 +10390,24 @@ impl Shell {
         // between the rail and the card would mean the frame is wrong.
         div()
             .debug_selector(|| "rail".into())
-            .w(px(theme::RAIL_W))
+            // Slice D3: the LIVE width, not the token. `theme::RAIL_W` is the
+            // launch default; the operator's dragged width lives on the shell
+            // and is restored from `frame.json`.
+            .w(px(self.rail_w))
             .h_full()
             .flex_none()
+            // The handle is absolutely positioned against this box, and it
+            // overhangs the seam by half its width — so this has to establish
+            // the containing block or the handle would anchor to the window.
+            .relative()
+            .bg(theme::rail_plate())
+            // **No right border.** The rail meets the content card across a
+            // CARD_GUTTER of window surface, and the card draws its own
+            // hairline — so a border here is a second line a few pixels from
+            // the first, which reads as a seam rather than an edge. The
+            // operator called it out on sight. The plate's own colour is what
+            // separates the rail from the window; the drag handle, which
+            // overhangs this box, is what says the seam is grabbable.
             .flex()
             .flex_col()
             .child(
@@ -8093,6 +10424,7 @@ impl Shell {
                     .pr(px(theme::RAIL_GUTTER)),
             )
             .child(self.rail_tabs(cx, phase))
+            .child(self.rail_handle(cx))
             .child(
                 div()
                     .px(px(theme::RAIL_GUTTER))
@@ -9484,11 +11816,14 @@ impl Shell {
                 // Slice V's rule stands, this only adds the other half.
                 let has_body = !input.trim().is_empty() || !result.trim().is_empty();
                 let open = state.open_tools.contains(tool_id);
-                let (label, dot) = match status {
-                    ToolStatus::Running => ("running…", theme::live()),
-                    ToolStatus::Finished if *is_error => ("failed", theme::danger()),
-                    ToolStatus::Finished => ("done", theme::text_tertiary()),
-                    ToolStatus::Interrupted => ("interrupted", theme::danger()),
+                // The colour that went with each word tinted the animated
+                // dot; bezel's row takes `failed` and colours its own icon,
+                // so only the word is still eave's to choose.
+                let label = match status {
+                    ToolStatus::Running => "running…",
+                    ToolStatus::Finished if *is_error => "failed",
+                    ToolStatus::Finished => "done",
+                    ToolStatus::Interrupted => "interrupted",
                 };
                 // What the tool was ASKED to do. Until Slice V a row was
                 // the tool's name and a status word, so an agent running
@@ -9521,73 +11856,53 @@ impl Shell {
                     }
                     text
                 });
-                let head = div()
-                    .id(SharedString::from(format!("tool-{tool_id}")))
-                    .when(has_body, |d| {
-                        let tid = tool_id.clone();
-                        let shell = state.shell.clone();
-                        d.cursor_pointer()
-                            .debug_selector(|| "tool-head".into())
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
-                                    let tid = tid.clone();
-                                    shell.update(cx, |shell, cx| {
-                                        shell.transcript.update(cx, |t, cx| {
-                                            if !t.open_tools.remove(&tid) {
-                                                t.open_tools.insert(tid.clone());
-                                            }
-                                            t.remeasure_tool(&tid);
-                                            cx.notify();
-                                        });
-                                    });
-                                }
-                            })
-                    })
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(loaders::work_dot(
-                        theme::TOOL_DOT,
-                        dot,
-                        // Only while it is actually running: `done` and
-                        // `interrupted` are settled facts.
-                        phase.filter(|_| matches!(status, ToolStatus::Running)),
-                    ))
-                    .child(
-                        div()
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::TOOL_NAME_SIZE))
-                            .line_height(px(theme::TOOL_NAME_LINE))
-                            .font_weight(theme::WEIGHT_LABEL)
-                            .text_color(theme::text_secondary())
-                            .child(SharedString::from(name.clone())),
+                // ── Slice BZ: this row is bezel's ────────────────────
+                // `step_row` draws the head, `step_output` the body it
+                // opens onto, `error_strip` a failure. eave still decides
+                // every FACT — the typed `call` decode, the status word,
+                // the caps — and bezel decides how they are laid out.
+                //
+                // What this costs, stated once: bezel's icon slot takes a
+                // path, not an element, so the animated `work_dot` is gone
+                // and a running tool is a static glyph. And bezel builds
+                // the interior of its rows itself, so the `tool-detail`
+                // handle the harness measured no longer exists — the two
+                // tests that asserted it now assert the fact at the model
+                // level instead, and say so.
+                let bz = crate::bezel_theme::theme();
+                let head = {
+                    use bezel::ui::widgets::Status as _;
+                    bz.step_row(
+                        tool_status_icon(status, *is_error),
+                        SharedString::from(name.clone()),
+                        detail.map(SharedString::from),
+                        Some(SharedString::from(label)),
+                        *is_error,
+                        has_body.then_some(open),
                     )
-                    .children(detail.map(|d| {
-                        div()
-                            .debug_selector(|| "tool-detail".into())
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::TOOL_NAME_SIZE))
-                            .line_height(px(theme::TOOL_NAME_LINE))
-                            .text_color(theme::text_tertiary())
-                            .child(SharedString::from(d))
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(if *is_error {
-                                theme::danger()
-                            } else {
-                                theme::text_tertiary()
-                            })
-                            .child(label),
-                    );
+                    .id(SharedString::from(format!("tool-{tool_id}")))
+                }
+                .when(has_body, |d| {
+                    let tid = tool_id.clone();
+                    let shell = state.shell.clone();
+                    d.cursor_pointer()
+                        .debug_selector(|| "tool-head".into())
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                                let tid = tid.clone();
+                                shell.update(cx, |shell, cx| {
+                                    shell.transcript.update(cx, |t, cx| {
+                                        if !t.open_tools.remove(&tid) {
+                                            t.open_tools.insert(tid.clone());
+                                        }
+                                        t.remeasure_tool(&tid);
+                                        cx.notify();
+                                    });
+                                });
+                            }
+                        })
+                });
                 div()
                     .debug_selector(|| "tool-row".into())
                     .pt(px(theme::SPACE_2))
@@ -9599,9 +11914,11 @@ impl Shell {
                     .child(head)
                     .children(open.then(|| {
                         // Opened: what it was asked, and what came back.
-                        // Both verbatim, both bounded, each labelled —
-                        // an unlabelled pair of blobs would make the
-                        // reader guess which is which.
+                        // Both verbatim, both bounded, each labelled — an
+                        // unlabelled pair of blobs would make the reader
+                        // guess which is which. bezel's `step_output` is
+                        // the plate; the label above it stays eave's,
+                        // because bezel has no slot for one.
                         let mut parts: Vec<(&str, String)> = Vec::new();
                         if !input.trim().is_empty() {
                             parts
@@ -9620,16 +11937,10 @@ impl Shell {
                             .flex_col()
                             .gap(px(theme::SPACE_1))
                             .children(parts.into_iter().map(|(label, body)| {
+                                use bezel::ui::widgets::Status as _;
                                 div()
-                                    .rounded(px(theme::RADIUS_CODE))
-                                    .border_1()
-                                    .border_color(theme::border())
-                                    .bg(theme::inset())
-                                    .px(px(theme::SPACE_2))
-                                    .py(px(theme::SPACE_1))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(theme::SPACE_1))
                                     .child(
                                         div()
                                             .text_size(px(theme::MICRO_SIZE))
@@ -9638,30 +11949,18 @@ impl Shell {
                                             .text_color(theme::text_tertiary())
                                             .child(label),
                                     )
-                                    .child(
-                                        div()
-                                            .font_family(theme::MONO)
-                                            .text_size(px(theme::DETAIL_SIZE))
-                                            .line_height(px(theme::SMALL_LINE))
-                                            .text_color(theme::text_secondary())
-                                            .child(SharedString::from(body)),
-                                    )
+                                    .child(bz.step_output(
+                                        SharedString::from(format!("tool-out-{tool_id}-{label}")),
+                                        SharedString::from(body),
+                                    ))
                             }))
                     }))
                     .children(failure.map(|f| {
+                        use bezel::ui::widgets::Status as _;
                         div()
+                            .debug_selector(|| "tool-failure".into())
                             .ml(px(theme::TOOL_INDENT))
-                            .rounded(px(theme::RADIUS_CODE))
-                            .border_1()
-                            .border_color(theme::border())
-                            .bg(theme::inset())
-                            .px(px(theme::SPACE_2))
-                            .py(px(theme::SPACE_1))
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::DETAIL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_secondary())
-                            .child(SharedString::from(f))
+                            .child(bz.error_strip(SharedString::from(f)))
                     }))
                     .into_any_element()
             }
@@ -10772,8 +13071,9 @@ impl Shell {
     /// is also the corner least likely to cover the top of a page's own
     /// content. It is a sibling of the page inside the well's `relative`
     /// box, so it needs no anchoring and cannot disturb any layout.
-    fn find_bar(&self, cx: &App) -> Option<AnyElement> {
+    fn find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let tab = self.find_here(cx)?;
+        let caret_lit = self.caret_lit(Field::Find, cx);
         let state = crate::web::find_state(&tab);
         let tally = state.tally();
         let empty = state.query.is_empty();
@@ -10817,6 +13117,10 @@ impl Shell {
                             state.query.clone()
                         }),
                 )
+                // The find bar had no caret at all before this slice, which
+                // made it the one field in eave where "where am I typing"
+                // had no answer on screen even in principle.
+                .child(caret_glyph("find", caret_lit))
                 // **The tally is absent, not blank, when there is nothing
                 // to say.** An empty slot reserved for a number is a
                 // surface claiming it knows something it does not — see
@@ -11058,6 +13362,405 @@ impl Shell {
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_page_menu(cx)),
         )
     }
+
+    fn open_tab_menu(&mut self, tab_id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        let target = match &self.split {
+            Some(s) if s.contains(tab_id) => TabMenuTarget::Split {
+                left: s.left.clone(),
+                right: s.right.clone(),
+            },
+            _ => TabMenuTarget::Tab(tab_id.to_string()),
+        };
+        self.open_tab_menu_at(TabMenu { target, at }, cx);
+    }
+
+    fn open_tab_menu_at(&mut self, req: TabMenu, cx: &mut Context<Self>) {
+        let enabled = self
+            .tab_menu_entries(&req, cx)
+            .iter()
+            .map(TabMenuEntry::enabled)
+            .collect();
+        let now = cx.background_executor().now();
+        self.tab_menu.open(req, enabled, now);
+        cx.notify();
+    }
+
+    fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.tab_menu.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.tab_menu.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn tab_menu_entries(&self, req: &TabMenu, cx: &App) -> Vec<TabMenuEntry> {
+        match &req.target {
+            TabMenuTarget::Tab(id) => self.single_tab_menu(id, cx),
+            TabMenuTarget::Split { left, right } => self.split_tab_menu(left, right, cx),
+        }
+    }
+
+    fn single_tab_menu(&self, tab_id: &str, cx: &App) -> Vec<TabMenuEntry> {
+        let snapshot = self.strip_snapshot(cx);
+        let tab = snapshot.tabs.iter().find(|t| t.id == tab_id);
+        let is_session =
+            tab.is_some_and(|t| matches!(t.content, eave_wire::TabContent::Session { .. }));
+        let has_url = tab
+            .and_then(|t| t.url.as_deref())
+            .is_some_and(|u| !u.is_empty());
+        let partner = self.split_partner_for(tab_id, cx);
+        let below = {
+            let order = strip::cycle_order(&snapshot);
+            order
+                .iter()
+                .position(|id| id == tab_id)
+                .is_some_and(|ix| ix + 1 < order.len())
+        };
+
+        let copy = MenuItem::new("Copy Link").trailing("⇧⌘C");
+        let share = MenuItem::new("Share").trailing("›");
+        let mute = MenuItem::new("Mute").disabled();
+        let rename = MenuItem::new("Rename…");
+        let add_split = MenuItem::new("Add Split View");
+        let dup = MenuItem::new("Duplicate");
+        let mov = MenuItem::new("Move to").trailing("›").disabled();
+        let archive = MenuItem::new("Archive Tab");
+        let below_item = MenuItem::new("Archive Tabs Below");
+
+        vec![
+            TabMenuEntry::Action(
+                TabMenuAction::CopyLink,
+                if has_url { copy } else { copy.disabled() },
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::Share,
+                if has_url { share } else { share.disabled() },
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::Mute, mute),
+            TabMenuEntry::Action(
+                TabMenuAction::Rename,
+                if is_session {
+                    rename
+                } else {
+                    rename.disabled()
+                },
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(
+                TabMenuAction::AddSplit,
+                if partner.is_some() {
+                    add_split
+                } else {
+                    add_split.disabled()
+                },
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::Duplicate,
+                if has_url { dup } else { dup.disabled() },
+            ),
+            TabMenuEntry::Action(TabMenuAction::MoveTo, mov),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::ArchiveTab, archive),
+            TabMenuEntry::Action(
+                TabMenuAction::ArchiveBelow,
+                if below {
+                    below_item
+                } else {
+                    below_item.disabled()
+                },
+            ),
+        ]
+    }
+
+    fn split_tab_menu(&self, left: &str, right: &str, cx: &App) -> Vec<TabMenuEntry> {
+        let snapshot = self.strip_snapshot(cx);
+        let label = |id: &str| {
+            snapshot
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| {
+                    t.title
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| t.url.as_deref().map(eave_wire::typing_form))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "New tab".into())
+                })
+                .unwrap_or_else(|| "Tab".into())
+        };
+        let any_url = snapshot.tabs.iter().any(|t| {
+            (t.id == left || t.id == right) && t.url.as_deref().is_some_and(|u| !u.is_empty())
+        });
+        let vertical = self.split.as_ref().is_some_and(|s| s.vertical);
+        let convert = if vertical {
+            "Convert to Horizontal Split View"
+        } else {
+            "Convert to Vertical Split View"
+        };
+        let left_label = elide(&label(left), 28);
+        let right_label = elide(&label(right), 28);
+        let share = MenuItem::new("Share Split View…");
+        let dup = MenuItem::new("Duplicate");
+        let mov = MenuItem::new("Move to").trailing("›").disabled();
+        let below = {
+            let order = strip::cycle_order(&snapshot);
+            let last = order
+                .iter()
+                .rposition(|id| id == left || id == right)
+                .unwrap_or(0);
+            last + 1 < order.len()
+        };
+
+        vec![
+            TabMenuEntry::Action(
+                TabMenuAction::ShareSplit,
+                if any_url { share } else { share.disabled() },
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::Separate, MenuItem::new("Separate All Tabs")),
+            TabMenuEntry::Action(TabMenuAction::AddTab, MenuItem::new("Add Tab…")),
+            TabMenuEntry::Action(TabMenuAction::ConvertAxis, MenuItem::new(convert)),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Header("Tab Options"),
+            TabMenuEntry::Action(
+                TabMenuAction::SplitMember(left.to_string()),
+                MenuItem::new(left_label).trailing("›"),
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::SplitMember(right.to_string()),
+                MenuItem::new(right_label).trailing("›"),
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(
+                TabMenuAction::Duplicate,
+                if any_url { dup } else { dup.disabled() },
+            ),
+            TabMenuEntry::Action(TabMenuAction::MoveTo, mov),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::ArchiveItem, MenuItem::new("Archive Item")),
+            TabMenuEntry::Action(
+                TabMenuAction::ArchiveBelow,
+                if below {
+                    MenuItem::new("Archive Tabs Below")
+                } else {
+                    MenuItem::new("Archive Tabs Below").disabled()
+                },
+            ),
+        ]
+    }
+
+    fn split_partner_for(&self, tab_id: &str, cx: &App) -> Option<String> {
+        let snapshot = self.strip_snapshot(cx);
+        let this_session = snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == tab_id && matches!(t.content, eave_wire::TabContent::Session { .. }));
+        for id in strip::cycle_order(&snapshot) {
+            if id == tab_id {
+                continue;
+            }
+            let other_session = snapshot
+                .tabs
+                .iter()
+                .any(|t| t.id == id && matches!(t.content, eave_wire::TabContent::Session { .. }));
+            if this_session && other_session {
+                continue;
+            }
+            return Some(id);
+        }
+        None
+    }
+
+    fn run_tab_menu(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(req) = self.tab_menu.data().cloned() else {
+            return;
+        };
+        let entries = self.tab_menu_entries(&req, cx);
+        let Some(TabMenuEntry::Action(action, item)) = entries.get(ix) else {
+            return;
+        };
+        if !item.enabled {
+            return;
+        }
+        let action = action.clone();
+        let tab_id = match &req.target {
+            TabMenuTarget::Tab(id) => id.clone(),
+            TabMenuTarget::Split { left, right } => self
+                .strip_snapshot(cx)
+                .active
+                .clone()
+                .filter(|a| a == left || a == right)
+                .unwrap_or_else(|| left.clone()),
+        };
+        match action {
+            TabMenuAction::CopyLink | TabMenuAction::Share => {
+                if let Some(url) = self.tab_url(&tab_id, cx) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                }
+            }
+            TabMenuAction::Mute | TabMenuAction::MoveTo => {}
+            TabMenuAction::Rename => {
+                if let Some(sid) = self.session_id_for_tab(&tab_id, cx) {
+                    self.begin_rename(sid, cx);
+                }
+            }
+            TabMenuAction::AddSplit => {
+                if let Some(partner) = self.split_partner_for(&tab_id, cx) {
+                    self.split_tabs(&partner, &tab_id, true, cx);
+                }
+            }
+            TabMenuAction::Duplicate => {
+                if let Some(url) = self.tab_url(&tab_id, cx) {
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                        url,
+                        activate: true,
+                    }));
+                }
+            }
+            TabMenuAction::ArchiveTab => self.close_tab(&tab_id, cx),
+            TabMenuAction::ArchiveBelow => self.archive_tabs_below(&tab_id, cx),
+            TabMenuAction::ShareSplit => {
+                let urls: Vec<String> = match &req.target {
+                    TabMenuTarget::Split { left, right } => [left.as_str(), right.as_str()]
+                        .into_iter()
+                        .filter_map(|id| self.tab_url(id, cx))
+                        .collect(),
+                    TabMenuTarget::Tab(_) => Vec::new(),
+                };
+                if !urls.is_empty() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(urls.join("\n")));
+                }
+            }
+            TabMenuAction::Separate => {
+                self.split = None;
+                cx.notify();
+            }
+            TabMenuAction::AddTab => self.new_tab(cx),
+            TabMenuAction::ConvertAxis => {
+                if let Some(s) = self.split.as_mut() {
+                    s.vertical = !s.vertical;
+                    cx.notify();
+                }
+            }
+            TabMenuAction::SplitMember(id) => {
+                self.open_tab_menu_at(
+                    TabMenu {
+                        target: TabMenuTarget::Tab(id),
+                        at: req.at,
+                    },
+                    cx,
+                );
+                return;
+            }
+            TabMenuAction::ArchiveItem => {
+                if let TabMenuTarget::Split { left, right } = req.target {
+                    self.split = None;
+                    self.close_tab(&left, cx);
+                    self.close_tab(&right, cx);
+                }
+            }
+        }
+        self.close_tab_menu(cx);
+    }
+
+    fn tab_url(&self, tab_id: &str, cx: &App) -> Option<String> {
+        self.strip_snapshot(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.url.clone())
+            .filter(|u| !u.is_empty())
+    }
+
+    fn session_id_for_tab(&self, tab_id: &str, cx: &App) -> Option<String> {
+        self.strip_snapshot(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| match &t.content {
+                eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
+                _ => None,
+            })
+    }
+
+    fn archive_tabs_below(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let order = strip::cycle_order(&self.strip_snapshot(cx));
+        let Some(ix) = order.iter().position(|id| id == tab_id) else {
+            return;
+        };
+        let rest: Vec<String> = order.into_iter().skip(ix + 1).collect();
+        for id in rest {
+            self.close_tab(&id, cx);
+        }
+    }
+
+    fn tab_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let req = self.tab_menu.data()?.clone();
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let live = self.tab_menu.is_open();
+        let highlighted = self.tab_menu.highlighted();
+        let rows = self
+            .tab_menu_entries(&req, cx)
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| match entry {
+                TabMenuEntry::Separator => overlay::menu_separator(),
+                TabMenuEntry::Header(label) => overlay::menu_header(*label),
+                TabMenuEntry::Action(action, item) => {
+                    let tag = tab_menu_tag(action);
+                    div()
+                        .debug_selector(move || format!("tab-menu-{tag}"))
+                        .child(overlay::menu_row(
+                            ix,
+                            item,
+                            highlighted == Some(ix),
+                            live,
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.run_tab_menu(ix, cx)
+                            }),
+                        ))
+                        .into_any_element()
+                }
+            })
+            .collect();
+        overlay::menu_layer(
+            &self.tab_menu,
+            req.at,
+            now,
+            reduced,
+            rows,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_tab_menu(cx)),
+        )
+    }
+}
+
+fn tab_menu_tag(action: &TabMenuAction) -> &'static str {
+    match action {
+        TabMenuAction::CopyLink => "copy-link",
+        TabMenuAction::Share => "share",
+        TabMenuAction::Mute => "mute",
+        TabMenuAction::Rename => "rename",
+        TabMenuAction::AddSplit => "add-split",
+        TabMenuAction::Duplicate => "duplicate",
+        TabMenuAction::MoveTo => "move-to",
+        TabMenuAction::ArchiveTab => "archive-tab",
+        TabMenuAction::ArchiveBelow => "archive-below",
+        TabMenuAction::ShareSplit => "share-split",
+        TabMenuAction::Separate => "separate",
+        TabMenuAction::AddTab => "add-tab",
+        TabMenuAction::ConvertAxis => "convert-axis",
+        TabMenuAction::SplitMember(_) => "member",
+        TabMenuAction::ArchiveItem => "archive-item",
+    }
 }
 
 /// How much of a selection the `Search for "…"` row shows.
@@ -11189,6 +13892,17 @@ impl Shell {
     }
 
     fn launch(&mut self, cx: &mut Context<Self>) {
+        // Slice T1 — if the launcher is up because a blank ⌘T tab is
+        // active, the session that comes back belongs in THAT tab. Noted
+        // here and consumed in `reconcile_strip`, because the session does
+        // not exist yet: `Command::Launch` is a request and the rail
+        // answers it later.
+        {
+            let snapshot = &self.web_tabs.read(cx).snapshot;
+            *self.launched_from_tab.borrow_mut() = strip::active_is_blank_page(snapshot)
+                .then(|| snapshot.active.clone())
+                .flatten();
+        }
         let p = self.provider();
         let _ = self.commands.send(Command::Launch {
             provider: p.id.to_string(),
@@ -11761,7 +14475,13 @@ fn composer_hint(pending: usize, has_draft: bool, overflow: usize) -> String {
     } else if overflow > 0 {
         format!("{} files per send — {overflow} not attached", attach::MAX)
     } else if has_draft {
-        "return to send".into()
+        // Slice CM: shift-return is named because it is the one affordance in
+        // the composer with no other way to be found. A multi-line draft is
+        // newly possible, and an operator who does not know the chord will
+        // conclude the composer cannot do it — the same reason the hint's own
+        // doc gives for spending the line only on things the reader can act on
+        // right now.
+        "return to send · shift-return for a line".into()
     } else {
         String::new()
     }
@@ -12025,6 +14745,27 @@ impl Render for Shell {
         let strip_snapshot = self.web_tabs.read(cx).snapshot.clone();
         self.reconcile_strip(&strip_snapshot, cx);
 
+        let shown_pages: Vec<String> = {
+            let mut ids = Vec::new();
+            let mut push_page = |id: &str| {
+                if strip_snapshot
+                    .tabs
+                    .iter()
+                    .any(|t| t.id == id && t.content == eave_wire::TabContent::Page)
+                {
+                    ids.push(id.to_string());
+                }
+            };
+            if let Some(s) = &self.split {
+                push_page(&s.left);
+                push_page(&s.right);
+            } else if let Some(a) = strip_snapshot.active.as_deref() {
+                push_page(a);
+            }
+            ids
+        };
+        crate::web::set_shown_pages(shown_pages);
+
         let page_el = {
             let active = strip_snapshot.active.clone();
             active.and_then(|id| crate::web::page_element(&id, cx))
@@ -12041,10 +14782,29 @@ impl Render for Shell {
         // or the transcript renders under a page tab — an agent's
         // conversation sitting where a document was asked for.
         let active_is_page = strip::active_is_page(&strip_snapshot);
-        let showing_page = page_el.is_some() || active_is_page;
+        let showing_page = self.split.is_some() || page_el.is_some() || active_is_page;
+        // Slice T1 — ⌘T's tab before anything has been typed into it.
+        //
+        // A page tab that has never been anywhere owns the well like any
+        // other page tab, and until now what it drew there was
+        // `PAGE_STARTING` — "the browser exists and this tab has not been
+        // handed one yet". True, and useless: the operator did not ask for
+        // a browser, they asked for somewhere to start. So the well gets
+        // the launcher instead, which is the surface that already answers
+        // *which agent, in which folder*.
+        //
+        // **Never in a split.** A split is two tabs sharing the well by the
+        // operator's explicit act; putting the launcher over half of it
+        // would take away the arrangement they just made.
+        let blank_page =
+            active_is_page && self.split.is_none() && strip::active_is_blank_page(&strip_snapshot);
         // What the well says when a page tab is active and nothing can draw
         // it. Two different absences, and only one of them is eave's fault.
-        let page_absence: Option<&'static str> = if page_el.is_some() || !active_is_page {
+        let page_absence: Option<&'static str> = if blank_page {
+            // The launcher is taking this well. Saying "starting the page"
+            // underneath it would be two answers to one question.
+            None
+        } else if page_el.is_some() || !active_is_page {
             None
         } else if crate::web::available() {
             // The browser exists and this tab has not been handed one yet.
@@ -12082,7 +14842,19 @@ impl Render for Shell {
         // tab and shows over a page). But an explicit "shown over a page,
         // because X" is a fine answer too. The unacceptable answer is not
         // having considered it.
-        let caret_lit = self.caret_lit(cx);
+        // Two asks, because the two boxes are drawn by different passes and
+        // the rail's takes `&Context`. They cannot disagree: at most one
+        // field owns the keyboard, so at most one of these is ever true.
+        let caret_lit = self.caret_lit(Field::Composer, cx);
+        let rename_caret_lit = self.caret_lit(Field::Rename, cx);
+        // Slice CM: the blink is decided once for the window (see `caret_lit`)
+        // and handed down. The field does not ask, because asking would mean a
+        // second lease on the pulse clock and a second reason for an idle
+        // window to keep redrawing — the exact thing N1 exists to prevent.
+        let composer_field = self.composer.read(cx).field.clone();
+        composer_field.update(cx, |f, _| {
+            f.set_caret_alpha(if caret_lit { 1.0 } else { 0.0 });
+        });
         // Slice N3: ONE ask for the whole window, here in the root
         // render pass. The shell decides once whether anything is
         // mid-flight, takes one lease on the pulse clock for it, and
@@ -12105,7 +14877,7 @@ impl Render for Shell {
         // empty log (the Stage E cosmetic bug), only when follow is broken.
         let show_affordance = state.scroll != ScrollMode::Follow && !state.display.is_empty();
         let rail_collapsed = self.sessions.read(cx).collapsed;
-        let composer_text = self.composer.read(cx).text.clone();
+        let composer_text = self.composer.read(cx).field.read(cx).content().to_string();
         let attachments = self.composer.read(cx).attachments.clone();
         let overflow = self.composer.read(cx).overflow;
         let has_text = !composer_text.is_empty();
@@ -12153,7 +14925,20 @@ impl Render for Shell {
         // belong over it. This was photographed drawing straight through
         // example.com: the launcher's occlusion assumption was written when
         // the only thing it could ever cover was an empty transcript.
-        let show_launcher = state.session_id.is_none() && !showing_page;
+        // Slice T1 adds the second way to reach the launcher: a blank page
+        // tab. The first — no session selected and no page — is unchanged.
+        let show_launcher = (state.session_id.is_none() && !showing_page) || blank_page;
+        // **The one mount decision**, used twice: to put the composer in the
+        // tree at the bottom of this function, and to decide whether its field
+        // may hold the keyboard (`sync_composer_focus`, called below once the
+        // transcript borrow has ended). Two expressions would be two chances
+        // to disagree, and the way they fail is silent.
+        //
+        // The two slices compose rather than collide: a blank ⌘T tab raises
+        // the launcher, which unmounts the composer — which is what a blank
+        // tab wants, and what T1's own harness asserts by checking `send` is
+        // absent there.
+        let composer_mounted = !show_launcher && !showing_page;
         let launch_error = state.launch_error.clone();
         let empty_state: Option<EmptyState> = if !state.display.is_empty() {
             None
@@ -12173,6 +14958,11 @@ impl Render for Shell {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
         })
         .size_full();
+
+        // Here rather than beside `composer_mounted` above: that read of the
+        // transcript is still borrowed at that point, and this needs `cx`
+        // mutably to move focus.
+        self.sync_composer_focus(composer_mounted, window, cx);
 
         let composer = Self::column(frost(
             theme::RADIUS_COMPOSER,
@@ -12204,55 +14994,26 @@ impl Render for Shell {
                         .min_h(px(theme::COMPOSER_MIN_H))
                         .px(px(theme::SPACE_1))
                         .pt(px(theme::SPACE_HALF))
+                        // **Slice CM.** These three lines are why the vendored
+                        // field draws no box of its own: `TextFieldElement`
+                        // shapes against `window.text_style()`, so it inherits
+                        // eave's rank and leading from right here. A field that
+                        // set its own would have painted 13.0/18.0 inside a
+                        // surface that had already said 13.5/22.0.
                         .text_size(px(theme::BODY_SIZE))
                         .line_height(px(theme::COMPOSER_LINE))
                         .text_color(theme::text())
-                        .child(if has_text {
-                            // The blink is a COLOUR-ONLY run split, never a
-                            // glyph swap and never a sibling element. The
-                            // caret has to stay inside the text so it wraps
-                            // with it, and cosmic-text's `Attrs::compatible`
-                            // ignores colour — so the two runs shape as one
-                            // contiguous string and the layout is byte-
-                            // identical whether the caret is lit or not.
-                            // (Same property the streaming veil relies on;
-                            // `VeiledBlock::text_runs`.)
-                            let caret = "▏";
-                            let font = gpui::font(theme::SANS);
-                            let run = |len: usize, color: Hsla| TextRun {
-                                len,
-                                font: font.clone(),
-                                color,
-                                background_color: None,
-                                underline: None::<UnderlineStyle>,
-                                strikethrough: None::<StrikethroughStyle>,
-                            };
-                            let runs = vec![
-                                run(composer_text.len(), theme::text()),
-                                run(
-                                    caret.len(),
-                                    theme::text().opacity(if caret_lit { 1.0 } else { 0.0 }),
-                                ),
-                            ];
-                            div()
-                                .debug_selector(|| "composer-text".into())
-                                .child(
-                                    StyledText::new(format!("{composer_text}{caret}"))
-                                        .with_runs(runs),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .flex()
-                                .flex_row()
-                                .child(div().text_color(theme::text()).child("▏"))
-                                .child(
-                                    div()
-                                        .text_color(theme::text_tertiary())
-                                        .child("Message eave…"),
-                                )
-                                .into_any_element()
-                        }),
+                        // The composer's caret is drawn INSIDE the text field
+                        // (Slice CM), so unlike the other three it is not an
+                        // element a test can find. The state is put on its
+                        // mount instead, for the same reason `caret_glyph`
+                        // puts it in a selector: `ui_harness` cannot read
+                        // colour, and an alpha nobody can assert is a blink
+                        // with no test under it.
+                        .debug_selector(move || {
+                            format!("caret-composer-{}", if caret_lit { "lit" } else { "dark" })
+                        })
+                        .child(composer_field),
                 )
                 .child(
                     div()
@@ -12482,6 +15243,7 @@ impl Render for Shell {
             self.open_page_menu(req, cx);
         }
         let page_menu_layer = self.page_menu_layer(cx);
+        let tab_menu_layer = self.tab_menu_layer(cx);
         let find_bar = self.find_bar(cx);
         // Slice Q2, built here for the same reason: the launcher and its
         // model menu both need `self` and `cx`, and the element chain
@@ -12528,6 +15290,22 @@ impl Render for Shell {
             .text_size(px(theme::BODY_SIZE))
             .line_height(px(theme::BODY_LINE))
             .track_focus(&self.focus)
+            // ── Slice CM: the blink anchor, moved to the capture phase ────
+            //
+            // §1.20's rule is that **any** key resets the anchor, not just the
+            // ones that change the text — backspacing to empty, a rejected
+            // ⌘-chord, an arrow key are all "the typist is still here", and a
+            // caret that blinked through them would be flashing at somebody
+            // actively using the composer.
+            //
+            // That rule used to be enforced inside `on_key`, which was fine
+            // while every key arrived there. It no longer does: backspace and
+            // the arrows are matched actions now, and a matched action fires
+            // **before** the bubble-phase listener — so the anchor would have
+            // stopped resetting on exactly the keys §1.20 names. The capture
+            // phase runs before both, which is the only place that still sees
+            // all of them.
+            .capture_key_down(cx.listener(Self::note_keystroke))
             .on_key_down(cx.listener(Self::on_key))
             // Slice K: answering is a real action with a real binding, not
             // a character the composer happens not to want.
@@ -12551,6 +15329,35 @@ impl Render for Shell {
             // Slice E1. Mounted on the root beside the strip's own
             // chords, and every one of them is a no-op unless the active
             // tab is a page — see `Shell::active_page`.
+            // ── Slice CM ──────────────────────────────────────────
+            //
+            // Return, and the four keys the `/` palette borrows. All five are
+            // scoped to a context the composer's field claims, so they are
+            // dispatched only when it has focus — and `SLASH_*` only while the
+            // palette is up, which is what gives `up`/`down` back to the caret
+            // the rest of the time.
+            .on_action(cx.listener(|this, _: &SendMessage, _, cx| this.composer_enter(cx)))
+            .on_action(cx.listener(|this, _: &SlashNext, _, cx| {
+                this.slash.popup.highlight_next();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SlashPrev, _, cx| {
+                this.slash.popup.highlight_prev();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SlashAccept, _, cx| {
+                // Complete to the top match — the classic gesture, and the one
+                // that does not make the operator press down first just to
+                // accept what is already highlighted in front of them.
+                this.choose_slash(this.slash.popup.highlighted().unwrap_or(0), cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlashDismiss, _, cx| {
+                // Refusal, not a text edit: the draft is left exactly as typed.
+                // Escape must never be the only way to close a menu AND a way
+                // to lose what you wrote.
+                this.slash.dismissed = true;
+                this.close_slash_palette(cx);
+            }))
             .on_action(cx.listener(|this, _: &FindInPage, _, cx| this.find_in_page(cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1, cx)))
@@ -12595,6 +15402,46 @@ impl Render for Shell {
                     .min_w(px(0.))
                     .flex()
                     .flex_row()
+                    // **The rail resize lives HERE, not on the handle
+                    // (Slice D3).** `on_drag_move` fires in the CAPTURE
+                    // phase for whatever the pointer is over, so it has to be
+                    // bound to a box the pointer stays inside — the frame
+                    // row — rather than to the 8 px column it grabbed. The
+                    // handle only starts the drag.
+                    .on_drag_move(cx.listener(
+                        |this, e: &DragMoveEvent<RailResize>, _window, cx| {
+                            let Some(drag) = this.rail_drag else {
+                                return;
+                            };
+                            let w = drag.start_w + (f32::from(e.event.position.x) - drag.grab_x);
+                            let w = clamp_rail_w(w);
+                            // Only notify on an actual change: a drag emits a
+                            // move per frame even when the pointer has not
+                            // crossed a pixel, and a notify per frame is the
+                            // defect N4's idle floor exists to prevent.
+                            if (w - this.rail_w).abs() >= 0.5 {
+                                this.rail_w = w;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    // The drag's END, and the only place the width is
+                    // written. Per-move writes would put ~120 file writes
+                    // through one 4 px adjustment; a drag is one decision.
+                    //
+                    // If a release ever lands outside the window and this is
+                    // missed, the width still holds for the run and simply is
+                    // not saved — a preference that fails to persist, not a
+                    // frame that breaks.
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                            if this.rail_drag.take().is_some() {
+                                save_rail_w(this.rail_w);
+                                cx.notify();
+                            }
+                        }),
+                    )
                     // **Collapsed means GONE, on the operator's ruling
                     // (2026-08-21): "i dont want the border on left side or
                     // on top on menu close. we should close to full screen
@@ -12610,7 +15457,9 @@ impl Render for Shell {
                     // supposed to be a space for tabs when the sidebar was
                     // closed but idk about it now"), so this slice does not
                     // answer it — it gets the borders out of the way.
-                    .when(!rail_collapsed, |d| d.child(self.rail(cx, pulse)))
+                    .when(!rail_collapsed, |d| {
+                        d.child(self.rail(cx, pulse, rename_caret_lit))
+                    })
                     .child(
                         // Content is a floating card on the window surface:
                         // uniform gutter, rounded, darker than the glass.
@@ -12620,150 +15469,186 @@ impl Render for Shell {
                             .flex_1()
                             .min_w(px(0.))
                             .p(px(theme::CARD_GUTTER))
-                            .child(content_card(
-                                div()
-                                    .debug_selector(|| "content-well".into())
-                                    .size_full()
-                                    .overflow_hidden()
-                                    .rounded(px(theme::RADIUS_PANEL))
-                                    .flex()
-                                    .flex_col()
-                                    // The one line that says what this region is, and
-                                    // — for a page — where it is. See
-                                    // `Shell::pane_header`.
-                                    .child(self.pane_header(cx, rail_collapsed))
-                                    .child(
-                                        // Stage H glass: the list's viewport runs
-                                        // the full column height and the composer
-                                        // stack FLOATS over it (content passes
-                                        // beneath the frost when scrolled; the
-                                        // trailing spacer keeps Follow's newest
-                                        // row above the glass).
-                                        div()
-                                            .flex_1()
-                                            .min_h(px(0.))
-                                            .relative()
-                                            // Slice M: the log dissolves into the
-                                            // well's edges instead of ending on a
-                                            // hard cut. LOG_TOP_PAD moved INSIDE
-                                            // the faded wrapper on purpose — it
-                                            // is the resting pad the top band is
-                                            // sized to (TRANSCRIPT_FADE_BAND_TOP),
-                                            // so scroll-top stays fully opaque and
-                                            // only content actually scrolling away
-                                            // fades. Not gated on scroll state:
-                                            // comet gated theirs and got a report
-                                            // of the top staying unfaded for one
-                                            // frame on every session switch. The
-                                            // floating chrome below is a SIBLING,
-                                            // outside the scope — the pill and the
-                                            // composer must not fade along with
-                                            // the content they occlude.
-                                            // The page takes the well when a web
-                                            // tab is active. No `edge_faded`
-                                            // wrapper on it: that fade exists to
-                                            // dissolve a SCROLLING LOG into the
-                                            // well's edges, and a page scrolls
-                                            // itself — fading its top and bottom
-                                            // would dim content the page believes
-                                            // is fully visible.
-                                            .children(page_el)
-                                            // Slice E1. **Shown over a page, and
-                                            // only over a page** — the
-                                            // occlusion rule answered at
-                                            // birth. It is allowed to
-                                            // because it is ABOUT the page
-                                            // underneath it; see
-                                            // `Shell::find_bar`. A sibling
-                                            // of the page inside this
-                                            // `relative` box, so it needs no
-                                            // anchoring and can disturb no
-                                            // layout.
-                                            .children(find_bar)
-                                            // Slice C5. A page tab with nothing to
-                                            // draw says which of the two absences
-                                            // it is, rather than showing an empty
-                                            // well or — worse — the transcript.
-                                            // Over the page, on purpose: the
-                                            // page behind it is STOPPED on
-                                            // this question and nothing else
-                                            // on screen would say so.
-                                            .children(page_dialog_el)
-                                            .children(page_absence.map(|note| {
-                                                div()
-                                                    .debug_selector(|| "page-absence".into())
-                                                    .absolute()
-                                                    .inset_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_size(px(theme::BODY_SIZE))
-                                                    .text_color(theme::text_secondary())
-                                                    .child(note)
-                                            }))
-                                            .when(!showing_page, |d| {
-                                                d.child(
-                                            edge_faded(
-                                                theme::TRANSCRIPT_FADE_BAND_TOP,
-                                                true,
-                                                true,
-                                                div()
-                                                    .size_full()
-                                                    .pt(px(theme::LOG_TOP_PAD))
-                                                    .child(transcript_el),
-                                            )
-                                            .band_top(theme::TRANSCRIPT_FADE_BAND_TOP)
-                                            .band_bottom(theme::TRANSCRIPT_FADE_BAND_BOTTOM),
-                                        )
-                                            })
-                                            // Slice M (§3.2): an overlay, so it is
-                                            // outside both the fade scope and the
-                                            // virtualized list and can never touch
-                                            // a row height. Held above the
-                                            // composer's clearance so it is never
-                                            // read through the frost.
-                                            //
-                                            // Slice AN kept the slot exactly and
-                                            // replaced what sits in it; the
-                                            // reasoning above is why the slot is
-                                            // the right one for a card too.
-                                            .children(empty_el)
-                                            // Slice Q2 — the launcher, in exactly
-                                            // the slot the note it replaced used:
-                                            // an overlay outside both the fade
-                                            // scope and the virtualized list, so
-                                            // it can never touch a row height.
-                                            .children(launcher_el)
-                                            // Slice C5 — the omnibox. **Shown over
-                                            // a page, deliberately**, and the only
-                                            // floating surface in this file for
-                                            // which that is the answer: it is about
-                                            // the page. See `Shell::omnibox_layer`
-                                            // for how it composites, which is the
-                                            // CEF spike's `BackdropBlur` finding
-                                            // cashed in for the first time.
-                                            //
-                                            // In this slot rather than in the
-                                            // bottom stack because it belongs to
-                                            // the TAB, and the bottom stack is
-                                            // agent chrome — everything in it is
-                                            // suppressed over a page for exactly
-                                            // the reason this is not.
-                                            .children(omnibox_el)
-                                            .when(show_affordance && !showing_page, |d| {
-                                                // §1.6, 180 ms. comet approximates a
-                                                // `scale 0.96→1` with fade + a 2 px
-                                                // rise because gpui divs have no
-                                                // scale transform at the pinned rev.
-                                                // The rise rides the ABSOLUTE inset
-                                                // here rather than a relative one —
-                                                // an absolutely positioned box moves
-                                                // nothing else by definition.
-                                                let t = motion::entrance_t(
-                                                    "in:to-bottom",
-                                                    motion::DIALOG_IN,
-                                                );
-                                                d.child(
+                            .child(content_card({
+                                if let Some(split) = self.split.clone() {
+                                    self.render_split_well(
+                                        &split,
+                                        rail_collapsed,
+                                        transcript_el.into_any_element(),
+                                        composer.into_any_element(),
+                                        cx,
+                                    )
+                                } else {
+                                    div()
+                                        .debug_selector(|| "content-well".into())
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .rounded(px(theme::RADIUS_PANEL))
+                                        .flex()
+                                        .flex_col()
+                                        .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                                            let on_right = this.well_drop_is_right(window, cx);
+                                            this.drop_tab_on_well(&drag.id, on_right, cx);
+                                        }))
+                                        .drag_over::<TabDrag>(|style, _, _, _| {
+                                            style.bg(theme::overlay())
+                                        })
+                                        // The one line that says what this region is, and
+                                        // — for a page — where it is. See
+                                        // `Shell::pane_header`.
+                                        .child(self.pane_header(
+                                            cx,
+                                            rail_collapsed,
+                                            None,
+                                            true,
+                                            true,
+                                            "pane-header",
+                                        ))
+                                        // Slice T1 — the bookmarks bar,
+                                        // under the header and above the
+                                        // page, on a page tab only.
+                                        //
+                                        // The WHOLE well, not each half of
+                                        // a split: a split's two panes each
+                                        // carry their own `pane_header`,
+                                        // and two bookmarks bars showing
+                                        // one bar's worth of bookmarks
+                                        // would read as two different sets.
+                                        .children(self.bookmarks_bar(showing_page, cx))
+                                        .child(
+                                            // Stage H glass: the list's viewport runs
+                                            // the full column height and the composer
+                                            // stack FLOATS over it (content passes
+                                            // beneath the frost when scrolled; the
+                                            // trailing spacer keeps Follow's newest
+                                            // row above the glass).
+                                            div()
+                                                .flex_1()
+                                                .min_h(px(0.))
+                                                .relative()
+                                                // Slice M: the log dissolves into the
+                                                // well's edges instead of ending on a
+                                                // hard cut. LOG_TOP_PAD moved INSIDE
+                                                // the faded wrapper on purpose — it
+                                                // is the resting pad the top band is
+                                                // sized to (TRANSCRIPT_FADE_BAND_TOP),
+                                                // so scroll-top stays fully opaque and
+                                                // only content actually scrolling away
+                                                // fades. Not gated on scroll state:
+                                                // comet gated theirs and got a report
+                                                // of the top staying unfaded for one
+                                                // frame on every session switch. The
+                                                // floating chrome below is a SIBLING,
+                                                // outside the scope — the pill and the
+                                                // composer must not fade along with
+                                                // the content they occlude.
+                                                // The page takes the well when a web
+                                                // tab is active. No `edge_faded`
+                                                // wrapper on it: that fade exists to
+                                                // dissolve a SCROLLING LOG into the
+                                                // well's edges, and a page scrolls
+                                                // itself — fading its top and bottom
+                                                // would dim content the page believes
+                                                // is fully visible.
+                                                .children(page_el)
+                                                // Slice E1. **Shown over a page,
+                                                // and only over a page** — the
+                                                // occlusion rule, answered at
+                                                // birth. It is allowed to sit
+                                                // there because it is ABOUT the
+                                                // page underneath it; see
+                                                // `Shell::find_bar`. A sibling
+                                                // of the page inside this
+                                                // `relative` box, so it needs no
+                                                // anchoring and disturbs no
+                                                // layout.
+                                                .children(find_bar)
+                                                // Slice C5. A page tab with nothing to
+                                                // draw says which of the two absences
+                                                // it is, rather than showing an empty
+                                                // well or — worse — the transcript.
+                                                // Over the page, on purpose: the
+                                                // page behind it is STOPPED on
+                                                // this question and nothing else
+                                                // on screen would say so.
+                                                .children(page_dialog_el)
+                                                .children(page_absence.map(|note| {
+                                                    div()
+                                                        .debug_selector(|| "page-absence".into())
+                                                        .absolute()
+                                                        .inset_0()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(theme::BODY_SIZE))
+                                                        .text_color(theme::text_secondary())
+                                                        .child(note)
+                                                }))
+                                                .when(!showing_page, |d| {
+                                                    d.child(
+                                                        edge_faded(
+                                                            theme::TRANSCRIPT_FADE_BAND_TOP,
+                                                            true,
+                                                            true,
+                                                            div()
+                                                                .size_full()
+                                                                .pt(px(theme::LOG_TOP_PAD))
+                                                                .child(transcript_el),
+                                                        )
+                                                        .band_top(theme::TRANSCRIPT_FADE_BAND_TOP)
+                                                        .band_bottom(
+                                                            theme::TRANSCRIPT_FADE_BAND_BOTTOM,
+                                                        ),
+                                                    )
+                                                })
+                                                // Slice M (§3.2): an overlay, so it is
+                                                // outside both the fade scope and the
+                                                // virtualized list and can never touch
+                                                // a row height. Held above the
+                                                // composer's clearance so it is never
+                                                // read through the frost.
+                                                //
+                                                // Slice AN kept the slot exactly and
+                                                // replaced what sits in it; the
+                                                // reasoning above is why the slot is
+                                                // the right one for a card too.
+                                                .children(empty_el)
+                                                // Slice Q2 — the launcher, in exactly
+                                                // the slot the note it replaced used:
+                                                // an overlay outside both the fade
+                                                // scope and the virtualized list, so
+                                                // it can never touch a row height.
+                                                .children(launcher_el)
+                                                // Slice C5 — the omnibox. **Shown over
+                                                // a page, deliberately**, and the only
+                                                // floating surface in this file for
+                                                // which that is the answer: it is about
+                                                // the page. See `Shell::omnibox_layer`
+                                                // for how it composites, which is the
+                                                // CEF spike's `BackdropBlur` finding
+                                                // cashed in for the first time.
+                                                //
+                                                // In this slot rather than in the
+                                                // bottom stack because it belongs to
+                                                // the TAB, and the bottom stack is
+                                                // agent chrome — everything in it is
+                                                // suppressed over a page for exactly
+                                                // the reason this is not.
+                                                .children(omnibox_el)
+                                                .when(show_affordance && !showing_page, |d| {
+                                                    // §1.6, 180 ms. comet approximates a
+                                                    // `scale 0.96→1` with fade + a 2 px
+                                                    // rise because gpui divs have no
+                                                    // scale transform at the pinned rev.
+                                                    // The rise rides the ABSOLUTE inset
+                                                    // here rather than a relative one —
+                                                    // an absolutely positioned box moves
+                                                    // nothing else by definition.
+                                                    let t = motion::entrance_t(
+                                                        "in:to-bottom",
+                                                        motion::DIALOG_IN,
+                                                    );
+                                                    d.child(
                                             div()
                                                 .absolute()
                                                 .opacity(t)
@@ -12819,57 +15704,60 @@ impl Render for Shell {
                                                         .child("bottom"),
                                                 )),
                                         )
-                                            })
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .bottom_0()
-                                                    .left_0()
-                                                    .right_0()
-                                                    .pb(px(theme::SPACE_3))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .children(self.conn_panel(cx))
-                                                    // Everything from here down is
-                                                    // AGENT chrome — a notice about
-                                                    // a session, its working
-                                                    // trailer, its `/` palette, its
-                                                    // composer. **None of it belongs
-                                                    // over a web page.** A prompt
-                                                    // box floating on somebody
-                                                    // else's document is not a
-                                                    // browser; the agent's surfaces
-                                                    // live on the agent's tab. The
-                                                    // connection panel above stays:
-                                                    // it is about the engine, and it
-                                                    // is true whichever tab is open.
-                                                    .children(notice.filter(|_| !showing_page))
-                                                    .children(trailer.filter(|_| !showing_page))
-                                                    // Slice AR — the `/` palette,
-                                                    // an ordinary sibling directly
-                                                    // above the composer. See
-                                                    // `Shell::slash_layer` for why
-                                                    // this is not `menu_layer`.
-                                                    .children(slash_layer.filter(|_| !showing_page))
-                                                    // Slice Q2: no session, no
-                                                    // composer. A draft typed at
-                                                    // the launcher has nothing to
-                                                    // be addressed to — the rest
-                                                    // loop drops a `Send` because
-                                                    // holding it to replay into
-                                                    // whatever opens next would be
-                                                    // worse — so an input that
-                                                    // silently eats what you type
-                                                    // is the one thing this must
-                                                    // not be.
-                                                    .children(
-                                                        (!show_launcher && !showing_page)
-                                                            .then_some(composer),
-                                                    ),
-                                            ),
-                                    )
-                                    .when(!showing_page, |d| d.child(self.footer(cx))),
-                            )),
+                                                })
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .bottom_0()
+                                                        .left_0()
+                                                        .right_0()
+                                                        .pb(px(theme::SPACE_3))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .children(self.conn_panel(cx))
+                                                        // Everything from here down is
+                                                        // AGENT chrome — a notice about
+                                                        // a session, its working
+                                                        // trailer, its `/` palette, its
+                                                        // composer. **None of it belongs
+                                                        // over a web page.** A prompt
+                                                        // box floating on somebody
+                                                        // else's document is not a
+                                                        // browser; the agent's surfaces
+                                                        // live on the agent's tab. The
+                                                        // connection panel above stays:
+                                                        // it is about the engine, and it
+                                                        // is true whichever tab is open.
+                                                        .children(notice.filter(|_| !showing_page))
+                                                        .children(trailer.filter(|_| !showing_page))
+                                                        // Slice AR — the `/` palette,
+                                                        // an ordinary sibling directly
+                                                        // above the composer. See
+                                                        // `Shell::slash_layer` for why
+                                                        // this is not `menu_layer`.
+                                                        .children(
+                                                            slash_layer.filter(|_| !showing_page),
+                                                        )
+                                                        // Slice Q2: no session, no
+                                                        // composer. A draft typed at
+                                                        // the launcher has nothing to
+                                                        // be addressed to — the rest
+                                                        // loop drops a `Send` because
+                                                        // holding it to replay into
+                                                        // whatever opens next would be
+                                                        // worse — so an input that
+                                                        // silently eats what you type
+                                                        // is the one thing this must
+                                                        // not be.
+                                                        .children(
+                                                            composer_mounted.then_some(composer),
+                                                        ),
+                                                ),
+                                        )
+                                        .when(!showing_page, |d| d.child(self.footer(cx)))
+                                        .into_any_element()
+                                }
+                            })),
                     ),
             )
             // Slice P1: the overlay layer mounts at the ROOT and nowhere
@@ -12888,7 +15776,8 @@ impl Render for Shell {
             // a virtualized list. Last, so that a page menu opened while
             // something else is up is the thing on top — it was opened by
             // the most recent act.
-            .children(page_menu_layer);
+            .children(page_menu_layer)
+            .children(tab_menu_layer);
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
         // claims this frame during the pass above; the root asks once, here,
@@ -13111,7 +16000,12 @@ pub fn run(data_dir: PathBuf) -> ! {
     // an `Application`-level concern and gpui exposes no `App` setter — which
     // is why the harness renders every glyph as empty coverage (icons.rs).
     application()
-        .with_assets(icons::Icons)
+        // Slice BZ: both icon sets through one source — gpui takes only one,
+        // and a bezel component whose glyph does not resolve draws an empty
+        // square rather than failing. eave's set wins a shared name. Kept
+        // after the tool-row revert because it is the seam any later adoption
+        // needs, and rebuilding it is the expensive half of trying again.
+        .with_assets(crate::bezel_theme::Assets)
         .run(move |cx: &mut App| {
             let queues = Arc::new(Queues::default());
             let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
@@ -13323,6 +16217,29 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         .map(|v| v == "10k")
         .unwrap_or(false);
 
+    // ── Slice CM: the field's editing keys, FIRST ─────────────────────
+    //
+    // Motion, selection, word jumps, undo, cut and copy, all scoped to the
+    // field's own context so they are inert anywhere else in the shell.
+    //
+    // **The order of these two calls is load-bearing.** gpui resolves a chord
+    // to the deepest matching context, and when two bindings match at the SAME
+    // depth the one registered LATER wins. The composer's field claims
+    // `TextArea` and — while the `/` palette is up — `EaveSlashPalette`, both
+    // on one node, so `down` matches twice: vertical caret motion from here,
+    // and the palette's highlight from eave's block below. eave's must be
+    // registered second or the palette cannot steer.
+    //
+    // That is the whole mechanism behind "borrow the key and give it back":
+    // outside the palette's lifetime `EaveSlashPalette` is not in the context
+    // stack at all, so the field's binding is the only match and `down` is a
+    // caret again. Nothing needs to unbind anything.
+    //
+    // Two chords are deliberately NOT bound by that call — `enter` and `cmd-v`,
+    // delta items 10 and 9. Both have exactly one reader in eave, and leaving
+    // bezel's binding in place would have made *this ordering* decide which,
+    // where here the ordering is stated and tested.
+    crate::text_field::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         // ── Slice C5 ──────────────────────────────────────────────────
@@ -13412,7 +16329,30 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // gpui pin has no Minimize/Close variants (see `app_menus`).
         KeyBinding::new("cmd-m", crate::app_menus::Minimize, None),
         KeyBinding::new("cmd-h", crate::app_menus::Hide, None),
+        // ── Slice CM: the composer's own chords ───────────────────────
+        //
+        // Return sends and shift-Return breaks a line, and both are scoped to
+        // `COMPOSER_KEY_CONTEXT` so they are inert in every other field eave
+        // ever grows. `text_field::init` below binds the field's editing keys;
+        // this pair is the app's, and it is deliberately bound **here** rather
+        // than left to that call, because a component library that decided what
+        // Return meant in somebody's composer would be overreaching.
+        KeyBinding::new("enter", SendMessage, Some(COMPOSER_KEY_CONTEXT)),
+        KeyBinding::new(
+            "shift-enter",
+            crate::text_field::InsertNewline,
+            Some(COMPOSER_KEY_CONTEXT),
+        ),
+        // The four the `/` palette borrows. `SLASH_KEY_CONTEXT` is claimed by
+        // the field only while the palette is live, so outside that window
+        // `up`/`down` are the field's vertical caret motion and `tab` is
+        // whatever gpui's focus order makes it.
+        KeyBinding::new("down", SlashNext, Some(SLASH_KEY_CONTEXT)),
+        KeyBinding::new("up", SlashPrev, Some(SLASH_KEY_CONTEXT)),
+        KeyBinding::new("tab", SlashAccept, Some(SLASH_KEY_CONTEXT)),
+        KeyBinding::new("escape", SlashDismiss, Some(SLASH_KEY_CONTEXT)),
     ]);
+
     cx.on_action(|_: &Quit, cx| {
         // **The page engine has to stop BEFORE gpui terminates, and it can
         // only stop on the pump's stack.** `cx.quit()` defers
@@ -13443,6 +16383,13 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     // `set_menus`, so without this `NSApp.mainMenu` is nil and the
     // auto-hidden system bar has nothing to reveal.
     crate::app_menus::init(cx); // handlers only — the bar goes in last
+
+    // Slice BZ: bezel's Theme global, built from `theme.rs`. Installed in
+    // `bootstrap` rather than in `run` for the reason the two lines around it
+    // give — the harness boots the same wiring production does, so a bezel
+    // component under test paints the tokens it will paint on screen. It must
+    // precede any bezel component's first paint; nothing here paints one yet.
+    crate::bezel_theme::install(cx);
 
     // Slice M (§1.22): honoured for the one animation eave has. gpui
     // applies this inside `with_animation` itself — a oneshot renders its
@@ -13481,6 +16428,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     let typeahead = cx.new(|_| TypeaheadState::default());
     let web_tabs = cx.new(|_| WebTabsState {
         snapshot: eave_wire::TabsSnapshot::default(),
+    });
+    let bookmarks = cx.new(|_| BookmarksState {
+        snapshot: eave_wire::BookmarksSnapshot::default(),
     });
     let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
     let transcript = cx.new(|_| {
@@ -13544,6 +16494,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let transcript = transcript.clone();
         let cmd_tx = cmd_tx.clone();
         let web_tabs = web_tabs.clone();
+        let bookmarks = bookmarks.clone();
         let typeahead = typeahead.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
@@ -13649,6 +16600,16 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 if let Some(snapshot) = tab_snapshots.into_iter().last() {
                     crate::web::drive(&snapshot);
                     web_tabs.update(cx, |state, cx| {
+                        state.snapshot = snapshot;
+                        cx.notify();
+                    });
+                }
+                // Slice T1. Same fold as the strip's: a bookmark burst is
+                // several states of one tree, and only the last is true.
+                let bookmark_snapshots: Vec<eave_wire::BookmarksSnapshot> =
+                    queues.bookmarks.lock().unwrap().drain(..).collect();
+                if let Some(snapshot) = bookmark_snapshots.into_iter().last() {
+                    bookmarks.update(cx, |state, cx| {
                         state.snapshot = snapshot;
                         cx.notify();
                     });
@@ -13759,7 +16720,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         });
                         if let Some((composer, key)) = moved {
                             composer.update(cx, |c, cx| {
-                                c.switch_to(key);
+                                c.switch_to(key, cx);
                                 cx.notify();
                             });
                         }
@@ -13788,14 +16749,26 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             },
             |window, cx| {
                 let shell = cx.new(|cx| {
-                    let composer = cx.new(|_| ComposerState {
-                        text: String::new(),
+                    let composer = cx.new(|cx| ComposerState {
+                        // Slice CM. `Grow { min: 1, max: 12 }` — one line at
+                        // rest, growing a line at a time and scrolling past a
+                        // dozen. The old composer was a wrapping `StyledText`
+                        // with no ceiling at all, which meant a pasted essay
+                        // could push the send button off the bottom of the
+                        // window; the max is the first thing this arrangement
+                        // fixes that nobody asked for.
+                        field: cx.new(|cx| {
+                            TextField::new(cx)
+                                .with_shape(crate::text_field::Shape::Grow { min: 1, max: 12 })
+                                .with_key_context(COMPOSER_KEY_CONTEXT)
+                                .with_placeholder("Message eave…")
+                                .with_debug_name("composer-text")
+                        }),
                         key: String::new(),
                         drafts: HashMap::new(),
                         attachments: Vec::new(),
                         parked_files: HashMap::new(),
                         overflow: 0,
-                        caret_anchor: None,
                     });
                     // Slice K: the approval card's buttons are built by a
                     // static row fn with no `Context`, so give the transcript
@@ -13808,25 +16781,52 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         t.composer = Some(composer.clone());
                         t.shell = Some(weak_shell);
                     });
+                    // ── Slice CM ──────────────────────────────────
+                    //
+                    // The `/` palette is a **projection of the composer's
+                    // text** (Slice AR), and it used to be re-derived from the
+                    // typing arm in `on_key`. That arm is gone — characters
+                    // reach the field through the platform's input handler now
+                    // — so the projection watches the field instead.
+                    //
+                    // Better than the arm it replaces, not merely equivalent:
+                    // it fires for every way the text can change, including the
+                    // ones nobody could do before. Undo back over a `/`,
+                    // select a word and type through it, drag a selection —
+                    // each re-derives the palette, where the old handler only
+                    // knew about a keystroke arriving.
+                    cx.observe(
+                        &composer.read(cx).field.clone(),
+                        |shell: &mut Shell, _, cx| {
+                            shell.sync_slash_palette(cx);
+                        },
+                    )
+                    .detach();
                     cx.observe(&conn, |_, _, cx| cx.notify()).detach();
                     cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();
                     cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                     cx.observe(&web_tabs, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&bookmarks, |_, _, cx| cx.notify()).detach();
                     cx.observe(&typeahead, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
                         demo: DemoOverlay::default(),
                         rename: None,
+                        caret: Cell::new(None),
                         launcher: LauncherUi::default(),
                         files_wait_since: Cell::new(None),
                         slash: SlashPalette::default(),
                         omni: Omnibox::default(),
                         dialog_text: None,
                         page_menu: Popup::default(),
+                        tab_menu: Popup::default(),
                         typeahead: typeahead.clone(),
                         asked_for_session_tab: RefCell::new(HashSet::new()),
+                        asked_for_project: RefCell::new(HashSet::new()),
+                        launched_from_tab: RefCell::new(None),
+                        bookmark_folder_open: RefCell::new(None),
                         asked_to_select: RefCell::new(None),
                         closed_pages: VecDeque::new(),
                         conn: conn.clone(),
@@ -13836,6 +16836,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         composer,
                         thumbs: HashMap::new(),
                         web_tabs: web_tabs.clone(),
+                        bookmarks: bookmarks.clone(),
                         commands: cmd_tx.clone(),
                         perf: perf_10k.then(|| PerfProbe {
                             frame_times: Vec::new(),
@@ -13849,6 +16850,14 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         friction_gen: 0,
                         friction_path_stated: false,
                         rail_scroll: ScrollHandle::new(),
+                        // Read once, here, rather than per frame: the file is
+                        // the launch value and the shell is the live one from
+                        // then on. A per-frame read would also make an
+                        // external edit fight the pointer mid-drag.
+                        rail_w: load_rail_w(),
+                        rail_drag: None,
+                        split: None,
+                        split_drag: None,
                         files_scroll: ScrollHandle::new(),
                         tabs_scroll: ScrollHandle::new(),
                         tab_scrolled_to: RefCell::new(None),
@@ -14688,7 +17697,10 @@ mod tests {
             "the composer is still captioning an action nobody can take — \
              `send_current` emits nothing on an empty draft"
         );
-        assert_eq!(composer_hint(0, true, 0), "return to send");
+        assert_eq!(
+            composer_hint(0, true, 0),
+            "return to send · shift-return for a line"
+        );
 
         for drafting in [false, true] {
             let warned = composer_hint(2, drafting, 0);

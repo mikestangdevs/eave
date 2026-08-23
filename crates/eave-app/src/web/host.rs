@@ -214,12 +214,31 @@ pub fn request_pump() {
     }
 }
 
+/// Pump CEF on this stack.
+///
+/// The async pump task lives on gpui's executor, which does not run while
+/// AppKit is inside a live-resize tracking loop (`NSEventTrackingRunLoopMode`).
+/// `PageSurface::paint` therefore calls this after `WasResized` so Chromium
+/// can layout on the same frames the window is changing size. Re-entrant
+/// calls are a no-op: nesting `CefDoMessageLoopWork` is forbidden, and the
+/// in-flight pump already re-posts via [`REQUESTED_DURING_PUMP`].
+pub fn pump_now() {
+    if !running() {
+        return;
+    }
+    if IN_PUMP.load(Ordering::SeqCst) {
+        REQUESTED_DURING_PUMP.store(true, Ordering::SeqCst);
+        return;
+    }
+    pump_cef();
+}
+
 /// Mark the page as busy, so the pump stays fast for a moment.
 pub fn note_activity() {
     ACTIVE_UNTIL.store(now_ms() + BUSY_TAIL_MS, Ordering::Relaxed);
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -364,6 +383,16 @@ pub fn start_pump(cx: &mut gpui::App) {
                 // main-queue work like any other and still has to be run.
                 cx.update(|app| app.quit());
             }
+            // Slice E3's eviction clock, read HERE and not on snapshots:
+            // the pump ticks whether or not anything changed, which is the
+            // property a clock needs. It runs BEFORE `pump_cef` because a
+            // close it asks for is work CEF has to be pumped to finish, and
+            // that pump is on the next line rather than a tick away.
+            //
+            // No borrow is held across it, for the same reason nothing else
+            // here holds one: it closes browsers, and closing a browser
+            // runs `on_before_close` synchronously on this stack.
+            super::evict::tick();
             pump_cef();
             refresh_if_painted(cx);
         }
@@ -452,40 +481,34 @@ fn pump_cef() {
 fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
     // Two reasons to redraw, one gate. A frame arriving is the obvious
     // one; the chrome changing is the one added with the display handler,
-    // because a cursor crossing a link boundary, a status bubble appearing,
-    // a find tally moving from "3 of 17" to "4 of 17" or a right-click menu
-    // opening is a real change that may deliver no frame at all. Both
-    // counters move on an EVENT and not on a clock, so the "never on vsync"
-    // property is unchanged.
+    // because a cursor crossing a link boundary or a status bubble
+    // appearing is a real change that may deliver no frame at all. Both
+    // counters move on an EVENT and not on a clock, so the "never on
+    // vsync" property is unchanged.
     //
     // The two counters are PACKED, not mixed: frames in the low 32 bits,
     // chrome revisions in the high 32. A hash of the pair could collide and
     // silently drop a redraw; a pack cannot until one of them passes 2^32,
     // which at 60 Hz is eight centuries of frames.
     //
-    // `CHROME_DIRTY` is the second way in, from Slice E1: a one-shot flag
-    // for callers that change something drawn about the page without owning
-    // a revision counter. Taken with `swap` so it is consumed exactly once.
-    // Two mechanisms rather than one because they answer to different
-    // owners — the display handler counts revisions, the find and menu
-    // paths raise a flag — and either alone would leave the other's changes
-    // on the screen a frame late.
-    let chrome_dirty = CHROME_DIRTY.swap(false, Ordering::Relaxed);
-    let frames = super::osr::frames_delivered();
-    let seen = (super::tabs::chrome_revision() << 32) | (frames & 0xffff_ffff);
+    // Slice R1 merged E1's `CHROME_DIRTY` in ALONGSIDE the pack rather than
+    // choosing between them. They are not redundant: the pack covers chrome
+    // eave learned about FROM Chromium (a link hover, a status bubble), and
+    // the flag covers chrome eave decided on ITSELF (a find tally moving
+    // "3 of 17" to "4 of 17", a context menu opening) — which bumps no CEF
+    // revision and would otherwise wait for an unrelated frame.
+    let chrome = CHROME_DIRTY.swap(false, Ordering::Relaxed);
+    let seen =
+        (super::tabs::chrome_revision() << 32) | (super::osr::frames_delivered() & 0xffff_ffff);
     let last = LAST_REFRESHED.load(Ordering::Relaxed);
-    if seen == last && !chrome_dirty {
+    if seen == last && !chrome {
         return;
     }
-    // Whether the PAGE painted, as opposed to anything else having changed.
-    let painted = (last & 0xffff_ffff) != (frames & 0xffff_ffff);
+    // E1: only a real FRAME is activity. A chrome change is not, or an open
+    // find bar would hold the pump at `BUSY_MS` for as long as it is up.
+    let painted = (seen & 0xffff_ffff) != (last & 0xffff_ffff);
     LAST_REFRESHED.store(seen, Ordering::Relaxed);
     if painted {
-        // A page that is painting is a page that is doing something. A
-        // chrome change is not: it must not extend the busy tail, or an
-        // open find bar would hold the pump at `BUSY_MS` for as long as it
-        // is up. (Slice E1 — the earlier version noted activity on any
-        // change at all, which made an idle page with a find bar busy.)
         note_activity();
     }
     cx.update(|app| app.refresh_windows());
