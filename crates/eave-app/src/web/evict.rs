@@ -267,7 +267,8 @@ pub fn tick() {
             let mut s = s.borrow_mut();
             let mut victims: Vec<String> = Vec::new();
             for tab in snapshot.tabs.iter() {
-                let is_active = Some(tab.id.as_str()) == active;
+                let is_active =
+                    Some(tab.id.as_str()) == active || super::tabs::is_on_screen(&tab.id);
                 let seen = s.entry(tab.id.clone()).or_insert_with(|| Seen::new(now));
                 // The tab being looked at never ages, and this is the whole
                 // reason the clock is read on the pump rather than on

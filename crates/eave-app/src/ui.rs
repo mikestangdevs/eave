@@ -1950,6 +1950,24 @@ fn page_resident(tab_id: &str) -> bool {
 /// glass ground measures 2.55:1 at the bright end of the backdrop sweep, under
 /// the 3:1 a non-text mark owes its surface; on `chip_plate` it is 6.01:1 in
 /// every state.
+fn page_globe(id: &str, resident: bool) -> AnyElement {
+    icons::tagged_icon(
+        icons::GLOBAL,
+        12.0,
+        if resident {
+            theme::text_secondary_on_wash()
+        } else {
+            theme::text_tertiary()
+        },
+        if resident {
+            format!("tab-chip-{id}")
+        } else {
+            format!("tab-chip-unloaded-{id}")
+        },
+    )
+    .into_any_element()
+}
+
 fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
     div()
         // `RAIL_MARK`, not `PROVIDER_CHIP` (Slice D3). The rail row's leading
@@ -1965,38 +1983,31 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
         .items_center()
         .justify_center()
         .child(match &tab.kind {
-            // **The globe IS eave's favicon** — `PageFact::Favicon` is on
-            // the wire and nothing reports one, so there is no site mark to
-            // dim and this is the equivalent the directive asked for.
-            //
-            // Slice E3: a page eave is not holding draws it receded, and
-            // under a selector that NAMES the state. The ink alone would be
-            // the honest half and an untestable one — this harness asserts
-            // what it can find by `debug_selector`, not what colour it came
-            // out — so the state is in the selector too and the suite can
-            // hold the treatment to account.
-            strip::TabKind::Page => icons::tagged_icon(
-                icons::GLOBAL,
-                12.0,
-                if tab.resident {
-                    theme::text_secondary_on_wash()
-                } else {
-                    // One rung down the existing ladder rather than a new
-                    // token. `text_tertiary` reads **5.72:1** on
-                    // `chip_plate`, well clear of the 3.0 non-text floor,
-                    // and its "may not be drawn where a state wash can land
-                    // on it" restriction is satisfied here for the reason
-                    // the plate exists at all: the plate is OPAQUE, so the
-                    // row's hover and selection washes never reach the mark.
-                    theme::text_tertiary()
-                },
-                if tab.resident {
-                    format!("tab-chip-{id}")
-                } else {
-                    format!("tab-chip-unloaded-{id}")
-                },
-            )
-            .into_any_element(),
+            // A page's mark is its favicon when Chromium has given us a
+            // URL, and the globe when it has not — or when the image fails
+            // to decode. Session rows keep the provider chip. The globe
+            // selector stays on the fallback so an unloaded page still
+            // recedes under `tab-chip-unloaded-*`.
+            strip::TabKind::Page => {
+                let resident = tab.resident;
+                match crate::web::favicon_image(id) {
+                    Some(image) => div()
+                        .debug_selector({
+                            let id = id.to_string();
+                            move || format!("tab-favicon-{id}")
+                        })
+                        .size(px(theme::RAIL_MARK))
+                        .overflow_hidden()
+                        .rounded(px(theme::RADIUS_CHIP))
+                        .child(
+                            img(image)
+                                .size(px(theme::RAIL_MARK))
+                                .object_fit(ObjectFit::Contain),
+                        )
+                        .into_any_element(),
+                    None => page_globe(id, resident),
+                }
+            }
             strip::TabKind::Session { chip, .. } => {
                 let provider = chip
                     .as_ref()
@@ -4102,6 +4113,133 @@ impl Render for RailResize {
     }
 }
 
+/// Two tabs painted in one well. Shell-local: the engine still has one
+/// `active`; this is which two the card is showing.
+///
+/// Brave's `split_view` is two pages inside one tab. eave's tabs are
+/// already first-class (page *or* session), so the split is a VIEW of two
+/// existing tabs — which is what lets a page sit next to an agent, the
+/// thing the browser spec named as the reason eave wants this.
+#[derive(Clone, Debug)]
+struct Split {
+    left: String,
+    right: String,
+    /// Left (or top) pane as a fraction of the well. Clamped to
+    /// [`theme::SPLIT_RATIO_MIN`].
+    ratio: f32,
+    /// Top/bottom rather than left/right. The menu's "Convert to Vertical
+    /// Split View" is this bit, not a second split type.
+    vertical: bool,
+}
+
+impl Split {
+    fn contains(&self, id: &str) -> bool {
+        self.left == id || self.right == id
+    }
+
+    fn other(&self, id: &str) -> Option<&str> {
+        if self.left == id {
+            Some(self.right.as_str())
+        } else if self.right == id {
+            Some(self.left.as_str())
+        } else {
+            None
+        }
+    }
+}
+
+/// A split-divider drag in flight. Same shape as [`RailDrag`]: grab offset
+/// rather than snapping the seam to the cursor.
+#[derive(Clone, Copy, Debug)]
+struct SplitDrag {
+    grab_x: f32,
+    start_ratio: f32,
+    well_w: f32,
+}
+
+/// Payload type for the split divider. Carries nothing; geometry lives on
+/// the shell, for the same reason [`RailResize`] does.
+#[derive(Clone, Copy, Debug)]
+struct SplitResize;
+
+impl Render for SplitResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// A rail tab being dragged. Drop on another tab, or on the content well,
+/// opens a split; drop on itself is a no-op.
+#[derive(Clone, Debug)]
+struct TabDrag {
+    id: String,
+    title: String,
+}
+
+impl Render for TabDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .bg(theme::overlay_strong())
+            .text_size(px(theme::DETAIL_SIZE))
+            .text_color(theme::text())
+            .child(SharedString::from(self.title.clone()))
+    }
+}
+
+/// What a right-click on the strip opened a menu about.
+#[derive(Clone, Debug)]
+struct TabMenu {
+    target: TabMenuTarget,
+    at: Point<Pixels>,
+}
+
+#[derive(Clone, Debug)]
+enum TabMenuTarget {
+    /// One tab, not currently in a split.
+    Tab(String),
+    /// The combined pill: the two tabs in the well.
+    Split { left: String, right: String },
+}
+
+/// One choosable row on the tab menu. Separators and headers live beside
+/// these in the rendered list and are not actions.
+#[derive(Clone, Debug)]
+enum TabMenuAction {
+    CopyLink,
+    Share,
+    Mute,
+    Rename,
+    AddSplit,
+    Duplicate,
+    MoveTo,
+    ArchiveTab,
+    ArchiveBelow,
+    ShareSplit,
+    Separate,
+    AddTab,
+    ConvertAxis,
+    SplitMember(String),
+    ArchiveItem,
+}
+
+enum TabMenuEntry {
+    Action(TabMenuAction, MenuItem),
+    Separator,
+    Header(&'static str),
+}
+
+impl TabMenuEntry {
+    fn enabled(&self) -> bool {
+        match self {
+            TabMenuEntry::Action(_, item) => item.enabled,
+            _ => false,
+        }
+    }
+}
+
 struct Shell {
     focus: FocusHandle,
     conn: Entity<ConnectionState>,
@@ -4142,6 +4280,10 @@ struct Shell {
     /// a *choice in progress*, not a fact about anything, and it must survive
     /// the feed events that rebuild the rail underneath the pointer.
     rail_drag: Option<RailDrag>,
+    /// Two tabs in the well, or `None` for the ordinary single-tab card.
+    split: Option<Split>,
+    /// The split-divider drag in progress, or `None`.
+    split_drag: Option<SplitDrag>,
     /// Slice AS — the session-tab strip's scroll offset.
     ///
     /// Unlike the two above, this one is *written* as well as read: the
@@ -4213,6 +4355,10 @@ struct Shell {
     /// editable field), and that has to survive the menu's exit or the rows
     /// would empty out mid-fade.
     page_menu: Popup<crate::web::PageMenu>,
+    /// Right-click on a rail tab (or the combined split pill). Same
+    /// overlay machinery as the page menu; the rows are a function of
+    /// whether that tab is alone in the well or sharing it.
+    tab_menu: Popup<TabMenu>,
     /// Slice C5 — the last typeahead answer the engine sent.
     typeahead: Entity<TypeaheadState>,
     /// Slice C5 — the session this window has already asked to select on
@@ -5818,6 +5964,25 @@ impl Shell {
             }
             return;
         }
+        if self.tab_menu.is_open() {
+            match ks.key.as_str() {
+                "escape" => self.close_tab_menu(cx),
+                "down" => {
+                    self.tab_menu.highlight_next();
+                    cx.notify();
+                }
+                "up" => {
+                    self.tab_menu.highlight_prev();
+                    cx.notify();
+                }
+                "enter" => match self.tab_menu.highlighted() {
+                    Some(ix) => self.run_tab_menu(ix, cx),
+                    None => self.close_tab_menu(cx),
+                },
+                _ => {}
+            }
+            return;
+        }
         // Stage AC: an open rename field owns the keyboard, exactly the
         // way P1's menus above do, and for the same reason — a field you
         // can type past is not a field, and every key that fell through
@@ -6131,10 +6296,99 @@ impl Shell {
     /// actual state, never a UI-held selection — and it is what makes
     /// `TabsState::active` a single notion rather than a cache.
     fn activate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        // A split is a view of two tabs. Clicking a third one leaves it;
+        // clicking one of the two just focuses that pane.
+        if let Some(s) = &self.split {
+            if !s.contains(tab_id) {
+                self.split = None;
+            }
+        }
         let _ = self
             .commands
             .send(Command::Browser(BrowserCmd::Activate(tab_id.to_string())));
         cx.notify();
+    }
+
+    /// Put `dragged` beside `host` in the well.
+    ///
+    /// `dragged_on_right` is the drop: onto the right half of the well, or
+    /// onto a tab (the host stays left, the dragged tab opens to its right —
+    /// Arc's default). Two session tabs are refused: this shell has one
+    /// transcript subscription, and a second session pane would be a
+    /// caption over an empty log.
+    fn split_tabs(
+        &mut self,
+        dragged: &str,
+        host: &str,
+        dragged_on_right: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged == host {
+            return;
+        }
+        let snapshot = self.strip_snapshot(cx);
+        let kind = |id: &str| {
+            snapshot
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.content.clone())
+        };
+        let Some(a) = kind(dragged) else {
+            return;
+        };
+        let Some(b) = kind(host) else {
+            return;
+        };
+        if matches!(a, eave_wire::TabContent::Session { .. })
+            && matches!(b, eave_wire::TabContent::Session { .. })
+        {
+            return;
+        }
+        let (left, right) = if dragged_on_right {
+            (host.to_string(), dragged.to_string())
+        } else {
+            (dragged.to_string(), host.to_string())
+        };
+        self.split = Some(Split {
+            left,
+            right,
+            ratio: 0.5,
+            vertical: false,
+        });
+        self.activate_tab(dragged, cx);
+    }
+
+    /// Drop a tab onto the content well. The host is the tab already
+    /// showing in that half (the opposite pane of a split, or the active
+    /// tab when the well is single).
+    fn drop_tab_on_well(&mut self, dragged: &str, on_right: bool, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let host = if let Some(s) = &self.split {
+            if on_right {
+                s.left.clone()
+            } else {
+                s.right.clone()
+            }
+        } else {
+            match snapshot.active.clone() {
+                Some(id) if id != dragged => id,
+                _ => return,
+            }
+        };
+        self.split_tabs(dragged, &host, on_right, cx);
+    }
+
+    fn well_drop_is_right(&self, window: &Window, cx: &App) -> bool {
+        let x = f32::from(window.mouse_position().x);
+        let rail = if self.sessions.read(cx).collapsed {
+            0.0
+        } else {
+            self.rail_w
+        };
+        let well_left = rail + theme::CARD_GUTTER;
+        let well_w = f32::from(window.viewport_size().width) - well_left - theme::CARD_GUTTER;
+        x > well_left + well_w.max(1.0) * 0.5
     }
 
     /// Close a tab, and say where the strip should land.
@@ -6164,7 +6418,22 @@ impl Shell {
             }
         }
         let was_active = snapshot.active.as_deref() == Some(tab_id);
-        if was_active {
+        // Closing one side of a split leaves the other filling the card.
+        // Activate that other tab ourselves so the successor walk cannot
+        // land on a third tab and drop the one that was still on screen.
+        let mut skip_successor = false;
+        if let Some(s) = &self.split {
+            if s.contains(tab_id) {
+                if let Some(other) = s.other(tab_id) {
+                    let _ = self
+                        .commands
+                        .send(Command::Browser(BrowserCmd::Activate(other.to_string())));
+                    skip_successor = true;
+                }
+                self.split = None;
+            }
+        }
+        if was_active && !skip_successor {
             if let Some(next) = strip::successor(&snapshot, tab_id) {
                 let _ = self
                     .commands
@@ -6259,7 +6528,22 @@ impl Shell {
     /// answer comes back round as a snapshot. It is never pruned on close,
     /// which is the whole close-a-session-tab story — see the field.
     fn reconcile_strip(&self, snapshot: &eave_wire::TabsSnapshot, cx: &mut App) {
-        if let Some(session_id) = strip::active_session(snapshot) {
+        // A page+session split keeps the session subscribed even while the
+        // focused pane is the page — otherwise the transcript empties the
+        // moment you click the document.
+        let session_id = strip::active_session(snapshot).or_else(|| {
+            self.split.as_ref().and_then(|s| {
+                [&s.left, &s.right].into_iter().find_map(|id| {
+                    snapshot.tabs.iter().find_map(|t| match &t.content {
+                        eave_wire::TabContent::Session { session_id } if t.id == *id => {
+                            Some(session_id.clone())
+                        }
+                        _ => None,
+                    })
+                })
+            })
+        });
+        if let Some(session_id) = session_id {
             let showing = self.transcript.read(cx).session_id.clone();
             let mut asked = self.asked_to_select.borrow_mut();
             if showing.as_deref() == Some(session_id.as_str()) {
@@ -6828,25 +7112,292 @@ impl Shell {
     /// *structure that blurs reads as unanchored* — applies here in exactly
     /// the same words. A′'s glass is the composer and the omnibox dropdown:
     /// the two surfaces that genuinely float.
-    fn pane_header(&self, cx: &mut Context<Self>, rail_collapsed: bool) -> gpui::Div {
+    fn render_split_well(
+        &self,
+        split: &Split,
+        rail_collapsed: bool,
+        transcript_el: AnyElement,
+        composer: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
-        let active = snapshot
-            .active
-            .as_deref()
-            .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a));
+        let is_session = |id: &str| {
+            snapshot
+                .tabs
+                .iter()
+                .any(|t| t.id == id && matches!(t.content, eave_wire::TabContent::Session { .. }))
+        };
+        let (left_tr, right_tr, left_co, right_co) = if is_session(&split.left) {
+            (Some(transcript_el), None, Some(composer), None)
+        } else if is_session(&split.right) {
+            (None, Some(transcript_el), None, Some(composer))
+        } else {
+            (None, None, None, None)
+        };
+        div()
+            .debug_selector(|| "split-well".into())
+            .size_full()
+            .overflow_hidden()
+            .flex()
+            .when(split.vertical, |d| d.flex_col())
+            .when(!split.vertical, |d| d.flex_row())
+            .on_drag_move(
+                cx.listener(|this, e: &DragMoveEvent<SplitResize>, _window, cx| {
+                    let Some(drag) = this.split_drag else {
+                        return;
+                    };
+                    let Some(split) = this.split.as_mut() else {
+                        return;
+                    };
+                    let pos = if split.vertical {
+                        f32::from(e.event.position.y)
+                    } else {
+                        f32::from(e.event.position.x)
+                    };
+                    let delta = (pos - drag.grab_x) / drag.well_w;
+                    let r = (drag.start_ratio + delta)
+                        .clamp(theme::SPLIT_RATIO_MIN, 1.0 - theme::SPLIT_RATIO_MIN);
+                    if (r - split.ratio).abs() >= 0.002 {
+                        split.ratio = r;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                    if this.split_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                let on_right = this.well_drop_is_right(window, cx);
+                this.drop_tab_on_well(&drag.id, on_right, cx);
+            }))
+            .child(self.split_pane(
+                &split.left,
+                "left",
+                split.ratio,
+                true,
+                false,
+                rail_collapsed,
+                left_tr,
+                left_co,
+                cx,
+            ))
+            .child(self.split_handle(split.vertical, cx))
+            .child(self.split_pane(
+                &split.right,
+                "right",
+                1.0 - split.ratio,
+                false,
+                true,
+                rail_collapsed,
+                right_tr,
+                right_co,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn split_handle(&self, vertical: bool, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id("split-handle")
+            .debug_selector(|| "split-handle".into())
+            .flex_none()
+            .when(vertical, |d| {
+                d.h(px(theme::RAIL_HANDLE_W)).w_full().cursor_row_resize()
+            })
+            .when(!vertical, |d| {
+                d.w(px(theme::RAIL_HANDLE_W)).h_full().cursor_col_resize()
+            })
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                    let Some(s) = this.split.as_ref() else {
+                        return;
+                    };
+                    let rail = if this.sessions.read(cx).collapsed {
+                        0.0
+                    } else {
+                        this.rail_w
+                    };
+                    let well_w = if s.vertical {
+                        f32::from(window.viewport_size().height)
+                            - 2.0 * theme::CARD_GUTTER
+                            - theme::RAIL_HANDLE_W
+                    } else {
+                        f32::from(window.viewport_size().width)
+                            - rail
+                            - 2.0 * theme::CARD_GUTTER
+                            - theme::RAIL_HANDLE_W
+                    };
+                    this.split_drag = Some(SplitDrag {
+                        grab_x: if s.vertical {
+                            f32::from(e.position.y)
+                        } else {
+                            f32::from(e.position.x)
+                        },
+                        start_ratio: s.ratio,
+                        well_w: well_w.max(1.0),
+                    });
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(SplitResize, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| SplitResize)
+            })
+            .into_any_element()
+    }
+
+    fn split_pane(
+        &self,
+        tab_id: &str,
+        side: &'static str,
+        ratio: f32,
+        show_rail: bool,
+        show_files: bool,
+        rail_collapsed: bool,
+        transcript_el: Option<AnyElement>,
+        composer: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let snapshot = self.strip_snapshot(cx);
+        let is_page = snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == tab_id && t.content == eave_wire::TabContent::Page);
+        let page_el = if is_page {
+            crate::web::page_element(tab_id, cx)
+        } else {
+            None
+        };
+        let find = self
+            .find_here(cx)
+            .filter(|t| t == tab_id)
+            .and_then(|_| self.find_bar(cx));
+        let absence: Option<&'static str> = if page_el.is_some() || !is_page {
+            None
+        } else if crate::web::available() {
+            Some(PAGE_STARTING)
+        } else {
+            Some(PAGE_NO_ENGINE)
+        };
+        let header_tag = if side == "left" {
+            "pane-header-left"
+        } else {
+            "pane-header-right"
+        };
+        let activate = tab_id.to_string();
+        let drop_id = tab_id.to_string();
+        let on_right = side == "right";
+        let is_focused = snapshot.active.as_deref() == Some(tab_id);
+        div()
+            .id(SharedString::from(format!("split-pane-{side}")))
+            .debug_selector(move || format!("split-pane-{side}"))
+            .flex()
+            .flex_col()
+            // `flex_basis(0)` so the grow factors ARE the pane sizes.
+            // With the default auto basis, a pane whose CEF frame had not
+            // reflowed yet kept its old content width and the other pane
+            // ate the leftover — the well moved, only one page did.
+            .flex_basis(px(0.))
+            .flex_grow(ratio)
+            .flex_shrink(1.)
+            .min_w(px(0.))
+            .h_full()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_PANEL))
+            // Always a 1 px border, colour only changes: a ring that
+            // appeared on focus would shrink the page by 2 px and fire
+            // another WasResized. Same reason the rail's selection rim
+            // is an inset shadow rather than a border.
+            .border_1()
+            .border_color(if is_focused {
+                theme::pane_focus_ring()
+            } else {
+                gpui::transparent_black()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.activate_tab(&activate, cx);
+                }),
+            )
+            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                cx.stop_propagation();
+                this.split_tabs(&drag.id, &drop_id, on_right, cx);
+            }))
+            .child(self.pane_header(
+                cx,
+                rail_collapsed,
+                Some(tab_id),
+                show_rail,
+                show_files,
+                header_tag,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .relative()
+                    .overflow_hidden()
+                    .children(page_el)
+                    .children(find)
+                    .children(absence.map(|note| {
+                        div()
+                            .debug_selector(|| "page-absence".into())
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::BODY_SIZE))
+                            .text_color(theme::text_secondary())
+                            .child(note)
+                    }))
+                    .children(transcript_el.map(|el| {
+                        div()
+                            .size_full()
+                            .pt(px(theme::LOG_TOP_PAD))
+                            .child(el)
+                            .into_any_element()
+                    }))
+                    .children(composer),
+            )
+            .into_any_element()
+    }
+
+    fn pane_header(
+        &self,
+        cx: &mut Context<Self>,
+        rail_collapsed: bool,
+        for_tab: Option<&str>,
+        show_rail: bool,
+        show_files: bool,
+        tag: &'static str,
+    ) -> gpui::Div {
+        let snapshot = self.strip_snapshot(cx);
+        let wanted = for_tab.or(snapshot.active.as_deref());
+        let active = wanted.and_then(|a| snapshot.tabs.iter().find(|t| t.id == a));
 
         // This strip is the card's top, inside the radius. Shut, the card
         // starts at CARD_GUTTER, so the pad is what the traffic lights need
         // minus that gutter — they sit at a fixed window position either
-        // way. Open, the rail already covers them.
-        let lead = if rail_collapsed {
+        // way. Open, the rail already covers them. Only the LEFT-most
+        // header (the one that also carries the rail toggle) keeps that
+        // clearance; a right split pane sits away from the lights.
+        let lead = if rail_collapsed && show_rail {
             theme::TRAFFIC_CLEARANCE - theme::CARD_GUTTER
         } else {
             theme::SPACE_3
         };
 
         let row = div()
-            .debug_selector(|| "pane-header".into())
+            .debug_selector(move || tag.into())
             .w_full()
             .h(px(theme::PANE_HEADER_H))
             .flex_none()
@@ -6856,11 +7407,6 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(theme::SPACE_2));
-
-        // The files toggle rides the trailing edge in EVERY arm, so it does
-        // not move when the active tab's kind changes. Built here rather than
-        // appended per-arm for the same reason.
-        let files = self.files_toggle(cx);
 
         // **The rail toggle lives HERE, not in the rail — and the test is
         // what found that out.** The first cut of this change put it in the
@@ -6874,7 +7420,7 @@ impl Shell {
         // thing it closes.
         let rail = self.rail_toggle(cx);
 
-        let row = row.child(rail);
+        let row = if show_rail { row.child(rail) } else { row };
 
         match active.map(|t| (t, t.content.clone())) {
             // ── a page: the browser toolbar ──────────────────────────────
@@ -6887,99 +7433,120 @@ impl Shell {
                     .as_deref()
                     .map(eave_wire::typing_form)
                     .filter(|t| !t.is_empty());
-                row.child(self.nav_arrow("nav-back", icons::ALT_ARROW_LEFT, back, -1, cx))
-                    .child(self.nav_arrow("nav-fwd", icons::ALT_ARROW_RIGHT, fwd, 1, cx))
-                    .child(
-                        div()
-                            .id("nav-reload")
-                            .debug_selector(|| "nav-reload".into())
-                            .flex_none()
-                            .size(px(theme::ICON_TOGGLE))
-                            .rounded(px(theme::RADIUS_BUTTON))
-                            .when(has_url, |d| {
-                                d.cursor_pointer()
-                                    .hover_fade("nav-reload", theme::wash_rest(), theme::overlay())
-                                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icons::tagged_icon(
-                                icons::REFRESH,
-                                theme::ICON_SM,
-                                if has_url {
+                let tab_id = tab.id.clone();
+                let back_tag = if tag == "pane-header" {
+                    "nav-back".to_string()
+                } else {
+                    format!("nav-back-{tab_id}")
+                };
+                let fwd_tag = if tag == "pane-header" {
+                    "nav-fwd".to_string()
+                } else {
+                    format!("nav-fwd-{tab_id}")
+                };
+                row.child(self.nav_arrow(
+                    back_tag,
+                    icons::ALT_ARROW_LEFT,
+                    back,
+                    -1,
+                    tab_id.clone(),
+                    cx,
+                ))
+                .child(self.nav_arrow(fwd_tag, icons::ALT_ARROW_RIGHT, fwd, 1, tab_id.clone(), cx))
+                .child(
+                    div()
+                        .id("nav-reload")
+                        .debug_selector(|| "nav-reload".into())
+                        .flex_none()
+                        .size(px(theme::ICON_TOGGLE))
+                        .rounded(px(theme::RADIUS_BUTTON))
+                        .when(has_url, |d| {
+                            let reload_id = tab_id.clone();
+                            d.cursor_pointer()
+                                .hover_fade("nav-reload", theme::wash_rest(), theme::overlay())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reload_tab(&reload_id, cx)
+                                }))
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icons::tagged_icon(
+                            icons::REFRESH,
+                            theme::ICON_SM,
+                            if has_url {
+                                theme::text_secondary()
+                            } else {
+                                theme::text_disabled()
+                            },
+                            "nav-reload-glyph",
+                        )),
+                )
+                .child(
+                    // The address. Clicking it opens the omnibox on it,
+                    // which is the same act ⌘L performs — one path, so
+                    // the field cannot be opened into two different
+                    // states.
+                    div()
+                        .id("pane-address")
+                        .debug_selector(|| "pane-address".into())
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h(px(theme::RAIL_TAB_H - theme::SPACE_1))
+                        .px(px(theme::SPACE_2))
+                        .rounded(px(theme::RADIUS_BUTTON))
+                        .cursor_pointer()
+                        .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
+                        .on_click(cx.listener(|this, _, _, cx| this.open_omnibox(cx)))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .debug_selector(|| "pane-address-text".into())
+                                .truncate()
+                                .text_size(px(theme::DETAIL_SIZE))
+                                .line_height(px(theme::DETAIL_LINE))
+                                .text_color(if address.is_some() {
                                     theme::text_secondary()
                                 } else {
-                                    theme::text_disabled()
-                                },
-                                "nav-reload-glyph",
-                            )),
-                    )
-                    .child(
-                        // The address. Clicking it opens the omnibox on it,
-                        // which is the same act ⌘L performs — one path, so
-                        // the field cannot be opened into two different
-                        // states.
-                        div()
-                            .id("pane-address")
-                            .debug_selector(|| "pane-address".into())
-                            .flex_1()
-                            .min_w(px(0.))
-                            .h(px(theme::RAIL_TAB_H - theme::SPACE_1))
-                            .px(px(theme::SPACE_2))
-                            .rounded(px(theme::RADIUS_BUTTON))
-                            .cursor_pointer()
-                            .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
-                            .on_click(cx.listener(|this, _, _, cx| this.open_omnibox(cx)))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .debug_selector(|| "pane-address-text".into())
-                                    .truncate()
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
-                                    .text_color(if address.is_some() {
-                                        theme::text_secondary()
-                                    } else {
-                                        theme::text_tertiary()
-                                    })
-                                    // A tab that has never navigated has no
-                                    // address, and says so in the register
-                                    // every other empty state in this shell
-                                    // uses: lower case, one clause, the fact.
-                                    .child(SharedString::from(
-                                        address.unwrap_or_else(|| "no address yet".to_string()),
-                                    )),
-                            ),
-                    )
-                    // ── Slice E1: the zoom fact ──────────────────────────
-                    //
-                    // **Present only when it is not 100%**, which is the
-                    // whole design. A chip reading "100%" on every tab
-                    // forever is a decoration: it states something that is
-                    // true of every page nobody has touched, so it carries
-                    // no information and costs a permanent slot in the one
-                    // line this region has. `web::zoom_percent` answers
-                    // `None` for a tab that has never been zoomed AND for
-                    // one that ⌘0 has put back, because those are the same
-                    // state and must read the same.
-                    //
-                    // A fact, not a control. It has no click handler and no
-                    // hover wash, because ⌘0 is the dismissal and inventing
-                    // a second one would be inventing an affordance this
-                    // slice was not asked for.
-                    .children(crate::web::zoom_percent(&tab.id).map(|pct| {
-                        div()
-                            .debug_selector(|| "pane-zoom".into())
-                            .flex_none()
-                            .px(px(theme::SPACE_1))
-                            .text_size(px(theme::DETAIL_SIZE))
-                            .line_height(px(theme::DETAIL_LINE))
-                            .text_color(theme::text_tertiary())
-                            .child(format!("{pct}%"))
-                    }))
-                    .child(files)
+                                    theme::text_tertiary()
+                                })
+                                // A tab that has never navigated has no
+                                // address, and says so in the register
+                                // every other empty state in this shell
+                                // uses: lower case, one clause, the fact.
+                                .child(SharedString::from(
+                                    address.unwrap_or_else(|| "no address yet".to_string()),
+                                )),
+                        ),
+                )
+                // ── Slice E1: the zoom fact ──────────────────────────
+                //
+                // **Present only when it is not 100%**, which is the
+                // whole design. A chip reading "100%" on every tab
+                // forever is a decoration: it states something that is
+                // true of every page nobody has touched, so it carries
+                // no information and costs a permanent slot in the one
+                // line this region has. `web::zoom_percent` answers
+                // `None` for a tab that has never been zoomed AND for
+                // one that ⌘0 has put back, because those are the same
+                // state and must read the same.
+                //
+                // A fact, not a control. It has no click handler and no
+                // hover wash, because ⌘0 is the dismissal and inventing
+                // a second one would be inventing an affordance this
+                // slice was not asked for.
+                .children(crate::web::zoom_percent(&tab.id).map(|pct| {
+                    div()
+                        .debug_selector(|| "pane-zoom".into())
+                        .flex_none()
+                        .px(px(theme::SPACE_1))
+                        .text_size(px(theme::DETAIL_SIZE))
+                        .line_height(px(theme::DETAIL_LINE))
+                        .text_color(theme::text_tertiary())
+                        .child(format!("{pct}%"))
+                }))
+                .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── a session: the breadcrumb ────────────────────────────────
             Some((_, eave_wire::TabContent::Session { session_id })) => {
@@ -7025,7 +7592,7 @@ impl Shell {
                         .text_color(theme::text_tertiary())
                         .child(SharedString::from(m))
                 }))
-                .child(files)
+                .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── nothing open: the line still exists ───────────────────────
             //
@@ -7033,7 +7600,9 @@ impl Shell {
             // that vanished would move the content region's top edge every
             // time the last tab closed — and the launcher underneath is
             // positioned against that edge.
-            _ => row.child(div().flex_1()).child(files),
+            _ => row
+                .child(div().flex_1())
+                .when(show_files, |d| d.child(self.files_toggle(cx))),
         }
     }
 
@@ -7045,22 +7614,27 @@ impl Shell {
     /// itself the fact that this surface has a history at all.
     fn nav_arrow(
         &self,
-        tag: &'static str,
+        tag: String,
         glyph: &'static str,
         enabled: bool,
         delta: i32,
+        tab_id: String,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let fade_key = tag.clone();
         div()
-            .id(tag)
-            .debug_selector(move || tag.into())
+            .id(SharedString::from(tag.clone()))
+            .debug_selector({
+                let tag = tag.clone();
+                move || tag.clone()
+            })
             .flex_none()
             .size(px(theme::ICON_TOGGLE))
             .rounded(px(theme::RADIUS_BUTTON))
             .when(enabled, |d| {
                 d.cursor_pointer()
-                    .hover_fade(tag, theme::wash_rest(), theme::overlay())
-                    .on_click(cx.listener(move |this, _, _, cx| this.go(delta, cx)))
+                    .hover_fade(fade_key.clone(), theme::wash_rest(), theme::overlay())
+                    .on_click(cx.listener(move |this, _, _, cx| this.go_tab(&tab_id, delta, cx)))
             })
             .flex()
             .items_center()
@@ -7086,10 +7660,18 @@ impl Shell {
     /// remove. `TabGo` clamps at both ends anyway, so a race lands as a no-op.
     fn go(&mut self, delta: i32, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
+        let Some(id) = snapshot.active.clone() else {
+            return;
+        };
+        self.go_tab(&id, delta, cx);
+    }
+
+    fn go_tab(&mut self, tab_id: &str, delta: i32, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
         let Some(tab) = snapshot
-            .active
-            .as_deref()
-            .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a))
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
             .filter(|t| t.content == eave_wire::TabContent::Page)
         else {
             return;
@@ -7120,18 +7702,27 @@ impl Shell {
     /// navigated to the empty string would be worse than one that is inert.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
-        let Some((tab_id, url)) = snapshot
-            .active
-            .as_deref()
-            .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a))
+        let Some(id) = snapshot.active.clone() else {
+            return;
+        };
+        self.reload_tab(&id, cx);
+    }
+
+    fn reload_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let Some(url) = snapshot
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
             .filter(|t| t.content == eave_wire::TabContent::Page)
-            .and_then(|t| t.url.clone().map(|u| (t.id.clone(), u)))
+            .and_then(|t| t.url.clone())
         else {
             return;
         };
-        let _ = self
-            .commands
-            .send(Command::Browser(BrowserCmd::Navigate { tab_id, url }));
+        let _ = self.commands.send(Command::Browser(BrowserCmd::Navigate {
+            tab_id: tab_id.to_string(),
+            url,
+        }));
     }
 
     /// Close the field, sending nothing. Escape, and every path that takes
@@ -7297,10 +7888,8 @@ impl Shell {
     /// keeps every tab the same width, which is what makes
     /// [`theme::TAB_NAME_W`] a slot a test can measure a real name against.
     ///
-    /// **There is no favicon.** `PageFact::Favicon` exists on the wire and
-    /// nothing reports one, and a favicon is bytes to fetch, decode and
-    /// cache — none of which exists here. A globe is the honest stand-in;
-    /// see the report's caveats.
+    /// A page tab paints its favicon in the plate when `favicon_url` is
+    /// set; the globe is the fallback, not the product.
     /// The rail's collapse toggle, in the rail it collapses.
     ///
     /// It used to sit in the titlebar next to a wordmark. A′ deleted that bar
@@ -7450,17 +8039,76 @@ impl Shell {
             .collect();
         let items = strip::items(&snapshot, &chips, &page_resident);
 
+        let split_members: Option<(strip::StripTab, strip::StripTab)> =
+            self.split.as_ref().and_then(|s| {
+                let find = |id: &str| {
+                    items.iter().find_map(|item| match item {
+                        strip::StripItem::Tab(t) if t.id == id => Some(t.clone()),
+                        _ => None,
+                    })
+                };
+                Some((find(&s.left)?, find(&s.right)?))
+            });
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut active_row: Option<usize> = None;
+        let mut emitted_split = false;
+        for item in &items {
+            match item {
+                strip::StripItem::Group {
+                    id,
+                    title,
+                    color,
+                    collapsed,
+                    count,
+                    holds_active,
+                } => {
+                    if *holds_active {
+                        active_row = Some(rows.len());
+                    }
+                    rows.push(self.group_head(
+                        id,
+                        title,
+                        color,
+                        *collapsed,
+                        *count,
+                        *holds_active,
+                        cx,
+                    ));
+                }
+                strip::StripItem::Tab(tab) => {
+                    if let Some(s) = &self.split {
+                        if s.contains(&tab.id) {
+                            if !emitted_split {
+                                if let Some((left, right)) = split_members.as_ref() {
+                                    if s.contains(snapshot.active.as_deref().unwrap_or("")) {
+                                        active_row = Some(rows.len());
+                                    }
+                                    rows.push(self.split_tabs_row(&[left, right], phase, cx));
+                                    emitted_split = true;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if tab.active {
+                        active_row = Some(rows.len());
+                    }
+                    rows.push(self.rail_tab(tab, phase, false, cx));
+                }
+            }
+        }
+
         // Scroll the active tab into view on the EDGE of it changing, never
         // every frame. `scroll_to_item` arms an active item that prepaint
         // consumes, so re-arming it every pass would pin the list and the
-        // operator could never scroll to anything else. (Slice AS's
-        // mechanism, carried through the axis change unchanged — the
-        // question "which item is active" does not depend on the axis.)
+        // operator could never scroll to anything else. Index is the ROW,
+        // not the strip item: a split draws two tabs as one child.
         {
             let mut been = self.tab_scrolled_to.borrow_mut();
             match snapshot.active.as_deref() {
                 Some(active) if been.as_deref() != Some(active) => {
-                    if let Some(ix) = items.iter().position(|i| i.tab_id() == Some(active)) {
+                    if let Some(ix) = active_row {
                         self.tabs_scroll.scroll_to_item(ix);
                         *been = Some(active.to_string());
                     }
@@ -7469,21 +8117,6 @@ impl Shell {
                 _ => {}
             }
         }
-
-        let rows: Vec<AnyElement> = items
-            .iter()
-            .map(|item| match item {
-                strip::StripItem::Group {
-                    id,
-                    title,
-                    color,
-                    collapsed,
-                    count,
-                    holds_active,
-                } => self.group_head(id, title, color, *collapsed, *count, *holds_active, cx),
-                strip::StripItem::Tab(tab) => self.rail_tab(tab, phase, cx),
-            })
-            .collect();
 
         div()
             .debug_selector(|| "rail-tabs".into())
@@ -7635,6 +8268,54 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The two (or more) tabs currently in the well, as one pill.
+    ///
+    /// T3 draws split tabs as chips in a single rounded bar rather than as
+    /// two stacked rows, so the strip says "these are on screen together"
+    /// instead of "these happen to be adjacent". Left chip is the left
+    /// pane, right chip the right pane. A third pane later is another
+    /// chip in the same bar, not a new row.
+    fn split_tabs_row(
+        &self,
+        members: &[&strip::StripTab],
+        phase: Option<f32>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("split-tabs")
+            .debug_selector(|| "split-tabs".into())
+            .w_full()
+            .h(px(theme::RAIL_TAB_H))
+            .px(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_BUTTON))
+            .bg(theme::overlay())
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = members.first().map(|t| t.id.clone()).unwrap_or_default();
+                    move |this, ev: &MouseDownEvent, _, cx| {
+                        if id.is_empty() {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        this.open_tab_menu(&id, ev.position, cx);
+                    }
+                }),
+            )
+            .children(
+                members
+                    .iter()
+                    .map(|tab| self.rail_tab(tab, phase, true, cx))
+                    .collect::<Vec<_>>(),
+            )
+            .into_any_element()
+    }
+
     /// One tab.
     /// One tab as a **row** (Slice D1), where it used to be a fixed-width chip.
     ///
@@ -7656,14 +8337,23 @@ impl Shell {
     ///   drawn and cost the name 20 px. In a list there is room to keep it out
     ///   of the resting state, and a column of nine identical ⓧ glyphs is
     ///   noise on a surface whose whole job is to be scanned.
+    ///
+    /// `compact` is the split-pill chip: same identity, half the rail, so
+    /// two (or more) tabs read as one group. Selection is only the focused
+    /// pane — the pill itself is the split's mark.
     fn rail_tab(
         &self,
         tab: &strip::StripTab,
         phase: Option<f32>,
+        compact: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let id = tab.id.clone();
-        let is_sel = tab.active;
+        let is_sel = if compact {
+            tab.active
+        } else {
+            tab.active || self.split.as_ref().is_some_and(|s| s.contains(&id))
+        };
         // The dot. On a session tab it is the rail's state pigment; on a
         // page tab it is the LOAD state, and a page that is neither loading
         // nor failed shows nothing — but keeps its width, which is what
@@ -7677,10 +8367,15 @@ impl Shell {
                 let id = id.clone();
                 move || format!("tab-{id}")
             })
-            .flex_none()
-            .w_full()
-            .h(px(theme::RAIL_TAB_H))
-            .px(px(theme::RAIL_CARD_BLEED))
+            .when(compact, |d| d.flex_1().min_w(px(0.)).h_full())
+            .when(!compact, |d| {
+                d.flex_none().w_full().h(px(theme::RAIL_TAB_H))
+            })
+            .px(px(if compact {
+                theme::SPACE_1
+            } else {
+                theme::RAIL_CARD_BLEED
+            }))
             .rounded(px(theme::RADIUS_BUTTON))
             // Slice AS's ruling, unchanged: selection is a NEUTRAL raised
             // fill plus a 1 px INSET rim, never an accent bar. The accent
@@ -7695,6 +8390,8 @@ impl Shell {
                 format!("tab-{id}"),
                 if is_sel {
                     theme::overlay_strong()
+                } else if compact {
+                    gpui::transparent_black()
                 } else {
                     theme::wash_rest()
                 },
@@ -7715,6 +8412,16 @@ impl Shell {
                     }
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = id.clone();
+                    move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_tab_menu(&id, ev.position, cx);
+                    }
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 // The same two lines the rail row runs, and for the same
                 // reason: an open rename field lives in one row's label
@@ -7725,14 +8432,39 @@ impl Shell {
                 this.close_omnibox(cx);
                 this.activate_tab(&activate, cx);
             }))
+            .on_drag(
+                TabDrag {
+                    id: id.clone(),
+                    title: tab.label.clone(),
+                },
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
+            )
+            .drag_over::<TabDrag>({
+                let id = id.clone();
+                move |style, dragged, _, _| {
+                    if dragged.id == id {
+                        style
+                    } else {
+                        style.bg(theme::overlay())
+                    }
+                }
+            })
+            .on_drop(cx.listener({
+                let target = id.clone();
+                move |this, drag: &TabDrag, _, cx| {
+                    cx.stop_propagation();
+                    this.split_tabs(&drag.id, &target, true, cx);
+                }
+            }))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(theme::SPACE_1))
             .child(loaders::work_dot(theme::STATE_DOT, dot, phase.filter(|_| pulsing)).flex_none())
-            // The 18 px identity plate — see `tab_plate`, which is the
-            // one implementation of it: a tab means the same thing at
-            // every width this frame draws it at.
+            // The plate is the site mark — a favicon when Chromium has
+            // given us one, the globe otherwise. Compact chips keep it:
+            // "always display favicons" is the identity of a page tab,
+            // split or not.
             .child(tab_plate(tab, &id))
             .child(
                 // A FIXED slot, not `flex_1`. Every tab is the same width,
@@ -7755,8 +8487,9 @@ impl Shell {
                     // The row's gap is `SPACE_1` (the dot and the plate are
                     // one identity group); the name takes the rail's
                     // `SPACE_2` off the plate, so this is the difference
-                    // and `TAB_CHROME_W` counts both.
-                    .ml(px(theme::SPACE_2 - theme::SPACE_1))
+                    // and `TAB_CHROME_W` counts both. Compact chips have
+                    // no plate, so the row gap is already the whole offset.
+                    .when(!compact, |d| d.ml(px(theme::SPACE_2 - theme::SPACE_1)))
                     // Slice D1: `flex_1`, not `TAB_NAME_W`. A row takes the
                     // rail's width, so the name gets what is left after the
                     // chrome — the same slot a session row gives it — and the
@@ -11505,6 +12238,405 @@ impl Shell {
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_page_menu(cx)),
         )
     }
+
+    fn open_tab_menu(&mut self, tab_id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        let target = match &self.split {
+            Some(s) if s.contains(tab_id) => TabMenuTarget::Split {
+                left: s.left.clone(),
+                right: s.right.clone(),
+            },
+            _ => TabMenuTarget::Tab(tab_id.to_string()),
+        };
+        self.open_tab_menu_at(TabMenu { target, at }, cx);
+    }
+
+    fn open_tab_menu_at(&mut self, req: TabMenu, cx: &mut Context<Self>) {
+        let enabled = self
+            .tab_menu_entries(&req, cx)
+            .iter()
+            .map(TabMenuEntry::enabled)
+            .collect();
+        let now = cx.background_executor().now();
+        self.tab_menu.open(req, enabled, now);
+        cx.notify();
+    }
+
+    fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.tab_menu.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.tab_menu.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn tab_menu_entries(&self, req: &TabMenu, cx: &App) -> Vec<TabMenuEntry> {
+        match &req.target {
+            TabMenuTarget::Tab(id) => self.single_tab_menu(id, cx),
+            TabMenuTarget::Split { left, right } => self.split_tab_menu(left, right, cx),
+        }
+    }
+
+    fn single_tab_menu(&self, tab_id: &str, cx: &App) -> Vec<TabMenuEntry> {
+        let snapshot = self.strip_snapshot(cx);
+        let tab = snapshot.tabs.iter().find(|t| t.id == tab_id);
+        let is_session =
+            tab.is_some_and(|t| matches!(t.content, eave_wire::TabContent::Session { .. }));
+        let has_url = tab
+            .and_then(|t| t.url.as_deref())
+            .is_some_and(|u| !u.is_empty());
+        let partner = self.split_partner_for(tab_id, cx);
+        let below = {
+            let order = strip::cycle_order(&snapshot);
+            order
+                .iter()
+                .position(|id| id == tab_id)
+                .is_some_and(|ix| ix + 1 < order.len())
+        };
+
+        let copy = MenuItem::new("Copy Link").trailing("⇧⌘C");
+        let share = MenuItem::new("Share").trailing("›");
+        let mute = MenuItem::new("Mute").disabled();
+        let rename = MenuItem::new("Rename…");
+        let add_split = MenuItem::new("Add Split View");
+        let dup = MenuItem::new("Duplicate");
+        let mov = MenuItem::new("Move to").trailing("›").disabled();
+        let archive = MenuItem::new("Archive Tab");
+        let below_item = MenuItem::new("Archive Tabs Below");
+
+        vec![
+            TabMenuEntry::Action(
+                TabMenuAction::CopyLink,
+                if has_url { copy } else { copy.disabled() },
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::Share,
+                if has_url { share } else { share.disabled() },
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::Mute, mute),
+            TabMenuEntry::Action(
+                TabMenuAction::Rename,
+                if is_session {
+                    rename
+                } else {
+                    rename.disabled()
+                },
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(
+                TabMenuAction::AddSplit,
+                if partner.is_some() {
+                    add_split
+                } else {
+                    add_split.disabled()
+                },
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::Duplicate,
+                if has_url { dup } else { dup.disabled() },
+            ),
+            TabMenuEntry::Action(TabMenuAction::MoveTo, mov),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::ArchiveTab, archive),
+            TabMenuEntry::Action(
+                TabMenuAction::ArchiveBelow,
+                if below {
+                    below_item
+                } else {
+                    below_item.disabled()
+                },
+            ),
+        ]
+    }
+
+    fn split_tab_menu(&self, left: &str, right: &str, cx: &App) -> Vec<TabMenuEntry> {
+        let snapshot = self.strip_snapshot(cx);
+        let label = |id: &str| {
+            snapshot
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| {
+                    t.title
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| t.url.as_deref().map(eave_wire::typing_form))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "New tab".into())
+                })
+                .unwrap_or_else(|| "Tab".into())
+        };
+        let any_url = snapshot.tabs.iter().any(|t| {
+            (t.id == left || t.id == right) && t.url.as_deref().is_some_and(|u| !u.is_empty())
+        });
+        let vertical = self.split.as_ref().is_some_and(|s| s.vertical);
+        let convert = if vertical {
+            "Convert to Horizontal Split View"
+        } else {
+            "Convert to Vertical Split View"
+        };
+        let left_label = elide(&label(left), 28);
+        let right_label = elide(&label(right), 28);
+        let share = MenuItem::new("Share Split View…");
+        let dup = MenuItem::new("Duplicate");
+        let mov = MenuItem::new("Move to").trailing("›").disabled();
+        let below = {
+            let order = strip::cycle_order(&snapshot);
+            let last = order
+                .iter()
+                .rposition(|id| id == left || id == right)
+                .unwrap_or(0);
+            last + 1 < order.len()
+        };
+
+        vec![
+            TabMenuEntry::Action(
+                TabMenuAction::ShareSplit,
+                if any_url { share } else { share.disabled() },
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::Separate, MenuItem::new("Separate All Tabs")),
+            TabMenuEntry::Action(TabMenuAction::AddTab, MenuItem::new("Add Tab…")),
+            TabMenuEntry::Action(TabMenuAction::ConvertAxis, MenuItem::new(convert)),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Header("Tab Options"),
+            TabMenuEntry::Action(
+                TabMenuAction::SplitMember(left.to_string()),
+                MenuItem::new(left_label).trailing("›"),
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::SplitMember(right.to_string()),
+                MenuItem::new(right_label).trailing("›"),
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(
+                TabMenuAction::Duplicate,
+                if any_url { dup } else { dup.disabled() },
+            ),
+            TabMenuEntry::Action(TabMenuAction::MoveTo, mov),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::ArchiveItem, MenuItem::new("Archive Item")),
+            TabMenuEntry::Action(
+                TabMenuAction::ArchiveBelow,
+                if below {
+                    MenuItem::new("Archive Tabs Below")
+                } else {
+                    MenuItem::new("Archive Tabs Below").disabled()
+                },
+            ),
+        ]
+    }
+
+    fn split_partner_for(&self, tab_id: &str, cx: &App) -> Option<String> {
+        let snapshot = self.strip_snapshot(cx);
+        let this_session = snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == tab_id && matches!(t.content, eave_wire::TabContent::Session { .. }));
+        for id in strip::cycle_order(&snapshot) {
+            if id == tab_id {
+                continue;
+            }
+            let other_session = snapshot
+                .tabs
+                .iter()
+                .any(|t| t.id == id && matches!(t.content, eave_wire::TabContent::Session { .. }));
+            if this_session && other_session {
+                continue;
+            }
+            return Some(id);
+        }
+        None
+    }
+
+    fn run_tab_menu(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(req) = self.tab_menu.data().cloned() else {
+            return;
+        };
+        let entries = self.tab_menu_entries(&req, cx);
+        let Some(TabMenuEntry::Action(action, item)) = entries.get(ix) else {
+            return;
+        };
+        if !item.enabled {
+            return;
+        }
+        let action = action.clone();
+        let tab_id = match &req.target {
+            TabMenuTarget::Tab(id) => id.clone(),
+            TabMenuTarget::Split { left, right } => self
+                .strip_snapshot(cx)
+                .active
+                .clone()
+                .filter(|a| a == left || a == right)
+                .unwrap_or_else(|| left.clone()),
+        };
+        match action {
+            TabMenuAction::CopyLink | TabMenuAction::Share => {
+                if let Some(url) = self.tab_url(&tab_id, cx) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                }
+            }
+            TabMenuAction::Mute | TabMenuAction::MoveTo => {}
+            TabMenuAction::Rename => {
+                if let Some(sid) = self.session_id_for_tab(&tab_id, cx) {
+                    self.begin_rename(sid, cx);
+                }
+            }
+            TabMenuAction::AddSplit => {
+                if let Some(partner) = self.split_partner_for(&tab_id, cx) {
+                    self.split_tabs(&partner, &tab_id, true, cx);
+                }
+            }
+            TabMenuAction::Duplicate => {
+                if let Some(url) = self.tab_url(&tab_id, cx) {
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                        url,
+                        activate: true,
+                    }));
+                }
+            }
+            TabMenuAction::ArchiveTab => self.close_tab(&tab_id, cx),
+            TabMenuAction::ArchiveBelow => self.archive_tabs_below(&tab_id, cx),
+            TabMenuAction::ShareSplit => {
+                let urls: Vec<String> = match &req.target {
+                    TabMenuTarget::Split { left, right } => [left.as_str(), right.as_str()]
+                        .into_iter()
+                        .filter_map(|id| self.tab_url(id, cx))
+                        .collect(),
+                    TabMenuTarget::Tab(_) => Vec::new(),
+                };
+                if !urls.is_empty() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(urls.join("\n")));
+                }
+            }
+            TabMenuAction::Separate => {
+                self.split = None;
+                cx.notify();
+            }
+            TabMenuAction::AddTab => self.new_tab(cx),
+            TabMenuAction::ConvertAxis => {
+                if let Some(s) = self.split.as_mut() {
+                    s.vertical = !s.vertical;
+                    cx.notify();
+                }
+            }
+            TabMenuAction::SplitMember(id) => {
+                self.open_tab_menu_at(
+                    TabMenu {
+                        target: TabMenuTarget::Tab(id),
+                        at: req.at,
+                    },
+                    cx,
+                );
+                return;
+            }
+            TabMenuAction::ArchiveItem => {
+                if let TabMenuTarget::Split { left, right } = req.target {
+                    self.split = None;
+                    self.close_tab(&left, cx);
+                    self.close_tab(&right, cx);
+                }
+            }
+        }
+        self.close_tab_menu(cx);
+    }
+
+    fn tab_url(&self, tab_id: &str, cx: &App) -> Option<String> {
+        self.strip_snapshot(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.url.clone())
+            .filter(|u| !u.is_empty())
+    }
+
+    fn session_id_for_tab(&self, tab_id: &str, cx: &App) -> Option<String> {
+        self.strip_snapshot(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| match &t.content {
+                eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
+                _ => None,
+            })
+    }
+
+    fn archive_tabs_below(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let order = strip::cycle_order(&self.strip_snapshot(cx));
+        let Some(ix) = order.iter().position(|id| id == tab_id) else {
+            return;
+        };
+        let rest: Vec<String> = order.into_iter().skip(ix + 1).collect();
+        for id in rest {
+            self.close_tab(&id, cx);
+        }
+    }
+
+    fn tab_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let req = self.tab_menu.data()?.clone();
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let live = self.tab_menu.is_open();
+        let highlighted = self.tab_menu.highlighted();
+        let rows = self
+            .tab_menu_entries(&req, cx)
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| match entry {
+                TabMenuEntry::Separator => overlay::menu_separator(),
+                TabMenuEntry::Header(label) => overlay::menu_header(*label),
+                TabMenuEntry::Action(action, item) => {
+                    let tag = tab_menu_tag(action);
+                    div()
+                        .debug_selector(move || format!("tab-menu-{tag}"))
+                        .child(overlay::menu_row(
+                            ix,
+                            item,
+                            highlighted == Some(ix),
+                            live,
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.run_tab_menu(ix, cx)
+                            }),
+                        ))
+                        .into_any_element()
+                }
+            })
+            .collect();
+        overlay::menu_layer(
+            &self.tab_menu,
+            req.at,
+            now,
+            reduced,
+            rows,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_tab_menu(cx)),
+        )
+    }
+}
+
+fn tab_menu_tag(action: &TabMenuAction) -> &'static str {
+    match action {
+        TabMenuAction::CopyLink => "copy-link",
+        TabMenuAction::Share => "share",
+        TabMenuAction::Mute => "mute",
+        TabMenuAction::Rename => "rename",
+        TabMenuAction::AddSplit => "add-split",
+        TabMenuAction::Duplicate => "duplicate",
+        TabMenuAction::MoveTo => "move-to",
+        TabMenuAction::ArchiveTab => "archive-tab",
+        TabMenuAction::ArchiveBelow => "archive-below",
+        TabMenuAction::ShareSplit => "share-split",
+        TabMenuAction::Separate => "separate",
+        TabMenuAction::AddTab => "add-tab",
+        TabMenuAction::ConvertAxis => "convert-axis",
+        TabMenuAction::SplitMember(_) => "member",
+        TabMenuAction::ArchiveItem => "archive-item",
+    }
 }
 
 /// How much of a selection the `Search for "…"` row shows.
@@ -12478,6 +13610,27 @@ impl Render for Shell {
         let strip_snapshot = self.web_tabs.read(cx).snapshot.clone();
         self.reconcile_strip(&strip_snapshot, cx);
 
+        let shown_pages: Vec<String> = {
+            let mut ids = Vec::new();
+            let mut push_page = |id: &str| {
+                if strip_snapshot
+                    .tabs
+                    .iter()
+                    .any(|t| t.id == id && t.content == eave_wire::TabContent::Page)
+                {
+                    ids.push(id.to_string());
+                }
+            };
+            if let Some(s) = &self.split {
+                push_page(&s.left);
+                push_page(&s.right);
+            } else if let Some(a) = strip_snapshot.active.as_deref() {
+                push_page(a);
+            }
+            ids
+        };
+        crate::web::set_shown_pages(shown_pages);
+
         let page_el = {
             let active = strip_snapshot.active.clone();
             active.and_then(|id| crate::web::page_element(&id, cx))
@@ -12494,7 +13647,7 @@ impl Render for Shell {
         // or the transcript renders under a page tab — an agent's
         // conversation sitting where a document was asked for.
         let active_is_page = strip::active_is_page(&strip_snapshot);
-        let showing_page = page_el.is_some() || active_is_page;
+        let showing_page = self.split.is_some() || page_el.is_some() || active_is_page;
         // What the well says when a page tab is active and nothing can draw
         // it. Two different absences, and only one of them is eave's fault.
         let page_absence: Option<&'static str> = if page_el.is_some() || !active_is_page {
@@ -12915,6 +14068,7 @@ impl Render for Shell {
             self.open_page_menu(req, cx);
         }
         let page_menu_layer = self.page_menu_layer(cx);
+        let tab_menu_layer = self.tab_menu_layer(cx);
         let find_bar = self.find_bar(cx);
         // Slice Q2, built here for the same reason: the launcher and its
         // model menu both need `self` and `cx`, and the element chain
@@ -13138,150 +14292,175 @@ impl Render for Shell {
                             .flex_1()
                             .min_w(px(0.))
                             .p(px(theme::CARD_GUTTER))
-                            .child(content_card(
-                                div()
-                                    .debug_selector(|| "content-well".into())
-                                    .size_full()
-                                    .overflow_hidden()
-                                    .rounded(px(theme::RADIUS_PANEL))
-                                    .flex()
-                                    .flex_col()
-                                    // The one line that says what this region is, and
-                                    // — for a page — where it is. See
-                                    // `Shell::pane_header`.
-                                    .child(self.pane_header(cx, rail_collapsed))
-                                    .child(
-                                        // Stage H glass: the list's viewport runs
-                                        // the full column height and the composer
-                                        // stack FLOATS over it (content passes
-                                        // beneath the frost when scrolled; the
-                                        // trailing spacer keeps Follow's newest
-                                        // row above the glass).
-                                        div()
-                                            .flex_1()
-                                            .min_h(px(0.))
-                                            .relative()
-                                            // Slice M: the log dissolves into the
-                                            // well's edges instead of ending on a
-                                            // hard cut. LOG_TOP_PAD moved INSIDE
-                                            // the faded wrapper on purpose — it
-                                            // is the resting pad the top band is
-                                            // sized to (TRANSCRIPT_FADE_BAND_TOP),
-                                            // so scroll-top stays fully opaque and
-                                            // only content actually scrolling away
-                                            // fades. Not gated on scroll state:
-                                            // comet gated theirs and got a report
-                                            // of the top staying unfaded for one
-                                            // frame on every session switch. The
-                                            // floating chrome below is a SIBLING,
-                                            // outside the scope — the pill and the
-                                            // composer must not fade along with
-                                            // the content they occlude.
-                                            // The page takes the well when a web
-                                            // tab is active. No `edge_faded`
-                                            // wrapper on it: that fade exists to
-                                            // dissolve a SCROLLING LOG into the
-                                            // well's edges, and a page scrolls
-                                            // itself — fading its top and bottom
-                                            // would dim content the page believes
-                                            // is fully visible.
-                                            .children(page_el)
-                                            // Slice E1. **Shown over a page,
-                                            // and only over a page** — the
-                                            // occlusion rule, answered at
-                                            // birth. It is allowed to sit
-                                            // there because it is ABOUT the
-                                            // page underneath it; see
-                                            // `Shell::find_bar`. A sibling
-                                            // of the page inside this
-                                            // `relative` box, so it needs no
-                                            // anchoring and disturbs no
-                                            // layout.
-                                            .children(find_bar)
-                                            // Slice C5. A page tab with nothing to
-                                            // draw says which of the two absences
-                                            // it is, rather than showing an empty
-                                            // well or — worse — the transcript.
-                                            // Over the page, on purpose: the
-                                            // page behind it is STOPPED on
-                                            // this question and nothing else
-                                            // on screen would say so.
-                                            .children(page_dialog_el)
-                                            .children(page_absence.map(|note| {
-                                                div()
-                                                    .debug_selector(|| "page-absence".into())
-                                                    .absolute()
-                                                    .inset_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_size(px(theme::BODY_SIZE))
-                                                    .text_color(theme::text_secondary())
-                                                    .child(note)
-                                            }))
-                                            .when(!showing_page, |d| {
-                                                d.child(
-                                            edge_faded(
-                                                theme::TRANSCRIPT_FADE_BAND_TOP,
-                                                true,
-                                                true,
-                                                div()
-                                                    .size_full()
-                                                    .pt(px(theme::LOG_TOP_PAD))
-                                                    .child(transcript_el),
-                                            )
-                                            .band_top(theme::TRANSCRIPT_FADE_BAND_TOP)
-                                            .band_bottom(theme::TRANSCRIPT_FADE_BAND_BOTTOM),
-                                        )
-                                            })
-                                            // Slice M (§3.2): an overlay, so it is
-                                            // outside both the fade scope and the
-                                            // virtualized list and can never touch
-                                            // a row height. Held above the
-                                            // composer's clearance so it is never
-                                            // read through the frost.
-                                            //
-                                            // Slice AN kept the slot exactly and
-                                            // replaced what sits in it; the
-                                            // reasoning above is why the slot is
-                                            // the right one for a card too.
-                                            .children(empty_el)
-                                            // Slice Q2 — the launcher, in exactly
-                                            // the slot the note it replaced used:
-                                            // an overlay outside both the fade
-                                            // scope and the virtualized list, so
-                                            // it can never touch a row height.
-                                            .children(launcher_el)
-                                            // Slice C5 — the omnibox. **Shown over
-                                            // a page, deliberately**, and the only
-                                            // floating surface in this file for
-                                            // which that is the answer: it is about
-                                            // the page. See `Shell::omnibox_layer`
-                                            // for how it composites, which is the
-                                            // CEF spike's `BackdropBlur` finding
-                                            // cashed in for the first time.
-                                            //
-                                            // In this slot rather than in the
-                                            // bottom stack because it belongs to
-                                            // the TAB, and the bottom stack is
-                                            // agent chrome — everything in it is
-                                            // suppressed over a page for exactly
-                                            // the reason this is not.
-                                            .children(omnibox_el)
-                                            .when(show_affordance && !showing_page, |d| {
-                                                // §1.6, 180 ms. comet approximates a
-                                                // `scale 0.96→1` with fade + a 2 px
-                                                // rise because gpui divs have no
-                                                // scale transform at the pinned rev.
-                                                // The rise rides the ABSOLUTE inset
-                                                // here rather than a relative one —
-                                                // an absolutely positioned box moves
-                                                // nothing else by definition.
-                                                let t = motion::entrance_t(
-                                                    "in:to-bottom",
-                                                    motion::DIALOG_IN,
-                                                );
-                                                d.child(
+                            .child(content_card({
+                                if let Some(split) = self.split.clone() {
+                                    self.render_split_well(
+                                        &split,
+                                        rail_collapsed,
+                                        transcript_el.into_any_element(),
+                                        composer.into_any_element(),
+                                        cx,
+                                    )
+                                } else {
+                                    div()
+                                        .debug_selector(|| "content-well".into())
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .rounded(px(theme::RADIUS_PANEL))
+                                        .flex()
+                                        .flex_col()
+                                        .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                                            let on_right = this.well_drop_is_right(window, cx);
+                                            this.drop_tab_on_well(&drag.id, on_right, cx);
+                                        }))
+                                        .drag_over::<TabDrag>(|style, _, _, _| {
+                                            style.bg(theme::overlay())
+                                        })
+                                        // The one line that says what this region is, and
+                                        // — for a page — where it is. See
+                                        // `Shell::pane_header`.
+                                        .child(self.pane_header(
+                                            cx,
+                                            rail_collapsed,
+                                            None,
+                                            true,
+                                            true,
+                                            "pane-header",
+                                        ))
+                                        .child(
+                                            // Stage H glass: the list's viewport runs
+                                            // the full column height and the composer
+                                            // stack FLOATS over it (content passes
+                                            // beneath the frost when scrolled; the
+                                            // trailing spacer keeps Follow's newest
+                                            // row above the glass).
+                                            div()
+                                                .flex_1()
+                                                .min_h(px(0.))
+                                                .relative()
+                                                // Slice M: the log dissolves into the
+                                                // well's edges instead of ending on a
+                                                // hard cut. LOG_TOP_PAD moved INSIDE
+                                                // the faded wrapper on purpose — it
+                                                // is the resting pad the top band is
+                                                // sized to (TRANSCRIPT_FADE_BAND_TOP),
+                                                // so scroll-top stays fully opaque and
+                                                // only content actually scrolling away
+                                                // fades. Not gated on scroll state:
+                                                // comet gated theirs and got a report
+                                                // of the top staying unfaded for one
+                                                // frame on every session switch. The
+                                                // floating chrome below is a SIBLING,
+                                                // outside the scope — the pill and the
+                                                // composer must not fade along with
+                                                // the content they occlude.
+                                                // The page takes the well when a web
+                                                // tab is active. No `edge_faded`
+                                                // wrapper on it: that fade exists to
+                                                // dissolve a SCROLLING LOG into the
+                                                // well's edges, and a page scrolls
+                                                // itself — fading its top and bottom
+                                                // would dim content the page believes
+                                                // is fully visible.
+                                                .children(page_el)
+                                                // Slice E1. **Shown over a page,
+                                                // and only over a page** — the
+                                                // occlusion rule, answered at
+                                                // birth. It is allowed to sit
+                                                // there because it is ABOUT the
+                                                // page underneath it; see
+                                                // `Shell::find_bar`. A sibling
+                                                // of the page inside this
+                                                // `relative` box, so it needs no
+                                                // anchoring and disturbs no
+                                                // layout.
+                                                .children(find_bar)
+                                                // Slice C5. A page tab with nothing to
+                                                // draw says which of the two absences
+                                                // it is, rather than showing an empty
+                                                // well or — worse — the transcript.
+                                                // Over the page, on purpose: the
+                                                // page behind it is STOPPED on
+                                                // this question and nothing else
+                                                // on screen would say so.
+                                                .children(page_dialog_el)
+                                                .children(page_absence.map(|note| {
+                                                    div()
+                                                        .debug_selector(|| "page-absence".into())
+                                                        .absolute()
+                                                        .inset_0()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(theme::BODY_SIZE))
+                                                        .text_color(theme::text_secondary())
+                                                        .child(note)
+                                                }))
+                                                .when(!showing_page, |d| {
+                                                    d.child(
+                                                        edge_faded(
+                                                            theme::TRANSCRIPT_FADE_BAND_TOP,
+                                                            true,
+                                                            true,
+                                                            div()
+                                                                .size_full()
+                                                                .pt(px(theme::LOG_TOP_PAD))
+                                                                .child(transcript_el),
+                                                        )
+                                                        .band_top(theme::TRANSCRIPT_FADE_BAND_TOP)
+                                                        .band_bottom(
+                                                            theme::TRANSCRIPT_FADE_BAND_BOTTOM,
+                                                        ),
+                                                    )
+                                                })
+                                                // Slice M (§3.2): an overlay, so it is
+                                                // outside both the fade scope and the
+                                                // virtualized list and can never touch
+                                                // a row height. Held above the
+                                                // composer's clearance so it is never
+                                                // read through the frost.
+                                                //
+                                                // Slice AN kept the slot exactly and
+                                                // replaced what sits in it; the
+                                                // reasoning above is why the slot is
+                                                // the right one for a card too.
+                                                .children(empty_el)
+                                                // Slice Q2 — the launcher, in exactly
+                                                // the slot the note it replaced used:
+                                                // an overlay outside both the fade
+                                                // scope and the virtualized list, so
+                                                // it can never touch a row height.
+                                                .children(launcher_el)
+                                                // Slice C5 — the omnibox. **Shown over
+                                                // a page, deliberately**, and the only
+                                                // floating surface in this file for
+                                                // which that is the answer: it is about
+                                                // the page. See `Shell::omnibox_layer`
+                                                // for how it composites, which is the
+                                                // CEF spike's `BackdropBlur` finding
+                                                // cashed in for the first time.
+                                                //
+                                                // In this slot rather than in the
+                                                // bottom stack because it belongs to
+                                                // the TAB, and the bottom stack is
+                                                // agent chrome — everything in it is
+                                                // suppressed over a page for exactly
+                                                // the reason this is not.
+                                                .children(omnibox_el)
+                                                .when(show_affordance && !showing_page, |d| {
+                                                    // §1.6, 180 ms. comet approximates a
+                                                    // `scale 0.96→1` with fade + a 2 px
+                                                    // rise because gpui divs have no
+                                                    // scale transform at the pinned rev.
+                                                    // The rise rides the ABSOLUTE inset
+                                                    // here rather than a relative one —
+                                                    // an absolutely positioned box moves
+                                                    // nothing else by definition.
+                                                    let t = motion::entrance_t(
+                                                        "in:to-bottom",
+                                                        motion::DIALOG_IN,
+                                                    );
+                                                    d.child(
                                             div()
                                                 .absolute()
                                                 .opacity(t)
@@ -13337,54 +14516,60 @@ impl Render for Shell {
                                                         .child("bottom"),
                                                 )),
                                         )
-                                            })
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .bottom_0()
-                                                    .left_0()
-                                                    .right_0()
-                                                    .pb(px(theme::SPACE_3))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .children(self.conn_panel(cx))
-                                                    // Everything from here down is
-                                                    // AGENT chrome — a notice about
-                                                    // a session, its working
-                                                    // trailer, its `/` palette, its
-                                                    // composer. **None of it belongs
-                                                    // over a web page.** A prompt
-                                                    // box floating on somebody
-                                                    // else's document is not a
-                                                    // browser; the agent's surfaces
-                                                    // live on the agent's tab. The
-                                                    // connection panel above stays:
-                                                    // it is about the engine, and it
-                                                    // is true whichever tab is open.
-                                                    .children(notice.filter(|_| !showing_page))
-                                                    .children(trailer.filter(|_| !showing_page))
-                                                    // Slice AR — the `/` palette,
-                                                    // an ordinary sibling directly
-                                                    // above the composer. See
-                                                    // `Shell::slash_layer` for why
-                                                    // this is not `menu_layer`.
-                                                    .children(slash_layer.filter(|_| !showing_page))
-                                                    // Slice Q2: no session, no
-                                                    // composer. A draft typed at
-                                                    // the launcher has nothing to
-                                                    // be addressed to — the rest
-                                                    // loop drops a `Send` because
-                                                    // holding it to replay into
-                                                    // whatever opens next would be
-                                                    // worse — so an input that
-                                                    // silently eats what you type
-                                                    // is the one thing this must
-                                                    // not be.
-                                                    .children(composer_mounted.then_some(composer)),
-                                            ),
-                                    )
-                                    .when(!showing_page, |d| d.child(self.footer(cx))),
-                            )),
+                                                })
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .bottom_0()
+                                                        .left_0()
+                                                        .right_0()
+                                                        .pb(px(theme::SPACE_3))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .children(self.conn_panel(cx))
+                                                        // Everything from here down is
+                                                        // AGENT chrome — a notice about
+                                                        // a session, its working
+                                                        // trailer, its `/` palette, its
+                                                        // composer. **None of it belongs
+                                                        // over a web page.** A prompt
+                                                        // box floating on somebody
+                                                        // else's document is not a
+                                                        // browser; the agent's surfaces
+                                                        // live on the agent's tab. The
+                                                        // connection panel above stays:
+                                                        // it is about the engine, and it
+                                                        // is true whichever tab is open.
+                                                        .children(notice.filter(|_| !showing_page))
+                                                        .children(trailer.filter(|_| !showing_page))
+                                                        // Slice AR — the `/` palette,
+                                                        // an ordinary sibling directly
+                                                        // above the composer. See
+                                                        // `Shell::slash_layer` for why
+                                                        // this is not `menu_layer`.
+                                                        .children(
+                                                            slash_layer.filter(|_| !showing_page),
+                                                        )
+                                                        // Slice Q2: no session, no
+                                                        // composer. A draft typed at
+                                                        // the launcher has nothing to
+                                                        // be addressed to — the rest
+                                                        // loop drops a `Send` because
+                                                        // holding it to replay into
+                                                        // whatever opens next would be
+                                                        // worse — so an input that
+                                                        // silently eats what you type
+                                                        // is the one thing this must
+                                                        // not be.
+                                                        .children(
+                                                            composer_mounted.then_some(composer),
+                                                        ),
+                                                ),
+                                        )
+                                        .when(!showing_page, |d| d.child(self.footer(cx)))
+                                        .into_any_element()
+                                }
+                            })),
                     ),
             )
             // Slice P1: the overlay layer mounts at the ROOT and nowhere
@@ -13403,7 +14588,8 @@ impl Render for Shell {
             // a virtualized list. Last, so that a page menu opened while
             // something else is up is the thing on top — it was opened by
             // the most recent act.
-            .children(page_menu_layer);
+            .children(page_menu_layer)
+            .children(tab_menu_layer);
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
         // claims this frame during the pass above; the root asks once, here,
@@ -14432,6 +15618,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         omni: Omnibox::default(),
                         dialog_text: None,
                         page_menu: Popup::default(),
+                        tab_menu: Popup::default(),
                         typeahead: typeahead.clone(),
                         asked_for_session_tab: RefCell::new(HashSet::new()),
                         asked_to_select: RefCell::new(None),
@@ -14462,6 +15649,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         // external edit fight the pointer mid-drag.
                         rail_w: load_rail_w(),
                         rail_drag: None,
+                        split: None,
+                        split_drag: None,
                         files_scroll: ScrollHandle::new(),
                         tabs_scroll: ScrollHandle::new(),
                         tab_scrolled_to: RefCell::new(None),

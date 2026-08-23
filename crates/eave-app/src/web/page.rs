@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType};
+use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType, PaintElementType};
 use gpui::{
     div, prelude::*, px, size, App, Bounds, ContentMask, Corners, Element, ElementId, FocusHandle,
     GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
@@ -399,6 +399,13 @@ impl Element for PageSurface {
                         host.notify_screen_info_changed();
                     }
                     host.was_resized();
+                    // A split pane that is not engine-`active` still has to
+                    // layout. WasResized alone is enough for the focused
+                    // browser; an unfocused OSR compositor often keeps the
+                    // last frame until it is invalidated. Without this,
+                    // dragging the window (or the divider) reflows one
+                    // pane and leaves the other stretched or clipped.
+                    host.invalidate(PaintElementType::VIEW);
                 }
             });
             // **Belt and braces, and the measurement says so.** The
@@ -425,6 +432,10 @@ impl Element for PageSurface {
             if !stretch_for_measurement() {
                 super::host::note_activity();
                 super::host::request_pump();
+                // Live window resize runs AppKit's tracking loop; the async
+                // pump does not. Pump here so Chromium answers on this frame
+                // rather than after mouse-up. See `host::pump_now`.
+                super::host::pump_now();
             }
         }
 
@@ -453,28 +464,60 @@ impl Element for PageSurface {
             bottom_right: px(theme::RADIUS_PANEL),
             bottom_left: px(theme::RADIUS_PANEL),
         };
-        if let Some(frame) = osr::frame(&self.tab_id) {
+        let want_w = f32::from(bounds.size.width);
+        let want_h = f32::from(bounds.size.height);
+        let fit_of = |frame: &osr::Frame| {
             let (fw, fh) = frame.logical(scale);
-            let want_w = f32::from(bounds.size.width);
-            let want_h = f32::from(bounds.size.height);
-            // Half a logical pixel of slack: the coded size is a rounded
-            // count of device pixels, so exact float equality is the wrong
-            // test and would put the steady state on the transient path at
-            // odd scales.
             let fits = (fw - want_w).abs() < 0.5 && (fh - want_h).abs() < 0.5;
-
-            note_fit(&self.tab_id, fits, fw, fh, want_w, want_h);
-
-            if fits || stretch_for_measurement() {
-                window.paint_surface_with_corners(bounds, frame.buffer, corners);
-            } else {
-                let at = Bounds {
-                    origin: bounds.origin,
-                    size: size(px(fw), px(fh)),
-                };
-                window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    window.paint_surface_with_corners(at, frame.buffer, corners);
+            (fw, fh, fits)
+        };
+        let mut frame = osr::frame(&self.tab_id);
+        if let Some(ref f) = frame {
+            let (fw, fh, mut fits) = fit_of(f);
+            // Still the wrong size: keep pumping on this stack for as long
+            // as the drag is producing paints. `change == Same` after the
+            // first live-resize tick, so the branch above does not run
+            // again until the view actually moves.
+            //
+            // Two pumps is a ceiling, not a delay: Invalidate queues a
+            // compositor frame, the first `CefDoMessageLoopWork` often runs
+            // the resize task, the second collects the frame. Stop early
+            // when it fits. Needed for the unfocused split pane, which
+            // otherwise stays one drag behind the focused one.
+            if !fits && !stretch_for_measurement() {
+                super::tabs::with_browser(&self.tab_id, |b| {
+                    if let Some(host) = b.host() {
+                        host.invalidate(PaintElementType::VIEW);
+                    }
                 });
+                for _ in 0..2 {
+                    super::host::pump_now();
+                    frame = osr::frame(&self.tab_id);
+                    if let Some(ref f) = frame {
+                        let next = fit_of(f);
+                        fits = next.2;
+                        note_fit(&self.tab_id, fits, next.0, next.1, want_w, want_h);
+                        if fits {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                note_fit(&self.tab_id, fits, fw, fh, want_w, want_h);
+            }
+            if let Some(frame) = frame {
+                let (fw, fh, fits) = fit_of(&frame);
+                if fits || stretch_for_measurement() {
+                    window.paint_surface_with_corners(bounds, frame.buffer, corners);
+                } else {
+                    let at = Bounds {
+                        origin: bounds.origin,
+                        size: size(px(fw), px(fh)),
+                    };
+                    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                        window.paint_surface_with_corners(at, frame.buffer, corners);
+                    });
+                }
             }
         }
 
