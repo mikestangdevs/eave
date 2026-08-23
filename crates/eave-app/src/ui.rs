@@ -14959,21 +14959,47 @@ impl Render for Shell {
         // mutably to move focus.
         self.sync_composer_focus(composer_mounted, window, cx);
 
-        let composer = Self::column(frost(
-            theme::RADIUS_COMPOSER,
+        // **Slice CM2 — the composer is bezel's control bar.**
+        //
+        // bezel's `ui::control_bar` builds its surface as, in order: a `div` at
+        // `BAR_HEIGHT` with `rounded(radius)`, `border_1` in `hairline(0.10)`,
+        // `shadow_lg`, `overflow_hidden`, `px(BAR_GAP)` and `glass_overlay` —
+        // all of it handed to `material(radius, MENU_BLUR, bar)`. Every one of
+        // those is reproduced here through `theme.rs` tokens (see its control
+        // bar block for why they are not read from bezel at this call site).
+        //
+        // **Composed rather than called**, and the reason is a feature, not a
+        // preference: `control_bar()` takes `leading/centre/trailing` clusters
+        // inside a fixed `.h(BAR_HEIGHT)` row. eave's composer grows to twelve
+        // rows and stacks an attachment strip above its text, so calling it
+        // would have deleted multi-line drafts and attachments to gain the
+        // look. `BAR_HEIGHT` therefore arrives as `min_h`. At rest the two
+        // surfaces are the same 56 px bar; typing is the only thing that tells
+        // them apart.
+        //
+        // The rim no longer answers `has_draft`. bezel's is uniform, and on a
+        // floating glass card the rim is what lifts it off the backdrop rather
+        // than a state channel — the draft signal lives on the send button,
+        // which is where a fact about sending belongs. `theme::bar_hairline`
+        // carries that argument in full.
+        let composer = Self::column(frost_at(
+            theme::RADIUS_BAR,
+            theme::BLUR_MENU,
             div()
                 .w_full()
-                .rounded(px(theme::RADIUS_COMPOSER))
+                .min_h(px(theme::BAR_HEIGHT))
+                .rounded(px(theme::RADIUS_BAR))
                 .border_1()
-                .border_color(if has_draft {
-                    theme::accent()
-                } else {
-                    theme::border()
-                })
-                .bg(theme::chrome_glass())
-                .shadow(theme::shadow_panel())
-                .px(px(theme::SPACE_3))
-                .pt(px(theme::SPACE_3))
+                .border_color(theme::bar_hairline())
+                .bg(theme::bar_glass())
+                .shadow_lg()
+                // bezel clips the bar so its glass never bleeds past the
+                // corner it just rounded. eave needs it for the same reason
+                // plus one of its own: the attachment strip is a child with
+                // its own fill.
+                .overflow_hidden()
+                .px(px(theme::BAR_GAP))
+                .pt(px(theme::BAR_GAP))
                 .pb(px(theme::SPACE_2))
                 .drag_over::<ExternalPaths>(|style, _, _, _| {
                     style
@@ -15175,11 +15201,21 @@ impl Render for Shell {
                                 // Slice AL: the ARMED fill is the accent, not
                                 // `solid`. The accent marks where you are acting,
                                 // not where you are — an armed send button is the
-                                // most literal case of that rule in the app, and
-                                // it arms together with the composer's rim and
-                                // caret, which are the same colour on purpose.
+                                // most literal case of that rule in the app.
                                 // Unarmed it stays neutral, because a button with
                                 // nothing to send is not an action.
+                                //
+                                // **Slice CM2 corrects the sentence that used to
+                                // end this paragraph.** It said the button "arms
+                                // together with the composer's rim and caret,
+                                // which are the same colour on purpose" — true
+                                // when written, false the moment the composer
+                                // became bezel's control bar, whose rim is a
+                                // uniform `hairline(0.10)` and does not answer
+                                // `has_draft` at all. The caret still does. So
+                                // this is now the ONE surface that arms, which
+                                // makes it carry the signal alone rather than
+                                // reinforce it — see `theme::bar_hairline`.
                                 .hover_fade(
                                     "send",
                                     if has_draft {
@@ -15809,14 +15845,33 @@ impl Render for Shell {
 
 struct Frost {
     corner_radius: f32,
+    blur_radius: f32,
     child: AnyElement,
 }
 
 /// Blur the scene behind `child` (radius [`theme::BLUR_CHROME`]), then
 /// paint it. `corner_radius` must match the child card's rounding.
 fn frost(corner_radius: f32, child: impl IntoElement) -> Frost {
+    frost_at(corner_radius, theme::BLUR_CHROME, child)
+}
+
+/// [`frost`] with the blur named rather than assumed.
+///
+/// **Slice CM2.** The composer is bezel's control bar now, and bezel builds
+/// that surface with `material(radius, MENU_BLUR, ..)` — a 44 px blur, not the
+/// 16 px every other eave float uses. `MENU_BLUR` and [`theme::BLUR_MENU`] are
+/// the same number from two directions: bezel's comment derives 44 from the
+/// reference `.glass-surface`, and eave's has named 44 for "menus/modals" since
+/// P1 while marking it *reserved, unused*. This is the first thing to paint it.
+///
+/// The two radii must agree or the blur frosts square corners outside a round
+/// border — that is bezel's stated reason for `control_bar` deriving one radius
+/// and feeding both, and it is why this takes the corner from the caller
+/// instead of owning one.
+fn frost_at(corner_radius: f32, blur_radius: f32, child: impl IntoElement) -> Frost {
     Frost {
         corner_radius,
+        blur_radius,
         child: child.into_any_element(),
     }
 }
@@ -15869,7 +15924,7 @@ impl Element for Frost {
             window.paint_backdrop_blur(
                 bounds,
                 Corners::all(px(self.corner_radius)),
-                px(theme::BLUR_CHROME),
+                px(self.blur_radius),
             );
             self.child.paint(window, cx);
         });
