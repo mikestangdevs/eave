@@ -31,10 +31,25 @@
 //!
 //! One ask per tab, which is also Chromium's own model — it serialises
 //! dialogs per frame and will not raise a second while one is outstanding.
+//!
+//! # The rule G1 added
+//! **A permission ask that has already been answered is not asked again.**
+//! D9 built the prompt and stopped there, so eave asked for the camera on
+//! every page load — which trains the operator to click the primary button
+//! without reading, the exact reflex a permission dialog exists to prevent.
+//! [`super::permissions`] holds the answers, mirrored from the engine
+//! (which is where they survive a restart), and this module consults it
+//! before disturbing anybody and records the answer when it does.
+//!
+//! Only the two permission paths do this. `alert()` and `<input type=file>`
+//! are events, not standing decisions, and a browser that remembered "you
+//! said OK to an alert once" would be remembering nothing.
 
 use std::collections::HashMap;
 
 use cef::*;
+
+use super::permissions::{PermissionDecision, PermissionKind, Verdict};
 
 /// What the page is asking for.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,7 +68,12 @@ pub enum Ask {
     /// difference between "Reload?" and "Leave?".
     Leave { message: String, reloading: bool },
     /// Camera, microphone, geolocation, notifications, clipboard…
-    Permission { kinds: Vec<String> },
+    ///
+    /// **Structured, not phrased.** The words come from
+    /// [`PermissionKind::label`] at the point of drawing; carrying the
+    /// strings instead would mean the answer had no stable key to be filed
+    /// under, which is how D9 ended up unable to remember anything.
+    Permission { kinds: Vec<PermissionKind> },
     /// `<input type=file>`, or a download asking where to go.
     Files {
         title: String,
@@ -159,6 +179,11 @@ pub fn answer(tab_id: &str, answer: Answer) {
     if super::tabs::trace() {
         eprintln!("[web] answered {:?} with {answer:?}", pending.ask);
     }
+    // G1: write the answer down before replying, so a page that re-asks
+    // the instant it is unblocked finds it already there.
+    if let Ask::Permission { kinds } = &pending.ask {
+        remember(&pending.origin, kinds, matches!(answer, Answer::Ok));
+    }
     reply_with(reply, answer);
     super::tabs::bump_chrome_revision();
     super::host::request_pump();
@@ -217,101 +242,171 @@ fn reply_with(reply: Reply, answer: Answer) {
     }
 }
 
-/// The permission bits, in words a person can answer.
+/// The permission bits, as capabilities eave has words for.
 ///
-/// Named individually rather than printed as a bitmask because this string
-/// is what the operator reads before deciding. "camera and microphone" is a
-/// question; `0x480` is not.
-fn permission_names(bits: u32) -> Vec<String> {
-    let known: &[(u32, &str)] = &[
-        (PermissionRequestTypes::CAMERA_STREAM.get_raw(), "camera"),
-        (PermissionRequestTypes::MIC_STREAM.get_raw(), "microphone"),
+/// The mapping lives here and not in `eave-core` for one reason: it needs
+/// CEF's constants, and the crate that stores the answer must not depend on
+/// Chromium. The *words* live over there, on [`PermissionKind::label`], so
+/// that the string a person reads and the key their answer is filed under
+/// can never drift apart.
+fn permission_kinds(bits: u32) -> Vec<PermissionKind> {
+    let known: &[(u32, PermissionKind)] = &[
+        (
+            PermissionRequestTypes::CAMERA_STREAM.get_raw(),
+            PermissionKind::Camera,
+        ),
+        (
+            PermissionRequestTypes::MIC_STREAM.get_raw(),
+            PermissionKind::Microphone,
+        ),
         (
             PermissionRequestTypes::GEOLOCATION.get_raw(),
-            "your location",
+            PermissionKind::Geolocation,
         ),
         (
             PermissionRequestTypes::NOTIFICATIONS.get_raw(),
-            "notifications",
+            PermissionKind::Notifications,
         ),
-        (PermissionRequestTypes::CLIPBOARD.get_raw(), "the clipboard"),
-        (PermissionRequestTypes::MIDI_SYSEX.get_raw(), "MIDI devices"),
+        (
+            PermissionRequestTypes::CLIPBOARD.get_raw(),
+            PermissionKind::Clipboard,
+        ),
+        (
+            PermissionRequestTypes::MIDI_SYSEX.get_raw(),
+            PermissionKind::MidiSysex,
+        ),
         (
             PermissionRequestTypes::POINTER_LOCK.get_raw(),
-            "the pointer",
+            PermissionKind::PointerLock,
         ),
         (
             PermissionRequestTypes::KEYBOARD_LOCK.get_raw(),
-            "the keyboard",
+            PermissionKind::KeyboardLock,
         ),
         (
             PermissionRequestTypes::WINDOW_MANAGEMENT.get_raw(),
-            "your windows",
+            PermissionKind::WindowManagement,
         ),
-        (PermissionRequestTypes::LOCAL_FONTS.get_raw(), "your fonts"),
+        (
+            PermissionRequestTypes::LOCAL_FONTS.get_raw(),
+            PermissionKind::LocalFonts,
+        ),
         (
             PermissionRequestTypes::IDLE_DETECTION.get_raw(),
-            "whether you are idle",
+            PermissionKind::IdleDetection,
         ),
         (
             PermissionRequestTypes::STORAGE_ACCESS.get_raw(),
-            "cross-site storage",
+            PermissionKind::StorageAccess,
         ),
         (
             PermissionRequestTypes::LOCAL_NETWORK.get_raw(),
-            "your local network",
+            PermissionKind::LocalNetwork,
         ),
         (
             PermissionRequestTypes::VR_SESSION.get_raw(),
-            "virtual reality",
+            PermissionKind::VrSession,
         ),
         (
             PermissionRequestTypes::AR_SESSION.get_raw(),
-            "augmented reality",
+            PermissionKind::ArSession,
         ),
     ];
-    let mut named: Vec<String> = known
+    let mut kinds: Vec<PermissionKind> = known
         .iter()
         .filter(|(bit, _)| bits & bit != 0)
-        .map(|(_, name)| (*name).to_string())
+        .map(|(_, kind)| kind.clone())
         .collect();
-    if named.is_empty() {
+    if kinds.is_empty() {
         // An unrecognised permission is still a permission, and denying it
         // silently because eave has no word for it would be the same
-        // do-nothing failure this handler exists to remove.
-        named.push(format!("an unrecognised capability (0x{bits:x})"));
+        // do-nothing failure this handler exists to remove. It is asked
+        // about every time and never remembered — `is_storable` is false —
+        // because remembering "allow" for something nobody could read is
+        // not consent.
+        kinds.push(PermissionKind::Unknown(bits));
     }
-    named
+    kinds
 }
 
-fn media_names(bits: u32) -> Vec<String> {
-    let known: &[(u32, &str)] = &[
+fn media_kinds(bits: u32) -> Vec<PermissionKind> {
+    let known: &[(u32, PermissionKind)] = &[
         (
             MediaAccessPermissionTypes::DEVICE_AUDIO_CAPTURE.get_raw(),
-            "microphone",
+            PermissionKind::Microphone,
         ),
         (
             MediaAccessPermissionTypes::DEVICE_VIDEO_CAPTURE.get_raw(),
-            "camera",
+            PermissionKind::Camera,
         ),
         (
             MediaAccessPermissionTypes::DESKTOP_AUDIO_CAPTURE.get_raw(),
-            "system audio",
+            PermissionKind::ScreenAudio,
         ),
         (
             MediaAccessPermissionTypes::DESKTOP_VIDEO_CAPTURE.get_raw(),
-            "your screen",
+            PermissionKind::ScreenVideo,
         ),
     ];
-    let mut named: Vec<String> = known
+    let mut kinds: Vec<PermissionKind> = known
         .iter()
         .filter(|(bit, _)| bits & bit != 0)
-        .map(|(_, name)| (*name).to_string())
+        .map(|(_, kind)| kind.clone())
         .collect();
-    if named.is_empty() {
-        named.push(format!("an unrecognised device (0x{bits:x})"));
+    if kinds.is_empty() {
+        kinds.push(PermissionKind::Unknown(bits));
     }
-    named
+    kinds
+}
+
+/// Write an answer down: locally first, so the very next ask finds it, and
+/// then to the engine, which is where it survives a restart.
+///
+/// **Nothing is sent for an origin or a capability that could not be filed
+/// honestly.** The engine's fold would refuse them anyway (rules 3 and 4 in
+/// `eave_core::browser::permissions`), so sending would only put a line on
+/// a socket for the far end to drop.
+fn remember(origin: &str, kinds: &[PermissionKind], allowed: bool) {
+    let decision = if allowed {
+        PermissionDecision::Allow
+    } else {
+        PermissionDecision::Deny
+    };
+    let storable: Vec<PermissionKind> = kinds.iter().filter(|k| k.is_storable()).cloned().collect();
+    if storable.is_empty() || eave_wire::normalize_origin(origin).is_none() {
+        return;
+    }
+    super::permissions::note_answer(origin, &storable, decision);
+    super::tabs::request(super::PageRequest::RememberPermission {
+        origin: origin.to_string(),
+        kinds: storable,
+        decision,
+    });
+}
+
+/// Answer an ask from what is already known, or `false` if nobody has
+/// answered this before and a person must be disturbed.
+///
+/// Called from inside the CEF handler and answering the continuation
+/// **synchronously**, which CEF documents as allowed for both permission
+/// paths — and which is the only option anyway, because the alternative is
+/// parking a stopped renderer while nothing is pending.
+fn trace_remembered(origin: &str, kinds: &[PermissionKind], allowed: bool) {
+    // Worth a line of its own: a prompt that does NOT appear is invisible
+    // by construction, so without this the difference between "remembered"
+    // and "the handler is broken" cannot be seen from outside.
+    if super::tabs::trace() {
+        let verdict = if allowed { "allow" } else { "deny" };
+        eprintln!("[web] permission {kinds:?} from {origin}: {verdict} from memory");
+    }
+}
+
+fn answered_already(origin: &str, kinds: &[PermissionKind]) -> Option<bool> {
+    match super::permissions::verdict(origin, kinds) {
+        Verdict::Ask => None,
+        Verdict::Allow => Some(true),
+        Verdict::Deny => Some(false),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,10 +510,25 @@ wrap_permission_handler! {
             callback: Option<&mut MediaAccessCallback>,
         ) -> i32 {
             let Some(callback) = callback else { return 0 };
+            let origin = requesting_origin.map(|o| o.to_string()).unwrap_or_default();
+            let kinds = media_kinds(requested_permissions);
+            // G1. Grant exactly what was asked for and nothing more, for
+            // the same reason `reply_with` does: CEF takes a bitmask, and
+            // a remembered "allow" for the microphone is not consent to
+            // the camera.
+            if let Some(allowed) = answered_already(&origin, &kinds) {
+                trace_remembered(&origin, &kinds, allowed);
+                if allowed {
+                    callback.cont(requested_permissions);
+                } else {
+                    callback.cancel();
+                }
+                return 1;
+            }
             raise(
                 &self.tab_id,
-                requesting_origin.map(|o| o.to_string()).unwrap_or_default(),
-                Ask::Permission { kinds: media_names(requested_permissions) },
+                origin,
+                Ask::Permission { kinds },
                 Reply::Media(callback.clone(), requested_permissions),
             );
             1
@@ -434,10 +544,21 @@ wrap_permission_handler! {
             callback: Option<&mut PermissionPromptCallback>,
         ) -> i32 {
             let Some(callback) = callback else { return 0 };
+            let origin = requesting_origin.map(|o| o.to_string()).unwrap_or_default();
+            let kinds = permission_kinds(requested_permissions);
+            if let Some(allowed) = answered_already(&origin, &kinds) {
+                trace_remembered(&origin, &kinds, allowed);
+                callback.cont(if allowed {
+                    PermissionRequestResult::ACCEPT
+                } else {
+                    PermissionRequestResult::DENY
+                });
+                return 1;
+            }
             raise(
                 &self.tab_id,
-                requesting_origin.map(|o| o.to_string()).unwrap_or_default(),
-                Ask::Permission { kinds: permission_names(requested_permissions) },
+                origin,
+                Ask::Permission { kinds },
                 Reply::Permission(callback.clone()),
             );
             1
@@ -526,26 +647,46 @@ mod tests {
     fn permissions_are_named_not_numbered() {
         let both = PermissionRequestTypes::CAMERA_STREAM.get_raw()
             | PermissionRequestTypes::MIC_STREAM.get_raw();
-        let names = permission_names(both);
-        assert!(names.contains(&"camera".to_string()), "{names:?}");
-        assert!(names.contains(&"microphone".to_string()), "{names:?}");
-        assert_eq!(names.len(), 2);
+        let kinds = permission_kinds(both);
+        assert!(kinds.contains(&PermissionKind::Camera), "{kinds:?}");
+        assert!(kinds.contains(&PermissionKind::Microphone), "{kinds:?}");
+        assert_eq!(kinds.len(), 2);
+        let names: Vec<String> = kinds.iter().map(|k| k.label()).collect();
+        assert_eq!(names, vec!["camera".to_string(), "microphone".to_string()]);
     }
 
     /// An unknown bit must still produce a question. Denying it silently
     /// because eave has no word for it is the do-nothing failure this
-    /// module exists to remove.
+    /// module exists to remove — and G1 must not turn it into a silent
+    /// PERMANENT grant either, so it is unstorable.
     #[test]
-    fn an_unknown_permission_still_asks() {
-        let names = permission_names(1 << 30);
-        assert_eq!(names.len(), 1);
-        assert!(names[0].contains("unrecognised"), "{names:?}");
+    fn an_unknown_permission_still_asks_and_is_never_remembered() {
+        let kinds = permission_kinds(1 << 30);
+        assert_eq!(kinds, vec![PermissionKind::Unknown(1 << 30)]);
+        assert!(kinds[0].label().contains("unrecognised"), "{kinds:?}");
+        assert!(!kinds[0].is_storable());
+        assert!(answered_already("https://x.test", &kinds).is_none());
     }
 
     #[test]
     fn media_bits_are_named_too() {
-        let names = media_names(MediaAccessPermissionTypes::DEVICE_VIDEO_CAPTURE.get_raw());
-        assert_eq!(names, vec!["camera".to_string()]);
+        let kinds = media_kinds(MediaAccessPermissionTypes::DEVICE_VIDEO_CAPTURE.get_raw());
+        assert_eq!(kinds, vec![PermissionKind::Camera]);
+        assert_eq!(kinds[0].label(), "camera");
+    }
+
+    /// The screen is not the camera and system audio is not the
+    /// microphone. They are separate keys, so allowing the camera must
+    /// never silently allow a screen capture.
+    #[test]
+    fn the_screen_and_the_camera_are_different_permissions() {
+        let screen = media_kinds(MediaAccessPermissionTypes::DESKTOP_VIDEO_CAPTURE.get_raw());
+        assert_eq!(screen, vec![PermissionKind::ScreenVideo]);
+        assert_ne!(screen[0], PermissionKind::Camera);
+        assert_eq!(
+            media_kinds(MediaAccessPermissionTypes::DESKTOP_AUDIO_CAPTURE.get_raw()),
+            vec![PermissionKind::ScreenAudio]
+        );
     }
 
     #[test]

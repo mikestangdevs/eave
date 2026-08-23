@@ -29,6 +29,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::bookmarks::{Bookmark, BookmarkTree};
+use super::permissions::{Grant, Permissions};
 use super::tabs::{GroupId, LoadState, PendingNav, Slot, TabContent, TabGroup, TabId, TabsState};
 
 /// One tab, as the strip sees it.
@@ -132,6 +133,30 @@ pub struct BookmarksSnapshot {
     pub nodes: Vec<BookmarkNode>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+}
+
+/// Every permission answer, flat and ordered (G1).
+///
+/// Flat rows rather than a nested map for two reasons that pull the same
+/// way: it is what a permissions list renders from, and it is what the
+/// app's mirror folds back into a [`Permissions`] with no special cases.
+/// Ordered by origin then capability, because the whole snapshot is
+/// re-sent on every change and a set that reshuffled itself would make
+/// every send look like a change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionsSnapshot {
+    pub grants: Vec<Grant>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
+impl Permissions {
+    pub fn snapshot(&self, read_only: bool) -> PermissionsSnapshot {
+        PermissionsSnapshot {
+            grants: self.grants(),
+            read_only,
+        }
+    }
 }
 
 impl TabsState {

@@ -555,6 +555,15 @@ impl Client {
         self.stream(Request::WatchBookmarks).await
     }
 
+    /// Every permission answer, and one frame on every change (G1). The
+    /// app mirrors this because CEF's question is synchronous — see
+    /// [`Request::WatchPermissions`].
+    pub async fn watch_permissions(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<SubscriptionItem>, ClientError> {
+        self.stream(Request::WatchPermissions).await
+    }
+
     /// Open a tab; returns the id the engine minted.
     pub async fn tab_open(&self, url: Option<&str>, activate: bool) -> Result<String, ClientError> {
         Ok(self

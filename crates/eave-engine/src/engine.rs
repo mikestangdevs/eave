@@ -2226,6 +2226,14 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 subs.insert(id, tokio::spawn(run_bookmarks(Arc::clone(&engine), w, id)));
                 continue;
             }
+            Request::WatchPermissions => {
+                let w = Arc::clone(&w);
+                subs.insert(
+                    id,
+                    tokio::spawn(run_permissions(Arc::clone(&engine), w, id)),
+                );
+                continue;
+            }
             Request::TabNav { tab_id } => match engine.browser.tab_nav(&tab_id) {
                 Ok(nav) => ok_value(&TabNavOk { tab_id, nav }),
                 Err(message) => ResponseBody::Err { message },
@@ -2312,6 +2320,15 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 since_ms,
                 before_ms,
             } => changed(engine.browser.history_clear(since_ms, before_ms)),
+            Request::PermissionSet {
+                origin,
+                permissions,
+                decision,
+            } => changed(engine.browser.permission_set(origin, permissions, decision)),
+            Request::PermissionForget { origin, permission } => {
+                changed(engine.browser.permission_forget(origin, permission))
+            }
+            Request::PermissionClear => changed(engine.browser.permission_clear()),
             Request::Unsubscribe { id: target } => {
                 // Stop the named stream and release what it held (the
                 // files stream's watcher refcount drops via guard drop).
@@ -2667,6 +2684,22 @@ async fn run_bookmarks(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, 
     loop {
         let item = SubscriptionItem::Bookmarks {
             snapshot: engine.browser.bookmarks_snapshot(),
+        };
+        if send_item(&w, id, item).await.is_err() {
+            return;
+        }
+        match rx.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => while rx.try_recv().is_ok() {},
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+async fn run_permissions(engine: Arc<Engine>, w: Arc<TokioMutex<OwnedWriteHalf>>, id: u64) {
+    let mut rx = engine.browser.subscribe_permissions();
+    loop {
+        let item = SubscriptionItem::Permissions {
+            snapshot: engine.browser.permissions_snapshot(),
         };
         if send_item(&w, id, item).await.is_err() {
             return;

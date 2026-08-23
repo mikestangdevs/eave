@@ -15,18 +15,21 @@
 //! <data_dir>/browser/tabs.jsonl        session restore: tabs, groups, ordering
 //! <data_dir>/browser/bookmarks.jsonl   the hierarchy
 //! <data_dir>/browser/history.jsonl     the visit log
+//! <data_dir>/browser/permissions.jsonl what a person answered, per origin
 //! <data_dir>/browser/chromium/         CEF's own cache root — NOT ours, and
 //!                                      not a journal; see web/host.rs
 //! ```
 //!
-//! Three files, not one, and the reason is that they have three different
-//! lifetimes and three different failure consequences. Tabs churn every few
+//! Four files, not one, and the reason is that they have four different
+//! lifetimes and four different failure consequences. Tabs churn every few
 //! seconds and are worth little individually; bookmarks change rarely and
 //! are worth a great deal each; history is the largest by orders of
-//! magnitude and is the only one a person ever asks to have destroyed.
-//! Sharing one file would make the cheapest writer set the durability
-//! policy for the most valuable data in it, and would make forgetting one
-//! url rewrite the tab strip.
+//! magnitude and is the only one a person ever asks to have destroyed;
+//! permissions are the smallest and the most dangerous to get wrong, since
+//! a lost row re-asks and a wrong row grants a camera. Sharing one file
+//! would make the cheapest writer set the durability policy for the most
+//! valuable data in it, and would make forgetting one url rewrite the tab
+//! strip.
 //!
 //! # Relationship to sessions (Slice B1 decision)
 //! Sessions are **not** tabs and this slice does not make them tabs. The
@@ -44,6 +47,7 @@
 pub mod bookmarks;
 pub mod history;
 pub mod log;
+pub mod permissions;
 pub mod snapshot;
 pub mod tabs;
 
@@ -53,6 +57,7 @@ use std::path::{Path, PathBuf};
 use bookmarks::{BookmarkEvent, BookmarkTree};
 use history::{History, HistoryEvent};
 use log::{EventLog, LoadReport};
+use permissions::{PermissionEvent, Permissions};
 use tabs::{TabEvent, TabsState};
 
 /// Where the browser's three logs live under a data dir.
@@ -67,6 +72,7 @@ pub struct OpenReport {
     pub tabs: LoadReport,
     pub bookmarks: LoadReport,
     pub history: LoadReport,
+    pub permissions: LoadReport,
 }
 
 impl OpenReport {
@@ -77,6 +83,7 @@ impl OpenReport {
             ("tabs", &self.tabs),
             ("bookmarks", &self.bookmarks),
             ("history", &self.history),
+            ("permissions", &self.permissions),
         ]
         .into_iter()
         .filter_map(|(name, r)| r.stated().map(|s| format!("{name}: {s}")))
@@ -95,9 +102,11 @@ pub struct BrowserStore {
     tabs_log: EventLog<TabEvent>,
     bookmarks_log: EventLog<BookmarkEvent>,
     history_log: EventLog<HistoryEvent>,
+    permissions_log: EventLog<PermissionEvent>,
     pub tabs: TabsState,
     pub bookmarks: BookmarkTree,
     pub history: History,
+    pub permissions: Permissions,
 }
 
 impl BrowserStore {
@@ -112,6 +121,8 @@ impl BrowserStore {
             EventLog::<BookmarkEvent>::open(&dir.join("bookmarks.jsonl"), "bookmarks")?;
         let (history_log, history_events, history_report) =
             EventLog::<HistoryEvent>::open(&dir.join("history.jsonl"), "history")?;
+        let (permissions_log, permission_events, permissions_report) =
+            EventLog::<PermissionEvent>::open(&dir.join("permissions.jsonl"), "permissions")?;
 
         let mut tabs = TabsState::new();
         for e in &tab_events {
@@ -132,13 +143,20 @@ impl BrowserStore {
         let mut history = History::new();
         history.load(history_events);
 
+        let mut permissions = Permissions::new();
+        for e in &permission_events {
+            permissions.apply(e);
+        }
+
         let mut store = Self {
             tabs_log,
             bookmarks_log,
             history_log,
+            permissions_log,
             tabs,
             bookmarks,
             history,
+            permissions,
         };
         // Enforce the entry cap at open, where paying for a compaction is
         // invisible, rather than on the visit that crosses it.
@@ -150,13 +168,17 @@ impl BrowserStore {
             tabs: tabs_report,
             bookmarks: bookmarks_report,
             history: history_report,
+            permissions: permissions_report,
         };
         Ok((store, report))
     }
 
     /// True when any log is from a format this build must not write.
     pub fn read_only(&self) -> bool {
-        self.tabs_log.sealed() || self.bookmarks_log.sealed() || self.history_log.sealed()
+        self.tabs_log.sealed()
+            || self.bookmarks_log.sealed()
+            || self.history_log.sealed()
+            || self.permissions_log.sealed()
     }
 
     /// Apply and journal one tab event. Returns whether anything changed;
@@ -209,12 +231,35 @@ impl BrowserStore {
         Ok(true)
     }
 
+    /// Apply and journal one permission event, fsynced both ways.
+    ///
+    /// A grant is fsynced for the reason a bookmark is: somebody decided
+    /// it deliberately and re-deciding it is a nag. A **revoke** is fsynced
+    /// and *compacted* for the reason a history forget is: "I took the
+    /// camera away from that site" has to still be true after a power cut,
+    /// and a tombstone appended after the grant would leave the grant
+    /// itself sitting in the file.
+    pub fn permission_event(&mut self, event: PermissionEvent) -> io::Result<bool> {
+        let destructive = event.requires_compaction();
+        if !self.permissions.apply(&event) {
+            return Ok(false);
+        }
+        if destructive {
+            self.permissions_log.compact(&self.permissions.retained())?;
+        } else {
+            self.permissions_log.append(&event)?;
+        }
+        self.permissions_log.sync()?;
+        Ok(true)
+    }
+
     /// Push every buffered write to the OS and fsync. Called at shutdown
     /// and wherever the engine wants a known-durable point.
     pub fn sync(&mut self) -> io::Result<()> {
         self.tabs_log.sync()?;
         self.bookmarks_log.sync()?;
-        self.history_log.sync()
+        self.history_log.sync()?;
+        self.permissions_log.sync()
     }
 }
 
@@ -323,7 +368,7 @@ mod tests {
         );
     }
 
-    /// The three logs are three files with three lifetimes. Forgetting a
+    /// The four logs are four files with four lifetimes. Forgetting a
     /// url rewrites history and must not touch the tab strip.
     #[test]
     fn forgetting_a_url_does_not_rewrite_the_tab_strip() {
@@ -353,5 +398,70 @@ mod tests {
         // The tab is still at the url it was at — a tab's own address is
         // not history, and forgetting history does not close tabs.
         assert_eq!(store.tabs.tabs["t"].url(), Some("https://keep.test/"));
+    }
+
+    /// G1, at the store: the whole point is that the answer is still there
+    /// after the process that took it has gone.
+    #[test]
+    fn a_permission_answered_once_is_still_answered_after_a_restart() {
+        use permissions::{Decision, PermissionEvent, PermissionKind, Verdict};
+        let dir = scratch();
+        {
+            let (mut store, _) = BrowserStore::open(&dir).unwrap();
+            assert!(store
+                .permission_event(PermissionEvent::Decided {
+                    origin: "https://cam.test/room/7".into(),
+                    permission: PermissionKind::Camera,
+                    decision: Decision::Allow,
+                    ts_ms: 9,
+                })
+                .unwrap());
+            store.sync().unwrap();
+        }
+        let (mut store, report) = BrowserStore::open(&dir).unwrap();
+        assert!(report.stated().is_empty(), "{:?}", report.stated());
+        assert_eq!(
+            store
+                .permissions
+                .verdict("https://cam.test", &[PermissionKind::Camera]),
+            Verdict::Allow
+        );
+
+        // And a revoke actually leaves the disk, rather than being
+        // tombstoned after a grant that stays readable.
+        let file = browser_dir(&dir).join("permissions.jsonl");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("cam.test"));
+        assert!(store
+            .permission_event(PermissionEvent::Forgotten {
+                origin: "https://cam.test".into(),
+                permission: None,
+            })
+            .unwrap());
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert!(!after.contains("cam.test"), "{after}");
+        assert!(store.permissions.is_empty());
+    }
+
+    /// A permission write must not rewrite anything else, for the same
+    /// reason a forget must not rewrite the strip: four lifetimes, four
+    /// files.
+    #[test]
+    fn answering_a_permission_does_not_rewrite_the_tab_strip() {
+        use permissions::{Decision, PermissionEvent, PermissionKind};
+        let dir = scratch();
+        let (mut store, _) = BrowserStore::open(&dir).unwrap();
+        open_tab(&mut store, "t", "https://keep.test/");
+        store.sync().unwrap();
+        let before = std::fs::read_to_string(browser_dir(&dir).join("tabs.jsonl")).unwrap();
+        store
+            .permission_event(PermissionEvent::Decided {
+                origin: "https://keep.test".into(),
+                permission: PermissionKind::Notifications,
+                decision: Decision::Deny,
+                ts_ms: 3,
+            })
+            .unwrap();
+        let after = std::fs::read_to_string(browser_dir(&dir).join("tabs.jsonl")).unwrap();
+        assert_eq!(before, after, "a permission answer rewrote the tab strip");
     }
 }

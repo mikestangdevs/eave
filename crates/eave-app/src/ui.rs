@@ -363,6 +363,14 @@ enum BrowserCmd {
     /// was actually typed. Both travel because the index is keyed on the
     /// former and the answer has to be matched back against the latter.
     Typeahead { query: String, for_text: String },
+    /// G1 — take back every permission answer given to one origin.
+    ///
+    /// The **undo** half of remembering. An answer that persists and cannot
+    /// be revoked is a worse bargain than one that is asked every time: a
+    /// mis-click on "Allow" would otherwise be permanent, and the whole
+    /// argument for persisting is that the operator stays in charge of
+    /// what this browser remembers about them.
+    ForgetPermissions { origin: String },
 }
 
 #[derive(Default)]
@@ -485,6 +493,14 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
         BrowserCmd::Activate(tab_id) => {
             let _ = client
                 .browser_do(eave_wire::Request::TabActivate { tab_id })
+                .await;
+        }
+        BrowserCmd::ForgetPermissions { origin } => {
+            let _ = client
+                .browser_do(eave_wire::Request::PermissionForget {
+                    origin,
+                    permission: None,
+                })
                 .await;
         }
         BrowserCmd::Close(tab_id) => {
@@ -771,8 +787,45 @@ async fn feed_loop(
                             Some(crate::web::PageRequest::External { url }) => {
                                 open_external(&url);
                             }
+                            // G1: what a person answered about an origin.
+                            // It has already been applied to the app's
+                            // mirror, so this is the durable half — the
+                            // engine writes it down and broadcasts it
+                            // back, and that snapshot is what survives a
+                            // restart.
+                            Some(crate::web::PageRequest::RememberPermission {
+                                origin,
+                                kinds,
+                                decision,
+                            }) => {
+                                let _ = client
+                                    .browser_do(eave_wire::Request::PermissionSet {
+                                        origin,
+                                        permissions: kinds,
+                                        decision,
+                                    })
+                                    .await;
+                            }
                             None => return,
                         },
+                    }
+                }
+            });
+        }
+        // The permission mirror (G1). Its own task, and engine-wide like
+        // the tab strip: nothing about it depends on which session or
+        // which tab is selected. It exists because Chromium asks its
+        // question SYNCHRONOUSLY on the app's stack — see
+        // `web/permissions.rs` — so the answer has to already be here.
+        {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let Ok(mut rx) = client.watch_permissions().await else {
+                    return;
+                };
+                while let Some(item) = rx.recv().await {
+                    if let SubscriptionItem::Permissions { snapshot } = item {
+                        crate::web::permissions::install(snapshot.grants);
                     }
                 }
             });
@@ -1018,6 +1071,7 @@ async fn feed_loop(
                         Some(SubscriptionItem::Sessions { .. })
                         | Some(SubscriptionItem::Files { .. })
                         | Some(SubscriptionItem::Tabs { .. })
+                        | Some(SubscriptionItem::Permissions { .. })
                         | Some(SubscriptionItem::Bookmarks { .. }) => {}
                         None => break StreamEnd::Conn, // connection gone → reconnect
                     },
@@ -1345,6 +1399,7 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
                 SubscriptionItem::Sessions { .. }
                 | SubscriptionItem::Files { .. }
                 | SubscriptionItem::Tabs { .. }
+                | SubscriptionItem::Permissions { .. }
                 | SubscriptionItem::Bookmarks { .. } => {}
             }
         }
@@ -1894,8 +1949,14 @@ fn provider_mark(provider: &str) -> Option<&'static str> {
 /// eave\'s own text ink rather than a hex nobody sourced.
 /// "camera", "camera and microphone", "camera, microphone and your
 /// location" — a list a person can answer, not a bitmask.
-fn join_kinds(kinds: &[String]) -> String {
-    match kinds {
+/// "camera and microphone", from the capabilities the ask names.
+///
+/// The words come from the capability rather than travelling as strings
+/// (G1): the label a person reads and the key their answer is filed under
+/// have to be two views of one value, or they drift.
+fn join_kinds(kinds: &[crate::web::permissions::PermissionKind]) -> String {
+    let named: Vec<String> = kinds.iter().map(|k| k.label()).collect();
+    match named.as_slice() {
         [] => "this".to_string(),
         [one] => one.clone(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
@@ -10799,6 +10860,22 @@ impl Shell {
                 elide(selection, MENU_SELECTION_CAP)
             )));
         }
+        // G1's undo. **Absent, not disabled**, and that is the opposite
+        // choice from the navigation three above — deliberately. A
+        // disabled row here would tell every operator on every page that
+        // eave holds permissions for the site they are on, which is a
+        // claim about their data and is usually false. The row appears
+        // only when there is something to reset, and says how much.
+        if let Some(url) = tab.and_then(|t| t.url.as_deref()) {
+            let held = crate::web::permissions::count_for(url);
+            if held > 0 {
+                items.push(MenuItem::new(if held == 1 {
+                    "Reset 1 permission for this site".to_string()
+                } else {
+                    format!("Reset {held} permissions for this site")
+                }));
+            }
+        }
         items
     }
 
@@ -10878,6 +10955,21 @@ impl Shell {
                         url,
                         activate: false,
                     }));
+                }
+            }
+            _ if label.starts_with("Reset ") && label.ends_with(" for this site") => {
+                // Locally first, so the row is gone on the click; then to
+                // the engine, which is where the answer actually lived.
+                let url = self
+                    .strip_snapshot(cx)
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.url.clone());
+                if let Some(origin) = url.and_then(|u| crate::web::permissions::forget_origin(&u)) {
+                    let _ = self
+                        .commands
+                        .send(Command::Browser(BrowserCmd::ForgetPermissions { origin }));
                 }
             }
             _ => {

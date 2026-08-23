@@ -40,7 +40,12 @@ pub use eave_core::browser::bookmarks::{Bookmark, BookmarkId, BookmarkKind};
 pub use eave_core::browser::history::{
     typing_form, HistoryEntry, HistoryMatch, MatchKind, Transition,
 };
-pub use eave_core::browser::snapshot::{BookmarkNode, BookmarksSnapshot, TabInfo, TabsSnapshot};
+pub use eave_core::browser::permissions::{
+    normalize_origin, Decision as PermissionDecision, Grant, PermissionKind, Permissions, Verdict,
+};
+pub use eave_core::browser::snapshot::{
+    BookmarkNode, BookmarksSnapshot, PermissionsSnapshot, TabInfo, TabsSnapshot,
+};
 pub use eave_core::browser::tabs::{
     GroupId, LoadState, NavEntry, NavStack, PendingNav, Setting, Slot, TabContent, TabGroup, TabId,
 };
@@ -277,6 +282,16 @@ pub enum Request {
     /// Observe the bookmark hierarchy. Same contract as
     /// [`Request::WatchTabs`].
     WatchBookmarks,
+    /// Observe every permission answer (G1). Same contract as
+    /// [`Request::WatchTabs`].
+    ///
+    /// A subscription rather than a query, and that is forced rather than
+    /// chosen: the page engine is asked its question **synchronously, on
+    /// the app's own stack**, by Chromium — there is no point in that
+    /// callback where a round trip to another process could be awaited.
+    /// So the app holds a mirror of this snapshot and reads it locally.
+    /// The mirror is a copy; the engine is the record.
+    WatchPermissions,
     /// One tab's full back/forward stack — unary, deliberately not on the
     /// snapshot. See `eave_core::browser::snapshot`'s module docs.
     TabNav {
@@ -452,6 +467,29 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before_ms: Option<u64>,
     },
+
+    /// Write down what a person answered about one origin (G1).
+    ///
+    /// `permissions` is the whole ask, not one bit of it: a grouped
+    /// camera-and-microphone prompt takes one answer, so both are recorded
+    /// with it. The engine refuses to store an origin it cannot name and a
+    /// capability it has no word for — see
+    /// `eave_core::browser::permissions`.
+    PermissionSet {
+        origin: String,
+        permissions: Vec<PermissionKind>,
+        decision: PermissionDecision,
+    },
+    /// Take an answer back. `permission: None` forgets everything this
+    /// origin was ever answered. The grant is physically removed from the
+    /// log, not tombstoned — same rule as [`Request::HistoryForget`].
+    PermissionForget {
+        origin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission: Option<PermissionKind>,
+    },
+    /// Forget every origin's answers.
+    PermissionClear,
 }
 
 /// Something a page engine observed and is reporting.
@@ -592,6 +630,8 @@ pub enum SubscriptionItem {
     Tabs { snapshot: TabsSnapshot },
     /// Bookmark-hierarchy frame (Slice B1). Same contract.
     Bookmarks { snapshot: BookmarksSnapshot },
+    /// Permission-answer frame (G1). Same contract.
+    Permissions { snapshot: PermissionsSnapshot },
 }
 
 /// Unary reply to [`Request::Decide`].
@@ -1717,6 +1757,21 @@ mod tests {
                 since_ms: Some(1),
                 before_ms: None,
             },
+            Request::WatchPermissions,
+            Request::PermissionSet {
+                origin: "https://x.test".into(),
+                permissions: vec![PermissionKind::Camera, PermissionKind::Microphone],
+                decision: PermissionDecision::Allow,
+            },
+            Request::PermissionForget {
+                origin: "https://x.test".into(),
+                permission: Some(PermissionKind::Notifications),
+            },
+            Request::PermissionForget {
+                origin: "https://x.test".into(),
+                permission: None,
+            },
+            Request::PermissionClear,
         ] {
             let env = RequestEnvelope { id: 3, request };
             let line = serde_json::to_string(&env).unwrap();
@@ -1889,6 +1944,17 @@ mod tests {
         for item in [
             SubscriptionItem::Tabs {
                 snapshot: TabsSnapshot::default(),
+            },
+            SubscriptionItem::Permissions {
+                snapshot: PermissionsSnapshot {
+                    grants: vec![Grant {
+                        origin: "https://x.test".into(),
+                        permission: PermissionKind::Camera,
+                        decision: PermissionDecision::Allow,
+                        ts_ms: 7,
+                    }],
+                    read_only: false,
+                },
             },
             SubscriptionItem::Bookmarks {
                 snapshot: BookmarksSnapshot::default(),

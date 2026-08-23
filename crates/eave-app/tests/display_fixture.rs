@@ -48,7 +48,9 @@ fn replay(mut check: impl FnMut(usize, &eave_app::display::DiffOps, usize, usize
             // Slice B1: this fixture is a transcript capture. Browser
             // snapshots are not in it and would not be a transcript if
             // they were.
-            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {}
+            SubscriptionItem::Tabs { .. }
+            | SubscriptionItem::Bookmarks { .. }
+            | SubscriptionItem::Permissions { .. } => {}
             SubscriptionItem::Events { epoch, records, .. } => {
                 let before = open_fences(&display);
                 transcript
@@ -141,7 +143,9 @@ fn incremental_fold_equals_batch_rebuild() {
             // Slice B1: this fixture is a transcript capture. Browser
             // snapshots are not in it and would not be a transcript if
             // they were.
-            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {}
+            SubscriptionItem::Tabs { .. }
+            | SubscriptionItem::Bookmarks { .. }
+            | SubscriptionItem::Permissions { .. } => {}
         }
     }
     let mut batch = DisplayList::new();

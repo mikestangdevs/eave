@@ -139,6 +139,18 @@ pub enum PageRequest {
     /// place eave shells out to `open(1)` stays in `ui.rs`, where the
     /// scheme guard and its test already live.
     External { url: String },
+    /// What a person answered about an origin's camera, microphone,
+    /// location… (G1).
+    ///
+    /// The **durable** half of the answer. `dialogs.rs` has already
+    /// applied it to the app's mirror by the time this is sent, so the
+    /// page is not waiting on it; this is the trip to the engine, which is
+    /// the only thing here that survives a restart.
+    RememberPermission {
+        origin: String,
+        kinds: Vec<super::permissions::PermissionKind>,
+        decision: super::permissions::PermissionDecision,
+    },
 }
 
 static REQUESTS: OnceLock<tokio::sync::mpsc::UnboundedSender<PageRequest>> = OnceLock::new();
@@ -151,7 +163,7 @@ pub fn install_request_sink(tx: tokio::sync::mpsc::UnboundedSender<PageRequest>)
     let _ = REQUESTS.set(tx);
 }
 
-fn request(req: PageRequest) {
+pub(super) fn request(req: PageRequest) {
     if let Some(tx) = REQUESTS.get() {
         let _ = tx.send(req);
     }

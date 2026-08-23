@@ -11058,6 +11058,93 @@ fn a_link_and_a_selection_each_add_their_own_rows(cx: &mut TestAppContext) {
     );
 }
 
+/// G1's undo, and the reason it is a row and not a settings page eave does
+/// not have: an answer that persists and cannot be taken back is a worse
+/// bargain than one asked every time, because a mis-click on "Allow"
+/// becomes permanent.
+///
+/// **Absent, not disabled, when there is nothing to reset.** A greyed row
+/// on every page would tell every operator that eave holds permissions for
+/// the site they are on — a claim about their data that is usually false.
+#[gpui::test]
+fn a_site_with_no_answers_offers_nothing_to_reset(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://permnone.example/x"));
+
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            link_url: None,
+            selection: None,
+            editable: false,
+        },
+    );
+    // Back, Forward, Reload, Copy — and nothing after them.
+    assert!(shown(vcx, "menu-row-3"), "the Copy row is missing");
+    assert!(
+        !shown(vcx, "menu-row-4"),
+        "a reset row appeared for a site with no answers"
+    );
+}
+
+/// And when there IS something to reset, the row is there and it works —
+/// locally at once, and on the wire for the store that actually held it.
+#[gpui::test]
+fn a_sites_permissions_can_be_reset_from_the_page_menu(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://permreset.example/room/7?x=1"));
+    crate::web::permissions::note_answer(
+        "https://permreset.example",
+        &[
+            crate::web::permissions::PermissionKind::Camera,
+            crate::web::permissions::PermissionKind::Microphone,
+        ],
+        crate::web::permissions::PermissionDecision::Allow,
+    );
+
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            link_url: None,
+            selection: None,
+            editable: false,
+        },
+    );
+    let _ = h.drain();
+    // Back, Forward, Reload, Copy, Reset.
+    assert!(
+        shown(vcx, "menu-row-4"),
+        "a site with two answers offered no way to take them back"
+    );
+    click(vcx, "menu-row-4");
+    vcx.run_until_parked();
+
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::ForgetPermissions { origin })
+                if origin == "https://permreset.example"
+        )),
+        "the reset row told the engine nothing: {cmds:?}"
+    );
+    // The mirror is cleared on the click rather than a round trip later,
+    // so the next ask from that site is an ask again.
+    assert_eq!(
+        crate::web::permissions::count_for("https://permreset.example/"),
+        0,
+        "the answers survived their own reset"
+    );
+}
+
 /// **Open Link in New Tab opens it in the BACKGROUND.** That row has meant
 /// "keep this, I am still reading" in every browser for twenty years;
 /// foregrounding it would be the behaviour of an ordinary click, which the

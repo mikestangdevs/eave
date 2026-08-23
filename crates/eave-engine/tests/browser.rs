@@ -17,8 +17,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use eave_engine::client::Client;
 use eave_wire::{
-    socket_path, BookmarksSnapshot, LoadState, PageFact, Request, ResponseBody, ResponseEnvelope,
-    Setting, Slot, SubscriptionItem, TabContent, TabsSnapshot,
+    socket_path, BookmarksSnapshot, LoadState, PageFact, PermissionDecision, PermissionKind,
+    PermissionsSnapshot, Request, ResponseBody, ResponseEnvelope, Setting, Slot, SubscriptionItem,
+    TabContent, TabsSnapshot,
 };
 
 /// Navigate the way the world works after Slice C1: the operator asks, and
@@ -157,6 +158,19 @@ async fn next_bookmarks(
     match item {
         SubscriptionItem::Bookmarks { snapshot } => snapshot,
         other => panic!("expected a bookmarks frame, got {other:?}"),
+    }
+}
+
+async fn next_permissions(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SubscriptionItem>,
+) -> PermissionsSnapshot {
+    let item = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("permissions frame in time")
+        .expect("permissions stream open");
+    match item {
+        SubscriptionItem::Permissions { snapshot } => snapshot,
+        other => panic!("expected a permissions frame, got {other:?}"),
     }
 }
 
@@ -1415,5 +1429,144 @@ async fn load_facts_carry_history_flags_onto_the_snapshot() {
          back={} fwd={}",
         t.can_go_back,
         t.can_go_forward
+    );
+}
+
+/// G1's whole claim, against a real engine: an answer given once is still
+/// given after the process that took it has been `kill -9`ed.
+///
+/// The defect this replaces is worse than a missing feature. D9 built the
+/// prompt and stored nothing, so eave asked for the camera on every page
+/// load — which teaches the operator to click the primary button without
+/// reading, the exact reflex a permission dialog exists to prevent.
+#[tokio::test]
+async fn a_permission_answer_survives_a_restart() {
+    let dir = scratch();
+    let mut engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+
+    // One grouped ask, answered once: both capabilities are recorded.
+    assert!(client
+        .browser_do(Request::PermissionSet {
+            origin: "https://meet.example/room/7?x=1".into(),
+            permissions: vec![PermissionKind::Camera, PermissionKind::Microphone],
+            decision: PermissionDecision::Allow,
+        })
+        .await
+        .unwrap());
+    // A refusal is remembered as firmly as a grant — otherwise "don't
+    // allow" is the one answer that still nags.
+    assert!(client
+        .browser_do(Request::PermissionSet {
+            origin: "https://ads.example".into(),
+            permissions: vec![PermissionKind::Notifications],
+            decision: PermissionDecision::Deny,
+        })
+        .await
+        .unwrap());
+    // Re-answering the same way is not a change, so it neither appends a
+    // line nor re-broadcasts. A page that re-asks on every load would
+    // otherwise grow the file forever.
+    assert!(
+        !client
+            .browser_do(Request::PermissionSet {
+                origin: "https://meet.example/other".into(),
+                permissions: vec![PermissionKind::Camera],
+                decision: PermissionDecision::Allow,
+            })
+            .await
+            .unwrap(),
+        "a no-op answer reported changed:true"
+    );
+
+    // Rules 3 and 4: an origin with no honest key, and a capability eave
+    // has no word for, are refused by the store rather than filed under a
+    // guess. Both must go on being asked about.
+    assert!(!client
+        .browser_do(Request::PermissionSet {
+            origin: "data:text/html,<b>hi".into(),
+            permissions: vec![PermissionKind::Camera],
+            decision: PermissionDecision::Allow,
+        })
+        .await
+        .unwrap());
+    assert!(!client
+        .browser_do(Request::PermissionSet {
+            origin: "https://odd.example".into(),
+            permissions: vec![PermissionKind::Unknown(1 << 30)],
+            decision: PermissionDecision::Allow,
+        })
+        .await
+        .unwrap());
+
+    drop(client);
+    engine.sigkill();
+    let mut engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+    let mut rx = client.watch_permissions().await.unwrap();
+    let snap = next_permissions(&mut rx).await;
+
+    assert_eq!(snap.grants.len(), 3, "{:#?}", snap.grants);
+    assert!(!snap.read_only);
+    // Origin-ordered then capability-ordered, because the whole snapshot
+    // is re-sent on every change and a set that reshuffled itself would
+    // make every send look like a change.
+    assert_eq!(snap.grants[0].origin, "https://ads.example");
+    assert_eq!(snap.grants[0].permission, PermissionKind::Notifications);
+    assert_eq!(snap.grants[0].decision, PermissionDecision::Deny);
+    // The page-and-query part of the url is not part of the key: a
+    // permission is per origin, which is what a person means by "this
+    // site".
+    assert_eq!(snap.grants[1].origin, "https://meet.example");
+    assert_eq!(snap.grants[1].permission, PermissionKind::Camera);
+    assert_eq!(snap.grants[2].origin, "https://meet.example");
+    assert_eq!(snap.grants[2].permission, PermissionKind::Microphone);
+
+    // A revoke takes the grant off the DISK, not just out of memory. A
+    // tombstone would leave "this browser may use your camera" sitting in
+    // plain text under somebody's name, and "I turned that off" would be
+    // false — the same claim `HistoryForget` makes and for the same
+    // reason.
+    assert!(client
+        .browser_do(Request::PermissionForget {
+            origin: "https://meet.example".into(),
+            permission: Some(PermissionKind::Camera),
+        })
+        .await
+        .unwrap());
+    let path = dir.join("browser").join("permissions.jsonl");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !raw.contains("\"camera\""),
+        "a revoked grant is still in {}: {raw}",
+        path.display()
+    );
+    assert!(
+        raw.contains("microphone"),
+        "the revoke took an unrelated grant with it: {raw}"
+    );
+
+    // Forgetting an origin outright, then everything.
+    assert!(client
+        .browser_do(Request::PermissionForget {
+            origin: "https://meet.example".into(),
+            permission: None,
+        })
+        .await
+        .unwrap());
+    assert!(client.browser_do(Request::PermissionClear).await.unwrap());
+    assert!(
+        !client.browser_do(Request::PermissionClear).await.unwrap(),
+        "clearing an empty store reported changed:true"
+    );
+
+    drop(client);
+    engine.sigkill();
+    let _engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+    let mut rx = client.watch_permissions().await.unwrap();
+    assert!(
+        next_permissions(&mut rx).await.grants.is_empty(),
+        "a cleared store came back with answers in it"
     );
 }

@@ -189,7 +189,9 @@ async fn drain_records(
             // ids and are demultiplexed by the client, so one arriving
             // here would mean the demux itself broke. Say so loudly
             // rather than drop it into the ignore arm above.
-            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+            SubscriptionItem::Tabs { .. }
+            | SubscriptionItem::Bookmarks { .. }
+            | SubscriptionItem::Permissions { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
         }

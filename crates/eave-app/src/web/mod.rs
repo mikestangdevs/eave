@@ -75,6 +75,13 @@
 /// in `tabs.rs`'s `on_before_browse`.
 pub mod policy;
 
+/// What a person has already answered, per origin (G1).
+///
+/// **Ungated for the same reason as [`policy`]** — it is a lock around a
+/// map and a pure function of it, and the suite runs with the feature off.
+/// The gated caller is a handful of lines in `dialogs.rs`.
+pub mod permissions;
+
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
@@ -581,6 +588,11 @@ pub enum PageRequest {
     External {
         url: String,
     },
+    RememberPermission {
+        origin: String,
+        kinds: Vec<permissions::PermissionKind>,
+        decision: permissions::PermissionDecision,
+    },
 }
 
 /// Give the page engine somewhere to ask. Nothing asks here.
@@ -646,7 +658,7 @@ pub enum Ask {
         reloading: bool,
     },
     Permission {
-        kinds: Vec<String>,
+        kinds: Vec<permissions::PermissionKind>,
     },
     Files {
         title: String,

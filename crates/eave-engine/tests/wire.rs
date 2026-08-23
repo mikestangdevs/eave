@@ -166,7 +166,9 @@ async fn drain_records(
             // ids and are demultiplexed by the client, so one arriving
             // here would mean the demux itself broke. Say so loudly
             // rather than drop it into the ignore arm above.
-            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+            SubscriptionItem::Tabs { .. }
+            | SubscriptionItem::Bookmarks { .. }
+            | SubscriptionItem::Permissions { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
         }
@@ -379,7 +381,9 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
             // ids and are demultiplexed by the client, so one arriving
             // here would mean the demux itself broke. Say so loudly
             // rather than drop it into the ignore arm above.
-            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+            SubscriptionItem::Tabs { .. }
+            | SubscriptionItem::Bookmarks { .. }
+            | SubscriptionItem::Permissions { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
         }
@@ -750,7 +754,9 @@ async fn deltas_fold_into_120ms_frames() {
             // ids and are demultiplexed by the client, so one arriving
             // here would mean the demux itself broke. Say so loudly
             // rather than drop it into the ignore arm above.
-            SubscriptionItem::Tabs { .. } | SubscriptionItem::Bookmarks { .. } => {
+            SubscriptionItem::Tabs { .. }
+            | SubscriptionItem::Bookmarks { .. }
+            | SubscriptionItem::Permissions { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
             SubscriptionItem::Events { epoch, records, .. } => {

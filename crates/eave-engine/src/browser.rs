@@ -31,7 +31,8 @@ use tokio::sync::broadcast;
 
 use eave_core::browser::bookmarks::{BookmarkEvent, BookmarkId};
 use eave_core::browser::history::{HistoryEvent, Transition};
-use eave_core::browser::snapshot::{BookmarksSnapshot, TabsSnapshot};
+use eave_core::browser::permissions::{Decision, PermissionEvent, PermissionKind};
+use eave_core::browser::snapshot::{BookmarksSnapshot, PermissionsSnapshot, TabsSnapshot};
 use eave_core::browser::tabs::{
     normalize_url, GroupId, LoadState, NavStack, PendingNav, Setting, TabContent, TabEvent, TabId,
 };
@@ -89,6 +90,7 @@ pub struct Browser {
     store: StdMutex<BrowserStore>,
     tabs_tx: broadcast::Sender<TabPoke>,
     bookmarks_tx: broadcast::Sender<()>,
+    permissions_tx: broadcast::Sender<()>,
     /// Distinguishes two requests for the same address. See [`PendingNav`].
     nav_seq: AtomicU64,
     /// What opening the logs found. Held so it can be stated more than
@@ -102,10 +104,12 @@ impl Browser {
         let (store, report) = BrowserStore::open(data_dir)?;
         let (tabs_tx, _) = broadcast::channel(BROWSER_CAP);
         let (bookmarks_tx, _) = broadcast::channel(BROWSER_CAP);
+        let (permissions_tx, _) = broadcast::channel(BROWSER_CAP);
         Ok(Arc::new(Self {
             store: StdMutex::new(store),
             tabs_tx,
             bookmarks_tx,
+            permissions_tx,
             nav_seq: AtomicU64::new(0),
             report,
         }))
@@ -134,9 +138,18 @@ impl Browser {
         s.tabs.snapshot(s.read_only())
     }
 
+    pub fn subscribe_permissions(&self) -> broadcast::Receiver<()> {
+        self.permissions_tx.subscribe()
+    }
+
     pub fn bookmarks_snapshot(&self) -> BookmarksSnapshot {
         let s = self.store.lock().unwrap();
         s.bookmarks.snapshot(s.read_only())
+    }
+
+    pub fn permissions_snapshot(&self) -> PermissionsSnapshot {
+        let s = self.store.lock().unwrap();
+        s.permissions.snapshot(s.read_only())
     }
 
     /// Apply one tab event, poke the strip if it changed.
@@ -164,6 +177,19 @@ impl Browser {
             .map_err(|e| format!("write bookmarks log: {e}"))?;
         if changed {
             let _ = self.bookmarks_tx.send(());
+        }
+        Ok(changed)
+    }
+
+    fn permission(&self, event: PermissionEvent) -> Result<bool, String> {
+        let changed = self
+            .store
+            .lock()
+            .unwrap()
+            .permission_event(event)
+            .map_err(|e| format!("write permissions log: {e}"))?;
+        if changed {
+            let _ = self.permissions_tx.send(());
         }
         Ok(changed)
     }
@@ -660,6 +686,49 @@ impl Browser {
             since_ms,
             before_ms,
         })
+    }
+
+    // -----------------------------------------------------------------
+    // Permissions (G1)
+
+    /// Record one answer, which may cover several capabilities: a grouped
+    /// camera-and-microphone prompt takes one answer and both are written.
+    ///
+    /// **Returns changed, not written.** An answer identical to the stored
+    /// one is neither logged nor broadcast, which is what keeps a page
+    /// that re-asks on every load from appending a line every time.
+    pub fn permission_set(
+        &self,
+        origin: String,
+        permissions: Vec<PermissionKind>,
+        decision: Decision,
+    ) -> Result<bool, String> {
+        let ts_ms = now_ms();
+        let mut changed = false;
+        for permission in permissions {
+            // Unstorable capabilities and unnameable origins are refused
+            // by the fold, not here — one place decides, and it is the one
+            // a hand-edited file also goes through.
+            changed |= self.permission(PermissionEvent::Decided {
+                origin: origin.clone(),
+                permission,
+                decision,
+                ts_ms,
+            })?;
+        }
+        Ok(changed)
+    }
+
+    pub fn permission_forget(
+        &self,
+        origin: String,
+        permission: Option<PermissionKind>,
+    ) -> Result<bool, String> {
+        self.permission(PermissionEvent::Forgotten { origin, permission })
+    }
+
+    pub fn permission_clear(&self) -> Result<bool, String> {
+        self.permission(PermissionEvent::Cleared)
     }
 
     // There is deliberately no `sync()` here. The engine's accept loop
