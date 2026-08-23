@@ -755,6 +755,22 @@ async fn feed_loop(
                                         .await;
                                 }
                             }
+                            // The clean URL after the policy filter took
+                            // a tracker off it. `TabNavigate` is the same
+                            // path the omnibox and every link take, so a
+                            // rewritten navigation is journalled once, like
+                            // any other.
+                            Some(crate::web::PageRequest::Navigate { tab_id, url }) => {
+                                let _ = client
+                                    .browser_do(eave_wire::Request::TabNavigate { tab_id, url })
+                                    .await;
+                            }
+                            // `mailto:` / `tel:`. Handed to the OS through
+                            // the one guarded opener, never spawned from
+                            // inside the CEF callback that decided it.
+                            Some(crate::web::PageRequest::External { url }) => {
+                                open_external(&url);
+                            }
                             None => return,
                         },
                     }
@@ -2584,6 +2600,32 @@ fn open_url(raw: &str) {
     #[cfg(not(test))]
     {
         let _ = std::process::Command::new("open").arg(&url).spawn();
+    }
+}
+
+/// Hand a non-web URL to the operating system — **if eave named the scheme
+/// itself**.
+///
+/// The sibling of [`open_url`], and the guard is repeated here for exactly
+/// the reason it is repeated there: `open(1)` launches whatever has
+/// registered for a scheme, and this string arrives from a web page. The
+/// allow-list lives in `web::policy`; asking it again at the syscall means
+/// a future caller cannot route around it by constructing the request
+/// directly.
+fn open_external(raw: &str) {
+    let Some(scheme) = crate::web::policy::scheme(raw) else {
+        return;
+    };
+    if !crate::web::policy::is_external_scheme(&scheme) {
+        return;
+    }
+    #[cfg(test)]
+    {
+        OPENED_URLS.with(|o| o.borrow_mut().push(raw.to_string()));
+    }
+    #[cfg(not(test))]
+    {
+        let _ = std::process::Command::new("open").arg(raw).spawn();
     }
 }
 

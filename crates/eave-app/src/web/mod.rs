@@ -67,6 +67,14 @@
 //! nothing — rather than panics, because "eave built without a browser" is a
 //! real configuration and not an error.
 
+/// What a navigation is allowed to do, decided before it starts (B7, E5).
+///
+/// **Ungated on purpose** — every function in it is a pure function of a
+/// URL string, and `cargo test` runs with the feature OFF. Same bargain as
+/// the shared half further down this file. The gated caller is four lines
+/// in `tabs.rs`'s `on_before_browse`.
+pub mod policy;
+
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
@@ -565,6 +573,13 @@ pub enum PageRequest {
         url: String,
         opener: String,
         activate: bool,
+    },
+    Navigate {
+        tab_id: String,
+        url: String,
+    },
+    External {
+        url: String,
     },
 }
 

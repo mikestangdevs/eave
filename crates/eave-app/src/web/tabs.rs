@@ -123,6 +123,22 @@ pub enum PageRequest {
         opener: String,
         activate: bool,
     },
+    /// A navigation eave rewrote before it started — a tracked link with
+    /// its trackers removed (`policy::Decision::Rewrite`).
+    ///
+    /// **Asked for rather than performed**, and that is the borrow rule in
+    /// `web/mod.rs` being obeyed rather than a style choice: the decision
+    /// is made inside `on_before_browse`, which CEF runs synchronously on
+    /// our stack, and calling `load_url` from in there would re-enter
+    /// Chromium mid-callback. Cancelling and posting the clean URL back
+    /// through the sink takes the same path every other navigation takes.
+    Navigate { tab_id: String, url: String },
+    /// A `mailto:` / `tel:` link. Not a page — the operating system's.
+    ///
+    /// Routed out here rather than spawned from the handler so that the one
+    /// place eave shells out to `open(1)` stays in `ui.rs`, where the
+    /// scheme guard and its test already live.
+    External { url: String },
 }
 
 static REQUESTS: OnceLock<tokio::sync::mpsc::UnboundedSender<PageRequest>> = OnceLock::new();
@@ -277,6 +293,15 @@ fn note_url(tab_id: &str, url: &str) -> bool {
             }
         }
     })
+}
+
+/// The address this tab is on, as last reported.
+///
+/// The initiator of a top-level navigation, for
+/// [`super::policy::decide`] — `None` on a tab's very first load, which
+/// the policy treats as cross-site.
+fn last_url(tab_id: &str) -> Option<String> {
+    LAST_URL.with(|u| u.borrow().get(tab_id).cloned())
 }
 
 /// Chromium's cursor, as gpui's.
@@ -1141,6 +1166,82 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        /// Decide what a navigation is allowed to do, before it starts.
+        ///
+        /// **This method was empty, and an empty `on_before_browse` is not
+        /// "allow everything" — it is three abilities the browser does not
+        /// have.** A `mailto:` link inside an off-screen browser resolves
+        /// to no handler and does nothing at all; a tracked link carries
+        /// its trackers; an unknown scheme is whatever Chromium decides.
+        ///
+        /// The decision itself is in [`super::policy`], ungated and
+        /// tested against Brave's own cases. All that happens here is
+        /// turning an answer into a return code.
+        ///
+        /// # Returning 1 means "cancel", and cancelling is how a rewrite
+        /// works
+        /// CEF gives no way to *edit* the URL from this callback, so a
+        /// rewrite is a cancel plus a fresh navigation. The fresh one is
+        /// asked for through the sink rather than issued here — see
+        /// [`super::PageRequest::Navigate`] for why re-entering Chromium
+        /// from inside its own callback is the thing this codebase has
+        /// already been bitten by twice.
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            // Named `incoming`, not `request`: this module has a free
+            // `request()` that posts to the sink, and a parameter of that
+            // name silently shadows it.
+            incoming: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let Some(req) = incoming else {
+                return 0;
+            };
+            // `url()` hands back a userfree string, which has no `Display`
+            // of its own — the utf16 view does.
+            let url = CefStringUtf16::from(&req.url()).to_string();
+            let method = CefStringUtf16::from(&req.method()).to_string();
+            // Where the tab is now IS the initiator of a top-level
+            // navigation, and `LAST_URL` already tracks it per tab for the
+            // address dedup.
+            let from = last_url(&self.tab_id);
+            let decision = super::policy::decide(
+                &url,
+                from.as_deref(),
+                &method,
+                is_redirect != 0,
+            );
+            match decision {
+                super::policy::Decision::Allow => 0,
+                super::policy::Decision::Rewrite(clean) => {
+                    if trace() {
+                        eprintln!("[web] policy: rewrote {url} -> {clean}");
+                    }
+                    request(super::PageRequest::Navigate {
+                        tab_id: self.tab_id.clone(),
+                        url: clean,
+                    });
+                    1
+                }
+                super::policy::Decision::External(url) => {
+                    if trace() {
+                        eprintln!("[web] policy: external {url}");
+                    }
+                    request(super::PageRequest::External { url });
+                    1
+                }
+                super::policy::Decision::Block => {
+                    if trace() {
+                        eprintln!("[web] policy: blocked {url}");
+                    }
+                    1
+                }
+            }
+        }
+
         /// The renderer for this tab died.
         ///
         /// **This is the worst failure mode eave had, because it produced no

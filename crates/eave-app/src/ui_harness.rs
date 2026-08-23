@@ -6633,6 +6633,36 @@ fn a_link_eave_will_not_open_is_drawn_inert_and_takes_no_click(cx: &mut TestAppC
     assert_eq!(opened_urls(), vec!["https://eave.sh".to_string()]);
 }
 
+/// The other opener, and the same rule.
+///
+/// `open_external` exists so `mailto:` and `tel:` reach the OS, and the
+/// danger it carries is exactly the danger `open_url` carries: `open(1)`
+/// launches whatever registered for a scheme, and the string came from a
+/// page. The allow-list is asked twice — once when `web::policy` decides,
+/// again at the syscall — so a caller who builds the request by hand still
+/// cannot get an arbitrary scheme launched.
+#[gpui::test]
+fn open_external_only_passes_the_schemes_eave_named(_cx: &mut TestAppContext) {
+    let _ = opened_urls();
+    open_external("mailto:a@b.test");
+    open_external("tel:+15551234");
+    assert_eq!(
+        opened_urls(),
+        vec!["mailto:a@b.test".to_string(), "tel:+15551234".to_string()],
+        "the control did not open — every refusal below would prove nothing"
+    );
+
+    let _ = opened_urls();
+    open_external("zoommtg://zoom.us/join");
+    open_external("javascript:alert(1)");
+    open_external("https://eave.sh");
+    open_external("x-random-app:do-a-thing");
+    assert!(
+        opened_urls().is_empty(),
+        "open_external passed a scheme that is not on the allow-list"
+    );
+}
+
 /// A list item's marker never collides with its own text.
 ///
 /// The gutter is a fixed WIDTH beside a column that wraps — never a fixed
