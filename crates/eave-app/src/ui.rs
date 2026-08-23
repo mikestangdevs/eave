@@ -5226,9 +5226,43 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                // A scrim, because the page behind is STOPPED. Dimming it
-                // is the only thing on screen that says so.
+                // A scrim, because for a JS dialog the page behind is
+                // STOPPED, and dimming it is the only thing on screen that
+                // says so.
                 .bg(theme::overlay_strongest())
+                // **And it must swallow the clicks it is dimming (G25).**
+                //
+                // Without this the scrim was decoration: `div().bg(..)`
+                // paints, it does not take input, so a click aimed at this
+                // card fell straight through into the live page. Every
+                // other floating surface in the shell already occludes —
+                // `overlay.rs:568`, `:674`, `:695`, and the find bar at
+                // `ui.rs:10752`. The dialog was the one that did not, which
+                // is what makes it an oversight rather than a decision.
+                //
+                // # Why nobody noticed, which is the part worth keeping
+                // The comment above used to read "the page behind is
+                // STOPPED" with no qualifier, and for four of the six asks
+                // this surface serves that is simply true: `Alert`,
+                // `Confirm`, `Prompt` and `Leave` hold a
+                // `CefJsdialogCallback` and the renderer's JS thread is
+                // blocked on it. Nothing can move underneath, so nothing
+                // reveals that clicks pass through.
+                //
+                // **It is false for `Ask::Permission`**, which is the one
+                // that matters: `requestPermission()` is async and the page
+                // keeps running the whole time it is on screen. Measured —
+                // a page counting `mousedown`s logged several *between*
+                // raising the prompt and it being answered. `Ask::Files` is
+                // async in CEF too and should pattern with Permission
+                // rather than with the JS dialogs; unverified.
+                //
+                // So the justification held for five cases out of six and
+                // failed on the security-critical one. A page can put
+                // content under where "Allow" will be, and an operator
+                // aiming at eave's own prompt clicks the page as well —
+                // which is the clickjacking shape, not a cosmetic bug.
+                .occlude()
                 .child(
                     div()
                         .debug_selector(|| "page-dialog-card".into())
