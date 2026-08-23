@@ -8350,8 +8350,13 @@ impl Shell {
             // the containing block or the handle would anchor to the window.
             .relative()
             .bg(theme::rail_plate())
-            .border_r_1()
-            .border_color(theme::border())
+            // **No right border.** The rail meets the content card across a
+            // CARD_GUTTER of window surface, and the card draws its own
+            // hairline — so a border here is a second line a few pixels from
+            // the first, which reads as a seam rather than an edge. The
+            // operator called it out on sight. The plate's own colour is what
+            // separates the rail from the window; the drag handle, which
+            // overhangs this box, is what says the seam is grabbable.
             .flex()
             .flex_col()
             .child(
