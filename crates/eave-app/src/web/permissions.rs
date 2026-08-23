@@ -111,6 +111,18 @@ pub fn count_for(url: &str) -> usize {
 /// than a round trip later.
 pub fn forget_origin(url: &str) -> Option<String> {
     let origin = eave_wire::normalize_origin(url)?;
+    // Taken BEFORE the clear, because Chromium's copy has to be cleared
+    // per capability and after this there is nothing left to enumerate.
+    let held: Vec<PermissionKind> = mirror()
+        .read()
+        .map(|m| {
+            m.grants()
+                .into_iter()
+                .filter(|g| g.origin == origin)
+                .map(|g| g.permission)
+                .collect()
+        })
+        .unwrap_or_default();
     if let Ok(mut m) = mirror().write() {
         m.apply(
             &eave_core::browser::permissions::PermissionEvent::Forgotten {
@@ -119,6 +131,15 @@ pub fn forget_origin(url: &str) -> Option<String> {
             },
         );
     }
+    // **Chromium keeps its own durable copy, and it is the one that decides
+    // whether eave is ever asked again.** `cb.cont(ACCEPT)` reaches
+    // `delegate_->Accept(std::monostate{})` — CEF does not expose
+    // `AcceptThisTime`, so it is always the durable branch — and
+    // `PermissionContextBase::RequestPermission` then returns early on a
+    // stored GRANTED/DENIED without ever reaching the prompt. Clearing only
+    // eave's two stores left the site holding the permission and the prompt
+    // never coming back: a revoke that did nothing and said nothing.
+    super::cef_clear_permissions(&origin, &held);
     Some(origin)
 }
 

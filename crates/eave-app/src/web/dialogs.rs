@@ -377,6 +377,19 @@ fn remember(origin: &str, kinds: &[PermissionKind], allowed: bool) {
         return;
     }
     super::permissions::note_answer(origin, &storable, decision);
+    // Chromium has already stored its own copy for the kinds it decides
+    // (that is the whole point of `sync_to_chromium`'s doc comment), but
+    // stating it explicitly costs one call and removes the case where the
+    // two disagree because eave's answer took a path Chromium did not see.
+    sync_to_chromium(
+        origin,
+        &storable,
+        if allowed {
+            ContentSettingValues::ALLOW
+        } else {
+            ContentSettingValues::BLOCK
+        },
+    );
     super::tabs::request(super::PageRequest::RememberPermission {
         origin: origin.to_string(),
         kinds: storable,
@@ -391,6 +404,94 @@ fn remember(origin: &str, kinds: &[PermissionKind], allowed: bool) {
 /// **synchronously**, which CEF documents as allowed for both permission
 /// paths — and which is the only option anyway, because the alternative is
 /// parking a stopped renderer while nothing is pending.
+/// The `ContentSettingsType` Chromium files this capability under, for the
+/// kinds Chromium itself decides.
+///
+/// `None` means **eave is the only store for this one**, and there are two
+/// such cases:
+///
+/// - **camera and microphone.** They arrive down
+///   `on_request_media_access_permission`, and CEF answers that from
+///   `media_access_query.cc`, which references `HostContentSettingsMap`
+///   nowhere at all — `CheckMediaAccessPermission` returns true with the
+///   comment "Always allowed here. RequestMediaAccessPermission will be
+///   called." Writing a content setting for these would write a fact that
+///   nothing ever reads.
+/// - **an unrecognised capability**, which is never stored anywhere.
+fn content_type(kind: &PermissionKind) -> Option<ContentSettingTypes> {
+    Some(match kind {
+        PermissionKind::Geolocation => ContentSettingTypes::GEOLOCATION,
+        PermissionKind::Notifications => ContentSettingTypes::NOTIFICATIONS,
+        PermissionKind::Clipboard => ContentSettingTypes::CLIPBOARD_READ_WRITE,
+        PermissionKind::MidiSysex => ContentSettingTypes::MIDI_SYSEX,
+        PermissionKind::PointerLock => ContentSettingTypes::POINTER_LOCK,
+        PermissionKind::WindowManagement => ContentSettingTypes::WINDOW_MANAGEMENT,
+        PermissionKind::LocalFonts => ContentSettingTypes::LOCAL_FONTS,
+        PermissionKind::IdleDetection => ContentSettingTypes::IDLE_DETECTION,
+        PermissionKind::StorageAccess => ContentSettingTypes::STORAGE_ACCESS,
+        PermissionKind::VrSession => ContentSettingTypes::VR,
+        PermissionKind::ArSession => ContentSettingTypes::AR,
+        // Camera, mic, screen capture, keyboard lock and the unknown bit:
+        // eave's store is the only one that decides these.
+        _ => return None,
+    })
+}
+
+/// Put Chromium's copy of an origin's answers in step with eave's.
+///
+/// # Why this exists, and why leaving it out was a DEFECT
+/// For every capability that comes down `on_show_permission_prompt`,
+/// **Chromium is the one that decides whether eave is asked at all.**
+/// `cb.cont(ACCEPT)` reaches `delegate_->Accept(std::monostate{})` — CEF
+/// deliberately does not expose `AcceptThisTime`, so it is always the
+/// durable branch — and `PermissionContextBase::RequestPermission` then
+/// short-circuits any later request:
+///
+/// ```text
+/// // Check the content setting to see if the user has already made a
+/// // decision, or if the origin is under embargo. If so, respect that.
+/// if (!status_ignorable && (result.status == GRANTED ||
+///                           result.status == DENIED)) { … return; }
+/// ```
+///
+/// `status_ignorable` is false for any request that is not
+/// `IsEmbeddedPermissionElementInitiated()`, which an ordinary
+/// `Notification.requestPermission()` is not. So without this call, eave's
+/// "Reset permissions for this site" cleared eave's two stores, Chromium
+/// kept its own ALLOW, **the prompt never came back and the site kept the
+/// permission.** The revoke did nothing and said nothing.
+///
+/// `verdict()`'s deliberate fail-towards-`Ask` cannot save that, because
+/// the prompt never arrives to be failed towards.
+///
+/// Verified against the pinned trees — Chromium 151.0.7922.174 and CEF
+/// branch `cef-151`, the pair the lockfile's `cef 151.6.0+151.3.18` names.
+fn sync_to_chromium(origin: &str, kinds: &[PermissionKind], value: ContentSettingValues) {
+    let Some(context) = request_context_get_global_context() else {
+        return;
+    };
+    // eave passes `None` for the request context when it creates a browser,
+    // so the global context IS the one every page uses.
+    let url = CefString::from(origin);
+    for kind in kinds {
+        let Some(ty) = content_type(kind) else {
+            continue;
+        };
+        // Requesting and top-level url are both the origin: eave has no
+        // per-embedder permission model, and answering "allow example.com"
+        // means allowing it, not allowing it only inside itself.
+        context.set_content_setting(Some(&url), Some(&url), ty, value);
+        if super::tabs::trace() {
+            eprintln!("[web] chromium content setting {kind:?} for {origin} := {value:?}");
+        }
+    }
+}
+
+/// Take back Chromium's copy for one origin. Called by the revoke path.
+pub fn clear_in_chromium(origin: &str, kinds: &[PermissionKind]) {
+    sync_to_chromium(origin, kinds, ContentSettingValues::DEFAULT);
+}
+
 fn trace_remembered(origin: &str, kinds: &[PermissionKind], allowed: bool) {
     // Worth a line of its own: a prompt that does NOT appear is invisible
     // by construction, so without this the difference between "remembered"

@@ -122,6 +122,22 @@ pub use tabs::{
     Download, Fact, PageChrome, PageRequest,
 };
 
+/// Clear Chromium's own copy of an origin's permission answers (G1).
+///
+/// **Not a tidiness call — a correctness one.** For every capability that
+/// arrives through `on_show_permission_prompt`, Chromium stores its own
+/// durable ALLOW/BLOCK and short-circuits later requests before the
+/// embedder is asked. Without this, eave's revoke cleared eave's stores and
+/// the site kept the permission. See `dialogs::sync_to_chromium`.
+#[cfg(feature = "web")]
+pub(crate) fn cef_clear_permissions(origin: &str, kinds: &[permissions::PermissionKind]) {
+    dialogs::clear_in_chromium(origin, kinds);
+}
+
+/// Nothing to clear: there is no Chromium here.
+#[cfg(not(feature = "web"))]
+pub(crate) fn cef_clear_permissions(_origin: &str, _kinds: &[permissions::PermissionKind]) {}
+
 // ---------------------------------------------------------------------------
 // What the two halves share (Slice E1)
 // ---------------------------------------------------------------------------
