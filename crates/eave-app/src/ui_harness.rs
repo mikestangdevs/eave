@@ -1555,7 +1555,14 @@ fn the_composer_types_pastes_and_sends(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -1856,7 +1863,14 @@ fn a_draft_stays_with_the_session_it_was_typed_into(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -1980,7 +1994,14 @@ fn the_launcher_reaches_no_composer(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -2328,7 +2349,14 @@ fn denying_carries_the_operators_reason_and_clears_the_composer(cx: &mut TestApp
     );
     let draft = vcx
         .read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap();
     assert!(
@@ -4684,7 +4712,14 @@ fn an_open_menu_swallows_typing(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
         vcx.read_window(&h.window, |shell, cx| {
-            shell.read(cx).composer.read(cx).text.clone()
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
         })
         .unwrap()
     };
@@ -5585,7 +5620,14 @@ fn rename_buffer(vcx: &mut VisualTestContext, h: &Harness) -> Option<String> {
 
 fn composer_draft(vcx: &mut VisualTestContext, h: &Harness) -> String {
     vcx.read_window(&h.window, |shell, cx| {
-        shell.read(cx).composer.read(cx).text.clone()
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .field
+            .read(cx)
+            .content()
+            .to_string()
     })
     .unwrap()
 }
@@ -8826,7 +8868,14 @@ fn omni_text(h: &Harness, vcx: &mut VisualTestContext) -> String {
 
 fn draft_of(h: &Harness, vcx: &mut VisualTestContext) -> String {
     vcx.read_window(&h.window, |shell, cx| {
-        shell.read(cx).composer.read(cx).text.clone()
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .field
+            .read(cx)
+            .content()
+            .to_string()
     })
     .unwrap()
 }

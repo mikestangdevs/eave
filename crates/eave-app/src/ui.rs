@@ -58,6 +58,7 @@ use crate::omnibox;
 use crate::overlay::{self, MenuItem, Popup};
 use crate::slash::{self, SlashEntry};
 use crate::strip;
+use crate::text_field::TextField;
 use crate::theme;
 
 actions!(
@@ -102,8 +103,36 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        /// Slice CM — Return in the composer.
+        ///
+        /// An action rather than an `on_key` arm because the composer's field
+        /// is the deepest node in the focus path, and gpui resolves a chord to
+        /// the deepest matching context: nothing mounted *above* the field can
+        /// take Return back off it, however it is bound. Scoped to
+        /// [`COMPOSER_KEY_CONTEXT`], which only the composer claims.
+        SendMessage,
+        /// Slice CM — the four keys the `/` palette borrows while it is up.
+        ///
+        /// Bound on [`SLASH_KEY_CONTEXT`], which the field claims **only while
+        /// the palette is live** and drops the moment it closes. That gating is
+        /// the whole reason they can be actions at all: `up` and `down` are the
+        /// field's own vertical caret motion the rest of the time, and a
+        /// permanent claim would have taken them away for good.
+        SlashNext,
+        SlashPrev,
+        SlashAccept,
+        SlashDismiss,
     ]
 );
+
+/// The key context eave's composer claims on top of the field's own.
+///
+/// See [`SendMessage`]. `shift-enter` is bound here too, because binding
+/// Return away from the field means putting the newline back by hand.
+const COMPOSER_KEY_CONTEXT: &str = "EaveComposer";
+
+/// Claimed **only while the `/` palette is up**. See [`SlashNext`].
+const SLASH_KEY_CONTEXT: &str = "EaveSlashPalette";
 
 /// How much of a tool's input the approval card shows before it states
 /// that it is holding back (Slice K). A 4 KB `Write` must not push its own
@@ -2207,10 +2236,16 @@ fn take_deny_reason(composer: Option<&Entity<ComposerState>>, cx: &mut App) -> S
     let Some(composer) = composer else {
         return String::new();
     };
-    let text = composer.read(cx).text.trim().to_string();
+    let text = composer
+        .read(cx)
+        .field
+        .read(cx)
+        .content()
+        .trim()
+        .to_string();
     if !text.is_empty() {
         composer.update(cx, |c, cx| {
-            c.text.clear();
+            c.field.update(cx, |f, cx| f.clear(cx));
             cx.notify();
         });
     }
@@ -3575,7 +3610,19 @@ items={count} rows={} frames={} ops={}",
 
 struct ComposerState {
     /// The live buffer: always the draft belonging to `key`.
-    text: String,
+    ///
+    /// **Slice CM.** This was a `String` the shell pushed characters onto from
+    /// a `KeyDownEvent` handler. It is a [`TextField`] now — the same buffer,
+    /// with an `EntityInputHandler` under it — and that swap is the whole
+    /// slice. What it bought: IME (so Japanese, Chinese and Korean input
+    /// compose here at all, which they could not), a selection, a caret you can
+    /// place with the mouse, word motion, and undo. What it cost is written up
+    /// in `docs/reports/stage-cm-composer.md`.
+    ///
+    /// The **field owns the live text** and there is no mirror of it here: the
+    /// same one-draft-one-home rule the parked drafts below already keep. Ask
+    /// it through [`Shell::composer_text`].
+    field: Entity<TextField>,
     /// Which session `text` belongs to; `""` is the launcher, which has no
     /// composer mounted and therefore never accumulates one.
     key: String,
@@ -3610,11 +3657,11 @@ impl ComposerState {
     ///
     /// An empty draft is removed rather than parked: absence and emptiness
     /// are the same fact here, and storing both invites them to disagree.
-    fn switch_to(&mut self, key: String) {
+    fn switch_to(&mut self, key: String, cx: &mut Context<Self>) {
         if key == self.key {
             return;
         }
-        let outgoing = std::mem::take(&mut self.text);
+        let outgoing = self.field.read(cx).content().to_string();
         if outgoing.is_empty() {
             self.drafts.remove(&self.key);
         } else {
@@ -3626,7 +3673,12 @@ impl ComposerState {
         } else {
             self.parked_files.insert(self.key.clone(), outgoing_files);
         }
-        self.text = self.drafts.remove(&key).unwrap_or_default();
+        let incoming = self.drafts.remove(&key).unwrap_or_default();
+        // `set_content` and not an insert: arriving at a session is not an
+        // edit somebody made, so there is no undo history to carry and nothing
+        // here for ⌘Z to walk back past into the *previous* session's words.
+        // bezel's `set_content` clears the history for exactly this reason.
+        self.field.update(cx, |f, cx| f.set_content(incoming, cx));
         self.attachments = self.parked_files.remove(&key).unwrap_or_default();
         self.overflow = 0;
         self.key = key;
@@ -4562,7 +4614,8 @@ impl Shell {
     /// Send the composer draft (enter key and send button share this).
     fn send_current(&mut self, cx: &mut Context<Self>) {
         let (text, files) = self.composer.update(cx, |c, cx| {
-            let text = std::mem::take(&mut c.text);
+            let text = c.field.read(cx).content().to_string();
+            c.field.update(cx, |f, cx| f.clear(cx));
             let files = std::mem::take(&mut c.attachments);
             c.overflow = 0;
             cx.notify();
@@ -4699,8 +4752,11 @@ impl Shell {
             return;
         }
         self.composer.update(cx, |c, cx| {
-            c.text.push_str(&text);
-            cx.notify();
+            // At the caret, replacing the selection — `TextField::insert`, not
+            // the old `push_str`, which appended to the end however far back
+            // the operator had arrowed. Nobody could arrow back before this
+            // slice, so the two agreed; now they do not.
+            c.field.update(cx, |f, cx| f.insert(&text, cx));
         });
         self.sync_slash_palette(cx);
     }
@@ -4885,7 +4941,7 @@ impl Shell {
     fn slash_palette_live(&self, cx: &Context<Self>) -> bool {
         self.slash.popup.is_open()
             && !self.slash.dismissed
-            && slash::palette_query(&self.composer.read(cx).text).is_some()
+            && slash::palette_query(self.composer.read(cx).field.read(cx).content()).is_some()
     }
 
     /// The rows the palette is currently offering, or `None` while the
@@ -4902,7 +4958,7 @@ impl Shell {
     /// itself — it decides whether a read is needed and hands it to the
     /// background executor.
     fn sync_slash_palette(&mut self, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text.clone();
+        let text = self.composer.read(cx).field.read(cx).content().to_string();
         let now = cx.background_executor().now();
         let query = slash::palette_query(&text);
 
@@ -4949,7 +5005,27 @@ impl Shell {
         } else {
             self.slash.popup.open((), enabled, now);
         }
+        self.claim_slash_keys(true, cx);
         cx.notify();
+    }
+
+    /// Take `up`/`down`/`tab`/`escape` for the palette, or give them back.
+    ///
+    /// The claim is a key context on the **field**, not on anything above it,
+    /// and that is forced: gpui resolves a chord to the deepest matching
+    /// context in the focus path, and while the composer is focused nothing is
+    /// deeper than the field. A context on the shell root would lose every
+    /// time.
+    ///
+    /// Held for exactly the palette's lifetime. A permanent claim would have
+    /// taken `up` and `down` away from the caret for good — which nobody would
+    /// have noticed before this slice, because there was no caret to move.
+    fn claim_slash_keys(&mut self, claimed: bool, cx: &mut Context<Self>) {
+        let context = claimed.then(|| SharedString::from(SLASH_KEY_CONTEXT));
+        self.composer.update(cx, |c, cx| {
+            c.field
+                .update(cx, |f, cx| f.set_transient_key_context(context, cx));
+        });
     }
 
     /// Read the disk, **off the UI thread**.
@@ -4992,7 +5068,7 @@ impl Shell {
                 // The row set only existed as `READING` until now, so the
                 // popup is navigating over one dead row. Re-point it at
                 // what actually arrived.
-                let text = shell.composer.read(cx).text.clone();
+                let text = shell.composer.read(cx).field.read(cx).content().to_string();
                 if let Some(q) = slash::palette_query(&text) {
                     if let Some(hits) = shell.slash_matches(q) {
                         shell.slash.popup.resize(vec![true; hits.len()]);
@@ -5005,6 +5081,10 @@ impl Shell {
     }
 
     fn close_slash_palette(&mut self, cx: &mut Context<Self>) {
+        // Released here rather than when the close ANIMATION finishes: the
+        // palette stops steering the moment it is dismissed, and a caret that
+        // could not move for the length of a fade would read as a hang.
+        self.claim_slash_keys(false, cx);
         let now = cx.background_executor().now();
         if self.slash.popup.begin_close(now, cx.reduce_motion()) {
             overlay::reap(cx, move |shell, _| {
@@ -5023,7 +5103,7 @@ impl Shell {
     /// and a space, which is exactly the state the operator is in if they
     /// had typed it, and Return then does what Return has always done.
     fn choose_slash(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text.clone();
+        let text = self.composer.read(cx).field.read(cx).content().to_string();
         let Some(query) = slash::palette_query(&text) else {
             return;
         };
@@ -5034,7 +5114,8 @@ impl Shell {
             return;
         };
         self.composer.update(cx, |c, cx| {
-            c.text = format!("{insertion} ");
+            c.field
+                .update(cx, |f, cx| f.set_content(format!("{insertion} "), cx));
             cx.notify();
         });
         // The trailing space closes the palette through the projection
@@ -5079,7 +5160,7 @@ impl Shell {
             // from the root render pass, which is where this is called.
             motion::mark_active();
         }
-        let text = self.composer.read(cx).text.clone();
+        let text = self.composer.read(cx).field.read(cx).content().to_string();
         let query = slash::palette_query(&text)?;
         let highlighted = self.slash.popup.highlighted();
 
@@ -5248,7 +5329,7 @@ impl Shell {
                             return false;
                         }
                         shell.composer.update(cx, |c, cx| {
-                            c.text = "/".into();
+                            c.field.update(cx, |f, cx| f.set_content("/", cx));
                             cx.notify();
                         });
                         shell.sync_slash_palette(cx);
@@ -5805,14 +5886,6 @@ impl Shell {
             }
             return;
         }
-        // §1.20: ANY key resets the blink anchor, not just the ones that
-        // change the text. Backspacing to empty, a rejected ⌘-chord, an
-        // arrow key — they are all "the typist is still here", and a caret
-        // that blinked through them would be flashing at someone who is
-        // actively using the composer.
-        let struck = cx.background_executor().now();
-        self.composer
-            .update(cx, |c, _| c.caret_anchor = Some(struck));
         // Slice AR — the `/` palette takes FOUR keys and no others.
         //
         // Deliberately unlike the overlay gates above, which swallow the
@@ -5861,26 +5934,30 @@ impl Shell {
         // Any key that reaches here and changes the text is the operator
         // typing again, which retracts an escape.
         self.slash.dismissed = false;
+        // ── Slice CM: what is NOT here any more ───────────────────────
+        //
+        // Two arms are gone, and their absence is load-bearing rather than
+        // tidy-up:
+        //
+        //   `_ => push_str(key_char)` — the composer's whole typing path.
+        //   `"backspace" => text.pop()` — its whole deleting path.
+        //
+        // The field handles both now, and it does not see them through this
+        // handler. A character reaches it through the platform's input
+        // handler, which `Window::dispatch_keystroke` runs **after** this
+        // listener has propagated (`window.rs:4932`); backspace reaches it as
+        // a matched action, which fires **before** this listener runs at all.
+        // Leaving either arm in place would not have shadowed the field — it
+        // would have typed every character twice.
+        //
+        // `enter` has moved for a different reason: it is a bound action now
+        // (`SendMessage`, on the composer's own key context) because the field
+        // is the deepest node in the focus path and no container above it can
+        // win a chord back. `composer_enter` is the shared body, so the arm
+        // below and the action are the same code — the arm is what still runs
+        // when a modal owns the keyboard and the field is not focused.
         match ks.key.as_str() {
-            // **Return still sends, exactly as it did before this slice**,
-            // unless the operator has explicitly moved the highlight onto
-            // a row. That ordering is the whole compatibility story: `/`
-            // messages already reached the CLI verbatim
-            // (`send_current` trims and forwards), so an operator who
-            // types `/framer` and hits Return must get what they have
-            // always got. Firing the top match instead would change the
-            // meaning of Return for every slash message ever typed.
-            "enter" => match self.slash.popup.highlighted() {
-                Some(ix) if self.slash_palette_live(cx) => self.choose_slash(ix, cx),
-                _ => self.send_current(cx),
-            },
-            "backspace" => {
-                self.composer.update(cx, |c, cx| {
-                    c.text.pop();
-                    cx.notify();
-                });
-                self.sync_slash_palette(cx);
-            }
+            "enter" => self.composer_enter(cx),
             // ctrl-k: kill the live session (dev affordance; real kill UI
             // is later stage work).
             "k" if ks.modifiers.control => {
@@ -5894,20 +5971,129 @@ impl Shell {
             // because the composer's key handler returns before the action
             // system sees a chord it has an arm for.
             "l" if ks.modifiers.platform && ks.modifiers.shift => self.friction_log(cx),
-            // cmd-v: paste (Stage D build directive; IME stays deferred).
+            // cmd-v: eave's paste, ahead of the field's own.
+            //
+            // bezel's `Paste` action takes text and nothing else. eave's ⌘V has
+            // to answer an image (write it to disk, stage it as an attachment)
+            // and a dropped file path (stage it) as well, and only the text
+            // case ends in an insert. So eave keeps the chord: `Paste` is not
+            // among the actions bound in `bootstrap`, and this arm is the only
+            // reader of ⌘V in the application.
             "v" if ks.modifiers.platform => self.paste_clipboard(cx),
-            _ => {
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ks.modifiers.platform && !ks.modifiers.control {
-                        let ch = ch.clone();
-                        self.composer.update(cx, |c, cx| {
-                            c.text.push_str(&ch);
-                            cx.notify();
-                        });
-                        self.sync_slash_palette(cx);
-                    }
-                }
-            }
+            _ => {}
+        }
+    }
+
+    /// Does the composer own the keyboard right now?
+    ///
+    /// # Why focus has to move at all (Slice CM)
+    ///
+    /// Before this slice every key in the shell arrived at one `on_key`
+    /// handler, and the modal surfaces took their turn by returning early from
+    /// it. A focused [`TextField`] cannot be gated that way, for two reasons
+    /// that fail differently:
+    ///
+    /// - **Characters bypass key handling entirely.** They reach the field
+    ///   through the platform's input handler, which
+    ///   [`gpui::Window::dispatch_keystroke`] runs *after* the key event has
+    ///   propagated. An `on_key` arm that consumed a character would have to
+    ///   stop propagation as well, and every existing arm would need auditing
+    ///   for it.
+    /// - **Editing keys are matched actions**, and a matched action fires
+    ///   *before* any bubble-phase listener. `backspace` with the omnibox open
+    ///   would have deleted a character from a draft nobody can see, and no
+    ///   ordering of `on_key`'s gates could have stopped it, because `on_key`
+    ///   had not run yet.
+    ///
+    /// So the gate is focus, which is what gpui gives us for exactly this. The
+    /// predicate below is the same list of surfaces `on_key` already returns
+    /// early for, in the same order, and it is deliberately written as one
+    /// expression rather than folded into those gates: they answer "who
+    /// handles this key", this answers "who owns the keyboard", and the two
+    /// questions stay legible apart.
+    fn composer_owns_keyboard(&self, cx: &mut Context<Self>) -> bool {
+        // **First: is the field even on screen?**
+        //
+        // This clause is not a nicety, and finding that out cost twenty-one
+        // tests. `render` mounts the composer only when
+        // `!show_launcher && !showing_page`, and focus follows the element,
+        // not the entity: focusing a field that is not in the tree leaves the
+        // window's focus pointing at a node the dispatch path never reaches,
+        // and **every action in the application stops firing** — ⌘1, ⌘W, ⌘F,
+        // all of it, silently. The symptom looks nothing like a focus bug.
+        //
+        // So the predicate has to track the mount condition exactly, and the
+        // two live thirty lines apart. `composer_mounted` is the shared answer.
+        if !self.composer_mounted(cx) {
+            return false;
+        }
+        // Then: is anything else holding the keyboard? A page dialog stops
+        // Chromium mid-callback; the omnibox and the menus were opened
+        // *instead of* typing; the rename field and the find bar are fields of
+        // their own.
+        self.page_ask(cx).is_none()
+            && !self.omnibox_open()
+            && self.find_here(cx).is_none()
+            && !self.launcher.models.is_open()
+            && !self.demo.menu.is_open()
+            && self.rename.is_none()
+    }
+
+    /// Is the composer in the render tree this frame?
+    ///
+    /// The mount condition at the bottom of `render`, asked as a question so
+    /// that [`Self::composer_owns_keyboard`] cannot drift from it. A session
+    /// with no page showing — the launcher has no composer (Slice Q2) and a
+    /// page tab replaces it with the page.
+    fn composer_mounted(&self, cx: &App) -> bool {
+        self.transcript.read(cx).session_id.is_some()
+            && !strip::active_is_page(&self.web_tabs.read(cx).snapshot)
+    }
+
+    /// Put the keyboard where [`Self::composer_owns_keyboard`] says it belongs.
+    ///
+    /// Called from `render`, which is the one place that has both the window
+    /// and the whole of the state this depends on. It is a no-op whenever the
+    /// answer already holds — `Window::focus` returns early on an unchanged
+    /// handle — so the steady state costs a comparison and schedules nothing.
+    fn sync_composer_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = if self.composer_owns_keyboard(cx) {
+            gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx)
+        } else {
+            self.focus.clone()
+        };
+        if !wanted.is_focused(window) {
+            window.focus(&wanted, cx);
+        }
+    }
+
+    /// §1.20's blink anchor: the typist is still here.
+    ///
+    /// Capture phase, and it consumes nothing — see the mount site for why the
+    /// bubble phase stopped being enough once backspace became an action.
+    fn note_keystroke(&mut self, _: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let struck = cx.background_executor().now();
+        self.composer
+            .update(cx, |c, _| c.caret_anchor = Some(struck));
+    }
+
+    /// Return in the composer: choose a slash command, or send.
+    ///
+    /// **Return still sends, exactly as it did before Slice AR**, unless the
+    /// operator has explicitly moved the highlight onto a row. That ordering is
+    /// the whole compatibility story: `/` messages already reached the CLI
+    /// verbatim (`send_current` trims and forwards), so an operator who types
+    /// `/framer` and hits Return must get what they have always got. Firing the
+    /// top match instead would change the meaning of Return for every slash
+    /// message ever typed.
+    ///
+    /// Slice CM gave this two callers — the bound `SendMessage` action, which
+    /// is what runs while the field has focus, and the `on_key` arm, which is
+    /// what runs while a modal has taken it. One body, so they cannot drift.
+    fn composer_enter(&mut self, cx: &mut Context<Self>) {
+        match self.slash.popup.highlighted() {
+            Some(ix) if self.slash_palette_live(cx) => self.choose_slash(ix, cx),
+            _ => self.send_current(cx),
         }
     }
 
@@ -6999,7 +7185,7 @@ impl Shell {
     fn caret_lit(&self, cx: &mut Context<Self>) -> bool {
         let (has_draft, anchor) = {
             let c = self.composer.read(cx);
-            (!c.text.is_empty(), c.caret_anchor)
+            (!c.field.read(cx).content().is_empty(), c.caret_anchor)
         };
         if !has_draft {
             return true;
@@ -12348,6 +12534,15 @@ impl Render for Shell {
         // because X" is a fine answer too. The unacceptable answer is not
         // having considered it.
         let caret_lit = self.caret_lit(cx);
+        // Slice CM: the blink is decided once for the window (see `caret_lit`)
+        // and handed down. The field does not ask, because asking would mean a
+        // second lease on the pulse clock and a second reason for an idle
+        // window to keep redrawing — the exact thing N1 exists to prevent.
+        let composer_field = self.composer.read(cx).field.clone();
+        composer_field.update(cx, |f, _| {
+            f.set_caret_alpha(if caret_lit { 1.0 } else { 0.0 });
+        });
+        self.sync_composer_focus(window, cx);
         // Slice N3: ONE ask for the whole window, here in the root
         // render pass. The shell decides once whether anything is
         // mid-flight, takes one lease on the pulse clock for it, and
@@ -12370,7 +12565,7 @@ impl Render for Shell {
         // empty log (the Stage E cosmetic bug), only when follow is broken.
         let show_affordance = state.scroll != ScrollMode::Follow && !state.display.is_empty();
         let rail_collapsed = self.sessions.read(cx).collapsed;
-        let composer_text = self.composer.read(cx).text.clone();
+        let composer_text = self.composer.read(cx).field.read(cx).content().to_string();
         let attachments = self.composer.read(cx).attachments.clone();
         let overflow = self.composer.read(cx).overflow;
         let has_text = !composer_text.is_empty();
@@ -12469,55 +12664,16 @@ impl Render for Shell {
                         .min_h(px(theme::COMPOSER_MIN_H))
                         .px(px(theme::SPACE_1))
                         .pt(px(theme::SPACE_HALF))
+                        // **Slice CM.** These three lines are why the vendored
+                        // field draws no box of its own: `TextFieldElement`
+                        // shapes against `window.text_style()`, so it inherits
+                        // eave's rank and leading from right here. A field that
+                        // set its own would have painted 13.0/18.0 inside a
+                        // surface that had already said 13.5/22.0.
                         .text_size(px(theme::BODY_SIZE))
                         .line_height(px(theme::COMPOSER_LINE))
                         .text_color(theme::text())
-                        .child(if has_text {
-                            // The blink is a COLOUR-ONLY run split, never a
-                            // glyph swap and never a sibling element. The
-                            // caret has to stay inside the text so it wraps
-                            // with it, and cosmic-text's `Attrs::compatible`
-                            // ignores colour — so the two runs shape as one
-                            // contiguous string and the layout is byte-
-                            // identical whether the caret is lit or not.
-                            // (Same property the streaming veil relies on;
-                            // `VeiledBlock::text_runs`.)
-                            let caret = "▏";
-                            let font = gpui::font(theme::SANS);
-                            let run = |len: usize, color: Hsla| TextRun {
-                                len,
-                                font: font.clone(),
-                                color,
-                                background_color: None,
-                                underline: None::<UnderlineStyle>,
-                                strikethrough: None::<StrikethroughStyle>,
-                            };
-                            let runs = vec![
-                                run(composer_text.len(), theme::text()),
-                                run(
-                                    caret.len(),
-                                    theme::text().opacity(if caret_lit { 1.0 } else { 0.0 }),
-                                ),
-                            ];
-                            div()
-                                .debug_selector(|| "composer-text".into())
-                                .child(
-                                    StyledText::new(format!("{composer_text}{caret}"))
-                                        .with_runs(runs),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .flex()
-                                .flex_row()
-                                .child(div().text_color(theme::text()).child("▏"))
-                                .child(
-                                    div()
-                                        .text_color(theme::text_tertiary())
-                                        .child("Message eave…"),
-                                )
-                                .into_any_element()
-                        }),
+                        .child(composer_field),
                 )
                 .child(
                     div()
@@ -12793,6 +12949,22 @@ impl Render for Shell {
             .text_size(px(theme::BODY_SIZE))
             .line_height(px(theme::BODY_LINE))
             .track_focus(&self.focus)
+            // ── Slice CM: the blink anchor, moved to the capture phase ────
+            //
+            // §1.20's rule is that **any** key resets the anchor, not just the
+            // ones that change the text — backspacing to empty, a rejected
+            // ⌘-chord, an arrow key are all "the typist is still here", and a
+            // caret that blinked through them would be flashing at somebody
+            // actively using the composer.
+            //
+            // That rule used to be enforced inside `on_key`, which was fine
+            // while every key arrived there. It no longer does: backspace and
+            // the arrows are matched actions now, and a matched action fires
+            // **before** the bubble-phase listener — so the anchor would have
+            // stopped resetting on exactly the keys §1.20 names. The capture
+            // phase runs before both, which is the only place that still sees
+            // all of them.
+            .capture_key_down(cx.listener(Self::note_keystroke))
             .on_key_down(cx.listener(Self::on_key))
             // Slice K: answering is a real action with a real binding, not
             // a character the composer happens not to want.
@@ -12816,6 +12988,35 @@ impl Render for Shell {
             // Slice E1. Mounted on the root beside the strip's own
             // chords, and every one of them is a no-op unless the active
             // tab is a page — see `Shell::active_page`.
+            // ── Slice CM ──────────────────────────────────────────
+            //
+            // Return, and the four keys the `/` palette borrows. All five are
+            // scoped to a context the composer's field claims, so they are
+            // dispatched only when it has focus — and `SLASH_*` only while the
+            // palette is up, which is what gives `up`/`down` back to the caret
+            // the rest of the time.
+            .on_action(cx.listener(|this, _: &SendMessage, _, cx| this.composer_enter(cx)))
+            .on_action(cx.listener(|this, _: &SlashNext, _, cx| {
+                this.slash.popup.highlight_next();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SlashPrev, _, cx| {
+                this.slash.popup.highlight_prev();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SlashAccept, _, cx| {
+                // Complete to the top match — the classic gesture, and the one
+                // that does not make the operator press down first just to
+                // accept what is already highlighted in front of them.
+                this.choose_slash(this.slash.popup.highlighted().unwrap_or(0), cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlashDismiss, _, cx| {
+                // Refusal, not a text edit: the draft is left exactly as typed.
+                // Escape must never be the only way to close a menu AND a way
+                // to lose what you wrote.
+                this.slash.dismissed = true;
+                this.close_slash_palette(cx);
+            }))
             .on_action(cx.listener(|this, _: &FindInPage, _, cx| this.find_in_page(cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1, cx)))
@@ -13633,6 +13834,29 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         .map(|v| v == "10k")
         .unwrap_or(false);
 
+    // ── Slice CM: the field's editing keys, FIRST ─────────────────────
+    //
+    // Motion, selection, word jumps, undo, cut and copy, all scoped to the
+    // field's own context so they are inert anywhere else in the shell.
+    //
+    // **The order of these two calls is load-bearing.** gpui resolves a chord
+    // to the deepest matching context, and when two bindings match at the SAME
+    // depth the one registered LATER wins. The composer's field claims
+    // `TextArea` and — while the `/` palette is up — `EaveSlashPalette`, both
+    // on one node, so `down` matches twice: vertical caret motion from here,
+    // and the palette's highlight from eave's block below. eave's must be
+    // registered second or the palette cannot steer.
+    //
+    // That is the whole mechanism behind "borrow the key and give it back":
+    // outside the palette's lifetime `EaveSlashPalette` is not in the context
+    // stack at all, so the field's binding is the only match and `down` is a
+    // caret again. Nothing needs to unbind anything.
+    //
+    // Two chords are deliberately NOT bound by that call — `enter` and `cmd-v`,
+    // delta items 10 and 9. Both have exactly one reader in eave, and leaving
+    // bezel's binding in place would have made *this ordering* decide which,
+    // where here the ordering is stated and tested.
+    crate::text_field::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         // ── Slice C5 ──────────────────────────────────────────────────
@@ -13722,7 +13946,30 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // gpui pin has no Minimize/Close variants (see `app_menus`).
         KeyBinding::new("cmd-m", crate::app_menus::Minimize, None),
         KeyBinding::new("cmd-h", crate::app_menus::Hide, None),
+        // ── Slice CM: the composer's own chords ───────────────────────
+        //
+        // Return sends and shift-Return breaks a line, and both are scoped to
+        // `COMPOSER_KEY_CONTEXT` so they are inert in every other field eave
+        // ever grows. `text_field::init` below binds the field's editing keys;
+        // this pair is the app's, and it is deliberately bound **here** rather
+        // than left to that call, because a component library that decided what
+        // Return meant in somebody's composer would be overreaching.
+        KeyBinding::new("enter", SendMessage, Some(COMPOSER_KEY_CONTEXT)),
+        KeyBinding::new(
+            "shift-enter",
+            crate::text_field::InsertNewline,
+            Some(COMPOSER_KEY_CONTEXT),
+        ),
+        // The four the `/` palette borrows. `SLASH_KEY_CONTEXT` is claimed by
+        // the field only while the palette is live, so outside that window
+        // `up`/`down` are the field's vertical caret motion and `tab` is
+        // whatever gpui's focus order makes it.
+        KeyBinding::new("down", SlashNext, Some(SLASH_KEY_CONTEXT)),
+        KeyBinding::new("up", SlashPrev, Some(SLASH_KEY_CONTEXT)),
+        KeyBinding::new("tab", SlashAccept, Some(SLASH_KEY_CONTEXT)),
+        KeyBinding::new("escape", SlashDismiss, Some(SLASH_KEY_CONTEXT)),
     ]);
+
     cx.on_action(|_: &Quit, cx| {
         // **The page engine has to stop BEFORE gpui terminates, and it can
         // only stop on the pump's stack.** `cx.quit()` defers
@@ -14076,7 +14323,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         });
                         if let Some((composer, key)) = moved {
                             composer.update(cx, |c, cx| {
-                                c.switch_to(key);
+                                c.switch_to(key, cx);
                                 cx.notify();
                             });
                         }
@@ -14105,8 +14352,21 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             },
             |window, cx| {
                 let shell = cx.new(|cx| {
-                    let composer = cx.new(|_| ComposerState {
-                        text: String::new(),
+                    let composer = cx.new(|cx| ComposerState {
+                        // Slice CM. `Grow { min: 1, max: 12 }` — one line at
+                        // rest, growing a line at a time and scrolling past a
+                        // dozen. The old composer was a wrapping `StyledText`
+                        // with no ceiling at all, which meant a pasted essay
+                        // could push the send button off the bottom of the
+                        // window; the max is the first thing this arrangement
+                        // fixes that nobody asked for.
+                        field: cx.new(|cx| {
+                            TextField::new(cx)
+                                .with_shape(crate::text_field::Shape::Grow { min: 1, max: 12 })
+                                .with_key_context(COMPOSER_KEY_CONTEXT)
+                                .with_placeholder("Message eave…")
+                                .with_debug_name("composer-text")
+                        }),
                         key: String::new(),
                         drafts: HashMap::new(),
                         attachments: Vec::new(),
@@ -14125,6 +14385,27 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         t.composer = Some(composer.clone());
                         t.shell = Some(weak_shell);
                     });
+                    // ── Slice CM ──────────────────────────────────
+                    //
+                    // The `/` palette is a **projection of the composer's
+                    // text** (Slice AR), and it used to be re-derived from the
+                    // typing arm in `on_key`. That arm is gone — characters
+                    // reach the field through the platform's input handler now
+                    // — so the projection watches the field instead.
+                    //
+                    // Better than the arm it replaces, not merely equivalent:
+                    // it fires for every way the text can change, including the
+                    // ones nobody could do before. Undo back over a `/`,
+                    // select a word and type through it, drag a selection —
+                    // each re-derives the palette, where the old handler only
+                    // knew about a keystroke arriving.
+                    cx.observe(
+                        &composer.read(cx).field.clone(),
+                        |shell: &mut Shell, _, cx| {
+                            shell.sync_slash_palette(cx);
+                        },
+                    )
+                    .detach();
                     cx.observe(&conn, |_, _, cx| cx.notify()).detach();
                     cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();

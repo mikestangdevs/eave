@@ -46,15 +46,27 @@
 //!    than the run-split the composer used to blink with.
 //! 4. **[`TextField::with_debug_name`]** — one `debug_selector` on the
 //!    wrapper, so eave's harness can still find the field it types into.
-//! 5. **[`TextField::set_key_context`]** — bezel's is construction-time only.
-//!    The composer claims an extra context *while the `/` palette is up* and
-//!    drops it again, which is how `up`/`down` drive the palette then go back
-//!    to being vertical caret motion.
+//! 5. **[`TextField::set_transient_key_context`]** — bezel's context is
+//!    construction-time only. The composer claims a second one *while the `/`
+//!    palette is up* and drops it again, which is how `up`/`down` drive the
+//!    palette and then go back to being vertical caret motion. A **second
+//!    slot**, not a setter for the first: see the field's own doc for what
+//!    sharing one cost.
 //! 6. The action namespace is `eave_text_field`, and the doc links that
 //!    pointed at bezel's siblings now point at eave's.
 //! 7. **Two let-chains desugared.** bezel is edition 2024 and `eave-app` is
 //!    2021. Bumping the workspace edition to import a text field is the tail
 //!    wagging the dog; two `Option::filter`s are not. Both are marked in place.
+//! 8. **`TextField::insert`** — the edit `replace_text_in_range` performs,
+//!    reachable without a `Window`. eave's ⌘V has none to give by the time it
+//!    has text; see the method.
+//! 10. **`enter` is left unbound** by [`init`] too, and for a sharper reason:
+//!     two bindings on one chord at the same dispatch depth are resolved by
+//!     registration order, which nothing in either file declares. eave binds
+//!     both `enter` and `shift-enter` on its own context.
+//! 9. **`Paste` is left unbound** by [`init`]. eave's ⌘V has to answer an
+//!    image and a dropped file path too, so the chord has exactly one reader
+//!    and it is eave's.
 //!
 //! # Re-vendoring
 //!
@@ -179,7 +191,18 @@ pub fn init(cx: &mut App) {
     // bound on every field.
     let area = Some(MULTILINE_KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new("enter", InsertNewline, area),
+        // eave delta (10): `enter` is NOT bound. eave's composer sends on
+        // Return and breaks a line on shift-Return, and it binds both itself
+        // on its own key context. Leaving this here put TWO bindings on one
+        // chord at the SAME dispatch depth — the field claims `TextArea` and
+        // `EaveComposer` on one node — where the winner is whichever was
+        // registered later. It measured as: Return typed a newline and sent
+        // nothing, from an ordering nothing in either file declares.
+        //
+        // An app mounting a multi-line field must bind `enter` itself. That is
+        // the honest requirement; a default that silently depends on call
+        // order is not a default.
+        // KeyBinding::new("enter", InsertNewline, area),
         KeyBinding::new("up", Up, area),
         KeyBinding::new("down", Down, area),
         KeyBinding::new("shift-up", SelectUp, area),
@@ -191,7 +214,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-a", SelectAll, ctx),
         KeyBinding::new("cmd-c", Copy, ctx),
         KeyBinding::new("cmd-x", Cut, ctx),
-        KeyBinding::new("cmd-v", Paste, ctx),
+        // eave delta (9): `Paste` is NOT bound. eave's ⌘V writes a pasted
+        // image to disk and stages it as an attachment before any text reaches
+        // the field, so the chord has one reader in `ui.rs::on_key` and two
+        // bindings on it would have let ordering decide which. The action and
+        // its handler stay — an app that wants bezel's plain-text paste binds
+        // it — but nothing in eave dispatches them.
+        // KeyBinding::new("cmd-v", Paste, ctx),
         KeyBinding::new("cmd-z", Undo, ctx),
         KeyBinding::new("cmd-shift-z", Redo, ctx),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, ctx),
@@ -337,6 +366,17 @@ pub struct TextField {
     /// A context this field claims *in addition* to [`KEY_CONTEXT`] and
     /// [`MULTILINE_KEY_CONTEXT`] — see [`Self::with_key_context`].
     key_context: Option<SharedString>,
+    /// **eave delta.** A context claimed and dropped *at runtime*, alongside
+    /// (never instead of) [`Self::key_context`].
+    ///
+    /// A slot of its own, and it has to be: eave's composer holds a permanent
+    /// context for `enter` and a temporary one for the `/` palette, and the
+    /// first cut of this wrote both through one field. The palette's first
+    /// close then set the slot to `None` and took `EaveComposer` with it, so
+    /// Return silently stopped being bound and fell through to a legacy
+    /// handler — a send that still worked, followed by a newline typed into
+    /// the draft that had just been cleared.
+    transient_context: Option<SharedString>,
     /// **eave delta.** How solid to paint the caret this frame, 0.0–1.0.
     ///
     /// bezel's caret is always on. eave's blinks on N1's motion clock
@@ -385,6 +425,7 @@ impl TextField {
             undo_limit: DEFAULT_UNDO_LIMIT,
             last_edit: None,
             key_context: None,
+            transient_context: None,
             caret_alpha: 1.0,
             debug_name: None,
             follow_caret: false,
@@ -426,9 +467,13 @@ impl TextField {
     /// good. Claiming it for the life of the palette and dropping it after is
     /// what lets the same two keys drive a menu and then go back to being
     /// vertical motion.
-    pub fn set_key_context(&mut self, context: Option<SharedString>, cx: &mut Context<Self>) {
-        if self.key_context != context {
-            self.key_context = context;
+    pub fn set_transient_key_context(
+        &mut self,
+        context: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.transient_context != context {
+            self.transient_context = context;
             cx.notify();
         }
     }
@@ -1260,35 +1305,7 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-
-        // Every edit lands here — typing, deleting, cut, paste, and the IME
-        // *committing*. Not `replace_and_mark_text_in_range`, which is the
-        // composing path: provisional text must not become undo steps, or every
-        // keystroke of Japanese input would be one.
-        let kind = if new_text.is_empty() {
-            EditKind::Delete
-        } else {
-            EditKind::Insert
-        };
-        // A delete grows leftwards, so its group continues at the range's end;
-        // an insert continues at its start.
-        self.push_undo(
-            kind,
-            if new_text.is_empty() {
-                range.end
-            } else {
-                range.start
-            },
-        );
-
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.marked_range.take();
-        self.last_edit = Some((kind, self.selected_range.end));
-        self.follow_caret = true;
-        cx.notify();
+        self.replace_range(range, new_text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1347,6 +1364,65 @@ impl EntityInputHandler for TextField {
     }
 }
 
+/// **eave delta (8).** Two methods bezel does not have.
+impl TextField {
+    /// The edit itself, without the `Window` the `EntityInputHandler`
+    /// signature demands.
+    ///
+    /// Lifted verbatim out of [`EntityInputHandler::replace_text_in_range`],
+    /// which bound its window to `_` and never used it, so that eave can reach
+    /// the one path every edit goes through from a handler that has no window
+    /// to pass. [`Self::insert`] is the caller that needed it.
+    fn replace_range(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
+        // Every edit lands here — typing, deleting, cut, paste, and the IME
+        // *committing*. Not `replace_and_mark_text_in_range`, which is the
+        // composing path: provisional text must not become undo steps, or every
+        // keystroke of Japanese input would be one.
+        let kind = if new_text.is_empty() {
+            EditKind::Delete
+        } else {
+            EditKind::Insert
+        };
+        // A delete grows leftwards, so its group continues at the range's end;
+        // an insert continues at its start.
+        self.push_undo(
+            kind,
+            if new_text.is_empty() {
+                range.end
+            } else {
+                range.start
+            },
+        );
+
+        self.content =
+            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+                .into();
+        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.marked_range.take();
+        self.last_edit = Some((kind, self.selected_range.end));
+        self.follow_caret = true;
+        cx.notify();
+    }
+
+    /// Insert at the caret, replacing any selection.
+    ///
+    /// eave's ⌘V is not bezel's: it writes a pasted image to disk and stages it
+    /// as an attachment, folds in dropped file paths, and only *then* has text
+    /// to insert — by which point it is deep inside a handler with no window.
+    ///
+    /// This is the same edit typing performs, so it groups with typing for undo
+    /// and lands **at the caret** rather than at the end, which is where the
+    /// old `push_str` composer always put it however far back you had arrowed.
+    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let range = self
+            .marked_range
+            .clone()
+            .unwrap_or(self.selected_range.clone());
+        let text = normalize(text, self.shape);
+        self.replace_range(range, &text, cx);
+    }
+}
+
 impl Focusable for TextField {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1361,6 +1437,9 @@ impl Render for TextField {
             key_context.add(MULTILINE_KEY_CONTEXT);
         }
         if let Some(extra) = self.key_context.clone() {
+            key_context.add(extra);
+        }
+        if let Some(extra) = self.transient_context.clone() {
             key_context.add(extra);
         }
         div()
