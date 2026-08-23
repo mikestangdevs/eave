@@ -9578,6 +9578,21 @@ fn the_gauge_names_the_quietest_rank_rather_than_a_number() {
 fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    // **Both pages resident, said out loud.** This test predates E3, which
+    // split the page chip's selector on residency — so with no override it
+    // asserted `tab-chip-p1` and got whatever `page_resident` happened to
+    // answer. That is not the same answer in both feature states: a build
+    // with no page engine reports every tab resident by design, and a
+    // `--features web` build asks a Chromium that this harness does not
+    // run, gets `false`, and draws the unloaded globe. So the test passed
+    // without the browser and failed with it, for a reason that has nothing
+    // to do with what it is about.
+    //
+    // Declared rather than tolerated: this test is about ONE STRIP holding
+    // TWO KINDS, so it should pin residency to something and say which,
+    // not accept either mark. Which mark goes with which state is
+    // `an_unloaded_page_tab_does_not_look_like_a_loaded_one`'s claim.
+    set_resident_for_test(Some(&["p1", "p2"]));
     strip_tabs(
         &h,
         vcx,
@@ -9630,6 +9645,11 @@ fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     for sel in ["tab-close-p1", "tab-close-aaaa1111", "tab-close-p2"] {
         assert!(shown(vcx, sel), "{sel} — a tab you cannot close");
     }
+
+    // Cleared, because the `thread_local` outlives the test on a reused
+    // thread and a leaked override would make an unrelated test's tabs
+    // recede for reasons its author never wrote down.
+    set_resident_for_test(None);
 }
 
 /// Slice E3. A tab whose page eave has thrown away must not look like one
