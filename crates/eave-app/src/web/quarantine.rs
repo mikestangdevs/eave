@@ -1,17 +1,49 @@
 //! `com.apple.quarantine` on a finished download (G4).
 //!
-//! # Why this is a security regression and not a missing nicety
-//! Gatekeeper does not scan the disk. It reacts to **one extended
-//! attribute** that the downloader is expected to set, and everything a
-//! person recognises as "macOS checking a download" hangs off it: the
-//! "downloaded from the internet, are you sure" sheet, the notarisation
-//! check on a `.app` or `.dmg`, the refusal to run an unsigned binary.
-//! Without the attribute none of that happens — not weakly, at all.
+//! # RETRACTION: the gap this was built for did not exist
+//! **G4's premise was wrong, and a live download proved it.** The spec row
+//! said "nothing sets `com.apple.quarantine`", and the report built on it
+//! said eave was handing over unsigned binaries with less friction than
+//! every other browser on the machine. Both were arrived at by **grepping
+//! eave's own source**, which answers a different question.
 //!
-//! So a browser that does not set it hands over an unsigned executable
-//! with **less** friction than every other browser on the machine, and
-//! silently. eave was that browser. This is the smallest change in the
-//! slice and the one whose absence was worst.
+//! Measured on 2026-08-23, downloading through the built bundle: the
+//! finished file carries
+//!
+//! ```text
+//! 0281;6a8b2bc0;;8BF670FC-7A2C-45C7-A3EB-FAD2FE160F0B
+//! ```
+//!
+//! eave hard-codes `0083`, the agent `eave`, and an **empty** UUID, so that
+//! value cannot have come from this module. **Chromium quarantines its own
+//! completed downloads**, and it writes without `XATTR_CREATE`, so it
+//! overwrites whatever was there. This is the same mistake §4 G of
+//! `06-browser.md` was written to name — an inventory of *eave's* code
+//! reporting an absence that Chromium was quietly filling — repeated one
+//! section later, in a row marked verified.
+//!
+//! # What this module is still for, stated honestly
+//! Two things, both smaller than the claim it was built on:
+//!
+//! 1. **Chromium marks at completion; this marks as soon as the partial
+//!    file exists.** The trace shows this module's `setxattr` succeeding on
+//!    the in-progress file, which means at that instant Chromium had not
+//!    marked it — so there is a real window, and eave now closes it. It is
+//!    seconds on a large download, not the "no protection at all" the
+//!    original justification claimed.
+//! 2. It costs one refused syscall per download update thereafter.
+//!
+//! # The gap that IS real, and is not fixed here
+//! **The agent field in Chromium's value is EMPTY.** Chrome writes
+//! `Chrome`, Safari writes `Safari`; a download through eave names nobody,
+//! so the Finder's "Where did this come from?" sheet cannot say eave.
+//!
+//! Fixing that means writing *after* Chromium — i.e. on `done`, and
+//! **without** `XATTR_CREATE`, which is precisely the overwrite this
+//! module refuses to be able to do. That trade is real and unresolved: the
+//! rule "nothing here can ever clear a quarantine somebody else set" is
+//! worth more than eave's name in a sheet, so it stands until somebody
+//! finds a way to have both.
 //!
 //! # The value, read off this machine rather than guessed
 //! `<flags>;<hex unix seconds>;<agent>;<uuid>` — four fields, semicolon
@@ -35,11 +67,9 @@
 //! empty for the same reason and Gatekeeper is unbothered.
 //!
 //! # When it is set: as early as the file exists, not at completion
-//! The attribute goes on as soon as the partial file is on disk, not when
-//! the transfer finishes. Setting it at completion would leave a window —
-//! short, but real — in which a fully-written executable sits in
-//! `~/Downloads` with no quarantine on it, and a person quick with a
-//! double-click gets no check at all. This is Chromium's own ordering.
+//! The attribute goes on as soon as the partial file is on disk. That is
+//! the one thing this module adds over Chromium's own marking, which
+//! happens at completion — see the retraction above.
 //!
 //! `XATTR_CREATE` means the first write wins and later ones fail
 //! harmlessly with `EEXIST`. That is the direction to fail in: this code
@@ -53,6 +83,10 @@ use std::path::Path;
 pub const AGENT: &str = "eave";
 
 /// Flags: what Chrome and Safari both write on this platform.
+///
+/// Note that Chromium's own marking of the finished file uses `0281`, not
+/// this — so a completed eave download ends up carrying Chromium's value,
+/// not the one below. See the retraction in the module docs.
 const FLAGS: &str = "0083";
 
 /// The attribute's value for a download taken at `secs` (Unix seconds).
