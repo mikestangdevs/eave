@@ -83,8 +83,12 @@ thread_local! {
     /// bounds it is given. So a frame produced at the old size, painted
     /// into the new bounds during a live resize, is a *stretched* page —
     /// and it stays stretched for as many frames as CEF takes to answer.
-    /// Carrying the coded size is what lets the element ask "is this frame
-    /// the right size?" and refuse to scale when the answer is no.
+    /// Carrying the size it DEPICTS is what lets the element ask "is this
+    /// frame the right size?" and refuse to scale when the answer is no.
+    ///
+    /// That size is `source_size`, and it is not the size of the buffer.
+    /// Reading the buffer's own size instead is what painted Chromium's
+    /// letterbox bars on screen for two slices — see [`Content`].
     static PAGES: RefCell<HashMap<String, Frame>> = RefCell::new(HashMap::new());
 
     /// Where each tab's page element was laid out, in device pixels, and at
@@ -151,29 +155,122 @@ pub fn popup(tab_id: &str) -> Option<(CVPixelBuffer, PopupRect)> {
     Some((frame, rect))
 }
 
-/// A finished page frame, and the geometry Chromium coded it at.
+/// A finished page frame, the pixels it holds, and the view those pixels
+/// are a rendering **of**.
 ///
-/// The two are one value because they are only ever true together: the
+/// The three are one value because they are only ever true together: the
 /// moment they are separated, something will paint the pixels at a size
 /// they were not drawn for and call it a resize.
 #[derive(Clone)]
 pub struct Frame {
+    /// The pixels, cropped to `content_rect` — so the buffer's own width and
+    /// height are the size of the picture, and there is no third size to
+    /// carry here.
     pub buffer: CVPixelBuffer,
-    /// **Device** pixels — `AcceleratedPaintInfo::coded_size`, which is the
-    /// logical size times the scale CEF was told about.
-    pub width: u32,
-    pub height: u32,
+    /// **Device** pixels this frame DEPICTS — `source_size`. Equal to the
+    /// buffer's own size in the steady state, and larger whenever Chromium
+    /// answered a resize by scaling the old view down into a smaller buffer.
+    /// This is the one thing the pixels cannot say about themselves, which
+    /// is why it is the one thing stored beside them.
+    pub src_width: u32,
+    pub src_height: u32,
 }
 
 impl Frame {
-    /// The size this frame is 1:1 at under `scale`, in logical pixels.
+    /// The logical size this frame is a picture of, under `scale`.
     ///
-    /// Not "the size it was drawn for": if the scale has changed since, the
-    /// honest answer is still one device pixel per device pixel, because
-    /// that is the only rendering of these pixels that invents nothing.
+    /// **`src_*`, not `width`/`height`, and that distinction is the dark-band
+    /// fix.** A letterboxed frame holds a 1439×1200 rendering of a 1672×1394
+    /// view; asking "how big is this frame" and answering 1439×1200 makes the
+    /// element treat a correct picture of the whole page as a stale frame that
+    /// is 200 px too narrow. What the caller wants to know is what the pixels
+    /// SHOW, which is the source size.
     pub fn logical(&self, scale: f32) -> (f32, f32) {
         let scale = if scale > 0. { scale } else { 1. };
-        (self.width as f32 / scale, self.height as f32 / scale)
+        (
+            self.src_width as f32 / scale,
+            self.src_height as f32 / scale,
+        )
+    }
+}
+
+/// Which part of a delivered buffer is the page, and what view it is a
+/// rendering of.
+///
+/// **CEF hands over three geometries and eave used to read one.** From a
+/// live trace of the first four frames of a page (`coded` / `content` /
+/// `source`):
+///
+/// ```text
+/// #0  coded=1600x1200  content=80+0+1439x1200  source=1672x1394
+/// #1  coded=1672x1394  content=0+0+1672x1394   source=1672x1394
+/// ```
+///
+/// Frame #0 is the browser's creation-size buffer carrying a picture of the
+/// view it had just been resized to. Chromium preserves aspect: 1672/1394 is
+/// 1.1994, so a 1200-tall fit is 1439 wide and it is centred at x=80. **The
+/// 80 and 81 columns either side are opaque black**, measured by reading the
+/// buffer back — `left=80 right=81`, `(0,0,0,255)`.
+///
+/// Painting the whole `coded_size` therefore paints Chromium's letterbox
+/// bars. They are black rather than dark, they sit inside the page's own
+/// edges rather than eave's, and on a page that never repaints they are
+/// permanent — which is exactly what the operator reported as "this weird
+/// darken at the top and bottom". Whether the bars land on the sides or on
+/// the top and bottom is just which way the aspect went.
+///
+/// So: crop to `content_rect`, and remember `source_size` as what the crop
+/// depicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Content {
+    /// Where the picture is inside the delivered buffer, in device pixels.
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    /// The view size the picture is a rendering of, in device pixels.
+    src_width: u32,
+    src_height: u32,
+}
+
+impl Content {
+    /// Read the three rects, defensively.
+    ///
+    /// **Every fallback is to the old behaviour**, because a frame we cannot
+    /// interpret should be painted exactly as it was before this fix rather
+    /// than dropped or cropped to nothing. A degenerate `content_rect`, one
+    /// that escapes the buffer, or an absent `source_size` each fall back a
+    /// single step, not all the way.
+    fn of(coded_w: u32, coded_h: u32, content: &Rect, source: &Size, has_source: bool) -> Self {
+        let fits = content.x >= 0
+            && content.y >= 0
+            && content.width > 0
+            && content.height > 0
+            && (content.x as i64 + content.width as i64) <= coded_w as i64
+            && (content.y as i64 + content.height as i64) <= coded_h as i64;
+        let (x, y, width, height) = if fits {
+            (
+                content.x as u32,
+                content.y as u32,
+                content.width as u32,
+                content.height as u32,
+            )
+        } else {
+            (0, 0, coded_w, coded_h)
+        };
+        let (src_width, src_height) = if has_source && source.width > 0 && source.height > 0 {
+            (source.width as u32, source.height as u32)
+        } else {
+            (width, height)
+        };
+        Self {
+            x,
+            y,
+            width,
+            height,
+            src_width,
+            src_height,
+        }
     }
 }
 
@@ -398,6 +495,63 @@ fn make_dest(device: &Retained<ProtocolObject<dyn MTLDevice>>, w: u32, h: u32) -
     Some((buffer, texture))
 }
 
+/// `EAVE_WEB_BANDPROBE=1` — read a delivered frame back and report the runs
+/// of pure black at each edge.
+///
+/// **A knob rather than a deleted scratch script, for the reason E1 kept
+/// `EAVE_WEB_STRETCH`:** this is the instrument that turned "there is a
+/// weird darken at the top and bottom" into a root cause, and re-deriving it
+/// costs an afternoon. It answers exactly one question — *are the edges of
+/// what CEF handed us black?* — which separates "Chromium sent us bars" from
+/// every other way a page can look wrong.
+///
+/// It costs a `waitUntilCompleted` per probed frame, which is why it probes
+/// the first four and then stops, and why it is off unless asked for.
+fn bandprobe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EAVE_WEB_BANDPROBE").is_ok())
+}
+
+fn probe_bands(n: u64, popup: bool, buffer: &CVPixelBuffer) {
+    use core_video::pixel_buffer::kCVPixelBufferLock_ReadOnly as READ_ONLY;
+    let what = if popup { "popup" } else { "page" };
+    let w = buffer.get_width();
+    let h = buffer.get_height();
+    if w == 0 || h == 0 {
+        eprintln!("[band] {what} #{n}: empty buffer");
+        return;
+    }
+    if buffer.lock_base_address(READ_ONLY) != 0 {
+        eprintln!("[band] {what} #{n}: could not lock");
+        return;
+    }
+    let base = unsafe { buffer.get_base_address() } as *const u8;
+    let stride = buffer.get_bytes_per_row();
+    // BGRA, so the byte order is reversed on the way out.
+    let px = |x: usize, y: usize| -> (u8, u8, u8, u8) {
+        let o = unsafe { base.add(y * stride + x * 4) };
+        unsafe { (*o.add(2), *o.add(1), *o, *o.add(3)) }
+    };
+    let black = |c: (u8, u8, u8, u8)| c.0 == 0 && c.1 == 0 && c.2 == 0;
+    let run = |n: usize, f: &dyn Fn(usize) -> (u8, u8, u8, u8)| {
+        let mut i = 0;
+        while i < n && black(f(i)) {
+            i += 1;
+        }
+        i
+    };
+    let (mx, my) = (w / 2, h / 2);
+    let left = run(w, &|i| px(i, my));
+    let right = run(w, &|i| px(w - 1 - i, my));
+    let top = run(h, &|i| px(mx, i));
+    let bottom = run(h, &|i| px(mx, h - 1 - i));
+    eprintln!(
+        "[band] {what} #{n} buf={w}x{h} black-run left={left} right={right} top={top} bottom={bottom} centre={:?}",
+        px(mx, my)
+    );
+    buffer.unlock_base_address(READ_ONLY);
+}
+
 /// Open CEF's IOSurface as a texture and copy it into one we own.
 ///
 /// **Commit and go, never `waitUntilCompleted`.** The spike measured 0.077 ms
@@ -405,16 +559,23 @@ fn make_dest(device: &Retained<ProtocolObject<dyn MTLDevice>>, w: u32, h: u32) -
 /// would be GPU work rather than encode time. Blocking the pump on the GPU
 /// every frame would be paying 8× for a number nobody reads at runtime — and
 /// the copy is ordered against the read by Metal regardless.
+///
+/// **Cropped to `content_rect` on the way through**, so Chromium's letterbox
+/// bars are never copied and never reach the screen. `coded_*` is the shape
+/// of the surface CEF handed us — the only shape it can be opened as — and
+/// `content` says which part of it is the page.
 fn import_and_blit(
     tab_id: &str,
     popup: bool,
     io_surface: *mut std::ffi::c_void,
-    w: u32,
-    h: u32,
+    coded_w: u32,
+    coded_h: u32,
+    content: Content,
 ) -> bool {
-    if w == 0 || h == 0 {
+    if coded_w == 0 || coded_h == 0 || content.width == 0 || content.height == 0 {
         return false;
     }
+    let (w, h) = (content.width, content.height);
     let key = SurfaceKey {
         tab_id: tab_id.to_string(),
         popup,
@@ -433,11 +594,14 @@ fn import_and_blit(
 
         // Reopened every frame, by contract. See the module docs — the pool
         // never repeats a handle, so caching by one is worse than useless.
+        // The SOURCE is the whole coded buffer — that is the shape CEF
+        // allocated and the only shape the IOSurface can be opened as. The
+        // crop happens in the copy below, not here.
         let desc = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                 MTLPixelFormat::BGRA8Unorm,
-                w as usize,
-                h as usize,
+                coded_w as usize,
+                coded_h as usize,
                 false,
             )
         };
@@ -464,7 +628,11 @@ fn import_and_blit(
                 &src,
                 0,
                 0,
-                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLOrigin {
+                    x: content.x as usize,
+                    y: content.y as usize,
+                    z: 0,
+                },
                 MTLSize { width: w as usize, height: h as usize, depth: 1 },
                 &dest,
                 0,
@@ -474,6 +642,20 @@ fn import_and_blit(
         }
         encoder.endEncoding();
         cb.commit();
+
+        // `EAVE_WEB_BANDPROBE=1` — read the delivered buffer back and say
+        // whether it has black edges. See [`probe_bands`].
+        if bandprobe() {
+            let n = if popup {
+                POPUP_FRAMES.load(Ordering::Relaxed)
+            } else {
+                FRAMES.load(Ordering::Relaxed)
+            };
+            if n < 4 {
+                cb.waitUntilCompleted();
+                probe_bands(n, popup, &buffer);
+            }
+        }
 
         // A POPUP keeps a bare buffer and a PAGE carries its coded size.
         // That asymmetry is deliberate: `Frame` exists so a page can be
@@ -488,8 +670,8 @@ fn import_and_blit(
                     tab_id.to_string(),
                     Frame {
                         buffer,
-                        width: w,
-                        height: h,
+                        src_width: content.src_width,
+                        src_height: content.src_height,
                     },
                 )
             })
@@ -611,9 +793,21 @@ wrap_render_handler! {
             let Some(info) = info else { return };
             if std::env::var("EAVE_WEB_TRACE").is_ok() {
                 let n = FRAMES.load(Ordering::Relaxed);
-                if n < 4 || n.is_multiple_of(200) {
-                    eprintln!("[web] accel_paint #{n} type={:?} {}x{}", type_,
-                        info.extra.coded_size.width, info.extra.coded_size.height);
+                if n < 8 || n.is_multiple_of(200) {
+                    // All three geometries, because reading only the first
+                    // is what put Chromium's letterbox bars on screen for
+                    // two slices. `visible_rect` is omitted: it measured
+                    // equal to `coded_size` in every frame of every page
+                    // tried, and a field that never varies is noise.
+                    let e = &info.extra;
+                    eprintln!(
+                        "[web] accel_paint #{n} type={:?} coded={}x{} content={}+{}+{}x{} source={}x{}",
+                        type_,
+                        e.coded_size.width, e.coded_size.height,
+                        e.content_rect.x, e.content_rect.y,
+                        e.content_rect.width, e.content_rect.height,
+                        e.source_size.width, e.source_size.height,
+                    );
                 }
             }
             // A `<select>` dropdown is a SECOND surface with its own
@@ -626,11 +820,29 @@ wrap_render_handler! {
             let popup = type_ == PaintElementType::POPUP;
             let w = info.extra.coded_size.width.max(0) as u32;
             let h = info.extra.coded_size.height.max(0) as u32;
+            // Crop to the picture, not to the allocation. A frame whose
+            // `content_rect` is a strict sub-rect of `coded_size` has
+            // Chromium's letterbox bars in the remainder, and they are
+            // opaque black — see [`Content`].
+            let content = Content::of(
+                w,
+                h,
+                &info.extra.content_rect,
+                &info.extra.source_size,
+                info.extra.has_source_size != 0,
+            );
             if popup && super::tabs::trace() {
                 let n = POPUP_FRAMES.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[web] popup frame #{n} {w}x{h}");
             }
-            import_and_blit(&self.tab_id, popup, info.shared_texture_io_surface, w, h);
+            import_and_blit(
+                &self.tab_id,
+                popup,
+                info.shared_texture_io_surface,
+                w,
+                h,
+                content,
+            );
         }
 
         /// The CPU fallback. Reached only if the GPU path is unavailable —
@@ -670,6 +882,128 @@ wrap_render_handler! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn size(w: i32, h: i32) -> Size {
+        Size {
+            width: w,
+            height: h,
+        }
+    }
+
+    fn cef_rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// The steady state, and the case that must not change: one frame, one
+    /// size, nothing to crop.
+    #[test]
+    fn a_full_bleed_frame_is_cropped_to_itself() {
+        let c = Content::of(
+            1672,
+            1394,
+            &cef_rect(0, 0, 1672, 1394),
+            &size(1672, 1394),
+            true,
+        );
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 0, 1672, 1394));
+        assert_eq!((c.src_width, c.src_height), (1672, 1394));
+    }
+
+    /// **The dark bands, as CEF actually delivered them.** These are not
+    /// invented numbers: they are frame #0 of a page opened in this app,
+    /// read off an `EAVE_WEB_TRACE` log, and the buffer was read back at the
+    /// same moment to confirm the 80 columns to the left and the 81 to the
+    /// right were opaque `(0,0,0,255)`.
+    ///
+    /// Chromium fitted a 1672x1394 view into the 1600x1200 buffer the
+    /// browser was created with, preserving aspect: 1672/1394 = 1.1994, so
+    /// 1200 tall is 1439 wide, centred at x = (1600-1439)/2 = 80.
+    #[test]
+    fn a_letterboxed_frame_crops_to_the_picture_and_remembers_what_it_shows() {
+        let c = Content::of(
+            1600,
+            1200,
+            &cef_rect(80, 0, 1439, 1200),
+            &size(1672, 1394),
+            true,
+        );
+        // The bars are never copied.
+        assert_eq!((c.x, c.y, c.width, c.height), (80, 0, 1439, 1200));
+        // And the crop is understood as a picture of the FULL view, so the
+        // element stretches it back rather than treating it as a frame that
+        // is 233 device pixels too narrow.
+        assert_eq!((c.src_width, c.src_height), (1672, 1394));
+    }
+
+    /// The other way round — a buffer wider in aspect than its source gets
+    /// bars on the top and bottom. This is the one the operator reported.
+    #[test]
+    fn bars_on_the_top_and_bottom_crop_the_same_way() {
+        let c = Content::of(
+            1672,
+            1394,
+            &cef_rect(0, 87, 1672, 1220),
+            &size(2072, 1512),
+            true,
+        );
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 87, 1672, 1220));
+        assert_eq!((c.src_width, c.src_height), (2072, 1512));
+    }
+
+    /// No `source_size` — an older CEF, or a frame that simply does not
+    /// carry one. The crop still happens; what it depicts falls back to its
+    /// own size, which is the honest answer and not the old behaviour.
+    #[test]
+    fn without_a_source_size_a_crop_depicts_itself() {
+        let c = Content::of(1600, 1200, &cef_rect(80, 0, 1439, 1200), &size(0, 0), false);
+        assert_eq!((c.x, c.y, c.width, c.height), (80, 0, 1439, 1200));
+        assert_eq!((c.src_width, c.src_height), (1439, 1200));
+    }
+
+    /// **Every unreadable rect falls back to the whole buffer, which is
+    /// exactly what this file did before the fix.** A frame we cannot
+    /// interpret must be painted as it always was, not dropped and not
+    /// cropped to nothing — a black band is a blemish, a blank page is an
+    /// outage.
+    #[test]
+    fn a_content_rect_that_makes_no_sense_falls_back_to_the_whole_buffer() {
+        for bad in [
+            cef_rect(0, 0, 0, 1200),      // empty
+            cef_rect(0, 0, 1439, 0),      // empty
+            cef_rect(-4, 0, 1439, 1200),  // negative origin
+            cef_rect(0, -4, 1439, 1200),  // negative origin
+            cef_rect(400, 0, 1439, 1200), // runs off the right
+            cef_rect(0, 400, 1439, 1200), // runs off the bottom
+            cef_rect(0, 0, 9999, 9999),   // larger than the allocation
+        ] {
+            let c = Content::of(1600, 1200, &bad, &size(1672, 1394), true);
+            assert_eq!(
+                (c.x, c.y, c.width, c.height),
+                (0, 0, 1600, 1200),
+                "an uninterpretable content_rect {bad:?} must fall back to the coded size"
+            );
+        }
+    }
+
+    /// A `source_size` of zero is not a size. Falling for it would publish a
+    /// frame that depicts nothing, and `Frame::logical` would divide it into
+    /// a zero-sized paint.
+    #[test]
+    fn a_zero_source_size_is_ignored_even_when_it_is_flagged_present() {
+        let c = Content::of(
+            1672,
+            1394,
+            &cef_rect(0, 0, 1672, 1394),
+            &size(0, 1394),
+            true,
+        );
+        assert_eq!((c.src_width, c.src_height), (1672, 1394));
+    }
 
     fn rect() -> PopupRect {
         PopupRect {
