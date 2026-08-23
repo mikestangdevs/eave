@@ -73,6 +73,10 @@ pub mod fixture;
 pub mod markdown;
 pub mod theme;
 
+// Slice BZ: bezel's tokens, built from ours. The only place in the tree
+// allowed to write a bezel token — see the module doc for why that matters.
+mod bezel_theme;
+
 pub mod ui;
 
 /// Slice C1: the page engine (Chromium/CEF, off-screen). Behind
