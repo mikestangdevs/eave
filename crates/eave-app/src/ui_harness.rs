@@ -10543,14 +10543,26 @@ fn closing_the_menu_gives_the_window_to_the_content(cx: &mut TestAppContext) {
 /// this guards: before C5, `showing_page` meant "there are page pixels", so
 /// a page tab in a non-web build rendered the TRANSCRIPT — an agent's
 /// conversation sitting in the well where a document was asked for.
+///
+/// **Slice T1 split the two absences.** A page tab that has BEEN somewhere
+/// and cannot draw is still `page-absence`; a tab that has never been
+/// anywhere gets the launcher instead, because "the browser has not handed
+/// this tab one yet" is not what somebody who pressed ⌘T wanted to read.
+/// The invariant this test actually guards is unchanged and is asserted in
+/// both cases: **the transcript never draws under a page tab.**
 #[gpui::test]
 fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    let visited = || {
+        let mut t = page_tab("p1", Some("https://docs.rs/"), Some("docs.rs"));
+        t.history_len = 1;
+        t
+    };
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     strip_tabs(
         &h,
         vcx,
-        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        vec![session_tab("aaaa1111"), visited()],
         Some("aaaa1111"),
     );
     assert!(
@@ -10559,11 +10571,12 @@ fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext)
     );
     assert!(!shown(vcx, "page-absence"), "no page tab is active");
 
-    // Now the page.
+    // Now the page — one that has been somewhere, so its emptiness is the
+    // browser's and the well has to say so.
     strip_tabs(
         &h,
         vcx,
-        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        vec![session_tab("aaaa1111"), visited()],
         Some("p1"),
     );
     assert!(
@@ -10573,6 +10586,25 @@ fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext)
     // The agent's chrome is gone with the transcript. A prompt box floating
     // on somebody else's document is not a browser.
     assert!(!shown(vcx, "send"), "the composer drew over a page tab");
+
+    // A tab that has never been anywhere is the OTHER absence: nothing has
+    // gone wrong and nothing is starting, so it gets the launcher — and the
+    // transcript still does not draw.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("blank", None, None)],
+        Some("blank"),
+    );
+    assert!(
+        !shown(vcx, "page-absence"),
+        "a fresh tab explained the browser instead of offering a chat"
+    );
+    assert!(shown(vcx, "launcher"));
+    assert!(
+        !shown(vcx, "send"),
+        "the composer drew under the launcher on a blank tab"
+    );
 }
 
 /// **⌘L opens the omnibox over the page, and row zero says what Return will
@@ -10742,6 +10774,326 @@ fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
         cmds.iter()
             .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
         "the strip's + is not ⌘T: {cmds:?}"
+    );
+}
+
+/// Slice T1 — seed a strip that has one project in it.
+///
+/// `workspace` is the checkout the project is bound to, which is the whole
+/// point of the group: `TabGroup::workspace` has recorded that binding since
+/// B1 and Slice T1 is what made anything act on it.
+fn strip_with_project(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    workspace: Option<&str>,
+    grouped: Vec<TabInfo>,
+    loose: Vec<TabInfo>,
+    active: Option<&str>,
+) {
+    let group_ids: Vec<String> = grouped.iter().map(|t| t.id.clone()).collect();
+    let mut order: Vec<eave_wire::Slot> = loose
+        .iter()
+        .map(|t| eave_wire::Slot::Tab { id: t.id.clone() })
+        .collect();
+    // The group goes LAST on the wire on purpose: the drawn order must be
+    // the strip's doing, not the fixture's.
+    order.push(eave_wire::Slot::Group { id: "grp".into() });
+    let mut tabs = loose;
+    tabs.extend(grouped);
+    h.plumbing.push_tabs(TabsSnapshot {
+        order,
+        tabs,
+        groups: vec![eave_wire::TabGroup {
+            id: "grp".into(),
+            title: Some("eave".into()),
+            color: None,
+            collapsed: false,
+            workspace: workspace.map(str::to_string),
+            last_active: None,
+            created_ts_ms: 0,
+        }],
+        group_tabs: vec![("grp".into(), group_ids)],
+        active: active.map(str::to_string),
+        read_only: false,
+    });
+    vcx.run_until_parked();
+}
+
+/// A project is drawn ABOVE the loose tabs, whatever order the engine keeps
+/// them in, with the `TABS` divider marking where it stops.
+///
+/// The fixture puts the group LAST on the wire, so a strip that simply drew
+/// `snapshot.order` would fail this — which is the point. B1's interleaved
+/// ordering is still the operator's ordering and is untouched; Slice T1 lays
+/// one presentation rule over it, in `strip::drawn_order`, where `items` and
+/// `cycle_order` both read it.
+#[gpui::test]
+fn a_project_is_drawn_above_the_loose_tabs_with_the_divider_between_them(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/tmp/eave-harness/repo"),
+        vec![session_tab("aaaa1111")],
+        vec![page_tab(
+            "loose",
+            Some("https://loose.test/"),
+            Some("loose"),
+        )],
+        Some("aaaa1111"),
+    );
+
+    let head = vcx
+        .debug_bounds("group-grp")
+        .expect("the project's head never drew");
+    let divider = vcx
+        .debug_bounds("tabs-divider")
+        .expect("nothing marked where the projects stop");
+    let grouped = vcx
+        .debug_bounds("tab-aaaa1111")
+        .expect("the project's tab never drew");
+    let loose = vcx
+        .debug_bounds("tab-loose")
+        .expect("the loose tab never drew");
+
+    assert!(
+        head.origin.y < grouped.origin.y,
+        "a project's head has to sit above the tabs it holds"
+    );
+    assert!(
+        grouped.origin.y < divider.origin.y,
+        "the divider landed inside the project instead of under it"
+    );
+    assert!(
+        divider.origin.y < loose.origin.y,
+        "the loose tab drew above the divider, so the sections are inverted"
+    );
+}
+
+/// Clicking a project's head folds it, and folding is an engine fact.
+///
+/// `collapsed` has been on the group since B1 and `strip.rs` has always
+/// drawn a collapsed one as a head plus a count. Nothing ever SET it, so
+/// every project was permanently open and the count was unreachable.
+#[gpui::test]
+fn folding_a_project_asks_the_engine_to_collapse_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/tmp/eave-harness/repo"),
+        vec![session_tab("aaaa1111")],
+        Vec::new(),
+        Some("aaaa1111"),
+    );
+
+    let _ = h.drain();
+    click(vcx, "group-grp");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::GroupSetCollapsed {
+                group_id,
+                collapsed: true
+            }) if group_id == "grp"
+        )),
+        "clicking the head did not fold the project: {cmds:?}"
+    );
+}
+
+/// A session in a checkout that has no project mints one, and its tab is
+/// asked for INSIDE it.
+///
+/// This is Slice T1 turning on the first of the three things
+/// `TabGroup::workspace`'s own doc comment says nobody does — *the engine
+/// never creates a group for a worktree*. It still does not: the client
+/// does, because the client is where the snapshot is.
+#[gpui::test]
+fn a_session_in_an_unclaimed_checkout_mints_a_project_for_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut info = session("aaaa1111");
+    info.checkout_root = Some("/tmp/eave-harness/repo".into());
+
+    // Drain BEFORE the rail arrives. `reconcile_strip` runs in the render
+    // pass, so the ask is already out by the time the rail push has parked
+    // — draining after it would throw away the very command under test.
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![info], "aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenSessionTab {
+                session_id,
+                workspace: Some(workspace),
+                group: None,
+                ..
+            }) if session_id == "aaaa1111" && workspace == "/tmp/eave-harness/repo"
+        )),
+        "the session's tab was asked for with no project to put it in: {cmds:?}"
+    );
+}
+
+/// A session whose checkout ALREADY has a project joins it rather than
+/// minting a second one.
+#[gpui::test]
+fn a_session_joins_the_project_its_checkout_already_has(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/tmp/eave-harness/repo".into());
+    let mut b = session("bbbb2222");
+    b.checkout_root = Some("/tmp/eave-harness/repo".into());
+
+    // The project exists FIRST, holding one of the two sessions. With no
+    // rail yet, `sessions_without_tabs` has nothing to ask for, so this
+    // pushes no commands of its own.
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/tmp/eave-harness/repo"),
+        vec![session_tab("aaaa1111")],
+        Vec::new(),
+        Some("aaaa1111"),
+    );
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![a, b], "aaaa1111");
+    let cmds = h.drain();
+    let asked: Vec<_> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::OpenSessionTab {
+                session_id,
+                group,
+                workspace,
+                ..
+            }) => Some((session_id.clone(), group.clone(), workspace.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![("bbbb2222".to_string(), Some("grp".to_string()), None)],
+        "the second session should have joined `grp`, minting nothing: {cmds:?}"
+    );
+}
+
+/// Slice T1 — ⌘T's tab is a **chat you can click into**, not a blank page
+/// you have to aim first.
+///
+/// A page tab that has never been anywhere used to draw `PAGE_STARTING` —
+/// "the browser exists and this tab has not been handed one yet". True, and
+/// no use to somebody who did not ask for a browser. The well gets the
+/// launcher instead: *which agent, in which folder*. So dismissing the
+/// omnibox lands in a chat rather than on an explanation.
+#[gpui::test]
+fn a_blank_tab_offers_a_chat_rather_than_explaining_the_browser(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("blank", None, None)],
+        Some("blank"),
+    );
+
+    assert!(
+        shown(vcx, "launcher"),
+        "a blank tab left the operator looking at the browser's excuses"
+    );
+}
+
+/// ...and a page tab that HAS been somewhere still belongs to the page.
+///
+/// The counter-case matters more than the case: a launcher drawn over a
+/// loaded page would be the floating-surface defect `showing_page` exists
+/// to catch, and it is the launcher specifically that was photographed
+/// drawing straight through docs.rs once already.
+#[gpui::test]
+fn a_page_that_has_been_somewhere_keeps_its_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let mut visited = page_tab("visited", Some("https://docs.rs/"), Some("docs.rs"));
+    visited.history_len = 1;
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), visited],
+        Some("visited"),
+    );
+
+    assert!(
+        !shown(vcx, "launcher"),
+        "the launcher drew over a page that had been somewhere"
+    );
+}
+
+/// Slice T1 — a session started from a blank ⌘T tab lands **in that tab**.
+///
+/// The operator made one tab and must end with one tab. Before this, the
+/// launcher's session arrived as a new tab appended to the strip and the
+/// blank one sat there forever — ⌘T, start a chat, and you owned two tabs,
+/// one of them permanently empty.
+#[gpui::test]
+fn a_session_started_from_a_blank_tab_takes_that_tabs_place(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // No session selected, one blank page tab active: the launcher is up
+    // and it is up *because of that tab*.
+    strip_tabs(&h, vcx, vec![page_tab("blank", None, None)], Some("blank"));
+    assert!(shown(vcx, "launcher"), "the launcher is not up");
+
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+
+    // The session the launch asked for now arrives on the rail.
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::ReplaceWithSessionTab {
+                closing,
+                session_id,
+                index: 0,
+                ..
+            }) if closing == "blank" && session_id == "aaaa1111"
+        )),
+        "the session did not take the blank tab's place: {cmds:?}"
+    );
+}
+
+/// ...and a session that arrives on its own does NOT evict somebody's tab.
+///
+/// The note is taken, not read: only the first session after a launch from
+/// a blank tab claims it, and a session nobody launched from a tab claims
+/// nothing.
+#[gpui::test]
+fn a_session_nobody_launched_from_a_tab_replaces_nothing(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(&h, vcx, vec![page_tab("blank", None, None)], Some("blank"));
+
+    let _ = h.drain();
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let cmds = h.drain();
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::ReplaceWithSessionTab { .. })
+        )),
+        "a session arriving on its own took a tab that was not offered: {cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenSessionTab { session_id, .. })
+                if session_id == "aaaa1111"
+        )),
+        "it should still get an ordinary tab of its own: {cmds:?}"
     );
 }
 

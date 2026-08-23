@@ -362,7 +362,52 @@ enum BrowserCmd {
     /// shape this slice exists to remove. The double-ask a fold burst could
     /// otherwise cause is held off by `asked_for_session_tab`, which is
     /// single-threaded render-thread state and cannot race.
-    OpenSessionTab { session_id: String, activate: bool },
+    OpenSessionTab {
+        session_id: String,
+        activate: bool,
+        /// The project this session's tab belongs in, when one already
+        /// exists for its checkout root.
+        group: Option<String>,
+        /// The session's checkout root, when it has one and no project is
+        /// bound to it yet. `Some` here with `group: None` is what makes
+        /// this verb two requests instead of one — mint the project, then
+        /// open the tab inside it. That is Slice T1 turning on the first of
+        /// the three things `TabGroup::workspace` said nobody does: *the
+        /// engine never creates a group for a worktree*. It still does not.
+        /// The client does, because the client is where the snapshot is.
+        workspace: Option<String>,
+    },
+    /// Slice T1 — a session tab taking a blank tab's place.
+    ///
+    /// ⌘T makes a page tab and offers the launcher in it. Starting a
+    /// session from there must land in **that tab**, not in a new one
+    /// beside it with the blank one left over: the operator made one tab
+    /// and should end with one tab.
+    ///
+    /// Open-then-close rather than close-then-open. Closing first would
+    /// leave a window where the strip has neither tab, and `strip::successor`
+    /// would activate some unrelated neighbour in it.
+    ReplaceWithSessionTab {
+        closing: String,
+        session_id: String,
+        group: Option<String>,
+        index: usize,
+    },
+    /// Slice T1 — fold a project open or shut.
+    ///
+    /// The second of the three things `TabGroup::workspace`'s doc says
+    /// nothing does. `collapsed` is already on the group and `strip.rs`
+    /// already draws a collapsed one as a head and a count; nothing had
+    /// ever set it, so every project was permanently open.
+    GroupSetCollapsed { group_id: String, collapsed: bool },
+    /// Slice T1 — a project the operator made by hand, from a folder they
+    /// picked.
+    ///
+    /// Bound to its checkout the same way an auto-created one is, so there
+    /// is no second class of project to keep working: once it exists,
+    /// sessions in that checkout file themselves under it through the same
+    /// `group_for_workspace` lookup.
+    NewProject { workspace: String },
     /// The omnibox asking history what it has, for `for_text`.
     ///
     /// `query` is the typing form (`typing_form`) and `for_text` is what
@@ -510,6 +555,56 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 })
                 .await;
         }
+        BrowserCmd::ReplaceWithSessionTab {
+            closing,
+            session_id,
+            group,
+            index,
+        } => {
+            if client
+                .browser_create(eave_wire::Request::TabOpen {
+                    url: None,
+                    group,
+                    index: Some(index),
+                    content: eave_wire::TabContent::Session { session_id },
+                    opener: None,
+                    activate: true,
+                })
+                .await
+                .is_ok()
+            {
+                // Only once the replacement exists. A failed open that
+                // still closed the blank tab would take the operator's
+                // launcher away and give them nothing back.
+                let _ = client
+                    .browser_do(eave_wire::Request::TabClose { tab_id: closing })
+                    .await;
+            }
+        }
+        BrowserCmd::GroupSetCollapsed {
+            group_id,
+            collapsed,
+        } => {
+            let _ = client
+                .browser_do(eave_wire::Request::GroupUpdate {
+                    group_id,
+                    title: None,
+                    color: None,
+                    workspace: None,
+                    collapsed: Some(collapsed),
+                })
+                .await;
+        }
+        BrowserCmd::NewProject { workspace } => {
+            let _ = client
+                .browser_create(eave_wire::Request::GroupCreate {
+                    title: Some(strip::project_title(&workspace)),
+                    color: None,
+                    workspace: Some(workspace),
+                    index: None,
+                })
+                .await;
+        }
         BrowserCmd::Navigate { tab_id, url } => {
             let _ = client
                 .browser_do(eave_wire::Request::TabNavigate { tab_id, url })
@@ -558,11 +653,34 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
         BrowserCmd::OpenSessionTab {
             session_id,
             activate,
+            group,
+            workspace,
         } => {
+            // Mint the project first when the checkout has none. A failure
+            // here is swallowed like every other failure in this function
+            // and the tab still opens — loose rather than filed, which is
+            // the same place it would have gone before Slice T1 and is a
+            // great deal better than no tab at all.
+            let group = match (group, workspace) {
+                (Some(group), _) => Some(group),
+                (None, Some(workspace)) => client
+                    .browser_create(eave_wire::Request::GroupCreate {
+                        title: Some(strip::project_title(&workspace)),
+                        color: None,
+                        workspace: Some(workspace),
+                        index: None,
+                    })
+                    .await
+                    .ok(),
+                (None, None) => None,
+            };
+            // Not `Client::tab_open_session`, which hardcodes
+            // `activate: false`: this verb carries an `activate` and the
+            // helper would drop it on the floor.
             let _ = client
                 .browser_create(eave_wire::Request::TabOpen {
                     url: None,
-                    group: None,
+                    group,
                     index: None,
                     content: eave_wire::TabContent::Session { session_id },
                     opener: None,
@@ -4189,6 +4307,28 @@ struct Shell {
     /// view comes back on the next launch, which is what session restore
     /// means.
     asked_for_session_tab: RefCell<HashSet<String>>,
+    /// The blank page tab a launch was started from (Slice T1), waiting for
+    /// its session to appear so the session's tab can take its place.
+    ///
+    /// Held rather than acted on immediately because **the session does not
+    /// exist yet when the launcher's button is pressed** — `Command::Launch`
+    /// is a request, and the session arrives later, on the rail. This is the
+    /// same shape as `asked_to_select`: a note of an intention, consumed by
+    /// the reconciler when the thing it was about shows up.
+    ///
+    /// Cleared when consumed, unlike the two `asked_*` sets — this one is a
+    /// pending act, not a record that something was already asked for.
+    launched_from_tab: RefCell<Option<String>>,
+    /// Checkout roots a project has already been asked for (Slice T1),
+    /// keyed on the root rather than the session.
+    ///
+    /// Same shape and same reason as `asked_for_session_tab` above: a fold
+    /// burst runs several times before the engine's answer comes back round
+    /// as a snapshot, and two sessions in one new worktree would otherwise
+    /// mint a project each. Never pruned — a project the operator then
+    /// closes stays closed, which is the whole point of firing auto-create
+    /// on a session that needs a view rather than on every snapshot.
+    asked_for_project: RefCell<HashSet<String>>,
     /// Slice E2 — last-closed **page** tabs, newest at the back. ⌘⇧T pops.
     ///
     /// The url is the one the tab last held (B1's own history on the tab,
@@ -6103,11 +6243,66 @@ impl Shell {
             .map(|s| s.session_id.clone())
             .collect();
 
+        // Slice T1 — where a session's tab goes. Its checkout root is its
+        // project; `TabGroup::workspace` has recorded that binding since B1
+        // and nothing has ever acted on it.
+        //
+        // **Auto-create fires here, on a session that needs a tab, and
+        // nowhere else.** Not on every snapshot: a project the operator
+        // closed would spring back the instant eave noticed its sessions
+        // still exist, and closing something that immediately returns is
+        // not closing it. Reaching this line means a session has no view,
+        // which is the one moment a project genuinely has to exist.
+        let roots: HashMap<&str, &str> = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                s.checkout_root
+                    .as_deref()
+                    .map(|root| (s.session_id.as_str(), root))
+            })
+            .collect();
+
         let mut asked = self.asked_for_session_tab.borrow_mut();
+        let mut minting = self.asked_for_project.borrow_mut();
         for session_id in strip::sessions_without_tabs(snapshot, &rail_order) {
             if !asked.insert(session_id.clone()) {
                 continue;
             }
+            // Slice T1 — a session started from a blank ⌘T tab takes that
+            // tab's place: same project, same row, and the blank one goes.
+            // Only for the FIRST session to arrive after the launch, which
+            // is what taking the note rather than reading it gives us.
+            let replacing = self
+                .launched_from_tab
+                .borrow_mut()
+                .take()
+                .and_then(|tab| strip::tab_slot(snapshot, &tab).map(|slot| (tab, slot)));
+            if let Some((closing, (group, index))) = replacing {
+                let _ = self
+                    .commands
+                    .send(Command::Browser(BrowserCmd::ReplaceWithSessionTab {
+                        closing,
+                        session_id,
+                        group,
+                        index,
+                    }));
+                continue;
+            }
+
+            let root = roots.get(session_id.as_str()).copied();
+            let group = root.and_then(|r| strip::group_for_workspace(snapshot, r));
+            // Ask for a project only when there is not one AND nobody has
+            // already asked for this same checkout. Two sessions in one new
+            // worktree arrive in a single fold burst, and without this they
+            // would mint two projects for one folder — the same double-ask
+            // `asked_for_session_tab` exists to stop, one level up.
+            let workspace = match (&group, root) {
+                (None, Some(root)) if minting.insert(root.to_string()) => Some(root.to_string()),
+                _ => None,
+            };
             let _ = self
                 .commands
                 .send(Command::Browser(BrowserCmd::OpenSessionTab {
@@ -6117,6 +6312,8 @@ impl Shell {
                     // one of them, and a reconciliation is not a request
                     // to go anywhere.
                     activate: false,
+                    group,
+                    workspace,
                 }));
         }
     }
@@ -7279,7 +7476,18 @@ impl Shell {
             match snapshot.active.as_deref() {
                 Some(active) if been.as_deref() != Some(active) => {
                     if let Some(ix) = items.iter().position(|i| i.tab_id() == Some(active)) {
-                        self.tabs_scroll.scroll_to_item(ix);
+                        // Row index, not item index: Slice T1 puts a `TABS`
+                        // divider into the drawn list at the section seam,
+                        // and every loose tab sits one row lower than its
+                        // place in `items`. Scrolling to the item index
+                        // would land one row short for exactly the tabs
+                        // furthest down the list.
+                        let row = if ix >= strip::project_item_count(&items) {
+                            ix + 1
+                        } else {
+                            ix
+                        };
+                        self.tabs_scroll.scroll_to_item(row);
                         *been = Some(active.to_string());
                     }
                 }
@@ -7288,9 +7496,19 @@ impl Shell {
             }
         }
 
-        let rows: Vec<AnyElement> = items
-            .iter()
-            .map(|item| match item {
+        // Slice T1 — where the projects stop and the loose tabs start.
+        // `strip::drawn_order` has already hoisted every group above every
+        // loose tab; this is only asking the same module where it put the
+        // seam, rather than re-deriving it here and risking a different
+        // answer from the one ctrl-tab walks.
+        let projects = strip::project_item_count(&items);
+
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(items.len() + 1);
+        for (ix, item) in items.iter().enumerate() {
+            if ix == projects {
+                rows.push(self.tabs_divider(cx));
+            }
+            rows.push(match item {
                 strip::StripItem::Group {
                     id,
                     title,
@@ -7300,8 +7518,14 @@ impl Shell {
                     holds_active,
                 } => self.group_head(id, title, color, *collapsed, *count, *holds_active, cx),
                 strip::StripItem::Tab(tab) => self.rail_tab(tab, phase, cx),
-            })
-            .collect();
+            });
+        }
+        // Always drawn, even with nothing loose under it — it carries ⌘T's
+        // `+`, and a control that appears only once you already have what it
+        // makes is not a control.
+        if projects == items.len() {
+            rows.push(self.tabs_divider(cx));
+        }
 
         div()
             .debug_selector(|| "rail-tabs".into())
@@ -7325,22 +7549,23 @@ impl Shell {
                             .line_height(px(theme::SECTION_LINE))
                             .font_weight(theme::WEIGHT_STRONG)
                             .text_color(theme::text_tertiary())
-                            .child("OPEN"),
+                            .child("PROJECTS"),
                     )
                     .child(
-                        // ⌘T's affordance. On the section header rather than
-                        // trailing the list: a vertical list grows downward,
-                        // so a `+` after the last row would move every time a
-                        // tab opened.
+                        // Slice T1 — a project by hand. The affordance sits
+                        // on the section header for the same reason ⌘T's
+                        // does below: a vertical list grows downward, so a
+                        // `+` after the last row would move every time
+                        // anything opened.
                         div()
-                            .id("tab-new")
-                            .debug_selector(|| "tab-new".into())
+                            .id("project-new")
+                            .debug_selector(|| "project-new".into())
                             .flex_none()
                             .size(px(theme::TAB_CLOSE))
                             .rounded(px(theme::RADIUS_BUTTON))
-                            .hover_fade("tab-new", theme::wash_rest(), theme::overlay())
+                            .hover_fade("project-new", theme::wash_rest(), theme::overlay())
                             .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                            .on_click(cx.listener(|this, _, _, cx| this.pick_project(cx)))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -7348,7 +7573,7 @@ impl Shell {
                                 icons::ADD_CIRCLE,
                                 theme::ICON_SM,
                                 theme::text_secondary(),
-                                "tab-new-glyph",
+                                "project-new-glyph",
                             )),
                     ),
             )
@@ -7389,6 +7614,95 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Slice T1 — the `TABS` divider: where the projects stop.
+    ///
+    /// A row inside the scroll list rather than a second sticky header, and
+    /// that is a layout constraint rather than a preference. The list has a
+    /// **definite** height, `theme::rail_tabs_h(rows.len())`, because a
+    /// scroll container's automatic minimum size is zero and a `max_h`
+    /// alone let it collapse to nothing — Slice D1 shipped exactly that for
+    /// one commit. That height is `rows.len()` times one row, so a divider
+    /// of any other height would put the box and its contents out of step
+    /// and re-open the defect from the other side. It is a full row tall
+    /// because it has to be.
+    ///
+    /// It carries ⌘T's `+`, which is what it is doing down here rather than
+    /// beside `PROJECTS`: the two affordances make different things and
+    /// each belongs next to what it makes.
+    fn tabs_divider(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "tabs-divider".into())
+            .flex_none()
+            .h(px(theme::RAIL_TAB_H))
+            .px(px(theme::SPACE_2))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .debug_selector(|| "tabs-divider-title".into())
+                    .text_size(px(theme::SECTION_SIZE))
+                    .line_height(px(theme::SECTION_LINE))
+                    .font_weight(theme::WEIGHT_STRONG)
+                    .text_color(theme::text_tertiary())
+                    .child("TABS"),
+            )
+            .child(
+                div()
+                    .id("tab-new")
+                    .debug_selector(|| "tab-new".into())
+                    .flex_none()
+                    .size(px(theme::TAB_CLOSE))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .hover_fade("tab-new", theme::wash_rest(), theme::overlay())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icons::tagged_icon(
+                        icons::ADD_CIRCLE,
+                        theme::ICON_SM,
+                        theme::text_secondary(),
+                        "tab-new-glyph",
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// Slice T1 — a project from a folder the operator picks.
+    ///
+    /// `directories: true, files: false`: a project is bound to a checkout
+    /// root, and a root is a directory. Offering files would let somebody
+    /// bind a project to something `group_for_workspace` can never match a
+    /// session against, which fails silently and looks like the project
+    /// simply never collects anything.
+    fn pick_project(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("New project".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = view.update(cx, |shell, _| {
+                let _ = shell
+                    .commands
+                    .send(Command::Browser(BrowserCmd::NewProject {
+                        workspace: path.to_string_lossy().into_owned(),
+                    }));
+            });
+        })
+        .detach();
+    }
+
     /// A group's head on the strip: its colour, its name, and — when it is
     /// collapsed — how many tabs it is holding.
     ///
@@ -7405,9 +7719,10 @@ impl Shell {
         collapsed: bool,
         count: usize,
         holds_active: bool,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
     ) -> AnyElement {
         let gid = id.to_string();
+        let click_id = id.to_string();
         div()
             .id(SharedString::from(format!("group-{id}")))
             .debug_selector(move || format!("group-{gid}"))
@@ -7417,10 +7732,36 @@ impl Shell {
             .rounded(px(theme::RADIUS_BUTTON))
             .when(holds_active, |d| d.shadow(theme::selection_rim()))
             .bg(theme::wash_rest())
+            .cursor_pointer()
+            // Slice T1 — the head folds its project. `collapsed` has been on
+            // the group since B1 and `strip.rs` has always drawn a collapsed
+            // one as a head plus a count; nothing ever set it, so every
+            // project was permanently open and the count was unreachable.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this
+                    .commands
+                    .send(Command::Browser(BrowserCmd::GroupSetCollapsed {
+                        group_id: click_id.clone(),
+                        collapsed: !collapsed,
+                    }));
+                cx.notify();
+            }))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(theme::SPACE_1))
+            // Which way the project is folded, stated before its name.
+            // A disclosure that only reads as a count ("3") says how much
+            // is hidden and not that anything is; the count disappears when
+            // the project is open, so on its own it is a mark that vanishes
+            // rather than a control that changes.
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .text_color(theme::text_tertiary())
+                    .child(if collapsed { "\u{25b8}" } else { "\u{25be}" }),
+            )
             .child(
                 div()
                     .size(px(theme::GROUP_DOT))
@@ -11454,6 +11795,17 @@ impl Shell {
     }
 
     fn launch(&mut self, cx: &mut Context<Self>) {
+        // Slice T1 — if the launcher is up because a blank ⌘T tab is
+        // active, the session that comes back belongs in THAT tab. Noted
+        // here and consumed in `reconcile_strip`, because the session does
+        // not exist yet: `Command::Launch` is a request and the rail
+        // answers it later.
+        {
+            let snapshot = &self.web_tabs.read(cx).snapshot;
+            *self.launched_from_tab.borrow_mut() = strip::active_is_blank_page(snapshot)
+                .then(|| snapshot.active.clone())
+                .flatten();
+        }
         let p = self.provider();
         let _ = self.commands.send(Command::Launch {
             provider: p.id.to_string(),
@@ -12307,9 +12659,29 @@ impl Render for Shell {
         // conversation sitting where a document was asked for.
         let active_is_page = strip::active_is_page(&strip_snapshot);
         let showing_page = page_el.is_some() || active_is_page;
+        // Slice T1 — ⌘T's tab before anything has been typed into it.
+        //
+        // A page tab that has never been anywhere owns the well like any
+        // other page tab, and until now what it drew there was
+        // `PAGE_STARTING` — "the browser exists and this tab has not been
+        // handed one yet". True, and useless: the operator did not ask for
+        // a browser, they asked for somewhere to start. So the well gets
+        // the launcher instead, which is the surface that already answers
+        // *which agent, in which folder* — the design eave had one screen
+        // away, exactly as the transcript's empty state found before it.
+        //
+        // This is what makes ⌘T a **chat** you can click into rather than a
+        // blank page you have to aim first: type an address and the tab
+        // navigates like any page tab, or dismiss the omnibox and start a
+        // session in the tab you already made.
+        let blank_page = active_is_page && strip::active_is_blank_page(&strip_snapshot);
         // What the well says when a page tab is active and nothing can draw
         // it. Two different absences, and only one of them is eave's fault.
-        let page_absence: Option<&'static str> = if page_el.is_some() || !active_is_page {
+        let page_absence: Option<&'static str> = if blank_page {
+            // The launcher is taking this well. Saying "starting the page"
+            // underneath it would be two answers to one question.
+            None
+        } else if page_el.is_some() || !active_is_page {
             None
         } else if crate::web::available() {
             // The browser exists and this tab has not been handed one yet.
@@ -12418,7 +12790,9 @@ impl Render for Shell {
         // belong over it. This was photographed drawing straight through
         // example.com: the launcher's occlusion assumption was written when
         // the only thing it could ever cover was an empty transcript.
-        let show_launcher = state.session_id.is_none() && !showing_page;
+        // Slice T1 adds the second way to reach the launcher: a blank page
+        // tab. The first — no session selected and no page — is unchanged.
+        let show_launcher = (state.session_id.is_none() && !showing_page) || blank_page;
         let launch_error = state.launch_error.clone();
         let empty_state: Option<EmptyState> = if !state.display.is_empty() {
             None
@@ -14144,6 +14518,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         page_menu: Popup::default(),
                         typeahead: typeahead.clone(),
                         asked_for_session_tab: RefCell::new(HashSet::new()),
+                        asked_for_project: RefCell::new(HashSet::new()),
+                        launched_from_tab: RefCell::new(None),
                         asked_to_select: RefCell::new(None),
                         closed_pages: VecDeque::new(),
                         conn: conn.clone(),

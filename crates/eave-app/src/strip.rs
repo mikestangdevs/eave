@@ -174,6 +174,83 @@ fn page_label(tab: &TabInfo) -> (String, bool) {
     (NEW_TAB_LABEL.to_string(), true)
 }
 
+/// The order the strip is DRAWN in: every group first, then every loose
+/// tab, each keeping its relative place in `snapshot.order`.
+///
+/// # Why the strip reorders the engine's list at all
+///
+/// A group is a **project** (Slice T1): it is bound to a checkout root by
+/// [`eave_wire::TabGroup::workspace`], and the sidebar draws projects above
+/// loose tabs the way Comet draws Projects above Tabs. The engine keeps one
+/// interleaved ordering because that is the operator's ordering and B1 was
+/// right not to split it; this is a presentation rule laid over it, and it
+/// is applied HERE — in one function both consumers share — rather than in
+/// the renderer.
+///
+/// **That last part is the whole reason this exists.** [`items`] and
+/// [`cycle_order`] each walked `snapshot.order` independently. A renderer
+/// that sectioned the list on its own would have moved what is drawn
+/// without moving what ctrl-tab walks, and the two would have disagreed
+/// silently — the invariant
+/// `ctrl_tab_walks_the_drawn_order_and_wraps_both_ways` asserts and the one
+/// a display-only split would quietly break.
+fn drawn_order(snapshot: &TabsSnapshot) -> Vec<&Slot> {
+    let (groups, loose): (Vec<&Slot>, Vec<&Slot>) = snapshot
+        .order
+        .iter()
+        .partition(|s| matches!(s, Slot::Group { .. }));
+    groups.into_iter().chain(loose).collect()
+}
+
+/// How many of `items` belong to the projects section — the leading run of
+/// group heads and grouped tabs.
+///
+/// Handed to the renderer so the two section headers know where to go,
+/// rather than the renderer re-deriving the split and getting a different
+/// answer from [`drawn_order`].
+pub fn project_item_count(items: &[StripItem]) -> usize {
+    items
+        .iter()
+        .take_while(|i| match i {
+            StripItem::Group { .. } => true,
+            StripItem::Tab(t) => t.run.is_some(),
+        })
+        .count()
+}
+
+/// What a project is called: the last segment of its checkout root.
+///
+/// `/Users/mike/Desktop/eave/wt-main` reads as `wt-main`, which is the name
+/// the operator uses for it out loud. The full path is what the group is
+/// BOUND to and stays on `workspace`; a title is what a person reads, and a
+/// 46-character absolute path in a 158 px row is not that.
+///
+/// A root that is all separators (`/`) has no last segment and keeps the
+/// path — a project called nothing at all would be worse than a project
+/// called `/`.
+pub fn project_title(workspace: &str) -> String {
+    workspace
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(workspace)
+        .to_string()
+}
+
+/// The group bound to this checkout root, if one already exists.
+///
+/// The lookup behind Slice T1's auto-create: a session opening in a
+/// checkout that has no group is what makes eave mint one. Equality on the
+/// stated path, exactly as `shared_with` is derived from equality of
+/// [`eave_wire::SessionInfo::checkout_root`] — same fact, same comparison.
+pub fn group_for_workspace(snapshot: &TabsSnapshot, workspace: &str) -> Option<String> {
+    snapshot
+        .groups
+        .iter()
+        .find(|g| g.workspace.as_deref() == Some(workspace))
+        .map(|g| g.id.clone())
+}
+
 /// Flatten the snapshot into the strip's single line.
 ///
 /// `sessions` is the rail's own view, keyed by session id. A session tab
@@ -193,7 +270,7 @@ pub fn items(
     let active = snapshot.active.as_deref();
 
     let mut out = Vec::with_capacity(snapshot.tabs.len() + snapshot.groups.len());
-    for slot in &snapshot.order {
+    for slot in drawn_order(snapshot) {
         match slot {
             Slot::Tab { id } => {
                 if let Some(info) = by_id.get(id.as_str()) {
@@ -314,7 +391,7 @@ pub fn cycle_order(snapshot: &TabsSnapshot) -> Vec<String> {
         .map(|(g, ids)| (g.as_str(), ids))
         .collect();
     let mut out = Vec::with_capacity(snapshot.tabs.len());
-    for slot in &snapshot.order {
+    for slot in drawn_order(snapshot) {
         match slot {
             Slot::Tab { id } => {
                 if live.contains_key(id.as_str()) {
@@ -434,6 +511,55 @@ pub fn active_is_page(snapshot: &TabsSnapshot) -> bool {
         .as_deref()
         .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a))
         .is_some_and(|t| t.content == TabContent::Page)
+}
+
+/// Slice T1 — whether the active tab is a page that has **never been
+/// anywhere**.
+///
+/// ⌘T's tab, before anything is typed into the omnibox. It is a page tab
+/// like any other, so `active_is_page` is true of it and the content well
+/// belongs to it; what it has no way to say on its own is that there is
+/// nothing to draw there *yet* and never was — as opposed to a page that is
+/// loading, or one whose browser eave evicted.
+///
+/// All three conditions are needed and none is redundant. `url` alone is
+/// `None` on a tab whose browser was evicted mid-history; `pending` catches
+/// the tab that has been asked to go somewhere and not yet arrived, which
+/// is emphatically not blank; and `history_len` is what tells a fresh tab
+/// from one the operator navigated back off the front of.
+pub fn active_is_blank_page(snapshot: &TabsSnapshot) -> bool {
+    let Some(active) = snapshot.active.as_deref() else {
+        return false;
+    };
+    snapshot.tabs.iter().any(|t| {
+        t.id == active
+            && matches!(t.content, TabContent::Page)
+            && t.url.is_none()
+            && t.pending.is_none()
+            && t.history_len == 0
+    })
+}
+
+/// Where a tab sits: which group holds it, and its index inside that
+/// container.
+///
+/// Slice T1 needs this to put a session tab exactly where the blank tab it
+/// replaces was — same project, same row. Reading the position off the
+/// snapshot rather than remembering it from when the tab was opened,
+/// because the operator may have dragged it since.
+pub fn tab_slot(snapshot: &TabsSnapshot, tab_id: &str) -> Option<(Option<String>, usize)> {
+    for (group, ids) in &snapshot.group_tabs {
+        if let Some(ix) = ids.iter().position(|t| t == tab_id) {
+            return Some((Some(group.clone()), ix));
+        }
+    }
+    // Loose: index among the top-level slots, which is what `TabMove` and
+    // `TabOpen` mean by an index at the top level.
+    snapshot
+        .order
+        .iter()
+        .position(|slot| matches!(slot, Slot::Tab { id } if id == tab_id))
+        .map(|ix| (None, ix))
 }
 
 #[cfg(test)]
@@ -631,14 +757,25 @@ mod tests {
         }
     }
 
-    /// B1's one ordering, flattened in place, with the run marked so the
-    /// renderer can draw it as one shape in a single pass.
+    /// B1's one ordering, with the run marked so the renderer can draw it
+    /// as one shape in a single pass — and the group hoisted above the
+    /// loose tabs, which is Slice T1's one presentation rule.
+    ///
+    /// This test used to be called `a_group_flattens_in_place_…` and
+    /// asserted that `loose` came first because the engine's `order` put it
+    /// there. In place is exactly what a group no longer is: a group is a
+    /// **project**, projects are a section above loose tabs, and the
+    /// hoisting happens in [`drawn_order`] so that what is drawn and what
+    /// ctrl-tab walks cannot come apart.
     #[test]
-    fn a_group_flattens_in_place_and_its_run_is_marked_at_both_ends() {
+    fn a_group_is_drawn_above_the_loose_tabs_with_its_run_marked_at_both_ends() {
         let items = items(&grouped(), &HashMap::new(), &|_| true);
         assert_eq!(items.len(), 5, "{items:?}");
-        assert!(matches!(&items[0], StripItem::Tab(t) if t.id == "loose" && t.run.is_none()));
-        match &items[1] {
+        assert!(
+            matches!(&items[4], StripItem::Tab(t) if t.id == "loose" && t.run.is_none()),
+            "the loose tab belongs under the projects, not above them: {items:?}"
+        );
+        match &items[0] {
             StripItem::Group {
                 id,
                 title,
@@ -655,7 +792,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let runs: Vec<(bool, bool)> = items[2..]
+        let runs: Vec<(bool, bool)> = items
             .iter()
             .filter_map(|i| match i {
                 StripItem::Tab(t) => t.run.as_ref().map(|r| (r.first, r.last)),
@@ -663,6 +800,98 @@ mod tests {
             })
             .collect();
         assert_eq!(runs, vec![(true, false), (false, false), (false, true)]);
+        assert_eq!(
+            project_item_count(&items),
+            4,
+            "the head and its three tabs are the projects section: {items:?}"
+        );
+    }
+
+    /// A project reads as its folder, not as its path.
+    #[test]
+    fn a_project_is_named_after_the_last_segment_of_its_checkout() {
+        assert_eq!(project_title("/Users/mike/Desktop/eave/wt-main"), "wt-main");
+        assert_eq!(
+            project_title("/Users/mike/Desktop/eave/wt-main/"),
+            "wt-main"
+        );
+        assert_eq!(project_title("eave"), "eave");
+        // Nothing to name it after. Keep the path rather than draw a blank.
+        assert_eq!(project_title("/"), "/");
+        assert_eq!(project_title(""), "");
+    }
+
+    /// Slice T1 — a group is a **project** and projects are drawn above
+    /// loose tabs, whatever order the engine keeps them in.
+    ///
+    /// The engine's `order` is the operator's ordering and B1 was right to
+    /// keep it interleaved; this asserts the presentation rule laid over
+    /// it, including the part that is easy to lose — that two groups keep
+    /// their order *relative to each other*, and two loose tabs keep
+    /// theirs. A partition that sorted rather than stably partitioned
+    /// would pass a one-group fixture and fail here.
+    #[test]
+    fn projects_are_drawn_above_loose_tabs_and_keep_their_relative_order() {
+        let mut s = grouped();
+        s.tabs
+            .push(page("loose2", Some("https://loose2.test/"), None));
+        s.tabs.push(page("h1", Some("https://h1.test/"), None));
+        s.groups.push(TabGroup {
+            id: "grp2".into(),
+            title: Some("summitpoint".into()),
+            color: None,
+            collapsed: false,
+            workspace: None,
+            last_active: None,
+            created_ts_ms: 0,
+        });
+        // Interleaved on the wire: loose, grp, loose2, grp2.
+        s.order = vec![
+            Slot::Tab { id: "loose".into() },
+            Slot::Group { id: "grp".into() },
+            Slot::Tab {
+                id: "loose2".into(),
+            },
+            Slot::Group { id: "grp2".into() },
+        ];
+        s.group_tabs.push(("grp2".into(), vec!["h1".into()]));
+
+        let items = items(&s, &HashMap::new(), &|_| true);
+        let drawn: Vec<&str> = items
+            .iter()
+            .map(|i| match i {
+                StripItem::Group { id, .. } => id.as_str(),
+                StripItem::Tab(t) => t.id.as_str(),
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            vec!["grp", "g1", "g2", "g3", "grp2", "h1", "loose", "loose2"],
+            "projects first, then loose tabs, each in its own relative order"
+        );
+        assert_eq!(project_item_count(&items), 6);
+    }
+
+    /// The lookup Slice T1's auto-create turns on: a checkout root either
+    /// already has a group or it does not.
+    ///
+    /// A group with no workspace must not answer for one — it is a project
+    /// the operator made by hand, and matching it to a checkout it was
+    /// never bound to would file somebody's sessions under a stranger.
+    #[test]
+    fn a_checkout_root_finds_its_group_and_an_unbound_group_answers_for_nothing() {
+        let mut s = grouped();
+        assert_eq!(
+            group_for_workspace(&s, "/Users/x/eave"),
+            None,
+            "an unbound group answered for a checkout it was never given"
+        );
+        s.groups[0].workspace = Some("/Users/x/eave".into());
+        assert_eq!(
+            group_for_workspace(&s, "/Users/x/eave").as_deref(),
+            Some("grp")
+        );
+        assert_eq!(group_for_workspace(&s, "/Users/x/other"), None);
     }
 
     /// A collapsed group hides its tabs from the strip but not from the
@@ -675,7 +904,7 @@ mod tests {
         let items = items(&s, &HashMap::new(), &|_| true);
         assert_eq!(items.len(), 2, "collapsed tabs were drawn: {items:?}");
         assert!(matches!(
-            &items[1],
+            &items[0],
             StripItem::Group {
                 count: 3,
                 holds_active: true,
@@ -683,9 +912,15 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(&items[1], StripItem::Tab(t) if t.id == "loose"));
+        assert_eq!(
+            project_item_count(&items),
+            1,
+            "a collapsed project is still the projects section, just an empty-looking one"
+        );
         assert_eq!(
             cycle_order(&s),
-            vec!["loose", "g1", "g2", "g3"],
+            vec!["g1", "g2", "g3", "loose"],
             "a collapsed group made its tabs unreachable by keyboard"
         );
     }
@@ -695,22 +930,31 @@ mod tests {
     #[test]
     fn ctrl_tab_walks_the_drawn_order_and_wraps_both_ways() {
         let s = grouped();
-        assert_eq!(cycle_order(&s), vec!["loose", "g1", "g2", "g3"]);
+        assert_eq!(cycle_order(&s), vec!["g1", "g2", "g3", "loose"]);
         assert_eq!(cycle(&s, true).as_deref(), Some("g3"));
         assert_eq!(cycle(&s, false).as_deref(), Some("g1"));
 
         let mut last = s.clone();
-        last.active = Some("g3".into());
-        assert_eq!(cycle(&last, true).as_deref(), Some("loose"));
+        last.active = Some("loose".into());
+        assert_eq!(cycle(&last, true).as_deref(), Some("g1"));
         let mut first = s.clone();
-        first.active = Some("loose".into());
-        assert_eq!(cycle(&first, false).as_deref(), Some("g3"));
+        first.active = Some("g1".into());
+        assert_eq!(cycle(&first, false).as_deref(), Some("loose"));
 
         assert_eq!(cycle(&snap(vec![], None), true), None);
         // Nothing active: start at the beginning rather than refuse.
         let mut none = s.clone();
         none.active = None;
-        assert_eq!(cycle(&none, true).as_deref(), Some("loose"));
+        assert_eq!(cycle(&none, true).as_deref(), Some("g1"));
+
+        // The invariant this whole hoist exists to keep: what ctrl-tab
+        // walks IS what is drawn, in that order. Asserted by construction
+        // rather than by two lists that happen to agree today.
+        let drawn: Vec<String> = items(&s, &HashMap::new(), &|_| true)
+            .iter()
+            .filter_map(|i| i.tab_id().map(str::to_string))
+            .collect();
+        assert_eq!(drawn, cycle_order(&s));
     }
 
     /// Right, then left. Landing on the left neighbour each time walks the
@@ -718,11 +962,16 @@ mod tests {
     #[test]
     fn closing_a_tab_lands_on_its_right_neighbour_then_its_left() {
         let s = grouped();
-        assert_eq!(successor(&s, "loose").as_deref(), Some("g1"));
+        assert_eq!(successor(&s, "g1").as_deref(), Some("g2"));
         assert_eq!(successor(&s, "g2").as_deref(), Some("g3"));
         assert_eq!(
             successor(&s, "g3").as_deref(),
-            Some("g2"),
+            Some("loose"),
+            "a project's last tab falls out to the loose tab below it"
+        );
+        assert_eq!(
+            successor(&s, "loose").as_deref(),
+            Some("g3"),
             "the last tab has no right neighbour"
         );
         assert_eq!(
