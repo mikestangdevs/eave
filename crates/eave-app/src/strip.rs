@@ -89,6 +89,21 @@ pub struct StripTab {
     /// "New tab".
     pub placeholder: bool,
     pub load: LoadState,
+    /// Whether this tab's page is in memory (Slice E3).
+    ///
+    /// **The renderer recedes these**, on the same principle as
+    /// `placeholder` above: a tab whose page eave has thrown away, drawn
+    /// identically to one holding a live page, is the strip claiming
+    /// something it cannot back up. Always `true` for a session tab — a
+    /// session is not a browser and has nothing to evict — so nothing here
+    /// makes a session row look unloaded.
+    ///
+    /// A never-visited tab reads `false` too, and that is deliberate rather
+    /// than sloppy: to the person looking at the strip, "eave gave this
+    /// tab's page back" and "you have not opened this tab yet" are the same
+    /// state — a tab whose page is not loaded and will load when they click
+    /// it. One rule covers both and cannot drift out of step with itself.
+    pub resident: bool,
     pub active: bool,
     pub pinned: bool,
     /// The group this tab is in, and where in its run it sits. `None` for a
@@ -164,7 +179,11 @@ fn page_label(tab: &TabInfo) -> (String, bool) {
 /// `sessions` is the rail's own view, keyed by session id. A session tab
 /// whose session is missing from it still draws — see
 /// [`ORPHAN_SESSION_LABEL`].
-pub fn items(snapshot: &TabsSnapshot, sessions: &HashMap<String, SessionChip>) -> Vec<StripItem> {
+pub fn items(
+    snapshot: &TabsSnapshot,
+    sessions: &HashMap<String, SessionChip>,
+    resident: &dyn Fn(&str) -> bool,
+) -> Vec<StripItem> {
     let by_id: HashMap<&str, &TabInfo> = snapshot.tabs.iter().map(|t| (t.id.as_str(), t)).collect();
     let group_tabs: HashMap<&str, &Vec<String>> = snapshot
         .group_tabs
@@ -178,7 +197,9 @@ pub fn items(snapshot: &TabsSnapshot, sessions: &HashMap<String, SessionChip>) -
         match slot {
             Slot::Tab { id } => {
                 if let Some(info) = by_id.get(id.as_str()) {
-                    out.push(StripItem::Tab(strip_tab(info, active, None, sessions)));
+                    out.push(StripItem::Tab(strip_tab(
+                        info, active, None, sessions, resident,
+                    )));
                 }
             }
             Slot::Group { id } => {
@@ -207,7 +228,13 @@ pub fn items(snapshot: &TabsSnapshot, sessions: &HashMap<String, SessionChip>) -
                             first: ix == 0,
                             last: ix == last_ix,
                         };
-                        out.push(StripItem::Tab(strip_tab(info, active, Some(run), sessions)));
+                        out.push(StripItem::Tab(strip_tab(
+                            info,
+                            active,
+                            Some(run),
+                            sessions,
+                            resident,
+                        )));
                     }
                 }
             }
@@ -221,6 +248,7 @@ fn strip_tab(
     active: Option<&str>,
     run: Option<GroupRun>,
     sessions: &HashMap<String, SessionChip>,
+    resident: &dyn Fn(&str) -> bool,
 ) -> StripTab {
     let (kind, label, placeholder) = match &info.content {
         TabContent::Page => {
@@ -243,11 +271,19 @@ fn strip_tab(
             )
         }
     };
+    // A session tab has no browser, so it is never "unloaded" — asking the
+    // page engine about it would be asking the wrong question and would
+    // recede every session row in a build with no Chromium in it.
+    let resident = match &info.content {
+        TabContent::Page => resident(&info.id),
+        TabContent::Session { .. } => true,
+    };
     StripTab {
         id: info.id.clone(),
         kind,
         label,
         placeholder,
+        resident,
         // A tab with a navigation asked for and unanswered is loading,
         // whatever the last engine said. The engine already sets this on
         // `tab_navigate`, and stating it here too costs nothing and closes
@@ -477,7 +513,7 @@ mod tests {
             ],
             Some("a"),
         );
-        let items = items(&s, &HashMap::new());
+        let items = items(&s, &HashMap::new(), &|_| true);
         let labels: Vec<(&str, bool)> = items
             .iter()
             .filter_map(|i| match i {
@@ -508,7 +544,7 @@ mod tests {
             ],
             Some("s1"),
         );
-        let items = items(&s, &chips(&[("sess-1", "refactor the fold")]));
+        let items = items(&s, &chips(&[("sess-1", "refactor the fold")]), &|_| true);
         assert_eq!(items.len(), 3);
         let labels: Vec<&str> = items
             .iter()
@@ -534,7 +570,7 @@ mod tests {
     #[test]
     fn a_session_tab_whose_session_the_rail_does_not_list_still_draws() {
         let s = snap(vec![session_tab("t", "sess-gone")], Some("t"));
-        let items = items(&s, &HashMap::new());
+        let items = items(&s, &HashMap::new(), &|_| true);
         match &items[0] {
             StripItem::Tab(t) => {
                 assert_eq!(t.label, ORPHAN_SESSION_LABEL);
@@ -561,7 +597,7 @@ mod tests {
         });
         t.load = LoadState::Complete;
         let s = snap(vec![t], Some("a"));
-        match &items(&s, &HashMap::new())[0] {
+        match &items(&s, &HashMap::new(), &|_| true)[0] {
             StripItem::Tab(t) => assert_eq!(t.load, LoadState::Loading),
             other => panic!("{other:?}"),
         }
@@ -599,7 +635,7 @@ mod tests {
     /// renderer can draw it as one shape in a single pass.
     #[test]
     fn a_group_flattens_in_place_and_its_run_is_marked_at_both_ends() {
-        let items = items(&grouped(), &HashMap::new());
+        let items = items(&grouped(), &HashMap::new(), &|_| true);
         assert_eq!(items.len(), 5, "{items:?}");
         assert!(matches!(&items[0], StripItem::Tab(t) if t.id == "loose" && t.run.is_none()));
         match &items[1] {
@@ -636,7 +672,7 @@ mod tests {
     fn a_collapsed_group_hides_its_tabs_but_still_counts_and_still_cycles() {
         let mut s = grouped();
         s.groups[0].collapsed = true;
-        let items = items(&s, &HashMap::new());
+        let items = items(&s, &HashMap::new(), &|_| true);
         assert_eq!(items.len(), 2, "collapsed tabs were drawn: {items:?}");
         assert!(matches!(
             &items[1],
@@ -733,5 +769,41 @@ mod tests {
 
         assert_eq!(active_session(&snap(vec![], None)), None);
         assert!(!active_is_page(&snap(vec![], None)));
+    }
+
+    /// Slice E3. The strip carries residency as a fact about the tab, and a
+    /// SESSION tab is always resident — it has no browser to lose. Without
+    /// that arm, a build with no page engine would report every session row
+    /// unloaded, and the rail would recede itself.
+    #[test]
+    fn residency_is_carried_for_pages_and_never_asked_of_a_session() {
+        let s = snap(
+            vec![
+                page("p-live", Some("https://example.com/"), Some("live")),
+                page("p-evicted", Some("https://docs.rs/gpui"), Some("evicted")),
+                session_tab("sess-1", "sess-1"),
+            ],
+            Some("p-live"),
+        );
+        let chips = chips(&[("sess-1", "refactor the fold")]);
+        // Only `p-live` holds a page. The closure is asked about page tabs
+        // and must never be consulted about the session one — if it were,
+        // this answer would recede it.
+        let items = items(&s, &chips, &|id| id == "p-live");
+        let by_id: Vec<(String, bool)> = items
+            .iter()
+            .filter_map(|i| match i {
+                StripItem::Tab(t) => Some((t.id.clone(), t.resident)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            by_id,
+            vec![
+                ("p-live".to_string(), true),
+                ("p-evicted".to_string(), false),
+                ("sess-1".to_string(), true),
+            ]
+        );
     }
 }

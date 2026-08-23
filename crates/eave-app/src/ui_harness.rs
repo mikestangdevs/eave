@@ -9632,6 +9632,94 @@ fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     }
 }
 
+/// Slice E3. A tab whose page eave has thrown away must not look like one
+/// holding a live page — otherwise the strip is claiming something it cannot
+/// back up, and the operator has no way to know why clicking costs a reload.
+///
+/// **Asserted on the selector, not on the colour**, because this harness can
+/// find what was painted and cannot read what ink it came out in. The globe
+/// carries the state in its `debug_selector` for exactly that reason: a
+/// treatment the suite cannot see is a treatment that rots.
+#[gpui::test]
+fn an_unloaded_page_tab_does_not_look_like_a_loaded_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    // `p2` is the evicted one. Set before the strip renders — the residency
+    // is read during paint.
+    set_resident_for_test(Some(&["p1"]));
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://example.com/"), Some("Example")),
+            page_tab("p2", Some("https://docs.rs/gpui"), Some("gpui")),
+        ],
+        Some("p1"),
+    );
+
+    assert!(
+        shown(vcx, "tab-chip-p1"),
+        "the resident tab lost its ordinary globe"
+    );
+    assert!(
+        !shown(vcx, "tab-chip-unloaded-p1"),
+        "a tab holding a live page is drawn as unloaded"
+    );
+    assert!(
+        shown(vcx, "tab-chip-unloaded-p2"),
+        "an evicted tab is drawn exactly like a loaded one — the whole point \
+         of the slice is that these differ"
+    );
+    assert!(
+        !shown(vcx, "tab-chip-p2"),
+        "the evicted tab still draws the loaded globe as well"
+    );
+
+    // **The treatment must not move anything.** A tab that changed size when
+    // its page was evicted would make the strip twitch under the pointer on
+    // a clock nobody can see, twenty minutes after they last touched it.
+    let b = |vcx: &mut VisualTestContext, sel: &'static str| vcx.debug_bounds(sel).expect(sel);
+    let (one, two) = (b(vcx, "tab-p1"), b(vcx, "tab-p2"));
+    assert_eq!(
+        one.size, two.size,
+        "an evicted tab is a different size from a loaded one"
+    );
+
+    set_resident_for_test(None);
+}
+
+/// The other half, and the one that would rot silently: a SESSION tab has no
+/// browser, so nothing about eviction may touch it. Without this, a build
+/// with no page engine — which is the build this suite runs — would recede
+/// every session row in the rail.
+#[gpui::test]
+fn eviction_never_recedes_a_session_tab(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    // Nothing is resident, page engine or not.
+    set_resident_for_test(Some(&[]));
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        Some("aaaa1111"),
+    );
+
+    assert!(
+        shown(vcx, "tab-chip-aaaa1111"),
+        "the session tab lost its provider mark to a page-engine rule"
+    );
+    assert!(
+        !shown(vcx, "tab-chip-unloaded-aaaa1111"),
+        "a session tab was drawn as an unloaded PAGE"
+    );
+    assert!(
+        shown(vcx, "tab-chip-unloaded-p1"),
+        "the page tab should be the one that recedes"
+    );
+
+    set_resident_for_test(None);
+}
+
 // ---------------------------------------------------------------------------
 // Slice D1 — the frame (A′): the rail owns the window, and the pane header
 // is the line that says where you are.

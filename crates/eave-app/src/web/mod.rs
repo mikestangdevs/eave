@@ -50,6 +50,10 @@
 //! though it were only about `RefCell`s. It never was. An abort and a hang;
 //! one rule. Anything added here that takes a CEF callback inherits it.
 //!
+//! The general form, which is what to carry to anything new here: **do not
+//! hold anything of your own — a borrow, a lock, a continuation — across a
+//! call into a foreign event loop that will call you back on this stack.**
+//!
 //! # Diagnostics
 //! `EAVE_WEB_TRACE=1` narrates the page engine's lifecycle on stderr: every
 //! reconciliation, every browser created, the load callbacks, the pump, and
@@ -72,6 +76,8 @@ mod dialogs;
 #[cfg(feature = "web")]
 mod find;
 #[cfg(feature = "web")]
+mod evict;
+#[cfg(feature = "web")]
 mod host;
 #[cfg(feature = "web")]
 mod input;
@@ -81,6 +87,15 @@ mod menu;
 mod osr;
 #[cfg(feature = "web")]
 mod page;
+/// The eviction DECISION, compiled in both feature states so the default
+/// test run exercises it. See its module docs.
+///
+/// With the feature OFF nothing calls it — `evict` is the only consumer and
+/// `evict` is gated — so its methods are dead in that build and only its
+/// tests run. The allow is scoped to exactly that state rather than blanket,
+/// so genuinely dead code in the `web` build is still caught.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+mod policy;
 #[cfg(feature = "web")]
 mod tabs;
 #[cfg(feature = "web")]
@@ -472,6 +487,29 @@ fn cef_set_zoom(tab_id: &str, percent: u32) {
 #[cfg(not(feature = "web"))]
 fn cef_set_zoom(_tab_id: &str, _percent: u32) {}
 
+/// Whether this tab's page is in memory right now — i.e. whether there is a
+/// live browser behind it.
+///
+/// **The hook Slice E3 leaves for the strip and the rail.** An evicted tab
+/// and a never-visited tab are the same thing to the person looking at the
+/// strip — a tab whose page is not loaded and will load when they click it
+/// — so this is the broad fact, and it is the one worth drawing. Dim the
+/// favicon on `!page_is_resident`.
+#[cfg(feature = "web")]
+pub fn page_is_resident(tab_id: &str) -> bool {
+    tabs::has_browser(tab_id)
+}
+
+/// Whether eave took this tab's browser back to reclaim memory (Slice E3).
+///
+/// The narrow fact, kept separate because the two are genuinely different
+/// events even where they look alike: this one is eave acting on the
+/// operator's memory rather than the operator never having opened the tab.
+#[cfg(feature = "web")]
+pub fn page_was_evicted(tab_id: &str) -> bool {
+    evict::was_evicted(tab_id)
+}
+
 // ---------------------------------------------------------------------------
 // The feature-off half
 // ---------------------------------------------------------------------------
@@ -701,6 +739,20 @@ pub fn page_element(_tab_id: &str, _cx: &mut gpui::App) -> Option<gpui::AnyEleme
 pub fn copy_selection(_tab_id: &str) {}
 
 // ---------------------------------------------------------------------------
+
+/// Whether this tab's page is in memory. Never, in a build with no
+/// Chromium in it — which is honest rather than convenient: the strip's
+/// "not loaded" treatment is then true of every page tab, because it is.
+#[cfg(not(feature = "web"))]
+pub fn page_is_resident(_tab_id: &str) -> bool {
+    false
+}
+
+/// Whether eave evicted this tab's browser. Nothing to evict here.
+#[cfg(not(feature = "web"))]
+pub fn page_was_evicted(_tab_id: &str) -> bool {
+    false
+}
 
 #[cfg(test)]
 mod tests {

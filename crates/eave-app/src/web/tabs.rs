@@ -309,6 +309,55 @@ fn cursor_style(type_: CursorType) -> gpui::CursorStyle {
     }
 }
 
+/// Ask a tab's browser to close. **The only place in eave that calls
+/// `close_browser` on a page.**
+///
+/// Three callers now — the departed-tab reaper, [`close_all`] on the way to
+/// `CefShutdown`, and Slice E3's eviction clock — and they were three
+/// open-coded copies of the same six lines before this existed. That is
+/// worth one function for the reason C7 gives about [`with_browser`]: a
+/// discipline that has to be re-applied at each call site is a discipline
+/// that will be missed at the next one, and the C7 audit found the missed
+/// one by reading nine call sites rather than one.
+///
+/// FORCED, and the argument is the reaper's: the unforced form runs the
+/// page's `beforeunload`, and eave has no dialog surface to ask the question
+/// on — so an unforced close would be refusable by a page with nowhere for
+/// the refusal to be seen, and the caller would re-issue it forever. For a
+/// departed tab the decision has already been made. For an eviction it is
+/// eave's own decision about eave's own memory, which is not a question to
+/// put to the page either. A `beforeunload` a person can actually answer
+/// needs the dialog surface first, and that is the same missing surface
+/// `<select>` needs.
+///
+/// Closing is ASYNCHRONOUS even when forced. This only asks; the entry
+/// disappears in `on_before_close`, on a later pump.
+pub fn close_browser_for(tab_id: &str) {
+    // **C7's rule, asserted rather than remembered.** Every close path in
+    // eave funnels through here, so this is the one place that can check
+    // the invariant for all of them: no cell in the `web` module may be
+    // borrowed when Chromium is about to run our handlers on this stack.
+    // A `debug_assert` because it costs nothing in a release build and
+    // because the failure it replaces — `already borrowed`, unwinding
+    // through Objective-C frames, aborting the process — is one nobody can
+    // debug from the crash report (C6 spent a slice on it).
+    debug_assert!(
+        BROWSERS.with(|b| b.try_borrow_mut().is_ok()),
+        "close_browser_for({tab_id}) with BROWSERS borrowed — see `with_browser`"
+    );
+    debug_assert!(
+        super::evict::borrows_clear(),
+        "close_browser_for({tab_id}) with an eviction cell borrowed — see `evict::tick`"
+    );
+    // Through `with_browser`, so the borrow is dropped before CEF is
+    // entered. See its doc comment for what holding it costs.
+    with_browser(tab_id, |b| {
+        if let Some(host) = b.host() {
+            host.close_browser(1);
+        }
+    });
+}
+
 /// Reconcile the page engine against the tab strip.
 ///
 /// Called on every snapshot, and cheap when nothing changed — which is the
@@ -327,6 +376,10 @@ pub fn drive(snapshot: &TabsSnapshot) {
     if !super::host::running() {
         return;
     }
+    // The eviction clock reads the strip between snapshots — which tab is
+    // active, which tabs are pages, which are pinned — so it is handed the
+    // strip here, at the one place that knows a fold has finished.
+    super::evict::note_snapshot(snapshot);
     // ── THE ANSWER TO "WHAT HAPPENS BEHIND A SESSION TAB?" (Slice C5) ──
     //
     // C1 drove exactly one tab — the active one, when it was a page — and
@@ -343,15 +396,25 @@ pub fn drive(snapshot: &TabsSnapshot) {
     // is what every browser does, and it is the only answer under which the
     // load state in the strip is a fact rather than a decoration.
     //
-    // **Creation still requires activation**, and that is the whole of the
-    // memory policy. A live browser is ~322 MB of helper processes, so
-    // opening twenty tabs must not cost 6 GB — a tab that has never been
-    // looked at has no browser and costs nothing. This is a deliberately
-    // conservative floor and not a resident-set policy: nothing here evicts
-    // a browser once created, so the ceiling is "tabs you have actually
-    // visited this run". Eviction is a policy question with its own tradeoffs
-    // (a discarded tab loses scroll, form state and JS heap) and it deserves
-    // its own slice; see the report.
+    // **Creation still requires activation**, and it is half of the memory
+    // policy. A tab that has never been looked at has no browser and costs
+    // nothing. (The other half of this sentence used to read "a live
+    // browser is ~322 MB of helper processes, so opening twenty tabs must
+    // not cost 6 GB". E3 measured that and it is wrong in an interesting
+    // way: ~322 MB is almost exactly eave's floor with NO page resident,
+    // and the marginal cost of a tab is far smaller. See
+    // `thresholds::PAGE_IDLE_EVICT_AFTER` for the table. The rule survives
+    // its bad justification — not creating a browser nobody asked to look
+    // at is still right — but the arithmetic behind it does not.) This is a
+    // deliberately
+    // conservative floor, and it is no longer the whole policy: Slice E3
+    // added the other half in `evict`, so a page tab nobody has looked at
+    // for `thresholds::PAGE_IDLE_EVICT_AFTER` gives its browser back and
+    // the ceiling stops being "tabs you have actually visited this run".
+    // The tradeoff C5 named is real and is paid rather than avoided — a
+    // discarded tab loses scroll, form state and JS heap — and the reason
+    // it is affordable is that the back/forward stack was never in
+    // Chromium to begin with (B1 put it in the engine). See `evict`.
     //
     // There is therefore ONE notion of active in eave, and it is
     // `TabsState::active`. It decides which tab's frames are painted and
@@ -377,7 +440,7 @@ pub fn drive(snapshot: &TabsSnapshot) {
     // A tab that left the strip takes its browser with it. Nothing did this
     // before C5 because nothing could close a tab — `EAVE_WEB_AT_BOOT` opens
     // one and never removes it — and ⌘W is what makes it reachable. Without
-    // this a closed tab keeps ~322 MB of helper processes alive, keeps
+    // this a closed tab keeps its share of the helper processes alive, keeps
     // loading, and keeps reporting facts about a tab the engine has already
     // forgotten (which the engine discards, so the leak is silent).
     //
@@ -394,20 +457,10 @@ pub fn drive(snapshot: &TabsSnapshot) {
         if std::env::var("EAVE_WEB_TRACE").is_ok() {
             eprintln!("[web] closing browser for departed tab {id}");
         }
-        with_browser(&id, |b| {
-            if let Some(host) = b.host() {
-                // FORCED. The unforced form runs the page's
-                // `beforeunload`, and eave has no dialog surface to ask
-                // the question on — so an unforced close would be
-                // refusable by a page with nowhere for the refusal to be
-                // seen, and this loop would re-issue it on every snapshot
-                // forever. The tab is already gone from the model; the
-                // decision has been made. A `beforeunload` that a person
-                // can actually answer needs the dialog surface first, and
-                // that is the same missing surface `<select>` needs.
-                host.close_browser(1);
-            }
-        });
+        close_browser_for(&id);
+        // The tab is gone from the model, so what this module knew about
+        // its idleness is not a fact about anything any more.
+        super::evict::forget(&id);
         super::host::request_pump();
     }
 }
@@ -668,11 +721,7 @@ pub fn copy_selection(tab_id: &str) {
 pub fn close_all() {
     let ids: Vec<String> = BROWSERS.with(|b| b.borrow().keys().cloned().collect());
     for id in ids {
-        with_browser(&id, |b| {
-            if let Some(host) = b.host() {
-                host.close_browser(1);
-            }
-        });
+        close_browser_for(&id);
     }
     // **Deliberately does NOT clear the map.** Closing is asynchronous even
     // when forced: `close_browser(1)` only asks, and `on_before_close` — which
@@ -708,6 +757,10 @@ pub fn forget_all() {
 /// space. So the figure is the page's own processes, and it is an
 /// **undercount** by whatever Chromium holds in ours — measured at ~141 MB
 /// for the combined app-and-browser process against ~322 MB of helpers.
+/// (That ~322 MB was one tab's total. E3 measured the same set with ten
+/// tabs and with none — 0.90 GB and 0.32 GB — so most of it is a floor
+/// that does not multiply. The undercount this paragraph is about is
+/// unaffected either way; only the sense of scale changes.)
 ///
 /// It also does not count **eave's own engine**, which is a child of this
 /// process too. Filtering on "is a child" alone billed the agent engine to
@@ -831,6 +884,9 @@ wrap_life_span_handler! {
             // size it was left at — after the insert, because `reapply`
             // goes through `with_browser`.
             super::zoom_reapply(&self.tab_id);
+            // This tab is resident again: start its idle clock and clear
+            // any evicted mark. Outside the borrow above, deliberately.
+            super::evict::note_created(&self.tab_id);
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -850,6 +906,9 @@ wrap_life_span_handler! {
             // same reason `close_browser` is reached at all, which is that
             // the tab itself has left the strip.
             super::forget_page(&self.tab_id);
+            // If this close was an eviction, the strip may want the tab
+            // back already. Sets a flag; nothing is created on this stack.
+            super::evict::note_closed(&self.tab_id);
         }
     }
 }
@@ -1397,6 +1456,68 @@ wrap_display_handler! {
             }
             0
         }
+
+        /// Camera and microphone, which is the ONE media signal CEF gives
+        /// eave with both edges (Slice E3). A tab holding a device is in a
+        /// call, and a tab in a call must not be evicted for idleness —
+        /// nobody looks at the tab they are talking through.
+        ///
+        /// This is device CAPTURE, not playback; the two are different
+        /// questions and only this one has an honest answer. See
+        /// `PageAudioHandler` for the other.
+        fn on_media_access_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            has_video_access: ::std::os::raw::c_int,
+            has_audio_access: ::std::os::raw::c_int,
+        ) {
+            let capturing = has_video_access != 0 || has_audio_access != 0;
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] media access {} capturing={capturing}", self.tab_id);
+            }
+            super::evict::note_media_access(&self.tab_id, capturing);
+        }
+    }
+}
+
+wrap_audio_handler! {
+    struct PageAudioHandler {
+        tab_id: String,
+    }
+
+    impl AudioHandler {
+        /// **eave declines the capture, and the return value is the whole
+        /// point of this handler** (Slice E3).
+        ///
+        /// CEF's contract on `get_audio_parameters` is "return true to
+        /// proceed with audio stream capture, or false to cancel it", and
+        /// proceeding means the page's audio is routed to this handler as
+        /// PCM *instead of* to the speakers. eave has nothing to play PCM
+        /// with, so proceeding would silence every page in exchange for
+        /// knowing that it was making noise. Returning 0 leaves playback
+        /// exactly as it was.
+        ///
+        /// What that costs is the stop edge. `on_audio_stream_started` and
+        /// `on_audio_stream_stopped` only fire for a capture we accepted,
+        /// so the ONLY thing eave ever learns is that a stream began —
+        /// which is why the eviction clock treats audio as a hold with a
+        /// timeout rather than as a state. Both failure modes are named on
+        /// `thresholds::PAGE_AUDIO_HOLD`.
+        ///
+        /// If CEF ever grows an `IsAudible` on the browser host, this
+        /// handler and that constant should both go.
+        fn audio_parameters(
+            &self,
+            _browser: Option<&mut Browser>,
+            _params: Option<&mut AudioParameters>,
+        ) -> ::std::os::raw::c_int {
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] audio stream starting on {}", self.tab_id);
+            }
+            super::evict::note_audio_started(&self.tab_id);
+            // 0 = do not capture. Playback is untouched.
+            0
+        }
     }
 }
 
@@ -1649,5 +1770,10 @@ mod tests {
             cursor_style(CursorType::NORTHEASTPANNING),
             gpui::CursorStyle::Arrow
         );
+        /// Present only so that eave is TOLD about audio (Slice E3). It
+        /// declines every capture it is offered — see `PageAudioHandler`.
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            Some(PageAudioHandler::new(self.tab_id.clone()))
+        }
     }
 }
