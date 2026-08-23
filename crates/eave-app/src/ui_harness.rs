@@ -5048,9 +5048,14 @@ fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
     let cmds = h.drain();
     assert_eq!(cmds.len(), 1, "start emitted {} commands", cmds.len());
     match &cmds[0] {
-        Command::Launch { provider, model } => {
+        Command::Launch {
+            provider,
+            model,
+            cwd,
+        } => {
             assert_eq!(provider, "claude-code");
             assert_eq!(*model, None, "eave invented a model nobody chose");
+            assert_eq!(*cwd, None, "eave invented a worktree nobody chose");
         }
         other => panic!("start emitted {other:?}"),
     }
@@ -11116,6 +11121,88 @@ fn a_session_started_from_a_blank_tab_takes_that_tabs_place(cx: &mut TestAppCont
     );
 }
 
+/// Slice T1 follow-up — a chat launched inside a project **starts in that
+/// project's worktree**.
+///
+/// `TabGroup::workspace` was recorded by B1 and read by nobody: eave drew
+/// the project, named it after the checkout, grouped its tabs — and then
+/// launched every chat in whatever directory the engine defaulted to. The
+/// group said which worktree it was about and the agent was started
+/// somewhere else.
+///
+/// Nothing new goes on the wire for this. `Request::Open` has carried a
+/// `cwd` since P2; the shell was passing `None`.
+#[gpui::test]
+fn a_chat_launched_in_a_project_starts_in_its_worktree(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/Users/x/Desktop/eave/wt-e3"),
+        vec![page_tab("blank", None, None)],
+        vec![],
+        Some("blank"),
+    );
+    assert!(shown(vcx, "launcher"), "the launcher is not up");
+
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+
+    let cmds = h.drain();
+    let cwd = cmds
+        .iter()
+        .find_map(|c| match c {
+            Command::Launch { cwd, .. } => Some(cwd.clone()),
+            _ => None,
+        })
+        .expect("no launch");
+    assert_eq!(
+        cwd.as_deref(),
+        Some("/Users/x/Desktop/eave/wt-e3"),
+        "the chat did not inherit its project's worktree"
+    );
+}
+
+/// ...and a chat launched outside any project still lets the engine pick.
+///
+/// The counter-case is the one that could regress silently. `cwd` is an
+/// `Option` precisely so "no project" keeps eave's pre-T1 behaviour, and a
+/// helper that invented a path for a loose tab — the checkout eave itself
+/// is running in, say — would start every ungrouped chat somewhere the
+/// operator never named.
+#[gpui::test]
+fn a_chat_launched_outside_a_project_names_no_worktree(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // A loose blank tab, and a project sitting right next to it that this
+    // tab does not belong to.
+    strip_with_project(
+        &h,
+        vcx,
+        Some("/Users/x/Desktop/eave/wt-e3"),
+        vec![page_tab("in-project", None, None)],
+        vec![page_tab("blank", None, None)],
+        Some("blank"),
+    );
+
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+
+    let cmds = h.drain();
+    let cwd = cmds
+        .iter()
+        .find_map(|c| match c {
+            Command::Launch { cwd, .. } => Some(cwd.clone()),
+            _ => None,
+        })
+        .expect("no launch");
+    assert_eq!(
+        cwd, None,
+        "a loose tab borrowed a neighbouring project's worktree"
+    );
+}
+
 /// ...and a session that arrives on its own does NOT evict somebody's tab.
 ///
 /// The note is taken, not read: only the first session after a launch from
@@ -11219,6 +11306,146 @@ fn the_bookmarks_bar_is_over_a_page_and_absent_in_a_chat(cx: &mut TestAppContext
     assert!(
         !shown(vcx, "bookmarks-bar"),
         "the bar drew over an agent's conversation"
+    );
+}
+
+/// Slice T1 follow-up — a bookmark can be taken **off** the bar.
+///
+/// The bar shipped with three ways to put something on it (drag an
+/// address, drop onto a folder, new folder) and no way to take anything
+/// off. A chip cannot be dragged to a trash can, so a bookmark added by a
+/// stray drop was permanent.
+#[gpui::test]
+fn a_right_click_on_a_bookmark_removes_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    let at = vcx.debug_bounds("bookmark-gh").expect("bookmark-gh");
+    vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-menu-remove-bookmark"),
+        "right-clicking a bookmark offered no way to remove it"
+    );
+
+    let _ = h.drain();
+    click(vcx, "tab-menu-remove-bookmark");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::BookmarkRemove { bookmark_id }) if bookmark_id == "gh"
+        )),
+        "Remove sent no removal: {cmds:?}"
+    );
+}
+
+/// ...and removing an OPEN folder closes it.
+///
+/// The engine answers a removal with a fresh snapshot, but the folder that
+/// is open is the shell's own state and no snapshot clears it. Without
+/// this, removing an open folder leaves its children hanging under a chip
+/// that is gone.
+#[gpui::test]
+fn removing_an_open_bookmark_folder_closes_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("dev"), None),
+            ("rs", 1, None, Some("https://docs.rs/")),
+        ],
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "bookmark-child-rs"), "the folder never opened");
+
+    let at = vcx
+        .debug_bounds("bookmark-folder-dev")
+        .expect("bookmark-folder-dev");
+    vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
+    vcx.run_until_parked();
+    let _ = h.drain();
+    click(vcx, "tab-menu-remove-bookmark");
+    vcx.run_until_parked();
+
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::BookmarkRemove { bookmark_id }) if bookmark_id == "dev"
+        )),
+        "the folder was not removed: {cmds:?}"
+    );
+    assert!(
+        !shown(vcx, "bookmark-child-rs"),
+        "a removed folder's children stayed on screen"
+    );
+}
+
+/// ...and a bookmark filed INSIDE a folder can be removed too.
+///
+/// The folder is the only place such a bookmark can be right-clicked, so
+/// leaving the child rows out would make anything dropped into a folder
+/// the permanent kind again.
+#[gpui::test]
+fn a_bookmark_inside_a_folder_can_be_removed(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("dev"), None),
+            ("rs", 1, None, Some("https://docs.rs/")),
+        ],
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![visited_tab("p1", "https://docs.rs/")],
+        Some("p1"),
+    );
+
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    let at = vcx
+        .debug_bounds("bookmark-child-rs")
+        .expect("bookmark-child-rs");
+    vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
+    vcx.run_until_parked();
+
+    let _ = h.drain();
+    click(vcx, "tab-menu-remove-bookmark");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::BookmarkRemove { bookmark_id }) if bookmark_id == "rs"
+        )),
+        "the child was not removed: {cmds:?}"
+    );
+    assert!(
+        shown(vcx, "bookmark-folder-dev"),
+        "removing a child took the folder with it"
     );
 }
 
