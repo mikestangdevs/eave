@@ -39,25 +39,30 @@ use eave_wire::{HistoryMatch, MatchKind};
 
 /// Where a search goes when nobody has said otherwise.
 ///
-/// **DuckDuckGo, and this is the stated fact the slice was asked for.** The
+/// **Google, and this is the stated fact the slice was asked for.** The
 /// choice is not neutral and pretending otherwise would be worse than
 /// picking: every character typed here that is not an address is sent to
-/// this host, so the default should be the one that asks for the least back.
-/// DuckDuckGo needs no account, sets no profile, and its result page works
-/// without JavaScript — which matters for a browser whose page engine is
-/// young.
+/// this host. Google is where a person typing a sentence into an address
+/// bar expects it to go, and a default that is quietly worse at the one job
+/// the row has is a default that gets worked around rather than trusted.
 ///
-/// It is **named in the interface**, not only here: the search row reads
-/// `Search duckduckgo.com for "…"`, so the host is on screen at the moment
-/// it is about to receive what you typed. That is the difference between a
-/// default and a hidden default.
+/// The cost is real and this does not hide it. The host is **named in the
+/// interface**, not only here: the search row reads `Search google.com for
+/// "…"`, so it is on screen at the moment it is about to receive what you
+/// typed. That is the difference between a default and a hidden default,
+/// and it is why the sentence is derived from the url rather than written
+/// down beside it.
+///
+/// The prefix carries `www.`; [`engine_host`] strips it, so the row reads
+/// `google.com` while the request goes to the host Google actually serves.
 ///
 /// Overridable with `EAVE_SEARCH_URL`, which is a **prefix**: the query is
-/// percent-encoded and appended. `https://www.google.com/search?q=` and
-/// `https://html.duckduckgo.com/html/?q=` both work. The row renames itself
-/// from the override's host, so an operator who changes this sees the change
-/// rather than a stale sentence.
-pub const DEFAULT_SEARCH: &str = "https://duckduckgo.com/?q=";
+/// percent-encoded and appended. `https://duckduckgo.com/?q=` and
+/// `https://html.duckduckgo.com/html/?q=` both work — the host that asks
+/// for the least back is one env var away. The row renames itself from the
+/// override's host, so an operator who changes this sees the change rather
+/// than a stale sentence.
+pub const DEFAULT_SEARCH: &str = "https://www.google.com/search?q=";
 
 /// The search prefix in force. Read per call rather than cached: this is not
 /// hot (it runs once per keystroke at typing speed, against a `Vec` lookup),
@@ -75,7 +80,7 @@ pub fn search_prefix() -> String {
 ///
 /// The **host**, not a brand name. A lookup table of pretty names would be
 /// wrong the moment somebody sets `EAVE_SEARCH_URL` to something not in it,
-/// and it would be wrong silently — the row would keep saying "DuckDuckGo"
+/// and it would be wrong silently — the row would keep saying "Google"
 /// while sending the query somewhere else. The host is derived from the
 /// thing that actually receives the text, so it cannot drift from it.
 pub fn engine_host(prefix: &str) -> String {
@@ -557,14 +562,14 @@ mod tests {
     fn a_search_is_encoded_and_names_who_receives_it() {
         match t("rust trait objects") {
             Target::Search { url, host, .. } => {
-                assert_eq!(url, "https://duckduckgo.com/?q=rust+trait+objects");
-                assert_eq!(host, "duckduckgo.com");
+                assert_eq!(url, "https://www.google.com/search?q=rust+trait+objects");
+                assert_eq!(host, "google.com");
             }
             other => panic!("{other:?}"),
         }
         match resolve("a&b=c/d?e", DEFAULT_SEARCH).unwrap() {
             Target::Search { url, .. } => {
-                assert_eq!(url, "https://duckduckgo.com/?q=a%26b%3Dc%2Fd%3Fe")
+                assert_eq!(url, "https://www.google.com/search?q=a%26b%3Dc%2Fd%3Fe")
             }
             other => panic!("{other:?}"),
         }
@@ -575,23 +580,27 @@ mod tests {
     fn a_query_encodes_utf8_by_the_byte() {
         match resolve("café", DEFAULT_SEARCH).unwrap() {
             Target::Search { url, .. } => {
-                assert_eq!(url, "https://duckduckgo.com/?q=caf%C3%A9")
+                assert_eq!(url, "https://www.google.com/search?q=caf%C3%A9")
             }
             other => panic!("{other:?}"),
         }
     }
 
     /// The override renames the row. A default that changed where the text
-    /// went while still saying "duckduckgo.com" would be worse than having
-    /// no sentence at all.
+    /// went while still saying "google.com" would be worse than having no
+    /// sentence at all.
+    ///
+    /// The override under test is the engine that used to be the default,
+    /// which is the case that has to keep working: DuckDuckGo is one env
+    /// var away, and the row has to say so.
     #[test]
     fn an_overridden_engine_is_named_from_the_url_it_points_at() {
-        let prefix = "https://www.google.com/search?q=";
-        assert_eq!(engine_host(prefix), "google.com");
+        let prefix = "https://duckduckgo.com/?q=";
+        assert_eq!(engine_host(prefix), "duckduckgo.com");
         match resolve("hello", prefix).unwrap() {
             Target::Search { url, host, .. } => {
-                assert_eq!(url, "https://www.google.com/search?q=hello");
-                assert_eq!(host, "google.com");
+                assert_eq!(url, "https://duckduckgo.com/?q=hello");
+                assert_eq!(host, "duckduckgo.com");
             }
             other => panic!("{other:?}"),
         }
@@ -631,7 +640,7 @@ mod tests {
 
         let r = rows("rust traits", &[], DEFAULT_SEARCH);
         assert_eq!(r[0].kind, RowKind::SearchWith);
-        assert_eq!(r[0].secondary.as_deref(), Some("search duckduckgo.com"));
+        assert_eq!(r[0].secondary.as_deref(), Some("search google.com"));
     }
 
     /// A suggestion that does exactly what the row above it does is a place
