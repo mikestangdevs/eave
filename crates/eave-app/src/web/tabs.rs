@@ -738,6 +738,9 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
             }
         }
     }
+    if let Some(url) = tab.favicon_url.as_deref() {
+        super::favicon::fetch(&tab.id, url);
+    }
 }
 
 /// Create a windowless browser for a tab.
@@ -1423,19 +1426,12 @@ wrap_display_handler! {
             report(&self.tab_id, PageFact::Committed { url, title: None });
         }
 
-        /// Where the page says its icon lives.
+        /// Where the page says its icon lives, and the fetch that follows.
         ///
-        /// `PageFact::Favicon` has existed on the wire since Slice B1 and
-        /// **nothing has ever sent one** — `TabInfo::favicon_url`, the
-        /// engine's `FaviconStated` fold and the strip's globe stand-in
-        /// were all built against a fact that was never raised. This raises
-        /// it. Fetching and decoding the bytes is still ahead (spec
-        /// 06-browser D13); a url the strip can act on is the half that was
-        /// missing from the model rather than from the renderer.
-        ///
-        /// Chromium offers every declared icon, best first. Taking the
-        /// first is the same choice Chrome makes at this stage; choosing by
-        /// size needs the bytes, which is the fetch half.
+        /// The URL is a fact about the tab (journalled). The pixels are a
+        /// cache in `favicon.rs`, fetched through this browser so cookies
+        /// and the proxy are Chromium's. The strip paints those bytes; the
+        /// globe is only "we do not have them yet".
         fn on_favicon_urlchange(
             &self,
             _browser: Option<&mut Browser>,
@@ -1461,9 +1457,12 @@ wrap_display_handler! {
             report(
                 &self.tab_id,
                 PageFact::Favicon {
-                    favicon_url: picked,
+                    favicon_url: picked.clone(),
                 },
             );
+            if let Some(url) = picked {
+                super::favicon::fetch(&self.tab_id, &url);
+            }
         }
 
         /// 0.0 to 1.0 across a load.

@@ -1961,29 +1961,22 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
             // recedes under `tab-chip-unloaded-*`.
             strip::TabKind::Page => {
                 let resident = tab.resident;
-                let globe = page_globe(id, resident);
-                match tab.favicon_url.as_deref() {
-                    Some(url) => {
-                        let id_load = id.to_string();
-                        let id_fail = id.to_string();
-                        div()
-                            .debug_selector({
-                                let id = id.to_string();
-                                move || format!("tab-favicon-{id}")
-                            })
-                            .size(px(theme::RAIL_MARK))
-                            .overflow_hidden()
-                            .rounded(px(theme::RADIUS_CHIP))
-                            .child(
-                                img(url.to_string())
-                                    .size(px(theme::RAIL_MARK))
-                                    .object_fit(ObjectFit::Contain)
-                                    .with_loading(move || page_globe(&id_load, resident))
-                                    .with_fallback(move || page_globe(&id_fail, resident)),
-                            )
-                            .into_any_element()
-                    }
-                    None => globe,
+                match crate::web::favicon_image(id) {
+                    Some(image) => div()
+                        .debug_selector({
+                            let id = id.to_string();
+                            move || format!("tab-favicon-{id}")
+                        })
+                        .size(px(theme::RAIL_MARK))
+                        .overflow_hidden()
+                        .rounded(px(theme::RADIUS_CHIP))
+                        .child(
+                            img(image)
+                                .size(px(theme::RAIL_MARK))
+                                .object_fit(ObjectFit::Contain),
+                        )
+                        .into_any_element(),
+                    None => page_globe(id, resident),
                 }
             }
             strip::TabKind::Session { chip, .. } => {

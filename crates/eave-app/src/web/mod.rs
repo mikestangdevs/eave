@@ -76,6 +76,8 @@ mod dialogs;
 #[cfg(feature = "web")]
 mod evict;
 #[cfg(feature = "web")]
+mod favicon;
+#[cfg(feature = "web")]
 mod find;
 #[cfg(feature = "web")]
 mod host;
@@ -413,6 +415,50 @@ pub fn take_menu_request() -> Option<PageMenu> {
     MENU.with(|m| m.borrow_mut().take())
 }
 
+/// The decoded favicon for a page tab, if Chromium has handed us one.
+///
+/// The snapshot carries the URL; the pixels live here. A globe on the
+/// strip is "we do not have bytes yet", not "this page has no icon".
+pub fn favicon_image(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    #[cfg(test)]
+    {
+        if let Some(image) = TEST_FAVICONS.with(|m| m.borrow().get(tab_id).cloned()) {
+            return Some(image);
+        }
+    }
+    cef_favicon(tab_id)
+}
+
+#[cfg(feature = "web")]
+fn cef_favicon(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    favicon::get(tab_id)
+}
+
+#[cfg(not(feature = "web"))]
+fn cef_favicon(_tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FAVICONS: std::cell::RefCell<
+        std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Test seam: put bytes on a tab the harness never created a browser for.
+#[cfg(test)]
+pub fn set_favicon_for_test(tab_id: &str, image: Option<std::sync::Arc<gpui::Image>>) {
+    TEST_FAVICONS.with(|m| match image {
+        Some(image) => {
+            m.borrow_mut().insert(tab_id.to_string(), image);
+        }
+        None => {
+            m.borrow_mut().remove(tab_id);
+        }
+    });
+}
+
 /// Chromium asked for a menu. Called by the gated context-menu handler —
 /// and by the harness, which is the point of it living here.
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
@@ -461,6 +507,11 @@ pub(crate) fn forget_page(tab_id: &str) {
             *m = None;
         }
     });
+    // An eviction keeps the pixels: the tab is still on the strip.
+    #[cfg(feature = "web")]
+    if !page_was_evicted(tab_id) {
+        favicon::forget(tab_id);
+    }
 }
 
 // ── The four shims: everything above this line is eave's, everything

@@ -12112,19 +12112,30 @@ fn convert_to_vertical_split_turns_the_handle(cx: &mut TestAppContext) {
     assert!(shown(vcx, "split-well"), "converting axis unsplits");
 }
 
-/// The plate paints the favicon URL, not only the globe. Decode can fail
-/// in the harness (no HTTP); the wrapper is what the operator asked to
-/// always be there once Chromium has named an icon.
+/// The plate paints decoded bytes, not an HTTP URL gpui cannot fetch.
+/// The harness injects a 1×1 PNG the way Chromium's download_image
+/// callback would after a live fetch.
 #[gpui::test]
-fn a_page_tab_paints_its_favicon_when_the_url_is_known(cx: &mut TestAppContext) {
+fn a_page_tab_paints_its_favicon_when_the_bytes_are_in(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    let mut p1 = page_tab("p1", Some("https://a.test/"), Some("A"));
-    p1.favicon_url = Some("https://a.test/favicon.png".into());
-    strip_tabs(&h, vcx, vec![p1], Some("p1"));
+    crate::web::set_favicon_for_test(
+        "p1",
+        Some(std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            TINY_PNG.to_vec(),
+        ))),
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/"), Some("A"))],
+        Some("p1"),
+    );
     assert!(
         shown(vcx, "tab-favicon-p1"),
-        "a page with a favicon URL still drew the globe instead of the icon"
+        "a page with favicon bytes still drew the globe"
     );
+    crate::web::set_favicon_for_test("p1", None);
 }
 
 /// Add Split View from the menu is the same act as dropping one tab on
