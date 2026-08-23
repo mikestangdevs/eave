@@ -11683,3 +11683,285 @@ fn a_build_with_no_page_engine_closes_the_fact_channel_at_once(_cx: &mut TestApp
          — read that guard before relying on this staying open."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Slice CM — the capability the composer did not have
+//
+// Everything above this line is the composer eave already had, re-proved
+// against a different buffer. These are the things that were **impossible**
+// before it: there was no `EntityInputHandler` anywhere in the application, so
+// no IME, no selection and no mouse caret, and a CJK operator could not type
+// into eave at all.
+//
+// They drive the field the way macOS drives it — through the trait, not
+// through a convenience wrapper — because the trait is the part that was
+// missing and a test that went around it would prove nothing.
+
+/// In scope so the tests below can drive the field the way macOS does — every
+/// IME method is a trait method, and reaching them any other way would be
+/// testing a wrapper instead of the thing that was missing.
+use gpui::EntityInputHandler as _;
+
+/// The composer's field, for tests that need to reach past the draft string.
+fn composer_field(h: &Harness, vcx: &mut VisualTestContext) -> Entity<TextField> {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell.read(cx).composer.read(cx).field.clone()
+    })
+    .unwrap()
+}
+
+/// **The slice's reason for existing.** Japanese input composes in the
+/// composer, and the provisional text is marked while it does.
+///
+/// This is the exact path macOS's input method takes: `replace_and_mark_text_in
+/// _range` for each keystroke of the composition, then `replace_text_in_range`
+/// when the operator picks a candidate. Before Slice CM eave implemented
+/// neither, so the system had nowhere to put composing text and the characters
+/// were simply lost.
+///
+/// The marked range matters as much as the text: it is what the field
+/// underlines, and it is what tells the operator which characters are still
+/// provisional. A composition that inserted text with no mark would look
+/// committed when it is not.
+#[gpui::test]
+fn japanese_composes_in_the_composer_and_commits(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let field = composer_field(&h, vcx);
+
+    // Typing `nihon` on a Japanese IME: the romaji are provisional, and the
+    // input method rewrites the same marked range on every keystroke.
+    //
+    // **The ranges are UTF-16, not bytes** — that is the IME's own coordinate
+    // system, and each of these kana is 1 unit and 3 bytes. It is also the
+    // reason the old composer could never have grown IME support by accident:
+    // it indexed a `String` by byte and had no mapping between the two.
+    // bezel's `offset_to_utf16`/`offset_from_utf16` (and the round-trip test
+    // vendored beside them) exist for exactly this boundary.
+    for (partial, mark) in [("に", 0..1), ("にほ", 0..2), ("にほん", 0..3)] {
+        let units = partial.encode_utf16().count();
+        vcx.update(|window, cx| {
+            field.update(cx, |f, cx| {
+                f.replace_and_mark_text_in_range(None, partial, Some(0..units), window, cx);
+            });
+        });
+        assert_eq!(
+            draft_of(&h, vcx),
+            partial,
+            "the composition did not reach the draft"
+        );
+        let marked = vcx
+            .update(|window, cx| field.update(cx, |f, cx| f.marked_text_range(window, cx)))
+            .expect("composing text was not marked, so nothing underlines it");
+        assert_eq!(
+            marked, mark,
+            "the marked range does not cover what is provisional"
+        );
+    }
+
+    // Picking the candidate commits it: the kanji replace the kana and the
+    // mark is gone, because nothing is provisional any more.
+    vcx.update(|window, cx| {
+        field.update(cx, |f, cx| {
+            f.replace_text_in_range(None, "日本", window, cx);
+        });
+    });
+    assert_eq!(draft_of(&h, vcx), "日本", "the candidate did not commit");
+    assert!(
+        vcx.update(|window, cx| field.update(cx, |f, cx| f.marked_text_range(window, cx)))
+            .is_none(),
+        "committed text is still marked provisional"
+    );
+
+    // And it sends like any other draft — the point being that the whole
+    // composer works for it, not just the field.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Send { text, .. }] if text == "日本"),
+        "a composed message did not send"
+    );
+}
+
+/// Text can be selected, and typing replaces the selection.
+///
+/// The old composer had one position — the end — and no notion of a range at
+/// all: `⌘A` did nothing, shift-arrow did nothing, and the only edit available
+/// was to delete backwards from the end. Correcting a word in the middle of a
+/// paragraph meant deleting everything after it.
+#[gpui::test]
+fn the_draft_can_be_selected_and_typed_over(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let field = composer_field(&h, vcx);
+    let selection = |vcx: &mut VisualTestContext, field: &Entity<TextField>| {
+        vcx.update(|window, cx| field.update(cx, |f, cx| f.selected_text_range(false, window, cx)))
+            .map(|s| s.range)
+    };
+
+    vcx.simulate_input("hello world");
+    assert_eq!(
+        selection(vcx, &field),
+        Some(11..11),
+        "the caret is at the end"
+    );
+
+    // Shift-left five times selects `world` backwards from the end.
+    vcx.simulate_keystrokes("shift-left shift-left shift-left shift-left shift-left");
+    assert_eq!(
+        selection(vcx, &field),
+        Some(6..11),
+        "shift-left did not extend a selection"
+    );
+
+    // Typing replaces it — the behaviour every text field has and eave's had
+    // no way to express.
+    vcx.simulate_input("there");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "hello there",
+        "typing over a selection did not replace it"
+    );
+
+    // ⌘A takes the lot, and backspace on a selection deletes the range rather
+    // than one character.
+    vcx.simulate_keystrokes("cmd-a");
+    assert_eq!(
+        selection(vcx, &field),
+        Some(0..11),
+        "cmd-A selected nothing"
+    );
+    vcx.simulate_keystrokes("backspace");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "",
+        "backspace did not delete the selection"
+    );
+}
+
+/// Clicking in the middle of a draft puts the caret there.
+///
+/// Not a nicety: with no mouse caret the only way to reach a character was to
+/// delete every character after it. This asserts the caret **moved off the
+/// end**, not a particular offset — the exact one depends on the shaped width
+/// of the glyphs, and pinning it would be pinning the font.
+#[gpui::test]
+fn a_click_places_the_caret_in_the_draft(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let field = composer_field(&h, vcx);
+
+    vcx.simulate_input("the quick brown fox");
+    let end = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    assert_eq!(end, 19, "precondition: typing leaves the caret at the end");
+
+    // A few characters in from the left edge of the field, vertically centred.
+    click_at(vcx, "composer-text", 12.0, 8.0);
+    vcx.run_until_parked();
+
+    let after = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    assert!(
+        after < end,
+        "clicking near the start of the draft left the caret at the end ({after})"
+    );
+}
+
+/// Shift-Return breaks a line; Return still sends.
+///
+/// The composer is `Shape::Grow`, so a multi-line draft is a real thing now.
+/// Both halves are asserted together because they are one decision: eave binds
+/// `enter` to its own send on the composer's key context, which is exactly why
+/// `shift-enter` had to be bound back to a newline by hand (delta item 10).
+#[gpui::test]
+fn shift_return_breaks_a_line_and_return_still_sends(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+
+    vcx.simulate_input("first");
+    vcx.simulate_keystrokes("shift-enter");
+    vcx.simulate_input("second");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "first\nsecond",
+        "shift-return did not break the line"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Send { text, .. }] if text == "first\nsecond"),
+        "return did not send the multi-line draft"
+    );
+}
+
+/// A run of typing undoes as one step, and redo puts it back.
+///
+/// bezel groups adjacent edits of the same kind, so ⌘Z gives back the word
+/// rather than the letter. eave had no undo at all.
+#[gpui::test]
+fn the_draft_undoes_a_word_at_a_time(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+
+    vcx.simulate_input("hello");
+    vcx.simulate_keystrokes("cmd-z");
+    assert_eq!(
+        draft_of(&h, vcx),
+        "",
+        "undo gave back a letter instead of the run"
+    );
+    vcx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(draft_of(&h, vcx), "hello", "redo did not restore the run");
+}
+
+/// The `/` palette borrows `up`/`down` and gives them back.
+///
+/// The mechanism the slice turns on: while the palette is live the field
+/// claims a second key context and the arrows steer the menu; the moment it
+/// closes the claim is dropped and the same keys are vertical caret motion
+/// again. Both halves matter — a permanent claim would have taken the arrows
+/// away from a multi-line draft for good.
+#[gpui::test]
+fn the_palette_borrows_the_arrows_and_returns_them(cx: &mut TestAppContext) {
+    let project = SlashProject::new("borrow");
+    let (mut h, vcx) = boot(cx);
+    open_session_in(&h, vcx, &project);
+    let field = composer_field(&h, vcx);
+
+    // A two-line draft with no palette: `up` is caret motion.
+    vcx.simulate_input("alpha");
+    vcx.simulate_keystrokes("shift-enter");
+    vcx.simulate_input("beta");
+    let at_end = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    vcx.simulate_keystrokes("up");
+    let after_up = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    assert!(
+        after_up < at_end,
+        "with no palette up must move the caret to the previous line"
+    );
+
+    // Now open the palette. The same key steers the menu and leaves the caret
+    // where it is.
+    vcx.simulate_keystrokes("cmd-a backspace");
+    vcx.simulate_input("/ship");
+    settle_palette(&h, vcx);
+    let before = vcx
+        .read_window(&h.window, |_, cx| field.read(cx).cursor())
+        .unwrap();
+    vcx.simulate_keystrokes("down");
+    settle_palette(&h, vcx);
+    assert_eq!(
+        vcx.read_window(&h.window, |_, cx| field.read(cx).cursor())
+            .unwrap(),
+        before,
+        "the palette's down key also moved the caret"
+    );
+}

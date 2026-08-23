@@ -12212,7 +12212,13 @@ fn composer_hint(pending: usize, has_draft: bool, overflow: usize) -> String {
     } else if overflow > 0 {
         format!("{} files per send — {overflow} not attached", attach::MAX)
     } else if has_draft {
-        "return to send".into()
+        // Slice CM: shift-return is named because it is the one affordance in
+        // the composer with no other way to be found. A multi-line draft is
+        // newly possible, and an operator who does not know the chord will
+        // conclude the composer cannot do it — the same reason the hint's own
+        // doc gives for spending the line only on things the reader can act on
+        // right now.
+        "return to send · shift-return for a line".into()
     } else {
         String::new()
     }
@@ -15292,7 +15298,10 @@ mod tests {
             "the composer is still captioning an action nobody can take — \
              `send_current` emits nothing on an empty draft"
         );
-        assert_eq!(composer_hint(0, true, 0), "return to send");
+        assert_eq!(
+            composer_hint(0, true, 0),
+            "return to send · shift-return for a line"
+        );
 
         for drafting in [false, true] {
             let warned = composer_hint(2, drafting, 0);
