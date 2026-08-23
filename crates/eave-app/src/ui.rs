@@ -6011,20 +6011,27 @@ impl Shell {
     /// expression rather than folded into those gates: they answer "who
     /// handles this key", this answers "who owns the keyboard", and the two
     /// questions stay legible apart.
-    fn composer_owns_keyboard(&self, cx: &mut Context<Self>) -> bool {
+    fn composer_owns_keyboard(&self, mounted: bool, cx: &mut Context<Self>) -> bool {
         // **First: is the field even on screen?**
         //
         // This clause is not a nicety, and finding that out cost twenty-one
-        // tests. `render` mounts the composer only when
-        // `!show_launcher && !showing_page`, and focus follows the element,
-        // not the entity: focusing a field that is not in the tree leaves the
-        // window's focus pointing at a node the dispatch path never reaches,
-        // and **every action in the application stops firing** — ⌘1, ⌘W, ⌘F,
-        // all of it, silently. The symptom looks nothing like a focus bug.
+        // tests. Focus follows the *element*, not the entity: focusing a field
+        // that is not in the render tree leaves the window's focus pointing at
+        // a node the dispatch path never reaches, and **every action in the
+        // application stops firing** — ⌘1, ⌘W, ⌘F, all of it, silently. The
+        // symptom looks nothing like a focus bug.
         //
-        // So the predicate has to track the mount condition exactly, and the
-        // two live thirty lines apart. `composer_mounted` is the shared answer.
-        if !self.composer_mounted(cx) {
+        // `mounted` is passed in rather than recomputed, and that is the whole
+        // point: it is the **same boolean** the mount site below uses, so the
+        // two cannot drift. The first cut of this mirrored the condition
+        // instead — `session_id.is_some() && !active_is_page` — which was
+        // right on the day and is exactly the kind of copy that rots. It
+        // already would have been wrong against the split-view work landing in
+        // parallel, where `showing_page` grew a `split.is_some()` term: the
+        // composer unmounts in a split and a mirrored predicate would not have
+        // known, re-opening the silent-dead-keyboard bug it was written to
+        // close.
+        if !mounted {
             return false;
         }
         // Then: is anything else holding the keyboard? A page dialog stops
@@ -6039,25 +6046,14 @@ impl Shell {
             && self.rename.is_none()
     }
 
-    /// Is the composer in the render tree this frame?
-    ///
-    /// The mount condition at the bottom of `render`, asked as a question so
-    /// that [`Self::composer_owns_keyboard`] cannot drift from it. A session
-    /// with no page showing — the launcher has no composer (Slice Q2) and a
-    /// page tab replaces it with the page.
-    fn composer_mounted(&self, cx: &App) -> bool {
-        self.transcript.read(cx).session_id.is_some()
-            && !strip::active_is_page(&self.web_tabs.read(cx).snapshot)
-    }
-
     /// Put the keyboard where [`Self::composer_owns_keyboard`] says it belongs.
     ///
     /// Called from `render`, which is the one place that has both the window
     /// and the whole of the state this depends on. It is a no-op whenever the
     /// answer already holds — `Window::focus` returns early on an unchanged
     /// handle — so the steady state costs a comparison and schedules nothing.
-    fn sync_composer_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let wanted = if self.composer_owns_keyboard(cx) {
+    fn sync_composer_focus(&mut self, mounted: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = if self.composer_owns_keyboard(mounted, cx) {
             gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx)
         } else {
             self.focus.clone()
@@ -12548,7 +12544,6 @@ impl Render for Shell {
         composer_field.update(cx, |f, _| {
             f.set_caret_alpha(if caret_lit { 1.0 } else { 0.0 });
         });
-        self.sync_composer_focus(window, cx);
         // Slice N3: ONE ask for the whole window, here in the root
         // render pass. The shell decides once whether anything is
         // mid-flight, takes one lease on the pulse clock for it, and
@@ -12620,6 +12615,12 @@ impl Render for Shell {
         // example.com: the launcher's occlusion assumption was written when
         // the only thing it could ever cover was an empty transcript.
         let show_launcher = state.session_id.is_none() && !showing_page;
+        // **The one mount decision**, used twice: to put the composer in the
+        // tree at the bottom of this function, and to decide whether its field
+        // may hold the keyboard (`sync_composer_focus`, called below once the
+        // transcript borrow has ended). Two expressions would be two chances
+        // to disagree, and the way they fail is silent.
+        let composer_mounted = !show_launcher && !showing_page;
         let launch_error = state.launch_error.clone();
         let empty_state: Option<EmptyState> = if !state.display.is_empty() {
             None
@@ -12639,6 +12640,11 @@ impl Render for Shell {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
         })
         .size_full();
+
+        // Here rather than beside `composer_mounted` above: that read of the
+        // transcript is still borrowed at that point, and this needs `cx`
+        // mutably to move focus.
+        self.sync_composer_focus(composer_mounted, window, cx);
 
         let composer = Self::column(frost(
             theme::RADIUS_COMPOSER,
@@ -13374,10 +13380,7 @@ impl Render for Shell {
                                                     // silently eats what you type
                                                     // is the one thing this must
                                                     // not be.
-                                                    .children(
-                                                        (!show_launcher && !showing_page)
-                                                            .then_some(composer),
-                                                    ),
+                                                    .children(composer_mounted.then_some(composer)),
                                             ),
                                     )
                                     .when(!showing_page, |d| d.child(self.footer(cx))),
