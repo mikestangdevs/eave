@@ -5,6 +5,12 @@
 //! already has the page's cookies — never a second HTTP client. Decode is
 //! Chromium's (`CefImage::get_as_png`); gpui then takes a PNG it already
 //! knows how to paint.
+//!
+//! **Do not call `download_image` from inside `OnFaviconURLChange`.**
+//! That handler runs in the middle of `CefDoMessageLoopWork`. Starting a
+//! URLRequest there is a no-op on this CEF (Alloy + OSR): the callback
+//! never fires and the plate stays on the globe. [`fetch`] only queues;
+//! [`run_queued`] starts the download after the pump returns.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -13,19 +19,7 @@ use std::sync::Arc;
 use cef::*;
 use gpui::ImageFormat;
 
-use super::tabs::with_browser;
-
-/// Longest side, in device pixels, we ask Chromium to decode to.
-///
-/// The plate is [`crate::theme::RAIL_MARK`] = 16 logical px, and Slice T1b's
-/// bookmark tile draws the same bytes at the same 16 px. The default backing
-/// scale on this machine is 2, so 32 is one device pixel per surface pixel.
-/// A 3x display still gets a sharp-enough downsample; asking for 48 would
-/// spend the decode on pixels neither surface can show.
-///
-/// Briefly 48, when T1b's tile was 60 px with a 24 px mark. The tile shrank;
-/// so does this.
-const MAX_SIDE: u32 = 32;
+use super::tabs::{with_any_browser, with_browser};
 
 thread_local! {
     static ICONS: RefCell<HashMap<String, Arc<gpui::Image>>> = RefCell::new(HashMap::new());
@@ -58,6 +52,8 @@ thread_local! {
     /// more attempt each time a page load completes, which is exactly when
     /// a browser is known good, and stops when the bytes land.
     static LOAD_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `(tab_id, icon_url, page_host)` — `tab_id` empty for a bookmark.
+    static QUEUE: RefCell<Vec<(String, String, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A page finished loading — some browser is now known to be usable.
@@ -88,9 +84,13 @@ pub fn forget(tab_id: &str) {
     ASKED.with(|m| {
         m.borrow_mut().remove(tab_id);
     });
+    QUEUE.with(|q| {
+        q.borrow_mut().retain(|(id, _, _)| id != tab_id);
+    });
 }
 
-/// Ask Chromium for this tab's icon, if we do not already have it.
+/// Queue a fetch. Safe to call from a CEF handler; the download starts
+/// on [`run_queued`], after the pump.
 ///
 /// `page_url` is what the icon is keyed by in [`BY_HOST`] — the PAGE's
 /// host, not the icon's. They differ whenever a site serves its mark off a
@@ -105,8 +105,6 @@ pub fn fetch(tab_id: &str, url: &str, page_url: &str) {
     // from the pixels we already hold rather than from this call's fetch —
     // otherwise the second call skips and the host key is never written,
     // which is exactly the bookmark tile staying a globe forever.
-    // `page_host`, not `host`: the closure below binds `b.host()`, a
-    // `BrowserHost`, to that name.
     let page_host = crate::omnibox::engine_host(page_url);
     if !page_host.is_empty() {
         if let Some(image) = get(tab_id) {
@@ -120,20 +118,103 @@ pub fn fetch(tab_id: &str, url: &str, page_url: &str) {
     if skip {
         return;
     }
-    ASKED.with(|m| {
-        m.borrow_mut().insert(tab_id.to_string(), url.to_string());
+    enqueue(tab_id.to_string(), url.to_string(), page_host);
+}
+
+/// `{scheme}://{host}/favicon.ico` for an ordinary page url, so a site
+/// that never raises `OnFaviconURLChange` still gets an icon.
+pub fn fallback_url(page_url: &str) -> Option<String> {
+    let scheme = if let Some(rest) = page_url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = page_url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return None;
+    };
+    let host = scheme.1.split('/').next().filter(|h| !h.is_empty())?;
+    if host.contains('@') {
+        return None;
+    }
+    Some(format!("{}://{host}/favicon.ico", scheme.0))
+}
+
+/// Start every queued download. Call after `CefDoMessageLoopWork` so we
+/// are not inside a display-handler stack.
+pub fn run_queued() {
+    let jobs = QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    for (tab_id, url, page_host) in jobs {
+        start(&tab_id, &url, &page_host);
+    }
+}
+
+fn enqueue(tab_id: String, url: String, page_host: String) {
+    QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        if !q.iter().any(|(id, u, _)| id == &tab_id && u == &url) {
+            q.push((tab_id, url, page_host));
+        }
     });
-    let started = with_browser(tab_id, |b| {
+    super::host::request_pump();
+}
+
+fn start(tab_id: &str, url: &str, page_host: &str) {
+    if !tab_id.is_empty()
+        && get(tab_id).is_some()
+        && ASKED.with(|m| m.borrow().get(tab_id).map(|u| u == url).unwrap_or(false))
+    {
+        return;
+    }
+    if tab_id.is_empty() && !page_host.is_empty() {
+        if BY_HOST.with(|m| m.borrow().contains_key(page_host)) {
+            return;
+        }
+    }
+
+    let download = |b: &Browser| {
         let Some(host) = b.host() else {
             return false;
         };
-        let mut cb = FaviconCallback::new(tab_id.to_string(), url.to_string(), page_host.clone());
-        host.download_image(Some(&CefString::from(url)), 1, MAX_SIDE, 0, Some(&mut cb));
+        let mut cb =
+            FaviconCallback::new(tab_id.to_string(), url.to_string(), page_host.to_string());
+        IN_FLIGHT.with(|v| {
+            v.borrow_mut().push(cb.clone());
+            if v.borrow().len() > 32 {
+                v.borrow_mut().remove(0);
+            }
+        });
+        // `is_favicon=0`: the dedicated favicon path on this CEF does not
+        // complete under OSR. An ordinary image download still uses the
+        // browser's request context (cookies, cache, proxy).
+        host.download_image(Some(&CefString::from(url)), 0, 0, 0, Some(&mut cb));
         true
-    })
-    .unwrap_or(false);
-    if started {
-        super::host::request_pump();
+    };
+
+    let started = if tab_id.is_empty() {
+        with_any_browser(download).unwrap_or(false)
+    } else {
+        let own = with_browser(tab_id, download).unwrap_or(false);
+        if own {
+            true
+        } else {
+            with_any_browser(download).unwrap_or(false)
+        }
+    };
+    if !started {
+        return;
+    }
+    if !tab_id.is_empty() {
+        ASKED.with(|m| {
+            m.borrow_mut().insert(tab_id.to_string(), url.to_string());
+        });
+    } else {
+        let gen = LOAD_GEN.with(|g| g.get());
+        ASKED_HOST.with(|m| {
+            m.borrow_mut().insert(page_host.to_string(), gen);
+        });
+    }
+    super::host::request_pump();
+    if super::tabs::trace() {
+        eprintln!("[web] favicon start {url} for {tab_id}");
     }
 }
 
@@ -165,8 +246,7 @@ fn store(tab_id: &str, host: &str, image: Arc<gpui::Image>) {
 /// page to read; a tab that later visits the host overwrites this with the
 /// icon the page actually declares.
 ///
-/// Does nothing when no browser is live — the tile keeps its globe and the
-/// next call retries, since the host is only marked asked once one starts.
+/// Queues rather than starting on this stack — same reason as [`fetch`].
 pub fn fetch_for_url(url: &str) {
     let host = crate::omnibox::engine_host(url);
     if host.is_empty() || for_url(url).is_some() {
@@ -177,57 +257,35 @@ pub fn fetch_for_url(url: &str) {
         return;
     }
     let guess = format!("https://{host}/favicon.ico");
-    let started = super::tabs::with_any_browser(|b| {
-        let Some(browser_host) = b.host() else {
-            if super::tabs::trace() {
-                eprintln!("[web] bookmark favicon {host}: browser carries no host");
-            }
-            return false;
-        };
-        let mut cb = FaviconCallback::new(String::new(), guess.clone(), host.clone());
-        browser_host.download_image(
-            Some(&CefString::from(guess.as_str())),
-            1,
-            MAX_SIDE,
-            0,
-            Some(&mut cb),
-        );
-        true
-    })
-    .unwrap_or(false);
-    if super::tabs::trace() {
-        eprintln!("[web] bookmark favicon {guess} started={started}");
-    }
-    if started {
-        ASKED_HOST.with(|m| {
-            m.borrow_mut().insert(host, gen);
-        });
-        super::host::request_pump();
-    }
+    enqueue(String::new(), guess, host);
 }
 
 fn png_from_cef(image: &mut Image) -> Option<Vec<u8>> {
-    if image.is_empty() == 1 {
+    if image.is_empty() != 0 {
         return None;
     }
-    let scale = if image.has_representation(2.0) == 1 {
-        2.0
-    } else {
-        1.0
-    };
-    let mut w = 0i32;
-    let mut h = 0i32;
-    let png = image.as_png(scale, 1, Some(&mut w), Some(&mut h))?;
-    let n = png.size();
-    if n == 0 {
-        return None;
+    for scale in [1.0_f32, 2.0] {
+        let mut w = 0i32;
+        let mut h = 0i32;
+        let Some(png) = image.as_png(scale, 1, Some(&mut w), Some(&mut h)) else {
+            continue;
+        };
+        let n = png.size();
+        if n == 0 {
+            continue;
+        }
+        let mut buf = vec![0u8; n];
+        let copied = png.data(Some(&mut buf), 0);
+        if copied > 0 {
+            buf.truncate(copied);
+            return Some(buf);
+        }
+        let ptr = png.raw_data() as *const u8;
+        if !ptr.is_null() {
+            return Some(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec());
+        }
     }
-    let ptr = png.raw_data() as *const u8;
-    if ptr.is_null() {
-        return None;
-    }
-    // Copy out: CEF's buffer dies with `png`.
-    Some(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
+    None
 }
 
 // `wrap_download_image_callback!` expands to trait names that do not
@@ -246,32 +304,54 @@ wrap_download_image_callback! {
             http_status_code: i32,
             image: Option<&mut Image>,
         ) {
-            // 200 is a live fetch; 0 is a cache hit. Anything else is a
-            // miss and the plate keeps the globe.
-            if http_status_code != 200 && http_status_code != 0 {
-                if super::tabs::trace() {
-                    eprintln!(
-                        "[web] favicon {} for {} status={http_status_code}",
-                        self.url, self.tab_id
-                    );
-                }
+            // 200 live, 0 cache, 304 not-modified. Anything 4xx/5xx keeps
+            // the globe.
+            let ok = http_status_code == 0
+                || http_status_code == 304
+                || (200..300).contains(&http_status_code);
+            if super::tabs::trace() {
+                eprintln!(
+                    "[web] favicon {} for {} status={http_status_code}",
+                    self.url, self.tab_id
+                );
+            }
+            if !ok {
                 return;
             }
             let Some(image) = image else { return };
             let Some(bytes) = png_from_cef(image) else { return };
-            if super::tabs::trace() {
-                eprintln!(
-                    "[web] favicon {} for {} {} bytes",
-                    self.url,
-                    self.tab_id,
-                    bytes.len()
-                );
-            }
             store(
                 &self.tab_id,
                 &self.host,
                 Arc::new(gpui::Image::from_bytes(ImageFormat::Png, bytes)),
             );
         }
+    }
+}
+
+thread_local! {
+    /// Rust-side retains so the callback cannot drop before Chromium
+    /// calls it. The binding AddRefs when passing into `download_image`,
+    /// then Drop Releases; without this extra hold the last ref can die
+    /// on the same stack the request was started.
+    static IN_FLIGHT: RefCell<Vec<DownloadImageCallback>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fallback_url;
+
+    #[test]
+    fn fallback_url_is_origin_favicon() {
+        assert_eq!(
+            fallback_url("https://github.com/zed-industries/zed").as_deref(),
+            Some("https://github.com/favicon.ico")
+        );
+        assert_eq!(
+            fallback_url("http://example.com:8080/a").as_deref(),
+            Some("http://example.com:8080/favicon.ico")
+        );
+        assert_eq!(fallback_url("about:blank"), None);
+        assert_eq!(fallback_url("https://user:pass@evil.test/"), None);
     }
 }

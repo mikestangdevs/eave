@@ -874,6 +874,10 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
     }
     if let Some(url) = tab.favicon_url.as_deref() {
         super::favicon::fetch(&tab.id, url, tab.url.as_deref().unwrap_or_default());
+    } else if let Some(page) = tab.url.as_deref() {
+        if let Some(ico) = super::favicon::fallback_url(page) {
+            super::favicon::fetch(&tab.id, &ico, page);
+        }
     }
 }
 

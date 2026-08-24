@@ -110,6 +110,10 @@ pub struct StripTab {
     /// for a page that has not reported one yet — the plate then draws
     /// the globe, which is the honest stand-in, not a missing mark.
     pub favicon_url: Option<String>,
+    /// The page address, so the plate can look the icon up by host when
+    /// the tab-keyed cache is empty (restored tabs journal no favicon
+    /// event). `None` for a session tab.
+    pub url: Option<String>,
     /// The group this tab is in, and where in its run it sits. `None` for a
     /// loose tab.
     pub run: Option<GroupRun>,
@@ -378,6 +382,10 @@ fn strip_tab(
         pinned: info.pinned,
         favicon_url: match &info.content {
             TabContent::Page => info.favicon_url.clone(),
+            TabContent::Session { .. } => None,
+        },
+        url: match &info.content {
+            TabContent::Page => info.url.clone(),
             TabContent::Session { .. } => None,
         },
         run,
@@ -705,6 +713,18 @@ mod tests {
             urls,
             vec![Some("https://a.test/favicon.png"), None],
             "session tabs must not inherit a page's favicon"
+        );
+        let pages: Vec<Option<&str>> = items
+            .iter()
+            .filter_map(|i| match i {
+                StripItem::Tab(t) => Some(t.url.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pages,
+            vec![Some("https://a.test/"), None],
+            "session tabs must not inherit a page's address"
         );
     }
 

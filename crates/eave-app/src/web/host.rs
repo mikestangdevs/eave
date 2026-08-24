@@ -458,6 +458,9 @@ fn pump_cef() {
     REQUESTED_DURING_PUMP.store(false, Ordering::SeqCst);
     do_message_loop_work();
     IN_PUMP.store(false, Ordering::SeqCst);
+    // Favicon downloads queued from OnFaviconURLChange start HERE, after
+    // the pump, not inside the display handler. See `favicon.rs`.
+    super::favicon::run_queued();
     // Anything Chromium queued while we were inside raised no request, so
     // ask for one more pass. This is what keeps the chain alive; without it
     // the loop runs on the heartbeat alone with work outstanding.

@@ -2284,8 +2284,14 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
             // recedes under `tab-chip-unloaded-*`.
             strip::TabKind::Page => {
                 let resident = tab.resident;
-                match crate::web::favicon_image(id) {
+                if let Some(page) = tab.url.as_deref() {
+                    crate::web::request_favicon(page);
+                }
+                let image = crate::web::favicon_image(id)
+                    .or_else(|| tab.url.as_deref().and_then(crate::web::favicon_for_url));
+                match image {
                     Some(image) => div()
+                        .id(SharedString::from(format!("tab-favicon-{id}")))
                         .debug_selector({
                             let id = id.to_string();
                             move || format!("tab-favicon-{id}")
@@ -2295,6 +2301,7 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
                         .rounded(px(theme::RADIUS_CHIP))
                         .child(
                             img(image)
+                                .id(SharedString::from(format!("tab-favicon-img-{id}")))
                                 .size(px(theme::RAIL_MARK))
                                 .object_fit(ObjectFit::Contain),
                         )
