@@ -472,6 +472,10 @@ enum BrowserCmd {
     /// already draws a collapsed one as a head and a count; nothing had
     /// ever set it, so every project was permanently open.
     GroupSetCollapsed { group_id: String, collapsed: bool },
+    /// Take a project off the rail (Slice D4.2 stage 3). Closes the group
+    /// and its tabs; by `Request::GroupClose`'s own contract the sessions
+    /// those tabs viewed are NOT ended, and nothing on disk is touched.
+    GroupClose { group_id: String },
     /// Slice T1 — a project the operator made by hand, from a folder they
     /// picked.
     ///
@@ -702,6 +706,11 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     .browser_do(eave_wire::Request::TabClose { tab_id: closing })
                     .await;
             }
+        }
+        BrowserCmd::GroupClose { group_id } => {
+            let _ = client
+                .browser_do(eave_wire::Request::GroupClose { group_id })
+                .await;
         }
         BrowserCmd::GroupSetCollapsed {
             group_id,
@@ -4463,6 +4472,9 @@ struct TabMenu {
 enum TabMenuTarget {
     /// One tab, not currently in a split.
     Tab(String),
+    /// A project row (Slice D4.2 stage 3). A project is a tab GROUP bound
+    /// to a worktree, so its menu acts on the group.
+    Group(String),
     /// The combined pill: the two tabs in the well.
     Split { left: String, right: String },
     /// A chip on the bookmarks bar — a link or a folder.
@@ -4480,12 +4492,23 @@ enum TabMenuTarget {
 #[derive(Clone, Debug)]
 enum TabMenuAction {
     CopyLink,
-    Share,
-    Mute,
+    // Slice D4.2 stage 3 — the page tab's real operations.
+    Close,
+    CloseOthers,
+    /// Put this page in the rail's pinned grid. "Pin" is what a browser
+    /// calls it; underneath it is a bookmark, which is the only pinning
+    /// eave has.
+    Pin,
+    ReopenClosed,
+    /// Take a pinned cell out of the grid.
+    Unpin,
+    OpenInNewTab,
+    /// Take a project off the rail. `GroupClose` — which closes the group's
+    /// tabs and, by its own contract, does not end the sessions they view.
+    RemoveProject,
     Rename,
     AddSplit,
     Duplicate,
-    MoveTo,
     ArchiveTab,
     ArchiveBelow,
     ShareSplit,
@@ -9525,6 +9548,7 @@ impl Shell {
     ) -> AnyElement {
         let gid = id.to_string();
         let click_id = id.to_string();
+        let menu_gid = id.to_string();
         div()
             .id(SharedString::from(format!("group-{id}")))
             .debug_selector(move || format!("group-{gid}"))
@@ -9539,6 +9563,14 @@ impl Shell {
             // the group since B1 and `strip.rs` has always drawn a collapsed
             // one as a head plus a count; nothing ever set it, so every
             // project was permanently open and the count was unreachable.
+            // Slice D4.2 stage 3 — the project row's menu.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.open_project_menu(&menu_gid, ev.position, cx);
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 let _ = this
                     .commands
@@ -13605,6 +13637,24 @@ impl Shell {
         );
     }
 
+    /// A project row's menu (Slice D4.2 stage 3).
+    ///
+    /// Same popup, same layer, same close path as the tab and bookmark
+    /// menus — a second parallel popup would be a second place for a menu
+    /// to be left open.
+    fn open_project_menu(&mut self, group_id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        self.open_tab_menu_at(
+            TabMenu {
+                target: TabMenuTarget::Group(group_id.to_string()),
+                at,
+            },
+            cx,
+        );
+    }
+
     fn open_tab_menu_at(&mut self, req: TabMenu, cx: &mut Context<Self>) {
         let enabled = self
             .tab_menu_entries(&req, cx)
@@ -13630,6 +13680,7 @@ impl Shell {
     fn tab_menu_entries(&self, req: &TabMenu, cx: &App) -> Vec<TabMenuEntry> {
         match &req.target {
             TabMenuTarget::Tab(id) => self.single_tab_menu(id, cx),
+            TabMenuTarget::Group(id) => self.project_menu(id, cx),
             TabMenuTarget::Split { left, right } => self.split_tab_menu(left, right, cx),
             TabMenuTarget::Bookmark(id) => self.bookmark_menu(id, cx),
         }
@@ -13651,16 +13702,75 @@ impl Shell {
         let Some(node) = snapshot.nodes.iter().find(|n| n.bookmark.id == bookmark_id) else {
             return Vec::new();
         };
-        let label = match node.bookmark.kind {
-            eave_wire::BookmarkKind::Folder => "Remove Folder",
-            eave_wire::BookmarkKind::Link { .. } => "Remove",
-        };
+        // Slice D4.2 stage 3 — a pinned CELL is a link and gets the link's
+        // three operations. A FOLDER row has no url, so it keeps the single
+        // removal it always had rather than being given two rows that could
+        // not work.
+        match &node.bookmark.kind {
+            eave_wire::BookmarkKind::Folder => vec![TabMenuEntry::Action(
+                TabMenuAction::RemoveBookmark,
+                MenuItem::new("Remove Folder"),
+            )],
+            eave_wire::BookmarkKind::Link { url } => {
+                let live = !url.trim().is_empty();
+                let open = MenuItem::new("Open in New Tab");
+                let copy = MenuItem::new("Copy Link").trailing("⇧⌘C");
+                vec![
+                    TabMenuEntry::Action(
+                        TabMenuAction::OpenInNewTab,
+                        if live { open } else { open.disabled() },
+                    ),
+                    TabMenuEntry::Action(
+                        TabMenuAction::CopyLink,
+                        if live { copy } else { copy.disabled() },
+                    ),
+                    TabMenuEntry::Separator,
+                    TabMenuEntry::Action(TabMenuAction::Unpin, MenuItem::new("Unpin")),
+                ]
+            }
+        }
+    }
+
+    /// A project row's menu (Slice D4.2 stage 3).
+    ///
+    /// **One row, not two.** The directive asks for `Rename` and `Remove
+    /// from rail`. `Remove from rail` is real — `GroupClose`. `Rename` is
+    /// not: renaming a project means `GroupUpdate { title }`, and there is
+    /// no inline rename field for a group the way there is for a session
+    /// (`begin_rename` is keyed by session id). Shipping it would have put
+    /// a row in the menu that does nothing, which is the one thing this
+    /// stage forbids. It is listed as not-built in the report instead.
+    ///
+    /// The disk fact is stated on the row itself. A project is bound to a
+    /// worktree and "Remove" is exactly the word that makes an operator
+    /// think their checkout is about to go — so the row says otherwise at
+    /// the point of decision, which is where the reassurance is worth
+    /// anything.
+    fn project_menu(&self, group_id: &str, cx: &App) -> Vec<TabMenuEntry> {
+        let snapshot = self.strip_snapshot(cx);
+        if !snapshot.groups.iter().any(|g| g.id == group_id) {
+            return Vec::new();
+        }
         vec![TabMenuEntry::Action(
-            TabMenuAction::RemoveBookmark,
-            MenuItem::new(label),
+            TabMenuAction::RemoveProject,
+            MenuItem::new("Remove from rail").detail("its worktree stays on disk"),
         )]
     }
 
+    /// The page tab's menu (Slice D4.2 stage 3).
+    ///
+    /// **No dead rows.** Three came out: `Mute` and `Move to` were both
+    /// permanently `.disabled()`, and `Share ›` advertised a submenu it did
+    /// not have while doing exactly what `Copy Link` does — a row that lies
+    /// about itself is worse than one that is missing.
+    ///
+    /// Close / Close Others / Pin / Reopen Closed are the directive's list.
+    /// The operations already here that WORK — Rename, Add Split, Duplicate,
+    /// Archive — are kept: the instruction was to remove dead rows, not
+    /// working features.
+    ///
+    /// "Pin" is the browser's word for it; underneath it is a bookmark,
+    /// which is the only pinning eave has.
     fn single_tab_menu(&self, tab_id: &str, cx: &App) -> Vec<TabMenuEntry> {
         let snapshot = self.strip_snapshot(cx);
         let tab = snapshot.tabs.iter().find(|t| t.id == tab_id);
@@ -13677,28 +13787,54 @@ impl Shell {
                 .position(|id| id == tab_id)
                 .is_some_and(|ix| ix + 1 < order.len())
         };
+        let others = snapshot
+            .tabs
+            .iter()
+            .filter(|t| t.id != tab_id)
+            .filter(|t| !matches!(t.content, eave_wire::TabContent::Session { .. }))
+            .count();
 
         let copy = MenuItem::new("Copy Link").trailing("⇧⌘C");
-        let share = MenuItem::new("Share").trailing("›");
-        let mute = MenuItem::new("Mute").disabled();
         let rename = MenuItem::new("Rename…");
         let add_split = MenuItem::new("Add Split View");
         let dup = MenuItem::new("Duplicate");
-        let mov = MenuItem::new("Move to").trailing("›").disabled();
         let archive = MenuItem::new("Archive Tab");
         let below_item = MenuItem::new("Archive Tabs Below");
+        let close = MenuItem::new("Close").trailing("⌘W");
+        let close_others = MenuItem::new("Close Others");
+        let pin = MenuItem::new("Pin");
+        let reopen = MenuItem::new("Reopen Closed Tab").trailing("⇧⌘T");
 
         vec![
+            TabMenuEntry::Action(
+                TabMenuAction::Close,
+                if is_session { close.disabled() } else { close },
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::CloseOthers,
+                if others == 0 {
+                    close_others.disabled()
+                } else {
+                    close_others
+                },
+            ),
+            TabMenuEntry::Action(
+                TabMenuAction::ReopenClosed,
+                if self.closed_pages.is_empty() {
+                    reopen.disabled()
+                } else {
+                    reopen
+                },
+            ),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(
+                TabMenuAction::Pin,
+                if has_url { pin } else { pin.disabled() },
+            ),
             TabMenuEntry::Action(
                 TabMenuAction::CopyLink,
                 if has_url { copy } else { copy.disabled() },
             ),
-            TabMenuEntry::Action(
-                TabMenuAction::Share,
-                if has_url { share } else { share.disabled() },
-            ),
-            TabMenuEntry::Separator,
-            TabMenuEntry::Action(TabMenuAction::Mute, mute),
             TabMenuEntry::Action(
                 TabMenuAction::Rename,
                 if is_session {
@@ -13720,7 +13856,6 @@ impl Shell {
                 TabMenuAction::Duplicate,
                 if has_url { dup } else { dup.disabled() },
             ),
-            TabMenuEntry::Action(TabMenuAction::MoveTo, mov),
             TabMenuEntry::Separator,
             TabMenuEntry::Action(TabMenuAction::ArchiveTab, archive),
             TabMenuEntry::Action(
@@ -13764,7 +13899,6 @@ impl Shell {
         let right_label = elide(&label(right), 28);
         let share = MenuItem::new("Share Split View…");
         let dup = MenuItem::new("Duplicate");
-        let mov = MenuItem::new("Move to").trailing("›").disabled();
         let below = {
             let order = strip::cycle_order(&snapshot);
             let last = order
@@ -13798,7 +13932,6 @@ impl Shell {
                 TabMenuAction::Duplicate,
                 if any_url { dup } else { dup.disabled() },
             ),
-            TabMenuEntry::Action(TabMenuAction::MoveTo, mov),
             TabMenuEntry::Separator,
             TabMenuEntry::Action(TabMenuAction::ArchiveItem, MenuItem::new("Archive Item")),
             TabMenuEntry::Action(
@@ -13849,8 +13982,52 @@ impl Shell {
         // The bookmark target has no tab, so it is answered before the
         // tab id is derived rather than by giving that derivation a
         // meaningless fallback.
+        // A project row has no tab either — same shape as the bookmark
+        // branch below, and answered before a tab id is derived.
+        if let TabMenuTarget::Group(group_id) = &req.target {
+            if matches!(action, TabMenuAction::RemoveProject) {
+                let _ = self.commands.send(Command::Browser(BrowserCmd::GroupClose {
+                    group_id: group_id.clone(),
+                }));
+            }
+            self.close_tab_menu(cx);
+            return;
+        }
         if let TabMenuTarget::Bookmark(bookmark_id) = &req.target {
-            if matches!(action, TabMenuAction::RemoveBookmark) {
+            // A pinned cell's url, read here for the same reason the branch
+            // exists at all: the bookmark id is in hand and there is no tab
+            // to derive one from.
+            let pinned_url = self
+                .bookmarks
+                .read(cx)
+                .snapshot
+                .nodes
+                .iter()
+                .find(|n| &n.bookmark.id == bookmark_id)
+                .and_then(|n| match &n.bookmark.kind {
+                    eave_wire::BookmarkKind::Link { url } => Some(url.clone()),
+                    eave_wire::BookmarkKind::Folder => None,
+                });
+            match action {
+                TabMenuAction::CopyLink => {
+                    if let Some(url) = pinned_url {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                    }
+                }
+                TabMenuAction::OpenInNewTab => {
+                    if let Some(url) = pinned_url {
+                        // `activate: false` — a background open is what
+                        // "Open in New Tab" means in every browser, and it
+                        // is the answer E1 added the field for.
+                        let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                            url,
+                            activate: false,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+            if matches!(action, TabMenuAction::RemoveBookmark | TabMenuAction::Unpin) {
                 let _ = self
                     .commands
                     .send(Command::Browser(BrowserCmd::BookmarkRemove {
@@ -13871,7 +14048,7 @@ impl Shell {
             // than returning bare — an unreachable arm that would leave a
             // popup open if it ever stopped being unreachable is worse
             // than one extra line.
-            TabMenuTarget::Bookmark(_) => {
+            TabMenuTarget::Bookmark(_) | TabMenuTarget::Group(_) => {
                 self.close_tab_menu(cx);
                 return;
             }
@@ -13884,13 +14061,53 @@ impl Shell {
                 .unwrap_or_else(|| left.clone()),
         };
         match action {
-            TabMenuAction::CopyLink | TabMenuAction::Share => {
+            TabMenuAction::CopyLink => {
                 if let Some(url) = self.tab_url(&tab_id, cx) {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
                 }
             }
-            // Handled above, where the bookmark id is still in hand.
-            TabMenuAction::Mute | TabMenuAction::MoveTo | TabMenuAction::RemoveBookmark => {}
+            // Handled above, where the bookmark or group id is still in hand.
+            TabMenuAction::RemoveBookmark | TabMenuAction::Unpin | TabMenuAction::RemoveProject => {
+            }
+            // Slice D4.2 stage 3 — the page tab's real operations.
+            TabMenuAction::Close => self.close_tab(&tab_id, cx),
+            TabMenuAction::CloseOthers => {
+                // Collected before closing anything: `close_tab` mutates the
+                // snapshot this list came from, and walking it while it
+                // changes underneath is how you close the wrong tab.
+                let snapshot = self.strip_snapshot(cx);
+                let doomed: Vec<String> = snapshot
+                    .tabs
+                    .iter()
+                    .filter(|t| t.id != tab_id)
+                    .filter(|t| !matches!(t.content, eave_wire::TabContent::Session { .. }))
+                    .map(|t| t.id.clone())
+                    .collect();
+                for id in doomed {
+                    self.close_tab(&id, cx);
+                }
+            }
+            TabMenuAction::ReopenClosed => self.reopen_closed_tab(cx),
+            TabMenuAction::Pin => {
+                if let Some(url) = self.tab_url(&tab_id, cx) {
+                    let _ = self
+                        .commands
+                        .send(Command::Browser(BrowserCmd::BookmarkAdd {
+                            parent: None,
+                            index: None,
+                            title: None,
+                            url: Some(url),
+                        }));
+                }
+            }
+            TabMenuAction::OpenInNewTab => {
+                if let Some(url) = self.tab_url(&tab_id, cx) {
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                        url,
+                        activate: false,
+                    }));
+                }
+            }
             TabMenuAction::Rename => {
                 if let Some(sid) = self.session_id_for_tab(&tab_id, cx) {
                     self.begin_rename(sid, cx);
@@ -13917,7 +14134,9 @@ impl Shell {
                         .into_iter()
                         .filter_map(|id| self.tab_url(id, cx))
                         .collect(),
-                    TabMenuTarget::Tab(_) | TabMenuTarget::Bookmark(_) => Vec::new(),
+                    TabMenuTarget::Tab(_)
+                    | TabMenuTarget::Bookmark(_)
+                    | TabMenuTarget::Group(_) => Vec::new(),
                 };
                 if !urls.is_empty() {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(urls.join("\n")));
@@ -14030,12 +14249,15 @@ impl Shell {
 fn tab_menu_tag(action: &TabMenuAction) -> &'static str {
     match action {
         TabMenuAction::CopyLink => "copy-link",
-        TabMenuAction::Share => "share",
-        TabMenuAction::Mute => "mute",
+        TabMenuAction::Close => "close",
+        TabMenuAction::CloseOthers => "close-others",
+        TabMenuAction::Pin => "pin",
+        TabMenuAction::Unpin => "unpin",
+        TabMenuAction::ReopenClosed => "reopen-closed",
+        TabMenuAction::OpenInNewTab => "open-in-new-tab",
         TabMenuAction::Rename => "rename",
         TabMenuAction::AddSplit => "add-split",
         TabMenuAction::Duplicate => "duplicate",
-        TabMenuAction::MoveTo => "move-to",
         TabMenuAction::ArchiveTab => "archive-tab",
         TabMenuAction::ArchiveBelow => "archive-below",
         TabMenuAction::ShareSplit => "share-split",
@@ -14044,6 +14266,7 @@ fn tab_menu_tag(action: &TabMenuAction) -> &'static str {
         TabMenuAction::ConvertAxis => "convert-axis",
         TabMenuAction::SplitMember(_) => "member",
         TabMenuAction::RemoveBookmark => "remove-bookmark",
+        TabMenuAction::RemoveProject => "remove-project",
         TabMenuAction::ArchiveItem => "archive-item",
     }
 }
