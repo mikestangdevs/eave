@@ -8781,9 +8781,18 @@ impl Shell {
                         .flex_none()
                         .size(px(theme::BOOKMARK_TILE))
                         .rounded(px(theme::BOOKMARK_TILE_RADIUS))
-                        // Ghost: no fill at rest, so it reads as the empty
-                        // slot after the last bookmark rather than as another
-                        // bookmark. Real cells sit on `overlay`.
+                        // Repair 2 — a GHOST cell, and it must not
+                        // impersonate content.
+                        //
+                        // It wore `icons::FOLDER` on a plate, which is the
+                        // silhouette a bookmark FOLDER would have: an
+                        // affordance dressed as one of the things it makes.
+                        // Now it carries the `+` every other zone action
+                        // carries, has no fill and no mark plate, and keeps
+                        // a dashed-weight rim so the empty slot is legible
+                        // as a slot.
+                        .border_1()
+                        .border_color(theme::border())
                         .hover_fade("bookmark-new-folder", theme::wash_rest(), theme::overlay())
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.new_bookmark_folder(cx)))
@@ -8791,7 +8800,7 @@ impl Shell {
                         .items_center()
                         .justify_center()
                         .child(icons::tagged_icon(
-                            icons::FOLDER,
+                            icons::ADD_CIRCLE,
                             theme::BOOKMARK_TILE_MARK,
                             theme::text_tertiary(),
                             "bookmark-new-folder-glyph",
