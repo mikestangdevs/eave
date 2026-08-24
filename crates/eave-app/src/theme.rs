@@ -1257,6 +1257,19 @@ pub fn bar_glass() -> Hsla {
     neutral(0.33).opacity(0.34)
 }
 pub const RADIUS_BUTTON: f32 = 7.0;
+
+/// The SELECTED row's corner (Slice D4.2, repair 4).
+///
+/// Named `RADIUS_SELECT`, not `RADIUS_PILL`: that name is taken, by the
+/// 13 px capsule further down this file. Two different shapes both called
+/// "pill" is the collision this track has already paid for three times.
+///
+/// **8, not [`RADIUS_BUTTON`]'s 7.** Selection is now a filled pill and
+/// nothing else — no rim, no outline — so the corner is the only thing
+/// carrying its shape, and it is worth one shared token rather than three
+/// call sites that can drift. Wake's sidebar reaches the same number for the
+/// same reason ("圆角均 8px" — every corner 8).
+pub const RADIUS_SELECT: f32 = 8.0;
 /// T3's `--control-radius` (8 px): ghost chips in the composer toolbar.
 pub const RADIUS_CONTROL: f32 = 8.0;
 

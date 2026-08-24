@@ -2859,7 +2859,7 @@ fn row_action(key: String, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(theme::RADIUS_BUTTON))
+        .rounded(px(theme::RADIUS_SELECT))
         // Its own wash, keyed to itself: the strip is already riding the
         // ROW's hover for opacity, and a control that cannot say which of
         // five is under the pointer is worse than five labelled boxes.
@@ -4444,7 +4444,7 @@ impl Render for TabDrag {
         div()
             .px(px(theme::SPACE_2))
             .py(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .bg(theme::overlay_strong())
             .text_size(px(theme::DETAIL_SIZE))
             .text_color(theme::text())
@@ -6038,7 +6038,7 @@ impl Shell {
                     })
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_2))
-                    .rounded(px(theme::RADIUS_BUTTON))
+                    .rounded(px(theme::RADIUS_SELECT))
                     .cursor_pointer()
                     .bg(if primary {
                         theme::overlay()
@@ -6121,7 +6121,7 @@ impl Shell {
                                     .debug_selector(|| "page-dialog-input".into())
                                     .px(px(theme::SPACE_2))
                                     .py(px(theme::SPACE_2))
-                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .rounded(px(theme::RADIUS_SELECT))
                                     .bg(theme::wash_rest())
                                     .text_size(px(theme::BODY_SIZE))
                                     .text_color(theme::text())
@@ -7893,7 +7893,7 @@ impl Shell {
                         .debug_selector(|| "nav-reload".into())
                         .flex_none()
                         .size(px(theme::ICON_TOGGLE))
-                        .rounded(px(theme::RADIUS_BUTTON))
+                        .rounded(px(theme::RADIUS_SELECT))
                         .when(has_url, |d| {
                             let reload_id = tab_id.clone();
                             d.cursor_pointer()
@@ -7928,7 +7928,7 @@ impl Shell {
                         .min_w(px(0.))
                         .h(px(theme::RAIL_TAB_H - theme::SPACE_1))
                         .px(px(theme::SPACE_2))
-                        .rounded(px(theme::RADIUS_BUTTON))
+                        .rounded(px(theme::RADIUS_SELECT))
                         .cursor_pointer()
                         .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
                         .on_click(cx.listener(|this, _, _, cx| this.open_omnibox(cx)))
@@ -8077,7 +8077,7 @@ impl Shell {
             })
             .flex_none()
             .size(px(theme::ICON_TOGGLE))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .when(enabled, |d| {
                 d.cursor_pointer()
                     .hover_fade(fade_key.clone(), theme::wash_rest(), theme::overlay())
@@ -8459,7 +8459,7 @@ impl Shell {
             .id("rail-toggle")
             .debug_selector(|| "rail-toggle".into())
             .p(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .hover_fade("rail-toggle", theme::wash_rest(), theme::overlay())
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| {
@@ -8485,7 +8485,7 @@ impl Shell {
             .debug_selector(|| "files-toggle".into())
             .flex_none()
             .p(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .hover_fade("files-toggle", theme::wash_rest(), theme::overlay())
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| {
@@ -8953,7 +8953,7 @@ impl Shell {
             .flex_none()
             .h(px(theme::RAIL_GHOST_H))
             .px(px(theme::RAIL_GUTTER))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             // THE hairline — one in the whole rail, on top of the tabs
             // zone's ghost row. Drawn as this row's TOP BORDER rather than
             // as a rule of its own, so the row stays exactly
@@ -9030,7 +9030,7 @@ impl Shell {
                     .flex_none()
                     .h(px(theme::RAIL_TAB_H))
                     .px(px(theme::RAIL_GUTTER))
-                    .rounded(px(theme::RADIUS_BUTTON))
+                    .rounded(px(theme::RADIUS_SELECT))
                     .when(is_open, |d| d.bg(theme::wash_rest()))
                     .cursor_pointer()
                     .hover_fade(
@@ -9134,7 +9134,7 @@ impl Shell {
                         // frames them.
                         .pl(px(theme::RAIL_GUTTER + theme::BOOKMARK_CHILD_INDENT))
                         .pr(px(theme::RAIL_GUTTER))
-                        .rounded(px(theme::RADIUS_BUTTON))
+                        .rounded(px(theme::RADIUS_SELECT))
                         .cursor_pointer()
                         .hover_fade(
                             format!("bookmark-child-{cid}"),
@@ -9365,7 +9365,7 @@ impl Shell {
             .flex_none()
             .h(px(theme::GROUP_HEAD_H))
             .px(px(theme::SPACE_2))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .when(holds_active, |d| d.shadow(theme::selection_rim()))
             .bg(theme::wash_rest())
             .cursor_pointer()
@@ -9449,7 +9449,7 @@ impl Shell {
             .w_full()
             .h(px(theme::RAIL_TAB_H))
             .px(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .bg(theme::overlay())
             .overflow_hidden()
             .flex()
@@ -9538,7 +9538,7 @@ impl Shell {
             } else {
                 theme::RAIL_CARD_BLEED
             }))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             // Slice AS's ruling, unchanged: selection is a NEUTRAL raised
             // fill plus a 1 px INSET rim, never an accent bar. The accent
             // marks where you are ACTING, not where you are, and a selected
@@ -9547,7 +9547,6 @@ impl Shell {
             // the moment you clicked it, and the strip is a scroll
             // container — a per-tab 2 px would move where every tab after
             // it starts.
-            .when(is_sel, |d| d.shadow(theme::selection_rim()))
             .hover_fade(
                 format!("tab-{id}"),
                 if is_sel {
@@ -9705,7 +9704,7 @@ impl Shell {
                     .ml(px(theme::SPACE_1))
                     .size(px(theme::TAB_CLOSE))
                     .flex_none()
-                    .rounded(px(theme::RADIUS_BUTTON))
+                    .rounded(px(theme::RADIUS_SELECT))
                     .hover_fade(
                         format!("tab-close-{id}"),
                         gpui::transparent_black(),
@@ -9898,7 +9897,7 @@ impl Shell {
                     .relative()
                     .px(px(theme::RAIL_CARD_BLEED))
                     .py(px(theme::SPACE_2))
-                    .rounded(px(theme::RADIUS_BUTTON))
+                    .rounded(px(theme::RADIUS_SELECT))
                     // Slice AO: selection reads as a RIM as well as a wash,
                     // which is the treatment `launcher.rs` has always used
                     // for its provider tiles — selected takes
@@ -9913,12 +9912,10 @@ impl Shell {
                     // move every row below it by 2 px the moment the
                     // operator clicked — the same reason the label below
                     // carries a border nobody can see.
-                    .border_1()
-                    .border_color(if is_sel {
-                        theme::border_strong()
-                    } else {
-                        gpui::transparent_black()
-                    })
+                    // Repair 4 — the outline died. Selection is a FILLED
+                    // pill and nothing else; a fill plus a rim is two
+                    // statements of one fact, and the rim is the one that
+                    // read as a box drawn around the row.
                     // A newly-arrived row fades in (§1.4). Opacity only, and
                     // opacity never participates in layout — the rail's
                     // structure is untouched.
@@ -10058,7 +10055,7 @@ impl Shell {
                                     .items_center()
                                     .border_1()
                                     .border_color(theme::border_strong())
-                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .rounded(px(theme::RADIUS_SELECT))
                                     // Slice AO: the field wears the name's
                                     // exact metrics because it replaces the
                                     // name in place. Any other size and
@@ -10129,7 +10126,7 @@ impl Shell {
                                     // in `fold_rail`.
                                     .border_1()
                                     .border_color(gpui::transparent_black())
-                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .rounded(px(theme::RADIUS_SELECT))
                                     // Slice AO — the anchor of the row.
                                     // 13 px, and deliberately NOT
                                     // `NAME_SIZE` (16), which is correct in
@@ -10511,7 +10508,7 @@ impl Shell {
                     .flex_none()
                     .h(px(theme::RAIL_GHOST_H))
                     .px(px(theme::RAIL_GUTTER))
-                    .rounded(px(theme::RADIUS_BUTTON))
+                    .rounded(px(theme::RADIUS_SELECT))
                     .cursor_pointer()
                     .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
                     .flex()
@@ -11023,7 +11020,7 @@ impl Shell {
             .debug_selector(|| format!("file-{}", f.path))
             .px(px(theme::RAIL_CARD_BLEED))
             .py(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             // §1.4: a file that has just appeared in the rail fades in.
             // The path is the key, so a snapshot replaced by an FS event
             // does not re-fade rows that were already there.
@@ -11767,7 +11764,7 @@ impl Shell {
                 div()
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_1))
-                    .rounded(px(theme::RADIUS_BUTTON))
+                    .rounded(px(theme::RADIUS_SELECT))
                     .border_1()
                     .border_color(theme::danger_ring())
                     .text_size(px(theme::DETAIL_SIZE))
@@ -12325,7 +12322,7 @@ impl Shell {
         div()
             .px(px(theme::SPACE_3))
             .py(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .flex()
             .flex_row()
             .items_center()
@@ -12953,7 +12950,7 @@ impl Shell {
             .left(px(theme::PLATE_MARGIN))
             .px(px(theme::SPACE_2))
             .py(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_BUTTON))
+            .rounded(px(theme::RADIUS_SELECT))
             .border_1()
             .border_color(theme::border_strong())
             .text_size(px(theme::LABEL_SIZE))
@@ -14240,7 +14237,7 @@ impl Shell {
                                     .debug_selector(|| "launcher-model".into())
                                     .px(px(theme::SPACE_3))
                                     .py(px(theme::SPACE_1))
-                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .rounded(px(theme::RADIUS_SELECT))
                                     .border_1()
                                     .border_color(theme::border())
                                     .text_size(px(theme::LABEL_SIZE))
@@ -14286,7 +14283,7 @@ impl Shell {
                                     .debug_selector(|| "launcher-start".into())
                                     .px(px(theme::SPACE_4))
                                     .py(px(theme::SPACE_1))
-                                    .rounded(px(theme::RADIUS_BUTTON))
+                                    .rounded(px(theme::RADIUS_SELECT))
                                     .bg(theme::solid())
                                     .text_size(px(theme::LABEL_SIZE))
                                     .line_height(px(theme::LABEL_LINE))
@@ -14511,7 +14508,7 @@ impl Shell {
                                         div()
                                             .debug_selector(|| "empty-key".into())
                                             .px(px(theme::SPACE_2))
-                                            .rounded(px(theme::RADIUS_BUTTON))
+                                            .rounded(px(theme::RADIUS_SELECT))
                                             .bg(theme::solid())
                                             .text_size(px(theme::LABEL_SIZE))
                                             .line_height(px(theme::LABEL_LINE))
