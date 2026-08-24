@@ -1150,6 +1150,20 @@ pub const TRAFFIC_X: f32 = 16.0;
 pub const TRAFFIC_Y: f32 = 17.0;
 pub const TRAFFIC_CLEARANCE: f32 = 86.0;
 
+/// The macOS window button's diameter. Not ours to choose — measured.
+pub const TRAFFIC_D: f32 = 12.0;
+
+/// The air between the traffic lights and the first thing in the rail
+/// (Slice D4.2, repair 6).
+///
+/// **Derived from the lights, not from [`TITLEBAR_H`].** The grid used to
+/// begin wherever the titlebar spacer happened to end, which made its
+/// position a coincidence of an unrelated constant: change `TITLEBAR_H` for
+/// any reason and the grid moves with it for no reason. The lights are what
+/// the eye actually measures the top of the rail against, so the pad is
+/// stated against them — `TRAFFIC_Y + TRAFFIC_D` is where they end.
+pub const RAIL_GRID_TOP: f32 = TRAFFIC_Y + TRAFFIC_D + SPACE_3;
+
 /// Uniform air between the window surface and the content card: top,
 /// right, bottom, and the gap between the rail and the card. 8 px is
 /// [`SPACE_2`].

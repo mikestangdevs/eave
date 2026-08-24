@@ -8752,6 +8752,22 @@ impl Shell {
         // CELL — a zone made of cells takes its action in the shape of a
         // cell. It could not simply be deleted with the header:
         // `new_bookmark_folder` has exactly one caller and that was it.
+        // Repair 6 — THREE columns, always.
+        //
+        // `flex_wrap` with a fixed-width cell was wrong: it makes the column
+        // count a consequence of arithmetic that has to come out right at
+        // every rail width, and it did not — at rest the third cell wrapped
+        // to a second row, giving 2 + 1. The rail is resizable, so no fixed
+        // width can hold three columns across its whole range.
+        //
+        // Chunked into rows of three with `flex_1` cells instead: the count
+        // is stated, and the cells divide whatever width there is. That is
+        // what "three columns filling the content width" actually asks for.
+        let mut cells: Vec<Option<bookmarks::BarItem>> = items.iter().cloned().map(Some).collect();
+        cells.push(None); // the new-folder ghost closes the grid
+        let rows: Vec<Vec<Option<bookmarks::BarItem>>> =
+            cells.chunks(3).map(|c| c.to_vec()).collect();
+
         Some(
             div()
                 .debug_selector(|| "bookmarks-grid".into())
@@ -8759,53 +8775,32 @@ impl Shell {
                 .w_full()
                 .flex_none()
                 .px(px(theme::RAIL_GUTTER))
-                // The zone boundary, in the absence of any label saying so.
                 .pb(px(theme::RAIL_ZONE_GAP))
                 .flex()
-                .flex_row()
-                // Wrap, not a hard three: the rail is draggable between
-                // `RAIL_W_MIN` and `RAIL_W_MAX`, and `BOOKMARK_TILE` is sized
-                // so the REST width yields exactly three columns.
-                .flex_wrap()
+                .flex_col()
                 .gap(px(theme::BOOKMARK_GRID_GAP))
-                .children(
-                    items
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, item)| self.bookmark_tile(item, ix, active_host.as_deref(), cx)),
-                )
-                .child(
-                    div()
-                        .id("bookmark-new-folder")
-                        .debug_selector(|| "bookmark-new-folder".into())
-                        .flex_none()
-                        .size(px(theme::BOOKMARK_TILE))
-                        .rounded(px(theme::BOOKMARK_TILE_RADIUS))
-                        // Repair 2 — a GHOST cell, and it must not
-                        // impersonate content.
-                        //
-                        // It wore `icons::FOLDER` on a plate, which is the
-                        // silhouette a bookmark FOLDER would have: an
-                        // affordance dressed as one of the things it makes.
-                        // Now it carries the `+` every other zone action
-                        // carries, has no fill and no mark plate, and keeps
-                        // a dashed-weight rim so the empty slot is legible
-                        // as a slot.
-                        .border_1()
-                        .border_color(theme::border())
-                        .hover_fade("bookmark-new-folder", theme::wash_rest(), theme::overlay())
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.new_bookmark_folder(cx)))
+                .children(rows.into_iter().enumerate().map(|(r, row)| {
+                    let mut lane = div()
+                        .w_full()
                         .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icons::tagged_icon(
-                            icons::ADD_CIRCLE,
-                            theme::BOOKMARK_TILE_MARK,
-                            theme::text_tertiary(),
-                            "bookmark-new-folder-glyph",
-                        )),
-                )
+                        .flex_row()
+                        .gap(px(theme::BOOKMARK_GRID_GAP));
+                    for (c, slot) in row.iter().enumerate() {
+                        lane = lane.child(match slot {
+                            Some(item) => {
+                                self.bookmark_tile(item, r * 3 + c, active_host.as_deref(), cx)
+                            }
+                            None => self.bookmark_new_cell(cx),
+                        });
+                    }
+                    // Pad the short last row so its cells keep the same width
+                    // as every other row's — three `flex_1` children of a
+                    // two-child row would each take half the rail.
+                    for _ in row.len()..3 {
+                        lane = lane.child(div().flex_1());
+                    }
+                    lane
+                }))
                 // Empty space past the last cell means "add at the end",
                 // the same contract the bar had.
                 .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
@@ -8814,6 +8809,35 @@ impl Shell {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// The grid's trailing GHOST cell — makes a bookmark folder.
+    ///
+    /// Repair 2: no fill and no mark plate, and a `+` rather than a folder
+    /// glyph, so an affordance never wears the silhouette of the content it
+    /// creates.
+    fn bookmark_new_cell(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id("bookmark-new-folder")
+            .debug_selector(|| "bookmark-new-folder".into())
+            .flex_1()
+            .h(px(theme::BOOKMARK_TILE))
+            .rounded(px(theme::BOOKMARK_TILE_RADIUS))
+            .border_1()
+            .border_color(theme::border())
+            .hover_fade("bookmark-new-folder", theme::wash_rest(), theme::overlay())
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.new_bookmark_folder(cx)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icons::tagged_icon(
+                icons::ADD_CIRCLE,
+                theme::BOOKMARK_TILE_MARK,
+                theme::text_tertiary(),
+                "bookmark-new-folder-glyph",
+            ))
+            .into_any_element()
     }
 
     /// One pinned bookmark: a site mark on a tile, with no label.
@@ -8839,8 +8863,8 @@ impl Shell {
         div()
             .id(SharedString::from(format!("bookmark-tile-{id}")))
             .debug_selector(move || format!("bookmark-tile-{sel}"))
-            .flex_none()
-            .size(px(theme::BOOKMARK_TILE))
+            .flex_1()
+            .h(px(theme::BOOKMARK_TILE))
             .rounded(px(theme::BOOKMARK_TILE_RADIUS))
             // A tile is a FILLED control, so it rests on a real fill and
             // climbs one rung on hover — `wash_rest` is transparent black
@@ -10565,7 +10589,8 @@ impl Shell {
                 div()
                     .debug_selector(|| "rail-top".into())
                     .w_full()
-                    .h(px(theme::TITLEBAR_H))
+                    // Repair 6 — the grid is anchored to the traffic lights.
+                    .h(px(theme::RAIL_GRID_TOP))
                     .flex_none()
                     .window_control_area(WindowControlArea::Drag)
                     .flex()
