@@ -4799,6 +4799,8 @@ struct Shell {
     /// `frame.json` at construction and written back on the click, so the
     /// rail comes back the way it was left.
     zone_projects_collapsed: std::cell::Cell<bool>,
+    zone_folders_collapsed: std::cell::Cell<bool>,
+    zone_tabs_collapsed: std::cell::Cell<bool>,
     zone_sessions_collapsed: std::cell::Cell<bool>,
     /// Checkout roots a project has already been asked for (Slice T1),
     /// keyed on the root rather than the session.
@@ -5195,8 +5197,10 @@ fn save_zone_collapsed(key: &str, collapsed: bool) {
     }
 }
 
-/// The two zone keys, named once so the reader and the writer cannot drift.
+/// The zone keys, named once so the reader and the writer cannot drift.
 pub(crate) const ZONE_PROJECTS: &str = "zone_projects_collapsed";
+pub(crate) const ZONE_FOLDERS: &str = "zone_folders_collapsed";
+pub(crate) const ZONE_TABS: &str = "zone_tabs_collapsed";
 pub(crate) const ZONE_SESSIONS: &str = "zone_sessions_collapsed";
 
 /// Write the rail width back, keeping every other key in the file.
@@ -8916,48 +8920,65 @@ impl Shell {
         // a split draws two tabs as one row — and that absorbs an inserted
         // divider without knowing it exists.
         let projects = strip::project_item_count(&items);
+        let project_count = items[..projects]
+            .iter()
+            .filter(|i| matches!(i, strip::StripItem::Group { .. }))
+            .count();
+        let loose_count = items.len() - projects;
+        let folder_count = bookmarks::folders(&self.bookmarks.read(cx).snapshot).len();
 
-        // Slice D4.2 stage 2 — the projects zone's collapse. The toggle is
-        // the zone's first row; when shut, the project rows, the folder rows
-        // and the zone's ghost row all go with it, and only the count stays.
         let proj_shut = self.zone_projects_collapsed.get();
+        let folders_shut = self.zone_folders_collapsed.get();
+        let tabs_shut = self.zone_tabs_collapsed.get();
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        // Rows in this list that are not tabs (Slice D4): the zone gap, the
-        // two ghost rows, and any bookmark folder rows. Counted so they do
+        // Rows in this list that are not tabs: zone headers, the zone gap,
+        // the ghost rows, and any bookmark folder rows. Counted so they do
         // not spend the tab budget — see `theme::rail_rows_h`.
         let mut extra = 0usize;
         let mut active_row: Option<usize> = None;
-        rows.push(self.zone_toggle("zone-projects", ZONE_PROJECTS, proj_shut, projects, cx));
+        rows.push(self.zone_toggle(
+            "zone-projects",
+            ZONE_PROJECTS,
+            "Projects",
+            proj_shut,
+            project_count,
+            false,
+            cx,
+        ));
         extra += 1;
+        if !proj_shut {
+            rows.push(self.ghost_row(
+                "project-new",
+                "new project",
+                false,
+                |this, cx| this.pick_project(cx),
+                cx,
+            ));
+            extra += 1;
+        }
         let mut emitted_split = false;
+        let mut emitted_tabs_seam = false;
         for (ix, item) in items.iter().enumerate() {
-            // While the zone is shut its own items are not drawn — but the
-            // loose tabs after the seam still are: they are a different zone
-            // and this loop happens to walk both.
-            if proj_shut && ix < projects {
+            if ix == projects && !emitted_tabs_seam {
+                extra += self.emit_folders_and_tabs_head(
+                    &mut rows,
+                    folders_shut,
+                    tabs_shut,
+                    folder_count,
+                    loose_count,
+                    cx,
+                );
+                emitted_tabs_seam = true;
+                if tabs_shut {
+                    break;
+                }
+            }
+            if ix < projects && proj_shut {
                 continue;
             }
-            if ix == projects {
-                // Slice T1b — the folders close the projects section, so
-                // they land above the TABS seam rather than among the
-                // loose tabs. `active_row` is captured as `rows.len()` at
-                // push time, so inserting here shifts nothing.
-                if !proj_shut {
-                    let folders = self.bookmark_folder_rows(cx);
-                    extra += folders.len() + 1;
-                    rows.extend(folders);
-                    // Slice D4 — the projects zone's action, where its ⊕ was.
-                    rows.push(self.ghost_row(
-                        "project-new",
-                        "new project",
-                        false,
-                        |this, cx| this.pick_project(cx),
-                        cx,
-                    ));
-                }
-                extra += 1;
-                rows.push(self.tabs_divider(cx));
+            if ix >= projects && tabs_shut {
+                continue;
             }
             match item {
                 strip::StripItem::Group {
@@ -9003,30 +9024,16 @@ impl Shell {
                 }
             }
         }
-        // Always drawn, even with nothing loose under it — it carries ⌘T's
-        // `+`, and a control that appears only once you already have what
-        // it makes is not a control.
-        if projects == items.len() {
-            if !proj_shut {
-                let folders = self.bookmark_folder_rows(cx);
-                extra += folders.len() + 1;
-                rows.extend(folders);
-                rows.push(self.ghost_row(
-                    "project-new",
-                    "new project",
-                    false,
-                    |this, cx| this.pick_project(cx),
-                    cx,
-                ));
-            }
-            extra += 1;
-            rows.push(self.tabs_divider(cx));
+        if !emitted_tabs_seam {
+            extra += self.emit_folders_and_tabs_head(
+                &mut rows,
+                folders_shut,
+                tabs_shut,
+                folder_count,
+                loose_count,
+                cx,
+            );
         }
-
-        // Slice D4 — the tabs zone's action, and the ONE hairline in the
-        // rail, immediately above it.
-        rows.push(self.ghost_row("tab-new", "new tab", true, |this, cx| this.new_tab(cx), cx));
-        extra += 1;
 
         // Scroll the active tab into view on the EDGE of it changing, never
         // every frame. `scroll_to_item` arms an active item that prepaint
@@ -9053,9 +9060,6 @@ impl Shell {
             .w_full()
             .flex()
             .flex_col()
-            // Slice D4 — no PROJECTS header and no ⊕. The zone is read
-            // from the shape of its rows; the action moved to a ghost row at
-            // the end of the zone (see `ghost_row`).
             .child(
                 div()
                     .id("tab-strip")
@@ -9319,25 +9323,18 @@ impl Shell {
             .into_any_element()
     }
 
-    /// A zone's collapse control, drawn as the zone's FIRST ROW.
-    ///
-    /// **Not a chevron bolted onto the first content row, which is what the
-    /// directive's words describe.** In the projects zone that row is a
-    /// project head, and a project head already carries its own chevron and
-    /// its own count for collapsing *itself* — a second chevron beside the
-    /// first, collapsing a different thing, is a control nobody can read.
-    /// So the zone's chevron is its own row, and it is the only row left
-    /// when the zone is shut.
-    ///
-    /// It is not a header coming back: no caps label, no title, nothing but
-    /// the chevron and — when shut — the count of what is hidden. A zone is
-    /// still identified by the shape of what follows it.
+    /// A zone's collapse control: `Label [n] ∨`, drawn as the zone's first
+    /// row. The caret follows the count, matching the other disclosure
+    /// headers in the shell. When the zone is shut this row is what stays.
+    #[allow(clippy::too_many_arguments)]
     fn zone_toggle(
         &self,
         selector: &'static str,
         key: &'static str,
+        label: &'static str,
         collapsed: bool,
         count: usize,
+        rule_above: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         div()
@@ -9348,37 +9345,44 @@ impl Shell {
             .h(px(theme::RAIL_GHOST_H))
             .px(px(theme::RAIL_GUTTER))
             .rounded(px(theme::RADIUS_SELECT))
+            .when(rule_above, |d| {
+                d.border_t(px(theme::HAIRLINE))
+                    .border_color(theme::border())
+            })
             .cursor_pointer()
             .hover_fade(selector, theme::wash_rest(), theme::overlay())
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(theme::SPACE_2))
+            .gap(px(theme::SPACE_1))
+            .child(
+                div()
+                    .debug_selector(move || format!("{selector}-label"))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(label)),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("{selector}-count"))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(format!("[{count}]"))),
+            )
             .child(icons::tagged_icon(
                 if collapsed {
                     icons::ALT_ARROW_RIGHT
                 } else {
                     icons::ALT_ARROW_DOWN
                 },
-                theme::RAIL_MARK,
+                theme::ICON_STATUS,
                 theme::text_tertiary(),
                 format!("{selector}-chevron"),
             ))
-            // The count is what a shut zone says instead of its rows. Absent
-            // when open, because the rows are right there being counted.
-            .children(collapsed.then(|| {
-                div()
-                    .debug_selector(move || format!("{selector}-count"))
-                    .text_size(px(theme::SMALL_SIZE))
-                    .text_color(theme::text_tertiary())
-                    .child(SharedString::from(count.to_string()))
-            }))
             .on_click(cx.listener(move |this, _, _, cx| {
-                let cell = if key == ZONE_PROJECTS {
-                    &this.zone_projects_collapsed
-                } else {
-                    &this.zone_sessions_collapsed
-                };
+                let cell = this.zone_cell(key);
                 let next = !cell.get();
                 cell.set(next);
                 save_zone_collapsed(key, next);
@@ -9387,14 +9391,68 @@ impl Shell {
             .into_any_element()
     }
 
-    /// A zone's action, shaped like the rows it ends (Slice D4).
+    fn zone_cell(&self, key: &'static str) -> &std::cell::Cell<bool> {
+        match key {
+            ZONE_PROJECTS => &self.zone_projects_collapsed,
+            ZONE_FOLDERS => &self.zone_folders_collapsed,
+            ZONE_TABS => &self.zone_tabs_collapsed,
+            ZONE_SESSIONS => &self.zone_sessions_collapsed,
+            other => unreachable!("unknown zone key: {other}"),
+        }
+    }
+
+    /// Folders zone + the TABS seam + the tabs header and its `new tab`
+    /// row. Pushed as a block so the two call sites (the seam inside the
+    /// item loop, and the no-loose-tabs tail) cannot drift.
+    fn emit_folders_and_tabs_head(
+        &self,
+        rows: &mut Vec<AnyElement>,
+        folders_shut: bool,
+        tabs_shut: bool,
+        folder_count: usize,
+        loose_count: usize,
+        cx: &Context<Self>,
+    ) -> usize {
+        let mut extra = 0usize;
+        rows.push(self.zone_toggle(
+            "zone-folders",
+            ZONE_FOLDERS,
+            "Folders",
+            folders_shut,
+            folder_count,
+            false,
+            cx,
+        ));
+        extra += 1;
+        if !folders_shut {
+            let folders = self.bookmark_folder_rows(cx);
+            extra += folders.len();
+            rows.extend(folders);
+        }
+        rows.push(self.tabs_divider(cx));
+        extra += 1;
+        rows.push(self.zone_toggle(
+            "zone-tabs",
+            ZONE_TABS,
+            "Tabs",
+            tabs_shut,
+            loose_count,
+            true,
+            cx,
+        ));
+        extra += 1;
+        if !tabs_shut {
+            rows.push(self.ghost_row("tab-new", "new tab", false, |this, cx| this.new_tab(cx), cx));
+            extra += 1;
+        }
+        extra
+    }
+
+    /// A zone's action, shaped like the rows it creates.
     ///
-    /// Replaces the header buttons — the ⊕ in the tabs seam, the "new" pill
-    /// on the sessions header, the ⊕ on the projects header. Those advertised
-    /// themselves as controls, which is exactly what D4 is taking out of the
-    /// rail: with no caps label above a zone, a button in that position reads
-    /// as the zone's title. A dimmed row at the END of a zone reads as "one
-    /// more of these", which is what the action makes.
+    /// Lives at the TOP of the zone, under the labelled header, so it is
+    /// the first thing in the section rather than a row you have to scroll
+    /// past the contents to find.
     ///
     /// Dimmed at rest and brightened on hover, so it recedes until looked
     /// for. `hover_fade` is N2's machinery, already used by every other rail
@@ -9415,13 +9473,10 @@ impl Shell {
             .h(px(theme::RAIL_GHOST_H))
             .px(px(theme::RAIL_GUTTER))
             .rounded(px(theme::RADIUS_SELECT))
-            // THE hairline — one in the whole rail, on top of the tabs
-            // zone's ghost row. Drawn as this row's TOP BORDER rather than
-            // as a rule of its own, so the row stays exactly
-            // `RAIL_GHOST_H` tall: the list above is a scroll container
-            // with a DEFINITE height computed from a uniform row, and a
-            // 5 px rule between rows would have put the box and its
-            // contents permanently out of step.
+            // Optional top hairline. The one in the rail now lives on the
+            // tabs header (`zone_toggle(..., rule_above: true)`); ghost
+            // rows no longer carry it. Kept as a parameter so a future
+            // zone can opt in without a second constructor.
             .when(rule_above, |d| {
                 d.border_t(px(theme::HAIRLINE))
                     .border_color(theme::border())
@@ -9456,8 +9511,9 @@ impl Shell {
         row.into_any_element()
     }
 
-    /// The bookmark FOLDERS, as titled rows under the projects — and, when
-    /// one is open, its children as rows directly beneath it.
+    /// The bookmark FOLDERS, as titled rows in their own zone between
+    /// projects and tabs — and, when one is open, its children as rows
+    /// directly beneath it.
     ///
     /// **Expansion is inline, not a popup.** T1 opened a folder into a
     /// `deferred` overlay hanging off the bar; the operator ruled against
@@ -10268,6 +10324,7 @@ impl Shell {
         // It buys 26 px, which is what makes a 220 px rail state its facts
         // whole instead of at 237.
         let meta_indent = theme::RAIL_STRIP_W;
+        let sess_count = sessions.len();
         let rows: Vec<AnyElement> = sessions
             .into_iter()
             .map(|info| {
@@ -10959,53 +11016,21 @@ impl Shell {
             rows
         };
 
-        // Slice D4 — the sessions zone's tail: the archived filter, then the
-        // zone's action as a ghost row.
-        //
-        // The archived toggle came back from the header I deleted with it.
-        // It is NOT one of the controls D4 retires — not a ⊕, not a "new"
-        // pill, not a caps label — it is a filter over what the zone shows,
-        // and removing it silently would have hidden every archived session
-        // with no way back. Restated as a row so it shares the zone's shape.
-        // Slice D4.2 stage 2 — the sessions zone's collapse. Same shape as
-        // the projects zone: the toggle heads the zone, and a shut zone keeps
-        // only its count.
+        // Sessions zone: labelled header, then `new session` at the top of
+        // the body, then the rows, then the archived filter. The filter is
+        // not a create action — it stays at the end because it is a filter
+        // over what the zone already shows.
         let sess_shut = self.zone_sessions_collapsed.get();
-        let sess_count = rows.len();
-        let mut rows = if sess_shut { Vec::new() } else { rows };
-        rows.insert(
-            0,
-            self.zone_toggle("zone-sessions", ZONE_SESSIONS, sess_shut, sess_count, cx),
-        );
-        if !sess_shut && archived_count > 0 {
-            let label = archived_toggle_label(archived_count, show_archived);
-            rows.push(
-                div()
-                    .id("rail-archived")
-                    .debug_selector(|| "rail-archived".into())
-                    .w_full()
-                    .flex_none()
-                    .h(px(theme::RAIL_GHOST_H))
-                    .px(px(theme::RAIL_GUTTER))
-                    .rounded(px(theme::RADIUS_SELECT))
-                    .cursor_pointer()
-                    .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
-                    .text_color(theme::text_tertiary())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sessions.update(cx, |state, cx| {
-                            state.show_archived = !state.show_archived;
-                            cx.notify();
-                        });
-                    }))
-                    .child(SharedString::from(label))
-                    .into_any_element(),
-            );
-        }
+        let body = rows;
+        let mut rows = vec![self.zone_toggle(
+            "zone-sessions",
+            ZONE_SESSIONS,
+            "Sessions",
+            sess_shut,
+            sess_count,
+            false,
+            cx,
+        )];
         if !sess_shut {
             rows.push(self.ghost_row(
                 "new-session",
@@ -11014,6 +11039,36 @@ impl Shell {
                 |this, _cx| this.new_session(),
                 cx,
             ));
+            rows.extend(body);
+            if archived_count > 0 {
+                let label = archived_toggle_label(archived_count, show_archived);
+                rows.push(
+                    div()
+                        .id("rail-archived")
+                        .debug_selector(|| "rail-archived".into())
+                        .w_full()
+                        .flex_none()
+                        .h(px(theme::RAIL_GHOST_H))
+                        .px(px(theme::RAIL_GUTTER))
+                        .rounded(px(theme::RADIUS_SELECT))
+                        .cursor_pointer()
+                        .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .text_size(px(theme::SMALL_SIZE))
+                        .line_height(px(theme::SMALL_LINE))
+                        .text_color(theme::text_tertiary())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sessions.update(cx, |state, cx| {
+                                state.show_archived = !state.show_archived;
+                                cx.notify();
+                            });
+                        }))
+                        .child(SharedString::from(label))
+                        .into_any_element(),
+                );
+            }
         }
         let rows = rows;
 
@@ -11061,9 +11116,6 @@ impl Shell {
             .children(self.bookmarks_grid(cx))
             .child(self.rail_tabs(cx, phase))
             .child(self.rail_handle(cx))
-            // Slice D4 — no SESSIONS header and no "new" pill. A session
-            // row's silhouette (provider chip, cwd subline, attention badge)
-            // is unlike any tab row, which is what separates the zones now.
             .child(
                 edge_faded(
                     theme::RAIL_FADE_BAND,
@@ -17692,6 +17744,10 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         zone_projects_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_PROJECTS,
                         )),
+                        zone_folders_collapsed: std::cell::Cell::new(load_zone_collapsed(
+                            ZONE_FOLDERS,
+                        )),
+                        zone_tabs_collapsed: std::cell::Cell::new(load_zone_collapsed(ZONE_TABS)),
                         zone_sessions_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_SESSIONS,
                         )),
