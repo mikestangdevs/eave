@@ -380,6 +380,15 @@ pub fn overlay_strongest() -> Hsla {
     ink(0.20)
 }
 
+/// Opaque plate for the front tile of the empty-bookmark stack.
+///
+/// [`overlay`] is α 0.08, so two overlapping ghosts show through each
+/// other. This is the composite of [`overlay_strongest`] over black,
+/// baked opaque, so the middle card reads as a filled tile.
+pub fn bookmark_empty_front() -> Hsla {
+    grey(0x2e)
+}
+
 // ---------------------------------------------------------------------------
 // Elevation — separates layers, never decorates. On a dark canvas the
 // mechanism is SURFACE LUMINANCE: each layer steps lighter, and its
@@ -1660,20 +1669,25 @@ pub fn rail_tabs_max_h() -> f32 {
 /// them and pushed the ninth tab off the bottom, which is exactly what it
 /// did on this slice's first run.
 ///
-/// So the cap applies to the tab rows and the rest are added on top. Every
-/// row in the list is [`RAIL_TAB_H`] tall — including the zone gap, since
-/// [`RAIL_ZONE_GAP`] is the same 24 — so one uniform arithmetic still holds.
+/// So the cap applies to the tab rows and the rest are added on top.
+///
+/// One of the extras is the folders/tabs rule, which is [`rail_rule_h`]
+/// rather than [`RAIL_TAB_H`]. Everything else extra (zone headers, ghost
+/// rows, folder rows) is still one tab tall. `extra` always includes that
+/// rule — `emit_folders_and_tabs_head` always pushes it.
 pub fn rail_rows_h(rows: usize, extra: usize) -> f32 {
     let tabs = rows.saturating_sub(extra);
-    let n = tabs.min(RAIL_TABS_VISIBLE) + extra;
-    if n == 0 {
-        return 0.0;
+    let extra_tab_h = extra.saturating_sub(1);
+    let n = tabs.min(RAIL_TABS_VISIBLE) + extra_tab_h;
+    if extra == 0 {
+        if n == 0 {
+            return 0.0;
+        }
+        let n = n as f32;
+        return RAIL_TAB_H * n + RAIL_ROW_GAP * (n - 1.0);
     }
-    // Computed here rather than delegated to `rail_tabs_h`: that function
-    // caps at `RAIL_TABS_VISIBLE`, which would re-apply the very cap this
-    // one exists to lift and silently hand back nine rows again.
-    let n = n as f32;
-    RAIL_TAB_H * n + RAIL_ROW_GAP * (n - 1.0)
+    let total = n + 1; // + the rule
+    RAIL_TAB_H * (n as f32) + rail_rule_h() + RAIL_ROW_GAP * (total.saturating_sub(1) as f32)
 }
 
 pub fn rail_tabs_h(n: usize) -> f32 {
@@ -1745,6 +1759,12 @@ pub const RAIL_GUTTER: f32 = SPACE_3;
 /// card is a highlight around text, so it must bleed past the text it
 /// highlights or the selection looks clipped.
 pub const RAIL_CARD_BLEED: f32 = SPACE_3;
+
+/// Air inside a rail hover/selection pill, between the wash's edge and
+/// the content. 6 sits in the 4–6 px the operator asked for after the
+/// gutter-inset pills sat flush on the text. [`SPACE_1`] is the floor of
+/// that range and still read tight against [`RADIUS_SELECT`].
+pub const RAIL_HOVER_PAD: f32 = 6.0;
 
 /// The rail row's **leading strip**: the bare column, outside the row's
 /// washed card, that carries the selection bar and the state mark.
@@ -1850,30 +1870,17 @@ pub const RAIL_NAME_LINE: f32 = 19.0;
 /// is being rescaled either way).
 pub const RAIL_MARK: f32 = 16.0;
 
-/// The site mark inside a tile — [`RAIL_MARK`], the same 16 px the strip
-/// plate uses.
+/// The site mark inside a tile.
 ///
-/// Held as its own name rather than spelled `RAIL_MARK` at the call site
-/// because the two are equal by coincidence of size, not by contract: the
-/// strip's mark answers to a row's height and this one to a tile's.
+/// 24 logical × 2 = 48 device on a retina Mac. Favicon bytes are
+/// rasterized to **this** size for the tile and to [`RAIL_MARK`]×2 (32)
+/// for the tab plate — one 48×48 bitmap in both slots is why the plate
+/// looked muddy (Metal bilinear 48→32). See `web/favicon_adapt.rs`.
 pub const BOOKMARK_TILE_MARK: f32 = 24.0;
 
 /// A tile's corner. Roughly a quarter of the tile, matching the reference
 /// frame's squircle.
 pub const BOOKMARK_TILE_RADIUS: f32 = 12.0;
-
-/// The plate a site mark sits on inside its cell (Slice D4.2, repair 1).
-///
-/// A favicon is authored against the page's own background, which is white
-/// far more often than not — so github's octocat and x.com's mark are
-/// near-black glyphs with transparent surrounds. Dropped straight onto the
-/// rail's dark cell they vanish into it. The plate is one rung up from the
-/// cell fill, which gives those marks the light ground they were drawn for
-/// without lying about what the icon is.
-pub const BOOKMARK_MARK_PLATE_RADIUS: f32 = 8.0;
-
-/// The plate's size: the mark plus a ring of its own ground on each side.
-pub const BOOKMARK_MARK_PLATE: f32 = BOOKMARK_TILE_MARK + SPACE_2;
 
 /// How far a folder's children sit in from the folder row (Slice T1b).
 ///
@@ -1900,7 +1907,26 @@ pub const BOOKMARK_CHILD_INDENT: f32 = RAIL_MARK + SPACE_2;
 /// the absolute size. A reader group things by relative proximity, so the
 /// between-zone gap has to be unmistakably larger than the within-zone one
 /// or the rail reads as a single undifferentiated list.
+///
+/// Not a labelled-zone seam — those are [`RAIL_RULE_PAD`] plus a hairline
+/// (folders/tabs inside the strip, tabs/sessions between the two
+/// containers).
 pub const RAIL_ZONE_GAP: f32 = UNIT * 6.0;
+
+/// Air above and below a zone hairline, inside the divider row.
+///
+/// [`SPACE_2`] (8). Folders/tabs also picks up the strip's [`RAIL_ROW_GAP`]
+/// (2), so that painted gap is 10. Tabs/sessions sit in different
+/// containers with no list gap, so the painted gap is 8. Both land in
+/// the 6–8 range that replaced the empty [`RAIL_ZONE_GAP`] box. A
+/// `border_t` on a rounded header is what made the old line hug the
+/// label and curve at the ends.
+pub const RAIL_RULE_PAD: f32 = SPACE_2;
+
+/// Height of a zone divider row: pad + hairline + pad.
+pub fn rail_rule_h() -> f32 {
+    RAIL_RULE_PAD * 2.0 + HAIRLINE
+}
 
 /// The space between rows INSIDE a zone.
 ///
@@ -1912,24 +1938,65 @@ pub const RAIL_ZONE_GAP: f32 = UNIT * 6.0;
 /// label to announce them.
 pub const RAIL_ROW_GAP: f32 = 2.0;
 
-/// One pinned-bookmark cell (Slice D4).
+/// One pinned-bookmark cell.
 ///
-/// **Derived to fill the rail's content width in three columns.** Content is
-/// `RAIL_W - 2 * RAIL_GUTTER` = `228 - 24` = **204**. Three columns with two
-/// [`BOOKMARK_GRID_GAP`] gaps leave `(204 - 20) / 3` = **61.33**, and the
-/// rail holds to the 4 px unit, so 60 is the fit: `60 * 3 + 10 * 2` = **200**
-/// of 204, with 4 px of slack rather than a fractional pixel on every cell.
+/// A **fixed square**. It does not grow with the rail: dragging the seam
+/// changes how many sit on a row ([`bookmark_columns`]), never the cell.
+/// D4's 60 filled three `flex_1` columns of the resting rail and became a
+/// ~92 px rectangle at [`RAIL_W_MAX`] — that stretch is the thing this
+/// number exists to stop.
 ///
-/// D4 calls the cells "the hero of the rail" and asks that they dominate the
-/// top at thumbnail size. This is the third value the tile has had: T1b's 60
-/// (three columns, called too big), then 36 (five columns), now 60 again —
-/// but arrived at from the opposite direction. 36 was too small because five
-/// columns is a strip of chips; 60 is right because three columns is a grid.
-/// The number was never the disagreement; the column count was.
-pub const BOOKMARK_TILE: f32 = 60.0;
+/// 44 is `UNIT * 11`. Content width is `rail_w − 2 * RAIL_GUTTER`. Three
+/// squares plus two [`BOOKMARK_GRID_GAP`]s need `3 * 44 + 20` = **152**.
+/// At [`RAIL_W_MIN`] that is 156 ≥ 152, so three from the floor up. 48
+/// needed 164 and wrapped the third tile (and the `+`) onto a second
+/// row at the width the operator was actually using.
+pub const BOOKMARK_TILE: f32 = 44.0;
+
+/// Empty-grid illustration tile. Two units smaller than a real pin so
+/// three overlapping squares fit the rail without looking like the
+/// populated grid.
+pub const BOOKMARK_EMPTY_TILE: f32 = BOOKMARK_TILE - SPACE_2;
+
+/// Horizontal step between overlapping empty tiles. [`SPACE_4`] so they
+/// overlap by half a tile (`40 − 16` = 24 of shared width).
+pub const BOOKMARK_EMPTY_STEP_X: f32 = SPACE_4;
+
+/// Vertical step between overlapping empty tiles.
+pub const BOOKMARK_EMPTY_STEP_Y: f32 = SPACE_2;
 
 /// The gap between grid cells (Slice D4 names 10 px).
 pub const BOOKMARK_GRID_GAP: f32 = 10.0;
+
+/// Fewest bookmark squares on a row. Kept as a floor for a rail that
+/// somehow lands under [`RAIL_W_MIN`]; at every legal width three fit.
+pub const BOOKMARK_COLS_MIN: usize = 2;
+
+/// Most bookmark squares on a row. A fourth would fit at [`RAIL_W_MAX`]
+/// (`4 * 44 + 30` = 206 ≤ 296) and is refused: leftover width stays empty
+/// rather than minting a fourth column or stretching the square.
+pub const BOOKMARK_COLS_MAX: usize = 3;
+
+/// Empty-grid copy. 9/12 so "Save sites you open all the time" holds
+/// one line at [`RAIL_W_MIN`] (156 px of content). 10 px still wrapped.
+pub const BOOKMARK_EMPTY_SIZE: f32 = 9.0;
+pub const BOOKMARK_EMPTY_LINE: f32 = 12.0;
+
+/// How many bookmark squares one rail row holds at `rail_w`.
+///
+/// Three once three fixed squares fit in the content width, two only if
+/// they do not (below the drag floor). Never four. Pass the shell's live
+/// rail width, not [`RAIL_W`].
+pub fn bookmark_columns(rail_w: f32) -> usize {
+    let content = rail_w - 2.0 * RAIL_GUTTER;
+    let three = (BOOKMARK_COLS_MAX as f32) * BOOKMARK_TILE
+        + ((BOOKMARK_COLS_MAX - 1) as f32) * BOOKMARK_GRID_GAP;
+    if content >= three {
+        BOOKMARK_COLS_MAX
+    } else {
+        BOOKMARK_COLS_MIN
+    }
+}
 
 /// A ghost row's height — the same as any other rail row, because it IS a
 /// row. That is the whole mechanic: an action shaped like the thing it acts
@@ -3374,6 +3441,7 @@ mod tests {
             ("overlay", overlay()),
             ("overlay_strong", overlay_strong()),
             ("overlay_strongest", overlay_strongest()),
+            ("bookmark_empty_front", bookmark_empty_front()),
             ("wash_raised", wash_raised()),
             ("border", border()),
             ("border_strong", border_strong()),

@@ -9,8 +9,12 @@
 //! **Do not call `download_image` from inside `OnFaviconURLChange`.**
 //! That handler runs in the middle of `CefDoMessageLoopWork`. Starting a
 //! URLRequest there is a no-op on this CEF (Alloy + OSR): the callback
-//! never fires and the plate stays on the globe. [`fetch`] only queues;
-//! [`run_queued`] starts the download after the pump returns.
+//! never fires and the globe stays. [`fetch`] only queues; [`run_queued`]
+//! starts the download after the pump returns. Dark-on-transparent glyphs
+//! are inverted in [`store`] so they read on the rail's dark tiles. Each
+//! slot gets its own device-size PNG: the tab plate is 16 logical (32
+//! device on 2×), the bookmark mark is 24 (48 device). Sharing one 48×48
+//! bitmap made the plate bilinear-filter 48→32.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -21,8 +25,22 @@ use gpui::ImageFormat;
 
 use super::tabs::{with_any_browser, with_browser};
 
+/// One download, two paint sizes. gpui `img` treats PNG pixels as 1×
+/// logical and Metal bilinear-filters a miss, so the plate and the tile
+/// cannot share a bitmap.
+///
+/// `source_px` is the native side before slot resize. GitHub's tab PNG
+/// is 32 — 1:1 on the plate, 1.5× and pixelated on the 48 px tile. A
+/// later apple-touch (120) must be allowed to replace it.
+#[derive(Clone)]
+struct CachedIcon {
+    tab: Arc<gpui::Image>,
+    tile: Arc<gpui::Image>,
+    source_px: u32,
+}
+
 thread_local! {
-    static ICONS: RefCell<HashMap<String, Arc<gpui::Image>>> = RefCell::new(HashMap::new());
+    static ICONS: RefCell<HashMap<String, CachedIcon>> = RefCell::new(HashMap::new());
     /// Last URL we asked Chromium to fetch, so a snapshot that restates
     /// the same icon does not start another download.
     static ASKED: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
@@ -32,11 +50,11 @@ thread_local! {
     /// A bookmark is not a tab, so it can never appear in [`ICONS`]. Keying
     /// by host also means visiting a site pays for its bookmark's tile: one
     /// download serves the tab plate and every bookmark to that host.
-    static BY_HOST: RefCell<HashMap<String, Arc<gpui::Image>>> = RefCell::new(HashMap::new());
-    /// Host -> the [`LOAD_GEN`] we last asked at, so a rail that re-renders
-    /// sixty times a second does not start sixty downloads — and so a
-    /// request Chromium dropped is asked again rather than never.
-    static ASKED_HOST: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+    static BY_HOST: RefCell<HashMap<String, CachedIcon>> = RefCell::new(HashMap::new());
+    /// `(host, icon_url)` -> the [`LOAD_GEN`] we last asked at. Keyed by
+    /// URL, not host: a 32 px `/favicon.ico` must not block the
+    /// apple-touch upgrade that makes the tile sharp.
+    static ASKED_HOST_URL: RefCell<HashMap<(String, String), u64>> = RefCell::new(HashMap::new());
     /// Bumped every time a page finishes loading.
     ///
     /// **This is the whole fix for "the tiles stayed globes".** The first
@@ -61,9 +79,21 @@ pub fn note_page_loaded() {
     LOAD_GEN.with(|g| g.set(g.get() + 1));
 }
 
-/// The icon for any url, by host. `None` means "no bytes yet", never
-/// "this site has no icon" — same contract as [`get`].
+/// The icon for any url, by host, sized for the bookmark tile.
+/// `None` means "no bytes yet", never "this site has no icon" — same
+/// contract as [`get`].
 pub fn for_url(url: &str) -> Option<Arc<gpui::Image>> {
+    host_icon(url).map(|c| c.tile)
+}
+
+/// The same host cache, sized for the tab plate. A restored tab has no
+/// tab-id entry until Chromium restates the icon; the host paid for both
+/// sizes when the page (or a bookmark) last fetched.
+pub fn tab_for_url(url: &str) -> Option<Arc<gpui::Image>> {
+    host_icon(url).map(|c| c.tab)
+}
+
+fn host_icon(url: &str) -> Option<CachedIcon> {
     let host = crate::omnibox::engine_host(url);
     if host.is_empty() {
         return None;
@@ -72,8 +102,21 @@ pub fn for_url(url: &str) -> Option<Arc<gpui::Image>> {
 }
 
 pub fn get(tab_id: &str) -> Option<Arc<gpui::Image>> {
+    ICONS.with(|m| m.borrow().get(tab_id).map(|c| c.tab.clone()))
+}
+
+fn cached(tab_id: &str) -> Option<CachedIcon> {
     ICONS.with(|m| m.borrow().get(tab_id).cloned())
 }
+
+fn host_source_px(host: &str) -> u32 {
+    BY_HOST.with(|m| m.borrow().get(host).map(|c| c.source_px).unwrap_or(0))
+}
+
+/// A source at least this large Lanczos-down to the 48 px tile without
+/// inventing pixels. 32 (GitHub's tab PNG / ICO) is below it — that is
+/// the pixelated bookmark.
+const TILE_SOURCE_MIN: u32 = 96;
 
 /// Forget a tab that has actually closed. An eviction keeps the pixels:
 /// the tab is still on the strip and the icon is still true of it.
@@ -107,11 +150,15 @@ pub fn fetch(tab_id: &str, url: &str, page_url: &str) {
     // which is exactly the bookmark tile staying a globe forever.
     let page_host = crate::omnibox::engine_host(page_url);
     if !page_host.is_empty() {
-        if let Some(image) = get(tab_id) {
+        if let Some(icon) = cached(tab_id) {
             BY_HOST.with(|m| {
-                m.borrow_mut().entry(page_host.clone()).or_insert(image);
+                m.borrow_mut().entry(page_host.clone()).or_insert(icon);
             });
         }
+        // Tab PNG is often 32 (GitHub). That is 1:1 on the plate and
+        // pixelated on the tile — ask apple-touch so the tile can
+        // Lanczos down from 120+.
+        maybe_enqueue_upgrade(&page_host);
     }
     let skip = ASKED.with(|m| m.borrow().get(tab_id).map(|u| u == url).unwrap_or(false))
         && get(tab_id).is_some();
@@ -165,7 +212,7 @@ fn start(tab_id: &str, url: &str, page_host: &str) {
         return;
     }
     if tab_id.is_empty() && !page_host.is_empty() {
-        if BY_HOST.with(|m| m.borrow().contains_key(page_host)) {
+        if host_source_px(page_host) >= TILE_SOURCE_MIN {
             return;
         }
     }
@@ -185,7 +232,10 @@ fn start(tab_id: &str, url: &str, page_host: &str) {
         // `is_favicon=0`: the dedicated favicon path on this CEF does not
         // complete under OSR. An ordinary image download still uses the
         // browser's request context (cookies, cache, proxy).
-        host.download_image(Some(&CefString::from(url)), 0, 0, 0, Some(&mut cb));
+        // `max_image_size` 256: keep a large source (apple-touch, SVG
+        // that actually rasters big, 128 PNG) and Lanczos *down* to the
+        // slot. 0 can mean "default small" on some CEF builds.
+        host.download_image(Some(&CefString::from(url)), 0, 256, 0, Some(&mut cb));
         true
     };
 
@@ -208,8 +258,9 @@ fn start(tab_id: &str, url: &str, page_host: &str) {
         });
     } else {
         let gen = LOAD_GEN.with(|g| g.get());
-        ASKED_HOST.with(|m| {
-            m.borrow_mut().insert(page_host.to_string(), gen);
+        ASKED_HOST_URL.with(|m| {
+            m.borrow_mut()
+                .insert((page_host.to_string(), url.to_string()), gen);
         });
     }
     super::host::request_pump();
@@ -224,50 +275,116 @@ fn start(tab_id: &str, url: &str, page_host: &str) {
 /// is empty for a url we could not read a host out of. Either may be
 /// skipped, and skipping both is a download nobody can ever see — which is
 /// why the caller checks before starting one.
-fn store(tab_id: &str, host: &str, image: Arc<gpui::Image>) {
+fn store(tab_id: &str, host: &str, icon: CachedIcon) {
     if !tab_id.is_empty() {
         ICONS.with(|m| {
-            m.borrow_mut().insert(tab_id.to_string(), image.clone());
+            let mut m = m.borrow_mut();
+            let better = m
+                .get(tab_id)
+                .is_none_or(|old| icon.source_px >= old.source_px);
+            if better {
+                m.insert(tab_id.to_string(), icon.clone());
+            }
         });
     }
     if !host.is_empty() {
         BY_HOST.with(|m| {
-            m.borrow_mut().insert(host.to_string(), image);
+            let mut m = m.borrow_mut();
+            let better = m
+                .get(host)
+                .is_none_or(|old| icon.source_px >= old.source_px);
+            if better {
+                m.insert(host.to_string(), icon);
+            }
         });
     }
     super::host::note_chrome_change();
 }
 
+/// `{origin}/apple-touch-icon.png` is the size Arc uses for a pin.
+/// GitHub's is 120×120; `/favicon.ico` is 16+32 and looks like Lego on
+/// the 24 px tile. Skip when we already have ≥ [`TILE_SOURCE_MIN`].
+fn maybe_enqueue_upgrade(host: &str) {
+    if host.is_empty() || host_source_px(host) >= TILE_SOURCE_MIN {
+        return;
+    }
+    let url = format!("https://{host}/apple-touch-icon.png");
+    let gen = LOAD_GEN.with(|g| g.get());
+    let asked = ASKED_HOST_URL.with(|m| {
+        m.borrow()
+            .get(&(host.to_string(), url.clone()))
+            .is_some_and(|asked| *asked == gen)
+    });
+    if asked {
+        return;
+    }
+    enqueue(String::new(), url, host.to_string());
+}
+
 /// Ask for a BOOKMARK's icon — no tab, no browser of its own.
 ///
 /// Routed through whatever browser happens to be live, per spec 06-browser
-/// D13 (never a second HTTP client). Guesses `/favicon.ico`, because the
-/// real icon url lives in a `<link rel=icon>` we would have to load the
-/// page to read; a tab that later visits the host overwrites this with the
-/// icon the page actually declares.
+/// D13 (never a second HTTP client). Guesses apple-touch first (the
+/// tile is 48 device; a 32 px ICO is what made GitHub look pixelated),
+/// then `/favicon.ico` so a site with no touch icon still gets a mark.
 ///
 /// Queues rather than starting on this stack — same reason as [`fetch`].
 pub fn fetch_for_url(url: &str) {
     let host = crate::omnibox::engine_host(url);
-    if host.is_empty() || for_url(url).is_some() {
+    if host.is_empty() {
         return;
     }
+    maybe_enqueue_upgrade(&host);
+    if host_source_px(&host) > 0 {
+        return;
+    }
+    let ico = format!("https://{host}/favicon.ico");
     let gen = LOAD_GEN.with(|g| g.get());
-    if ASKED_HOST.with(|m| m.borrow().get(&host).is_some_and(|asked| *asked == gen)) {
+    let asked = ASKED_HOST_URL.with(|m| {
+        m.borrow()
+            .get(&(host.clone(), ico.clone()))
+            .is_some_and(|asked| *asked == gen)
+    });
+    if asked {
         return;
     }
-    let guess = format!("https://{host}/favicon.ico");
-    enqueue(String::new(), guess, host);
+    enqueue(String::new(), ico, host);
 }
 
 fn png_from_cef(image: &mut Image) -> Option<Vec<u8>> {
     if image.is_empty() != 0 {
         return None;
     }
-    for scale in [1.0_f32, 2.0] {
+    // Ask for the *native* representation with the most pixels, not
+    // `as_png(3.0)` — closest-match at 3× can bilinear-upsample a 16×16
+    // to 48, and that blurry PNG is what we then painted 1:1.
+    let mut best_scale = 1.0_f32;
+    let mut best_area = 0i32;
+    let mut found = false;
+    for want in [3.0_f32, 2.0, 1.5, 1.0] {
+        let mut actual = 0.0_f32;
         let mut w = 0i32;
         let mut h = 0i32;
-        let Some(png) = image.as_png(scale, 1, Some(&mut w), Some(&mut h)) else {
+        if image.representation_info(want, Some(&mut actual), Some(&mut w), Some(&mut h)) == 0 {
+            continue;
+        }
+        let area = w.saturating_mul(h);
+        if area > best_area {
+            best_area = area;
+            best_scale = if actual > 0.0 { actual } else { want };
+            found = true;
+        }
+    }
+    let scales: &[f32] = if found {
+        &[best_scale]
+    } else {
+        &[3.0, 2.0, 1.0]
+    };
+    let mut best: Option<(i32, Vec<u8>)> = None;
+    for scale in scales {
+        let mut w = 0i32;
+        let mut h = 0i32;
+        let Some(png) = image.as_png(*scale, 1, Some(&mut w), Some(&mut h)) else {
             continue;
         };
         let n = png.size();
@@ -276,16 +393,22 @@ fn png_from_cef(image: &mut Image) -> Option<Vec<u8>> {
         }
         let mut buf = vec![0u8; n];
         let copied = png.data(Some(&mut buf), 0);
-        if copied > 0 {
+        let bytes = if copied > 0 {
             buf.truncate(copied);
-            return Some(buf);
-        }
-        let ptr = png.raw_data() as *const u8;
-        if !ptr.is_null() {
-            return Some(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec());
+            buf
+        } else {
+            let ptr = png.raw_data() as *const u8;
+            if ptr.is_null() {
+                continue;
+            }
+            unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+        };
+        let area = w.saturating_mul(h);
+        if best.as_ref().is_none_or(|(a, _)| area > *a) {
+            best = Some((area, bytes));
         }
     }
-    None
+    best.map(|(_, b)| b)
 }
 
 // `wrap_download_image_callback!` expands to trait names that do not
@@ -320,10 +443,15 @@ wrap_download_image_callback! {
             }
             let Some(image) = image else { return };
             let Some(bytes) = png_from_cef(image) else { return };
+            let pngs = super::favicon_adapt::for_dark_rail(&bytes);
             store(
                 &self.tab_id,
                 &self.host,
-                Arc::new(gpui::Image::from_bytes(ImageFormat::Png, bytes)),
+                CachedIcon {
+                    tab: Arc::new(gpui::Image::from_bytes(ImageFormat::Png, pngs.tab)),
+                    tile: Arc::new(gpui::Image::from_bytes(ImageFormat::Png, pngs.tile)),
+                    source_px: pngs.source_px,
+                },
             );
         }
     }

@@ -136,6 +136,29 @@ pub fn children_of(snapshot: &BookmarksSnapshot, folder_id: &str) -> Vec<BarItem
         .collect()
 }
 
+/// Every link url in a folder's subtree, in tree order.
+///
+/// Direct and nested. "Copy All Links" is the whole contents, not only
+/// the first rank — a folder of folders would otherwise copy nothing.
+pub fn links_in(snapshot: &BookmarksSnapshot, folder_id: &str) -> Vec<String> {
+    let Some(start) = snapshot
+        .nodes
+        .iter()
+        .position(|n| n.bookmark.id == folder_id)
+    else {
+        return Vec::new();
+    };
+    let depth = snapshot.nodes[start].depth;
+    snapshot.nodes[start + 1..]
+        .iter()
+        .take_while(|n| n.depth > depth)
+        .filter_map(|n| match &n.bookmark.kind {
+            BookmarkKind::Link { url } if !url.is_empty() => Some(url.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +224,17 @@ mod tests {
         // node is not swept in.
         assert!(children_of(&s, "hn").is_empty());
         assert!(children_of(&s, "nobody").is_empty());
+    }
+
+    #[test]
+    fn copy_all_links_walks_the_whole_subtree() {
+        let s = tree();
+        assert_eq!(
+            links_in(&s, "dev"),
+            vec!["https://docs.rs/", "https://deep.test/"]
+        );
+        assert!(links_in(&s, "hn").is_empty());
+        assert!(links_in(&s, "nobody").is_empty());
     }
 
     /// A link with no name of its own reads as its host, and an operator's

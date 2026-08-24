@@ -1,54 +1,90 @@
 #!/usr/bin/env python3
-"""Stop every eave UI, engine, and CEF helper this machine is running.
+"""Stop eave UI, engine, and CEF helpers.
 
 eave is one binary in two roles. The process that owns the window is
 rarely the one a name search returns — that is usually `--engine`, which
 outlives the window on purpose and will make the *next* UI attach to an
-old product. Kill both, from every checkout and from /Applications, so
-the bundle we launch next is the only eave on screen.
+old product. Kill both.
+
+`--bundle PATH` kills only that `.app` (what `dev.sh` / `run-app.sh`
+want). With no flag it still hunts every `/eave.app/Contents/` and every
+loose `target/debug/eave`, so a leftover from another checkout cannot
+own the window.
 
 Does not match Cursor helpers or this script. Identifies victims by the
 path of the binary, never by the substring "eave" alone.
+
+Uses `pgrep` + `ps -p`, never `ps -ax`. Whole-process-table `ps` never
+returns on this host (CloudDocs).
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import signal
 import subprocess
 import time
 
 
-def victims() -> list[int]:
-    out = subprocess.check_output(["ps", "-ax", "-o", "pid=,command="], text=True)
-    found: list[int] = []
+def pgrep(*args: str) -> list[int]:
+    try:
+        out = subprocess.check_output(["pgrep", *args], text=True)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 1:
+            return []
+        raise
+    return [int(x) for x in out.split() if x.isdigit()]
+
+
+def cmdline(pid: int) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="], text=True
+        )
+    except subprocess.CalledProcessError:
+        return None
+    cmd = out.strip()
+    return cmd or None
+
+
+def victims(bundle: str | None) -> list[int]:
+    cand: set[int] = set()
+    cand.update(pgrep("-x", "eave"))
+    cand.update(pgrep("-f", "/eave.app/Contents/"))
+    cand.update(pgrep("-f", "/target/debug/eave"))
+    cand.update(pgrep("-f", "/target/release/eave"))
+    needle = None
+    if bundle:
+        needle = os.path.realpath(bundle).rstrip("/")
     me = os.getpid()
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        pid_s, _, cmd = line.partition(" ")
-        try:
-            pid = int(pid_s)
-        except ValueError:
-            continue
+    found: list[int] = []
+    for pid in cand:
         if pid == me:
             continue
-        if "Cursor Helper" in cmd:
+        cmd = cmdline(pid)
+        if not cmd or "Cursor Helper" in cmd:
             continue
-        # Product bundle (UI, engine spawned from it, CEF helpers).
+        if needle is not None:
+            if needle in cmd:
+                found.append(pid)
+            continue
         if "/eave.app/Contents/" in cmd:
             found.append(pid)
             continue
-        # Loose cargo output from any worktree — the thing that is not
-        # a browser, and the thing last session launched by mistake.
         if "/target/debug/eave" in cmd or "/target/release/eave" in cmd:
             found.append(pid)
     return found
 
 
 def main() -> None:
-    pids = victims()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--bundle",
+        help="only kill processes of this .app (realpath-matched)",
+    )
+    args = parser.parse_args()
+    pids = victims(args.bundle)
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -56,14 +92,16 @@ def main() -> None:
             pass
     deadline = time.time() + 2.5
     while time.time() < deadline:
-        if not victims():
+        if not victims(args.bundle):
             break
         time.sleep(0.08)
-    for pid in victims():
+    for pid in victims(args.bundle):
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    if args.bundle:
+        return
     data = os.path.join(
         os.path.expanduser("~"), "Library", "Application Support", "eave"
     )

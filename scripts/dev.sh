@@ -67,7 +67,7 @@ restamp() {
     tail -40 "$LOG" >&2
     return 1
   fi
-  python3 "$ROOT/scripts/stop-eave.py"
+  python3 "$ROOT/scripts/stop-eave.py" --bundle "$APP"
   install -m 755 "$ROOT/target/debug/eave" "$BIN"
   local helper_src="$ROOT/target/debug/eave-web-helper"
   local entry name helper
@@ -96,7 +96,7 @@ rebuild() {
 }
 
 launch() {
-  python3 "$ROOT/scripts/stop-eave.py"
+  python3 "$ROOT/scripts/stop-eave.py" --bundle "$APP"
   log "opening $APP"
   open -n "$APP"
 }

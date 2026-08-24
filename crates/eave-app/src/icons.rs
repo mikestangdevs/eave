@@ -9,7 +9,7 @@
 //!
 //! # Where these come from
 //!
-//! The 52 line glyphs are the **Solar Icons** set (Linear weight) by 480
+//! The 53 line glyphs are the **Solar Icons** set (Linear weight) by 480
 //! Design, **CC BY 4.0** — vendored out of `comet/crates/ui/assets/icons/`
 //! in this same workspace, which is where the user pointed. **Attribution
 //! is a licence condition, not a courtesy**; eave had no notices file at
@@ -24,7 +24,7 @@
 //!
 //! The five `status-*` glyphs are the only P3 drawings that survive, for a
 //! reason that is not sentiment: **the family has no VCS status set**, and
-//! nothing in 52 Solar glyphs means "modified" or "conflicted".
+//! nothing in 53 Solar glyphs means "modified" or "conflicted".
 //!
 //! # Three classes, because one weight rule cannot cover all three
 //!
@@ -128,7 +128,7 @@ icons! {
 // Solar Icons (Linear) by 480 Design, CC BY 4.0. Attribution in
 // `THIRD_PARTY_NOTICES.md`. The whole family is vendored rather than the
 // handful today's screens use: a set is only coherent if the next screen
-// can reach for a glyph without a second licensing pass, and 52 files is
+// can reach for a glyph without a second licensing pass, and 53 files is
 // ~40 KB in the binary.
 Line {
     ADD_CIRCLE => "add-circle.svg",
@@ -155,6 +155,7 @@ Line {
     FOLD_VERTICAL => "fold-vertical.svg",
     FOLDER_WITH_FILES => "folder-with-files.svg",
     FOLDER => "folder.svg",
+    FOLDER_OPEN => "folder-open.svg",
     GIT_BRANCH => "git-branch.svg",
     GLOBAL => "global.svg",
     INFO_CIRCLE => "info-circle.svg",
@@ -470,19 +471,18 @@ mod tests {
         for (path, _, _) in REGISTRY {
             assert!(Icons.load(path).unwrap().is_some(), "{path}");
         }
-        assert_eq!(of(Class::Line).count(), 52, "the vendored Solar family");
+        assert_eq!(of(Class::Line).count(), 53, "the vendored Solar family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 63);
+        assert_eq!(REGISTRY.len(), 64);
     }
 
     /// Every registered path is a file that exists on disk under exactly
     /// the name the constant claims, and every file on disk is registered.
     ///
     /// `include_bytes!` already proves the first half at compile time. The
-    /// second half is the one that matters here: 63 files arrived in one
-    /// `cp` sweep, and an unregistered leftover is dead weight in the repo
-    /// that no test would otherwise mention.
+    /// second half is the one that matters here: an unregistered leftover
+    /// is dead weight in the repo that no test would otherwise mention.
     #[test]
     fn the_assets_directory_and_the_registry_hold_the_same_names() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons");

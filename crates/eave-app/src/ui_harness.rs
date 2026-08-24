@@ -4738,7 +4738,7 @@ fn covered_affordance(vcx: &mut VisualTestContext, menu: Bounds<Pixels>) -> Boun
     const CANDIDATES: &[&str] = &[
         "rail-aaaa1111",
         "rail-bbbb2222",
-        "bookmark-new-folder",
+        "bookmark-new",
         "project-new",
         "new-session",
     ];
@@ -12193,14 +12193,16 @@ fn moving_a_bookmark_reparents_or_reorders(cx: &mut TestAppContext) {
     );
 }
 
-/// Slice T1 — the bar makes folders, and names them so two are told apart.
+/// Slice T1 — the Folders header makes folders, and names them so two
+/// are told apart.
 ///
-/// A folder created unnamed would draw as an empty chip: eave has no
-/// inline rename for a bookmark yet (`BookmarkRename` is on the wire and
-/// nothing calls it), so the operator could open it and fill it but never
-/// identify it.
+/// New folder is on the Folders dropdown (double-click / right-click),
+/// not on the bookmark grid's `+`. A folder created unnamed would draw
+/// as an empty chip: eave has no inline rename for a bookmark yet
+/// (`BookmarkRename` is on the wire and nothing calls it), so the
+/// operator could open it and fill it but never identify it.
 #[gpui::test]
-fn the_bar_makes_folders_and_names_them_apart(cx: &mut TestAppContext) {
+fn the_folders_header_makes_folders_and_names_them_apart(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     push_bookmarks(&h, vcx, &[]);
@@ -12212,7 +12214,10 @@ fn the_bar_makes_folders_and_names_them_apart(cx: &mut TestAppContext) {
     );
 
     let _ = h.drain();
-    click(vcx, "bookmark-new-folder");
+    let at = vcx.debug_bounds("zone-folders").expect("zone-folders");
+    vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
+    vcx.run_until_parked();
+    click(vcx, "tab-menu-new-folder");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
@@ -12221,13 +12226,16 @@ fn the_bar_makes_folders_and_names_them_apart(cx: &mut TestAppContext) {
             Command::Browser(BrowserCmd::BookmarkAdd { url: None, title: Some(t), .. })
                 if t == "new folder"
         )),
-        "the bar's folder button made no folder: {cmds:?}"
+        "the Folders header made no folder: {cmds:?}"
     );
 
     // With one already there, the next is distinguishable from it.
     push_bookmarks(&h, vcx, &[("f1", 0, Some("new folder"), None)]);
     let _ = h.drain();
-    click(vcx, "bookmark-new-folder");
+    let at = vcx.debug_bounds("zone-folders").expect("zone-folders");
+    vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
+    vcx.run_until_parked();
+    click(vcx, "tab-menu-new-folder");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(

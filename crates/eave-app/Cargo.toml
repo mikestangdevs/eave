@@ -164,6 +164,10 @@ bezel = { git = "https://github.com/crabtalk/bezel", rev = "f86dbbfc84569cc69f3c
 # so this resolves to the same 1.13.3 and adds nothing to the build.
 unicode-segmentation = "1.13"
 
+# Favicon adapt-for-dark: decode a PNG, decide if it is a dark glyph on
+# transparent, invert. Same crate gpui already compiles (png only).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 futures = "0.3"
 serde_json = "1"

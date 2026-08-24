@@ -49,29 +49,52 @@ fn report(tab_id: &str, fact: PageFact) {
     }
 }
 
-/// Chromium lists icons best-first, but "best" is often a 16×16 ICO.
-/// gpui's `img` decodes PNG/SVG/WEBP more reliably, so those win; an ICO
-/// is still taken over drawing nothing. The plate falls back to the globe
+/// Chromium lists icons best-first, but "best" is often a 16×16 ICO or
+/// an SVG whose viewBox is 16. CEF's `DownloadImage` has no
+/// `preferred_size`, so an SVG rasters at its intrinsic size — usually
+/// 16 — and that is the blur. Prefer a sized PNG / apple-touch, then a
+/// multi-res ICO, and take SVG last. The plate falls back to the globe
 /// if decode fails.
 fn pick_favicon_url(urls: &[String]) -> Option<String> {
-    let score = |u: &str| {
-        let l = u.to_ascii_lowercase();
-        if l.contains(".svg") {
-            0
-        } else if l.contains(".png") || l.contains(".webp") {
-            1
-        } else if l.contains(".jpg") || l.contains(".jpeg") {
-            2
-        } else if l.contains(".ico") {
-            4
-        } else {
-            3
-        }
-    };
     urls.iter()
         .filter(|u| !u.is_empty())
-        .min_by_key(|u| score(u))
+        .min_by_key(|u| favicon_url_score(u))
         .cloned()
+}
+
+fn favicon_url_score(u: &str) -> (u8, u8) {
+    let l = u.to_ascii_lowercase();
+    let size = if l.contains("apple-touch")
+        || l.contains("fluidicon")
+        || l.contains("fluid-icon")
+        || l.contains("192x192")
+        || l.contains("180x180")
+        || l.contains("128x128")
+        || l.contains("256x256")
+        || l.contains("512x512")
+    {
+        0
+    } else if l.contains("96x96") || l.contains("64x64") || l.contains("48x48") {
+        1
+    } else if l.contains("32x32") {
+        2
+    } else if l.contains("16x16") {
+        6
+    } else {
+        3
+    };
+    let kind = if l.contains(".png") || l.contains(".webp") {
+        0
+    } else if l.contains(".ico") {
+        1
+    } else if l.contains(".jpg") || l.contains(".jpeg") {
+        3
+    } else if l.contains(".svg") {
+        4
+    } else {
+        2
+    };
+    (size, kind)
 }
 
 /// CEF caps a windowless browser at `windowless_frame_rate`, and **its
@@ -102,6 +125,31 @@ mod favicon_pick {
         assert_eq!(
             pick_favicon_url(&urls).as_deref(),
             Some("https://a.test/favicon.ico")
+        );
+    }
+
+    #[test]
+    fn prefers_ico_over_svg() {
+        let urls = [
+            "https://a.test/favicon.svg".into(),
+            "https://a.test/favicon.ico".into(),
+        ];
+        assert_eq!(
+            pick_favicon_url(&urls).as_deref(),
+            Some("https://a.test/favicon.ico"),
+            "CEF rasters SVG at its viewBox, usually 16"
+        );
+    }
+
+    #[test]
+    fn prefers_a_sized_png_over_a_bare_ico() {
+        let urls = [
+            "https://a.test/favicon.ico".into(),
+            "https://a.test/favicon-32x32.png".into(),
+        ];
+        assert_eq!(
+            pick_favicon_url(&urls).as_deref(),
+            Some("https://a.test/favicon-32x32.png")
         );
     }
 }

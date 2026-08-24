@@ -16,7 +16,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$ROOT/target/bundle/eave.app"
 CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
 
-python3 "$ROOT/scripts/stop-eave.py"
+python3 "$ROOT/scripts/stop-eave.py" --bundle "$APP"
 
 if [[ ! -x "$APP/Contents/MacOS/eave" ]]; then
   echo "run-app: no binary at $APP — run scripts/dev.sh" >&2
