@@ -1150,6 +1150,20 @@ pub const TRAFFIC_X: f32 = 16.0;
 pub const TRAFFIC_Y: f32 = 17.0;
 pub const TRAFFIC_CLEARANCE: f32 = 86.0;
 
+/// The macOS window button's diameter. Not ours to choose — measured.
+pub const TRAFFIC_D: f32 = 12.0;
+
+/// The air between the traffic lights and the first thing in the rail
+/// (Slice D4.2, repair 6).
+///
+/// **Derived from the lights, not from [`TITLEBAR_H`].** The grid used to
+/// begin wherever the titlebar spacer happened to end, which made its
+/// position a coincidence of an unrelated constant: change `TITLEBAR_H` for
+/// any reason and the grid moves with it for no reason. The lights are what
+/// the eye actually measures the top of the rail against, so the pad is
+/// stated against them — `TRAFFIC_Y + TRAFFIC_D` is where they end.
+pub const RAIL_GRID_TOP: f32 = TRAFFIC_Y + TRAFFIC_D + SPACE_3;
+
 /// Uniform air between the window surface and the content card: top,
 /// right, bottom, and the gap between the rail and the card. 8 px is
 /// [`SPACE_2`].
@@ -1257,6 +1271,19 @@ pub fn bar_glass() -> Hsla {
     neutral(0.33).opacity(0.34)
 }
 pub const RADIUS_BUTTON: f32 = 7.0;
+
+/// The SELECTED row's corner (Slice D4.2, repair 4).
+///
+/// Named `RADIUS_SELECT`, not `RADIUS_PILL`: that name is taken, by the
+/// 13 px capsule further down this file. Two different shapes both called
+/// "pill" is the collision this track has already paid for three times.
+///
+/// **8, not [`RADIUS_BUTTON`]'s 7.** Selection is now a filled pill and
+/// nothing else — no rim, no outline — so the corner is the only thing
+/// carrying its shape, and it is worth one shared token rather than three
+/// call sites that can drift. Wake's sidebar reaches the same number for the
+/// same reason ("圆角均 8px" — every corner 8).
+pub const RADIUS_SELECT: f32 = 8.0;
 /// T3's `--control-radius` (8 px): ghost chips in the composer toolbar.
 pub const RADIUS_CONTROL: f32 = 8.0;
 
@@ -1622,13 +1649,45 @@ pub fn rail_tabs_max_h() -> f32 {
 ///
 /// Zero rows gives zero height rather than one row of empty box, so a rail
 /// with nothing open shows a header and no gap under it.
+/// The OPEN section's height when the list also carries rows that are NOT
+/// tabs (Slice D4).
+///
+/// [`RAIL_TABS_VISIBLE`] is a promise about **tabs** — nine of them on
+/// screen at the default window size, which `nine_tabs_fit_the_rail_without_scrolling`
+/// measures. D4 put four other kinds of row into the same list: the zone
+/// gap, the projects ghost row, the tabs ghost row, and any bookmark folder
+/// rows. Capping the total at nine would have spent the tabs' budget on
+/// them and pushed the ninth tab off the bottom, which is exactly what it
+/// did on this slice's first run.
+///
+/// So the cap applies to the tab rows and the rest are added on top. Every
+/// row in the list is [`RAIL_TAB_H`] tall — including the zone gap, since
+/// [`RAIL_ZONE_GAP`] is the same 24 — so one uniform arithmetic still holds.
+pub fn rail_rows_h(rows: usize, extra: usize) -> f32 {
+    let tabs = rows.saturating_sub(extra);
+    let n = tabs.min(RAIL_TABS_VISIBLE) + extra;
+    if n == 0 {
+        return 0.0;
+    }
+    // Computed here rather than delegated to `rail_tabs_h`: that function
+    // caps at `RAIL_TABS_VISIBLE`, which would re-apply the very cap this
+    // one exists to lift and silently hand back nine rows again.
+    let n = n as f32;
+    RAIL_TAB_H * n + RAIL_ROW_GAP * (n - 1.0)
+}
+
 pub fn rail_tabs_h(n: usize) -> f32 {
     let n = n.min(RAIL_TABS_VISIBLE);
     if n == 0 {
         return 0.0;
     }
     let n = n as f32;
-    RAIL_TAB_H * n + TAB_GAP * (n - 1.0)
+    // `RAIL_ROW_GAP`, not `TAB_GAP` (Slice D4). This is a DEFINITE height on
+    // a scroll container, so it has to be computed from the gap the list
+    // actually lays out with — D4 tightened rows to 2 px and leaving 4 px
+    // here would have over-measured the box by `(n - 1) * 2`, silently
+    // showing a strip of the tenth row.
+    RAIL_TAB_H * n + RAIL_ROW_GAP * (n - 1.0)
 }
 
 /// **The changes section's height cap (Slice D1).**
@@ -1790,6 +1849,92 @@ pub const RAIL_NAME_LINE: f32 = 19.0;
 /// favicon is actually served at (`16×16` is the ICO default; anything else
 /// is being rescaled either way).
 pub const RAIL_MARK: f32 = 16.0;
+
+/// The site mark inside a tile — [`RAIL_MARK`], the same 16 px the strip
+/// plate uses.
+///
+/// Held as its own name rather than spelled `RAIL_MARK` at the call site
+/// because the two are equal by coincidence of size, not by contract: the
+/// strip's mark answers to a row's height and this one to a tile's.
+pub const BOOKMARK_TILE_MARK: f32 = 24.0;
+
+/// A tile's corner. Roughly a quarter of the tile, matching the reference
+/// frame's squircle.
+pub const BOOKMARK_TILE_RADIUS: f32 = 12.0;
+
+/// The plate a site mark sits on inside its cell (Slice D4.2, repair 1).
+///
+/// A favicon is authored against the page's own background, which is white
+/// far more often than not — so github's octocat and x.com's mark are
+/// near-black glyphs with transparent surrounds. Dropped straight onto the
+/// rail's dark cell they vanish into it. The plate is one rung up from the
+/// cell fill, which gives those marks the light ground they were drawn for
+/// without lying about what the icon is.
+pub const BOOKMARK_MARK_PLATE_RADIUS: f32 = 8.0;
+
+/// The plate's size: the mark plus a ring of its own ground on each side.
+pub const BOOKMARK_MARK_PLATE: f32 = BOOKMARK_TILE_MARK + SPACE_2;
+
+/// How far a folder's children sit in from the folder row (Slice T1b).
+///
+/// One [`RAIL_MARK`] plus the gap that follows it, so a child's own glyph
+/// starts where the folder's LABEL starts — the indent lines the two ranks
+/// up rather than picking an arbitrary step.
+pub const BOOKMARK_CHILD_INDENT: f32 = RAIL_MARK + SPACE_2;
+
+// ---------------------------------------------------------------------------
+// Slice D4 — the rail reads by SHAPE, not by labels
+// ---------------------------------------------------------------------------
+//
+// D4 deleted every caps zone header (`BOOKMARKS`, `PROJECTS`, `TABS`,
+// `SESSIONS`). Nothing names a zone any more, so two things have to carry
+// what the labels used to: the silhouette of a zone's first row, and the
+// space between zones. That makes the gap load-bearing rather than
+// decorative, which is why it gets its own name and a much larger value
+// than any gap inside a zone.
+
+/// The space BETWEEN zones — the whole separator, now that no header names
+/// one.
+///
+/// `UNIT * 6`. Twelve times [`RAIL_ROW_GAP`]: the ratio is the point, not
+/// the absolute size. A reader group things by relative proximity, so the
+/// between-zone gap has to be unmistakably larger than the within-zone one
+/// or the rail reads as a single undifferentiated list.
+pub const RAIL_ZONE_GAP: f32 = UNIT * 6.0;
+
+/// The space between rows INSIDE a zone.
+///
+/// **Deliberately off the 4 px unit.** Every other gap in the rail is a
+/// multiple of [`UNIT`]; this one is half of it, because rows inside a zone
+/// should read as one block and [`TAB_GAP`]'s 4 px was enough air to make
+/// each row look separately addressable. Against [`RAIL_ZONE_GAP`] the
+/// contrast is 1:12, which is what makes zone boundaries obvious with no
+/// label to announce them.
+pub const RAIL_ROW_GAP: f32 = 2.0;
+
+/// One pinned-bookmark cell (Slice D4).
+///
+/// **Derived to fill the rail's content width in three columns.** Content is
+/// `RAIL_W - 2 * RAIL_GUTTER` = `228 - 24` = **204**. Three columns with two
+/// [`BOOKMARK_GRID_GAP`] gaps leave `(204 - 20) / 3` = **61.33**, and the
+/// rail holds to the 4 px unit, so 60 is the fit: `60 * 3 + 10 * 2` = **200**
+/// of 204, with 4 px of slack rather than a fractional pixel on every cell.
+///
+/// D4 calls the cells "the hero of the rail" and asks that they dominate the
+/// top at thumbnail size. This is the third value the tile has had: T1b's 60
+/// (three columns, called too big), then 36 (five columns), now 60 again —
+/// but arrived at from the opposite direction. 36 was too small because five
+/// columns is a strip of chips; 60 is right because three columns is a grid.
+/// The number was never the disagreement; the column count was.
+pub const BOOKMARK_TILE: f32 = 60.0;
+
+/// The gap between grid cells (Slice D4 names 10 px).
+pub const BOOKMARK_GRID_GAP: f32 = 10.0;
+
+/// A ghost row's height — the same as any other rail row, because it IS a
+/// row. That is the whole mechanic: an action shaped like the thing it acts
+/// on, rather than a button parked in a header.
+pub const RAIL_GHOST_H: f32 = RAIL_TAB_H;
 
 // ---------------------------------------------------------------------------
 // Session tabs (Slice AS) — switching sessions with the rail collapsed.

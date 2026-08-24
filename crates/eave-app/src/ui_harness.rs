@@ -1426,17 +1426,22 @@ fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
 
     // Header label and footer fact are both text directly on the rail, so
     // they share the gutter.
+    // Slice D4 deleted the caps header this used to anchor on. The rule it
+    // was checking survives — everything at rail level starts on one gutter
+    // — so it is anchored on the zone's ghost row, which is text on the rail
+    // exactly as the header was.
     assert_eq!(
-        x(vcx, "rail-title"),
+        x(vcx, "new-session-glyph"),
         x(vcx, "rail-resource"),
-        "the sessions rail's header and footer start on different edges"
+        "the sessions zone and the rail's footer start on different edges"
     );
-    // The header's trailing control and a row's card share their RIGHT
-    // edge — this is the 4 px overhang, asserted.
+    // The zone's trailing row and a session row's card share their RIGHT
+    // edge — the 4 px overhang, asserted. Both sit in the same scroller now,
+    // so this is the same rule the header's control used to carry.
     assert_eq!(
         right(vcx, "new-session"),
         right(vcx, "rail-aaaa1111"),
-        "the row card and the + new button end on different edges"
+        "the row card and the zone's ghost row end on different edges"
     );
 
     // The files rail is the same rule, and had the same drift.
@@ -1472,8 +1477,8 @@ fn the_empty_state_starts_on_the_gutter(cx: &mut TestAppContext) {
     };
     assert_eq!(
         x(vcx, "rail-empty"),
-        x(vcx, "rail-title"),
-        "the empty state is indented past the header it sits under"
+        x(vcx, "new-session-glyph"),
+        "the empty state is indented past the rows it sits among"
     );
 }
 
@@ -2987,7 +2992,22 @@ fn the_empty_note_never_becomes_a_row(cx: &mut TestAppContext) {
 }
 
 /// Every clickable element states that it is clickable, and answers the
-/// pointer.
+//// Where `ghost_row` is called for `selector`, if it is one.
+///
+/// rustfmt puts the arguments on one line or on several depending on how
+/// long they are, so this looks for the call and the quoted selector rather
+/// than for a fixed spelling of the two together.
+fn ghost_row_call(src: &str, selector: &str) -> Option<usize> {
+    let quoted = format!("\"{selector}\"");
+    src.match_indices("ghost_row(")
+        .find(|(ix, _)| {
+            let window: String = src[*ix..].chars().take(200).collect();
+            window.contains(&quoted)
+        })
+        .map(|(ix, _)| ix)
+}
+
+// pointer.
 ///
 /// This is a structural check on the source rather than a rendered one,
 /// and deliberately so: gpui resolves `hover` and `cursor_pointer` inside
@@ -3087,6 +3107,29 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         // lost its hover feedback" and both times nothing of the sort had
         // happened. Proximity in a source file is not a property; a fade
         // registered under the control's own key is.
+        // Slice D4 — the zone actions became ghost rows, and all three are
+        // built by ONE helper, so their selector and their fade are both
+        // written generically (`debug_selector(move || selector.into())`,
+        // `hover_fade(selector, ..)`). A source-text search for the literal
+        // therefore cannot find them.
+        //
+        // The guarantee is not weakened, it moved: the helper is checked
+        // once for the shape every ghost row inherits, and the row is
+        // checked for being built by it. That is strictly stronger than
+        // three literal matches, because it cannot drift per-row.
+        if let Some(call) = ghost_row_call(&src, selector) {
+            assert!(
+                src.contains("hover_fade(selector, theme::wash_rest(), theme::overlay())"),
+                "ghost_row lost the hover_fade every zone action inherits \
+                 (checked because {selector} is built at {call})"
+            );
+            assert!(
+                src.contains("debug_selector(move || selector.into())"),
+                "ghost_row lost the debug_selector every zone action \
+                 inherits (checked because {selector} is built at {call})"
+            );
+            continue;
+        }
         assert!(
             src.contains(&format!(r#"debug_selector(|| "{selector}".into())"#)),
             "{selector} is no longer tagged"
@@ -4679,6 +4722,42 @@ fn overlaps(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
         && b.origin.y < a.origin.y + a.size.height
 }
 
+/// A live, command-sending shell affordance that the menu actually covers.
+///
+/// The two occlusion fixtures used to name `rail-aaaa1111` outright. That
+/// worked by **two pixels** — the first session row sat at y=148 and the
+/// menu ended at y=150 — so any change to what the rail stacks above its
+/// sessions silently turned both tests into assertions about nothing. Slice
+/// T1b's BOOKMARKS section was such a change.
+///
+/// Searching for the affordance instead of naming one keeps the fixture
+/// pointed at its actual claim: *something clickable is under this menu*.
+/// Every candidate below sends a command when clicked, which is what the
+/// `h.drain().is_empty()` assertions downstream are reading.
+fn covered_affordance(vcx: &mut VisualTestContext, menu: Bounds<Pixels>) -> Bounds<Pixels> {
+    const CANDIDATES: &[&str] = &[
+        "rail-aaaa1111",
+        "rail-bbbb2222",
+        "bookmark-new-folder",
+        "project-new",
+        "new-session",
+    ];
+    let mut seen = Vec::new();
+    for name in CANDIDATES {
+        if let Some(b) = vcx.debug_bounds(name) {
+            if overlaps(menu, b) {
+                return b;
+            }
+            seen.push(format!("{name} {b:?}"));
+        }
+    }
+    panic!(
+        "no live affordance under the menu {menu:?} — the fixture would \
+         prove nothing. Candidates: {}",
+        seen.join(", ")
+    );
+}
+
 /// Boot, fill the rail, open the menu, and settle it. Returns the menu's
 /// bounds — every occlusion assertion needs them.
 fn open_menu(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext, Bounds<Pixels>) {
@@ -4697,6 +4776,14 @@ fn open_menu(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContex
     // Let the 140 ms entrance land, so nothing below is asserting against
     // a surface that is still arriving.
     drive(&h, vcx, Duration::from_millis(16));
+    // Drain AFTER the trigger, not before it. The opening click is a click
+    // on the shell like any other, and anything it sends belongs to the
+    // fixture rather than to the assertions below. Draining beforehand left
+    // it in the queue, so the first `h.drain().is_empty()` downstream
+    // reported the OPENING click as a click that fell through the menu —
+    // which is what Slice D4 hit the moment a control appeared under the
+    // demo trigger, and it accused the wrong click for an hour.
+    let _ = h.drain();
     let bounds = vcx
         .debug_bounds("overlay-menu")
         .expect("the menu did not render");
@@ -4752,14 +4839,7 @@ fn escape_takes_the_menu_away(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_menu_row_takes_the_click_the_row_beneath_it_would_have(cx: &mut TestAppContext) {
     let (mut h, vcx, menu) = open_menu(cx);
-    let rail = vcx
-        .debug_bounds("rail-aaaa1111")
-        .expect("the rail row did not render");
-    assert!(
-        overlaps(menu, rail),
-        "the fixture proves nothing unless the menu actually covers a live \
-         affordance — menu {menu:?} rail {rail:?}"
-    );
+    let _covered = covered_affordance(vcx, menu);
 
     click(vcx, "menu-row-0");
     vcx.run_until_parked();
@@ -4864,7 +4944,11 @@ fn a_disabled_row_is_present_and_inert(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(chosen, None, "a disabled row fired");
     assert!(open, "a disabled row dismissed the menu it sits in");
-    assert!(h.drain().is_empty(), "the click fell through to the shell");
+    let leaked = h.drain();
+    assert!(
+        leaked.is_empty(),
+        "the click fell through to the shell: {leaked:?}"
+    );
 }
 
 /// An open menu owns the keyboard. A character typed at it must not land
@@ -5011,11 +5095,7 @@ fn a_menu_costs_frames_only_while_it_moves(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_surface_stays_up_and_dead_through_its_exit(cx: &mut TestAppContext) {
     let (mut h, vcx, menu) = open_menu(cx);
-    let rail = vcx.debug_bounds("rail-aaaa1111").expect("no rail row");
-    assert!(
-        overlaps(menu, rail),
-        "the fixture must cover a live affordance"
-    );
+    let _covered = covered_affordance(vcx, menu);
 
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
@@ -8902,8 +8982,14 @@ fn selecting_a_tab_moves_no_tab(cx: &mut TestAppContext) {
 fn no_session_falls_off_the_end_of_the_strip(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let ids = [
+        // **Slice D4 had to grow this again.** D1 grew it from nine because
+        // the rail fits nine; D4 added four non-tab rows to the same list
+        // (zone gap, two ghost rows, folder rows), and `rail_rows_h` gives
+        // those their own budget on top of the nine — so twelve fit now and
+        // the fixture stopped overflowing at all.
         "aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555", "ffff6666", "aaab7777",
-        "bbbc8888", "cccd9999", "dddda111", "eeeeb222", "ffffc333",
+        "bbbc8888", "cccd9999", "dddda111", "eeeeb222", "ffffc333", "aaaad444", "bbbbe555",
+        "ccccf666", "dddd0777",
     ];
     // Distinct activity stamps, newest first, so the rail's order is a
     // known thing rather than whatever `fold_rail` does with a nine-way tie
@@ -11572,14 +11658,19 @@ fn visited_tab(id: &str, url: &str) -> TabInfo {
     t
 }
 
-/// Slice T1 — bookmarks sit **on top of pages**, which means they are not
-/// there in a chat.
+/// Slice T1b — bookmarks live in the **rail**, so they are there in a chat
+/// too.
 ///
-/// That is the operator's own ruling and it has a real cost: the bar
-/// vanishes when the well holds a session. Asserted in both directions so
-/// the cost stays a decision rather than becoming a surprise.
+/// This asserts the REVERSE of what Slice T1 asserted, deliberately. T1 hung
+/// the bookmarks in a bar over the content well and this test proved the bar
+/// vanished when the well held a session — the operator's ruling at the time.
+/// T1b overturned it on the operator's own reference frame: the standing rule
+/// is that a surface may sit over a page only if it is ABOUT that page, and a
+/// bookmarks bar is not about the page it covers. In the rail there is no
+/// page to be about, so the grid is unconditional — which is the whole point,
+/// and is asserted in both directions so it stays a decision.
 #[gpui::test]
-fn the_bookmarks_bar_is_over_a_page_and_absent_in_a_chat(cx: &mut TestAppContext) {
+fn the_bookmarks_grid_is_in_the_rail_in_a_page_and_in_a_chat(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
@@ -11593,8 +11684,11 @@ fn the_bookmarks_bar_is_over_a_page_and_absent_in_a_chat(cx: &mut TestAppContext
         ],
         Some("p1"),
     );
-    assert!(shown(vcx, "bookmarks-bar"), "no bar over a page");
-    assert!(shown(vcx, "bookmark-gh"), "the bar drew none of its chips");
+    assert!(shown(vcx, "bookmarks-grid"), "no grid over a page");
+    assert!(
+        shown(vcx, "bookmark-tile-gh"),
+        "the grid drew none of its tiles"
+    );
 
     strip_tabs(
         &h,
@@ -11606,8 +11700,168 @@ fn the_bookmarks_bar_is_over_a_page_and_absent_in_a_chat(cx: &mut TestAppContext
         Some("aaaa1111"),
     );
     assert!(
+        shown(vcx, "bookmarks-grid"),
+        "the grid vanished when the well held a conversation — it is in the \
+         rail now and owes the page nothing"
+    );
+    assert!(
+        shown(vcx, "bookmark-tile-gh"),
+        "the grid lost its tiles in a chat"
+    );
+}
+
+/// Slice T1b — a folder row sits **under the projects and above the TABS
+/// seam**, which is the operator's own placement.
+///
+/// Geometry, not presence: "the folder rendered somewhere in the rail" is
+/// true of every wrong answer here, including the one where folders land
+/// among the loose tabs.
+#[gpui::test]
+fn a_bookmark_folder_sits_under_the_projects_and_above_the_tabs_seam(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("dev", 0, Some("dev"), None)]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://docs.rs/"),
+        ],
+        Some("p1"),
+    );
+
+    let folder = vcx
+        .debug_bounds("bookmark-folder-dev")
+        .expect("the folder row did not render in the rail");
+    let seam = vcx
+        .debug_bounds("tabs-divider")
+        .expect("no TABS seam to place the folder against");
+
+    assert!(
+        folder.origin.y < seam.origin.y,
+        "the folder fell BELOW the TABS seam, among the loose tabs — \
+         folder {folder:?} seam {seam:?}"
+    );
+}
+
+/// Slice T1b — an open folder **takes up room**, which is what makes it a
+/// disclosure rather than a popup.
+///
+/// The distinguishing property, and the only one worth asserting: T1's
+/// overlay floated over the rail and moved nothing, so "the children are
+/// visible" was true of both designs. What separates them is whether the
+/// rows BELOW the folder get pushed down. The operator asked for the list
+/// to grow and the sidebar to scroll; this is that, measured.
+#[gpui::test]
+fn opening_a_bookmark_folder_pushes_the_rows_below_it_down(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("dev"), None),
+            // depth 1 — INSIDE the folder. At depth 0 it is a sibling link,
+            // and the folder opens onto nothing.
+            ("rs", 1, None, Some("https://docs.rs/")),
+        ],
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://docs.rs/"),
+        ],
+        Some("p1"),
+    );
+
+    let before = vcx
+        .debug_bounds("tabs-divider")
+        .expect("no TABS seam")
+        .origin
+        .y;
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    let after = vcx
+        .debug_bounds("tabs-divider")
+        .expect("the TABS seam vanished when a folder opened")
+        .origin
+        .y;
+
+    assert!(
+        shown(vcx, "bookmark-child-rs"),
+        "the folder did not open at all"
+    );
+    assert!(
+        after > before,
+        "the folder opened OVER the rail instead of pushing it down — the \
+         TABS seam did not move (before {before:?}, after {after:?})"
+    );
+}
+
+/// Slice T1b — a tile wears the site's own mark once the bytes are in.
+///
+/// The grid is label-less, so the mark is the entire identity of a
+/// bookmark: a tile that never gets past the globe is a tile the operator
+/// cannot tell from its neighbour. Keyed by HOST, which is what lets a
+/// bookmark wear an icon it never had a browser to fetch.
+#[gpui::test]
+fn a_pinned_bookmark_wears_its_site_mark_when_the_bytes_are_in(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+
+    assert!(
+        !shown(vcx, "bookmark-mark-gh"),
+        "a tile drew a mark before any bytes arrived"
+    );
+    assert!(
+        shown(vcx, "bookmark-tile-glyph"),
+        "the globe fallback is missing, so an iconless tile is invisible"
+    );
+
+    crate::web::set_host_favicon_for_test(
+        "github.com",
+        Some(std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            TINY_PNG.to_vec(),
+        ))),
+    );
+    // Bytes landing is not itself a notify — Chromium's callback calls
+    // `note_chrome_change` for that. Re-pushing the same snapshot is the
+    // harness's way of driving the frame that would follow.
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+
+    assert!(
+        shown(vcx, "bookmark-mark-gh"),
+        "the tile kept its globe with bytes in hand"
+    );
+    crate::web::set_host_favicon_for_test("github.com", None);
+}
+
+/// Slice T1b — the page well holds no bookmarks surface at all.
+///
+/// The companion to the test above, and the one that would catch the bar
+/// coming back by accident: `bookmarks-bar` is gone, not merely hidden.
+#[gpui::test]
+fn no_bookmarks_bar_is_drawn_over_a_page(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://docs.rs/"),
+        ],
+        Some("p1"),
+    );
+    assert!(
         !shown(vcx, "bookmarks-bar"),
-        "the bar drew over an agent's conversation"
+        "the bar is over the page again"
     );
 }
 
@@ -11629,7 +11883,9 @@ fn a_right_click_on_a_bookmark_removes_it(cx: &mut TestAppContext) {
         Some("p1"),
     );
 
-    let at = vcx.debug_bounds("bookmark-gh").expect("bookmark-gh");
+    let at = vcx
+        .debug_bounds("bookmark-tile-gh")
+        .expect("bookmark-tile-gh");
     vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
     vcx.run_until_parked();
     assert!(
@@ -11809,7 +12065,7 @@ fn clicking_a_bookmark_sends_the_active_tab_to_it(cx: &mut TestAppContext) {
     );
 
     let _ = h.drain();
-    click(vcx, "bookmark-gh");
+    click(vcx, "bookmark-tile-gh");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(

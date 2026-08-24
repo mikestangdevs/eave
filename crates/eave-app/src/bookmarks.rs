@@ -91,6 +91,28 @@ pub fn bar(snapshot: &BookmarksSnapshot) -> Vec<BarItem> {
         .collect()
 }
 
+/// The top-level LINKS — what the rail's pinned grid paints.
+///
+/// Slice T1b moved bookmarks off the page and into the rail, where the two
+/// kinds stop being interchangeable: a link becomes an icon tile with no
+/// label, a folder becomes a titled row under the projects. Splitting them
+/// here rather than filtering at each call site keeps the two renderers
+/// from disagreeing about which is which.
+pub fn pinned(snapshot: &BookmarksSnapshot) -> Vec<BarItem> {
+    bar(snapshot)
+        .into_iter()
+        .filter(|i| !i.is_folder())
+        .collect()
+}
+
+/// The top-level FOLDERS — the titled rows that sit under the projects.
+pub fn folders(snapshot: &BookmarksSnapshot) -> Vec<BarItem> {
+    bar(snapshot)
+        .into_iter()
+        .filter(BarItem::is_folder)
+        .collect()
+}
+
 /// What a folder opens: its DIRECT children, in order.
 ///
 /// Direct, not its whole subtree — a depth-first list makes a grandchild
