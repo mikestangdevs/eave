@@ -429,6 +429,38 @@ pub fn favicon_image(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
     cef_favicon(tab_id)
 }
 
+/// The favicon for any url, by host — for surfaces that have an address
+/// but no tab. The rail's pinned bookmark grid (Slice T1b) is the caller.
+pub fn favicon_for_url(url: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    #[cfg(test)]
+    {
+        let host = crate::omnibox::engine_host(url);
+        if let Some(image) = TEST_HOST_FAVICONS.with(|m| m.borrow().get(&host).cloned()) {
+            return Some(image);
+        }
+    }
+    cef_favicon_for_url(url)
+}
+
+/// Ask for a bookmark's icon. A no-op without `web`, and idempotent per
+/// host, so a render pass may call it on every tile every frame.
+pub fn request_favicon(url: &str) {
+    #[cfg(feature = "web")]
+    favicon::fetch_for_url(url);
+    #[cfg(not(feature = "web"))]
+    let _ = url;
+}
+
+#[cfg(feature = "web")]
+fn cef_favicon_for_url(url: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    favicon::for_url(url)
+}
+
+#[cfg(not(feature = "web"))]
+fn cef_favicon_for_url(_url: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    None
+}
+
 #[cfg(feature = "web")]
 fn cef_favicon(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
     favicon::get(tab_id)
@@ -444,6 +476,27 @@ thread_local! {
     static TEST_FAVICONS: std::cell::RefCell<
         std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOST_FAVICONS: std::cell::RefCell<
+        std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Test seam: give a HOST bytes, so the rail's grid can be driven without
+/// a browser. Keyed the way [`favicon_for_url`] looks up.
+#[cfg(test)]
+pub fn set_host_favicon_for_test(host: &str, image: Option<std::sync::Arc<gpui::Image>>) {
+    TEST_HOST_FAVICONS.with(|m| match image {
+        Some(image) => {
+            m.borrow_mut().insert(host.to_string(), image);
+        }
+        None => {
+            m.borrow_mut().remove(host);
+        }
+    });
 }
 
 /// Test seam: put bytes on a tab the harness never created a browser for.

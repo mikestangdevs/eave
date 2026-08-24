@@ -169,6 +169,21 @@ pub fn with_browser<R>(tab_id: &str, f: impl FnOnce(&Browser) -> R) -> Option<R>
     Some(f(&browser))
 }
 
+/// Run `f` against SOME live browser — whichever the map yields first.
+///
+/// For work that needs Chromium's network stack but belongs to no tab: a
+/// bookmark's favicon is the case this was added for. Spec 06-browser D13
+/// says fetch through a browser that has the cookies rather than standing
+/// up a second HTTP client, and a bookmark has no browser of its own.
+///
+/// Clones out before calling, exactly as [`with_browser`] does and for the
+/// same reason: holding `BROWSERS.borrow()` across a synchronous CEF call
+/// is what aborted the app on every quit until Slice C7.
+pub fn with_any_browser<R>(f: impl FnOnce(&Browser) -> R) -> Option<R> {
+    let browser = BROWSERS.with(|b| b.borrow().values().next().cloned())?;
+    Some(f(&browser))
+}
+
 // ---------------------------------------------------------------------------
 // What a page ASKS for (as against what it reports)
 // ---------------------------------------------------------------------------
@@ -739,7 +754,7 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
         }
     }
     if let Some(url) = tab.favicon_url.as_deref() {
-        super::favicon::fetch(&tab.id, url);
+        super::favicon::fetch(&tab.id, url, tab.url.as_deref().unwrap_or_default());
     }
 }
 
@@ -1052,6 +1067,9 @@ wrap_load_handler! {
                 return;
             }
             set_chrome(&self.tab_id, |c| c.progress = 1.0);
+            // A loaded page means some browser is usable, which is what a
+            // bookmark's favicon fetch needs and could not assume at boot.
+            super::favicon::note_page_loaded();
             report(
                 &self.tab_id,
                 PageFact::Load {
@@ -1461,7 +1479,8 @@ wrap_display_handler! {
                 },
             );
             if let Some(url) = picked {
-                super::favicon::fetch(&self.tab_id, &url);
+                let page = LAST_URL.with(|u| u.borrow().get(&self.tab_id).cloned());
+                super::favicon::fetch(&self.tab_id, &url, page.as_deref().unwrap_or_default());
             }
         }
 

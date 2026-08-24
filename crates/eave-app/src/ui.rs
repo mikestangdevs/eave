@@ -8568,10 +8568,29 @@ impl Shell {
         let projects = strip::project_item_count(&items);
 
         let mut rows: Vec<AnyElement> = Vec::new();
+        // Rows in this list that are not tabs (Slice D4): the zone gap, the
+        // two ghost rows, and any bookmark folder rows. Counted so they do
+        // not spend the tab budget — see `theme::rail_rows_h`.
+        let mut extra = 0usize;
         let mut active_row: Option<usize> = None;
         let mut emitted_split = false;
         for (ix, item) in items.iter().enumerate() {
             if ix == projects {
+                // Slice T1b — the folders close the projects section, so
+                // they land above the TABS seam rather than among the
+                // loose tabs. `active_row` is captured as `rows.len()` at
+                // push time, so inserting here shifts nothing.
+                let folders = self.bookmark_folder_rows(cx);
+                extra += folders.len() + 2;
+                rows.extend(folders);
+                // Slice D4 — the projects zone's action, where its ⊕ was.
+                rows.push(self.ghost_row(
+                    "project-new",
+                    "new project",
+                    false,
+                    |this, cx| this.pick_project(cx),
+                    cx,
+                ));
                 rows.push(self.tabs_divider(cx));
             }
             match item {
@@ -8622,8 +8641,23 @@ impl Shell {
         // `+`, and a control that appears only once you already have what
         // it makes is not a control.
         if projects == items.len() {
+            let folders = self.bookmark_folder_rows(cx);
+            extra += folders.len() + 2;
+            rows.extend(folders);
+            rows.push(self.ghost_row(
+                "project-new",
+                "new project",
+                false,
+                |this, cx| this.pick_project(cx),
+                cx,
+            ));
             rows.push(self.tabs_divider(cx));
         }
+
+        // Slice D4 — the tabs zone's action, and the ONE hairline in the
+        // rail, immediately above it.
+        rows.push(self.ghost_row("tab-new", "new tab", true, |this, cx| this.new_tab(cx), cx));
+        extra += 1;
 
         // Scroll the active tab into view on the EDGE of it changing, never
         // every frame. `scroll_to_item` arms an active item that prepaint
@@ -8650,50 +8684,9 @@ impl Shell {
             .w_full()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .px(px(theme::RAIL_GUTTER))
-                    .pt(px(theme::SPACE_2))
-                    .pb(px(theme::SPACE_1))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .debug_selector(|| "rail-tabs-title".into())
-                            .text_size(px(theme::SECTION_SIZE))
-                            .line_height(px(theme::SECTION_LINE))
-                            .font_weight(theme::WEIGHT_STRONG)
-                            .text_color(theme::text_tertiary())
-                            .child("PROJECTS"),
-                    )
-                    .child(
-                        // Slice T1 — a project by hand. The affordance sits
-                        // on the section header for the same reason ⌘T's
-                        // does below: a vertical list grows downward, so a
-                        // `+` after the last row would move every time
-                        // anything opened.
-                        div()
-                            .id("project-new")
-                            .debug_selector(|| "project-new".into())
-                            .flex_none()
-                            .size(px(theme::TAB_CLOSE))
-                            .rounded(px(theme::RADIUS_BUTTON))
-                            .hover_fade("project-new", theme::wash_rest(), theme::overlay())
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.pick_project(cx)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icons::tagged_icon(
-                                icons::ADD_CIRCLE,
-                                theme::ICON_SM,
-                                theme::text_secondary(),
-                                "project-new-glyph",
-                            )),
-                    ),
-            )
+            // Slice D4 — no PROJECTS header and no ⊕. The zone is read
+            // from the shape of its rows; the action moved to a ghost row at
+            // the end of the zone (see `ghost_row`).
             .child(
                 div()
                     .id("tab-strip")
@@ -8714,7 +8707,7 @@ impl Shell {
                     // twelve tabs in the journal and an empty OPEN section on
                     // screen to see it — the render-vs-measure gap the
                     // webview spike named, arriving from the other side.
-                    .h(px(theme::rail_tabs_h(rows.len())))
+                    .h(px(theme::rail_rows_h(rows.len(), extra)))
                     .overflow_y_scroll()
                     .track_scroll(&self.tabs_scroll)
                     // Same reason the horizontal strip stopped propagation:
@@ -8725,89 +8718,72 @@ impl Shell {
                     .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
                     .flex()
                     .flex_col()
-                    .gap(px(theme::TAB_GAP))
+                    .gap(px(theme::RAIL_ROW_GAP))
                     .children(rows),
             )
             .into_any_element()
     }
 
-    /// Slice T1 — **the bookmarks bar**, under the pane header, on a page.
+    /// Slice T1b — **the rail's bookmarks section**: pinned marks, and the
+    /// folder rows that follow the projects.
     ///
-    /// `None` unless a page tab is showing, and that is the operator's own
-    /// ruling: bookmarks sit *on top of pages*. It follows that the bar is
-    /// not there in a chat, which is a real cost and was accepted when the
-    /// place was chosen.
-    ///
-    /// # Why this is a UI-only slice
-    ///
-    /// The store underneath is complete and was complete before this slice
-    /// started: `Folder | Link`, a node naming its parent, ordered child
-    /// ids, `BookmarkAdd/Move/Rename/Remove/Retarget`, a `WatchBookmarks`
-    /// subscription and a cycle check on moves. 127 mentions in
-    /// `eave-core`, 93 in `eave-engine`, 31 in `eave-wire` — and five in
-    /// this crate, all of them `SubscriptionItem::Bookmarks { .. } => {}`.
-    /// Every bookmark fact eave draws here was already durable; nothing had
-    /// ever asked for it.
-    ///
-    /// # The two drags
-    ///
-    /// Dragging eave's OWN chrome — the address out of the pane header, a
-    /// chip along the bar, a chip into a folder — is gpui drag, which this
-    /// file already uses for the rail divider. Dragging a link out of the
-    /// rendered page is a different animal: CEF windowless mode needs
-    /// `StartDragging` and the `DragTarget*` family plumbed through, and
-    /// eave has none of it. That gesture is deliberately absent rather than
-    /// half-built.
-    fn bookmarks_bar(&self, showing_page: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !showing_page {
-            return None;
-        }
-        let items = bookmarks::bar(&self.bookmarks.read(cx).snapshot);
-        let open = self.bookmark_folder_open.borrow().clone();
-        let end = items.len();
+    /// Replaces T1's horizontal bar over the content well. The store
+    /// underneath is unchanged and was already complete before T1 began —
+    /// `Folder | Link`, a node naming its parent, ordered child ids,
+    /// `BookmarkAdd/Move/Rename/Remove/Retarget`, a `WatchBookmarks`
+    /// subscription and a cycle check on moves — so both slices are UI only.
+    fn bookmarks_grid(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let items = bookmarks::pinned(&self.bookmarks.read(cx).snapshot);
+        // Which cell is the page you are looking at.
+        let snapshot = self.strip_snapshot(cx);
+        let active_host = snapshot
+            .active
+            .as_deref()
+            .and_then(|id| snapshot.tabs.iter().find(|t| t.id == id))
+            .and_then(|t| t.url.as_deref())
+            .map(crate::omnibox::engine_host)
+            .filter(|h| !h.is_empty());
 
+        // Slice D4 — NO header. The zone is its own label: three large cells
+        // at the top of the rail are unmistakably bookmarks, and nothing
+        // else in the rail is a grid.
+        //
+        // Always drawn, because the new-folder control lives here as a ghost
+        // CELL — a zone made of cells takes its action in the shape of a
+        // cell. It could not simply be deleted with the header:
+        // `new_bookmark_folder` has exactly one caller and that was it.
         Some(
             div()
-                .debug_selector(|| "bookmarks-bar".into())
-                .id("bookmarks-bar")
-                .flex_none()
+                .debug_selector(|| "bookmarks-grid".into())
+                .id("bookmarks-grid")
                 .w_full()
-                .h(px(theme::RAIL_TAB_H))
-                .px(px(theme::SPACE_2))
+                .flex_none()
+                .px(px(theme::RAIL_GUTTER))
+                // The zone boundary, in the absence of any label saying so.
+                .pb(px(theme::RAIL_ZONE_GAP))
                 .flex()
                 .flex_row()
-                .items_center()
-                .gap(px(theme::SPACE_1))
-                .overflow_x_hidden()
-                // The bar's own empty space is a drop target: past the last
-                // chip means the end, which is where a person aiming at
-                // "not into any of these" naturally lets go.
-                .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
-                .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                    this.add_bookmark(None, None, drag, cx)
-                }))
-                .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
-                .on_drop(cx.listener(move |this, drag: &BookmarkDrag, _, cx| {
-                    this.move_bookmark(drag.id.clone(), None, end, cx)
-                }))
+                // Wrap, not a hard three: the rail is draggable between
+                // `RAIL_W_MIN` and `RAIL_W_MAX`, and `BOOKMARK_TILE` is sized
+                // so the REST width yields exactly three columns.
+                .flex_wrap()
+                .gap(px(theme::BOOKMARK_GRID_GAP))
                 .children(
                     items
                         .iter()
                         .enumerate()
-                        .map(|(ix, item)| self.bookmark_chip(item, ix, open.as_deref(), cx)),
+                        .map(|(ix, item)| self.bookmark_tile(item, ix, active_host.as_deref(), cx)),
                 )
-                // New folder. Trailing the chips rather than heading them:
-                // this bar grows to the RIGHT, so a control after the last
-                // chip stays put as bookmarks are added — the opposite of
-                // the vertical tab list, where the `+` had to go in the
-                // header for exactly the same reason.
                 .child(
                     div()
                         .id("bookmark-new-folder")
                         .debug_selector(|| "bookmark-new-folder".into())
                         .flex_none()
-                        .size(px(theme::TAB_CLOSE))
-                        .rounded(px(theme::RADIUS_BUTTON))
+                        .size(px(theme::BOOKMARK_TILE))
+                        .rounded(px(theme::BOOKMARK_TILE_RADIUS))
+                        // Ghost: no fill at rest, so it reads as the empty
+                        // slot after the last bookmark rather than as another
+                        // bookmark. Real cells sit on `overlay`.
                         .hover_fade("bookmark-new-folder", theme::wash_rest(), theme::overlay())
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.new_bookmark_folder(cx)))
@@ -8816,74 +8792,107 @@ impl Shell {
                         .justify_center()
                         .child(icons::tagged_icon(
                             icons::FOLDER,
-                            theme::ICON_SM,
+                            theme::BOOKMARK_TILE_MARK,
                             theme::text_tertiary(),
                             "bookmark-new-folder-glyph",
                         )),
                 )
+                // Empty space past the last cell means "add at the end",
+                // the same contract the bar had.
+                .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::wash_rest()))
+                .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
+                    this.add_bookmark(None, None, drag, cx)
+                }))
                 .into_any_element(),
         )
     }
 
-    /// One chip on the bar — a link, or a folder that opens under it.
-    fn bookmark_chip(
+    /// One pinned bookmark: a site mark on a tile, with no label.
+    fn bookmark_tile(
         &self,
         item: &bookmarks::BarItem,
         index: usize,
-        open: Option<&str>,
-        cx: &mut Context<Self>,
+        active_host: Option<&str>,
+        cx: &Context<Self>,
     ) -> AnyElement {
+        let url = item.url.clone().unwrap_or_default();
+        // Idempotent per host, so calling it every frame costs one hash
+        // lookup and starts at most one download.
+        crate::web::request_favicon(&url);
+        let mark = crate::web::favicon_for_url(&url);
+        let host = crate::omnibox::engine_host(&url);
+        let here = active_host.is_some_and(|h| h == host);
+
         let id = item.id.clone();
         let sel = item.id.clone();
-        let folder = item.is_folder();
-        let url = item.url.clone();
-        let is_open = folder && open == Some(item.id.as_str());
-        let (click_id, drop_id, drag_id) = (id.clone(), id.clone(), id.clone());
-        let menu_id = id.clone();
-
-        let chip = div()
-            .id(SharedString::from(format!("bookmark-{id}")))
-            .debug_selector(move || {
-                if folder {
-                    format!("bookmark-folder-{sel}")
-                } else {
-                    format!("bookmark-{sel}")
-                }
-            })
+        let (open_url, menu_id, drag_id, drop_id) =
+            (url.clone(), id.clone(), id.clone(), id.clone());
+        div()
+            .id(SharedString::from(format!("bookmark-tile-{id}")))
+            .debug_selector(move || format!("bookmark-tile-{sel}"))
             .flex_none()
-            .h(px(theme::GROUP_HEAD_H))
-            .px(px(theme::SPACE_2))
-            .rounded(px(theme::RADIUS_BUTTON))
-            .when(is_open, |d| d.bg(theme::wash_rest()))
+            .size(px(theme::BOOKMARK_TILE))
+            .rounded(px(theme::BOOKMARK_TILE_RADIUS))
+            // A tile is a FILLED control, so it rests on a real fill and
+            // climbs one rung on hover — `wash_rest` is transparent black
+            // (theme.rs), which would have left the tiles invisible and the
+            // favicons floating on the rail plate.
+            //
+            // The current page is marked by the accent RIM, not by fill:
+            // fill carries interaction state here, and a "selected" fill
+            // would be the same colour as a hovered neighbour.
+            .bg(theme::overlay())
+            .when(here, |d| d.border_1().border_color(theme::accent()))
             .cursor_pointer()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::SPACE_1))
-            .child(icons::tagged_icon(
-                if folder { icons::FOLDER } else { icons::GLOBAL },
-                12.0,
-                theme::text_secondary(),
-                "bookmark-glyph",
-            ))
-            .child(
-                div()
-                    .text_size(px(theme::MICRO_SIZE))
-                    .text_color(theme::text())
-                    .child(SharedString::from(item.label.clone())),
+            .hover_fade(
+                format!("bookmark-tile-{id}"),
+                theme::overlay(),
+                theme::overlay_strong(),
             )
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(match mark {
+                // Repair 1 — the mark sits on a LIGHTER plate inside the
+                // cell. Favicons are drawn for a white page, so the dark
+                // ones (github, x.com) disappear straight onto the cell.
+                Some(image) => div()
+                    .debug_selector({
+                        let id = item.id.clone();
+                        move || format!("bookmark-mark-{id}")
+                    })
+                    .size(px(theme::BOOKMARK_MARK_PLATE))
+                    .rounded(px(theme::BOOKMARK_MARK_PLATE_RADIUS))
+                    .bg(theme::overlay_strong())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(theme::BOOKMARK_TILE_MARK))
+                            .overflow_hidden()
+                            .rounded(px(theme::RADIUS_CHIP))
+                            .child(
+                                img(image)
+                                    .size(px(theme::BOOKMARK_TILE_MARK))
+                                    .object_fit(ObjectFit::Contain),
+                            ),
+                    )
+                    .into_any_element(),
+                None => icons::tagged_icon(
+                    icons::GLOBAL,
+                    theme::BOOKMARK_TILE_MARK,
+                    theme::text_tertiary(),
+                    "bookmark-tile-glyph",
+                )
+                .into_any_element(),
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
-                match &url {
-                    // A link goes in the tab you are looking at, which is
-                    // what a bookmarks bar has meant in every browser.
-                    Some(url) => this.open_bookmark(url.clone(), cx),
-                    None => this.toggle_bookmark_folder(&click_id, cx),
-                }
+                this.open_bookmark(open_url.clone(), cx);
                 cx.notify();
             }))
-            // Right-click is the ONLY way off the bar: a chip cannot be
-            // dragged to a trash can, and a bookmark added by a stray drop
-            // was otherwise permanent.
+            // Right-click is still the only way off: a tile cannot be
+            // dragged to a trash can either.
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -8894,122 +8903,278 @@ impl Shell {
             .on_drag(BookmarkDrag { id: drag_id }, |drag, _, _, cx| {
                 cx.new(|_| drag.clone())
             })
-            // Dropping ONTO a chip means "put it here", at this chip's
-            // index — except on a folder, where it means "put it inside".
             .on_drop(cx.listener(move |this, drag: &BookmarkDrag, _, cx| {
                 if drag.id == drop_id {
                     return;
                 }
-                if folder {
-                    this.move_bookmark(drag.id.clone(), Some(drop_id.clone()), 0, cx)
-                } else {
-                    this.move_bookmark(drag.id.clone(), None, index, cx)
-                }
+                this.move_bookmark(drag.id.clone(), None, index, cx)
             }))
             .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                if folder {
-                    this.add_bookmark(Some(id.clone()), None, drag, cx)
-                } else {
-                    this.add_bookmark(None, Some(index), drag, cx)
-                }
+                this.add_bookmark(None, Some(index), drag, cx)
             }))
             .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::overlay()))
-            .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::overlay()));
-
-        if !is_open {
-            return chip.into_any_element();
-        }
-        div()
-            .relative()
-            .flex_none()
-            .child(chip)
-            .child(self.bookmark_folder_menu(item, cx))
+            .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::overlay()))
             .into_any_element()
     }
 
-    /// What an open folder shows: its direct children, under it.
+    /// A zone's action, shaped like the rows it ends (Slice D4).
     ///
-    /// `deferred` because it overhangs everything below the bar, and the
-    /// bar is painted before the content well — without it the menu is
-    /// drawn under the page.
-    fn bookmark_folder_menu(
+    /// Replaces the header buttons — the ⊕ in the tabs seam, the "new" pill
+    /// on the sessions header, the ⊕ on the projects header. Those advertised
+    /// themselves as controls, which is exactly what D4 is taking out of the
+    /// rail: with no caps label above a zone, a button in that position reads
+    /// as the zone's title. A dimmed row at the END of a zone reads as "one
+    /// more of these", which is what the action makes.
+    ///
+    /// Dimmed at rest and brightened on hover, so it recedes until looked
+    /// for. `hover_fade` is N2's machinery, already used by every other rail
+    /// control.
+    fn ghost_row(
         &self,
-        folder: &bookmarks::BarItem,
-        cx: &mut Context<Self>,
+        selector: &'static str,
+        label: &'static str,
+        rule_above: bool,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
     ) -> AnyElement {
-        let children = bookmarks::children_of(&self.bookmarks.read(cx).snapshot, &folder.id);
-        let fid = folder.id.clone();
-        deferred(
-            div()
-                .debug_selector(move || format!("bookmark-menu-{fid}"))
-                .absolute()
-                .top(px(theme::GROUP_HEAD_H))
-                .left_0()
-                .min_w(px(theme::DIRECTIVE_MAX_W / 3.))
-                .p(px(theme::SPACE_1))
-                .rounded(px(theme::RADIUS_PANEL))
-                .bg(theme::overlay())
-                .shadow(theme::selection_rim())
-                .flex()
-                .flex_col()
-                .gap(px(theme::SPACE_1))
-                .children(if children.is_empty() {
-                    // An empty folder is a fact, and saying so beats an
-                    // empty box the operator cannot tell from a failure.
-                    vec![div()
-                        .debug_selector(|| "bookmark-menu-empty".into())
-                        .px(px(theme::SPACE_2))
-                        .text_size(px(theme::MICRO_SIZE))
-                        .text_color(theme::text_tertiary())
-                        .child("empty")
-                        .into_any_element()]
-                } else {
-                    children
-                        .iter()
-                        .map(|child| {
-                            let url = child.url.clone();
-                            let cid = child.id.clone();
-                            let menu_cid = child.id.clone();
-                            div()
-                                .id(SharedString::from(format!("bookmark-child-{}", child.id)))
-                                .debug_selector(move || format!("bookmark-child-{cid}"))
-                                .px(px(theme::SPACE_2))
-                                .h(px(theme::GROUP_HEAD_H))
-                                .rounded(px(theme::RADIUS_BUTTON))
-                                .cursor_pointer()
-                                .hover_fade("bookmark-child", theme::overlay(), theme::wash_rest())
-                                .flex()
-                                .items_center()
-                                .text_size(px(theme::MICRO_SIZE))
-                                .text_color(theme::text())
-                                .child(SharedString::from(child.label.clone()))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(url) = url.clone() {
-                                        this.open_bookmark(url, cx);
-                                    }
-                                    this.bookmark_folder_open.replace(None);
-                                    cx.notify();
-                                }))
-                                // A bookmark filed INSIDE a folder is
-                                // still a bookmark, and the folder is the
-                                // only place it can be right-clicked.
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.open_bookmark_menu(&menu_cid, ev.position, cx);
-                                    }),
-                                )
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>()
-                }),
-        )
-        .into_any_element()
+        let row = div()
+            .id(SharedString::from(selector))
+            .debug_selector(move || selector.into())
+            .w_full()
+            .flex_none()
+            .h(px(theme::RAIL_GHOST_H))
+            .px(px(theme::RAIL_GUTTER))
+            .rounded(px(theme::RADIUS_BUTTON))
+            // THE hairline — one in the whole rail, on top of the tabs
+            // zone's ghost row. Drawn as this row's TOP BORDER rather than
+            // as a rule of its own, so the row stays exactly
+            // `RAIL_GHOST_H` tall: the list above is a scroll container
+            // with a DEFINITE height computed from a uniform row, and a
+            // 5 px rule between rows would have put the box and its
+            // contents permanently out of step.
+            .when(rule_above, |d| {
+                d.border_t(px(theme::HAIRLINE))
+                    .border_color(theme::border())
+            })
+            .cursor_pointer()
+            .hover_fade(selector, theme::wash_rest(), theme::overlay())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_2))
+            .child(icons::tagged_icon(
+                icons::ADD_CIRCLE,
+                theme::RAIL_MARK,
+                theme::text_tertiary(),
+                format!("{selector}-glyph"),
+            ))
+            .child(
+                div()
+                    // The LABEL carries a selector of its own: the row is
+                    // full-width, so its own origin is the rail's edge, not
+                    // the gutter every piece of rail text starts on.
+                    .debug_selector(move || format!("{selector}-label"))
+                    .min_w(px(0.))
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(label)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)));
+
+        row.into_any_element()
     }
 
-    /// Send the active tab to a bookmark. Falls back to opening a tab when
-    /// there is no page tab to send — the same rule the omnibox commits by.
+    /// The bookmark FOLDERS, as titled rows under the projects — and, when
+    /// one is open, its children as rows directly beneath it.
+    ///
+    /// **Expansion is inline, not a popup.** T1 opened a folder into a
+    /// `deferred` overlay hanging off the bar; the operator ruled against
+    /// it. A disclosure that pushes its neighbours down is a list, and this
+    /// rail is already a scrolling list — the container these rows land in
+    /// is `overflow_y_scroll` with a definite height capped at
+    /// `RAIL_TABS_VISIBLE`, so an expanded folder scrolls with everything
+    /// else and needs no machinery of its own.
+    ///
+    /// Returns a flat `Vec` rather than a nested element for exactly that
+    /// reason: the children have to be siblings of the tab rows to share
+    /// their scroll, not children of the folder row.
+    fn bookmark_folder_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let snapshot = &self.bookmarks.read(cx).snapshot;
+        let folders = bookmarks::folders(snapshot);
+        let open = self.bookmark_folder_open.borrow().clone();
+        let mut out: Vec<AnyElement> = Vec::new();
+
+        for item in &folders {
+            let id = item.id.clone();
+            let sel = item.id.clone();
+            let is_open = open.as_deref() == Some(item.id.as_str());
+            let (click_id, menu_id, drop_id, add_id) =
+                (id.clone(), id.clone(), id.clone(), id.clone());
+
+            out.push(
+                div()
+                    .id(SharedString::from(format!("bookmark-folder-{id}")))
+                    .debug_selector(move || format!("bookmark-folder-{sel}"))
+                    .w_full()
+                    .flex_none()
+                    .h(px(theme::RAIL_TAB_H))
+                    .px(px(theme::RAIL_GUTTER))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .when(is_open, |d| d.bg(theme::wash_rest()))
+                    .cursor_pointer()
+                    .hover_fade(
+                        format!("bookmark-folder-{id}"),
+                        theme::wash_rest(),
+                        theme::overlay(),
+                    )
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .child(icons::tagged_icon(
+                        if is_open {
+                            icons::ALT_ARROW_DOWN
+                        } else {
+                            icons::ALT_ARROW_RIGHT
+                        },
+                        theme::ICON_SM,
+                        theme::text_tertiary(),
+                        format!("bookmark-folder-chevron-{id}"),
+                    ))
+                    .child(icons::tagged_icon(
+                        icons::FOLDER,
+                        theme::RAIL_MARK,
+                        theme::text_secondary(),
+                        "bookmark-folder-glyph",
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .text_color(theme::text())
+                            .child(SharedString::from(item.label.clone())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_bookmark_folder(&click_id, cx);
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_bookmark_menu(&menu_id, ev.position, cx);
+                        }),
+                    )
+                    .on_drop(cx.listener(move |this, drag: &BookmarkDrag, _, cx| {
+                        if drag.id == drop_id {
+                            return;
+                        }
+                        this.move_bookmark(drag.id.clone(), Some(drop_id.clone()), 0, cx)
+                    }))
+                    .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
+                        this.add_bookmark(Some(add_id.clone()), None, drag, cx)
+                    }))
+                    .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::overlay()))
+                    .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::overlay()))
+                    .into_any_element(),
+            );
+
+            if !is_open {
+                continue;
+            }
+            let children = bookmarks::children_of(snapshot, &item.id);
+            if children.is_empty() {
+                // An empty folder is a fact, and saying so beats a folder
+                // that opens into nothing the operator cannot tell from a
+                // failure. Carried over from the popup this replaced.
+                out.push(
+                    div()
+                        .debug_selector(|| "bookmark-menu-empty".into())
+                        .w_full()
+                        .flex_none()
+                        .h(px(theme::RAIL_TAB_H))
+                        .pl(px(theme::RAIL_GUTTER + theme::BOOKMARK_CHILD_INDENT))
+                        .pr(px(theme::RAIL_GUTTER))
+                        .flex()
+                        .items_center()
+                        .text_size(px(theme::SMALL_SIZE))
+                        .text_color(theme::text_tertiary())
+                        .child("empty")
+                        .into_any_element(),
+                );
+                continue;
+            }
+            for child in &children {
+                let cid = child.id.clone();
+                let csel = child.id.clone();
+                let curl = child.url.clone();
+                let cmenu = child.id.clone();
+                out.push(
+                    div()
+                        .id(SharedString::from(format!("bookmark-child-{cid}")))
+                        .debug_selector(move || format!("bookmark-child-{csel}"))
+                        .w_full()
+                        .flex_none()
+                        .h(px(theme::RAIL_TAB_H))
+                        // Indented, which is the only thing saying these
+                        // rows belong to the folder now that no overlay
+                        // frames them.
+                        .pl(px(theme::RAIL_GUTTER + theme::BOOKMARK_CHILD_INDENT))
+                        .pr(px(theme::RAIL_GUTTER))
+                        .rounded(px(theme::RADIUS_BUTTON))
+                        .cursor_pointer()
+                        .hover_fade(
+                            format!("bookmark-child-{cid}"),
+                            theme::wash_rest(),
+                            theme::overlay(),
+                        )
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACE_2))
+                        .child(icons::tagged_icon(
+                            if child.is_folder() {
+                                icons::FOLDER
+                            } else {
+                                icons::GLOBAL
+                            },
+                            theme::RAIL_MARK,
+                            theme::text_tertiary(),
+                            "bookmark-child-glyph",
+                        ))
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(theme::SMALL_SIZE))
+                                .text_color(theme::text())
+                                .child(SharedString::from(child.label.clone())),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(url) = curl.clone() {
+                                this.open_bookmark(url, cx);
+                            }
+                            cx.notify();
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_bookmark_menu(&cmenu, ev.position, cx);
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        out
+    }
+
     fn open_bookmark(&mut self, url: String, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
         let target = strip::active_is_page(&snapshot)
@@ -9113,45 +9278,23 @@ impl Shell {
     /// It carries ⌘T's `+`, which is what it is doing down here rather than
     /// beside `PROJECTS`: the two affordances make different things and
     /// each belongs next to what it makes.
-    fn tabs_divider(&self, cx: &Context<Self>) -> AnyElement {
+    /// The seam between the projects zone and the loose tabs (Slice D4).
+    ///
+    /// Was a caps `TABS` label with a ⊕ beside it. Both are gone: the label
+    /// because zones are read by shape, the ⊕ because zone actions became
+    /// ghost rows. What is left is the zone gap itself — an empty box of
+    /// `RAIL_ZONE_GAP`, which is the only thing now saying "different kind
+    /// of thing below here".
+    ///
+    /// It stays a row pushed into `rows` rather than becoming padding on the
+    /// list, because `active_row` is tracked as `rows.len()` at push time and
+    /// the scroll-into-view arithmetic counts it.
+    fn tabs_divider(&self, _cx: &Context<Self>) -> AnyElement {
         div()
             .debug_selector(|| "tabs-divider".into())
+            .w_full()
             .flex_none()
-            .h(px(theme::RAIL_TAB_H))
-            .px(px(theme::SPACE_2))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .debug_selector(|| "tabs-divider-title".into())
-                    .text_size(px(theme::SECTION_SIZE))
-                    .line_height(px(theme::SECTION_LINE))
-                    .font_weight(theme::WEIGHT_STRONG)
-                    .text_color(theme::text_tertiary())
-                    .child("TABS"),
-            )
-            .child(
-                div()
-                    .id("tab-new")
-                    .debug_selector(|| "tab-new".into())
-                    .flex_none()
-                    .size(px(theme::TAB_CLOSE))
-                    .rounded(px(theme::RADIUS_BUTTON))
-                    .hover_fade("tab-new", theme::wash_rest(), theme::overlay())
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icons::tagged_icon(
-                        icons::ADD_CIRCLE,
-                        theme::ICON_SM,
-                        theme::text_secondary(),
-                        "tab-new-glyph",
-                    )),
-            )
+            .h(px(theme::RAIL_ZONE_GAP))
             .into_any_element()
     }
 
@@ -10328,6 +10471,53 @@ impl Shell {
             rows
         };
 
+        // Slice D4 — the sessions zone's tail: the archived filter, then the
+        // zone's action as a ghost row.
+        //
+        // The archived toggle came back from the header I deleted with it.
+        // It is NOT one of the controls D4 retires — not a ⊕, not a "new"
+        // pill, not a caps label — it is a filter over what the zone shows,
+        // and removing it silently would have hidden every archived session
+        // with no way back. Restated as a row so it shares the zone's shape.
+        let mut rows = rows;
+        if archived_count > 0 {
+            let label = archived_toggle_label(archived_count, show_archived);
+            rows.push(
+                div()
+                    .id("rail-archived")
+                    .debug_selector(|| "rail-archived".into())
+                    .w_full()
+                    .flex_none()
+                    .h(px(theme::RAIL_GHOST_H))
+                    .px(px(theme::RAIL_GUTTER))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .cursor_pointer()
+                    .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sessions.update(cx, |state, cx| {
+                            state.show_archived = !state.show_archived;
+                            cx.notify();
+                        });
+                    }))
+                    .child(SharedString::from(label))
+                    .into_any_element(),
+            );
+        }
+        rows.push(self.ghost_row(
+            "new-session",
+            "new session",
+            false,
+            |this, _cx| this.new_session(),
+            cx,
+        ));
+        let rows = rows;
+
         // The window surface is the sidebar. Traffic lights, pins, Projects,
         // Tabs paint directly on the glass — no plate, no divider. A seam
         // between the rail and the card would mean the frame is wrong.
@@ -10366,107 +10556,14 @@ impl Shell {
                     .justify_end()
                     .pr(px(theme::RAIL_GUTTER)),
             )
+            // Slice T1b — the pinned marks head the rail, above the
+            // projects, as the reference frame has them.
+            .children(self.bookmarks_grid(cx))
             .child(self.rail_tabs(cx, phase))
             .child(self.rail_handle(cx))
-            .child(
-                div()
-                    .px(px(theme::RAIL_GUTTER))
-                    .pt(px(theme::SPACE_3))
-                    .pb(px(theme::SPACE_2))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            // Slice AO: the SECTION rank. Uppercase, so the
-                            // header reads as a label for the list rather
-                            // than as the first item in it — at the same
-                            // size and case as a row's own text it was
-                            // neither. (gpui at this revision exposes no
-                            // letter-spacing, so AL's "tracked" half of the
-                            // section role is not available here; the case
-                            // change is.)
-                            .text_size(px(theme::SECTION_SIZE))
-                            .line_height(px(theme::SECTION_LINE))
-                            .font_weight(theme::WEIGHT_STRONG)
-                            .debug_selector(|| "rail-title".into())
-                            .text_color(theme::text_tertiary())
-                            .child("SESSIONS"),
-                    )
-                    .child(
-                        div()
-                            .id("new-session")
-                            .debug_selector(|| "new-session".into())
-                            .px(px(theme::SPACE_2))
-                            .py(px(theme::SPACE_1))
-                            .rounded(px(theme::RADIUS_BUTTON))
-                            .border_1()
-                            .border_color(theme::border())
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_secondary_on_wash())
-                            .hover_fade("new-session", theme::wash_rest(), theme::overlay())
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, _| this.new_session()))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACE_1))
-                            .child(icons::tagged_icon(
-                                icons::PEN_NEW_SQUARE,
-                                theme::ICON_SM,
-                                theme::text_secondary_on_wash(),
-                                "new-session-glyph",
-                            ))
-                            .child("new"),
-                    ),
-            )
-            // Stage AC: the archived shelf, on its own line rather than
-            // squeezed into the header beside `new`. At 248 px the header
-            // has ~212 px of room and "sessions" plus `new` already take
-            // most of it — a third control up there would be a contest
-            // between a fact and a button, which is the contest a fact
-            // loses. Present only when there is something filed away, so a
-            // rail nobody has archived from looks exactly as it did.
-            .children((archived_count > 0).then(|| {
-                div()
-                    .flex_none()
-                    .px(px(theme::RAIL_GUTTER))
-                    .pb(px(theme::SPACE_2))
-                    .child(
-                        div()
-                            .id("rail-archived")
-                            .debug_selector(|| "rail-archived".into())
-                            .px(px(theme::SPACE_2))
-                            .py(px(theme::SPACE_1))
-                            .rounded(px(theme::RADIUS_BUTTON))
-                            .border_1()
-                            .border_color(theme::border())
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_secondary())
-                            .hover_fade("rail-archived", theme::wash_rest(), theme::overlay())
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sessions.update(cx, |state, cx| {
-                                    state.show_archived = !state.show_archived;
-                                    cx.notify();
-                                });
-                            }))
-                            .child(SharedString::from(archived_toggle_label(
-                                archived_count,
-                                show_archived,
-                            ))),
-                    )
-            }))
-            // Slice M: rows dissolve at the scroller's edges instead of
-            // ending on a hard cut. The rail paints no surface of its
-            // own, so there is nothing to cut against BUT the desktop
-            // showing through the glass — which is exactly the case a
-            // painted gradient cannot handle and `EdgeFade` can. Gated on
-            // overflow (the rail has no resting top pad), so a rail whose
-            // sessions all fit looks exactly as it did before.
+            // Slice D4 — no SESSIONS header and no "new" pill. A session
+            // row's silhouette (provider chip, cwd subline, attention badge)
+            // is unlike any tab row, which is what separates the zones now.
             .child(
                 edge_faded(
                     theme::RAIL_FADE_BAND,
@@ -10480,10 +10577,14 @@ impl Shell {
                         .overflow_y_scroll()
                         .track_scroll(&self.rail_scroll)
                         .pr(px(theme::RAIL_CARD_BLEED))
+                        // The tabs -> sessions boundary. The two zones live
+                        // in different containers, so unlike projects -> tabs
+                        // there is no divider row to carry it.
+                        .pt(px(theme::RAIL_ZONE_GAP))
                         .pb(px(theme::SPACE_2))
                         .flex()
                         .flex_col()
-                        .gap(px(theme::SPACE_1))
+                        .gap(px(theme::RAIL_ROW_GAP))
                         .children(rows),
                 )
                 .fade_overflow_y(&self.rail_scroll),
@@ -15535,17 +15636,6 @@ impl Render for Shell {
                                             true,
                                             "pane-header",
                                         ))
-                                        // Slice T1 — the bookmarks bar,
-                                        // under the header and above the
-                                        // page, on a page tab only.
-                                        //
-                                        // The WHOLE well, not each half of
-                                        // a split: a split's two panes each
-                                        // carry their own `pane_header`,
-                                        // and two bookmarks bars showing
-                                        // one bar's worth of bookmarks
-                                        // would read as two different sets.
-                                        .children(self.bookmarks_bar(showing_page, cx))
                                         .child(
                                             // Stage H glass: the list's viewport runs
                                             // the full column height and the composer
