@@ -4692,6 +4692,11 @@ struct Shell {
     launched_from_tab: RefCell<Option<String>>,
     /// Which bookmark folder is open on the bar (Slice T1). One at a time.
     bookmark_folder_open: RefCell<Option<String>>,
+    /// Which rail zones are collapsed (Slice D4.2 stage 2). Loaded from
+    /// `frame.json` at construction and written back on the click, so the
+    /// rail comes back the way it was left.
+    zone_projects_collapsed: std::cell::Cell<bool>,
+    zone_sessions_collapsed: std::cell::Cell<bool>,
     /// Checkout roots a project has already been asked for (Slice T1),
     /// keyed on the root rather than the session.
     ///
@@ -5040,6 +5045,56 @@ fn load_rail_w() -> f32 {
         .map(|w| clamp_rail_w(w as f32))
         .unwrap_or(theme::RAIL_W)
 }
+
+/// Which rail zones are collapsed (Slice D4.2, stage 2).
+///
+/// Same file and the same merged read-modify-write as the rail width, for
+/// the same reason stated at the top of this section: several checkouts
+/// share one data dir, so a build that does not know a key must not drop it.
+///
+/// Absent key means expanded. That is the right default for a preference
+/// nobody has expressed: a first launch shows the rail's contents, and a
+/// missing or corrupt file cannot hide the operator's sessions from them.
+fn load_zone_collapsed(key: &str) -> bool {
+    let Some(path) = frame_prefs_path() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    v.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Write one zone's collapsed state back, keeping every other key.
+///
+/// On the click, not on a timer — a collapse is one decision, like the
+/// drag's mouse-up.
+fn save_zone_collapsed(key: &str, collapsed: bool) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    doc[key] = serde_json::json!(collapsed);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!("eave: cannot save {key} to {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise {key}: {e}"),
+    }
+}
+
+/// The two zone keys, named once so the reader and the writer cannot drift.
+pub(crate) const ZONE_PROJECTS: &str = "zone_projects_collapsed";
+pub(crate) const ZONE_SESSIONS: &str = "zone_sessions_collapsed";
 
 /// Write the rail width back, keeping every other key in the file.
 ///
@@ -8567,30 +8622,46 @@ impl Shell {
         // divider without knowing it exists.
         let projects = strip::project_item_count(&items);
 
+        // Slice D4.2 stage 2 — the projects zone's collapse. The toggle is
+        // the zone's first row; when shut, the project rows, the folder rows
+        // and the zone's ghost row all go with it, and only the count stays.
+        let proj_shut = self.zone_projects_collapsed.get();
+
         let mut rows: Vec<AnyElement> = Vec::new();
         // Rows in this list that are not tabs (Slice D4): the zone gap, the
         // two ghost rows, and any bookmark folder rows. Counted so they do
         // not spend the tab budget — see `theme::rail_rows_h`.
         let mut extra = 0usize;
         let mut active_row: Option<usize> = None;
+        rows.push(self.zone_toggle("zone-projects", ZONE_PROJECTS, proj_shut, projects, cx));
+        extra += 1;
         let mut emitted_split = false;
         for (ix, item) in items.iter().enumerate() {
+            // While the zone is shut its own items are not drawn — but the
+            // loose tabs after the seam still are: they are a different zone
+            // and this loop happens to walk both.
+            if proj_shut && ix < projects {
+                continue;
+            }
             if ix == projects {
                 // Slice T1b — the folders close the projects section, so
                 // they land above the TABS seam rather than among the
                 // loose tabs. `active_row` is captured as `rows.len()` at
                 // push time, so inserting here shifts nothing.
-                let folders = self.bookmark_folder_rows(cx);
-                extra += folders.len() + 2;
-                rows.extend(folders);
-                // Slice D4 — the projects zone's action, where its ⊕ was.
-                rows.push(self.ghost_row(
-                    "project-new",
-                    "new project",
-                    false,
-                    |this, cx| this.pick_project(cx),
-                    cx,
-                ));
+                if !proj_shut {
+                    let folders = self.bookmark_folder_rows(cx);
+                    extra += folders.len() + 1;
+                    rows.extend(folders);
+                    // Slice D4 — the projects zone's action, where its ⊕ was.
+                    rows.push(self.ghost_row(
+                        "project-new",
+                        "new project",
+                        false,
+                        |this, cx| this.pick_project(cx),
+                        cx,
+                    ));
+                }
+                extra += 1;
                 rows.push(self.tabs_divider(cx));
             }
             match item {
@@ -8641,16 +8712,19 @@ impl Shell {
         // `+`, and a control that appears only once you already have what
         // it makes is not a control.
         if projects == items.len() {
-            let folders = self.bookmark_folder_rows(cx);
-            extra += folders.len() + 2;
-            rows.extend(folders);
-            rows.push(self.ghost_row(
-                "project-new",
-                "new project",
-                false,
-                |this, cx| this.pick_project(cx),
-                cx,
-            ));
+            if !proj_shut {
+                let folders = self.bookmark_folder_rows(cx);
+                extra += folders.len() + 1;
+                rows.extend(folders);
+                rows.push(self.ghost_row(
+                    "project-new",
+                    "new project",
+                    false,
+                    |this, cx| this.pick_project(cx),
+                    cx,
+                ));
+            }
+            extra += 1;
             rows.push(self.tabs_divider(cx));
         }
 
@@ -8947,6 +9021,74 @@ impl Shell {
             }))
             .drag_over::<BookmarkDrag>(|style, _, _, _| style.bg(theme::overlay()))
             .drag_over::<AddressDrag>(|style, _, _, _| style.bg(theme::overlay()))
+            .into_any_element()
+    }
+
+    /// A zone's collapse control, drawn as the zone's FIRST ROW.
+    ///
+    /// **Not a chevron bolted onto the first content row, which is what the
+    /// directive's words describe.** In the projects zone that row is a
+    /// project head, and a project head already carries its own chevron and
+    /// its own count for collapsing *itself* — a second chevron beside the
+    /// first, collapsing a different thing, is a control nobody can read.
+    /// So the zone's chevron is its own row, and it is the only row left
+    /// when the zone is shut.
+    ///
+    /// It is not a header coming back: no caps label, no title, nothing but
+    /// the chevron and — when shut — the count of what is hidden. A zone is
+    /// still identified by the shape of what follows it.
+    fn zone_toggle(
+        &self,
+        selector: &'static str,
+        key: &'static str,
+        collapsed: bool,
+        count: usize,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(selector))
+            .debug_selector(move || selector.into())
+            .w_full()
+            .flex_none()
+            .h(px(theme::RAIL_GHOST_H))
+            .px(px(theme::RAIL_GUTTER))
+            .rounded(px(theme::RADIUS_SELECT))
+            .cursor_pointer()
+            .hover_fade(selector, theme::wash_rest(), theme::overlay())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_2))
+            .child(icons::tagged_icon(
+                if collapsed {
+                    icons::ALT_ARROW_RIGHT
+                } else {
+                    icons::ALT_ARROW_DOWN
+                },
+                theme::RAIL_MARK,
+                theme::text_tertiary(),
+                format!("{selector}-chevron"),
+            ))
+            // The count is what a shut zone says instead of its rows. Absent
+            // when open, because the rows are right there being counted.
+            .children(collapsed.then(|| {
+                div()
+                    .debug_selector(move || format!("{selector}-count"))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(count.to_string()))
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let cell = if key == ZONE_PROJECTS {
+                    &this.zone_projects_collapsed
+                } else {
+                    &this.zone_sessions_collapsed
+                };
+                let next = !cell.get();
+                cell.set(next);
+                save_zone_collapsed(key, next);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -10521,8 +10663,17 @@ impl Shell {
         // pill, not a caps label — it is a filter over what the zone shows,
         // and removing it silently would have hidden every archived session
         // with no way back. Restated as a row so it shares the zone's shape.
-        let mut rows = rows;
-        if archived_count > 0 {
+        // Slice D4.2 stage 2 — the sessions zone's collapse. Same shape as
+        // the projects zone: the toggle heads the zone, and a shut zone keeps
+        // only its count.
+        let sess_shut = self.zone_sessions_collapsed.get();
+        let sess_count = rows.len();
+        let mut rows = if sess_shut { Vec::new() } else { rows };
+        rows.insert(
+            0,
+            self.zone_toggle("zone-sessions", ZONE_SESSIONS, sess_shut, sess_count, cx),
+        );
+        if !sess_shut && archived_count > 0 {
             let label = archived_toggle_label(archived_count, show_archived);
             rows.push(
                 div()
@@ -10551,13 +10702,15 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        rows.push(self.ghost_row(
-            "new-session",
-            "new session",
-            false,
-            |this, _cx| this.new_session(),
-            cx,
-        ));
+        if !sess_shut {
+            rows.push(self.ghost_row(
+                "new-session",
+                "new session",
+                false,
+                |this, _cx| this.new_session(),
+                cx,
+            ));
+        }
         let rows = rows;
 
         // The window surface is the sidebar. Traffic lights, pins, Projects,
@@ -17010,6 +17163,12 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         asked_for_project: RefCell::new(HashSet::new()),
                         launched_from_tab: RefCell::new(None),
                         bookmark_folder_open: RefCell::new(None),
+                        zone_projects_collapsed: std::cell::Cell::new(load_zone_collapsed(
+                            ZONE_PROJECTS,
+                        )),
+                        zone_sessions_collapsed: std::cell::Cell::new(load_zone_collapsed(
+                            ZONE_SESSIONS,
+                        )),
                         asked_to_select: RefCell::new(None),
                         closed_pages: VecDeque::new(),
                         conn: conn.clone(),
