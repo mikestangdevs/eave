@@ -7143,22 +7143,6 @@ impl Shell {
         self.omni.open.is_some()
     }
 
-    /// True when typing belongs in the pane header's address field, not
-    /// in a floating palette over the page.
-    ///
-    /// A page tab already has an address bar. Opening a second surface on
-    /// top of the document is why clicking that strip used to feel like it
-    /// opened "search". Session tabs and the launcher have no such field,
-    /// so those still get the floating palette.
-    fn omnibox_follows_header(&self, cx: &App) -> bool {
-        let snapshot = self.strip_snapshot(cx);
-        snapshot
-            .active
-            .as_deref()
-            .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a))
-            .is_some_and(|t| t.content == eave_wire::TabContent::Page)
-    }
-
     /// ⌘L — open the omnibox on the active tab's address, selected.
     ///
     /// Seeded with the address, because the commonest reason to open an
@@ -7403,11 +7387,6 @@ impl Shell {
     /// notice, a working trailer, a `/` palette — and none of those belong
     /// on somebody else's document. This one does.
     ///
-    /// Over a page the input itself is the pane header's address field;
-    /// this layer is then only the suggestion dropdown, hung from that
-    /// bar. The floating input remains for a session tab and the launcher,
-    /// which have no address field to type into.
-    ///
     /// # How it composites, which is the spike's finding cashed in
     ///
     /// It is `frost(…)`, so it is a **`BackdropBlur` over Chromium's own
@@ -7429,7 +7408,6 @@ impl Shell {
     /// the need for all of it.
     fn omnibox_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let edit = self.omni.open.as_ref()?;
-        let in_header = self.omnibox_follows_header(cx);
         let text = edit.text.clone();
         let seeded = edit.seeded;
         let highlighted = edit.highlighted;
@@ -7508,40 +7486,6 @@ impl Shell {
                     .into_any_element()
             })
             .collect();
-
-        if in_header {
-            if row_els.is_empty() {
-                return None;
-            }
-            return Some(
-                div()
-                    .absolute()
-                    .top(px(0.))
-                    .left_0()
-                    .right_0()
-                    .px(px(theme::SPACE_3))
-                    .pt(px(theme::SPACE_1))
-                    .child(
-                        frost(
-                            theme::RADIUS_PANEL,
-                            div()
-                                .id("omnibox-menu")
-                                .debug_selector(|| "omnibox-menu".into())
-                                .w_full()
-                                .rounded(px(theme::RADIUS_PANEL))
-                                .border_1()
-                                .border_color(theme::border_strong())
-                                .shadow(theme::shadow_panel())
-                                .overflow_hidden()
-                                .flex()
-                                .flex_col()
-                                .children(row_els),
-                        )
-                        .into_any_element(),
-                    )
-                    .into_any_element(),
-            );
-        }
 
         Some(
             div()
@@ -8086,21 +8030,11 @@ impl Shell {
                             "nav-reload-glyph",
                         )),
                 )
-                .child({
-                    // The address. At rest it states where the page is.
-                    // Clicking it (or ⌘L) edits in THIS field: search and
-                    // navigation run in the pane header, not in a second
-                    // surface floating over the document.
-                    let editing = self
-                        .omni
-                        .open
-                        .as_ref()
-                        .filter(|_| snapshot.active.as_deref() == Some(tab.id.as_str()));
-                    let seeded = editing.is_some_and(|e| e.seeded);
-                    let edit_text = editing.map(|e| e.text.clone());
-                    let has_edit = editing.is_some();
-                    let drag_url = tab.url.clone();
-                    let drag_title = tab.title.clone();
+                .child(
+                    // The address. Clicking it opens the omnibox on it,
+                    // which is the same act ⌘L performs — one path, so
+                    // the field cannot be opened into two different
+                    // states.
                     div()
                         .id("pane-address")
                         .debug_selector(|| "pane-address".into())
@@ -8110,23 +8044,8 @@ impl Shell {
                         .px(px(theme::SPACE_2))
                         .rounded(px(theme::RADIUS_BUTTON))
                         .cursor_pointer()
-                        .when(!has_edit, |d| {
-                            d.hover_fade("pane-address", theme::wash_rest(), theme::overlay())
-                        })
-                        .when(has_edit, |d| d.bg(theme::overlay()))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.omnibox_open() {
-                                // Already typing here. A second click
-                                // re-selects, the way ⌘L does, without
-                                // wiping what was typed.
-                                if let Some(e) = this.omni.open.as_mut() {
-                                    e.seeded = !e.text.is_empty();
-                                }
-                                cx.notify();
-                            } else {
-                                this.open_omnibox(cx);
-                            }
-                        }))
+                        .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
+                        .on_click(cx.listener(|this, _, _, cx| this.open_omnibox(cx)))
                         // Slice T1 — drag the address onto the bookmarks
                         // bar to file it. The RAW url, not the typing form
                         // drawn beside it: `typing_form` drops the scheme
@@ -8134,84 +8053,34 @@ impl Shell {
                         // bookmark stored that way cannot be navigated to.
                         // What is shown and what is kept are different
                         // strings, and this is the one place with both.
-                        // Not while the field is live: a drag from a caret
-                        // is a selection, not a bookmark.
-                        .when(!has_edit, |d| {
-                            d.when_some(drag_url, |d, url| {
-                                d.on_drag(
-                                    AddressDrag {
-                                        url,
-                                        title: drag_title,
-                                    },
-                                    |drag, _, _, cx| cx.new(|_| drag.clone()),
-                                )
+                        .when_some(tab.url.clone(), |d, url| {
+                            let title = tab.title.clone();
+                            d.on_drag(AddressDrag { url, title }, |drag, _, _, cx| {
+                                cx.new(|_| drag.clone())
                             })
                         })
                         .flex()
                         .items_center()
-                        .when(!has_edit, |d| {
-                            d.child(
-                                div()
-                                    .debug_selector(|| "pane-address-text".into())
-                                    .truncate()
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
-                                    .text_color(if address.is_some() {
-                                        theme::text_secondary()
-                                    } else {
-                                        theme::text_tertiary()
-                                    })
-                                    // A tab that has never navigated has no
-                                    // address, and says so in the register
-                                    // every other empty state in this shell
-                                    // uses: lower case, one clause, the fact.
-                                    .child(SharedString::from(
-                                        address.unwrap_or_else(|| "no address yet".to_string()),
-                                    )),
-                            )
-                        })
-                        .when(has_edit, |d| {
-                            let text = edit_text.unwrap_or_default();
-                            d.child(
-                                div()
-                                    .id("omnibox")
-                                    .debug_selector(|| "omnibox".into())
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .debug_selector(|| "omnibox-text".into())
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .text_size(px(theme::DETAIL_SIZE))
-                                            .line_height(px(theme::DETAIL_LINE))
-                                            .when(seeded && !text.is_empty(), |t| {
-                                                t.bg(theme::overlay_strong())
-                                                    .rounded(px(theme::RADIUS_CHIP))
-                                                    .px(px(theme::SPACE_1))
-                                            })
-                                            .text_color(if text.is_empty() {
-                                                theme::text_tertiary()
-                                            } else {
-                                                theme::text()
-                                            })
-                                            .child(SharedString::from(if text.is_empty() {
-                                                OMNIBOX_HINT.to_string()
-                                            } else {
-                                                text
-                                            })),
-                                    )
-                                    .child(
-                                        caret_glyph("omnibox", self.caret_lit(Field::Omnibox, cx))
-                                            .text_size(px(theme::DETAIL_SIZE)),
-                                    ),
-                            )
-                        })
-                })
+                        .child(
+                            div()
+                                .debug_selector(|| "pane-address-text".into())
+                                .truncate()
+                                .text_size(px(theme::DETAIL_SIZE))
+                                .line_height(px(theme::DETAIL_LINE))
+                                .text_color(if address.is_some() {
+                                    theme::text_secondary()
+                                } else {
+                                    theme::text_tertiary()
+                                })
+                                // A tab that has never navigated has no
+                                // address, and says so in the register
+                                // every other empty state in this shell
+                                // uses: lower case, one clause, the fact.
+                                .child(SharedString::from(
+                                    address.unwrap_or_else(|| "no address yet".to_string()),
+                                )),
+                        ),
+                )
                 // ── Slice E1: the zoom fact ──────────────────────────
                 //
                 // **Present only when it is not 100%**, which is the
