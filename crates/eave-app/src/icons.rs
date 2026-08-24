@@ -9,7 +9,7 @@
 //!
 //! # Where these come from
 //!
-//! The 53 line glyphs are the **Solar Icons** set (Linear weight) by 480
+//! The 54 line glyphs are the **Solar Icons** set (Linear weight) by 480
 //! Design, **CC BY 4.0** — vendored out of `comet/crates/ui/assets/icons/`
 //! in this same workspace, which is where the user pointed. **Attribution
 //! is a licence condition, not a courtesy**; eave had no notices file at
@@ -128,7 +128,7 @@ icons! {
 // Solar Icons (Linear) by 480 Design, CC BY 4.0. Attribution in
 // `THIRD_PARTY_NOTICES.md`. The whole family is vendored rather than the
 // handful today's screens use: a set is only coherent if the next screen
-// can reach for a glyph without a second licensing pass, and 53 files is
+// can reach for a glyph without a second licensing pass, and 54 files is
 // ~40 KB in the binary.
 Line {
     ADD_CIRCLE => "add-circle.svg",
@@ -144,6 +144,7 @@ Line {
     BELL => "bell.svg",
     CHAT_ROUND_LINE => "chat-round-line.svg",
     CHECKLIST => "checklist.svg",
+    CLOSE => "close.svg",
     CLOSE_CIRCLE => "close-circle.svg",
     CLOUD => "cloud.svg",
     COMMAND => "command.svg",
@@ -471,10 +472,10 @@ mod tests {
         for (path, _, _) in REGISTRY {
             assert!(Icons.load(path).unwrap().is_some(), "{path}");
         }
-        assert_eq!(of(Class::Line).count(), 53, "the vendored Solar family");
+        assert_eq!(of(Class::Line).count(), 54, "the vendored Solar family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 64);
+        assert_eq!(REGISTRY.len(), 65);
     }
 
     /// Every registered path is a file that exists on disk under exactly

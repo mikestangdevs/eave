@@ -1663,18 +1663,18 @@ pub fn rail_tabs_max_h() -> f32 {
 ///
 /// [`RAIL_TABS_VISIBLE`] is a promise about **tabs** — nine of them on
 /// screen at the default window size, which `nine_tabs_fit_the_rail_without_scrolling`
-/// measures. D4 put four other kinds of row into the same list: the zone
-/// gap, the projects ghost row, the tabs ghost row, and any bookmark folder
-/// rows. Capping the total at nine would have spent the tabs' budget on
-/// them and pushed the ninth tab off the bottom, which is exactly what it
-/// did on this slice's first run.
+/// measures. D4 put other kinds of row into the same list: the zone
+/// gap, the zone headers, and any bookmark folder rows. Capping the
+/// total at nine would have spent the tabs' budget on them and pushed
+/// the ninth tab off the bottom, which is exactly what it did on this
+/// slice's first run.
 ///
 /// So the cap applies to the tab rows and the rest are added on top.
 ///
 /// One of the extras is the folders/tabs rule, which is [`rail_rule_h`]
-/// rather than [`RAIL_TAB_H`]. Everything else extra (zone headers, ghost
-/// rows, folder rows) is still one tab tall. `extra` always includes that
-/// rule — `emit_folders_and_tabs_head` always pushes it.
+/// rather than [`RAIL_TAB_H`]. Everything else extra (zone headers, folder
+/// rows) is still one tab tall. `extra` always includes that rule —
+/// `emit_folders_and_tabs_head` always pushes it.
 pub fn rail_rows_h(rows: usize, extra: usize) -> f32 {
     let tabs = rows.saturating_sub(extra);
     let extra_tab_h = extra.saturating_sub(1);

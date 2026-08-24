@@ -20,6 +20,11 @@
 //! one of them is wrong it is wrong the same way every time, which is the
 //! only kind of wrong a person can learn to work around.
 //!
+//! [`rows`] adds one more stated fact on top of that ladder: **a matching
+//! bookmark is what Return does.** Pinning a page is a decision the operator
+//! already made, so typing `github` with `github.com/mikestangdevs` pinned
+//! goes there, not to a search for the word. History never outranks a pin.
+//!
 //! # Two refusals, which are the interesting part
 //!
 //! `javascript:` and `data:` are valid schemes that this deliberately treats
@@ -344,17 +349,203 @@ fn percent_encode_query(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Bookmarks, which the omnibox favours
+// ---------------------------------------------------------------------------
+
+/// A page the operator pinned. The dropdown ranks these ahead of history
+/// and, when one matches, ahead of a search: pinning is a decision, a
+/// visit is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    pub url: String,
+    pub title: Option<String>,
+}
+
+/// How many matching bookmarks sit in the dropdown (including row zero
+/// when a bookmark is what Return does).
+///
+/// Four. They go first, and a list of every pin would bury the search
+/// row the operator still needs when the pin is not the one they meant.
+pub const MAX_BOOKMARK_ROWS: usize = 4;
+
+fn host_of_typing(typing: &str) -> &str {
+    typing.split(['/', '?', '#']).next().unwrap_or(typing)
+}
+
+/// How well `probe` matches this pin. Lower is better. `None` is no match.
+///
+/// Address prefixes beat host-only, which beat a later label (`github.com`
+/// inside `docs.github.com`), which beat a path segment, which beat a
+/// title word. The same ladder history uses, so a pin and a visit that
+/// match the same way still rank the pin first — that part is the
+/// caller's job, not this score.
+fn saved_rank(saved: &Saved, probe: &str) -> Option<u8> {
+    if probe.is_empty() {
+        return None;
+    }
+    let typing = eave_wire::typing_form(&saved.url);
+    let url_l = saved.url.to_ascii_lowercase();
+    if typing.starts_with(probe) || url_l.starts_with(probe) {
+        return Some(0);
+    }
+    let host = host_of_typing(&typing);
+    if host.starts_with(probe) {
+        return Some(1);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    for start in 1..labels.len().saturating_sub(1) {
+        if labels[start..].join(".").starts_with(probe) {
+            return Some(2);
+        }
+    }
+    for seg in typing.split(['/', '?', '#']).skip(1) {
+        if !seg.is_empty() && seg.starts_with(probe) {
+            return Some(3);
+        }
+    }
+    if let Some(title) = &saved.title {
+        for word in title
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+        {
+            if word.starts_with(probe) {
+                return Some(4);
+            }
+        }
+    }
+    None
+}
+
+/// Matching pins, best first, original order as the tiebreak.
+///
+/// Tree order is what the operator arranged on the grid. There is no
+/// visit-count on a bookmark, and inventing one would be frecency by
+/// another name.
+fn saved_hits<'a>(typed: &str, saved: &'a [Saved]) -> Vec<&'a Saved> {
+    let needle = typed.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let short = eave_wire::typing_form(&needle);
+    let mut scored: Vec<(u8, usize, &'a Saved)> = Vec::new();
+    for (i, b) in saved.iter().enumerate() {
+        let rank = saved_rank(b, &needle)
+            .into_iter()
+            .chain(if short == needle {
+                None
+            } else {
+                saved_rank(b, &short)
+            })
+            .min();
+        if let Some(rank) = rank {
+            scored.push((rank, i, b));
+        }
+    }
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, b)| b).collect()
+}
+
+/// The untyped tail of the favoured pin, when the typed text is a prefix
+/// of it. Drawn as ghost after the caret. Title-only matches have no
+/// tail — the field cannot complete a word into a url.
+pub fn ghost_suffix(typed: &str, saved: &[Saved]) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return None;
+    }
+    let hit = saved_hits(typed, saved).into_iter().next()?;
+    let needle = typed.to_ascii_lowercase();
+    suffix_after(&hit.url, typed, &needle)
+        .or_else(|| suffix_after(&eave_wire::typing_form(&hit.url), typed, &needle))
+}
+
+/// What Tab writes into the field to accept the ghost: the rest of the
+/// pin, not a search. `None` when there is no ghost to accept.
+pub fn fill_text(typed: &str, saved: &[Saved]) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return None;
+    }
+    let hit = saved_hits(typed, saved).into_iter().next()?;
+    let needle = typed.to_ascii_lowercase();
+    let url_l = hit.url.to_ascii_lowercase();
+    if url_l.starts_with(&needle) {
+        return Some(hit.url.clone());
+    }
+    let fill = eave_wire::typing_form(&hit.url);
+    if fill.starts_with(&needle) {
+        return Some(fill);
+    }
+    None
+}
+
+fn suffix_after(full: &str, typed: &str, needle: &str) -> Option<String> {
+    if !full.to_ascii_lowercase().starts_with(needle) {
+        return None;
+    }
+    full.get(typed.len()..)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+fn same_place(a: &str, b: &str) -> bool {
+    a == b || eave_wire::typing_form(a) == eave_wire::typing_form(b)
+}
+
+fn bookmark_row(saved: &Saved) -> Row {
+    let form = eave_wire::typing_form(&saved.url);
+    let titled = saved
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != form);
+    Row {
+        kind: RowKind::Bookmark,
+        primary: titled.unwrap_or(&form).to_string(),
+        secondary: if titled.is_some() {
+            Some(form)
+        } else {
+            Some("bookmark".to_string())
+        },
+        url: saved.url.clone(),
+    }
+}
+
+fn go_row(target: &Target) -> Row {
+    match target {
+        Target::Address { url, typed_scheme } => Row {
+            kind: RowKind::Go,
+            primary: url.clone(),
+            // Say so when the scheme was inferred. The operator typed
+            // `example.com` and is about to go to `https://example.com` —
+            // that is a fact about their navigation, not a detail.
+            secondary: (!typed_scheme).then(|| "https added".to_string()),
+            url: url.clone(),
+        },
+        Target::Search { url, query, host } => Row {
+            kind: RowKind::SearchWith,
+            primary: query.clone(),
+            secondary: Some(format!("search {host}")),
+            url: url.clone(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The rows
 // ---------------------------------------------------------------------------
 
 /// What one row of the dropdown is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKind {
-    /// Row zero: what Return does right now, before any history is
-    /// consulted. Always present while there is text, and always first.
+    /// Navigate to this address, as typed (or as inferred).
     Go,
-    /// Row zero, when the line is a search rather than an address.
+    /// Search. Row zero only when no bookmark matched.
     SearchWith,
+    /// A pinned page. When one matches, it is row zero — a bookmark is a
+    /// decision already made, and it beats a search and a visit.
+    Bookmark,
     /// Somewhere this operator has been. `MatchKind` says whether the typed
     /// text matched the address or the title, which is the difference
     /// between "you were going here" and "you were looking for this".
@@ -374,7 +565,7 @@ pub struct Row {
     pub url: String,
 }
 
-/// How many history suggestions are offered under the `Go` row.
+/// How many history suggestions are offered under the pin and `Go` rows.
 ///
 /// Six. The dropdown floats over a page, and a list that covers the document
 /// is a menu that has stopped being a suggestion. Chrome shows eight in a
@@ -384,41 +575,47 @@ pub const MAX_HISTORY_ROWS: usize = 6;
 /// Build the dropdown for one typed line.
 ///
 /// Row zero is always what Return does, so **the operator can always see
-/// what they are about to commit to** — the single most important property
-/// of an address bar, and the one that makes the url-versus-search decision
-/// auditable rather than mysterious. History follows, best-ranked first,
-/// with anything that duplicates row zero removed: a row that does the same
-/// thing as the row above it is a place to lose a click.
-pub fn rows(input: &str, matches: &[HistoryMatch], prefix: &str) -> Vec<Row> {
+/// what they are about to commit to**. A matching bookmark takes that
+/// slot: pinning `github.com/mikestangdevs` and typing `github` goes
+/// there, not to a google search for the word. The search (or the inferred
+/// address) stays in the list under the pins so it is still a keystroke
+/// away. History follows, with anything that duplicates a row above it
+/// removed.
+pub fn rows(input: &str, saved: &[Saved], matches: &[HistoryMatch], prefix: &str) -> Vec<Row> {
     let Some(target) = resolve(input, prefix) else {
         return Vec::new();
     };
-    let mut rows = Vec::with_capacity(1 + matches.len().min(MAX_HISTORY_ROWS));
-    match &target {
-        Target::Address { url, typed_scheme } => rows.push(Row {
-            kind: RowKind::Go,
-            primary: url.clone(),
-            // Say so when the scheme was inferred. The operator typed
-            // `example.com` and is about to go to `https://example.com` —
-            // that is a fact about their navigation, not a detail.
-            secondary: (!typed_scheme).then(|| "https added".to_string()),
-            url: url.clone(),
-        }),
-        Target::Search { url, query, host } => rows.push(Row {
-            kind: RowKind::SearchWith,
-            primary: query.clone(),
-            secondary: Some(format!("search {host}")),
-            url: url.clone(),
-        }),
-    }
-    let first = rows[0].url.clone();
-    for m in matches.iter() {
-        if rows.len() > MAX_HISTORY_ROWS {
-            break;
-        }
-        if m.entry.url == first {
+    let hits = saved_hits(input, saved);
+    let go = go_row(&target);
+    let mut rows = Vec::with_capacity(
+        hits.len().min(MAX_BOOKMARK_ROWS) + 1 + matches.len().min(MAX_HISTORY_ROWS),
+    );
+    let mut seen: Vec<String> = Vec::new();
+
+    for b in hits.iter().take(MAX_BOOKMARK_ROWS) {
+        if seen.iter().any(|u| same_place(u, &b.url)) {
             continue;
         }
+        seen.push(b.url.clone());
+        rows.push(bookmark_row(b));
+    }
+    if rows.is_empty() {
+        seen.push(go.url.clone());
+        rows.push(go);
+    } else if !seen.iter().any(|u| same_place(u, &go.url)) {
+        rows.push(go);
+    }
+
+    let mut history_added = 0;
+    for m in matches.iter() {
+        if history_added >= MAX_HISTORY_ROWS {
+            break;
+        }
+        if seen.iter().any(|u| same_place(u, &m.entry.url)) {
+            continue;
+        }
+        seen.push(m.entry.url.clone());
+        history_added += 1;
         rows.push(Row {
             kind: RowKind::Visited(m.matched),
             primary: m
@@ -636,18 +833,18 @@ mod tests {
     /// url-versus-search decision auditable instead of mysterious.
     #[test]
     fn row_zero_is_always_what_return_does() {
-        let r = rows("example.com", &[], DEFAULT_SEARCH);
+        let r = rows("example.com", &[], &[], DEFAULT_SEARCH);
         assert_eq!(r[0].kind, RowKind::Go);
         assert_eq!(r[0].url, "https://example.com");
         assert_eq!(r[0].secondary.as_deref(), Some("https added"));
 
-        let r = rows("https://example.com", &[], DEFAULT_SEARCH);
+        let r = rows("https://example.com", &[], &[], DEFAULT_SEARCH);
         assert_eq!(
             r[0].secondary, None,
             "a scheme the operator typed is not news"
         );
 
-        let r = rows("rust traits", &[], DEFAULT_SEARCH);
+        let r = rows("rust traits", &[], &[], DEFAULT_SEARCH);
         assert_eq!(r[0].kind, RowKind::SearchWith);
         assert_eq!(r[0].secondary.as_deref(), Some("search google.com"));
     }
@@ -660,7 +857,7 @@ mod tests {
             entry("https://example.com", Some("Example")),
             entry("https://example.com/deep", Some("Deep")),
         ];
-        let r = rows("example.com", &hits, DEFAULT_SEARCH);
+        let r = rows("example.com", &[], &hits, DEFAULT_SEARCH);
         assert_eq!(r.len(), 2, "{r:?}");
         assert_eq!(r[0].url, "https://example.com");
         assert_eq!(r[1].url, "https://example.com/deep");
@@ -673,7 +870,7 @@ mod tests {
         let hits: Vec<HistoryMatch> = (0..30)
             .map(|i| entry(&format!("https://n{i}.test/"), None))
             .collect();
-        let r = rows("n", &hits, DEFAULT_SEARCH);
+        let r = rows("n", &[], &hits, DEFAULT_SEARCH);
         assert_eq!(r.len(), MAX_HISTORY_ROWS + 1);
         assert!(r.iter().all(|r| !r.url.is_empty()), "a row went nowhere");
     }
@@ -683,13 +880,82 @@ mod tests {
     #[test]
     fn an_untitled_entry_reads_as_its_address_once() {
         let hits = [entry("https://plain.test/path", None)];
-        let r = rows("plain", &hits, DEFAULT_SEARCH);
+        let r = rows("plain", &[], &hits, DEFAULT_SEARCH);
         assert_eq!(r[1].primary, "plain.test/path");
         assert_eq!(r[1].secondary, None);
 
         let hits = [entry("https://titled.test/path", Some("Titled"))];
-        let r = rows("titled", &hits, DEFAULT_SEARCH);
+        let r = rows("titled", &[], &hits, DEFAULT_SEARCH);
         assert_eq!(r[1].primary, "Titled");
         assert_eq!(r[1].secondary.as_deref(), Some("titled.test/path"));
+    }
+
+    fn pin(url: &str, title: Option<&str>) -> Saved {
+        Saved {
+            url: url.into(),
+            title: title.map(str::to_string),
+        }
+    }
+
+    /// Pinning `github.com/mikestangdevs` and typing `github` goes there,
+    /// not to a google search for the word. The search stays in the list
+    /// so it is still a keystroke away.
+    #[test]
+    fn a_matching_bookmark_is_what_return_does() {
+        let saved = [pin("https://github.com/mikestangdevs", None)];
+        let r = rows("github", &saved, &[], DEFAULT_SEARCH);
+        assert_eq!(r[0].kind, RowKind::Bookmark);
+        assert_eq!(r[0].url, "https://github.com/mikestangdevs");
+        assert_eq!(r[0].primary, "github.com/mikestangdevs");
+        assert!(
+            r.iter().any(|row| row.kind == RowKind::SearchWith),
+            "the search has to stay reachable: {r:?}"
+        );
+    }
+
+    /// A visit never outranks a pin, even when it is the same host.
+    #[test]
+    fn bookmarks_sit_ahead_of_history() {
+        let saved = [pin("https://github.com/mikestangdevs", Some("mike"))];
+        let hits = [entry("https://github.com/other", Some("other"))];
+        let r = rows("github", &saved, &hits, DEFAULT_SEARCH);
+        assert_eq!(r[0].url, "https://github.com/mikestangdevs");
+        assert_eq!(r[0].kind, RowKind::Bookmark);
+        assert!(
+            r.iter().any(|row| row.url == "https://github.com/other"),
+            "history still appears under the pin: {r:?}"
+        );
+        let other = r
+            .iter()
+            .position(|row| row.url == "https://github.com/other")
+            .unwrap();
+        assert!(other > 0);
+    }
+
+    /// The field completes the pin when what was typed is a prefix of it.
+    #[test]
+    fn the_ghost_completes_the_pin() {
+        let saved = [pin("https://github.com/mikestangdevs", None)];
+        assert_eq!(
+            ghost_suffix("github", &saved).as_deref(),
+            Some(".com/mikestangdevs")
+        );
+        assert_eq!(
+            fill_text("github", &saved).as_deref(),
+            Some("github.com/mikestangdevs")
+        );
+        assert_eq!(ghost_suffix("rust", &saved), None);
+        assert_eq!(fill_text("rust", &saved), None);
+    }
+
+    /// A title match still favours the pin for Return, but there is no
+    /// ghost — the field cannot complete a word into a url.
+    #[test]
+    fn a_title_match_has_no_ghost() {
+        let saved = [pin("https://example.com/secret", Some("Widget Factory"))];
+        let r = rows("widget", &saved, &[], DEFAULT_SEARCH);
+        assert_eq!(r[0].url, "https://example.com/secret");
+        assert_eq!(ghost_suffix("widget", &saved), None);
+        assert_eq!(fill_text("widget", &saved), None);
     }
 }

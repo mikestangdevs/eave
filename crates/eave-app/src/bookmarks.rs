@@ -136,6 +136,22 @@ pub fn children_of(snapshot: &BookmarksSnapshot, folder_id: &str) -> Vec<BarItem
         .collect()
 }
 
+/// Every link in the tree, depth-first. Folders are skipped.
+///
+/// The omnibox reads this list: a page you pinned is a page you meant to
+/// keep, whether it sits on the grid or inside a folder, and typing its
+/// host should land there before a search or a visit.
+pub fn all_links(snapshot: &BookmarksSnapshot) -> Vec<BarItem> {
+    snapshot
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.bookmark.kind {
+            BookmarkKind::Link { url } if !url.is_empty() => Some(item(n)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every link url in a folder's subtree, in tree order.
 ///
 /// Direct and nested. "Copy All Links" is the whole contents, not only
@@ -235,6 +251,25 @@ mod tests {
         );
         assert!(links_in(&s, "hn").is_empty());
         assert!(links_in(&s, "nobody").is_empty());
+    }
+
+    /// Nested pins are still pins. The omnibox would miss a folder's
+    /// contents if this only returned the grid.
+    #[test]
+    fn all_links_walks_the_whole_tree() {
+        let urls: Vec<String> = all_links(&tree())
+            .into_iter()
+            .filter_map(|i| i.url)
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.github.com/eave/pulls",
+                "https://docs.rs/",
+                "https://deep.test/",
+                "https://news.ycombinator.com/",
+            ]
+        );
     }
 
     /// A link with no name of its own reads as its host, and an operator's

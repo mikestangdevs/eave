@@ -4643,8 +4643,9 @@ enum TabMenuTarget {
     /// left open, and eave already closes the page menu when this one
     /// opens for exactly that reason.
     Bookmark(String),
-    /// The Folders zone header. New folder lives here (double-click /
-    /// right-click), not on the bookmark grid's `+`.
+    /// The Folders zone header. New folder lives on this header's `+`
+    /// (and still on double-click / right-click), not on the bookmark
+    /// grid's `+`.
     Folders,
 }
 
@@ -5290,6 +5291,18 @@ pub(crate) const ZONE_FOLDERS: &str = "zone_folders_collapsed";
 pub(crate) const ZONE_TABS: &str = "zone_tabs_collapsed";
 pub(crate) const ZONE_SESSIONS: &str = "zone_sessions_collapsed";
 
+/// Selector on the zone header's `+`, kept as the ids the ghost rows
+/// used to wear so a click still names the same act.
+fn zone_add_id(key: &'static str) -> &'static str {
+    match key {
+        ZONE_PROJECTS => "project-new",
+        ZONE_FOLDERS => "folder-new",
+        ZONE_TABS => "tab-new",
+        ZONE_SESSIONS => "new-session",
+        other => unreachable!("unknown zone key: {other}"),
+    }
+}
+
 /// Write the rail width back, keeping every other key in the file.
 ///
 /// Called on mouse-UP, never per mouse-move: a drag is one decision, and a
@@ -5553,7 +5566,7 @@ impl Shell {
                         this.remove_staged_file(ix, cx);
                     }))
                     .child(icons::tagged_icon(
-                        icons::CLOSE_CIRCLE,
+                        icons::CLOSE,
                         theme::ICON_SM,
                         theme::text_secondary_on_wash(),
                         format!("{chip}-close"),
@@ -7402,7 +7415,52 @@ impl Shell {
         } else {
             &[]
         };
-        omnibox::rows(&edit.text, hits, &omnibox::search_prefix())
+        let saved = self.omnibox_saved(cx);
+        omnibox::rows(&edit.text, &saved, hits, &omnibox::search_prefix())
+    }
+
+    /// Every pin the omnibox can complete, grid and folders, in tree order.
+    fn omnibox_saved(&self, cx: &App) -> Vec<omnibox::Saved> {
+        bookmarks::all_links(&self.bookmarks.read(cx).snapshot)
+            .into_iter()
+            .filter_map(|i| {
+                i.url.map(|url| omnibox::Saved {
+                    title: Some(i.label).filter(|s| !s.is_empty()),
+                    url,
+                })
+            })
+            .collect()
+    }
+
+    /// Ghost tail of the favoured pin, when the field is being typed
+    /// rather than showing a seeded selection.
+    fn omnibox_ghost(&self, cx: &App) -> Option<String> {
+        let edit = self.omni.open.as_ref()?;
+        if edit.seeded || edit.text.is_empty() {
+            return None;
+        }
+        let saved = self.omnibox_saved(cx);
+        omnibox::ghost_suffix(&edit.text, &saved)
+    }
+
+    /// Tab / → accepts the ghost into the field so it can be edited.
+    fn accept_omnibox_fill(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.omni.open.as_ref() else {
+            return;
+        };
+        if edit.seeded {
+            return;
+        }
+        let saved = self.omnibox_saved(cx);
+        let Some(fill) = omnibox::fill_text(&edit.text, &saved) else {
+            return;
+        };
+        if let Some(e) = self.omni.open.as_mut() {
+            e.text = fill;
+            e.highlighted = 0;
+        }
+        self.query_typeahead(cx);
+        cx.notify();
     }
 
     /// Ask the engine for typeahead against what has been typed.
@@ -7501,6 +7559,7 @@ impl Shell {
         match ks.key.as_str() {
             "escape" => self.close_omnibox(cx),
             "enter" => self.commit_omnibox(cx),
+            "tab" | "right" => self.accept_omnibox_fill(cx),
             "down" => {
                 if let Some(e) = self.omni.open.as_mut() {
                     if rows > 0 {
@@ -7629,6 +7688,7 @@ impl Shell {
                 let glyph = match row.kind {
                     omnibox::RowKind::Go => icons::GLOBAL,
                     omnibox::RowKind::SearchWith => icons::MAGNIFER,
+                    omnibox::RowKind::Bookmark => icons::STAR,
                     // A visited page is a place, not an act — the same
                     // globe row zero uses when row zero is a navigation.
                     omnibox::RowKind::Visited(_) => icons::GLOBAL,
@@ -7705,6 +7765,7 @@ impl Shell {
         }
         let text = edit.text.clone();
         let seeded = edit.seeded;
+        let ghost = self.omnibox_ghost(cx);
         let row_els = self.omnibox_suggestion_els(cx);
 
         Some(
@@ -7759,8 +7820,7 @@ impl Shell {
                                     .child(
                                         div()
                                             .debug_selector(|| "omnibox-text".into())
-                                            .flex_1()
-                                            .min_w(px(0.))
+                                            .when(ghost.is_none(), |d| d.flex_1().min_w(px(0.)))
                                             .truncate()
                                             .text_size(px(theme::BODY_SIZE))
                                             // The seeded address is drawn on
@@ -7804,7 +7864,17 @@ impl Shell {
                                     .child(
                                         caret_glyph("omnibox", self.caret_lit(Field::Omnibox, cx))
                                             .text_size(px(theme::BODY_SIZE)),
-                                    ),
+                                    )
+                                    .children(ghost.map(|g| {
+                                        div()
+                                            .debug_selector(|| "omnibox-ghost".into())
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_size(px(theme::BODY_SIZE))
+                                            .text_color(theme::text_tertiary())
+                                            .child(SharedString::from(g))
+                                    })),
                             )
                             .when(!row_els.is_empty(), |d| {
                                 d.child(
@@ -8301,6 +8371,7 @@ impl Shell {
                     let has_edit = editing.is_some();
                     let seeded = editing.is_some_and(|e| e.seeded);
                     let edit_text = editing.map(|e| e.text.clone()).unwrap_or_default();
+                    let ghost = has_edit.then(|| self.omnibox_ghost(cx)).flatten();
                     let drag_url = tab.url.clone();
                     let drag_title = tab.title.clone();
                     div()
@@ -8416,8 +8487,9 @@ impl Shell {
                                             .child(
                                                 div()
                                                     .debug_selector(|| "omnibox-text".into())
-                                                    .flex_1()
-                                                    .min_w(px(0.))
+                                                    .when(ghost.is_none(), |d| {
+                                                        d.flex_1().min_w(px(0.))
+                                                    })
                                                     .truncate()
                                                     .text_size(px(theme::DETAIL_SIZE))
                                                     .line_height(px(theme::DETAIL_LINE))
@@ -8445,7 +8517,18 @@ impl Shell {
                                                     self.caret_lit(Field::Omnibox, cx),
                                                 )
                                                 .text_size(px(theme::DETAIL_SIZE)),
-                                            ),
+                                            )
+                                            .children(ghost.map(|g| {
+                                                div()
+                                                    .debug_selector(|| "omnibox-ghost".into())
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .text_size(px(theme::DETAIL_SIZE))
+                                                    .line_height(px(theme::DETAIL_LINE))
+                                                    .text_color(theme::text_tertiary())
+                                                    .child(SharedString::from(g))
+                                            })),
                                     )
                                     .children(self.omnibox_attached(cx)),
                             ))
@@ -9071,9 +9154,9 @@ impl Shell {
         let tabs_shut = self.zone_tabs_collapsed.get();
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        // Rows in this list that are not tabs: zone headers, the zone gap,
-        // the ghost rows, and any bookmark folder rows. Counted so they do
-        // not spend the tab budget — see `theme::rail_rows_h`.
+        // Rows in this list that are not tabs: zone headers, the zone
+        // rule, and any bookmark folder rows. Counted so they do not
+        // spend the tab budget — see `theme::rail_rows_h`.
         let mut extra = 0usize;
         let mut active_row: Option<usize> = None;
         rows.push(self.zone_toggle(
@@ -9083,19 +9166,10 @@ impl Shell {
             proj_shut,
             project_count,
             false,
+            |this, cx| this.pick_project(cx),
             cx,
         ));
         extra += 1;
-        if !proj_shut {
-            rows.push(self.ghost_row(
-                "project-new",
-                "new project",
-                false,
-                |this, cx| this.pick_project(cx),
-                cx,
-            ));
-            extra += 1;
-        }
         let mut emitted_split = false;
         let mut emitted_tabs_seam = false;
         for (ix, item) in items.iter().enumerate() {
@@ -9670,9 +9744,11 @@ impl Shell {
             .into_any_element()
     }
 
-    /// A zone's collapse control: `Label n ∨`, drawn as the zone's first
-    /// row. The caret follows the count, matching the other disclosure
-    /// headers in the shell. When the zone is shut this row is what stays.
+    /// A zone's collapse control: `Label [n] + ∨`, drawn as the zone's
+    /// first row. `n` is omitted at zero — an empty zone stating "0" is
+    /// noise. The `+` is how you add to the zone; it sits on the right
+    /// with the caret so it is not read as part of the title. When the
+    /// zone is shut this row is what stays.
     #[allow(clippy::too_many_arguments)]
     fn zone_toggle(
         &self,
@@ -9682,8 +9758,10 @@ impl Shell {
         collapsed: bool,
         count: usize,
         rule_above: bool,
+        on_add: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let add_id = zone_add_id(key);
         rail_inset()
             .child(
                 div()
@@ -9711,13 +9789,47 @@ impl Shell {
                             .text_color(theme::text_tertiary())
                             .child(SharedString::from(label)),
                     )
+                    .when(count > 0, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("{selector}-count"))
+                                .text_size(px(theme::SMALL_SIZE))
+                                .line_height(px(theme::SMALL_LINE))
+                                .text_color(theme::text_tertiary())
+                                .child(SharedString::from(format!("{count}"))),
+                        )
+                    })
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .debug_selector(move || format!("{selector}-count"))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
-                            .child(SharedString::from(format!("{count}"))),
+                            .id(SharedString::from(add_id))
+                            .debug_selector(move || add_id.into())
+                            .size(px(theme::ICON_SM))
+                            .rounded(px(theme::RADIUS_SELECT))
+                            .cursor_pointer()
+                            .hover_fade(add_id, theme::wash_rest(), theme::overlay())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                let cell = this.zone_cell(key);
+                                if cell.get() {
+                                    cell.set(false);
+                                    save_zone_collapsed(key, false);
+                                }
+                                on_add(this, cx);
+                                cx.notify();
+                            }))
+                            .child(icons::tagged_icon(
+                                icons::ADD_CIRCLE,
+                                theme::ICON_STATUS,
+                                theme::text_tertiary(),
+                                format!("{add_id}-glyph"),
+                            )),
                     )
                     .child(icons::tagged_icon(
                         if collapsed {
@@ -9769,9 +9881,9 @@ impl Shell {
         }
     }
 
-    /// Folders zone + the TABS seam + the tabs header and its `new tab`
-    /// row. Pushed as a block so the two call sites (the seam inside the
-    /// item loop, and the no-loose-tabs tail) cannot drift.
+    /// Folders zone + the TABS seam + the tabs header. Pushed as a block
+    /// so the two call sites (the seam inside the item loop, and the
+    /// no-loose-tabs tail) cannot drift. Add is the header `+`.
     fn emit_folders_and_tabs_head(
         &self,
         rows: &mut Vec<AnyElement>,
@@ -9789,15 +9901,16 @@ impl Shell {
             folders_shut,
             folder_count,
             false,
+            |this, cx| this.new_bookmark_folder(cx),
             cx,
         ));
         extra += 1;
         if !folders_shut {
             let folders = self.bookmark_folder_rows(cx);
             if folders.is_empty() {
-                // No ghost row here: new folder is on this header's
-                // double-click / right-click menu. The note is the fact,
-                // not a second button.
+                // No ghost row here: new folder is the header `+` (and
+                // still the double-click / right-click menu). The note
+                // is the fact, not a second button.
                 rows.push(
                     rail_inset()
                         .child(
@@ -9841,77 +9954,11 @@ impl Shell {
             tabs_shut,
             loose_count,
             false,
+            |this, cx| this.new_tab(cx),
             cx,
         ));
         extra += 1;
-        if !tabs_shut {
-            rows.push(self.ghost_row("tab-new", "new tab", false, |this, cx| this.new_tab(cx), cx));
-            extra += 1;
-        }
         extra
-    }
-
-    /// A zone's action, shaped like the rows it creates.
-    ///
-    /// Lives at the TOP of the zone, under the labelled header, so it is
-    /// the first thing in the section rather than a row you have to scroll
-    /// past the contents to find.
-    ///
-    /// Dimmed at rest and brightened on hover, so it recedes until looked
-    /// for. `hover_fade` is N2's machinery, already used by every other rail
-    /// control.
-    fn ghost_row(
-        &self,
-        selector: &'static str,
-        label: &'static str,
-        rule_above: bool,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let row = div()
-            .id(SharedString::from(selector))
-            .debug_selector(move || selector.into())
-            .w_full()
-            .h(px(theme::RAIL_GHOST_H))
-            .px(px(theme::RAIL_HOVER_PAD))
-            .rounded(px(theme::RADIUS_SELECT))
-            // Optional top hairline. Zone seams use `zone_rule` (an inset
-            // row), not a border on a rounded header — a `border_t` on
-            // `RADIUS_SELECT` curves the ends and runs edge-to-edge.
-            // Kept as a parameter so a future zone can opt in without a
-            // second constructor.
-            .when(rule_above, |d| {
-                d.border_t(px(theme::HAIRLINE))
-                    .border_color(theme::border())
-            })
-            .cursor_pointer()
-            .hover_fade(selector, theme::wash_rest(), theme::overlay())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::SPACE_2))
-            .child(icons::tagged_icon(
-                icons::ADD_CIRCLE,
-                theme::RAIL_MARK,
-                theme::text_tertiary(),
-                format!("{selector}-glyph"),
-            ))
-            .child(
-                div()
-                    // The LABEL carries a selector of its own: the row is
-                    // full-width, so its own origin is the rail's edge, not
-                    // the gutter every piece of rail text starts on.
-                    .debug_selector(move || format!("{selector}-label"))
-                    .min_w(px(0.))
-                    .flex_1()
-                    .truncate()
-                    .text_size(px(theme::SMALL_SIZE))
-                    .text_color(theme::text_tertiary())
-                    .child(SharedString::from(label)),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)));
-
-        rail_inset().child(row).into_any_element()
     }
 
     /// The bookmark FOLDERS, as titled rows in their own zone between
@@ -10259,6 +10306,11 @@ impl Shell {
     /// blank page has no address and this is a no-op — those still split
     /// the well when dropped there, which is the other meaning of a tab
     /// drag.
+    ///
+    /// **The tab moves.** Filing it is not a copy: the page lives on the
+    /// grid now, so the tab that was showing it closes. Dragging the
+    /// address itself (`AddressDrag`) still copies — that gesture is a
+    /// url, not a tab.
     fn drop_tab_as_bookmark(
         &mut self,
         parent: Option<String>,
@@ -10272,22 +10324,27 @@ impl Shell {
         };
         let title = (!drag.title.is_empty() && drag.title != strip::NEW_TAB_LABEL)
             .then(|| drag.title.clone());
+        let tab_id = drag.id.clone();
         self.add_bookmark(parent, index, &AddressDrag { url, title }, cx);
+        self.close_tab(&tab_id, cx);
     }
 
     /// Pin the page in front of you onto the bookmark grid.
     ///
     /// Same verb as the tab menu's Pin. No-ops on a session tab or a blank
     /// page — there is nothing to pin. Folders are not made here.
+    ///
+    /// Moves the tab, the way dropping it on the grid does: the page is
+    /// on the grid now.
     fn pin_active_page(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
         if !strip::active_is_page(&snapshot) {
             return;
         }
-        let Some(id) = snapshot.active.as_deref() else {
+        let Some(id) = snapshot.active.clone() else {
             return;
         };
-        let Some(url) = self.tab_url(id, cx) else {
+        let Some(url) = self.tab_url(&id, cx) else {
             return;
         };
         if crate::omnibox::engine_host(&url).is_empty() {
@@ -10301,10 +10358,10 @@ impl Shell {
                 title: None,
                 url: Some(url),
             }));
-        cx.notify();
+        self.close_tab(&id, cx);
     }
 
-    /// A top-level folder, from the Folders header menu.
+    /// A top-level folder, from the Folders header `+` or its menu.
     ///
     /// Named on creation rather than left blank and renamed after. eave has
     /// no inline rename for a bookmark yet (`BookmarkRename` is on the wire
@@ -10774,7 +10831,10 @@ impl Shell {
                     .ml(px(theme::SPACE_1))
                     .size(px(theme::TAB_CLOSE))
                     .flex_none()
-                    .rounded(px(theme::RADIUS_SELECT))
+                    // Rounded square, not a circle: `RADIUS_SELECT` (8) on
+                    // an 18 px box is a disc. `RADIUS_CHIP` (5) is the
+                    // same corner the provider plate uses at this size.
+                    .rounded(px(theme::RADIUS_CHIP))
                     .hover_fade(
                         format!("tab-close-{id}"),
                         gpui::transparent_black(),
@@ -10793,7 +10853,7 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .child(icons::tagged_icon(
-                        icons::CLOSE_CIRCLE,
+                        icons::CLOSE,
                         theme::ICON_SM,
                         theme::text_secondary()
                             .opacity(crate::motion::hover_t(&format!("tab-{id}"))),
@@ -11542,8 +11602,8 @@ impl Shell {
             .collect();
         // Slice M (§3.1): an empty rail rendered literally nothing, so a
         // first run and a rail that failed to load looked identical. One
-        // clause, the fact only — the action is the `+ new` button eight
-        // pixels above it, and restating a visible button is noise.
+        // clause, the fact only — the action is the `+` on the Sessions
+        // header, and restating a visible button is noise.
         let rows: Vec<AnyElement> = if rows.is_empty() {
             vec![div()
                 .px(px(theme::RAIL_GUTTER))
@@ -11566,10 +11626,10 @@ impl Shell {
             rows
         };
 
-        // Sessions zone: labelled header, then `new session` at the top of
-        // the body, then the rows, then the archived filter. The filter is
-        // not a create action — it stays at the end because it is a filter
-        // over what the zone already shows.
+        // Sessions zone: labelled header (add is the `+` on it), then the
+        // rows, then the archived filter. The filter is not a create
+        // action — it stays at the end because it is a filter over what
+        // the zone already shows.
         let sess_shut = self.zone_sessions_collapsed.get();
         let body = rows;
         let mut rows = vec![self.zone_toggle(
@@ -11579,16 +11639,10 @@ impl Shell {
             sess_shut,
             sess_count,
             false,
+            |this, _cx| this.new_session(),
             cx,
         )];
         if !sess_shut {
-            rows.push(self.ghost_row(
-                "new-session",
-                "new session",
-                false,
-                |this, _cx| this.new_session(),
-                cx,
-            ));
             rows.extend(body);
             if archived_count > 0 {
                 let label = archived_toggle_label(archived_count, show_archived);
@@ -15062,6 +15116,7 @@ impl Shell {
                             title: None,
                             url: Some(url),
                         }));
+                    self.close_tab(&tab_id, cx);
                 }
             }
             TabMenuAction::OpenInNewTab => {
