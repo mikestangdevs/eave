@@ -2309,12 +2309,10 @@ pub const OMNIBOX_H: f32 = 44.0;
 /// One suggestion row.
 pub const OMNIBOX_ROW_H: f32 = 40.0;
 
-/// How far the omnibox floats below the top of the content well.
-///
-/// It hangs from the well's top edge rather than from the window's, because
-/// the well is what the page fills and the omnibox is about the page. A
-/// surface anchored to the window would sit over the titlebar's traffic
-/// lights on a short window.
+/// How far the **floating** omnibox hangs below the top of the content
+/// well. Used only when the pane header cannot host the field — a session
+/// tab or the launcher. Over a page, field and suggestions are one card
+/// hung from the address bar.
 pub const OMNIBOX_TOP: f32 = SPACE_3;
 
 #[cfg(test)]
