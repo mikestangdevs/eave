@@ -9681,10 +9681,21 @@ impl Shell {
                 // `flex_1` now, so a hidden close really would give its 22 px
                 // to the title. What survives is the part that was never
                 // about width: **a control that appears under the pointer is
-                // one the operator cannot see before reaching for it.** That
-                // still decides it. Revealing on row hover would also need
+                // one the operator cannot see before reaching for it.**
+                //
+                // **Slice D4.2 repair 3 reverses this, and the note above it
+                // was out of date.** It said row hover "would also need
                 // group-hover state this gpui pin does not expose, so the
-                // alternative was not merely rejected — it was not available.
+                // alternative was not merely rejected — it was not
+                // available." It is available: N2's fade store keys hover by
+                // string, this row already registers under `tab-{id}` via
+                // its own `hover_fade`, and `motion::hover_t` reads that key
+                // back at render. Nothing new had to be wired.
+                //
+                // The width objection does not survive the move either: the
+                // slot is laid out at all times and only the glyph's ink
+                // changes, so nothing reflows and no row shifts under the
+                // pointer.
                 div()
                     .id(SharedString::from(format!("tab-close-{id}")))
                     .debug_selector({
@@ -9715,7 +9726,8 @@ impl Shell {
                     .child(icons::tagged_icon(
                         icons::CLOSE_CIRCLE,
                         theme::ICON_SM,
-                        theme::text_secondary(),
+                        theme::text_secondary()
+                            .opacity(crate::motion::hover_t(&format!("tab-{id}"))),
                         format!("tab-close-glyph-{id}"),
                     )),
             )
