@@ -14972,3 +14972,81 @@ fn the_palette_borrows_the_arrows_and_returns_them(cx: &mut TestAppContext) {
         "the palette's down key also moved the caret"
     );
 }
+
+// ---------------------------------------------------------------------------
+// G2 — a notification that is actually on screen
+// ---------------------------------------------------------------------------
+
+/// Put a notification through the whole path a page uses, minus Chromium.
+///
+/// `web::drive_notifications` runs in the render pass, so pushing a
+/// `Runtime.bindingCalled` event and rendering is exactly what a page
+/// calling `new Notification(..)` does — `cdp_call`'s feature-off twin
+/// issues the calls and nothing here needs a browser.
+fn page_notifies(h: &Harness, vcx: &mut VisualTestContext, origin: &str, payload: &str) {
+    let url = format!("{origin}/app");
+    strip_tabs(h, vcx, vec![page_tab("t-note", Some(&url), None)], Some("t-note"));
+    // First render installs the shim; the event can only follow it.
+    crate::web::cdp::note_event(
+        "t-note",
+        "Runtime.bindingCalled",
+        &serde_json::json!({
+            "name": crate::web::NOTIFY_BINDING,
+            "payload": payload,
+        })
+        .to_string(),
+    );
+    vcx.run_until_parked();
+    drive(h, vcx, Duration::from_millis(16));
+}
+
+/// The row, as a thing you can see.
+///
+/// Every other G2 test asserts about decisions and CDP calls. This one
+/// asserts the pixels exist, which is the claim `0f9fd22` could not make
+/// and the one that matters to a person.
+#[gpui::test]
+fn a_granted_notification_appears_over_the_page(cx: &mut TestAppContext) {
+    let (h, vcx) = &mut boot(cx);
+    let origin = "https://harness-granted.example";
+    crate::web::permissions::note_answer(
+        origin,
+        &[eave_core::browser::permissions::PermissionKind::Notifications],
+        crate::web::permissions::PermissionDecision::Allow,
+    );
+    page_notifies(
+        h,
+        vcx,
+        origin,
+        r#"{"kind":"show","seq":1,"title":"Build done","body":"3 tests"}"#,
+    );
+    assert!(shown(vcx, "notification-stack"), "the stack never mounted");
+    assert!(shown(vcx, "notification-toast"), "no toast on screen");
+    assert!(
+        shown(vcx, "notification-origin"),
+        "the origin line is the one part of the card the page does not \
+         control; a toast without it is unattributable"
+    );
+}
+
+/// **The G2 defect itself, as a UI assertion.**
+///
+/// A screenshot of a working toast would not catch this: the failure was
+/// never that notifications did not appear, it was that a page was told a
+/// notification HAD appeared when nothing did. So the load-bearing test is
+/// the negative one — no grant, no pixels, and the page hears `error`.
+#[gpui::test]
+fn a_notification_without_permission_never_reaches_the_screen(cx: &mut TestAppContext) {
+    let (h, vcx) = &mut boot(cx);
+    page_notifies(
+        h,
+        vcx,
+        "https://harness-ungranted.example",
+        r#"{"kind":"show","seq":1,"title":"trust me"}"#,
+    );
+    assert!(
+        !shown(vcx, "notification-toast"),
+        "a page with no grant put something on screen"
+    );
+    assert!(!shown(vcx, "notification-stack"));
+}

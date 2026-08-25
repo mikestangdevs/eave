@@ -90,22 +90,50 @@ pub fn take_replay_request() -> bool {
 /// fallback, shows no in-page banner, and the person is simply never told
 /// anything. A refusal is a fact the page can act on; a false grant is not.
 ///
-/// Notifications are the case. **CEF exposes no notification API at all** —
-/// the 151.6.0 bindings carry 24 symbols matching "notification" and every
-/// one of them is a colour id (`CEF_ColorNotificationBackgroundActive` and
-/// friends). There is no handler to implement and no callback to answer.
-/// Displaying one would mean shimming `window.Notification` in the renderer
-/// and routing it out to `UNUserNotificationCenter`, and eave has no
-/// renderer seam to shim through: there is not one `RenderProcessHandler`,
-/// `on_process_message_received`, `send_process_message` or
-/// `execute_java_script` in the crate, and `web_helper.rs` is 27 lines.
-/// That seam is a slice of its own — and the one E8's agent-visible console
-/// needs too, which is the argument for building it once, deliberately.
+/// **Nothing is undeliverable now**, and this returns true for everything.
+/// It is kept rather than deleted because the rule it enforces is the
+/// slice's whole point and the next capability eave models before it
+/// implements will want it — every caller asks this question instead of
+/// naming a kind, so turning one off again is a one-line change here.
 ///
-/// **This is the ONE place to flip when the seam exists.** Everything else
-/// asks this question rather than naming the kind.
-pub fn can_deliver(kind: &PermissionKind) -> bool {
-    !matches!(kind, PermissionKind::Notifications)
+/// # Notifications were the case, and the reasoning that closed it was wrong
+/// This comment used to say the fix needed a renderer seam eave did not
+/// have — "not one `RenderProcessHandler`, `on_process_message_received`,
+/// `send_process_message` or `execute_java_script` in the crate" — and
+/// called that seam a slice of its own. Every one of those facts was true
+/// and the conclusion was still wrong: **the seam is CDP.** E9's channel
+/// (`web/inspector.rs`, `7f2120b`) already reaches into the renderer, and
+/// `Runtime.addBinding` plus `Page.addScriptToEvaluateOnNewDocument` put a
+/// `window.Notification` in the page and get its calls back out — no new
+/// CEF surface at all. See [`super::notify`].
+///
+/// Worth keeping as a warning rather than deleting: the survey was
+/// accurate, exhaustive, and searched for the wrong thing. It asked *does
+/// eave have the seam Chrome would use*, and the answer eave needed was
+/// *does eave have a seam*.
+pub fn can_deliver(_kind: &PermissionKind) -> bool {
+    true
+}
+
+/// Kinds eave serves ITSELF, so Chromium must never serve them.
+///
+/// Notifications, and for now only notifications. `super::notify` shims
+/// `window.Notification` and draws the result in eave's own chrome, which
+/// means Chromium's notification path must stay shut: two implementations
+/// of one API is one too many, and the Chromium one is the half that
+/// **lies** — its platform notification service is present, non-null, and
+/// drops what it is handed, which is how G2 came to fire `onshow` for
+/// notifications that never displayed.
+///
+/// So this is not belt-and-braces. It is the thing that keeps the measured
+/// defect fixed while the capability is switched back on.
+pub fn eave_delivers(kind: &PermissionKind) -> bool {
+    matches!(kind, PermissionKind::Notifications)
+}
+
+/// Every kind eave serves itself. See [`eave_delivers`].
+pub fn eave_delivered_kinds() -> Vec<PermissionKind> {
+    all_kinds().into_iter().filter(eave_delivers).collect()
 }
 
 /// Every kind eave models, minus `Unknown`.
@@ -491,24 +519,56 @@ mod tests {
 
     // ---- G2: what eave can actually deliver on ----
 
-    /// The whole point of the row, stated as an assertion: eave must not be
-    /// able to say yes to a notification while nothing can display one.
+    /// The row is built, so the refusal is gone — and this is the
+    /// assertion that says so rather than leaving it to be inferred from
+    /// three deleted tests.
+    ///
+    /// `0f9fd22` made a notification eave could not deliver **refused**
+    /// instead of falsely granted. It is now delivered, by `super::notify`,
+    /// so refusing it would be the new lie.
     #[test]
-    fn notifications_are_not_deliverable() {
-        assert!(!can_deliver(&PermissionKind::Notifications));
+    fn eave_can_now_deliver_a_notification() {
+        assert!(can_deliver(&PermissionKind::Notifications));
+        assert!(
+            undeliverable_kinds().is_empty(),
+            "nothing is undeliverable now; the machinery is kept for the next \
+             capability eave models before it implements"
+        );
     }
 
-    /// ...and the refusal is exactly one kind wide. A capability rule that
-    /// quietly took the rest of the list with it would be a much larger
-    /// change wearing G2's name.
+    /// The property that must OUTLIVE the fix, and the reason
+    /// `eave_delivers` exists as a second question.
+    ///
+    /// eave shows notifications in its own chrome. Chromium's own path must
+    /// stay shut, because Chromium's is the half that lies — a present,
+    /// non-null platform service that drops what it is handed. Two
+    /// implementations of one API is one too many, and letting the grant
+    /// through to Chromium would restore the measured defect behind a
+    /// working feature.
     #[test]
-    fn notifications_are_the_only_thing_eave_refuses() {
-        assert_eq!(
-            undeliverable_kinds(),
-            vec![PermissionKind::Notifications],
-            "the capability refusal grew or shrank; if a kind was added to \
-             PermissionKind it also needs adding to all_kinds()"
-        );
+    fn chromium_must_never_deliver_what_eave_delivers_itself() {
+        assert!(eave_delivers(&PermissionKind::Notifications));
+        assert_eq!(eave_delivered_kinds(), vec![PermissionKind::Notifications]);
+    }
+
+    /// The rule is exactly one kind wide, in the new direction.
+    ///
+    /// A capability rule that quietly took the rest of the list with it
+    /// would be a much larger change wearing G2's name — and here the cost
+    /// of that mistake is every permission silently forced to BLOCK in
+    /// Chromium, which no test of notifications alone would catch.
+    #[test]
+    fn nothing_else_is_taken_with_it() {
+        for kind in all_kinds() {
+            if kind == PermissionKind::Notifications {
+                continue;
+            }
+            assert!(
+                !eave_delivers(&kind),
+                "{kind:?} was swept into the eave-delivers rule; it would be \
+                 forced to BLOCK in Chromium whatever the person answered"
+            );
+        }
         // That the enumeration is the WHOLE enum is checked by the
         // compiler, in `_every_variant_is_accounted_for` — not here. A
         // length assertion against a literal compares the list to itself
@@ -517,18 +577,5 @@ mod tests {
             all_kinds().iter().all(|k| k.is_storable()),
             "all_kinds picked up Unknown, which is never a real kind"
         );
-    }
-
-    /// `undeliverable` names what stopped it rather than answering yes/no,
-    /// because a trace line that says `Notifications` is the difference
-    /// between "eave refused on purpose" and "the handler is broken".
-    #[test]
-    fn undeliverable_names_the_kind_that_stopped_it() {
-        assert_eq!(
-            undeliverable(&[PermissionKind::Geolocation, PermissionKind::Notifications]),
-            vec![PermissionKind::Notifications]
-        );
-        assert!(undeliverable(&[PermissionKind::Camera]).is_empty());
-        assert!(undeliverable(&[]).is_empty());
     }
 }

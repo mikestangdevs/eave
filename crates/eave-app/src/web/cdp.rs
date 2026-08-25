@@ -235,6 +235,46 @@ pub fn drain_events() -> Vec<Event> {
     EVENTS.with(|e| e.borrow_mut().drain(..).collect())
 }
 
+/// Take only the events a consumer asked for, leaving the rest queued.
+///
+/// [`drain_events`] is the take-everything case and stays the default; this
+/// exists because **there is more than one consumer**. E8 wants console and
+/// network; G2's notifications want `Runtime.bindingCalled` and nothing
+/// else. With a single drain, whichever ran first would silently eat the
+/// other's traffic — a defect with no error and no log line, visible only
+/// as a feature that works until someone opens the other one.
+///
+/// A predicate rather than a list of method prefixes, so neither consumer
+/// has to commit to a taxonomy of CDP events before anyone knows what the
+/// second one needs.
+///
+/// # Known next move: this makes starvation possible, and the cap is silent
+/// One capped queue plus selective takes means a category **nobody** reads
+/// can fill all [`EVENT_CAP`] slots and evict a category someone is reading
+/// — the docked frontend's self-enabled `Network.*` being the obvious
+/// source, since it produces into this queue without any consumer asking.
+/// So a notification can go missing because a person opened Inspect. The
+/// fix, when it is needed, is an interest registry: [`note_event`] keeps
+/// only what some consumer has registered for, which also restores
+/// [`dropped_events`] to meaning what its name says. Deliberately not built
+/// yet — it is the right answer to a problem nobody has measured.
+pub fn take_events_matching(want: impl Fn(&Event) -> bool) -> Vec<Event> {
+    EVENTS.with(|e| {
+        let mut e = e.borrow_mut();
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::with_capacity(e.len());
+        for event in e.drain(..) {
+            if want(&event) {
+                taken.push(event);
+            } else {
+                kept.push_back(event);
+            }
+        }
+        *e = kept;
+        taken
+    })
+}
+
 /// How many events have been dropped to the cap. Never resets.
 ///
 /// # This is NOT a backpressure signal on its own, and an earlier version
@@ -350,6 +390,39 @@ pub fn event_enables() -> [(&'static str, Value); 3] {
         ("Log.enable", json!({})),
         ("Runtime.enable", json!({})),
     ]
+}
+
+/// Install a function on the page's global that calls back into eave.
+///
+/// The page calls `<name>(someString)` and Chromium raises
+/// `Runtime.bindingCalled` with `{"name":..,"payload":..}`. It is the only
+/// page-to-embedder channel CDP has, and it is **one-way**: the answer, if
+/// there is one, goes back as a separate [`evaluate`].
+///
+/// Requires `Runtime.enable` first — without it the call succeeds, the
+/// binding is installed, the page can call it, and no event ever arrives.
+///
+/// # This is a real global and it cannot be hidden
+/// Any script on the page can see it, call it, and lie in the payload.
+/// Whatever the binding guards must be guarded on the Rust side.
+pub fn add_binding(name: &str) -> (&'static str, Value) {
+    ("Runtime.addBinding", json!({ "name": name }))
+}
+
+/// Run `source` at the start of every document loaded from now on.
+///
+/// For **future** documents only — it does nothing to the one already
+/// loaded, which is a distinction with no error attached to it: install a
+/// shim this way and it works perfectly on the second page a person visits.
+/// Pair it with an [`evaluate`] of the same source for the current
+/// document, and write the source so running twice is harmless.
+///
+/// Requires `Page.enable` first.
+pub fn add_script_on_new_document(source: &str) -> (&'static str, Value) {
+    (
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": source }),
+    )
 }
 
 #[cfg(test)]

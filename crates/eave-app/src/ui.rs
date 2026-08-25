@@ -6408,6 +6408,102 @@ impl Shell {
         });
     }
 
+    /// Notifications a page raised, drawn over that page — 06-browser G2.
+    ///
+    /// # Why this surface exists at all
+    /// **CEF alloy has no notification API.** The platform service behind
+    /// it is present, non-null, and drops what it is handed, so
+    /// `new Notification(..)` used to fire `onshow` for something that had
+    /// never displayed — a capability that reported success and did
+    /// nothing. `web/notify.rs` shims `window.Notification` over E9's CDP
+    /// channel and routes it here; **this element is the only reason that
+    /// `onshow` is now true.**
+    ///
+    /// # It is shown over a page, and it answers the occlusion rule
+    /// The floating-surface rule in `render` demands every overlay say
+    /// whether it is suppressed or shown over a page, and the standard this
+    /// file already holds is that a surface may sit over a page **only if
+    /// it is about that page**. A notification is raised *by* the page
+    /// underneath it, which is the same warrant `page_dialog` has.
+    ///
+    /// Top-right, the corner Chrome, Safari and macOS all use, so nothing
+    /// about its position needs learning.
+    ///
+    /// # The origin is above the text, for the reason `page_dialog` says
+    /// A page chooses every word of a notification's title and body,
+    /// including a convincing imitation of eave's own voice. The origin is
+    /// the only line on this card the page does not control — `notify.rs`
+    /// derives it from eave's tab model and never reads it from the
+    /// payload — so it is stated separately and first.
+    fn notification_toasts(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let live = crate::web::notifications();
+        if live.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .debug_selector(|| "notification-stack".into())
+                .absolute()
+                .top(px(theme::SPACE_3))
+                .right(px(theme::SPACE_3))
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_2))
+                .children(live.into_iter().map(|n| {
+                    let seq = n.seq;
+                    div()
+                        .debug_selector(|| "notification-toast".into())
+                        // Clicking one takes it down. `occlude` because the
+                        // page is underneath and a click meant for the
+                        // toast must not also reach it — the same reason
+                        // the menu layer occludes.
+                        .occlude()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                crate::web::dismiss_notification(seq);
+                                cx.notify();
+                            }),
+                        )
+                        .w(px(320.))
+                        .p(px(theme::SPACE_3))
+                        .rounded(px(theme::RADIUS_PANEL))
+                        .bg(theme::overlay_strong())
+                        .border_1()
+                        .border_color(theme::card_border())
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme::SPACE_1))
+                        .child(
+                            div()
+                                .debug_selector(|| "notification-origin".into())
+                                .text_size(px(theme::MICRO_SIZE))
+                                .text_color(theme::text_secondary())
+                                .child(eave_wire::typing_form(&n.origin)),
+                        )
+                        .when(!n.title.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .debug_selector(|| "notification-title".into())
+                                    .text_size(px(theme::BODY_SIZE))
+                                    .text_color(theme::text())
+                                    .child(n.title.clone()),
+                            )
+                        })
+                        .when(!n.body.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .debug_selector(|| "notification-body".into())
+                                    .text_size(px(theme::BODY_SIZE))
+                                    .text_color(theme::text_secondary())
+                                    .child(n.body.clone()),
+                            )
+                        })
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// The dialog a page is stopped on, drawn over that page.
     ///
     /// # This surface is DELIBERATELY shown over a page
@@ -17268,6 +17364,12 @@ impl Render for Shell {
             ids
         };
         crate::web::set_shown_pages(shown_pages);
+        // G2. Here because this is where the tab snapshot is readable and
+        // where the file's other once-per-frame reconciliations already
+        // live. It installs the `window.Notification` shim on pages that
+        // need it, answers whatever pages have asked for since the last
+        // frame, and retires toasts that have been up long enough.
+        crate::web::drive_notifications(&strip_snapshot);
 
         let page_el = {
             let active = strip_snapshot.active.clone();
@@ -17281,6 +17383,11 @@ impl Render for Shell {
         // relationship to the page decided in one place. See `page_dialog`
         // for why this one is deliberately drawn OVER a page.
         let page_dialog_el = self.page_dialog(cx);
+        // Computed beside `page_dialog_el` because the floating-surface
+        // rule below wants every overlay's relationship to the page decided
+        // in one place, and this one has the same warrant: it is about the
+        // page underneath it.
+        let toast_el = self.notification_toasts(cx);
         // Slice C5: a page TAB is active even in a build with no page
         // engine, and even before its browser has painted. `showing_page`
         // has to mean "the well is the page's" and not "there are pixels",
@@ -18140,6 +18247,12 @@ impl Render for Shell {
                                                 // this question and nothing else
                                                 // on screen would say so.
                                                 .children(page_dialog_el)
+                                                // G2. Over the page and
+                                                // only over a page: it is
+                                                // ABOUT the page that
+                                                // raised it. See
+                                                // `Shell::notification_toasts`.
+                                                .children(toast_el)
                                                 .children(page_absence.map(|note| {
                                                     div()
                                                         .debug_selector(|| "page-absence".into())

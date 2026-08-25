@@ -144,6 +144,14 @@ mod input;
 mod inspector;
 #[cfg(feature = "web")]
 mod menu;
+/// `window.Notification`, reimplemented over a CDP binding because CEF
+/// alloy has no notification API — the display half of G2. Compiled in
+/// BOTH feature states: everything that decides whether a notification is
+/// shown, and who it is attributed to, lives here rather than in the
+/// injected JavaScript, so the default test run exercises the decisions.
+/// See its module docs.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+mod notify;
 #[cfg(feature = "web")]
 mod osr;
 #[cfg(feature = "web")]
@@ -711,6 +719,10 @@ pub(crate) fn request_menu(menu: PageMenu) {
 /// not arrived. Keep the query, drop the bit.
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub(crate) fn forget_page(tab_id: &str) {
+    // Whatever this tab had on screen goes with it, unacked: there is no
+    // page left to hear a `close`, and an ack to a dead browser answers
+    // `NotSent` on a later pump for nothing. See `notify::forget_tab`.
+    notify::forget_tab(tab_id);
     FINDS.with(|f| {
         f.borrow_mut().remove(tab_id);
     });
@@ -999,6 +1011,39 @@ pub fn cdp_type(tab_id: &str, text: &str) -> u32 {
 pub fn cdp_screenshot(tab_id: &str) -> u32 {
     let (method, params) = cdp::screenshot();
     cdp_call(tab_id, method, &params)
+}
+
+// ---------------------------------------------------------------------------
+// G2 — notifications eave actually delivers
+// ---------------------------------------------------------------------------
+
+/// One turn of the notification loop.
+///
+/// Called from the render pass, beside [`set_shown_pages`], because that
+/// is where the tab snapshot is readable and where every other
+/// once-per-frame reconciliation in this file already happens.
+///
+/// **Ungated on purpose.** `cdp_call` has a feature-off twin that issues
+/// the call and lets a test answer it, so the whole loop — install, decide,
+/// ack, expire — runs and is asserted in the default suite. The only thing
+/// the `web` build adds is a Chromium on the other end.
+pub fn drive_notifications(snapshot: &eave_wire::TabsSnapshot) {
+    notify::drive(snapshot, std::time::Instant::now());
+}
+
+/// The binding name a page calls to reach eave. Re-exported because
+/// `notify` is private and the UI harness has to raise the same event
+/// Chromium would — naming the string twice is how the two drift.
+pub use notify::BINDING as NOTIFY_BINDING;
+
+/// What is on screen right now, oldest first. The renderer's whole view.
+pub fn notifications() -> Vec<notify::Live> {
+    notify::live()
+}
+
+/// A person clicked one away.
+pub fn dismiss_notification(seq: u64) {
+    notify::dismiss(seq);
 }
 
 /// Turn on the domains that make a tab report what it is doing — the E8

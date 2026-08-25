@@ -547,13 +547,21 @@ fn sync_to_chromium(origin: &str, kinds: &[PermissionKind], value: ContentSettin
             continue;
         };
         // G2: every write to Chromium goes through this loop, so forcing
-        // the value here is what makes "eave cannot grant a notification"
-        // true of all paths rather than of the ones I remembered to edit.
-        // An undeliverable kind is BLOCK whatever the caller asked for.
-        let value = if super::permissions::can_deliver(kind) {
-            value
-        } else {
+        // the value here is what makes "Chromium never delivers a
+        // notification" true of all paths rather than of the ones I
+        // remembered to edit.
+        //
+        // The forcing SURVIVED the capability being switched on. eave now
+        // shows notifications itself (`super::notify`), so a person can
+        // grant one and eave's own store says Allow — but Chromium's copy
+        // of that answer stays BLOCK, because Chromium's notification path
+        // is the half that lies: its platform service is present, non-null,
+        // and drops what it is handed. Granting it here would restore the
+        // exact defect G2 exists to fix, behind a working feature.
+        let value = if super::permissions::eave_delivers(kind) {
             ContentSettingValues::BLOCK
+        } else {
+            value
         };
         // Requesting and top-level url are both the origin: eave has no
         // per-embedder permission model, and answering "allow example.com"
@@ -654,13 +662,13 @@ fn block_undeliverable_by_default() {
     let Some(context) = super::host::global_request_context() else {
         return;
     };
-    for kind in super::permissions::undeliverable_kinds() {
+    for kind in super::permissions::eave_delivered_kinds() {
         let Some(ty) = content_type(&kind) else {
             continue;
         };
         context.set_content_setting(None, None, ty, ContentSettingValues::BLOCK);
         if super::tabs::trace() {
-            eprintln!("[web] chromium DEFAULT {kind:?} := BLOCK — eave cannot deliver it");
+            eprintln!("[web] chromium DEFAULT {kind:?} := BLOCK — eave delivers it itself");
         }
     }
 }
