@@ -1059,41 +1059,92 @@ pub fn show_devtools(tab_id: &str, _x: i32, _y: i32) {
     })
     .flatten()
     .filter(|u| !u.is_empty());
-    let Some(frontend) = devtools_frontend_url(page_url.as_deref()) else {
-        if std::env::var("EAVE_WEB_TRACE").is_ok() {
-            eprintln!("[web] devtools: no frontend url for {tab_id} (endpoint down or no target)");
-        }
-        return;
-    };
-    if std::env::var("EAVE_WEB_TRACE").is_ok() {
-        eprintln!("[web] devtools: docking {dt_id} at {frontend}");
-    }
-    // From here it is `create` verbatim, for the devtools id.
-    let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
-    window_info.shared_texture_enabled = 1;
-    let v = super::osr::view(&dt_id);
-    window_info.bounds = Rect {
-        x: 0,
-        y: 0,
-        width: v.width,
-        height: v.height,
-    };
-    let settings = BrowserSettings {
-        windowless_frame_rate: FRAME_RATE,
-        ..Default::default()
-    };
+
+    // **The lookup runs on ANOTHER THREAD, and that is the whole reason
+    // the dock stayed black.** Chromium answers `/json` by posting to the
+    // UI thread (`devtools_http_handler.cc`: `GetUIThreadTaskRunner()
+    // ->PostTask(&OnJsonRequest)`), and this function IS the UI thread.
+    // Asking here blocked the only thread that could answer, the read
+    // timed out, and `show_devtools` gave up without a word. From a
+    // separate process the identical call always succeeded, which is what
+    // made it look like the endpoint was fine.
+    //
+    // The answer comes back through `run_queued_docks`, on the UI thread,
+    // just after a pump — the same shape `favicon::run_queued` uses for
+    // work that must not happen inside a CEF callback.
     CREATING.with(|c| c.borrow_mut().insert(dt_id.clone()));
-    let mut client = PageClient::new(dt_id.clone());
-    let start = CefString::from(frontend.as_str());
-    browser_host_create_browser(
-        Some(&window_info),
-        Some(&mut client),
-        Some(&start),
-        Some(&settings),
-        None,
-        None,
-    );
-    super::host::request_pump();
+    std::thread::spawn(move || {
+        let found = devtools_frontend_url(page_url.as_deref());
+        if let Ok(mut q) = PENDING_DOCKS.lock() {
+            q.push((dt_id, found));
+        }
+        super::host::request_pump();
+    });
+}
+
+/// Docks whose target lookup has come back, waiting for the UI thread.
+///
+/// `None` is a failed lookup, carried rather than dropped so the pane can
+/// be taken down instead of standing empty over a browser that is never
+/// coming.
+static PENDING_DOCKS: std::sync::Mutex<Vec<(String, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Create the browsers whose frontend URLs arrived since the last pump.
+///
+/// **UI thread, after the pump**, beside `favicon::run_queued` and for the
+/// same reason: this creates browsers, and browser creation is not
+/// something to do from a worker thread or from inside a CEF callback.
+pub(super) fn run_queued_docks() {
+    let queued = match PENDING_DOCKS.lock() {
+        Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+        _ => return,
+    };
+    for (dt_id, frontend) in queued {
+        let Some(frontend) = frontend else {
+            // The lookup failed. Let go of the id so a later Inspect can
+            // try again, and close the dock so no empty pane is left.
+            CREATING.with(|c| {
+                c.borrow_mut().remove(&dt_id);
+            });
+            super::devtools_note_closed(&dt_id);
+            if std::env::var("EAVE_WEB_TRACE").is_ok() {
+                eprintln!("[web] devtools: no frontend url for {dt_id}");
+            }
+            continue;
+        };
+        if has_browser(&dt_id) {
+            continue;
+        }
+        if std::env::var("EAVE_WEB_TRACE").is_ok() {
+            eprintln!("[web] devtools: docking {dt_id} at {frontend}");
+        }
+        // From here it is `create` verbatim, for the devtools id.
+        let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
+        window_info.shared_texture_enabled = 1;
+        let v = super::osr::view(&dt_id);
+        window_info.bounds = Rect {
+            x: 0,
+            y: 0,
+            width: v.width,
+            height: v.height,
+        };
+        let settings = BrowserSettings {
+            windowless_frame_rate: FRAME_RATE,
+            ..Default::default()
+        };
+        let mut client = PageClient::new(dt_id.clone());
+        let start = CefString::from(frontend.as_str());
+        browser_host_create_browser(
+            Some(&window_info),
+            Some(&mut client),
+            Some(&start),
+            Some(&settings),
+            None,
+            None,
+        );
+        super::host::request_pump();
+    }
 }
 
 /// The frontend URL for a tab's target, from the local protocol endpoint.
@@ -1160,8 +1211,15 @@ fn devtools_targets_json_at(addr: std::net::SocketAddr) -> Option<String> {
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).ok()?;
     s.set_read_timeout(Some(std::time::Duration::from_millis(700)))
         .ok()?;
-    s.write_all(b"GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .ok()?;
+    // **The `Host` header must carry the PORT**, because Chromium builds
+    // the URLs it hands back from it: with `Host: 127.0.0.1` every
+    // `webSocketDebuggerUrl` came back as `ws://127.0.0.1/devtools/…`,
+    // pointing the frontend at port 80. Measured both ways against the
+    // live endpoint before this line was written.
+    s.write_all(
+        format!("GET /json/list HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .ok()?;
 
     // **Read to `Content-Length`, never to EOF.** The endpoint ignores
     // `Connection: close` and holds the socket open, so `read_to_end`

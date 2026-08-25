@@ -461,6 +461,10 @@ fn pump_cef() {
     // Favicon downloads queued from OnFaviconURLChange start HERE, after
     // the pump, not inside the display handler. See `favicon.rs`.
     super::favicon::run_queued();
+    // DevTools docks whose target lookup came back on a worker thread.
+    // Same reason as the favicons: it creates a browser, which does not
+    // belong on a worker thread or inside a CEF callback.
+    super::tabs::run_queued_docks();
     // Anything Chromium queued while we were inside raised no request, so
     // ask for one more pass. This is what keeps the chain alive; without it
     // the loop runs on the heartbeat alone with work outstanding.
@@ -627,6 +631,44 @@ wrap_app! {
     impl App {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
             Some(EaveBrowserProcessHandler::new())
+        }
+
+        /// One switch, and the docked DevTools does not connect without it.
+        ///
+        /// Chromium refuses a websocket to the debugging port that arrives
+        /// with an `Origin` header, unless that origin is named here — the
+        /// mitigation for a web page reaching the port via DNS rebinding.
+        /// eave's frontend is a real page served from
+        /// `http://127.0.0.1:<port>`, so it sends exactly such a header and
+        /// is refused: the panel draws, then "Debugging connection was
+        /// closed — WebSocket disconnected". Chromium says so on stderr,
+        /// naming the flag; nothing surfaces in the UI.
+        ///
+        /// **The value is that ONE origin, never `*`.** `*` would admit any
+        /// page in any browser on this machine that can guess the port.
+        /// This admits the frontend eave itself serves, which is the only
+        /// thing at that origin.
+        fn on_before_command_line_processing(
+            &self,
+            process_type: Option<&CefString>,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            // Browser process only — it is the one that hosts the endpoint.
+            // Renderers and helpers get an empty process type too, so check
+            // for emptiness rather than for a name.
+            let is_browser = process_type
+                .map(|t| t.to_string().is_empty())
+                .unwrap_or(true);
+            let Some(command_line) = command_line else { return };
+            if !is_browser {
+                return;
+            }
+            command_line.append_switch_with_value(
+                Some(&CefString::from("remote-allow-origins")),
+                Some(&CefString::from(
+                    format!("http://127.0.0.1:{DEVTOOLS_PORT}").as_str(),
+                )),
+            );
         }
     }
 }
