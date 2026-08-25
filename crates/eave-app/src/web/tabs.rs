@@ -1047,6 +1047,13 @@ pub fn show_devtools(tab_id: &str, _x: i32, _y: i32) {
     if !super::host::running() {
         return;
     }
+    // No docking DevTools onto DevTools. Nothing in the product asks for
+    // it now that the frontend keeps its own menus, but the id would be
+    // `devtools:devtools:…` and the second frontend would inspect the
+    // first, which is a state worth refusing rather than explaining.
+    if super::devtools_parent(tab_id).is_some() {
+        return;
+    }
     let dt_id = super::devtools_id(tab_id);
     if has_browser(&dt_id) || CREATING.with(|c| c.borrow().contains(&dt_id)) {
         // Already docked, or on its way — a second Inspect is "make sure
@@ -1188,21 +1195,54 @@ fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
     // also the one that must be used on principle: a browser's devtools
     // should not be a fetch from a third-party host.
     let ws = pick["webSocketDebuggerUrl"].as_str()?.strip_prefix("ws://")?;
-    // **`can_dock=true` is what makes this a DOCK rather than a remote
-    // debugging session.** A `?ws=` frontend assumes it is inspecting a
-    // device somewhere else, so it opens the SCREENCAST app: the page
-    // arrives as a picture in a phone-shaped frame, next to the panels,
-    // and eave's own copy of the page sits behind it. Chrome appends this
-    // for every docked window it opens (`devtools_window.cc`
-    // `GetDevToolsURL`: `if (can_dock) url += "&can_dock=true"`).
+    // **`devtools_app.html`, and deliberately NO `can_dock`.** Both were
+    // measured against the live dock; both were wrong the other way first.
     //
-    // Measured against the live dock before it was written here:
-    // `.screencast` present without it, absent with it.
+    // `inspector.html` is Chrome's FALLBACK entrypoint
+    // (`devtools_window.cc`: `kFallbackFrontendURL`); `devtools_app.html`
+    // is `kDefaultFrontendURL`, the one every docked window actually gets.
+    //
+    // `can_dock=true` looked right — it is what Chrome appends, and it did
+    // stop the frontend opening the screencast app. But the frontend then
+    // runs `AdvancedApp`, which keeps a pane for the INSPECTED PAGE and
+    // only gives it up once the embedder confirms the dock. eave is not
+    // that embedder — the host object here is the stub every hosted
+    // frontend gets — so the confirmation never came, `document.body`
+    // stayed `undocked`, and the pane stood empty: 150 px of grey between
+    // eave's page and the panels. Without the flag the frontend is the
+    // screencast app instead, whose empty pane DOES collapse, once the
+    // screencast setting is off — which is what `devtools_settle_frontend`
+    // does from inside the page.
+    //
+    // Measured: with `can_dock` the split is `151:350 , 0:150` and the
+    // body class is `undocked`; without it, and with screencast off, there
+    // is no split at all and the panels have the full 501.
     Some(format!(
-        "http://127.0.0.1:{}/devtools/inspector.html?ws={}&can_dock=true",
+        "http://127.0.0.1:{}/devtools/devtools_app.html?ws={}",
         super::host::DEVTOOLS_PORT,
         ws
     ))
+}
+
+/// The one setting the docked frontend needs, set from inside its own page.
+///
+/// `screencast-enabled` defaults to **true**, and it is what draws the
+/// page a second time as a picture in a phone-shaped frame beside the
+/// panels. It lives in `localStorage` on the frontend's own origin, so
+/// there is no way to seed it from out here: the page sets it and reloads
+/// **once per profile**, after which the value persists and this is a
+/// no-op. `getItem` immediately after `setItem` is what makes it exactly
+/// once rather than a reload loop.
+fn devtools_settle_frontend(frame: &mut Frame) {
+    const SHIM: &str = "(function(){\
+         try {\
+           if (localStorage.getItem('screencast-enabled') !== 'false') {\
+             localStorage.setItem('screencast-enabled', 'false');\
+             location.reload();\
+           }\
+         } catch (e) {}\
+       })();";
+    frame.execute_java_script(Some(&CefString::from(SHIM)), None, 0);
 }
 
 /// `GET /json/list` from the local endpoint. Blocking but bounded — it is
@@ -1551,8 +1591,15 @@ wrap_load_handler! {
             if std::env::var("EAVE_WEB_TRACE").is_ok() {
                 eprintln!("[web] on_load_end status={_http_status_code}");
             }
-            if frame.map(|f| f.is_main()) != Some(1) {
+            let Some(frame) = frame else { return };
+            if frame.is_main() != 1 {
                 return;
+            }
+            // The docked DevTools frontend, settling its own settings. A
+            // no-op for every ordinary page, and for the frontend after
+            // the first time. See `devtools_settle_frontend`.
+            if super::devtools_parent(&self.tab_id).is_some() {
+                devtools_settle_frontend(frame);
             }
             set_chrome(&self.tab_id, |c| c.progress = 1.0);
             // G5: the commit is the moment Chromium has applied this

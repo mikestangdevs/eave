@@ -70,6 +70,22 @@ cef::wrap_context_menu_handler! {
             _model: Option<&mut MenuModel>,
             callback: Option<&mut RunContextMenuCallback>,
         ) -> i32 {
+            // **The DevTools frontend gets its own menus, not eave's.**
+            // It is a page like any other to this handler, so without
+            // this a right-click inside the panels offered Back, Reload,
+            // View Page Source and an "Inspect" that would have docked
+            // DevTools onto DevTools. The frontend draws its own menus in
+            // its own DOM (a hosted frontend uses soft menus), and that
+            // has already happened by the time this runs — so answering
+            // `1` and cancelling leaves the right menu on screen and
+            // suppresses ours.
+            if super::devtools_parent(&self.tab_id).is_some() {
+                if let Some(callback) = callback {
+                    callback.cancel();
+                }
+                return 1;
+            }
+
             let Some(params) = params else {
                 // No params is no menu. Declining outright is better than
                 // an empty one at a point we would have to invent.
