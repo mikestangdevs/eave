@@ -944,6 +944,12 @@ pub const SPACE_6: f32 = UNIT * 6.0;
 
 /// 1 px rules and dividers (the markdown `---` rule).
 pub const HAIRLINE: f32 = 1.0;
+/// Insertion-point width. waku paints 1.5 px on this gpui pin; comet and
+/// eave's previous TextField used 2 px, which read as a bar rather than a
+/// caret. 1 CSS px is the Mac insertion point, but a 1-logical-px quad
+/// anti-aliases away at half-pixel origins; 1.5 is the floor that stays
+/// findable.
+pub const CARET_W: f32 = 1.5;
 
 // ---------------------------------------------------------------------------
 // Typography

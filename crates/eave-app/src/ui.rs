@@ -4783,6 +4783,11 @@ struct Shell {
     /// Whether the friction log's path has been stated in the footer yet
     /// this run (Stage L).
     friction_path_stated: bool,
+    /// Zoom chip in the pane header. `None` unless ⌘+ / ⌘− just fired on
+    /// this tab — Chromium remembering 90% is not a reason to keep the
+    /// number on screen.
+    zoom_hud: Option<(u64, String)>,
+    zoom_hud_gen: u64,
     /// The rails' scroll offsets (Slice M). Held only so the scroll-edge
     /// fades can read overflow at PAINT time — nothing else reads them,
     /// and no scroll POSITION is authoritative here (spec 03: the UI
@@ -5136,19 +5141,17 @@ enum Field {
     Rename,
 }
 
-/// The caret glyph. A half-width vertical bar rather than a full block: it
-/// marks a position between two characters, and a block marks a character.
-const CARET: &str = "▏";
-
 /// One caret, for every field whose text does not wrap.
 ///
-/// The composer's is not built here and cannot be — its text wraps, so its
-/// caret has to live *inside* the string as a colour-only run or it stops
-/// travelling with the last line. Every other field in eave truncates
-/// instead, and a truncating box has to keep the caret out of the string it
-/// is clipping, or the first thing a long value clips is the insertion
-/// point. So: a sibling, `flex_none`, always in the layout and only
-/// sometimes in the ink.
+/// A painted [`theme::CARET_W`] quad, not the `▏` glyph. That glyph is a
+/// block element: it advances a whole character cell and reads as a white
+/// bar sitting beside the text. The composer's caret is not built here —
+/// its text wraps, so the insertion point has to live inside the shaped
+/// line (TextField paints it). Every other field truncates, and a
+/// truncating box has to keep the caret out of the string it is clipping
+/// or the first thing a long value clips is the insertion point. So: a
+/// sibling, `flex_none`, always in the layout and only sometimes in the
+/// ink.
 ///
 /// **Drawn at zero opacity rather than removed**, which is what makes the
 /// blink ink and never layout — nothing on the row moves as it flashes.
@@ -5160,12 +5163,17 @@ const CARET: &str = "▏";
 /// exists to do. `caret-omnibox-lit` and `caret-omnibox-dark` are two
 /// elements to a test and one element to a reader. (The find bar's tally
 /// already takes this trick, from Slice E3's evicted tab chip.)
-fn caret_glyph(field: &'static str, lit: bool) -> Div {
+///
+/// `height` is the field's type size, not its line-height: a caret as tall
+/// as the cell is a bar. Ink is [`theme::text`] — an I-beam, not an accent
+/// tick. Accent on the caret sat on the address selection and vanished.
+fn caret_glyph(field: &'static str, lit: bool, height: f32, color: Hsla) -> Div {
     div()
         .debug_selector(move || format!("caret-{field}-{}", if lit { "lit" } else { "dark" }))
         .flex_none()
-        .text_color(theme::text().opacity(if lit { 1.0 } else { 0.0 }))
-        .child(CARET)
+        .w(px(theme::CARET_W))
+        .h(px(height))
+        .bg(color.opacity(if lit { 1.0 } else { 0.0 }))
 }
 
 /// One open rail rename (Stage AC).
@@ -5523,6 +5531,11 @@ fn local_timestamp() -> String {
 
 /// How long the ⌘⇧L footer confirmation stands.
 const FRICTION_NOTE_TTL: Duration = Duration::from_secs(4);
+/// How long the zoom chip stands after ⌘+ / ⌘−.
+///
+/// One second: the operator's ruling. Long enough to read the new
+/// percent, short enough that 90% does not become chrome.
+const ZOOM_HUD_TTL: Duration = Duration::from_millis(1000);
 
 impl Shell {
     /// Send the composer draft (enter key and send button share this).
@@ -6433,30 +6446,6 @@ impl Shell {
                 },
                 "Cancel",
             ),
-            // D7. The HOST is the title, because it is the only thing on
-            // this card worth deciding on — a person about to type a
-            // password needs to read who is asking before anything else.
-            crate::web::Ask::Credentials {
-                host,
-                realm,
-                is_proxy,
-            } => (
-                Some(if *is_proxy {
-                    format!("The proxy {host} wants a password")
-                } else {
-                    format!("Sign in to {host}")
-                }),
-                match realm {
-                    // The server's own words, quoted so it is visibly the
-                    // server talking and not eave. It is attacker-controlled
-                    // text and gets no more authority than that.
-                    Some(realm) => format!("The server says: “{realm}”"),
-                    None => String::new(),
-                },
-                "Sign in",
-                "Cancel",
-            ),
-
             // D7. The HOST is the title, because it is the only thing on
             // this card worth deciding on — a person about to type a
             // password needs to read who is asking before anything else.
@@ -7929,6 +7918,79 @@ impl Shell {
         omnibox::ghost_suffix(&edit.text, &saved)
     }
 
+    /// Address-bar contents: text (or the hint), caret, ghost.
+    ///
+    /// Shared by the launcher overlay and the pane header so the two
+    /// surfaces cannot disagree about where the insertion point sits. An
+    /// empty field puts the caret *before* the hint. A seeded address is
+    /// [`theme::overlay_strong`] on the glyphs only — the wash *is* the
+    /// selection, so there is no caret after it. A white line at the end
+    /// of a selected URL is the bar this field used to wear.
+    fn omnibox_field(
+        &self,
+        text: String,
+        ghost: Option<String>,
+        seeded: bool,
+        size: f32,
+        line: f32,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let empty = text.is_empty();
+        let selected = seeded && !empty;
+        let caret = (!selected).then(|| {
+            caret_glyph(
+                "omnibox",
+                self.caret_lit(Field::Omnibox, cx),
+                size,
+                theme::text(),
+            )
+            .into_any_element()
+        });
+        let body = div()
+            .debug_selector(|| "omnibox-text".into())
+            .min_w(px(0.))
+            .when(empty, |d| d.flex_1())
+            .truncate()
+            .text_size(px(size))
+            .line_height(px(line))
+            .when(selected, |d| d.bg(theme::overlay_strong()))
+            .text_color(if empty {
+                theme::text_tertiary()
+            } else {
+                theme::text()
+            })
+            .child(SharedString::from(if empty {
+                OMNIBOX_HINT.to_string()
+            } else {
+                text
+            }));
+        let mut out = Vec::new();
+        if empty {
+            out.extend(caret);
+            out.push(body.into_any_element());
+            return out;
+        }
+        out.push(body.into_any_element());
+        out.extend(caret);
+        if let Some(g) = ghost {
+            out.push(
+                div()
+                    .debug_selector(|| "omnibox-ghost".into())
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(size))
+                    .line_height(px(line))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(g))
+                    .into_any_element(),
+            );
+        } else {
+            out.push(div().flex_1().min_w(px(0.)).into_any_element());
+        }
+        out
+    }
+
     /// Tab / → accepts the ghost into the field so it can be edited.
     fn accept_omnibox_fill(&mut self, cx: &mut Context<Self>) {
         let Some(edit) = self.omni.open.as_ref() else {
@@ -8305,62 +8367,20 @@ impl Shell {
                                     ))
                                     .child(
                                         div()
-                                            .debug_selector(|| "omnibox-text".into())
-                                            .when(ghost.is_none(), |d| d.flex_1().min_w(px(0.)))
-                                            .truncate()
-                                            .text_size(px(theme::BODY_SIZE))
-                                            // The seeded address is drawn on
-                                            // a wash, which is this shell's
-                                            // only way to say "selected" —
-                                            // there is no selection model
-                                            // here, and the wash is what
-                                            // makes "the next character
-                                            // replaces this" legible before
-                                            // it happens rather than after.
-                                            .when(seeded && !text.is_empty(), |d| {
-                                                d.bg(theme::overlay_strong())
-                                                    .rounded(px(theme::RADIUS_CHIP))
-                                                    .px(px(theme::SPACE_1))
-                                            })
-                                            .text_color(if text.is_empty() {
-                                                theme::text_tertiary()
-                                            } else {
-                                                theme::text()
-                                            })
-                                            .child(SharedString::from(if text.is_empty() {
-                                                OMNIBOX_HINT.to_string()
-                                            } else {
-                                                text.clone()
-                                            })),
-                                    )
-                                    // The caret. ONE anchor for the whole
-                                    // window (`Shell::caret`), so eave's four
-                                    // carets can never blink out of phase with
-                                    // each other — the N1 rule about
-                                    // phase-locked indicators, and the reason
-                                    // the field travels with the instant
-                                    // rather than each box timing itself.
-                                    //
-                                    // Until this slice the call here read the
-                                    // COMPOSER's draft, which is empty by
-                                    // definition while somebody is typing into
-                                    // an address bar — so the one caret an
-                                    // operator stares at while typing a url
-                                    // was the one that could never blink.
-                                    .child(
-                                        caret_glyph("omnibox", self.caret_lit(Field::Omnibox, cx))
-                                            .text_size(px(theme::BODY_SIZE)),
-                                    )
-                                    .children(ghost.map(|g| {
-                                        div()
-                                            .debug_selector(|| "omnibox-ghost".into())
                                             .flex_1()
                                             .min_w(px(0.))
-                                            .truncate()
-                                            .text_size(px(theme::BODY_SIZE))
-                                            .text_color(theme::text_tertiary())
-                                            .child(SharedString::from(g))
-                                    })),
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .children(self.omnibox_field(
+                                                text,
+                                                ghost,
+                                                seeded,
+                                                theme::BODY_SIZE,
+                                                theme::BODY_LINE,
+                                                cx,
+                                            )),
+                                    ),
                             )
                             .when(!row_els.is_empty(), |d| {
                                 d.child(
@@ -9007,82 +9027,41 @@ impl Shell {
                                             .flex()
                                             .flex_row()
                                             .items_center()
-                                            .child(
-                                                div()
-                                                    .debug_selector(|| "omnibox-text".into())
-                                                    .when(ghost.is_none(), |d| {
-                                                        d.flex_1().min_w(px(0.))
-                                                    })
-                                                    .truncate()
-                                                    .text_size(px(theme::DETAIL_SIZE))
-                                                    .line_height(px(theme::DETAIL_LINE))
-                                                    .when(seeded && !edit_text.is_empty(), |t| {
-                                                        t.bg(theme::overlay_strong())
-                                                            .rounded(px(theme::RADIUS_CHIP))
-                                                            .px(px(theme::SPACE_1))
-                                                    })
-                                                    .text_color(if edit_text.is_empty() {
-                                                        theme::text_tertiary()
-                                                    } else {
-                                                        theme::text()
-                                                    })
-                                                    .child(SharedString::from(
-                                                        if edit_text.is_empty() {
-                                                            OMNIBOX_HINT.to_string()
-                                                        } else {
-                                                            edit_text
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                caret_glyph(
-                                                    "omnibox",
-                                                    self.caret_lit(Field::Omnibox, cx),
-                                                )
-                                                .text_size(px(theme::DETAIL_SIZE)),
-                                            )
-                                            .children(ghost.map(|g| {
-                                                div()
-                                                    .debug_selector(|| "omnibox-ghost".into())
-                                                    .flex_1()
-                                                    .min_w(px(0.))
-                                                    .truncate()
-                                                    .text_size(px(theme::DETAIL_SIZE))
-                                                    .line_height(px(theme::DETAIL_LINE))
-                                                    .text_color(theme::text_tertiary())
-                                                    .child(SharedString::from(g))
-                                            })),
+                                            .children(self.omnibox_field(
+                                                edit_text,
+                                                ghost,
+                                                seeded,
+                                                theme::DETAIL_SIZE,
+                                                theme::DETAIL_LINE,
+                                                cx,
+                                            )),
                                     )
                                     .children(self.omnibox_attached(cx)),
                             ))
                         })
                 })
-                // ── Slice E1: the zoom fact ──────────────────────────
-                //
-                // **Present only when it is not 100%**, which is the
-                // whole design. A chip reading "100%" on every tab
-                // forever is a decoration: it states something that is
-                // true of every page nobody has touched, so it carries
-                // no information and costs a permanent slot in the one
-                // line this region has. `web::zoom_percent` answers
-                // `None` for a tab that has never been zoomed AND for
-                // one that ⌘0 has put back, because those are the same
-                // state and must read the same.
-                //
-                // A fact, not a control. It has no click handler and no
-                // hover wash, because ⌘0 is the dismissal and inventing
-                // a second one would be inventing an affordance this
-                // slice was not asked for.
-                .children(crate::web::zoom_percent(&tab.id).map(|pct| {
-                    div()
-                        .debug_selector(|| "pane-zoom".into())
-                        .flex_none()
-                        .px(px(theme::SPACE_1))
-                        .text_size(px(theme::DETAIL_SIZE))
-                        .line_height(px(theme::DETAIL_LINE))
-                        .text_color(theme::text_tertiary())
-                        .child(format!("{pct}%"))
-                }))
+                // Zoom chip: only after ⌘+ / ⌘−, and only for a moment.
+                // A standing "90%" on a host Chromium already remembers
+                // is a decoration — the operator already knows, and the
+                // slot is the one line this region has.
+                .children(
+                    crate::web::zoom_percent(&tab.id)
+                        .filter(|_| {
+                            self.zoom_hud
+                                .as_ref()
+                                .is_some_and(|(_, id)| id == &tab.id)
+                        })
+                        .map(|pct| {
+                            div()
+                                .debug_selector(|| "pane-zoom".into())
+                                .flex_none()
+                                .px(px(theme::SPACE_1))
+                                .text_size(px(theme::DETAIL_SIZE))
+                                .line_height(px(theme::DETAIL_LINE))
+                                .text_color(theme::text_tertiary())
+                                .child(format!("{pct}%"))
+                        }),
+                )
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── a session: the breadcrumb ────────────────────────────────
@@ -9618,7 +9597,7 @@ impl Shell {
     /// Radius carries a Projects tree and a Tabs list in one column. A
     /// session with a tab open appears in both, and that is correct: one
     /// section is what is open, the other is what exists.
-    fn rail_tabs(&self, cx: &Context<Self>, phase: Option<f32>) -> AnyElement {
+    fn rail_tabs(&self, cx: &Context<Self>, phase: Option<f32>, caret_lit: bool) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
         let chips: HashMap<String, strip::SessionChip> = self
             .sessions
@@ -9697,6 +9676,7 @@ impl Shell {
                     &mut rows,
                     folders_shut,
                     folder_count,
+                    caret_lit,
                     cx,
                 );
                 emitted_tabs_seam = true;
@@ -9753,6 +9733,7 @@ impl Shell {
                 &mut rows,
                 folders_shut,
                 folder_count,
+                caret_lit,
                 cx,
             );
         }
@@ -10419,6 +10400,7 @@ impl Shell {
         rows: &mut Vec<AnyElement>,
         folders_shut: bool,
         folder_count: usize,
+        caret_lit: bool,
         cx: &Context<Self>,
     ) -> usize {
         let mut extra = 0usize;
@@ -10437,7 +10419,7 @@ impl Shell {
             // No empty-state row: add is the header `+` (and still the
             // double-click / right-click menu). An empty zone has nothing
             // nested, so it is just the header.
-            let folders = self.bookmark_folder_rows(cx);
+            let folders = self.bookmark_folder_rows(caret_lit, cx);
             extra += folders.len();
             rows.extend(folders);
         }
@@ -10506,7 +10488,7 @@ impl Shell {
     /// Returns a flat `Vec` rather than a nested element for exactly that
     /// reason: the children have to be siblings of the tab rows to share
     /// their scroll, not children of the folder row.
-    fn bookmark_folder_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+    fn bookmark_folder_rows(&self, caret_lit: bool, cx: &Context<Self>) -> Vec<AnyElement> {
         let snapshot = &self.bookmarks.read(cx).snapshot;
         let folders = bookmarks::folders(snapshot);
         let open = self.bookmark_folder_open.borrow().clone();
@@ -10556,7 +10538,7 @@ impl Shell {
                                 theme::text_secondary(),
                                 "bookmark-folder-glyph",
                             ))
-                            .child(self.bookmark_folder_label(&id, item.label.clone(), cx))
+                            .child(self.bookmark_folder_label(&id, item.label.clone(), caret_lit, cx))
                             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                                 cx.stop_propagation();
                                 if ev.click_count() >= 2 {
@@ -10666,7 +10648,7 @@ impl Shell {
                         "bookmark-child-glyph",
                     ))
                     .child(if nested {
-                        self.bookmark_folder_label(&cid, child.label.clone(), cx)
+                        self.bookmark_folder_label(&cid, child.label.clone(), caret_lit, cx)
                     } else {
                         div()
                             .min_w(px(0.))
@@ -10739,7 +10721,13 @@ impl Shell {
         }
     }
 
-    fn bookmark_folder_label(&self, id: &str, label: String, _cx: &Context<Self>) -> AnyElement {
+    fn bookmark_folder_label(
+        &self,
+        id: &str,
+        label: String,
+        caret_lit: bool,
+        _cx: &Context<Self>,
+    ) -> AnyElement {
         let editing = self
             .rename
             .as_ref()
@@ -10771,7 +10759,12 @@ impl Shell {
                         .truncate()
                         .child(SharedString::from(text)),
                 )
-                .child(caret_glyph("rename", true))
+                .child(caret_glyph(
+                    "rename",
+                    caret_lit,
+                    theme::SMALL_SIZE,
+                    theme::text(),
+                ))
                 .into_any_element(),
             None => div()
                 .min_w(px(0.))
@@ -11766,7 +11759,12 @@ impl Shell {
                                             .truncate()
                                             .child(SharedString::from(text.to_string())),
                                     )
-                                    .child(caret_glyph("rename", caret_lit))
+                                    .child(caret_glyph(
+                                        "rename",
+                                        caret_lit,
+                                        theme::RAIL_NAME_SIZE,
+                                        theme::text(),
+                                    ))
                                     .into_any_element(),
                                 // Stage AB: `min_w(0)` is what makes
                                 // `truncate` bite inside a flex row — a
@@ -12225,7 +12223,7 @@ impl Shell {
             // Slice T1b — the pinned marks head the rail, above the
             // projects, as the reference frame has them.
             .children(self.bookmarks_grid(cx))
-            .child(self.rail_tabs(cx, phase))
+            .child(self.rail_tabs(cx, phase, caret_lit))
             .child(self.rail_handle(cx))
             // Tabs/sessions seam. Same painter as folders/tabs, sitting
             // BETWEEN the two containers so scrolling either list does
@@ -14767,10 +14765,32 @@ impl Shell {
         };
         if delta == 0 {
             crate::web::zoom_reset(&tab);
-        } else {
-            crate::web::zoom_step(&tab, delta);
+            self.zoom_hud = None;
+            cx.notify();
+            return;
         }
+        crate::web::zoom_step(&tab, delta);
+        self.flash_zoom_hud(tab, cx);
+    }
+
+    /// Put the zoom chip up for [`ZOOM_HUD_TTL`]. Generation-gated the
+    /// same way as [`Self::transient_note`]: a second ⌘+ arms its own
+    /// timer, and the first must not clear the second.
+    fn flash_zoom_hud(&mut self, tab: String, cx: &mut Context<Self>) {
+        self.zoom_hud_gen += 1;
+        let gen = self.zoom_hud_gen;
+        self.zoom_hud = Some((gen, tab));
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ZOOM_HUD_TTL).await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.zoom_hud.as_ref().is_some_and(|(g, _)| *g == gen) {
+                    shell.zoom_hud = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The find bar, when it is up. Mounted over the page.
@@ -14816,11 +14836,16 @@ impl Shell {
                 .shadow(theme::shadow_panel())
                 .text_size(px(theme::BODY_SIZE))
                 .line_height(px(theme::BODY_LINE))
-                .child(
-                    div()
+                .child({
+                    let caret = caret_glyph(
+                        "find",
+                        caret_lit,
+                        theme::BODY_SIZE,
+                        theme::text(),
+                    );
+                    let query = div()
                         .debug_selector(|| "find-query".into())
-                        .min_w(px(theme::FIND_FIELD_MIN_W))
-                        .max_w(px(theme::FIND_FIELD_MAX_W))
+                        .min_w(px(0.))
                         .truncate()
                         .text_color(if empty {
                             theme::text_tertiary()
@@ -14834,12 +14859,22 @@ impl Shell {
                             "Find".to_string()
                         } else {
                             state.query.clone()
-                        }),
-                )
-                // The find bar had no caret at all before this slice, which
-                // made it the one field in eave where "where am I typing"
-                // had no answer on screen even in principle.
-                .child(caret_glyph("find", caret_lit))
+                        });
+                    // Caret sits in the query, not in the bar's gap: a
+                    // sibling of the tally with `SPACE_2` between them
+                    // was a white bar floating off the text.
+                    div()
+                        .min_w(px(theme::FIND_FIELD_MIN_W))
+                        .max_w(px(theme::FIND_FIELD_MAX_W))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .children(if empty {
+                            vec![caret.into_any_element(), query.into_any_element()]
+                        } else {
+                            vec![query.into_any_element(), caret.into_any_element()]
+                        })
+                })
                 // **The tally is absent, not blank, when there is nothing
                 // to say.** An empty slot reserved for a number is a
                 // surface claiming it knows something it does not — see
@@ -18986,6 +19021,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         friction: None,
                         friction_gen: 0,
                         friction_path_stated: false,
+                        zoom_hud: None,
+                        zoom_hud_gen: 0,
                         rail_scroll: ScrollHandle::new(),
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from

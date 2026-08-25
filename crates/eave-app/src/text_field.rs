@@ -139,7 +139,9 @@ pub const DEFAULT_UNDO_LIMIT: usize = 10;
 
 /// Width of the caret. Named because horizontal scrolling has to keep the caret
 /// itself on screen, not merely the character before it.
-const CARET_WIDTH: Pixels = px(2.);
+fn caret_width() -> Pixels {
+    px(crate::theme::CARET_W)
+}
 
 /// The key context the field claims; bindings from [`init`] are scoped to it.
 pub const KEY_CONTEXT: &str = "TextField";
@@ -1717,8 +1719,8 @@ impl Element for TextFieldElement {
             // that has to clear the right edge — not the character before it.
             if at.x < scroll.x {
                 scroll.x = at.x;
-            } else if at.x + CARET_WIDTH > scroll.x + bounds.size.width {
-                scroll.x = at.x + CARET_WIDTH - bounds.size.width;
+            } else if at.x + caret_width() > scroll.x + bounds.size.width {
+                scroll.x = at.x + caret_width() - bounds.size.width;
             }
             scroll.x = scroll.x.clamp(px(0.), max.x);
             scroll.y = scroll.y.clamp(px(0.), max.y);
@@ -1731,10 +1733,17 @@ impl Element for TextFieldElement {
 
         let (selection, cursor) = if selected_range.is_empty() {
             let at = position_for_offset(&lines, cursor, line_height).unwrap_or_default();
+            // Inset by SPACE_HALF so the caret is the type's height, not
+            // the cell's — a full-leading quad is a bar, not an I-beam.
+            let inset = px(crate::theme::SPACE_HALF);
+            let caret_h = (line_height - inset - inset).max(caret_width());
             (
                 Vec::new(),
                 Some(fill(
-                    Bounds::new(origin + at, gpui::size(CARET_WIDTH, line_height)),
+                    Bounds::new(
+                        origin + at + gpui::point(px(0.), inset),
+                        gpui::size(caret_width(), caret_h),
+                    ),
                     // **eave delta (3).** The blink, as alpha on the quad.
                     crate::theme::text().opacity(caret_alpha),
                 )),
