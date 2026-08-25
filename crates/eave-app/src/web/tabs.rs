@@ -1764,6 +1764,7 @@ wrap_life_span_handler! {
             let gone = BROWSERS.with(|b| b.borrow_mut().remove(&self.tab_id));
             drop(gone);
             super::osr::forget(&self.tab_id);
+            super::page::forget_resize_state(&self.tab_id);
             forget_chrome(&self.tab_id);
             // A held dialog callback is a stopped renderer. This browser is
             // going away and so is the page that would have been unblocked,

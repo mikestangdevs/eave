@@ -455,6 +455,58 @@ fn live_divider() -> bool {
     LIVE_DIVIDER.with(|c| c.get())
 }
 
+/// How many paints after a size change a surface may still be painted
+/// stretched. Small enough that a page cannot sit visibly scaled, large
+/// enough to cover the couple of pumps Chromium needs to reflow.
+const RESIZE_SETTLE_PAINTS: u32 = 8;
+
+thread_local! {
+    /// Per surface: the last size it was asked to paint at, and how many
+    /// paints have happened since that size last changed.
+    static LAST_ASK: std::cell::RefCell<std::collections::HashMap<String, ((f32, f32), u32)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// True while this surface's size is still moving.
+///
+/// **Why this exists on top of [`live_divider`].** That flag is set from
+/// the shell, which can only see the dividers the SHELL owns. Once the
+/// DevTools dock became a real dock, the resizer between the page and the
+/// panels became **DevTools' own** — the shell has no drag state for it,
+/// so the stretch stopped happening exactly where it was needed and the
+/// page tore on every resize. This asks the only question that is true in
+/// both cases: *is the size I am being asked to paint at different from
+/// the size I was asked for last time?*
+///
+/// Self-clearing, and bounded on purpose. While a drag is running every
+/// paint sees a new size and the counter stays at zero. When it stops, the
+/// counter climbs; if Chromium has not caught up within
+/// [`RESIZE_SETTLE_PAINTS`] we stop stretching and fall back to E1's
+/// honest 1:1-and-clipped, rather than leaving a page visibly scaled for
+/// ever because a frame never arrived.
+fn size_is_moving(tab_id: &str, want_w: f32, want_h: f32) -> bool {
+    LAST_ASK.with(|m| {
+        let mut m = m.borrow_mut();
+        let entry = m.entry(tab_id.to_string()).or_insert(((want_w, want_h), 0));
+        let (last, since) = entry;
+        if (last.0 - want_w).abs() >= 0.5 || (last.1 - want_h).abs() >= 0.5 {
+            *last = (want_w, want_h);
+            *since = 0;
+            return true;
+        }
+        *since = since.saturating_add(1);
+        *since < RESIZE_SETTLE_PAINTS
+    })
+}
+
+/// A surface that has gone away should not leave its last size behind for
+/// the next tab that reuses the id.
+pub(super) fn forget_resize_state(tab_id: &str) {
+    LAST_ASK.with(|m| {
+        m.borrow_mut().remove(tab_id);
+    });
+}
+
 thread_local! {
     static LIVE_DIVIDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -635,6 +687,9 @@ impl Element for PageSurface {
             let fits = (fw - want_w).abs() < 0.5 && (fh - want_h).abs() < 0.5;
             (fw, fh, fits)
         };
+        // Asked once per paint, and it MUTATES the counter, so it must not
+        // be called again inside this frame.
+        let moving = size_is_moving(&self.tab_id, want_w, want_h);
         let mut frame = osr::frame(&self.tab_id);
         if let Some(ref f) = frame {
             let (fw, fh, mut fits) = fit_of(f);
@@ -671,7 +726,23 @@ impl Element for PageSurface {
             }
             if let Some(frame) = frame {
                 let (fw, fh, fits) = fit_of(&frame);
-                if fits || stretch_for_measurement() || live_divider() {
+                // **A stretch is only honest across a SMALL gap.** Scaling
+                // the last frame to a size a little different from its own
+                // reads as the page resizing. Scaling it across a large
+                // jump — a pane that just went from a third of the well to
+                // all of it — reads as the page exploding, which is
+                // exactly what the operator saw when the dock's layout
+                // still switched modes on open. Past this factor, fall
+                // back to E1's 1:1-and-clipped: momentarily the wrong
+                // size, but never the wrong picture.
+                const MAX_STRETCH: f32 = 1.5;
+                let ratio = |a: f32, b: f32| if a > b { a / b.max(1.0) } else { b / a.max(1.0) };
+                let modest =
+                    ratio(fw, want_w) <= MAX_STRETCH && ratio(fh, want_h) <= MAX_STRETCH;
+                if fits
+                    || stretch_for_measurement()
+                    || ((live_divider() || moving) && modest)
+                {
                     window.paint_surface_with_corners(bounds, frame.buffer, corners);
                 } else {
                     let at = Bounds {

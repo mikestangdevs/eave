@@ -8782,31 +8782,46 @@ impl Shell {
         // `AdvancedApp` off `globalThis`, say). Falling back to the old
         // side-by-side keeps a usable dock instead of a page with no
         // place to be.
-        // Nested rather than a tuple pattern: a tuple evaluates BOTH
-        // arms, so `take()` would empty the option the fallback below
-        // still needs on the frames before the frontend has reported.
-        if let Some((x, y, w, h)) = crate::web::dock_page_rect(tab_id) {
-            if let Some(el) = devtools_el.take() {
-                return div()
-                    .id(SharedString::from(format!("devtools-dock-{tab_id}")))
-                    .debug_selector(|| "devtools-dock".into())
-                    .size_full()
-                    .relative()
-                    .overflow_hidden()
-                    .child(div().absolute().inset_0().child(el))
-                    .child(
-                        div()
-                            .debug_selector(|| "devtools-page-slot".into())
-                            .absolute()
-                            .left(px(x))
-                            .top(px(y))
-                            .w(px(w))
-                            .h(px(h))
-                            .overflow_hidden()
-                            .child(page_el),
-                    )
-                    .into_any_element();
-            }
+        // **One layout from the frontend's first frame, and that is not a
+        // detail.** This used to switch modes: side-by-side until a rect
+        // had been reported, overlay afterwards. Both surfaces changed
+        // size at that switch — the frontend from a third of the well to
+        // all of it, the page from the whole well to a fraction — and with
+        // the resize stretch in place, two stale frames were scaled across
+        // a 3x jump on the same frame. That is what "the screen freaks out
+        // and jumps into a big fast image" was.
+        //
+        // So the frontend owns the well as soon as it exists, and the only
+        // thing the report refines is where the page sits inside it. The
+        // default is the ratio the old divider used, which is close to
+        // where DevTools puts its own split, so the correction when the
+        // first report lands is small instead of violent.
+        if let Some(el) = devtools_el.take() {
+            let reported = crate::web::dock_page_rect(tab_id);
+            let mut slot = div()
+                .debug_selector(|| "devtools-page-slot".into())
+                .absolute()
+                .overflow_hidden();
+            slot = match reported {
+                Some((x, y, w, h)) => slot.left(px(x)).top(px(y)).w(px(w)).h(px(h)),
+                None => slot
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(relative(1.0 - DEVTOOLS_RATIO))
+                    .h_full(),
+            };
+            return div()
+                .id(SharedString::from(format!("devtools-dock-{tab_id}")))
+                .debug_selector(|| "devtools-dock".into())
+                .size_full()
+                .relative()
+                .overflow_hidden()
+                // The page is the SECOND child so it draws over the
+                // placeholder, which is a plain background, and so gpui
+                // hit-tests page input before frontend input in that rect.
+                .child(div().absolute().inset_0().child(el))
+                .child(slot.child(page_el))
+                .into_any_element();
         }
 
         let r = self
