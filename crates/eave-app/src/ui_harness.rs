@@ -10686,6 +10686,198 @@ fn an_ask_on_a_background_tab_is_not_drawn(cx: &mut TestAppContext) {
     crate::web::answer("p2", crate::web::Answer::Dismiss);
 }
 
+/// **D6 — `<input type=file>` reaches a real picker and the page gets the
+/// paths.**
+///
+/// Both ends of this existed for a whole slice and nothing in the middle
+/// ever built an `Answer::Files`, so the dialog drew one button and said
+/// so. gpui's test platform queues the panel and hands back its sender,
+/// which is what lets this be a test rather than a screenshot.
+#[gpui::test]
+fn choosing_a_file_answers_the_page_with_the_path(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://upload.test/",
+        crate::web::Ask::Files {
+            title: "Choose a file".into(),
+            multiple: false,
+            folder: false,
+            save: false,
+        },
+    );
+    assert!(shown(vcx, "dialog-choose"), "no picker button was drawn");
+    assert!(
+        !cx.did_prompt_for_paths(),
+        "the panel opened before anyone asked for it"
+    );
+
+    click(vcx, "dialog-choose");
+    vcx.run_until_parked();
+    assert!(cx.did_prompt_for_paths(), "the button opened no panel");
+
+    // The ask is still outstanding while the panel is up — the renderer is
+    // still blocked, so the scrim is still telling the truth.
+    assert!(
+        crate::web::pending("p1").is_some(),
+        "the ask was answered before a file was chosen"
+    );
+
+    cx.simulate_path_prompt_response(|opts| {
+        assert!(opts.files, "a file ask did not offer files");
+        assert!(!opts.directories, "a file ask offered directories");
+        assert!(!opts.multiple, "a single-file ask allowed multiple");
+        Some(vec![std::path::PathBuf::from("/tmp/eave-pick.txt")])
+    });
+    vcx.run_until_parked();
+    assert!(
+        crate::web::pending("p1").is_none(),
+        "choosing a file left the ask outstanding"
+    );
+    assert!(!shown(vcx, "page-dialog"), "the card stayed up");
+}
+
+/// A `multiple` ask asks the panel for multiple. Getting this wrong is
+/// invisible until someone tries to attach two files and cannot.
+#[gpui::test]
+fn a_multiple_file_ask_lets_the_panel_take_more_than_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://upload.test/",
+        crate::web::Ask::Files {
+            title: "Choose files".into(),
+            multiple: true,
+            folder: false,
+            save: false,
+        },
+    );
+    click(vcx, "dialog-choose");
+    vcx.run_until_parked();
+    cx.simulate_path_prompt_response(|opts| {
+        assert!(opts.multiple, "a multiple ask did not allow multiple");
+        Some(vec![
+            std::path::PathBuf::from("/tmp/a.txt"),
+            std::path::PathBuf::from("/tmp/b.txt"),
+        ])
+    });
+    vcx.run_until_parked();
+    assert!(crate::web::pending("p1").is_none());
+}
+
+/// A folder ask wants directories and NOT files. Offering both would let
+/// someone satisfy `webkitdirectory` with a file the page cannot use.
+#[gpui::test]
+fn a_folder_ask_offers_directories_and_not_files(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://upload.test/",
+        crate::web::Ask::Files {
+            title: "Choose a folder".into(),
+            multiple: false,
+            folder: true,
+            save: false,
+        },
+    );
+    click(vcx, "dialog-choose");
+    vcx.run_until_parked();
+    cx.simulate_path_prompt_response(|opts| {
+        assert!(opts.directories, "a folder ask did not offer directories");
+        assert!(!opts.files, "a folder ask also offered files");
+        Some(vec![std::path::PathBuf::from("/tmp/somewhere")])
+    });
+    vcx.run_until_parked();
+    assert!(crate::web::pending("p1").is_none());
+}
+
+/// Cancelling the PANEL answers the ask — it must not leave the renderer
+/// blocked on a callback nobody can reach any more.
+#[gpui::test]
+fn cancelling_the_panel_still_answers_the_page(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://upload.test/",
+        crate::web::Ask::Files {
+            title: "Choose a file".into(),
+            multiple: false,
+            folder: false,
+            save: false,
+        },
+    );
+    click(vcx, "dialog-choose");
+    vcx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| None);
+    vcx.run_until_parked();
+    assert!(
+        crate::web::pending("p1").is_none(),
+        "cancelling the panel left the page stopped forever"
+    );
+    assert!(!shown(vcx, "page-dialog"));
+}
+
+/// An empty selection is a cancel, not a selection of nothing. The rule
+/// exists at the CEF end too (`reply_with`); this is the shell end of it.
+#[gpui::test]
+fn an_empty_selection_is_a_cancel(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://upload.test/",
+        crate::web::Ask::Files {
+            title: "Choose a file".into(),
+            multiple: false,
+            folder: false,
+            save: false,
+        },
+    );
+    click(vcx, "dialog-choose");
+    vcx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| Some(Vec::new()));
+    vcx.run_until_parked();
+    assert!(crate::web::pending("p1").is_none());
+}
+
+/// The card names the origin BEFORE the panel opens, which is the whole
+/// reason eave shows one at all where Chrome goes straight to the panel:
+/// the native picker cannot tell you which site summoned it.
+#[gpui::test]
+fn the_file_card_names_the_origin_before_any_panel_opens(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://upload.test/",
+        crate::web::Ask::Files {
+            title: "Choose a file".into(),
+            multiple: false,
+            folder: false,
+            save: false,
+        },
+    );
+    assert!(
+        shown(vcx, "page-dialog-origin"),
+        "no origin on the file card"
+    );
+    assert!(
+        !cx.did_prompt_for_paths(),
+        "the panel opened before the origin could be read"
+    );
+    crate::web::answer("p1", crate::web::Answer::Dismiss);
+}
+
 /// G24 — the two extra buttons on the mouse walk the page's history.
 ///
 /// gpui has always delivered `MouseButton::Navigate`; eave matched on

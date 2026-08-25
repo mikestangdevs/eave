@@ -642,6 +642,37 @@ pub fn running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }
 
+/// The one way to reach Chromium's global request context.
+///
+/// # This exists because remembering a guard is not a strategy
+/// **Reaching a CEF global before `CefInitialize` is not "absent", it is
+/// UNSAFE.** `request_context_get_global_context` dereferences a global
+/// the framework has not built, so it is a SIGSEGV rather than a `None` —
+/// signal 11, no assertion, no failing test name, the whole lib-test
+/// binary gone. It has now bitten this codebase in **three** places:
+///
+/// 1. `dialogs::sync_to_chromium`, the first time the `--features web`
+///    suite ran — reached through `permissions::forget_origin`.
+/// 2. `permissions::forget_origin` → `cef_clear_permissions` again, in a
+///    later slice, before that guard covered it.
+/// 3. `browser_settings`, from a test that only wanted to read two fields
+///    — a `CefString` is allocated by the framework too, so merely
+///    *building* a `Settings` is enough.
+///
+/// Each was fixed by remembering to write `if !running() { return }` at
+/// the call site, which is a strategy that works until somebody forgets.
+/// So the check moves *inside*: this returns `None` before initialisation
+/// and is the only place `request_context_get_global_context` is named.
+///
+/// It does not help with (3) — nothing can, short of not touching a
+/// `CefString` from a test. That is why `USER_AGENT` is a constant.
+pub(super) fn global_request_context() -> Option<RequestContext> {
+    if !running() {
+        return None;
+    }
+    request_context_get_global_context()
+}
+
 /// Load the Chromium framework, which is not linked — it is `dlopen`ed out
 /// of the bundle at runtime.
 ///

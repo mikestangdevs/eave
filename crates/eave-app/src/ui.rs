@@ -6408,16 +6408,79 @@ impl Shell {
                 "Allow",
                 "Don't allow",
             ),
-            crate::web::Ask::Files { title, .. } => (
+            // D6. The card is NOT an apology any more, and it is also not
+            // just a step on the way to the panel.
+            //
+            // Chrome opens the native picker with nothing in front of it.
+            // eave shows this first, deliberately: a file chooser is a
+            // surface a page summons and a person hands real files to, and
+            // the one thing the panel cannot tell you is **which origin
+            // asked**. That line is already the first thing on this card.
+            crate::web::Ask::Files {
+                title,
+                folder,
+                save,
+                ..
+            } => (
                 Some(title.clone()),
-                // Stated rather than pretended. A picker is a real surface
-                // and eave does not have one yet (spec 06-browser D6); the
-                // honest thing is to say so and let the page be told
-                // "cancelled", which is what it would hear anyway.
-                "eave cannot choose files yet, so this will be cancelled.".to_string(),
-                "",
+                String::new(),
+                if *save {
+                    "Save…"
+                } else if *folder {
+                    "Choose folder…"
+                } else {
+                    "Choose…"
+                },
                 "Cancel",
             ),
+            // D7. The HOST is the title, because it is the only thing on
+            // this card worth deciding on — a person about to type a
+            // password needs to read who is asking before anything else.
+            crate::web::Ask::Credentials {
+                host,
+                realm,
+                is_proxy,
+            } => (
+                Some(if *is_proxy {
+                    format!("The proxy {host} wants a password")
+                } else {
+                    format!("Sign in to {host}")
+                }),
+                match realm {
+                    // The server's own words, quoted so it is visibly the
+                    // server talking and not eave. It is attacker-controlled
+                    // text and gets no more authority than that.
+                    Some(realm) => format!("The server says: “{realm}”"),
+                    None => String::new(),
+                },
+                "Sign in",
+                "Cancel",
+            ),
+
+            // D7. The HOST is the title, because it is the only thing on
+            // this card worth deciding on — a person about to type a
+            // password needs to read who is asking before anything else.
+            crate::web::Ask::Credentials {
+                host,
+                realm,
+                is_proxy,
+            } => (
+                Some(if *is_proxy {
+                    format!("The proxy {host} wants a password")
+                } else {
+                    format!("Sign in to {host}")
+                }),
+                match realm {
+                    // The server's own words, quoted so it is visibly the
+                    // server talking and not eave. It is attacker-controlled
+                    // text and gets no more authority than that.
+                    Some(realm) => format!("The server says: “{realm}”"),
+                    None => String::new(),
+                },
+                "Sign in",
+                "Cancel",
+            ),
+
             // D7. The HOST is the title, because it is the only thing on
             // this card worth deciding on — a person about to type a
             // password needs to read who is asking before anything else.
@@ -6463,6 +6526,9 @@ impl Shell {
 
         let is_prompt = matches!(pending.ask, crate::web::Ask::Prompt { .. });
         let is_credentials = matches!(pending.ask, crate::web::Ask::Credentials { .. });
+        // D6 — this one's primary button opens a panel instead of
+        // answering, so it cannot go through `button` with a fixed answer.
+        let is_files = matches!(pending.ask, crate::web::Ask::Files { .. });
         let is_certificate = matches!(pending.ask, crate::web::Ask::Certificate { .. });
         let typed = self.dialog_buffer(&tab, &pending);
         // Rendered as bullets and never as itself. The rule is one
@@ -6695,8 +6761,33 @@ impl Shell {
                                 .when(refusable && !refuse_label.is_empty(), |d| {
                                     d.child(button(refuse_label, false, refuse_answer.clone(), cx))
                                 })
-                                .when(!confirm_label.is_empty(), |d| {
+                                .when(!confirm_label.is_empty() && !is_files, |d| {
                                     d.child(button(confirm_label, true, confirm_answer.clone(), cx))
+                                })
+                                // D6: the same button, wired to the panel
+                                // rather than to an answer. The ask stays
+                                // outstanding while the panel is up, which
+                                // is correct — the page is still stopped,
+                                // and the scrim is still what says so.
+                                .when(is_files, |d| {
+                                    let ask = pending.ask.clone();
+                                    let tab = tab.clone();
+                                    d.child(
+                                        div()
+                                            .id("dialog-choose")
+                                            .debug_selector(|| "dialog-choose".into())
+                                            .px(px(theme::SPACE_3))
+                                            .py(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_SELECT))
+                                            .cursor_pointer()
+                                            .bg(theme::overlay())
+                                            .text_size(px(theme::BODY_SIZE))
+                                            .text_color(theme::text())
+                                            .child(confirm_label.to_string())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.choose_files(tab.clone(), ask.clone(), cx)
+                                            })),
+                                    )
                                 }),
                         ),
                 )
@@ -6827,6 +6918,91 @@ impl Shell {
         self.dialog_secret = None;
         self.dialog_on_secret = false;
         cx.notify();
+    }
+
+    /// **D6 — `<input type=file>` finally opens something.**
+    ///
+    /// The row read "asks, cannot yet pick" and it was the stranger of the
+    /// two tier-0 ⚠️ rows, because *both ends already existed*:
+    /// `Ask::Files` was raised, and `Answer::Files(paths)` already reached
+    /// `cb.cont(list)` in `dialogs.rs`. **Nothing in the middle ever
+    /// constructed an `Answer::Files`**, so the dialog drew one button —
+    /// Cancel — and said so honestly. This is the middle.
+    ///
+    /// # Why gpui's picker and not `NSOpenPanel`
+    /// `cx.prompt_for_paths` is already in this file (`pick_attachments`,
+    /// for the composer's own attach flow), it is async by construction,
+    /// and it costs no new dependency — `objc2` is only in the graph under
+    /// `--features web`, and a file picker that exists only in the
+    /// Chromium build would be an odd thing to explain. It also means the
+    /// suite can answer the panel: gpui's test platform queues the request
+    /// and hands the sender back, so `simulate_path_prompt_response` drives
+    /// this end to end.
+    ///
+    /// # The ask stays outstanding while the panel is up
+    /// Deliberately. The renderer is still blocked on the callback, so the
+    /// scrim is still telling the truth, and a person who dismisses the
+    /// panel comes back to the card rather than to a page that silently
+    /// carried on. Cancelling the PANEL answers with
+    /// [`Answer::Dismiss`] — nobody chose anything, and `reply_with` turns
+    /// that into `cb.cancel()`, which is what `<input type=file>` hears
+    /// when you close a picker in any browser.
+    fn choose_files(&mut self, tab: String, ask: crate::web::Ask, cx: &mut Context<Self>) {
+        let crate::web::Ask::Files {
+            title,
+            multiple,
+            folder,
+            save,
+        } = ask
+        else {
+            return;
+        };
+        if save {
+            // A download asking where to go. `prompt_for_new_path` needs a
+            // starting directory; the home directory is the one place that
+            // always exists and is always writable, and Chromium has
+            // already applied its own default when it gets the path back.
+            let start = home_dir();
+            let rx = cx.prompt_for_new_path(&start, None);
+            cx.spawn(async move |view, cx| {
+                let answer = match rx.await {
+                    Ok(Ok(Some(path))) => {
+                        crate::web::Answer::Files(vec![path.to_string_lossy().into_owned()])
+                    }
+                    // Cancelled, or the platform could not open a panel.
+                    // Both are "no path", and neither is a decision.
+                    _ => crate::web::Answer::Dismiss,
+                };
+                let _ = view.update(cx, |shell, cx| shell.answer_dialog(&tab, answer, cx));
+            })
+            .detach();
+            return;
+        }
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            // A folder ask wants directories and NOT files. Passing both
+            // would let someone satisfy `webkitdirectory` with a file,
+            // which the page cannot use.
+            files: !folder,
+            directories: folder,
+            multiple,
+            prompt: Some(title.into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let answer = match rx.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => crate::web::Answer::Files(
+                    paths
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect(),
+                ),
+                // An empty selection is a cancel, not a selection of
+                // nothing — the same rule `reply_with` keeps at the other
+                // end, stated here so the two cannot disagree.
+                _ => crate::web::Answer::Dismiss,
+            };
+            let _ = view.update(cx, |shell, cx| shell.answer_dialog(&tab, answer, cx));
+        })
+        .detach();
     }
 
     /// This tab's password buffer. Never seeded from anything — unlike

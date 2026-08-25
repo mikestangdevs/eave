@@ -285,6 +285,12 @@ pub fn take(tab_id: &str) -> Option<Pending> {
 /// so a code added to one side and forgotten on the other is a test
 /// failure rather than a silent fallback sentence in front of a person
 /// deciding whether they are being attacked.
+///
+/// Read only by the tests that pin the two halves together — which is the
+/// entire job. The same `cfg_attr` `evict_policy` uses, scoped to exactly
+/// that rather than a blanket allow, so genuinely dead code here is still
+/// caught.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const CERTIFICATE_REASONS: &[&str] = &[
     "ERR_CERT_COMMON_NAME_INVALID",
     "ERR_CERT_DATE_INVALID",
