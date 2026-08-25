@@ -1151,11 +1151,13 @@ wrap_life_span_handler! {
             CREATING.with(|c| c.borrow_mut().remove(&self.tab_id));
             let evicted = BROWSERS.with(|b| b.borrow_mut().insert(self.tab_id.clone(), browser));
             drop(evicted);
-            // Slice E1: zoom belongs to the TAB, not to the browser. A tab
-            // whose browser was closed and re-made must come back at the
-            // size it was left at — after the insert, because `reapply`
-            // goes through `with_browser`.
-            super::zoom_reapply(&self.tab_id);
+            // G5: nothing to re-assert here any more. E1 pushed eave's
+            // remembered zoom onto each new browser because zoom was
+            // thought to belong to the tab; Chromium has been storing it
+            // per HOST and restoring it itself all along, so pushing a
+            // tab-keyed value in would OVERRIDE the host's own. The
+            // reconciliation is now a read, and it happens once the
+            // navigation has committed — see `on_load_end`.
             // This tab is resident again: start its idle clock and clear
             // any evicted mark. Outside the borrow above, deliberately.
             super::evict::note_created(&self.tab_id);
@@ -1247,6 +1249,12 @@ wrap_load_handler! {
                 return;
             }
             set_chrome(&self.tab_id, |c| c.progress = 1.0);
+            // G5: the commit is the moment Chromium has applied this
+            // host's stored zoom, so it is the moment eave can state it.
+            // Earlier — in `on_after_created` — the level is still the
+            // default and the header would say 100% over a zoomed page,
+            // which is the bug this replaced.
+            super::zoom_sync(&self.tab_id);
             // A loaded page means some browser is usable, which is what a
             // bookmark's favicon fetch needs and could not assume at boot.
             super::favicon::note_page_loaded();

@@ -266,6 +266,41 @@ pub fn level_for(percent: u32) -> f64 {
     (percent as f64 / 100.0).ln() / 1.2f64.ln()
 }
 
+/// The ladder rung nearest a CEF zoom level — the inverse of [`level_for`].
+///
+/// # Why it snaps instead of computing (G5)
+/// `percent = 100 * 1.2^level` is exact in principle and not in `f64`.
+/// Measured on this tree, three rungs do not survive the round trip:
+///
+/// ```text
+///  33% -> 32.99999999999999289   <- `as u32` gives 32
+/// 110% -> 110.00000000000001421
+/// 175% -> 174.99999999999997158
+/// ```
+///
+/// A truncating conversion therefore reports the 33% rung as **32%**,
+/// which is not on [`LADDER`] and which no ⌘+ could step off. Rounding
+/// would rescue those three, but only by luck, and nothing checks the luck.
+/// So the arithmetic finds the neighbourhood and the LADDER decides the
+/// answer — which also means a
+/// level Chromium restored from an earlier release, or one a page set with
+/// a pinch, is reported as the nearest rung eave can actually step from,
+/// rather than as a percentage no ⌘+ can move off.
+///
+/// Level 0 is exactly 100% and must stay exactly 100%, or a page at rest
+/// would draw a zoom badge.
+pub fn percent_for(level: f64) -> u32 {
+    let exact = 100.0 * 1.2f64.powf(level);
+    *LADDER
+        .iter()
+        .min_by(|a, b| {
+            let da = (**a as f64 - exact).abs();
+            let db = (**b as f64 - exact).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(&100)
+}
+
 /// Step `delta` rungs from `current`. **Clamped at both ends**, so holding
 /// ⌘+ stops at the top rather than wrapping round to 25%.
 pub fn step_index(current: usize, delta: i32) -> usize {
@@ -451,27 +486,54 @@ pub fn zoom_reset(tab_id: &str) {
     cef_set_zoom(tab_id, 100);
 }
 
-/// Re-assert this tab's zoom on a browser that has just been created.
+/// Put this tab's displayed zoom in step with what Chromium actually has
+/// (G5).
 ///
-/// **Zoom belongs to the tab, not to the browser.** A tab whose browser was
-/// closed and re-made must come back at the size it was left at, or the
-/// zoom silently belonged to the browser all along.
+/// # This replaced `zoom_reapply`, and the direction reversed
+/// The old function asserted eave's remembered zoom ONTO a newly created
+/// browser, because "zoom belongs to the tab, not to the browser". The
+/// probe in `docs/reports/stage-g-probes.md` §2 showed why that was the
+/// wrong way round: **`set_zoom_level` reaches `ZoomController` in
+/// `ZOOM_MODE_DEFAULT`, whose default branch is
+/// `SetZoomLevelForHost` — per host and durable.** Chromium has been
+/// storing zoom in `Preferences` on every ⌘+ all along, keyed by host, and
+/// restores it by itself on the next navigation. eave's map was the second
+/// copy, and the one that was wrong: at launch it is empty, so a page came
+/// back zoomed with the header reading nothing.
 ///
-/// That was a hypothetical when it was written and is not one now: Slice E3
-/// evicts idle page browsers, so **a browser's lifetime is shorter than its
-/// tab's and a restored tab is a brand-new browser at the same url**. Keyed
-/// by tab id, re-applied here.
+/// So the map is now a **cache of Chromium's answer**, not a store, and
+/// this is where it is refreshed. Called after a navigation commits, which
+/// is also the only correct moment: zoom is per HOST, so it can change
+/// without the tab doing anything except going somewhere else.
 ///
-/// ⚠️ **Open, and it belongs to E3's side of the seam:** [`forget_page`]
-/// drops the zoom, and it runs from `on_before_close` — which is reached by
-/// a tab being CLOSED and by a browser being EVICTED alike. An evicted tab
-/// arguably keeps its zoom; a closed one certainly does not. Only the
-/// eviction path knows which it is.
+/// # The behaviour this decides, stated because it is a change
+/// Zoom is now **per origin, shared across tabs** — two tabs on the same
+/// site are at the same zoom, and a new tab on a site you zoomed last week
+/// opens zoomed. That is what Chrome, Edge, Brave and Safari all do, and
+/// after this probe it is the only self-consistent option: Chromium writes
+/// that store whether or not eave reads it, so the alternative was not
+/// "per tab" but "per tab, plus a divergent per-host store on disk".
+///
+/// The `⚠️` that used to hang on `zoom_reapply` — *does an evicted tab keep
+/// its zoom?* — is answered rather than moved: it comes back at its host's
+/// zoom, the same as any other tab on that host, and [`forget_page`]
+/// dropping the entry is now dropping a cache line rather than a fact.
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
-pub(crate) fn zoom_reapply(tab_id: &str) {
-    if let Some(p) = zoom_percent(tab_id) {
-        cef_set_zoom(tab_id, p);
-    }
+pub(crate) fn zoom_sync(tab_id: &str) {
+    let Some(level) = cef_zoom_level(tab_id) else {
+        return;
+    };
+    let percent = percent_for(level);
+    ZOOMS.with(|z| {
+        let mut z = z.borrow_mut();
+        if percent == LADDER[rest_index()] {
+            // At rest. Absent rather than `Some(100)`, so "never zoomed"
+            // and "put back" stay one state — see [`zoom_percent`].
+            z.remove(tab_id);
+        } else if let Some(ix) = LADDER.iter().position(|p| *p == percent) {
+            z.insert(tab_id.to_string(), ix);
+        }
+    });
 }
 
 /// Take the menu request, if there is one. Called from the shell's render
@@ -679,6 +741,20 @@ fn cef_set_zoom(tab_id: &str, percent: u32) {
 }
 #[cfg(not(feature = "web"))]
 fn cef_set_zoom(_tab_id: &str, _percent: u32) {}
+
+/// What Chromium currently has this tab's page at, as a zoom LEVEL.
+///
+/// The read half of G5. There was never one before, which is how eave came
+/// to state a zoom it had not checked.
+#[cfg(feature = "web")]
+fn cef_zoom_level(tab_id: &str) -> Option<f64> {
+    zoom::level_now(tab_id)
+}
+#[cfg(not(feature = "web"))]
+fn cef_zoom_level(_tab_id: &str) -> Option<f64> {
+    None
+}
+
 
 /// Whether this tab's page is in memory right now — i.e. whether there is a
 /// live browser behind it.
@@ -932,6 +1008,68 @@ pub fn page_was_evicted(_tab_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G5: every rung has to survive the round trip through CEF's float,
+    /// because that float is what comes back out of Chromium and it is what
+    /// the pane header is now derived from.
+    #[test]
+    fn every_rung_survives_the_trip_through_a_zoom_level() {
+        for percent in LADDER {
+            assert_eq!(
+                percent_for(level_for(percent)),
+                percent,
+                "{percent}% did not come back"
+            );
+        }
+    }
+
+    /// The rung that proves the snap is load-bearing, measured on this
+    /// tree: **33% does not survive the round trip.**
+    ///
+    /// ```text
+    ///  33% -> 32.99999999999999289   <- `as u32` gives 32
+    /// 110% -> 110.00000000000001421
+    /// 175% -> 174.99999999999997158
+    /// ```
+    ///
+    /// So a conversion that truncates reports the 33% rung as 32%, which is
+    /// not on [`LADDER`] and which no ⌘+ could step off. `percent_for`
+    /// snaps instead, and this is the case that would catch a rewrite back
+    /// to arithmetic.
+    #[test]
+    fn the_thirty_three_rung_does_not_round_trip_exactly() {
+        let level = level_for(33);
+        let exact = 100.0 * 1.2f64.powf(level);
+        assert!(exact < 33.0, "{exact} — the premise changed");
+        assert_eq!(exact as u32, 32, "truncation is what snapping avoids");
+        assert_eq!(percent_for(level), 33);
+    }
+
+    /// Chromium's own stored level for one notch down, taken off this
+    /// machine's `Preferences` after a real ⌘-. Unlike the rung above this
+    /// one *is* exact — which is the point: the ladder decides, so it does
+    /// not matter which rungs happen to be lucky.
+    #[test]
+    fn chromiums_own_stored_level_reads_as_ninety() {
+        assert_eq!(percent_for(-0.5778829311823857), 90);
+    }
+
+    /// Rest is exactly rest. A page nobody has zoomed must not draw a badge,
+    /// and `zoom_sync` decides that by comparing against this.
+    #[test]
+    fn level_zero_is_exactly_a_hundred() {
+        assert_eq!(percent_for(0.0), 100);
+    }
+
+    /// A level eave never set — a pinch, or an older release's ladder —
+    /// still has to name a rung ⌘+ can step from, rather than a percentage
+    /// that no keystroke can move off.
+    #[test]
+    fn an_off_ladder_level_snaps_to_a_reachable_rung() {
+        let odd = level_for(137);
+        let snapped = percent_for(odd);
+        assert!(LADDER.contains(&snapped), "{snapped} is not on the ladder");
+    }
 
     /// The ladder has to contain the rest point, or ⌘0 lands on 25%.
     #[test]

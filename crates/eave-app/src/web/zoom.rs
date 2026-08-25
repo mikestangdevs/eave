@@ -65,3 +65,18 @@ pub(super) fn apply(tab_id: &str, percent: u32) {
     super::host::request_pump();
     super::host::note_chrome_change();
 }
+
+/// What Chromium currently has this tab's page at, as a zoom LEVEL.
+///
+/// The read half G5 was missing. `set_zoom_level` had no counterpart, so
+/// eave's `ZOOMS` map was the only thing the chrome could state — and it is
+/// keyed by tab and empty at launch, while Chromium's is keyed by host and
+/// durable. A fresh tab on a zoomed origin rendered zoomed with the header
+/// saying nothing. Measured, `docs/reports/stage-g-probes.md` §2.
+///
+/// `None` when there is no browser: an evicted or not-yet-created tab has
+/// no zoom of its own to report, and `None` reads as "unknown" rather than
+/// as 100%.
+pub(super) fn level_now(tab_id: &str) -> Option<f64> {
+    super::tabs::with_browser(tab_id, |b| b.host().map(|h| h.zoom_level())).flatten()
+}
