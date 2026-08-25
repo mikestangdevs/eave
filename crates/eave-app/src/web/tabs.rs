@@ -1964,6 +1964,17 @@ thread_local! {
     /// Downloads by CEF's own id, newest state wins.
     static DOWNLOADS: std::cell::RefCell<HashMap<u32, Download>> =
         std::cell::RefCell::new(HashMap::new());
+    /// The live callback for each in-flight download — **the only handle
+    /// that can stop one**.
+    ///
+    /// CEF hands a fresh `DownloadItemCallback` to every
+    /// `on_download_updated`, and it is valid for that call only unless it
+    /// is retained. Dropping it is what made cancel unbuildable before:
+    /// the item id was known, and nothing in the process could act on it.
+    /// Same shape as `dialogs`' held ask callbacks — an ask is data, and
+    /// the reply is a CEF callback someone has to be holding.
+    static CANCELS: std::cell::RefCell<HashMap<u32, DownloadItemCallback>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// Every download this run knows about, newest first.
@@ -1971,6 +1982,24 @@ pub fn downloads() -> Vec<Download> {
     let mut all: Vec<Download> = DOWNLOADS.with(|d| d.borrow().values().cloned().collect());
     all.sort_by_key(|d| std::cmp::Reverse(d.id));
     all
+}
+
+/// Stop a download in flight.
+///
+/// A no-op for an id that has finished or was never live — a person can
+/// click cancel on a row that completed while the menu was open, and that
+/// is not an error.
+pub fn cancel_download(id: u32) {
+    // Cloned out before the call, never called under the borrow: CEF runs
+    // handlers on our stack under an external pump, and `on_download_updated`
+    // fires from inside `cancel()` wanting this same map.
+    let callback = CANCELS.with(|c| c.borrow().get(&id).cloned());
+    let Some(callback) = callback else { return };
+    if trace() {
+        eprintln!("[web] download id={id} cancel requested");
+    }
+    callback.cancel();
+    super::host::request_pump();
 }
 
 /// Where downloads go.
@@ -2080,6 +2109,13 @@ wrap_download_handler! {
         ) {
             let Some(item) = download_item else { return };
             let id = item.id();
+            // Retain the callback while the transfer is live. Cloning a CEF
+            // handle is a retain, not a copy of the download.
+            if let Some(callback) = _callback {
+                CANCELS.with(|c| {
+                    c.borrow_mut().insert(id, callback.clone());
+                });
+            }
             let next = Download {
                 id,
                 url: CefString::from(&item.url()).to_string(),
@@ -2127,6 +2163,14 @@ wrap_download_handler! {
                     "[web] download id={id} {}% {}/{} done={} cancelled={}",
                     next.percent, next.received, next.total, next.done, next.cancelled
                 );
+            }
+            // Finished or stopped: the callback can do nothing more, and
+            // holding it would keep a CEF object alive for the life of the
+            // run for every file a person ever downloaded.
+            if next.done || next.cancelled {
+                CANCELS.with(|c| {
+                    c.borrow_mut().remove(&id);
+                });
             }
             // A download is chrome, not page pixels: it changes something
             // eave draws with no page frame to carry the change, which is

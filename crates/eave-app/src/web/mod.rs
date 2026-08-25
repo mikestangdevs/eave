@@ -1257,6 +1257,119 @@ pub fn downloads() -> Vec<Download> {
     Vec::new()
 }
 
+// ---------------------------------------------------------------------------
+// D4 — what the downloads panel says, and what a row does
+// ---------------------------------------------------------------------------
+
+/// What clicking a download row does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadAction {
+    /// Stop a transfer that is still running.
+    Cancel(u32),
+    /// Show the finished file in Finder. Carries the path, because the row
+    /// is rendered from a snapshot and the map may have moved on by the
+    /// time someone clicks.
+    Reveal(String),
+    /// Nothing to do: a cancelled transfer, a finished one whose path
+    /// Chromium never settled, or the empty-state row.
+    Nothing,
+}
+
+/// One row of the downloads panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadRow {
+    pub label: String,
+    pub action: DownloadAction,
+    pub enabled: bool,
+}
+
+/// Turn the live download list into rows.
+///
+/// Ungated and pure, so the default feature-OFF suite runs it: what a row
+/// SAYS is a decision about two integers and two bools, and none of it
+/// needs Chromium. The panel then renders these; it does not decide them.
+///
+/// **`percent` is `-1` when Chromium does not know the total size** — the
+/// header says so at `cef_download_item_capi.h:102`, "the rough percent
+/// complete or -1 if the receive total size is unknown". A chunked response
+/// with no `Content-Length` is the ordinary case, not a rare one, and a row
+/// rendered straight from that number reads `-1%`.
+pub fn download_rows(all: &[Download]) -> Vec<DownloadRow> {
+    if all.is_empty() {
+        return vec![DownloadRow {
+            label: "No downloads".to_string(),
+            action: DownloadAction::Nothing,
+            enabled: false,
+        }];
+    }
+    all.iter()
+        .map(|d| {
+            if d.cancelled {
+                DownloadRow {
+                    label: format!("{} — cancelled", d.file_name),
+                    action: DownloadAction::Nothing,
+                    enabled: false,
+                }
+            } else if d.done {
+                // A finished download with no settled path cannot be
+                // revealed. Chromium leaves `full_path` empty until it
+                // commits the name, so this is reachable rather than
+                // defensive.
+                let revealable = !d.path.is_empty();
+                DownloadRow {
+                    label: d.file_name.clone(),
+                    action: if revealable {
+                        DownloadAction::Reveal(d.path.clone())
+                    } else {
+                        DownloadAction::Nothing
+                    },
+                    enabled: revealable,
+                }
+            } else {
+                DownloadRow {
+                    label: if d.percent < 0 {
+                        format!("{} — downloading", d.file_name)
+                    } else {
+                        format!("{} — {}%", d.file_name, d.percent)
+                    },
+                    action: DownloadAction::Cancel(d.id),
+                    enabled: true,
+                }
+            }
+        })
+        .collect()
+}
+
+/// Stop a download in flight.
+#[cfg(feature = "web")]
+pub fn cancel_download(id: u32) {
+    tabs::cancel_download(id);
+}
+#[cfg(not(feature = "web"))]
+pub fn cancel_download(_id: u32) {}
+
+/// Show a finished download in Finder.
+///
+/// **Reveal, not open, and that is a decision rather than a shortcut.**
+/// Opening runs the file. Chromium quarantines every download as soon as
+/// the file exists (see `quarantine::mark`, and 06-browser G4) precisely so
+/// that Gatekeeper gets a say before anything executes — and a browser that
+/// launches its own downloads on a single click hands that away. Revealing
+/// puts the file in front of the person with the OS still in the loop.
+///
+/// Ungated: there is no Chromium in it. `open -R` is the documented way to
+/// select a file in Finder, and a path that no longer exists makes it fail
+/// quietly, which is the right outcome for a row someone clicked late.
+pub fn reveal_download(path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
+}
+
 /// Answer a tab's outstanding ask.
 ///
 /// **06-browser G26 is closed here.** This used to be an empty function
@@ -1736,6 +1849,103 @@ mod tests {
         assert!(methods.contains(&"Network.enable".to_string()));
         assert!(methods.contains(&"Log.enable".to_string()));
         assert!(methods.contains(&"Runtime.enable".to_string()));
+    }
+
+    // -----------------------------------------------------------------
+    // D4 — the downloads panel's rows
+    // -----------------------------------------------------------------
+
+    fn dl(name: &str, percent: i32, done: bool, cancelled: bool, path: &str) -> Download {
+        Download {
+            id: 7,
+            url: "https://example.com/f".into(),
+            file_name: name.into(),
+            path: path.into(),
+            received: 0,
+            total: 0,
+            percent,
+            done,
+            cancelled,
+        }
+    }
+
+    /// An empty panel still says something. A menu that renders zero rows
+    /// reads as broken rather than as empty.
+    #[test]
+    fn an_empty_panel_says_so_in_one_disabled_row() {
+        let rows = download_rows(&[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "No downloads");
+        assert!(!rows[0].enabled);
+        assert_eq!(rows[0].action, DownloadAction::Nothing);
+    }
+
+    /// A live transfer shows its percentage and offers to stop.
+    #[test]
+    fn a_running_download_shows_its_percentage_and_cancels() {
+        let rows = download_rows(&[dl("report.pdf", 42, false, false, "/tmp/report.pdf")]);
+        assert_eq!(rows[0].label, "report.pdf — 42%");
+        assert_eq!(rows[0].action, DownloadAction::Cancel(7));
+        assert!(rows[0].enabled);
+    }
+
+    /// **The trap.** Chromium reports `-1` when it does not know the total
+    /// size — a chunked response with no `Content-Length`, which is
+    /// ordinary rather than rare. Rendered straight, that row reads `-1%`.
+    #[test]
+    fn an_unknown_total_never_renders_as_minus_one_percent() {
+        let rows = download_rows(&[dl("stream.bin", -1, false, false, "/tmp/stream.bin")]);
+        assert!(
+            !rows[0].label.contains("-1"),
+            "unknown size leaked a sentinel: {}",
+            rows[0].label
+        );
+        assert_eq!(rows[0].label, "stream.bin — downloading");
+        assert_eq!(rows[0].action, DownloadAction::Cancel(7));
+    }
+
+    /// A finished download drops the progress text and offers Finder.
+    #[test]
+    fn a_finished_download_reveals_rather_than_reporting_a_percentage() {
+        let rows = download_rows(&[dl("notes.md", 100, true, false, "/tmp/notes.md")]);
+        assert_eq!(rows[0].label, "notes.md");
+        assert_eq!(
+            rows[0].action,
+            DownloadAction::Reveal("/tmp/notes.md".to_string())
+        );
+    }
+
+    /// Chromium leaves `full_path` empty until it commits the name, so a
+    /// finished row can have nowhere to point. Offering Finder anyway would
+    /// be a click that does nothing.
+    #[test]
+    fn a_finished_download_with_no_path_offers_nothing() {
+        let rows = download_rows(&[dl("notes.md", 100, true, false, "")]);
+        assert_eq!(rows[0].action, DownloadAction::Nothing);
+        assert!(!rows[0].enabled);
+    }
+
+    /// A cancelled transfer stays on the list and says why, rather than
+    /// vanishing — a row that disappears reads as a bug in the panel.
+    #[test]
+    fn a_cancelled_download_says_so_and_does_nothing() {
+        let rows = download_rows(&[dl("big.iso", 12, false, true, "/tmp/big.iso")]);
+        assert_eq!(rows[0].label, "big.iso — cancelled");
+        assert_eq!(rows[0].action, DownloadAction::Nothing);
+        assert!(!rows[0].enabled);
+    }
+
+    /// The order it is given is the order it renders. `downloads()` sorts
+    /// newest-first; re-sorting here would be a second opinion about
+    /// ordering that could disagree with it.
+    #[test]
+    fn rows_keep_the_order_they_were_given() {
+        let rows = download_rows(&[
+            dl("first.txt", 10, false, false, "/tmp/a"),
+            dl("second.txt", 20, false, false, "/tmp/b"),
+        ]);
+        assert!(rows[0].label.starts_with("first.txt"));
+        assert!(rows[1].label.starts_with("second.txt"));
     }
 
     // -----------------------------------------------------------------
