@@ -1035,6 +1035,18 @@ pub fn copy_selection(tab_id: &str) {
 /// at a node needs the CDP channel (E9's surface). The row still opens the
 /// dock; it just doesn't pre-select the element under the pointer.
 pub fn show_devtools(tab_id: &str, _x: i32, _y: i32) {
+    // **CEF must be running, and this guard is load-bearing in TESTS.**
+    // Everything below ends in `CefString::from`, and a `CefString` built
+    // in a process that never ran `CefInitialize` is a SIGSEGV that takes
+    // the whole lib-test binary with it — no assertion, no test name.
+    // Before the endpoint existed the early returns hid that; now the
+    // lookup SUCCEEDS from a test process, because the developer's own
+    // eave is usually running and its debugging port answers anyone on
+    // loopback. The suite reached a live browser and then died on the
+    // next line. (It is also a fair demonstration of what that port is.)
+    if !super::host::running() {
+        return;
+    }
     let dt_id = super::devtools_id(tab_id);
     if has_browser(&dt_id) || CREATING.with(|c| c.borrow().contains(&dt_id)) {
         // Already docked, or on its way — a second Inspect is "make sure
@@ -1136,18 +1148,67 @@ fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
 /// localhost, 300 ms to connect and 700 ms to read, and it runs once per
 /// Inspect click, not per frame.
 fn devtools_targets_json() -> Option<String> {
+    devtools_targets_json_at(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        super::host::DEVTOOLS_PORT,
+    )))
+}
+
+fn devtools_targets_json_at(addr: std::net::SocketAddr) -> Option<String> {
     use std::io::{Read, Write};
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], super::host::DEVTOOLS_PORT));
     let mut s =
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).ok()?;
     s.set_read_timeout(Some(std::time::Duration::from_millis(700)))
         .ok()?;
     s.write_all(b"GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .ok()?;
+
+    // **Read to `Content-Length`, never to EOF.** The endpoint ignores
+    // `Connection: close` and holds the socket open, so `read_to_end`
+    // ends in `Err(TimedOut)` — and `.ok()?` on that discards a
+    // COMPLETE response already sitting in the buffer. That is what made
+    // the dock silently never open: the target lookup failed every time,
+    // `show_devtools` gave up, and no browser was ever created.
+    //
+    // `curl` could not show it, because curl stops at `Content-Length`
+    // like this now does. The bug only existed in the hand-rolled read.
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw).ok()?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(head_end) = find(&raw, b"\r\n\r\n") {
+                    match content_length(&raw[..head_end]) {
+                        // Whole body in hand — stop rather than wait out
+                        // the read timeout on a socket that stays open.
+                        Some(len) if raw.len() - (head_end + 4) >= len => break,
+                        Some(_) => {}
+                        // No length header: fall back to waiting for the
+                        // close or the timeout, and keep what arrives.
+                        None => {}
+                    }
+                }
+            }
+            // A timeout here is an answer, not a failure: whatever
+            // arrived is what there is.
+            Err(_) => break,
+        }
+    }
     let text = String::from_utf8_lossy(&raw);
     text.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn content_length(head: &[u8]) -> Option<usize> {
+    String::from_utf8_lossy(head)
+        .lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
+        .and_then(|(_, v)| v.trim().parse().ok())
 }
 
 /// Close a tab's DevTools browser, if it has one. The state half lives in
@@ -2437,6 +2498,46 @@ mod tests {
     /// The counter is process-wide (the pump reads it from gpui's executor),
     /// so the tests that assert on it take a turn rather than racing.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// **The defect that made the DevTools dock paint black for three
+    /// builds**, as a test: Chromium's protocol endpoint ignores
+    /// `Connection: close` and holds the socket open after a complete
+    /// response. Reading to EOF therefore ends in `Err(TimedOut)`, and
+    /// treating that as failure throws away a response already in hand —
+    /// so the target lookup returned nothing, `show_devtools` gave up,
+    /// and no browser was ever created.
+    ///
+    /// The server here answers and then deliberately does NOT close,
+    /// which is the whole point: against a server that closes politely,
+    /// the broken version passed.
+    #[test]
+    fn a_complete_response_is_read_even_when_the_server_never_closes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"[{"type":"page","url":"https://example.com/"}]"#;
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length:{}\r\nContent-Type:application/json\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            );
+            // Held open, exactly like Chromium's endpoint. Outlives the
+            // read; the socket dies with the test process.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        assert_eq!(
+            devtools_targets_json_at(addr).as_deref(),
+            Some(body),
+            "the body was discarded because the server kept the socket open"
+        );
+    }
 
     /// **The two halves of D8's naming, pinned to each other.** This side
     /// maps `Errorcode` onto a string; `ask::certificate_explanation` maps
