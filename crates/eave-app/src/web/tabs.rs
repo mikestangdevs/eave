@@ -1111,16 +1111,25 @@ fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
                 .copied()
         })
         .or_else(|| candidates.first().copied())?;
-    let path = pick["devtoolsFrontendUrl"].as_str()?;
-    Some(if path.starts_with("http://") || path.starts_with("https://") {
-        path.to_string()
-    } else {
-        format!(
-            "http://127.0.0.1:{}{}",
-            super::host::DEVTOOLS_PORT,
-            path
-        )
-    })
+    // **Built from `webSocketDebuggerUrl`, NOT from `devtoolsFrontendUrl`,
+    // and that is the whole of why the dock painted black.** The listing's
+    // own frontend url points at Google's REMOTE copy
+    // (`https://chrome-devtools-frontend.appspot.com/serve_rev/@<rev>/…`)
+    // with `?ws=127.0.0.1:…` attached — and an `https` page may not open an
+    // insecure websocket, so the frontend loaded and then could never reach
+    // the target. Nothing painted, no error anywhere eave could see it.
+    //
+    // The same endpoint serves the BUNDLED frontend — the copy inside the
+    // framework we already ship, version-matched to this Chromium — over
+    // plain http, where a `ws://` to the same host is ordinary. That is
+    // also the one that must be used on principle: a browser's devtools
+    // should not be a fetch from a third-party host.
+    let ws = pick["webSocketDebuggerUrl"].as_str()?.strip_prefix("ws://")?;
+    Some(format!(
+        "http://127.0.0.1:{}/devtools/inspector.html?ws={}",
+        super::host::DEVTOOLS_PORT,
+        ws
+    ))
 }
 
 /// `GET /json/list` from the local endpoint. Blocking but bounded — it is
