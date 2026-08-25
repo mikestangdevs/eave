@@ -2180,25 +2180,85 @@ const PROMINENT_AFTER_MS: u64 = 10 * 60 * 1000;
 /// (`TestAppContext` hardcodes `Arc::new(())` as its asset source), so a
 /// row whose identity lived only in the mark would be unreadable to every
 /// test in this file.
-/// A tab's state dot, and whether it pulses — one implementation for the rail
-/// row and the spine, because a tab means the same thing at both widths.
-///
-/// On a session tab it is the rail's state pigment; on a page tab it is the
-/// LOAD state, and a page that is neither loading nor failed shows nothing
-/// while keeping its width. That last clause is why the colour is
-/// `transparent_black` rather than an `Option`: every tab is the same shape.
-fn spine_dot(tab: &strip::StripTab) -> (Hsla, bool) {
-    match &tab.kind {
-        strip::TabKind::Session { chip, .. } => match chip {
-            Some(c) => (state_color(&c.state), c.state == "running"),
-            None => (theme::text_tertiary(), false),
-        },
-        strip::TabKind::Page => match &tab.load {
-            eave_wire::LoadState::Failed { .. } => (theme::danger(), false),
-            eave_wire::LoadState::Loading => (theme::live(), true),
-            _ => (gpui::transparent_black(), false),
-        },
+/// One address-pill wash. `started` is the first loading frame;
+/// `finished` is the first frame Chromium said the page had landed.
+/// A remount of the header must not restart either clock.
+#[derive(Clone, Copy)]
+struct LoadShown {
+    started: Instant,
+    finished: Option<Instant>,
+}
+
+thread_local! {
+    static LOAD_SHOWN: RefCell<HashMap<String, LoadShown>> =
+        RefCell::new(HashMap::new());
+}
+
+fn page_load_is_showing() -> bool {
+    LOAD_SHOWN.with(|m| !m.borrow().is_empty())
+}
+
+/// Crawl toward [`theme::ADDRESS_LOAD_HOLD`] while the page is still
+/// loading. Completing to 1.0 is reserved for Chromium saying it landed.
+fn address_load_crawl(elapsed: f32) -> f32 {
+    let tau = theme::ADDRESS_LOAD_TAU_MS as f32 / 1000.0;
+    if tau <= 0.0 {
+        return theme::ADDRESS_LOAD_HOLD;
     }
+    theme::ADDRESS_LOAD_HOLD * (1.0 - (-elapsed / tau).exp())
+}
+
+/// Whether the address pill should show its load wash.
+///
+/// Returns `(t, alpha)`. While loading, `t` crawls toward the hold and
+/// waits. The frame Chromium reports Complete (or Failed), we ease the
+/// rest of the way to 1 and fade out — we do **not** keep playing a
+/// 1.4 s clock after the page is up, and we do **not** treat leftover
+/// `chrome.progress ∈ (0, 1)` as still loading once `LoadState` has
+/// landed (that is how GitHub kept the wash up).
+fn page_load_overlay(tab_id: &str, loading: bool, now: Instant) -> Option<(f32, f32)> {
+    LOAD_SHOWN.with(|m| {
+        let mut map = m.borrow_mut();
+        if loading {
+            let entry = map.entry(tab_id.to_string()).or_insert(LoadShown {
+                started: now,
+                finished: None,
+            });
+            if entry.finished.is_some() {
+                *entry = LoadShown {
+                    started: now,
+                    finished: None,
+                };
+            }
+            let elapsed = now.saturating_duration_since(entry.started).as_secs_f32();
+            crate::motion::mark_active();
+            return Some((address_load_crawl(elapsed), 1.0));
+        }
+        let Some(mut entry) = map.get(tab_id).copied() else {
+            return None;
+        };
+        if entry.finished.is_none() {
+            entry.finished = Some(now);
+            map.insert(tab_id.to_string(), entry);
+        }
+        let finished = entry.finished.unwrap();
+        let t0 = address_load_crawl(finished.saturating_duration_since(entry.started).as_secs_f32());
+        let fill = theme::ADDRESS_LOAD_FINISH_MS as f32 / 1000.0;
+        let fade = theme::ADDRESS_LOAD_FADE_MS as f32 / 1000.0;
+        let after = now.saturating_duration_since(finished).as_secs_f32();
+        if after < fill {
+            crate::motion::mark_active();
+            let u = crate::motion::EASE_OUT.eval((after / fill).clamp(0.0, 1.0));
+            Some((t0 + (1.0 - t0) * u, 1.0))
+        } else if after < fill + fade {
+            crate::motion::mark_active();
+            let a = 1.0 - ((after - fill) / fade).clamp(0.0, 1.0);
+            Some((1.0, a))
+        } else {
+            map.remove(tab_id);
+            None
+        }
+    })
 }
 
 thread_local! {
@@ -2973,13 +3033,11 @@ fn archived_toggle_label(archived: usize, showing: bool) -> String {
     format!("{archived} archived · {action}")
 }
 
-/// What the rail says when it holds rows and draws none of them
-/// (Stage AC).
-///
-/// "no sessions" over a rail whose sessions are all filed away is a lie
-/// of exactly the shape this codebase keeps finding: a state that lost
-/// the reason it is in. The count is the reason, and the toggle that
-/// undoes it is the line directly above.
+/// What the rail used to say when it held rows and drew none of them
+/// (Stage AC). Kept under test so the copy is still named if the empty
+/// note ever comes back; the live rail no longer draws it — add is the
+/// Sessions header `+`.
+#[cfg(test)]
 fn rail_empty_note(total: usize, archived: usize) -> String {
     if total == 0 {
         "no sessions".to_string()
@@ -4886,7 +4944,6 @@ struct Shell {
     /// rail comes back the way it was left.
     zone_projects_collapsed: std::cell::Cell<bool>,
     zone_folders_collapsed: std::cell::Cell<bool>,
-    zone_tabs_collapsed: std::cell::Cell<bool>,
     zone_sessions_collapsed: std::cell::Cell<bool>,
     /// Checkout roots a project has already been asked for (Slice T1),
     /// keyed on the root rather than the session.
@@ -5288,18 +5345,80 @@ fn save_zone_collapsed(key: &str, collapsed: bool) {
 /// The zone keys, named once so the reader and the writer cannot drift.
 pub(crate) const ZONE_PROJECTS: &str = "zone_projects_collapsed";
 pub(crate) const ZONE_FOLDERS: &str = "zone_folders_collapsed";
-pub(crate) const ZONE_TABS: &str = "zone_tabs_collapsed";
 pub(crate) const ZONE_SESSIONS: &str = "zone_sessions_collapsed";
 
 /// Selector on the zone header's `+`, kept as the ids the ghost rows
-/// used to wear so a click still names the same act.
+/// used to wear so a click still names the same act. Tabs are not a
+/// collapsing zone — their add is the standing `tab-new` pill.
 fn zone_add_id(key: &'static str) -> &'static str {
     match key {
         ZONE_PROJECTS => "project-new",
         ZONE_FOLDERS => "folder-new",
-        ZONE_TABS => "tab-new",
         ZONE_SESSIONS => "new-session",
         other => unreachable!("unknown zone key: {other}"),
+    }
+}
+
+/// ⌘T chip on the New Tab hover tip. Same size as a tab close so the
+/// two keycaps read as a pair of squares, not a word.
+fn shortcut_keycap(child: AnyElement) -> AnyElement {
+    div()
+        .size(px(theme::TAB_CLOSE))
+        .rounded(px(theme::RADIUS_CHIP))
+        .bg(theme::overlay_strong())
+        .border_1()
+        .border_color(theme::border_strong())
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(child)
+        .into_any_element()
+}
+
+/// Hover tip for the standing New Tab pill: the act, then the chord as
+/// two keycaps — ⌘ and T — matching the screenshot they sent.
+struct NewTabTip;
+
+impl Render for NewTabTip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("tab-new-tip")
+            .debug_selector(|| "tab-new-tip".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_HALF))
+            .px(px(theme::SPACE_3))
+            .py(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_MENU))
+            .bg(theme::chip_plate())
+            .border_1()
+            .border_color(theme::border_strong())
+            .shadow(theme::shadow_panel())
+            .child(
+                div()
+                    .text_size(px(theme::RAIL_NAME_SIZE))
+                    .line_height(px(theme::RAIL_NAME_LINE))
+                    .text_color(theme::text())
+                    .child("New tab"),
+            )
+            .child(shortcut_keycap(
+                icons::tagged_icon(
+                    icons::COMMAND,
+                    theme::ICON_STATUS,
+                    theme::text(),
+                    "tab-new-tip-cmd",
+                )
+                .into_any_element(),
+            ))
+            .child(shortcut_keycap(
+                div()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
+                    .text_color(theme::text())
+                    .child("T")
+                    .into_any_element(),
+            ))
     }
 }
 
@@ -7993,6 +8112,7 @@ impl Shell {
         rail_collapsed: bool,
         transcript_el: AnyElement,
         composer: AnyElement,
+        phase: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
@@ -8059,6 +8179,7 @@ impl Shell {
                 rail_collapsed,
                 left_tr,
                 left_co,
+                phase,
                 cx,
             ))
             .child(self.split_handle(split.vertical, cx))
@@ -8071,6 +8192,7 @@ impl Shell {
                 rail_collapsed,
                 right_tr,
                 right_co,
+                phase,
                 cx,
             ))
             .into_any_element()
@@ -8138,6 +8260,7 @@ impl Shell {
         rail_collapsed: bool,
         transcript_el: Option<AnyElement>,
         composer: Option<AnyElement>,
+        phase: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
@@ -8214,6 +8337,7 @@ impl Shell {
                 show_rail,
                 show_files,
                 header_tag,
+                phase,
             ))
             .child(
                 div()
@@ -8255,6 +8379,7 @@ impl Shell {
         show_rail: bool,
         show_files: bool,
         tag: &'static str,
+        _phase: Option<f32>,
     ) -> gpui::Div {
         let snapshot = self.strip_snapshot(cx);
         let wanted = for_tab.or(snapshot.active.as_deref());
@@ -8374,23 +8499,51 @@ impl Shell {
                     let ghost = has_edit.then(|| self.omnibox_ghost(cx)).flatten();
                     let drag_url = tab.url.clone();
                     let drag_title = tab.title.clone();
+                    let chrome = crate::web::chrome(&tab.id);
+                    let progress = chrome.as_ref().map(|c| c.progress).unwrap_or(0.0);
+                    // Complete/Failed is the page having landed. Leftover
+                    // Chromium progress (SPAs keep ticking under 1) must
+                    // not keep the wash up after that.
+                    let loading = if tab.pending.is_none()
+                        && matches!(
+                            tab.load,
+                            eave_wire::LoadState::Complete | eave_wire::LoadState::Failed { .. }
+                        ) {
+                        false
+                    } else {
+                        matches!(tab.load, eave_wire::LoadState::Loading)
+                            || tab.pending.is_some()
+                            || (progress > 0.0 && progress < 1.0)
+                    };
+                    let now = cx.background_executor().now();
+                    // Do not skip on reduce_motion — attempts 3–5 painted
+                    // without that gate, and 6–8 vanished after it went in.
+                    let load = page_load_overlay(&tab.id, loading, now);
                     div()
                         .id("pane-address")
                         .debug_selector(|| "pane-address".into())
                         .flex_1()
                         .min_w(px(0.))
-                        .h(px(theme::RAIL_TAB_H - theme::SPACE_1))
+                        .h(px(theme::ADDRESS_H))
+                        .relative()
+                        // Clip the load fill to the pill. Not while the
+                        // omnibox card is up — that card hangs below this
+                        // box, and overflow would cut it off.
+                        .when(!has_edit, |d| d.overflow_hidden())
                         .cursor_pointer()
                         .when(!has_edit, |d| {
-                            d.px(px(theme::SPACE_2))
-                                .rounded(px(theme::RADIUS_SELECT))
-                                .hover_fade("pane-address", theme::wash_rest(), theme::overlay())
+                            d.px(px(theme::SPACE_3))
+                                .rounded(px(theme::RADIUS_PANEL))
+                                .hover_fade(
+                                    "pane-address",
+                                    theme::wash_rest(),
+                                    theme::overlay_strongest(),
+                                )
                         })
                         // Live, this slot is only a size holder. The card
                         // that paints here is `deferred` so it can hang
                         // over the page AND own one hitbox for the field
                         // plus the list — see the `has_edit` child below.
-                        .when(has_edit, |d| d.relative())
                         .on_click(cx.listener(|this, _, _, cx| {
                             if this.omnibox_open() {
                                 // Already typing here. A second click
@@ -8426,6 +8579,9 @@ impl Shell {
                         })
                         .flex()
                         .items_center()
+                        .children((!has_edit).then(|| load).flatten().map(|(t, a)| {
+                            loaders::address_load(t, a).into_any_element()
+                        }))
                         .when(!has_edit, |d| {
                             d.child(
                                 div()
@@ -8479,8 +8635,8 @@ impl Shell {
                                             .id("omnibox")
                                             .debug_selector(|| "omnibox".into())
                                             .w_full()
-                                            .h(px(theme::RAIL_TAB_H - theme::SPACE_1))
-                                            .px(px(theme::SPACE_2))
+                                            .h(px(theme::ADDRESS_H))
+                                            .px(px(theme::SPACE_3))
                                             .flex()
                                             .flex_row()
                                             .items_center()
@@ -8960,13 +9116,10 @@ impl Shell {
     /// # What a tab says
     ///
     /// The two kinds share one anatomy so the strip has one rhythm: a
-    /// **state dot**, an **18 px plate**, the **name**, and a **close**.
-    /// On a session tab the dot is the rail's own state pigment and the
-    /// plate is the provider's mark (Slice AS, unchanged). On a page tab
-    /// the dot is the *load* state and the plate is a globe. Reserving the
-    /// dot's width on a page that is neither loading nor failed is what
-    /// keeps every tab the same width, which is what makes
-    /// [`theme::TAB_NAME_W`] a slot a test can measure a real name against.
+    /// **plate**, the **name**, and a **close**. Load is a fill and
+    /// underline on the address pill, not a bubble in front of the mark.
+    /// On a session tab the plate is the provider's mark; on a page tab
+    /// it is a favicon or a globe.
     ///
     /// A page tab paints its favicon in the plate when `favicon_url` is
     /// set; the globe is the fallback, not the product.
@@ -9146,17 +9299,16 @@ impl Shell {
             .iter()
             .filter(|i| matches!(i, strip::StripItem::Group { .. }))
             .count();
-        let loose_count = items.len() - projects;
         let folder_count = bookmarks::folders(&self.bookmarks.read(cx).snapshot).len();
 
         let proj_shut = self.zone_projects_collapsed.get();
         let folders_shut = self.zone_folders_collapsed.get();
-        let tabs_shut = self.zone_tabs_collapsed.get();
 
         let mut rows: Vec<AnyElement> = Vec::new();
         // Rows in this list that are not tabs: zone headers, the zone
-        // rule, and any bookmark folder rows. Counted so they do not
-        // spend the tab budget — see `theme::rail_rows_h`.
+        // rule, bookmark folder rows, and the standing New Tab pill.
+        // Counted so they do not spend the tab budget — see
+        // `theme::rail_rows_h`.
         let mut extra = 0usize;
         let mut active_row: Option<usize> = None;
         rows.push(self.zone_toggle(
@@ -9177,20 +9329,12 @@ impl Shell {
                 extra += self.emit_folders_and_tabs_head(
                     &mut rows,
                     folders_shut,
-                    tabs_shut,
                     folder_count,
-                    loose_count,
                     cx,
                 );
                 emitted_tabs_seam = true;
-                if tabs_shut {
-                    break;
-                }
             }
             if ix < projects && proj_shut {
-                continue;
-            }
-            if ix >= projects && tabs_shut {
                 continue;
             }
             match item {
@@ -9241,9 +9385,7 @@ impl Shell {
             extra += self.emit_folders_and_tabs_head(
                 &mut rows,
                 folders_shut,
-                tabs_shut,
                 folder_count,
-                loose_count,
                 cx,
             );
         }
@@ -9744,11 +9886,12 @@ impl Shell {
             .into_any_element()
     }
 
-    /// A zone's collapse control: `Label [n] + ∨`, drawn as the zone's
-    /// first row. `n` is omitted at zero — an empty zone stating "0" is
-    /// noise. The `+` is how you add to the zone; it sits on the right
-    /// with the caret so it is not read as part of the title. When the
-    /// zone is shut this row is what stays.
+    /// A zone's header: `Label [n] + ∨`. `n` and the caret are omitted at
+    /// zero — an empty zone has nothing nested, so a count of 0 and a
+    /// disclosure that discloses nothing are both noise. The `+` is how
+    /// you add; it is the same box as a tab's close (plain glyph, rounded
+    /// square hover), not a circled plus. When the zone is shut this row
+    /// is what stays.
     #[allow(clippy::too_many_arguments)]
     fn zone_toggle(
         &self,
@@ -9762,6 +9905,7 @@ impl Shell {
         cx: &Context<Self>,
     ) -> AnyElement {
         let add_id = zone_add_id(key);
+        let nested = count > 0;
         rail_inset()
             .child(
                 div()
@@ -9775,8 +9919,10 @@ impl Shell {
                         d.border_t(px(theme::HAIRLINE))
                             .border_color(theme::border())
                     })
-                    .cursor_pointer()
-                    .hover_fade(selector, theme::wash_rest(), theme::overlay())
+                    .when(nested, |d| {
+                        d.cursor_pointer()
+                            .hover_fade(selector, theme::wash_rest(), theme::overlay())
+                    })
                     .flex()
                     .flex_row()
                     .items_center()
@@ -9784,17 +9930,19 @@ impl Shell {
                     .child(
                         div()
                             .debug_selector(move || format!("{selector}-label"))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_BODY)
                             .text_color(theme::text_tertiary())
                             .child(SharedString::from(label)),
                     )
-                    .when(count > 0, |d| {
+                    .when(nested, |d| {
                         d.child(
                             div()
                                 .debug_selector(move || format!("{selector}-count"))
-                                .text_size(px(theme::SMALL_SIZE))
-                                .line_height(px(theme::SMALL_LINE))
+                                .text_size(px(theme::RAIL_NAME_SIZE))
+                                .line_height(px(theme::RAIL_NAME_LINE))
+                                .font_weight(theme::WEIGHT_BODY)
                                 .text_color(theme::text_tertiary())
                                 .child(SharedString::from(format!("{count}"))),
                         )
@@ -9804,10 +9952,17 @@ impl Shell {
                         div()
                             .id(SharedString::from(add_id))
                             .debug_selector(move || add_id.into())
-                            .size(px(theme::ICON_SM))
-                            .rounded(px(theme::RADIUS_SELECT))
+                            .size(px(theme::TAB_CLOSE))
+                            .flex_none()
+                            // Same box as tab close: `RADIUS_SELECT` on 18 px
+                            // is a disc; `RADIUS_CHIP` is the rounded square.
+                            .rounded(px(theme::RADIUS_CHIP))
                             .cursor_pointer()
-                            .hover_fade(add_id, theme::wash_rest(), theme::overlay())
+                            .hover_fade(
+                                add_id,
+                                gpui::transparent_black(),
+                                theme::overlay_strong(),
+                            )
                             .flex()
                             .items_center()
                             .justify_center()
@@ -9825,31 +9980,39 @@ impl Shell {
                                 cx.notify();
                             }))
                             .child(icons::tagged_icon(
-                                icons::ADD_CIRCLE,
-                                theme::ICON_STATUS,
-                                theme::text_tertiary(),
+                                icons::ADD,
+                                theme::ICON_SM,
+                                theme::text_secondary(),
                                 format!("{add_id}-glyph"),
                             )),
                     )
-                    .child(icons::tagged_icon(
-                        if collapsed {
-                            icons::ALT_ARROW_RIGHT
-                        } else {
-                            icons::ALT_ARROW_DOWN
-                        },
-                        theme::ICON_STATUS,
-                        theme::text_tertiary(),
-                        format!("{selector}-chevron"),
-                    ))
+                    .when(nested, |d| {
+                        d.child(icons::tagged_icon(
+                            if collapsed {
+                                icons::ALT_ARROW_RIGHT
+                            } else {
+                                icons::ALT_ARROW_DOWN
+                            },
+                            theme::ICON_STATUS,
+                            theme::text_tertiary(),
+                            format!("{selector}-chevron"),
+                        ))
+                    })
                     .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                         if key == ZONE_FOLDERS && ev.click_count() >= 2 {
-                            // First click of the pair already toggled collapse;
-                            // put it back so a double-click is the menu.
-                            let cell = this.zone_cell(key);
-                            let next = !cell.get();
-                            cell.set(next);
-                            save_zone_collapsed(key, next);
+                            if nested {
+                                // First click of the pair already toggled
+                                // collapse; put it back so a double-click
+                                // is the menu.
+                                let cell = this.zone_cell(key);
+                                let next = !cell.get();
+                                cell.set(next);
+                                save_zone_collapsed(key, next);
+                            }
                             this.open_folders_menu(ev.position(), cx);
+                            return;
+                        }
+                        if !nested {
                             return;
                         }
                         let cell = this.zone_cell(key);
@@ -9875,22 +10038,20 @@ impl Shell {
         match key {
             ZONE_PROJECTS => &self.zone_projects_collapsed,
             ZONE_FOLDERS => &self.zone_folders_collapsed,
-            ZONE_TABS => &self.zone_tabs_collapsed,
             ZONE_SESSIONS => &self.zone_sessions_collapsed,
             other => unreachable!("unknown zone key: {other}"),
         }
     }
 
-    /// Folders zone + the TABS seam + the tabs header. Pushed as a block
-    /// so the two call sites (the seam inside the item loop, and the
-    /// no-loose-tabs tail) cannot drift. Add is the header `+`.
+    /// Folders zone + the tabs seam + the standing New Tab pill. Pushed
+    /// as a block so the two call sites (the seam inside the item loop,
+    /// and the no-loose-tabs tail) cannot drift. Tabs themselves are not
+    /// a collapsing zone — they just exist under the pill.
     fn emit_folders_and_tabs_head(
         &self,
         rows: &mut Vec<AnyElement>,
         folders_shut: bool,
-        tabs_shut: bool,
         folder_count: usize,
-        loose_count: usize,
         cx: &Context<Self>,
     ) -> usize {
         let mut extra = 0usize;
@@ -9906,59 +10067,61 @@ impl Shell {
         ));
         extra += 1;
         if !folders_shut {
+            // No empty-state row: add is the header `+` (and still the
+            // double-click / right-click menu). An empty zone has nothing
+            // nested, so it is just the header.
             let folders = self.bookmark_folder_rows(cx);
-            if folders.is_empty() {
-                // No ghost row here: new folder is the header `+` (and
-                // still the double-click / right-click menu). The note
-                // is the fact, not a second button.
-                rows.push(
-                    rail_inset()
-                        .child(
-                            div()
-                                .debug_selector(|| "folders-empty".into())
-                                .w_full()
-                                .h(px(theme::RAIL_TAB_H))
-                                .px(px(theme::RAIL_HOVER_PAD))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(theme::SPACE_2))
-                                .child(icons::tagged_icon(
-                                    icons::FOLDER,
-                                    theme::RAIL_MARK,
-                                    theme::text_tertiary(),
-                                    "folders-empty-glyph",
-                                ))
-                                .child(
-                                    div()
-                                        .text_size(px(theme::SMALL_SIZE))
-                                        .line_height(px(theme::SMALL_LINE))
-                                        .text_color(theme::text_tertiary())
-                                        .child("nothing filed"),
-                                ),
-                        )
-                        .into_any_element(),
-                );
-                extra += 1;
-            } else {
-                extra += folders.len();
-                rows.extend(folders);
-            }
+            extra += folders.len();
+            rows.extend(folders);
         }
         rows.push(self.zone_rule("tabs-divider"));
         extra += 1;
-        rows.push(self.zone_toggle(
-            "zone-tabs",
-            ZONE_TABS,
-            "Tabs",
-            tabs_shut,
-            loose_count,
-            false,
-            |this, cx| this.new_tab(cx),
-            cx,
-        ));
+        rows.push(self.new_tab_row(cx));
         extra += 1;
         extra
+    }
+
+    /// Standing New Tab control. Not a zone header: no caret, no count,
+    /// no collapse. A labelled pill, always drawn, same act as ⌘T.
+    fn new_tab_row(&self, cx: &Context<Self>) -> AnyElement {
+        rail_inset()
+            .child(
+                div()
+                    .id("tab-new")
+                    .debug_selector(|| "tab-new".into())
+                    .w_full()
+                    .h(px(theme::RAIL_TAB_H))
+                    .px(px(theme::RAIL_HOVER_PAD))
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .cursor_pointer()
+                    .hover_fade(
+                        "tab-new",
+                        gpui::transparent_black(),
+                        theme::overlay_strongest(),
+                    )
+                    .tooltip(|_, cx| cx.new(|_| NewTabTip).into())
+                    .tooltip_show_delay(Duration::from_secs(1))
+                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .child(icons::tagged_icon(
+                        icons::ADD,
+                        theme::ICON_SM,
+                        theme::text_secondary(),
+                        "tab-new-glyph",
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_BODY)
+                            .text_color(theme::text_secondary())
+                            .child("New Tab"),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The bookmark FOLDERS, as titled rows in their own zone between
@@ -10143,6 +10306,7 @@ impl Shell {
                             .flex_1()
                             .truncate()
                             .text_size(px(theme::SMALL_SIZE))
+                            .font_weight(theme::WEIGHT_BODY)
                             .text_color(theme::text())
                             .child(SharedString::from(child.label.clone()))
                             .into_any_element()
@@ -10229,6 +10393,7 @@ impl Shell {
                 .border_color(theme::border_strong())
                 .rounded(px(theme::RADIUS_SELECT))
                 .text_size(px(theme::SMALL_SIZE))
+                .font_weight(theme::WEIGHT_BODY)
                 .text_color(theme::text())
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -10246,6 +10411,7 @@ impl Shell {
                 .flex_1()
                 .truncate()
                 .text_size(px(theme::SMALL_SIZE))
+                .font_weight(theme::WEIGHT_BODY)
                 .text_color(theme::text())
                 .child(SharedString::from(label))
                 .into_any_element(),
@@ -10546,7 +10712,7 @@ impl Shell {
                     .children(title.as_ref().map(|t| {
                         div()
                             .text_size(px(theme::MICRO_SIZE))
-                            .font_weight(theme::WEIGHT_STRONG)
+                            .font_weight(theme::WEIGHT_BODY)
                             .text_color(theme::text())
                             .child(SharedString::from(t.clone()))
                     }))
@@ -10618,10 +10784,10 @@ impl Shell {
     /// One tab as a **row** (Slice D1), where it used to be a fixed-width chip.
     ///
     /// Everything about a tab's identity survives the axis change unaltered —
-    /// the state dot, the 18 px provider/globe plate, the neutral raised fill
-    /// plus inset rim for selection (never an accent bar: the accent marks
-    /// where you are ACTING, and a selected tab is a location). Two things
-    /// change, and both are consequences of the axis rather than new opinions:
+    /// the provider/globe plate, the name, the close. Load lives on the
+    /// address pill, not as a bubble in front of the mark — the mark has
+    /// to line up with New Tab's plus. Two things change, and both are
+    /// consequences of the axis rather than new opinions:
     ///
     /// - **The name slot is no longer a fixed 92 px.** `TAB_NAME_W` existed
     ///   because a horizontal strip had to fit five tabs across a titlebar,
@@ -10642,7 +10808,7 @@ impl Shell {
     fn rail_tab(
         &self,
         tab: &strip::StripTab,
-        phase: Option<f32>,
+        _phase: Option<f32>,
         compact: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -10652,11 +10818,6 @@ impl Shell {
         } else {
             tab.active || self.split.as_ref().is_some_and(|s| s.contains(&id))
         };
-        // The dot. On a session tab it is the rail's state pigment; on a
-        // page tab it is the LOAD state, and a page that is neither loading
-        // nor failed shows nothing — but keeps its width, which is what
-        // makes every tab identical and `TAB_NAME_W` a measurable slot.
-        let (dot, pulsing) = spine_dot(tab);
         let activate = id.clone();
         let closing = id.clone();
         let tab = div()
@@ -10747,8 +10908,14 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(theme::SPACE_1))
-            .child(loaders::work_dot(theme::STATE_DOT, dot, phase.filter(|_| pulsing)).flex_none())
+            // Same gap as New Tab (`+` then the label), so the favicon
+            // and the title share that column rather than sitting past
+            // a reserved load bubble.
+            .gap(px(if compact {
+                theme::SPACE_1
+            } else {
+                theme::SPACE_2
+            }))
             // The plate is the site mark — a favicon when Chromium has
             // given us one, the globe otherwise. Compact chips keep it:
             // "always display favicons" is the identity of a page tab,
@@ -10772,12 +10939,6 @@ impl Shell {
                         let id = id.clone();
                         move || format!("tab-label-{id}")
                     })
-                    // The row's gap is `SPACE_1` (the dot and the plate are
-                    // one identity group); the name takes the rail's
-                    // `SPACE_2` off the plate, so this is the difference
-                    // and `TAB_CHROME_W` counts both. Compact chips have
-                    // no plate, so the row gap is already the whole offset.
-                    .when(!compact, |d| d.ml(px(theme::SPACE_2 - theme::SPACE_1)))
                     // Slice D1: `flex_1`, not `TAB_NAME_W`. A row takes the
                     // rail's width, so the name gets what is left after the
                     // chrome — the same slot a session row gives it — and the
@@ -10789,7 +10950,7 @@ impl Shell {
                     .truncate()
                     .text_size(px(theme::RAIL_NAME_SIZE))
                     .line_height(px(theme::RAIL_NAME_LINE))
-                    .font_weight(theme::WEIGHT_STRONG)
+                    .font_weight(theme::WEIGHT_BODY)
                     .text_color(if tab.placeholder {
                         theme::text_secondary()
                     } else {
@@ -10887,7 +11048,6 @@ impl Shell {
         // rows themselves are untouched — so the count below is a real
         // count and un-archiving needs nothing to come back from.
         let show_archived = self.sessions.read(cx).show_archived;
-        let total = all.len();
         let archived_count = all.iter().filter(|s| s.archived).count();
         let editing = self
             .rename
@@ -11199,7 +11359,7 @@ impl Shell {
                                     // height under the operator's pointer.
                                     .text_size(px(theme::RAIL_NAME_SIZE))
                                     .line_height(px(theme::RAIL_NAME_LINE))
-                                    .font_weight(theme::WEIGHT_STRONG)
+                                    .font_weight(theme::WEIGHT_BODY)
                                     .text_color(theme::text())
                                     // Clicking inside the field is not a
                                     // click on the row: without this, a
@@ -11289,7 +11449,7 @@ impl Shell {
                                     // headings, in a 560 px column.
                                     .text_size(px(theme::RAIL_NAME_SIZE))
                                     .line_height(px(theme::RAIL_NAME_LINE))
-                                    .font_weight(theme::WEIGHT_STRONG)
+                                    .font_weight(theme::WEIGHT_BODY)
                                     // Slice AO: primary ink on every row,
                                     // not just the selected one. Selection
                                     // is carried by the bar, the rim and
@@ -11600,31 +11760,9 @@ impl Shell {
                 .into_any_element()
             })
             .collect();
-        // Slice M (§3.1): an empty rail rendered literally nothing, so a
-        // first run and a rail that failed to load looked identical. One
-        // clause, the fact only — the action is the `+` on the Sessions
-        // header, and restating a visible button is noise.
-        let rows: Vec<AnyElement> = if rows.is_empty() {
-            vec![div()
-                .px(px(theme::RAIL_GUTTER))
-                .py(px(theme::SPACE_1))
-                .child(
-                    div()
-                        .debug_selector(|| "rail-empty".into())
-                        .text_size(px(theme::SMALL_SIZE))
-                        .line_height(px(theme::SMALL_LINE))
-                        .text_color(theme::text_tertiary())
-                        // Stage AC: "no sessions" over a rail whose
-                        // sessions are all filed away is an empty state
-                        // that lost its reason. `rail_empty_note` keeps
-                        // the reason on screen, and the toggle that undoes
-                        // it is the line directly above.
-                        .child(SharedString::from(rail_empty_note(total, archived_count))),
-                )
-                .into_any_element()]
-        } else {
-            rows
-        };
+        // No empty-state copy under Sessions. Add is the header `+`.
+        // If every session is archived, the archived toggle below is the
+        // reason the list is empty — restating it is noise.
 
         // Sessions zone: labelled header (add is the `+` on it), then the
         // rows, then the archived filter. The filter is not a create
@@ -12577,6 +12715,14 @@ impl Shell {
             .sessions
             .iter()
             .any(|s| s.state == "running")
+        {
+            return true;
+        }
+        // The address pill's load fill: in flight, or still easing out
+        // to 1 after Chromium said complete.
+        if self.web_tabs.read(cx).snapshot.tabs.iter().any(|t| {
+            matches!(t.load, eave_wire::LoadState::Loading) || t.pending.is_some()
+        }) || page_load_is_showing()
         {
             return true;
         }
@@ -17053,6 +17199,7 @@ impl Render for Shell {
                                         rail_collapsed,
                                         transcript_el.into_any_element(),
                                         composer.into_any_element(),
+                                        pulse,
                                         cx,
                                     )
                                 } else {
@@ -17080,6 +17227,7 @@ impl Render for Shell {
                                             true,
                                             true,
                                             "pane-header",
+                                            pulse,
                                         ))
                                         .child(
                                             // Stage H glass: the list's viewport runs
@@ -18418,7 +18566,6 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         zone_folders_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_FOLDERS,
                         )),
-                        zone_tabs_collapsed: std::cell::Cell::new(load_zone_collapsed(ZONE_TABS)),
                         zone_sessions_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_SESSIONS,
                         )),

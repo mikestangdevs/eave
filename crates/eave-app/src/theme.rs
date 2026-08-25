@@ -1471,6 +1471,28 @@ pub const WORK_BAR_CELLS: usize = 4;
 pub const WORK_BAR_CELL: f32 = 3.0;
 pub const WORK_BAR_GAP: f32 = SPACE_HALF;
 
+/// Soft leading edge of the load wash, as a fraction of the pill.
+pub const ADDRESS_LOAD_TIP: f32 = 0.22;
+
+/// While the page is still loading, the wash crawls toward this fraction
+/// of the pill and waits. Completing is Chromium's job, not the clock.
+pub const ADDRESS_LOAD_HOLD: f32 = 0.88;
+
+/// Time constant of that crawl, in ms. `1 - exp(-t/τ)` — at τ the wash
+/// is at 63 % of [`ADDRESS_LOAD_HOLD`].
+pub const ADDRESS_LOAD_TAU_MS: u64 = 520;
+
+/// Once the page has landed, ease the remaining wash to the end, in ms.
+/// Shorter than this read as a dart (attempt 5).
+pub const ADDRESS_LOAD_FINISH_MS: u64 = 360;
+
+/// Fade the wash out after that finish.
+pub const ADDRESS_LOAD_FADE_MS: u64 = 280;
+
+/// Wash over the pill during a load. 0.28 read as a solid plate;
+/// 0.08 vanished when the overlay had no size. 0.12 is a tint.
+pub const ADDRESS_LOAD_WASH: f32 = 0.12;
+
 /// Skeleton rows for a load state. The slot height is [`DETAIL_LINE`] —
 /// the line height of the stated-fact text a skeleton stands in for at
 /// both of its sites — and the bar pulses INSIDE that slot, so the
@@ -1673,8 +1695,8 @@ pub fn rail_tabs_max_h() -> f32 {
 ///
 /// One of the extras is the folders/tabs rule, which is [`rail_rule_h`]
 /// rather than [`RAIL_TAB_H`]. Everything else extra (zone headers, folder
-/// rows) is still one tab tall. `extra` always includes that rule —
-/// `emit_folders_and_tabs_head` always pushes it.
+/// rows, the standing New Tab pill) is still one tab tall. `extra` always
+/// includes that rule — `emit_folders_and_tabs_head` always pushes it.
 pub fn rail_rows_h(rows: usize, extra: usize) -> f32 {
     let tabs = rows.saturating_sub(extra);
     let extra_tab_h = extra.saturating_sub(1);
@@ -1733,6 +1755,11 @@ pub fn files_section_max_h() -> f32 {
 /// stance is *every element states an observed fact*, a browser that will not
 /// say where you are is a stance violation, not a missing feature.
 pub const PANE_HEADER_H: f32 = TITLEBAR_H;
+
+/// The in-header address pill. [`SPACE_1`] of air above and below so the
+/// hover wash is a pill in the strip, not a second bar — and not the 20 px
+/// chip (`RAIL_TAB_H` − [`SPACE_1`]) that used to sit in a 48 px header.
+pub const ADDRESS_H: f32 = PANE_HEADER_H - SPACE_1 * 2.0;
 
 /// Ground margin around the floating content card (and the air the rails
 /// keep from the window edges). Frame-level inset is [`CARD_GUTTER`]; this

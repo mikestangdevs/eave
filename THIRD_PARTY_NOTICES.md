@@ -7,7 +7,7 @@ attribution those licences require; it is not a courtesy list.
 
 | Component | What | Licence | Source |
 | --- | --- | --- | --- |
-| **Solar Icons** (Linear weight) | The 52 line glyphs in `crates/eave-app/assets/icons/` | **CC BY 4.0** | 480 Design — https://www.figma.com/community/file/1166831539721848736 |
+| **Solar Icons** (Linear weight) | The 55 line glyphs in `crates/eave-app/assets/icons/` | **CC BY 4.0** | 480 Design — https://www.figma.com/community/file/1166831539721848736 |
 
 > **Solar Icons by 480 Design**, licensed under
 > [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
