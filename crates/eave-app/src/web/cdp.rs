@@ -109,6 +109,8 @@ thread_local! {
     /// Events dropped to the cap, ever. **Counted, not silent** — a trace
     /// cap that discards without saying so cost this repo two wrong
     /// conclusions in slice C5, and the fix is that the number survives.
+    /// **It is not a backpressure signal on its own**: see
+    /// [`dropped_events`].
     static DROPPED: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -233,9 +235,22 @@ pub fn drain_events() -> Vec<Event> {
     EVENTS.with(|e| e.borrow_mut().drain(..).collect())
 }
 
-/// How many events have been dropped to the cap. Never resets: a consumer
-/// that sees this climb knows it is reading too slowly, which is a fact
-/// about the consumer that no amount of draining reveals.
+/// How many events have been dropped to the cap. Never resets.
+///
+/// # This is NOT a backpressure signal on its own, and an earlier version
+/// # of this comment said it was
+/// It was written as "a consumer that sees this climb knows it is reading
+/// too slowly". That is wrong, because **eave is not the only producer into
+/// this queue.** The docked DevTools frontend (G9) attaches to the same
+/// agent on the same browser, and the domains it enables *for itself* raise
+/// events that reach [`super::inspector`]'s observer like any other. So
+/// opening Inspect on a busy page fills all [`EVENT_CAP`] slots with
+/// traffic nobody asked for and this number climbs — from a **human
+/// action**, with no consumer involved at all.
+///
+/// The cap is working when that happens; it is not a leak. But a reader who
+/// takes a rising count as "my consumer is too slow" will go looking in the
+/// wrong process. Quote it with the condition attached: *was a dock open?*
 pub fn dropped_events() -> u64 {
     DROPPED.with(Cell::get)
 }
