@@ -17292,6 +17292,14 @@ impl Render for Shell {
         // need it, answers whatever pages have asked for since the last
         // frame, and retires toasts that have been up long enough.
         crate::web::drive_notifications(&strip_snapshot);
+        // E8. Same place and the same reason: this is where the tab
+        // snapshot is readable. It turns on `Network`/`Log`/`Runtime` for
+        // tabs that lack them and folds what has arrived into the per-tab
+        // console and network stores an agent reads. Until this line
+        // existed the domains were enabled only by a test, so a page
+        // reported nothing and the silence looked exactly like a page
+        // doing nothing.
+        crate::web::drive_observation(&strip_snapshot);
 
         let page_el = {
             let active = strip_snapshot.active.clone();

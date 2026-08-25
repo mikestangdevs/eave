@@ -144,6 +144,12 @@ mod input;
 mod inspector;
 #[cfg(feature = "web")]
 mod menu;
+/// What a page did — console and network — kept where an agent can read
+/// it (E8). Compiled in BOTH feature states: it is a fold over CDP events
+/// into bounded per-tab stores, and every decision in it is testable
+/// without a Chromium. See its module docs.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+mod observe;
 /// `window.Notification`, reimplemented over a CDP binding because CEF
 /// alloy has no notification API — the display half of G2. Compiled in
 /// BOTH feature states: everything that decides whether a notification is
@@ -723,6 +729,10 @@ pub(crate) fn forget_page(tab_id: &str) {
     // page left to hear a `close`, and an ack to a dead browser answers
     // `NotSent` on a later pump for nothing. See `notify::forget_tab`.
     notify::forget_tab(tab_id);
+    // Its console and network record goes too — including the fact that it
+    // was watched, or a reused id would never have its domains enabled
+    // again and would report nothing, with no error anywhere.
+    observe::forget_tab(tab_id);
     FINDS.with(|f| {
         f.borrow_mut().remove(tab_id);
     });
@@ -1011,6 +1021,31 @@ pub fn cdp_type(tab_id: &str, text: &str) -> u32 {
 pub fn cdp_screenshot(tab_id: &str) -> u32 {
     let (method, params) = cdp::screenshot();
     cdp_call(tab_id, method, &params)
+}
+
+// ---------------------------------------------------------------------------
+// E8 — what a page did, where an agent can read it
+// ---------------------------------------------------------------------------
+
+/// One turn of the observation loop: enable the reporting domains on tabs
+/// that lack them, then fold whatever has arrived into the per-tab stores.
+///
+/// Driven from the render pass with the other per-frame reconciliations.
+/// **Ungated**, like the notification loop and for the same reason:
+/// `cdp_call`'s feature-off twin issues the calls and a test supplies the
+/// events, so the whole fold runs in the default suite.
+pub fn drive_observation(snapshot: &eave_wire::TabsSnapshot) {
+    observe::drive(snapshot);
+}
+
+/// What this tab printed, oldest first.
+pub fn tab_console(tab_id: &str) -> Vec<observe::ConsoleLine> {
+    observe::console(tab_id)
+}
+
+/// What this tab fetched, oldest first.
+pub fn tab_exchanges(tab_id: &str) -> Vec<observe::Exchange> {
+    observe::exchanges(tab_id)
 }
 
 // ---------------------------------------------------------------------------
