@@ -159,7 +159,7 @@ pub use dialogs::answer;
 #[cfg(feature = "web")]
 pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 #[cfg(feature = "web")]
-pub use page::{page_element, page_focus_handle, set_keyboard_page};
+pub use page::{page_element, page_focus_handle, set_keyboard_page, set_live_divider};
 #[cfg(feature = "web")]
 pub use tabs::{
     chrome, copy_selection, downloads, drive, install_fact_sink, install_request_sink,
@@ -816,6 +816,10 @@ pub(crate) fn devtools_note_closed(id: &str) {
         DEVTOOLS_OPEN.with(|d| {
             d.borrow_mut().remove(&parent);
         });
+        // The browser closed itself (or finished a Close we asked for).
+        // Nothing else would redraw: a dying frontend delivers no frame.
+        #[cfg(feature = "web")]
+        host::note_chrome_change();
     }
 }
 
@@ -836,10 +840,80 @@ fn cef_close_devtools(_tab_id: &str) {}
 pub fn inspect_element(tab_id: &str, x: i32, y: i32) {
     #[cfg(test)]
     TEST_INSPECTS.with(|i| *i.borrow_mut() = Some((tab_id.to_string(), x, y)));
+    // The dock rides Chromium's debugging port, and the port is off unless
+    // the operator asked for it. Refuse BEFORE marking the dock open: the
+    // ⌘⌥I toggle and the "Close DevTools" row both key off `devtools_open`,
+    // so setting the flag and then failing would leave the menu offering to
+    // close a dock that was never opened.
+    if !devtools_available() {
+        eprintln!(
+            "[web] Inspect needs Chromium's DevTools port, which is off by \
+             default. Relaunch with EAVE_DEVTOOLS_PORT=1 to enable it."
+        );
+        return;
+    }
     DEVTOOLS_OPEN.with(|d| {
         d.borrow_mut().insert(tab_id.to_string());
     });
     cef_inspect_element(tab_id, x, y);
+}
+
+/// Whether the DevTools dock can work at all this session.
+///
+/// Feature-OFF answers **true**: there is no Chromium and no port, but the
+/// dock's open/closed state is view state the default suite must still
+/// exercise — the same reason `DEVTOOLS_OPEN` itself is ungated. What is
+/// gated is whether a real port was opened.
+pub fn devtools_available() -> bool {
+    // In a test process the port policy is not the thing under test: the
+    // harness asserts dock VIEW state, and `devtools_port_enabled` reads a
+    // process-wide `OnceLock` that no test can vary. So tests default to
+    // available and flip it explicitly with
+    // [`set_devtools_available_for_test`] when the refusal is the subject.
+    // The policy itself is tested purely, in `devtools_port_requested`.
+    #[cfg(test)]
+    {
+        TEST_DOCK_AVAILABLE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        #[cfg(feature = "web")]
+        {
+            host::devtools_port_enabled()
+        }
+        #[cfg(not(feature = "web"))]
+        {
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DOCK_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Test seam: pretend the debugging port is on or off.
+#[cfg(test)]
+pub fn set_devtools_available_for_test(available: bool) {
+    TEST_DOCK_AVAILABLE.with(|d| d.set(available));
+}
+
+/// Whether an operator's environment asks for Chromium's debugging port.
+///
+/// The decision, kept pure and ungated so the default suite runs it —
+/// `nav_policy`/`evict_policy`'s pattern. Unset is off; so is an empty
+/// value and a literal `0`, because `EAVE_DEVTOOLS_PORT=0` plainly reads
+/// as "no" and a bare `is_ok()` would read it as yes.
+///
+/// Its only caller is `host::devtools_port_enabled`, which is gated, so
+/// feature-OFF nothing reaches it and only its tests run. The allow is
+/// scoped to exactly that state rather than blanket — `evict_policy`'s
+/// reasoning, and for the same reason: genuinely dead code in the `web`
+/// build should still be caught.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) fn devtools_port_requested(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "0")
 }
 
 #[cfg(feature = "web")]
@@ -1193,6 +1267,10 @@ pub fn page_focus_handle(
 #[cfg(not(feature = "web"))]
 pub fn set_keyboard_page(_tab_id: Option<&str>) {}
 
+/// No page engine, so there is no stale frame to stretch.
+#[cfg(not(feature = "web"))]
+pub fn set_live_divider(_on: bool) {}
+
 /// No page engine, so nothing is on screen as a page.
 #[cfg(not(feature = "web"))]
 pub fn set_shown_pages(_ids: impl IntoIterator<Item = impl AsRef<str>>) {}
@@ -1508,6 +1586,74 @@ mod tests {
         assert!(methods.contains(&"Network.enable".to_string()));
         assert!(methods.contains(&"Log.enable".to_string()));
         assert!(methods.contains(&"Runtime.enable".to_string()));
+    }
+
+    // -----------------------------------------------------------------
+    // The DevTools debugging port is opt-in
+    // -----------------------------------------------------------------
+
+    /// Unset means off. This is the whole point of the gate: no shipping
+    /// Chromium browser opens a debugging port by default, and eave did.
+    #[test]
+    fn an_absent_variable_does_not_open_the_port() {
+        assert!(!devtools_port_requested(None));
+    }
+
+    /// `EAVE_DEVTOOLS_PORT=0` plainly reads as "no". A bare `is_ok()` on
+    /// the variable would read it as yes, which is the trap this replaces.
+    #[test]
+    fn a_zero_or_empty_value_does_not_open_the_port() {
+        assert!(!devtools_port_requested(Some("0")));
+        assert!(!devtools_port_requested(Some("")));
+    }
+
+    /// **The gate's actual effect**, and the failure it prevents: with the
+    /// port off, Inspect must refuse AND leave the dock flag clear. A
+    /// refusal that set the flag would leave ⌘⌥I and the menu offering to
+    /// close a dock that was never opened — and a pane standing over a
+    /// frontend that can never connect, which is the defect `59b5af2`
+    /// removed.
+    #[test]
+    fn with_the_port_off_inspect_refuses_and_the_dock_stays_shut() {
+        let tab = "tab-port-off";
+        set_devtools_available_for_test(false);
+        inspect_element(tab, 3, 4);
+        assert!(!devtools_open(tab), "no dock, and no flag claiming one");
+        set_devtools_available_for_test(true);
+        inspect_element(tab, 3, 4);
+        assert!(devtools_open(tab), "and it opens once the port is on");
+        close_devtools(tab);
+    }
+
+    /// Anything an operator would plausibly type to mean yes.
+    #[test]
+    fn an_asked_for_port_is_opened() {
+        for value in ["1", "true", "yes", "9223"] {
+            assert!(
+                devtools_port_requested(Some(value)),
+                "{value} should enable the port"
+            );
+        }
+    }
+
+    /// Refusing Inspect must NOT mark the dock open. ⌘⌥I and the "Close
+    /// DevTools" row both key off `devtools_open`, so a refusal that set
+    /// the flag would leave the menu offering to close a dock that was
+    /// never opened. Feature-OFF the dock is always available, so this
+    /// asserts the ordinary path leaves the flag consistent with what the
+    /// menu will read.
+    #[test]
+    fn the_dock_flag_matches_what_inspect_actually_did() {
+        let tab = "tab-dock-flag";
+        assert!(!devtools_open(tab), "not open before");
+        inspect_element(tab, 1, 2);
+        assert_eq!(
+            devtools_open(tab),
+            devtools_available(),
+            "the flag says open exactly when the dock could be opened"
+        );
+        close_devtools(tab);
+        assert!(!devtools_open(tab), "and closing clears it");
     }
 
     /// Every call goes to the tab it names — one queue serves them all, so

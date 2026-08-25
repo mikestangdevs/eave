@@ -1047,6 +1047,19 @@ pub fn show_devtools(tab_id: &str, _x: i32, _y: i32) {
     if !super::host::running() {
         return;
     }
+    // The frontend reaches its target over Chromium's debugging port, and
+    // the port is off unless the operator asked for it. Refuse HERE, with
+    // the other guards, and above all **before any browser is created**:
+    // once the OSR surface exists it has to be reaped, and the reaper maps
+    // a devtools id to its PARENT's snapshot row — a dock that never loads
+    // is exactly the shape that gets missed there.
+    if !super::host::devtools_port_enabled() {
+        eprintln!(
+            "[web] DevTools dock refused: the debugging port is off. \
+             Relaunch with EAVE_DEVTOOLS_PORT=1."
+        );
+        return;
+    }
     // No docking DevTools onto DevTools. Nothing in the product asks for
     // it now that the frontend keeps its own menus, but the id would be
     // `devtools:devtools:…` and the second frontend would inspect the
@@ -1121,6 +1134,19 @@ pub(super) fn run_queued_docks() {
             continue;
         };
         if has_browser(&dt_id) {
+            CREATING.with(|c| {
+                c.borrow_mut().remove(&dt_id);
+            });
+            continue;
+        }
+        // Closed while the lookup was in flight. Creating it now would
+        // reopen a dock the operator just shut — Close looking like it
+        // did nothing, until they did it a second time.
+        let still_wanted = super::devtools_parent(&dt_id).is_some_and(super::devtools_open);
+        if !still_wanted {
+            CREATING.with(|c| {
+                c.borrow_mut().remove(&dt_id);
+            });
             continue;
         }
         if std::env::var("EAVE_WEB_TRACE").is_ok() {
@@ -1234,15 +1260,29 @@ fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
 /// no-op. `getItem` immediately after `setItem` is what makes it exactly
 /// once rather than a reload loop.
 fn devtools_settle_frontend(frame: &mut Frame) {
-    const SHIM: &str = "(function(){\
-         try {\
-           if (localStorage.getItem('screencast-enabled') !== 'false') {\
-             localStorage.setItem('screencast-enabled', 'false');\
-             location.reload();\
-           }\
-         } catch (e) {}\
-       })();";
-    frame.execute_java_script(Some(&CefString::from(SHIM)), None, 0);
+    // The overlay close sits in a reserved strip on the header's trailing
+    // edge so it does not cover the frontend's gear. Size is the overlay
+    // itself ([`theme::ICON_TOGGLE`]) plus its inset ([`theme::SPACE_1`]).
+    let pad = crate::theme::ICON_TOGGLE + crate::theme::SPACE_1;
+    let shim = format!(
+        "(function(){{\
+           try {{\
+             if (localStorage.getItem('screencast-enabled') !== 'false') {{\
+               localStorage.setItem('screencast-enabled', 'false');\
+               location.reload();\
+               return;\
+             }}\
+             var n=0;\
+             var f=function(){{\
+               var h=document.querySelector('.tabbed-pane-header');\
+               if(h) h.style.paddingRight='{pad:.0}px';\
+               else if(++n<60) requestAnimationFrame(f);\
+             }};\
+             f();\
+           }} catch (e) {{}}\
+         }})();"
+    );
+    frame.execute_java_script(Some(&CefString::from(shim.as_str())), None, 0);
 }
 
 /// `GET /json/list` from the local endpoint. Blocking but bounded — it is
@@ -1321,9 +1361,17 @@ fn content_length(head: &[u8]) -> Option<usize> {
 
 /// Close a tab's DevTools browser, if it has one. The state half lives in
 /// `super::close_devtools`; the map entry disappears in the devtools
-/// browser's own `on_before_close`, like any browser's.
+/// browser's own `on_before_close`, like any browser's. Also drops an
+/// in-flight lookup so a Close that beats the worker cannot reopen the
+/// dock when the URL arrives.
 pub fn close_devtools(tab_id: &str) {
     let dt = super::devtools_id(tab_id);
+    CREATING.with(|c| {
+        c.borrow_mut().remove(&dt);
+    });
+    if let Ok(mut q) = PENDING_DOCKS.lock() {
+        q.retain(|(id, _)| id != &dt);
+    }
     if has_browser(&dt) {
         close_browser_for(&dt);
     }

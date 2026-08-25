@@ -830,7 +830,44 @@ const USER_AGENT_PRODUCT: Option<&str> = None;
 /// for remote debugging unless told otherwise). 9223 rather than the
 /// conventional 9222 so a developer's ordinary Chrome debugging session
 /// on this machine cannot collide with eave's.
+///
+/// **Only reached when the operator asks for it** — see
+/// [`devtools_port_enabled`].
 pub(crate) const DEVTOOLS_PORT: u16 = 9223;
+
+/// Whether this session was launched with the debugging port enabled.
+///
+/// # Why this is off by default
+/// `remote_debugging_port` is a `CefSettings` field applied at
+/// `CefInitialize`, so enabling it opens the endpoint **for the whole
+/// session and every tab, from launch, whether or not a dock is ever
+/// opened**. Inspect is not the exposure; running eave was. Chromium's
+/// DevTools endpoint is unauthenticated to anything that can reach
+/// loopback: `/json/list` hands out target ids and a target is full CDP
+/// over every origin the browser holds — cookies, storage and script
+/// execution included.
+///
+/// **This is not theoretical, and it was demonstrated here by accident.**
+/// `tabs::show_devtools` carries the account: the lib-test binary, run
+/// from a checkout, reached a *different* eave's live browser because that
+/// process's debugging port answered a stranger on loopback. A test
+/// process drove another instance's browser without asking anyone. That is
+/// the whole threat model, performed in-house, before anyone was looking
+/// for it.
+///
+/// No shipping Chromium browser has this on by default. Chrome and Arc
+/// require `--remote-debugging-port`, and **Brave does not patch remote
+/// debugging at all** (zero files in `brave-core` mention it, so it
+/// inherits Chromium's default). Their own docked DevTools uses no socket
+/// whatsoever — `DevToolsAgentHost::AttachClient`, an in-process binding.
+/// Read once: a variable that changed mid-session would make two halves of
+/// one run disagree about whether a port is open.
+pub(crate) fn devtools_port_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::devtools_port_requested(std::env::var("EAVE_DEVTOOLS_PORT").ok().as_deref())
+    })
+}
 
 /// The settings eave starts Chromium with.
 ///
@@ -851,13 +888,25 @@ fn browser_settings(cache: &std::path::Path) -> Settings {
         // gpui owns [NSApp run]; CEF gets pumped instead of running its own.
         external_message_pump: 1,
         root_cache_path: cache.to_string_lossy().as_ref().into(),
-        // The DevTools protocol endpoint, bound to localhost by Chromium.
-        // This is what makes a DOCKED frontend possible at all: CEF 151's
+        // The DevTools protocol endpoint, bound to localhost by Chromium,
+        // and **off unless the operator asked for it**.
+        //
+        // It is what makes a DOCKED frontend possible at all: CEF 151's
         // ShowDevTools rejects windowless rendering outright, so the
         // bundled frontend is loaded into an eave-owned OSR browser and
         // connected to the tab's target over this port instead. See
-        // `tabs::show_devtools`.
-        remote_debugging_port: DEVTOOLS_PORT as i32,
+        // `tabs::show_devtools`. That cost is real — with the port off the
+        // dock cannot work, and `web::inspect_element` says so rather than
+        // leaving a pane over a frontend that will never connect.
+        //
+        // Only 1024–65535 enables it; 0 is the default and is off. (The
+        // ephemeral-port behaviour CEF documents for 0 applies to the
+        // command-line switch, not to this field.)
+        remote_debugging_port: if devtools_port_enabled() {
+            DEVTOOLS_PORT as i32
+        } else {
+            0
+        },
         ..Default::default()
     };
     if let Some(ua) = USER_AGENT {
