@@ -410,6 +410,71 @@ fn stretch_for_measurement() -> bool {
     *ON.get_or_init(|| std::env::var("EAVE_WEB_STRETCH").is_ok())
 }
 
+/// True while the operator is dragging one of eave's own dividers — the
+/// split handle or the DevTools dock handle.
+///
+/// **Why a divider is not a window corner.** E1 decided that a stale frame
+/// is painted one device pixel per device pixel and clipped, never
+/// stretched, because a layout stretched horizontally is *the wrong
+/// picture* rather than a smaller one. That is right for a window resize:
+/// the size changes, Chromium answers within a frame or two, and the
+/// uncovered strip shows for that long.
+///
+/// A divider drag is a different shape. Every pointer move is a **new
+/// size**, so the pane that is growing never catches up while the pointer
+/// is down, and the uncovered strip is not a transient — it is a black
+/// band that tracks the pointer for the whole gesture. That is what the
+/// operator reported. Between two wrong pictures, a briefly-scaled page
+/// that follows the divider reads as the panel resizing; a black band
+/// reads as the panel being broken.
+///
+/// So this narrows E1's rule rather than reversing it: stretch **only**
+/// while a divider is actually moving. On mouse-up the flag clears, the
+/// next frame that fits is painted 1:1, and E1's behaviour is back. The
+/// pump path above is deliberately left alone — Chromium is still asked to
+/// reflow on every paint, so the stretch is what is on screen *until* the
+/// real frame arrives, not instead of it.
+///
+/// Set from the shell's render, which is the one place that can see both
+/// drags at once.
+///
+/// **Thread-local, not a `static`, and the suite is what says so.** Both
+/// ends of this live on gpui's main thread — `Shell::render` writes it,
+/// `PageSurface::paint` reads it, same thread, same frame — so a
+/// thread-local is not a compromise here. It was a process-global
+/// `AtomicBool` first, and that version passed alone and **failed in the
+/// full `--features web` run**: the harness runs tests in parallel, every
+/// other test's render publishes `false`, and they were all writing to one
+/// cell. Green-alone-red-together is the tell.
+///
+/// This is the opposite call to G1's permission mirror, which is an
+/// `RwLock` precisely because it is read from a thread other than the one
+/// that writes it. The rule is not "prefer one" — it is that the choice
+/// follows which threads actually touch it.
+fn live_divider() -> bool {
+    LIVE_DIVIDER.with(|c| c.get())
+}
+
+thread_local! {
+    static LIVE_DIVIDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`live_divider`]. Called every render with the current drag state,
+/// so it is self-correcting: a drag that ends without a mouse-up (a
+/// dropped grab, a window deactivation) clears on the next frame rather
+/// than leaving every page stretched for ever.
+pub fn set_live_divider(on: bool) {
+    LIVE_DIVIDER.with(|c| c.set(on));
+}
+
+/// The flag `paint` actually consults, so the shell's rule is tested
+/// against the real thing with the feature on rather than only against
+/// the feature-off stub's record.
+#[cfg(test)]
+pub(super) fn live_divider_for_test() -> bool {
+    live_divider()
+}
+
 struct PageSurface {
     tab_id: String,
 }
@@ -606,7 +671,7 @@ impl Element for PageSurface {
             }
             if let Some(frame) = frame {
                 let (fw, fh, fits) = fit_of(&frame);
-                if fits || stretch_for_measurement() {
+                if fits || stretch_for_measurement() || live_divider() {
                     window.paint_surface_with_corners(bounds, frame.buffer, corners);
                 } else {
                     let at = Bounds {

@@ -1267,9 +1267,40 @@ pub fn page_focus_handle(
 #[cfg(not(feature = "web"))]
 pub fn set_keyboard_page(_tab_id: Option<&str>) {}
 
-/// No page engine, so there is no stale frame to stretch.
+/// No page engine, so there is no stale frame to stretch — but the
+/// SHELL's half of the rule is still worth pinning here, which is why
+/// this stub records rather than discarding.
+///
+/// The rule is "the flag is on exactly while a divider is being dragged",
+/// and the failure that matters is not turning it *on* — it is failing to
+/// turn it back off, which leaves every page painting stretched for ever
+/// and looks like a rendering bug with no obvious cause. That is a shell
+/// bug, not a Chromium one, so the feature-off suite can hold it.
 #[cfg(not(feature = "web"))]
-pub fn set_live_divider(_on: bool) {}
+pub fn set_live_divider(on: bool) {
+    LIVE_DIVIDER_FOR_TEST.with(|c| c.set(on));
+}
+
+#[cfg(not(feature = "web"))]
+thread_local! {
+    static LIVE_DIVIDER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The last value the shell published. See [`set_live_divider`].
+///
+/// Answered from whichever half is compiled, so the shell's rule is held
+/// by BOTH suites: feature-off this is the stub's own record, and with the
+/// feature on it is the flag `page::paint` actually consults. A test that
+/// only existed in one state would leave the state that ships untested.
+#[cfg(all(test, not(feature = "web")))]
+pub fn live_divider_for_test() -> bool {
+    LIVE_DIVIDER_FOR_TEST.with(|c| c.get())
+}
+
+#[cfg(all(test, feature = "web"))]
+pub fn live_divider_for_test() -> bool {
+    page::live_divider_for_test()
+}
 
 /// No page engine, so nothing is on screen as a page.
 #[cfg(not(feature = "web"))]

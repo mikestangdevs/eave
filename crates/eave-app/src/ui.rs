@@ -8814,8 +8814,112 @@ impl Shell {
                     .flex_grow(r)
                     .min_w(px(0.))
                     .h_full()
+                    .flex()
+                    .flex_col()
                     .overflow_hidden()
-                    .children(devtools_el),
+                    // **Both children or neither, and that is the whole
+                    // fix for the dead end.** `inspect_element` marks the
+                    // dock open BEFORE the frontend browser exists, so for
+                    // a frame or two this pane is empty. The reverted
+                    // slice mounted its ✕ on that empty pane, which put a
+                    // live control under the pointer inside the very
+                    // gesture that chose Inspect — the click that opened
+                    // the dock closed it again. Keying the whole titlebar
+                    // off `page_element` being `Some` means the control
+                    // cannot exist until a browser has been created and
+                    // handed us a surface, which is many frames after the
+                    // pointer went up.
+                    .children(
+                        devtools_el
+                            .map(|el| {
+                                vec![
+                                    self.devtools_titlebar(tab_id, cx),
+                                    div()
+                                        .flex_1()
+                                        .min_h(px(0.))
+                                        .overflow_hidden()
+                                        .child(el)
+                                        .into_any_element(),
+                                ]
+                            })
+                            .unwrap_or_default(),
+                    )
+                    .into_any_element(),
+            )
+            .into_any_element()
+    }
+
+    /// The dock's own title strip: eave chrome, with the close on the
+    /// right where Chrome puts it.
+    ///
+    /// **Why eave draws a strip instead of overlaying the frontend's
+    /// toolbar.** Chrome's ✕ lives *in* the DevTools frontend, in the same
+    /// row as the gear and the kebab, and it appears only when the
+    /// frontend is told `can_dock=true`. eave cannot pass that: it makes
+    /// the frontend run `AdvancedApp`, which holds a permanently empty
+    /// pane waiting for an embedder confirmation a hosted frontend can
+    /// never send (the grey band, dock report §4). So the frontend eave
+    /// serves has no ✕ to reuse and no room reserved for one.
+    ///
+    /// The alternative was to float eave's ✕ over the frontend's top-right
+    /// corner — which is exactly where that frontend already draws its
+    /// kebab, and covering a live control with a different live control is
+    /// worse than spending 26 px. Padding the frontend's own toolbar out
+    /// of the way was tried in the reverted slice and is ruled out for a
+    /// better reason than aesthetics: it means injecting CSS into a
+    /// versioned Chromium bundle, and there is already one load-bearing
+    /// shim there (`screencast-enabled`).
+    ///
+    /// A strip cannot collide with anything the frontend draws, at any
+    /// Chromium version, and it costs height rather than width — which is
+    /// the cheaper axis for a panel whose panels are all width-hungry.
+    fn devtools_titlebar(&self, tab_id: &str, cx: &Context<Self>) -> AnyElement {
+        let for_tab = tab_id.to_string();
+        let key = format!("devtools-close-{tab_id}");
+        div()
+            .debug_selector(|| "devtools-titlebar".into())
+            .flex_none()
+            .w_full()
+            .h(px(theme::TAB_CLOSE + theme::SPACE_1 * 2.0))
+            .px(px(theme::SPACE_1))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .bg(theme::chrome_glass())
+            .border_b_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .id(SharedString::from(key.clone()))
+                    .debug_selector(|| "devtools-close".into())
+                    .flex_none()
+                    .size(px(theme::TAB_CLOSE))
+                    .rounded(px(theme::RADIUS_CHIP))
+                    .hover_fade(key.clone(), gpui::transparent_black(), theme::overlay_strong())
+                    .cursor_pointer()
+                    // The frontend is a live browser surface underneath;
+                    // without this the same press also reaches Chromium.
+                    .occlude()
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        cx.stop_propagation();
+                        // The same call the page-menu row makes. The close
+                        // path itself is untouched: `close_devtools`
+                        // clears the flag and asks CEF to close the
+                        // browser, and `devtools_note_closed` still only
+                        // reacts to the browser actually going away.
+                        crate::web::close_devtools(&for_tab);
+                        cx.notify();
+                    }))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icons::tagged_icon(
+                        icons::CLOSE,
+                        theme::ICON_SM,
+                        theme::text_secondary(),
+                        format!("{key}-glyph"),
+                    )),
             )
             .into_any_element()
     }
@@ -17061,6 +17165,21 @@ impl Render for Shell {
         // Time comes from the executor, never `Instant::now()` — N1's rule,
         // and what lets the harness drive every tween off the fake clock.
         motion::begin_frame(cx.background_executor().now(), cx.reduce_motion());
+
+        // While one of eave's dividers is moving, the page surfaces paint
+        // their last CEF frame stretched instead of 1:1-and-clipped —
+        // otherwise the pane that is GROWING shows a black band that
+        // tracks the pointer for the whole gesture, because a divider
+        // hands Chromium a new size on every move and it never catches up
+        // while the button is down. See `web::page::live_divider`, which
+        // carries why this narrows Slice E1's rule rather than reversing
+        // it.
+        //
+        // Told every frame rather than from the drag handlers: this is the
+        // one place that can see both dividers, and a grab that ends
+        // without a mouse-up clears on the next frame instead of leaving
+        // every page stretched for ever.
+        crate::web::set_live_divider(self.split_drag.is_some() || self.devtools_drag.is_some());
 
         // Perf probe: measure inter-frame time while force-scrolling the
         // 10k transcript top to bottom (spec 04 §Acceptance).

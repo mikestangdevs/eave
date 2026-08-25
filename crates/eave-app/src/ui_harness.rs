@@ -13751,6 +13751,65 @@ fn the_devtools_dock_opens_once_and_closes(cx: &mut TestAppContext) {
     let _ = (h, vcx);
 }
 
+/// **A divider that is let go stops stretching.** While one of eave's
+/// dividers is dragged, the page surfaces paint their last CEF frame
+/// stretched to the new bounds — without that, the pane that is growing
+/// shows a black band that tracks the pointer for the whole gesture,
+/// because every move hands Chromium a size it cannot answer before the
+/// next frame.
+///
+/// The direction that needs a test is the *release*. Leaving the flag set
+/// paints every page stretched for ever, from then on, with nothing on
+/// screen to say why — and because the flag is published from `render`
+/// rather than from the drag handlers, the guarantee is "a grab that ends
+/// any way at all clears on the next frame", which is exactly what this
+/// walks.
+#[gpui::test]
+fn letting_go_of_a_divider_stops_the_stretch(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(
+        !crate::web::live_divider_for_test(),
+        "nothing is being dragged and the pages are already stretching"
+    );
+
+    for grab in ["devtools", "split"] {
+        h.window
+            .update(vcx, |shell, _, cx| {
+                let drag = SplitDrag {
+                    grab_x: 400.,
+                    start_ratio: 0.5,
+                    well_w: 800.,
+                };
+                if grab == "devtools" {
+                    shell.devtools_drag = Some(drag);
+                } else {
+                    shell.split_drag = Some(drag);
+                }
+                cx.notify();
+            })
+            .unwrap();
+        vcx.run_until_parked();
+        assert!(
+            crate::web::live_divider_for_test(),
+            "the {grab} divider was moving and the surfaces were still clipping"
+        );
+
+        // Dropped, not mouse-upped: the shape a lost grab takes.
+        h.window
+            .update(vcx, |shell, _, cx| {
+                shell.devtools_drag = None;
+                shell.split_drag = None;
+                cx.notify();
+            })
+            .unwrap();
+        vcx.run_until_parked();
+        assert!(
+            !crate::web::live_divider_for_test(),
+            "the {grab} grab ended and every page is still painting stretched"
+        );
+    }
+}
+
 /// **The dock can be shut from the same row that opened it.** The
 /// frontend's own ✕ cannot do it — that button asks a host window eave
 /// does not provide — so if this row did not toggle, the dock would be a
