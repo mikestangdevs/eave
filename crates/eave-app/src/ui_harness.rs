@@ -8382,27 +8382,18 @@ fn empty_session(
         id: "aaaa1111".into(),
     });
     vcx.run_until_parked();
-    // Let the card's entrance land before anything measures it. The rise
+    // Let the cluster's entrance land before anything measures it. The rise
     // is a live `top` offset while `motion::entrance_t` is below 1, so a
-    // bounds read on a mid-entrance card is reading the animation, not the
-    // layout — and two reads either side of an unrelated change would
+    // bounds read on a mid-entrance cluster is reading the animation, not
+    // the layout — and two reads either side of an unrelated change would
     // differ for a reason that has nothing to do with the change.
     drive(h, vcx, Duration::from_millis(10));
     s
 }
 
-/// The four parts of an empty state, and the claim that a centred grey
-/// string was none of them.
-///
-/// What shipped before this slice was `"nothing sent yet"` at
-/// `SMALL_SIZE`, `text_tertiary`, dead centre of a pane that is roughly
-/// two thirds of the window. It **announced** nothing (it was the app's
-/// quietest rank), it **oriented** nobody (a person who has just opened
-/// eave cannot tell which folder this session runs in or which agent it
-/// drives), and it **offered** nothing.
-///
-/// So this asserts all four are present at once, because any one of them
-/// alone is what was already there.
+/// An empty selected session is a centered cluster: circular logo, then
+/// the composer card, then the cwd line. The Slice AN card (`empty-title`,
+/// `empty-key`, `empty-action`) is gone.
 #[gpui::test]
 fn the_empty_state_announces_orients_and_offers(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -8412,121 +8403,123 @@ fn the_empty_state_announces_orients_and_offers(cx: &mut TestAppContext) {
         shown(vcx, "transcript-empty"),
         "a selected session with an empty journal shows no empty state at all"
     );
-    for part in ["empty-title", "empty-where", "empty-key", "empty-action"] {
+    assert!(
+        shown(vcx, "empty-logo"),
+        "the empty session has no logo placeholder"
+    );
+    assert!(
+        shown(vcx, "empty-cluster"),
+        "the logo+composer cluster never mounted"
+    );
+    for part in ["composer-hint", "send", "composer-attach", "composer-model"] {
         assert!(
             shown(vcx, part),
-            "the empty state is missing {part} — announce / orient / offer \
-             is the whole difference between this and a caption"
+            "the composer card is missing {part} under the logo"
+        );
+    }
+    assert!(
+        shown(vcx, "empty-where"),
+        "the cwd line is gone — work in this project is no longer reachable"
+    );
+    for retired in ["empty-title", "empty-key", "empty-action"] {
+        assert!(
+            !shown(vcx, retired),
+            "{retired} is the Slice AN card this layout replaced"
         );
     }
 }
 
-/// **The announce rank is real, not claimed.** `DISPLAY_LINE` is 26 and
-/// `SMALL_LINE` — what the old caption used — is 15. A headline whose box
-/// is 15 px tall is the old caption with a new selector on it.
-///
-/// The number is written as a literal on purpose: reading it back out of
-/// `theme::DISPLAY_LINE` would make this test agree with the constant no
-/// matter what the constant became, which is the one thing it must not do.
+/// The placeholder is a circle: equal width and height (the round fill is
+/// `rounded_full` on that same box). A square that is not round, or a disc
+/// that is a stretched oval, is not the mock.
 #[gpui::test]
 fn the_empty_states_headline_is_at_the_display_rank(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
 
-    let title = vcx.debug_bounds("empty-title").expect("the headline");
+    let logo = vcx.debug_bounds("empty-logo").expect("the logo placeholder");
     assert_eq!(
-        title.size.height,
-        px(26.),
-        "the headline's line box is {:?}; the display rank is 26 and the \
-         retired caption's rank was 15",
-        title.size.height
+        logo.size.width, logo.size.height,
+        "the logo is not circular: {:?} × {:?}",
+        logo.size.width, logo.size.height
     );
-
-    // And it is the ONLY thing on the card at that rank — a rank that
-    // appears twice on one surface has stopped announcing anything.
-    for quieter in ["empty-where", "empty-action"] {
-        let b = vcx.debug_bounds(quieter).expect(quieter);
-        assert!(
-            b.size.height < px(26.),
-            "{quieter} is {:?} tall, which is the headline's own rank",
-            b.size.height
-        );
-    }
+    // A 1 px speck or a pane-filling wash would still be square. The
+    // disc is a control-sized mark, not a backdrop — 24 px is smaller
+    // than any control in the composer, 120 px is larger than the
+    // resting composer bar.
+    assert!(
+        logo.size.width > px(24.) && logo.size.width < px(120.),
+        "the logo is {:?} across, which is not a placeholder disc",
+        logo.size.width
+    );
 }
 
-/// **Clearance, not merely fit.** The card is an absolute overlay bottomed
-/// at `COMPOSER_CLEARANCE`, so it cannot reach the composer — but that is
-/// an argument about the code, and the thing worth pinning is the gap on
-/// screen. A future card that grew a fourth line, or a composer that grew
-/// a second row, would close it silently.
+/// The composer sits *below* the logo, with a real gap. Stacking them on
+/// top of each other, or putting the card above the disc, is not the mock.
 #[gpui::test]
 fn the_empty_state_clears_the_composer_it_points_at(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
 
-    let action = vcx.debug_bounds("empty-action").expect("the action line");
-    let hint = vcx.debug_bounds("composer-hint").expect("the composer");
-    let card_bottom = action.origin.y + action.size.height;
+    let logo = vcx.debug_bounds("empty-logo").expect("the logo");
+    let card = vcx.debug_bounds("composer-card").expect("the composer card");
+    let logo_bottom = logo.origin.y + logo.size.height;
     assert!(
-        card_bottom < hint.origin.y,
-        "the empty state runs to {card_bottom:?} and the composer starts at \
-         {:?} — the card is sitting on the input it is telling you to use",
-        hint.origin.y
+        card.origin.y > logo_bottom,
+        "the composer starts at {:?} and the logo ends at {logo_bottom:?} — \
+         they overlap or the card is above the disc",
+        card.origin.y
     );
-    // Not merely non-overlapping: separated by more than a hairline. The
-    // composer's own card is inset from `COMPOSER_CLEARANCE`, so a gap
-    // this small would already mean something has gone wrong above.
     assert!(
-        hint.origin.y - card_bottom > px(24.),
-        "only {:?} between the card and the composer",
-        hint.origin.y - card_bottom
+        card.origin.y - logo_bottom > px(8.),
+        "only {:?} between the logo and the composer",
+        card.origin.y - logo_bottom
     );
 }
 
-/// **Above centre, not at it.** Dead centre is where an alert goes, which
-/// is exactly why a small grey string sitting there read as a failed load
-/// rather than as a rest state. But the first pass overcorrected to the
-/// upper third and the card read as orphaned, so the ratio moved to 4:5.
-///
-/// `EMPTY_ABOVE`:`EMPTY_BELOW` is 4:5, so the free space above the card
-/// should be about 4/9 of the free space total. The bounds are 0.38 and
-/// 0.48 as literals, NOT derived from the constants they check: wide
-/// enough that the card's own height and a pixel of rounding do not
-/// matter, narrow enough that both failure modes fail — dead centre
-/// (0.5) and the upper third this replaced (0.333).
+/// The cluster sits near the middle of the well, not pinned to the top
+/// third the way the Slice AN card was. Literals, not the flex-grow
+/// constants: a leftover 4:5 spacer pair would land around 0.44 above.
 #[gpui::test]
 fn the_empty_state_sits_above_centre_but_not_at_the_top(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
 
     let pane = vcx.debug_bounds("transcript-empty").expect("the slot");
-    let title = vcx.debug_bounds("empty-title").expect("the headline");
-    let action = vcx.debug_bounds("empty-action").expect("the action line");
+    let cluster = vcx.debug_bounds("empty-cluster").expect("the cluster");
 
-    let above = title.origin.y - pane.origin.y;
-    let below = (pane.origin.y + pane.size.height) - (action.origin.y + action.size.height);
+    let pane_mid = f32::from(pane.origin.y) + f32::from(pane.size.height) / 2.0;
+    let cluster_mid = f32::from(cluster.origin.y) + f32::from(cluster.size.height) / 2.0;
+    let well_h = f32::from(pane.size.height);
     assert!(
-        above > px(0.) && below > px(0.),
-        "the card is not inside its own slot: above={above:?} below={below:?}"
+        well_h > 0.0,
+        "the empty overlay has no height, so centering is unmeasurable"
     );
-    let share = f32::from(above) / f32::from(above + below);
+    let offset = (cluster_mid - pane_mid).abs() / well_h;
     assert!(
-        (0.38..0.48).contains(&share),
-        "the card's free space is {share:.3} above / {:.3} below; 4:5 is \
-         ~0.444, dead centre is 0.5, the old upper third was 0.333",
-        1.0 - share
+        offset < 0.20,
+        "the cluster mid is {offset:.3} of the well away from centre \
+         (pane mid {pane_mid}, cluster mid {cluster_mid})"
+    );
+    // The retired card sat in the top third. A cluster whose mid is still
+    // up there is that card with a logo glued on.
+    let from_top = (cluster_mid - f32::from(pane.origin.y)) / well_h;
+    assert!(
+        from_top > 0.35,
+        "the cluster mid is {from_top:.3} of the way down the well — \
+         still the leftover upper-third card"
     );
 }
 
 /// **Gone the instant a turn exists**, and a turn is the operator's
-/// message alone — not the agent's reply to it. A card still up while the
-/// first directive is on screen would be claiming the session is empty
-/// over the proof that it is not.
+/// message alone — not the agent's reply to it. The logo leaves; the
+/// composer stays, now docked at the bottom of the well.
 #[gpui::test]
 fn the_empty_state_is_gone_the_instant_a_turn_exists(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
     assert!(shown(vcx, "transcript-empty"));
+    assert!(shown(vcx, "empty-logo"));
 
     h.plumbing.push_feed(FeedEvent::Records {
         id: "aaaa1111".into(),
@@ -8537,57 +8530,60 @@ fn the_empty_state_is_gone_the_instant_a_turn_exists(cx: &mut TestAppContext) {
 
     assert!(
         !shown(vcx, "transcript-empty"),
-        "one directive landed and the card is still claiming nothing was sent"
+        "one directive landed and the cluster is still claiming nothing was sent"
     );
-    for part in ["empty-title", "empty-where", "empty-key", "empty-action"] {
+    for part in [
+        "empty-logo",
+        "empty-cluster",
+        "empty-where",
+        "empty-title",
+        "empty-key",
+        "empty-action",
+    ] {
         assert!(
             !shown(vcx, part),
-            "{part} outlived the card it belongs to — the container went \
-             away and a piece of it did not"
+            "{part} outlived the cluster it belongs to"
         );
     }
-    // And the composer is still the composer: the card leaving must not
-    // take the input with it.
     assert!(shown(vcx, "composer-hint"));
+    assert!(shown(vcx, "send"));
+    assert!(shown(vcx, "composer-attach"));
+
+    let well = vcx.debug_bounds("content-well").expect("the well");
+    let send = vcx.debug_bounds("send").expect("the send disc");
+    let from_top = (f32::from(send.origin.y) - f32::from(well.origin.y))
+        / f32::from(well.size.height);
+    assert!(
+        from_top > 0.55,
+        "after the first turn the composer is still in the empty-cluster \
+         slot (send is {from_top:.3} of the way down the well)"
+    );
 }
 
-/// The card and the launcher answer different questions and can be up in
-/// two windows at once, so a person has to be able to tell which one they
-/// are looking at. They are never on screen together (the launcher owns
-/// "no session"; the card owns "a session with no turns"), and the shapes
-/// are different: the launcher centres its content in a 700 px column,
-/// the card is left-aligned and capped at `DIRECTIVE_MAX_W`.
+/// The cluster and the launcher answer different questions and can be up
+/// in two windows at once. They are never on screen together (the launcher
+/// owns "no session"; the cluster owns "a session with no turns").
 #[gpui::test]
 fn the_empty_state_and_the_launcher_are_never_the_same_screen(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     assert!(shown(vcx, "launcher"), "a bare boot is the launcher");
     assert!(
-        !shown(vcx, "transcript-empty"),
-        "the launcher and the card must never stack"
+        !shown(vcx, "transcript-empty") && !shown(vcx, "empty-logo"),
+        "the launcher and the empty-session cluster must never stack"
     );
-    let launcher_title = vcx.debug_bounds("launcher-title").expect("the launcher");
 
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
     assert!(!shown(vcx, "launcher"));
-    let card_title = vcx.debug_bounds("empty-title").expect("the card");
-
-    // The launcher's headline is centred in the pane; the card's is on
-    // the transcript's left reading edge. That is the difference a person
-    // reads first, before a single word.
-    assert!(
-        card_title.origin.x < launcher_title.origin.x,
-        "the card's headline starts at {:?} and the launcher's at {:?} — \
-         they are laid out alike and will be mistaken for each other",
-        card_title.origin.x,
-        launcher_title.origin.x
+    assert!(shown(vcx, "empty-logo"), "selecting a session lost the cluster");
+    let logo = vcx.debug_bounds("empty-logo").expect("the logo");
+    assert_eq!(
+        logo.size.width, logo.size.height,
+        "the empty-session mark is not a disc — it will be mistaken for the launcher"
     );
 }
 
-/// The one clickable thing on the card, and it routes through the seam
-/// that already existed (`open_in_system`) rather than through a command
-/// invented for it. Knowing *where* an agent is about to run is the fact
-/// this whole card is built around; being able to go look is the cheapest
-/// possible way to make that fact checkable.
+/// The cwd line routes through the seam that already existed
+/// (`open_in_system`) rather than through a command invented for it.
 #[gpui::test]
 fn the_empty_states_folder_line_opens_the_folder(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -8604,20 +8600,16 @@ fn the_empty_states_folder_line_opens_the_folder(cx: &mut TestAppContext) {
 }
 
 /// **Emptying the composer's hint moves nothing.** The row's height is
-/// set by the send button (26) and not by the hint (`MICRO_LINE`, 14), so
-/// a hint that comes and goes with the draft must leave every box in the
-/// composer exactly where it was — otherwise the first character typed
-/// would shove the composer, and with it the clearance the empty-state
-/// card is measured against.
-///
-/// This is the same invariant as `the_overlay_moves_nothing_it_floats_over`,
-/// applied to a line of text that now has two states instead of one.
+/// set by the send button and not by the hint, so a hint that comes and
+/// goes with the draft must leave every box in the cluster exactly where
+/// it was — otherwise the first character typed would shove the composer
+/// and the logo with it.
 #[gpui::test]
 fn emptying_the_composer_hint_moves_nothing(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
 
-    let probes = ["composer-hint", "send", "empty-title", "empty-action"];
+    let probes = ["composer-hint", "send", "empty-logo", "composer-attach"];
     let quiet: Vec<_> = probes.iter().map(|s| vcx.debug_bounds(s)).collect();
     assert!(
         quiet.iter().all(|b| b.is_some()),
@@ -8639,6 +8631,178 @@ fn emptying_the_composer_hint_moves_nothing(cx: &mut TestAppContext) {
              {a:?} -> {b:?}"
         );
     }
+}
+
+/// A draft typed into the empty cluster is still there after the first
+/// record docks the composer, and the field still owns keys.
+#[gpui::test]
+fn a_typed_draft_survives_the_first_turn_docking(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    vcx.simulate_input("hello");
+    vcx.run_until_parked();
+    assert_eq!(composer_draft(vcx, &h), "hello");
+    assert!(shown(vcx, "empty-logo"));
+
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "the first turn")],
+    });
+    vcx.run_until_parked();
+
+    assert!(!shown(vcx, "empty-logo"));
+    assert_eq!(
+        composer_draft(vcx, &h),
+        "hello",
+        "docking the composer remounted the field and ate the draft"
+    );
+    vcx.simulate_input(" world");
+    vcx.run_until_parked();
+    assert_eq!(
+        composer_draft(vcx, &h),
+        "hello world",
+        "the field lost the keyboard when it moved to the bottom"
+    );
+}
+
+/// Shrinking the window must keep the cluster inside the well — not clip
+/// it off the bottom — and still centred. The first headed walk showed an
+/// empty well at a smaller size: the overlay had no definite height, so
+/// the composer left the visible rect.
+#[gpui::test]
+fn the_empty_cluster_stays_in_the_well_when_the_window_shrinks(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
+    assert!(shown(vcx, "empty-logo"));
+    assert!(shown(vcx, "composer-card"));
+
+    vcx.simulate_resize(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H)));
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(10));
+
+    let well = vcx.debug_bounds("transcript-empty").expect("the well");
+    let card = vcx
+        .debug_bounds("composer-card")
+        .expect("composer after resize");
+    let send = vcx.debug_bounds("send").expect("send after resize");
+    assert!(
+        well.size.height > px(0.) && well.size.width > px(0.),
+        "the empty pane collapsed to {well:?}"
+    );
+    let well_bottom = well.origin.y + well.size.height;
+    let well_right = well.origin.x + well.size.width;
+    for (name, b) in [("composer-card", card), ("send", send)] {
+        assert!(
+            b.origin.y >= well.origin.y - px(1.)
+                && b.origin.y + b.size.height <= well_bottom + px(1.)
+                && b.origin.x >= well.origin.x - px(1.)
+                && b.origin.x + b.size.width <= well_right + px(1.),
+            "{name} left the well after resize: {b:?} vs well {well:?}"
+        );
+    }
+    let card_mid = f32::from(card.origin.y) + f32::from(card.size.height) / 2.0;
+    let well_mid = f32::from(well.origin.y) + f32::from(well.size.height) / 2.0;
+    let offset = (card_mid - well_mid).abs() / f32::from(well.size.height);
+    assert!(
+        offset < 0.30,
+        "after resize the composer is {offset:.3} of the well from centre"
+    );
+    assert!(
+        shown(vcx, "empty-logo"),
+        "the min window hid the logo — the disc fits the well leftover at WINDOW_MIN_H"
+    );
+    let logo = vcx.debug_bounds("empty-logo").expect("logo after resize");
+    assert!(
+        logo.origin.y >= well.origin.y - px(1.)
+            && logo.origin.y + logo.size.height <= well_bottom + px(1.),
+        "the logo left the well after resize: {logo:?} vs well {well:?}"
+    );
+}
+
+/// Distance from the pane header's bottom to the cluster's vertical mid.
+/// The well is the window leftover; growing or collapsing the rail must
+/// not change this. A cluster that tracks the rail's min-content sits
+/// lower as folders open and clips its logo when they shut.
+fn cluster_mid_below_header(vcx: &mut VisualTestContext) -> f32 {
+    let header = vcx
+        .debug_bounds("pane-header")
+        .expect("pane-header");
+    let cluster = vcx
+        .debug_bounds("empty-cluster")
+        .expect("empty-cluster");
+    let header_bottom = f32::from(header.origin.y) + f32::from(header.size.height);
+    let cluster_mid = f32::from(cluster.origin.y) + f32::from(cluster.size.height) / 2.0;
+    cluster_mid - header_bottom
+}
+
+/// Open folders on the rail must not move the empty cluster or hide the
+/// logo. The headed walk: full-screen it sat in the middle; a smaller
+/// window with Projects and Sessions open put it too low, then blank;
+/// collapsing those zones recentred it and dropped the disc.
+#[gpui::test]
+fn the_empty_cluster_ignores_how_tall_the_rail_is(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let selected = empty_session(&h, vcx, "/tmp/eave-harness/repo", Some("opus"));
+    assert!(shown(vcx, "empty-logo"));
+    let before = cluster_mid_below_header(vcx);
+
+    let mut rail = vec![selected];
+    for i in 0..24 {
+        let mut s = session(&format!("sess{i:04}"));
+        s.last_seq = 1;
+        rail.push(s);
+    }
+    h.plumbing.push_rail(rail);
+    h.plumbing.push_bookmarks(eave_wire::BookmarksSnapshot {
+        nodes: (0..20)
+            .map(|i| eave_wire::BookmarkNode {
+                bookmark: eave_wire::Bookmark {
+                    id: format!("f{i}"),
+                    parent: None,
+                    title: Some(format!("folder {i}")),
+                    kind: eave_wire::BookmarkKind::Folder,
+                    created_ts_ms: 0,
+                },
+                depth: 0,
+                children: 0,
+            })
+            .collect(),
+        ..Default::default()
+    });
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(10));
+
+    assert!(
+        shown(vcx, "empty-logo"),
+        "filling the rail hid the logo"
+    );
+    let grown = cluster_mid_below_header(vcx);
+    assert!(
+        (grown - before).abs() < 8.0,
+        "open Sessions + Folders moved the cluster {:+.1} px from the header \
+         (the well is tracking the rail, not the window)",
+        grown - before
+    );
+
+    // Folders first: they live in the rail-tabs strip whose definite
+    // height grew, so collapsing them gives Sessions room to be hit.
+    click(vcx, "zone-folders");
+    vcx.run_until_parked();
+    click(vcx, "zone-sessions");
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(10));
+
+    assert!(
+        shown(vcx, "empty-logo"),
+        "collapsing the rail zones hid the logo"
+    );
+    let shut = cluster_mid_below_header(vcx);
+    assert!(
+        (shut - before).abs() < 8.0,
+        "collapsing Sessions + Folders moved the cluster {:+.1} px from the header",
+        shut - before
+    );
 }
 
 // ---------------------------------------------------------------------------

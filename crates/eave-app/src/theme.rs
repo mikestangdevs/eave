@@ -1682,26 +1682,15 @@ pub const LAUNCHER_GAP: f32 = SPACE_6;
 /// everything reads as a dashboard, not an invitation.
 pub const LAUNCHER_MAX_W: f32 = 700.0;
 
-/// Where the transcript's empty-state card sits in the free space above
-/// the composer, as a flex-grow pair: `EMPTY_ABOVE` parts of spacer over
-/// it, `EMPTY_BELOW` parts under it.
-///
-/// **Dead centre is the modal convention** — a box in the exact middle of
-/// a pane is what an alert looks like, which is why "nothing sent yet"
-/// centred in a black rectangle read as a failure rather than as a rest
-/// state. So the card sits above centre, but only just.
-///
-/// 4:5 was 1:2 until the card was photographed. At a third of the free
-/// height, and shrink-wrapped to its text, the card read as *orphaned* in
-/// the upper-left of a very large empty pane — it drew the eye to how
-/// much nothing surrounded it, which is the opposite of what an empty
-/// state is for. Widening it to the reading column and dropping it to
-/// 4/9 (~0.44) keeps it clear of the alert position while letting it
-/// occupy the space rather than float in it. The gap below is still
-/// visibly larger than the gap above, so it belongs to the pane rather
-/// than hovering over the composer.
-pub const EMPTY_ABOVE: f32 = 4.0;
-pub const EMPTY_BELOW: f32 = 5.0;
+/// Placeholder disc above the empty-session composer. Square, then
+/// `rounded_full`, so it is a circle. Equal to [`BAR_HEIGHT`]: the disc
+/// is the same size as the resting composer bar, so the cluster's two
+/// shapes share a measure rather than inventing a third.
+pub const EMPTY_LOGO: f32 = BAR_HEIGHT;
+
+/// Gap between the disc and the composer card in the empty-session
+/// cluster. [`SPACE_6`] is the shell's section gap.
+pub const EMPTY_CLUSTER_GAP: f32 = SPACE_6;
 
 // ---------------------------------------------------------------------------
 // Provider marks (Slice Q1) — a vendor's own logo, not a glyph.

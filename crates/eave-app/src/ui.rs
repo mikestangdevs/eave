@@ -2511,7 +2511,7 @@ fn attach_button() -> gpui::Stateful<gpui::Div> {
         .hover_fade("composer-attach", theme::wash_rest(), theme::overlay())
         .cursor_pointer()
         .child(icons::tagged_icon(
-            icons::ADD_CIRCLE,
+            icons::ADD,
             theme::ICON_SM,
             theme::text_secondary_on_wash(),
             "composer-attach-glyph",
@@ -12585,6 +12585,7 @@ impl Shell {
             // and is restored from `frame.json`.
             .w(px(self.rail_w))
             .h_full()
+            .min_h(px(0.))
             .flex_none()
             // The handle is absolutely positioned against this box, and it
             // overhangs the seam by half its width — so this has to establish
@@ -16053,9 +16054,9 @@ impl Shell {
                 }
                 TabMenuAction::OpenInNewTab => {
                     if let Some(url) = pinned_url {
-                        // `activate: false` — a background open is what
-                        // "Open in New Tab" means in every browser, and it
-                        // is the answer E1 added the field for.
+                        // A background open is what "Open in New Tab" means
+                        // in every browser, and it is the answer E1 added
+                        // the field for.
                         let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                             url,
                             activate: false,
@@ -16787,206 +16788,113 @@ impl Shell {
             .into_any_element()
     }
 
-    /// A session that exists and has no turns yet (Slice AN).
+    /// A session that exists and has no turns yet.
     ///
-    /// # What this replaced, and why three words were not an empty state
+    /// Slice AN put a left-aligned "Ready for the first turn" card in the
+    /// upper third of the well, with a keycap teaching Return. That card
+    /// is gone: an empty session is a **centered cluster** — a circular
+    /// logo placeholder, then the same composer that later docks at the
+    /// bottom, then the cwd line. The composer is not rebuilt for this
+    /// screen; this function only *places* the subtree it is handed.
     ///
-    /// Slice M put `"nothing sent yet"` in `text_tertiary` at
-    /// `SMALL_SIZE`, centred in a pane that is roughly two thirds of the
-    /// window. Photographed (`docs/shots/ah-eternal-skeleton-after.png`)
-    /// it reads as a failed load, not as a rest state — dead centre is the
-    /// **modal** position, so a small grey string sitting there is shaped
-    /// exactly like an error dialog with its buttons missing.
+    /// The launcher still answers *which agent, in which folder*. This
+    /// answers *this session exists and has no turns*. They never stack
+    /// (`empty_state` requires a selected session; the launcher requires
+    /// none).
     ///
-    /// The finding worth keeping is not that the caption was too small.
-    /// It is that **eave already had this design one screen away**: the
-    /// launcher ([`Shell::launcher_view`]) is a display headline, a quiet
-    /// line naming the working folder, and one obvious next step, and it
-    /// is the best-looking surface in the app. The transcript's empty
-    /// state was not missing a design — it was missing the design already
-    /// in the building. So this mirrors the launcher's ranks
-    /// ([`theme::DISPLAY_SIZE`] headline, [`theme::DETAIL_SIZE`] "in
-    /// <cwd>" line) rather than inventing a second idiom.
-    ///
-    /// # How it stays distinguishable from the launcher
-    ///
-    /// They answer different questions — the launcher asks *which agent,
-    /// in which folder*; this says *this session exists and has no turns*
-    /// — and both can be up in two windows at once, so telling them apart
-    /// at a glance is a requirement, not a nicety. Four things separate
-    /// them, and none of them is the wording:
-    ///
-    /// 1. **Shape.** The launcher is centred, unbounded, 700 px wide.
-    ///    This is a bounded card with a rim and a shadow, capped at
-    ///    [`theme::DIRECTIVE_MAX_W`] (560).
-    /// 2. **Alignment.** The launcher centres its text. This is left-
-    ///    aligned, on the transcript's own reading column.
-    /// 3. **Height.** The launcher sits dead centre of a pane with no
-    ///    composer under it. This sits at the upper third
-    ///    ([`theme::EMPTY_ABOVE`]:[`theme::EMPTY_BELOW`]) of the space
-    ///    above a composer that is mounted.
-    /// 4. **The near-white plate.** The launcher's `Start Claude Code` is
-    ///    the app's primary-action treatment and it stays unique to a
-    ///    screen that HAS a primary action. What carries the pigment here
-    ///    is a keycap, and the difference is the point (see below).
-    ///
-    /// # Why there is no button on it
-    ///
-    /// The brief allowed either "say what pressing return will do" or
-    /// "offer the primary action". There is no primary action to offer,
-    /// and shipping one would have meant shipping a lie:
-    ///
-    /// - **There is no focus step.** `on_key` is mounted on the shell's
-    ///   root focus handle, so every keystroke already reaches the
-    ///   composer the instant a session is selected. A "Write the first
-    ///   message" button would call `window.focus` on a handle that
-    ///   already has focus — a no-op wearing the app's loudest pigment.
-    /// - **`send_current` on an empty draft emits nothing**, so a "Send"
-    ///   button would be inert in exactly the state this card is up for.
-    /// - Prefilling a canned prompt is the third option and it is worse
-    ///   than both: it invents a command and puts words in the operator's
-    ///   mouth.
-    ///
-    /// So the action is stated, on a keycap, in the primary pigment — and
-    /// the sentence beside it is the one deleted from the composer, moved
-    /// to the one screen where its reader has not yet learned it.
-    ///
-    /// The **cwd line is clickable** and is the only clickable thing on
-    /// the card: it routes through [`open_in_system`], which already
-    /// exists for the worktree affordance and the diff pane's ⌘-click, so
-    /// no new command was invented and the harness can assert the intent
-    /// without launching Finder.
+    /// The **cwd line is clickable** and routes through [`open_in_system`],
+    /// which already exists for the worktree affordance and the diff
+    /// pane's ⌘-click, so no new command was invented and the harness can
+    /// assert the intent without launching Finder.
     ///
     /// # Where it mounts
     ///
-    /// The same slot the caption used and the launcher uses: an absolute
-    /// overlay bottomed at [`theme::COMPOSER_CLEARANCE`], outside the
-    /// edge-fade scope and outside the virtualized list. That is what
-    /// makes "it cannot collide with the composer" a property of the
-    /// layout rather than of a measurement, and what keeps it from ever
-    /// touching a cached row height.
-    fn transcript_empty_view(e: EmptyState) -> AnyElement {
-        // The entrance rides an INNER div, and the key is Slice M's
-        // (`in:empty-note`): this box is absolute, `relative()` on it
-        // would destroy that outright, and re-keying it would silently
-        // re-run the entrance for a card that is already on screen.
+    /// In-flow `flex_1` of the well body, outside the edge-fade scope and
+    /// the virtualized list. The well's height is the window leftover
+    /// (the frame row pins `min_h(0)` so open rail folders cannot stretch
+    /// it). Row + `items_center` is the page-absence / page-dialog
+    /// pattern. The composer lives *inside* the cluster, so there is no
+    /// clearance to reserve.
+    fn transcript_empty_view(
+        e: EmptyState,
+        notice: Option<AnyElement>,
+        trailer: Option<AnyElement>,
+        slash: Option<AnyElement>,
+        composer: AnyElement,
+    ) -> AnyElement {
         let t = motion::entrance_t("in:empty-note", motion::FADE_IN);
         let cwd = e.cwd.clone();
 
         div()
             .debug_selector(|| "transcript-empty".into())
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .bottom(px(theme::COMPOSER_CLEARANCE))
+            .flex_1()
+            .min_h(px(0.))
+            .min_w(px(0.))
             .flex()
-            .flex_col()
-            // The upper-third placement, as spacers rather than as a pad:
-            // a fixed top pad is a number that is right at one window
-            // height and wrong at every other, and this pane's height is
-            // whatever is left after a titlebar, a plate margin and a
-            // composer.
-            .child(div().flex_grow(theme::EMPTY_ABOVE).min_h(px(0.)))
+            .items_center()
             .child(
-                Self::column(
-                    div().flex().flex_col().items_start().w_full().child(
-                        div()
+                div()
+                    .id("empty-cluster")
+                    .debug_selector(|| "empty-cluster".into())
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::EMPTY_CLUSTER_GAP))
+                    .child(
+                        empty_logo()
                             .opacity(t)
                             .relative()
                             .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
-                            .w_full()
-                            .max_w(px(theme::DIRECTIVE_MAX_W))
-                            .min_w(px(0.))
-                            .rounded(px(theme::RADIUS_PANEL))
-                            .border_1()
-                            .border_color(theme::border_strong())
-                            .bg(theme::chrome_glass())
-                            .shadow(theme::shadow_panel())
-                            .px(px(theme::SPACE_4))
-                            .py(px(theme::SPACE_3))
-                            .flex()
-                            .flex_col()
-                            .gap(px(theme::SPACE_3))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(theme::SPACE_HALF))
-                                    .child(
-                                        div()
-                                            .debug_selector(|| "empty-title".into())
-                                            .text_size(px(theme::DISPLAY_SIZE))
-                                            .line_height(px(theme::DISPLAY_LINE))
-                                            .font_weight(theme::WEIGHT_STRONG)
-                                            .text_color(theme::text())
-                                            .child("Ready for the first turn"),
-                                    )
-                                    .child(
-                                        // Where it will run and what
-                                        // it will drive, stated before
-                                        // it runs rather than
-                                        // discovered afterwards — the
-                                        // launcher's own argument for
-                                        // its cwd line, and the same
-                                        // rank.
-                                        div()
-                                            .id("empty-where")
-                                            .debug_selector(|| "empty-where".into())
-                                            .text_size(px(theme::DETAIL_SIZE))
-                                            .line_height(px(theme::DETAIL_LINE))
-                                            .text_color(theme::text_tertiary())
-                                            .cursor_pointer()
-                                            .on_click(move |_, _, _| {
-                                                open_in_system(Path::new(&cwd));
-                                            })
-                                            .child(e.where_line()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(theme::SPACE_2))
-                                    .child(
-                                        // A KEYCAP, not a button. Every
-                                        // button in this app carries a
-                                        // verb ("new", "rename",
-                                        // "isolate", "Start Claude
-                                        // Code"); a plate holding the
-                                        // name of a key and no verb is
-                                        // not one, and it takes no
-                                        // pointer cursor and no hover
-                                        // fade, so it never offers a
-                                        // press it cannot honour.
-                                        div()
-                                            .debug_selector(|| "empty-key".into())
-                                            .px(px(theme::SPACE_2))
-                                            .rounded(px(theme::RADIUS_SELECT))
-                                            .bg(theme::solid())
-                                            .text_size(px(theme::LABEL_SIZE))
-                                            .line_height(px(theme::LABEL_LINE))
-                                            .font_weight(theme::WEIGHT_LABEL)
-                                            .text_color(theme::on_solid())
-                                            .child(RETURN_KEY),
-                                    )
-                                    .child(
-                                        div()
-                                            .debug_selector(|| "empty-action".into())
-                                            .text_size(px(theme::DETAIL_SIZE))
-                                            .line_height(px(theme::DETAIL_LINE))
-                                            .text_color(theme::text_secondary())
-                                            .child(EMPTY_ACTION),
-                                    ),
-                            ),
+                            .self_center(),
+                    )
+                    .children(notice)
+                    .children(trailer)
+                    .children(slash)
+                    .child(composer)
+                    .child(
+                        Self::column(
+                            div()
+                                .id("empty-where")
+                                .debug_selector(|| "empty-where".into())
+                                .w_full()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACE_2))
+                                .text_size(px(theme::DETAIL_SIZE))
+                                .line_height(px(theme::DETAIL_LINE))
+                                .text_color(theme::text_tertiary())
+                                .cursor_pointer()
+                                .on_click(move |_, _, _| {
+                                    open_in_system(Path::new(&cwd));
+                                })
+                                .child(icons::tagged_icon(
+                                    icons::FOLDER,
+                                    theme::ICON_SM,
+                                    theme::text_tertiary(),
+                                    "empty-where-glyph",
+                                ))
+                                .child(e.where_line()),
+                        )
+                        .flex_none(),
                     ),
-                )
-                .flex_none(),
             )
-            .child(div().flex_grow(theme::EMPTY_BELOW).min_h(px(0.)))
             .into_any_element()
     }
+}
+
+/// Circular logo placeholder for an empty session. Equal width and height,
+/// `rounded_full` fill, no mark — the real product mark is a later slice.
+fn empty_logo() -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("empty-logo")
+        .debug_selector(|| "empty-logo".into())
+        .flex_none()
+        .size(px(theme::EMPTY_LOGO))
+        .rounded_full()
+        .bg(theme::overlay_strongest())
 }
 
 /// What an empty omnibox says.
@@ -17035,9 +16943,9 @@ const PAGE_NO_ENGINE: &str = "this build has no page engine (`--features web`)";
 ///    handle, so a non-empty draft is the only honest signal that
 ///    somebody is typing into it.
 /// 3. **Neither.** Nothing. The first-run reader who has not learned the
-///    keystroke is looking at the empty-state card
-///    ([`Shell::transcript_empty_view`]), which states it on a keycap;
-///    every other reader has sent a message before.
+///    keystroke is looking at an empty composer that already has focus;
+///    teaching Return on a keycap next to it was the card this layout
+///    replaced. The hint still appears the moment a draft exists.
 fn composer_hint(pending: usize, has_draft: bool, overflow: usize) -> String {
     if pending > 0 {
         "return to send — queued behind the approval above until you answer".into()
@@ -17157,17 +17065,7 @@ fn usage_line(turn: Option<TurnTokens>, context: Option<ContextWindow>) -> Strin
     parts.join(" · ")
 }
 
-/// The name of the key on a macOS keyboard. Spelled out rather than drawn
-/// as `⏎`, because the physical key this refers to has the word printed
-/// on it and a glyph would be eave's translation of it.
-const RETURN_KEY: &str = "return";
-
-/// What that key does, on the one screen whose reader has not learned it
-/// yet. This sentence used to live in the composer permanently, on every
-/// screen, forever (see the `composer-hint` build).
-const EMPTY_ACTION: &str = "sends what you type below";
-
-/// The two facts the empty-state card orients on, lifted off the session
+/// The two facts the empty-session cluster orients on, lifted off the session
 /// the rail already holds.
 ///
 /// A struct rather than a formatted string so the *composition* of the
@@ -17614,6 +17512,7 @@ impl Render for Shell {
                 .border_color(theme::bar_hairline())
                 .bg(theme::bar_glass())
                 .shadow_lg()
+                .debug_selector(|| "composer-card".into())
                 // bezel clips the bar so its glass never bleeds past the
                 // corner it just rounded. eave needs it for the same reason
                 // plus one of its own: the attachment strip is a child with
@@ -17914,10 +17813,10 @@ impl Render for Shell {
         //
         // Suppressed, not adapted: "this session has sent nothing yet" is
         // a statement about the AGENT, and the agent's surfaces live on
-        // the agent's tab.
-        let empty_el = empty_state
-            .filter(|_| !showing_page)
-            .map(Self::transcript_empty_view);
+        // the agent's tab. The overlay is built in the well below, once
+        // the composer is placed — empty vs docked is a placement of the
+        // same subtree, so this must not consume `composer` before the
+        // split/well branch.
         let launcher_menu = self.launcher_menu_layer(cx);
         // Built here for the same reason the launcher and its menu are:
         // it needs `self` and `cx`, and the element chain below has
@@ -18079,6 +17978,14 @@ impl Render for Shell {
                 div()
                     .flex_1()
                     .min_w(px(0.))
+                    // Open Projects / Sessions folders are min-content of
+                    // the rail. Without this the row will not shrink below
+                    // that height, the well stretches with the rail, and
+                    // the empty cluster centres in a box taller than the
+                    // window — too low, then blank. The well is the
+                    // window leftover; the rail scrolls.
+                    .min_h(px(0.))
+                    .overflow_hidden()
                     .flex()
                     .flex_row()
                     // **The rail resize lives HERE, not on the handle
@@ -18147,6 +18054,7 @@ impl Render for Shell {
                         div()
                             .flex_1()
                             .min_w(px(0.))
+                            .min_h(px(0.))
                             .p(px(theme::CARD_GUTTER))
                             .child(content_card({
                                 if let Some(split) = self.split.clone() {
@@ -18159,6 +18067,37 @@ impl Render for Shell {
                                         cx,
                                     )
                                 } else {
+                                    // Empty vs docked is a placement of one
+                                    // composer: the cluster takes the subtree
+                                    // (and its slash/notice/trailer siblings)
+                                    // so a draft and focus handle survive the
+                                    // first turn.
+                                    let empty_here = empty_state.filter(|_| !showing_page);
+                                    let (empty_el, dock_notice, dock_trailer, dock_slash, dock_composer) =
+                                        match empty_here {
+                                            Some(e) if composer_mounted => (
+                                                Some(Self::transcript_empty_view(
+                                                    e,
+                                                    notice.filter(|_| !showing_page),
+                                                    trailer.filter(|_| !showing_page),
+                                                    slash_layer.filter(|_| !showing_page),
+                                                    composer.into_any_element(),
+                                                )),
+                                                None,
+                                                None,
+                                                None,
+                                                None,
+                                            ),
+                                            _ => (
+                                                None,
+                                                notice.filter(|_| !showing_page),
+                                                trailer.filter(|_| !showing_page),
+                                                slash_layer.filter(|_| !showing_page),
+                                                composer_mounted.then_some(
+                                                    composer.into_any_element(),
+                                                ),
+                                            ),
+                                        };
                                     div()
                                         .debug_selector(|| "content-well".into())
                                         .size_full()
@@ -18192,10 +18131,18 @@ impl Render for Shell {
                                             // beneath the frost when scrolled; the
                                             // trailing spacer keeps Follow's newest
                                             // row above the glass).
+                                            //
+                                            // Empty sessions are in-flow: this pane
+                                            // becomes a column whose `flex_1` child
+                                            // is the cluster, so its height is the
+                                            // leftover after header/footer and
+                                            // tracks the window.
                                             div()
                                                 .flex_1()
                                                 .min_h(px(0.))
+                                                .min_w(px(0.))
                                                 .relative()
+                                                .when(empty_el.is_some(), |d| d.flex().flex_col())
                                                 // Slice M: the log dissolves into the
                                                 // well's edges instead of ending on a
                                                 // hard cut. LOG_TOP_PAD moved INSIDE
@@ -18260,7 +18207,7 @@ impl Render for Shell {
                                                         .text_color(theme::text_secondary())
                                                         .child(note)
                                                 }))
-                                                .when(!showing_page, |d| {
+                                                .when(!showing_page && empty_el.is_none(), |d| {
                                                     d.child(
                                                         edge_faded(
                                                             theme::TRANSCRIPT_FADE_BAND_TOP,
@@ -18280,14 +18227,11 @@ impl Render for Shell {
                                                 // Slice M (§3.2): an overlay, so it is
                                                 // outside both the fade scope and the
                                                 // virtualized list and can never touch
-                                                // a row height. Held above the
-                                                // composer's clearance so it is never
-                                                // read through the frost.
-                                                //
-                                                // Slice AN kept the slot exactly and
-                                                // replaced what sits in it; the
-                                                // reasoning above is why the slot is
-                                                // the right one for a card too.
+                                                // a row height. The composer lives
+                                                // *inside* this overlay while the
+                                                // session is empty, then docks in the
+                                                // bottom stack the instant a turn
+                                                // exists.
                                                 .children(empty_el)
                                                 // Slice Q2 — the launcher, in exactly
                                                 // the slot the note it replaced used:
@@ -18404,16 +18348,20 @@ impl Render for Shell {
                                                         // connection panel above stays:
                                                         // it is about the engine, and it
                                                         // is true whichever tab is open.
-                                                        .children(notice.filter(|_| !showing_page))
-                                                        .children(trailer.filter(|_| !showing_page))
+                                                        //
+                                                        // When the session is empty these
+                                                        // four ride the centered cluster
+                                                        // instead, so the slash palette
+                                                        // stays a sibling of the field
+                                                        // it projects.
+                                                        .children(dock_notice)
+                                                        .children(dock_trailer)
                                                         // Slice AR — the `/` palette,
                                                         // an ordinary sibling directly
                                                         // above the composer. See
                                                         // `Shell::slash_layer` for why
                                                         // this is not `menu_layer`.
-                                                        .children(
-                                                            slash_layer.filter(|_| !showing_page),
-                                                        )
+                                                        .children(dock_slash)
                                                         // Slice Q2: no session, no
                                                         // composer. A draft typed at
                                                         // the launcher has nothing to
@@ -18425,9 +18373,7 @@ impl Render for Shell {
                                                         // silently eats what you type
                                                         // is the one thing this must
                                                         // not be.
-                                                        .children(
-                                                            composer_mounted.then_some(composer),
-                                                        ),
+                                                        .children(dock_composer),
                                                 ),
                                         )
                                         .when(!showing_page, |d| d.child(self.footer(cx)))
