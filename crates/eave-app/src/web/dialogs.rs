@@ -19,7 +19,11 @@
 //!   off-screen rendering there is no native window for CEF to parent a
 //!   picker to, so the click is simply consumed.
 //! - **No `PermissionHandler`** — camera, microphone, geolocation,
-//!   notifications and clipboard are all auto-denied without asking.
+//!   notifications and clipboard were all auto-denied without asking.
+//!   (That handler exists now. The line is kept because it is what this
+//!   module was built to fix — but note that it stopped being true, and
+//!   notifications spent a while grantable-and-undeliverable as a result.
+//!   See `permissions::can_deliver` and 06-browser G2.)
 //!
 //! # The rule this module keeps
 //! **A held callback is a stopped page.** Every entry in [`REPLIES`] is a
@@ -365,7 +369,16 @@ fn remember(origin: &str, kinds: &[PermissionKind], allowed: bool) {
     } else {
         PermissionDecision::Deny
     };
-    let storable: Vec<PermissionKind> = kinds.iter().filter(|k| k.is_storable()).cloned().collect();
+    // G2: `can_deliver` is a fact about eave, not an answer from a person,
+    // so it must never be written down as one. Storing the refusal would
+    // leave a Deny nobody chose sitting in `permissions.jsonl`, outliving
+    // the missing capability and quietly answering for the person on the
+    // day it arrives.
+    let storable: Vec<PermissionKind> = kinds
+        .iter()
+        .filter(|k| k.is_storable() && super::permissions::can_deliver(k))
+        .cloned()
+        .collect();
     if storable.is_empty() || eave_wire::normalize_origin(origin).is_none() {
         return;
     }
@@ -533,6 +546,15 @@ fn sync_to_chromium(origin: &str, kinds: &[PermissionKind], value: ContentSettin
         let Some(ty) = content_type(kind) else {
             continue;
         };
+        // G2: every write to Chromium goes through this loop, so forcing
+        // the value here is what makes "eave cannot grant a notification"
+        // true of all paths rather than of the ones I remembered to edit.
+        // An undeliverable kind is BLOCK whatever the caller asked for.
+        let value = if super::permissions::can_deliver(kind) {
+            value
+        } else {
+            ContentSettingValues::BLOCK
+        };
         // Requesting and top-level url are both the origin: eave has no
         // per-embedder permission model, and answering "allow example.com"
         // means allowing it, not allowing it only inside itself.
@@ -600,11 +622,46 @@ pub fn replay_into_chromium() {
         );
         written += 1;
     }
+    block_undeliverable_by_default();
     if super::tabs::trace() {
         eprintln!(
             "[web] replayed {written} of {} grants into chromium",
             grants.len()
         );
+    }
+}
+
+/// Make the refusal Chromium's own default, so the page never asks.
+///
+/// **This is what actually turns `Notification.permission` into
+/// `'denied'`.** Refusing in `on_show_permission_prompt` stops eave saying
+/// yes, but a page that reads `Notification.permission` without calling
+/// `requestPermission()` never goes through that handler at all, and a page
+/// that does call it gets a prompt eave then refuses — a prompt for
+/// something that could never have worked. Setting the default means
+/// Chromium answers both itself, with no prompt and no round trip.
+///
+/// `set_content_setting` with **both urls absent** sets the DEFAULT value
+/// for the type — that is the documented contract of
+/// `cef_request_context_t::set_content_setting`. Read, not measured: it is
+/// the one claim in this file I have not put in front of a running browser,
+/// so it is deliberately the *belt* and not the *braces*. If the contract
+/// is not what I read, the per-prompt refusal above still holds and eave
+/// still never grants — the page would simply see `'default'` instead of
+/// `'denied'` and be told no when it asks. Settle it with a live probe
+/// (06-browser G2) and delete this paragraph.
+fn block_undeliverable_by_default() {
+    let Some(context) = super::host::global_request_context() else {
+        return;
+    };
+    for kind in super::permissions::undeliverable_kinds() {
+        let Some(ty) = content_type(&kind) else {
+            continue;
+        };
+        context.set_content_setting(None, None, ty, ContentSettingValues::BLOCK);
+        if super::tabs::trace() {
+            eprintln!("[web] chromium DEFAULT {kind:?} := BLOCK — eave cannot deliver it");
+        }
     }
 }
 
@@ -764,6 +821,35 @@ wrap_permission_handler! {
             let Some(callback) = callback else { return 0 };
             let origin = requesting_origin.map(|o| o.to_string()).unwrap_or_default();
             let kinds = permission_kinds(requested_permissions);
+            // G2: refuse what eave cannot honour, BEFORE the store is
+            // consulted and before anyone is asked.
+            //
+            // Answered first because a stored Allow from before this rule
+            // existed would otherwise be replayed straight back into a
+            // false grant — the person really did click Allow once, and the
+            // grant is still on disk. It is not overwritten (see `remember`,
+            // which will not write one either way): it is simply not acted
+            // on while the capability is missing, so it becomes true again
+            // by itself on the day the renderer seam lands.
+            //
+            // The whole request is denied, not just the undeliverable part,
+            // because one `PermissionPromptCallback` answers the whole
+            // prompt — there is no partial ACCEPT. In practice this costs
+            // nothing: `Notification.requestPermission()` asks for
+            // notifications alone, and the default BLOCK written by
+            // `replay_into_chromium` means Chromium mostly answers these
+            // itself and never reaches this handler at all.
+            let refused = super::permissions::undeliverable(&kinds);
+            if !refused.is_empty() {
+                if super::tabs::trace() {
+                    eprintln!(
+                        "[web] refused {refused:?} from {origin} — eave cannot \
+                         deliver it, so granting it would be a lie (G2)"
+                    );
+                }
+                callback.cont(PermissionRequestResult::DENY);
+                return 1;
+            }
             if let Some(allowed) = answered_already(&origin, &kinds) {
                 trace_remembered(&origin, &kinds, allowed);
                 callback.cont(if allowed {

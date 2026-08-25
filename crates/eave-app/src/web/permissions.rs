@@ -83,6 +83,113 @@ pub fn take_replay_request() -> bool {
 /// origin with no honest key, or a poisoned lock. Failing towards the
 /// prompt is the only safe direction: the cost is one dialog, and the cost
 /// of failing the other way is a camera.
+/// What eave can actually deliver on, today.
+///
+/// **06-browser G2.** A permission eave grants and then cannot honour is
+/// worse than one it refuses: the page is told it succeeded, so it takes no
+/// fallback, shows no in-page banner, and the person is simply never told
+/// anything. A refusal is a fact the page can act on; a false grant is not.
+///
+/// Notifications are the case. **CEF exposes no notification API at all** —
+/// the 151.6.0 bindings carry 24 symbols matching "notification" and every
+/// one of them is a colour id (`CEF_ColorNotificationBackgroundActive` and
+/// friends). There is no handler to implement and no callback to answer.
+/// Displaying one would mean shimming `window.Notification` in the renderer
+/// and routing it out to `UNUserNotificationCenter`, and eave has no
+/// renderer seam to shim through: there is not one `RenderProcessHandler`,
+/// `on_process_message_received`, `send_process_message` or
+/// `execute_java_script` in the crate, and `web_helper.rs` is 27 lines.
+/// That seam is a slice of its own — and the one E8's agent-visible console
+/// needs too, which is the argument for building it once, deliberately.
+///
+/// **This is the ONE place to flip when the seam exists.** Everything else
+/// asks this question rather than naming the kind.
+pub fn can_deliver(kind: &PermissionKind) -> bool {
+    !matches!(kind, PermissionKind::Notifications)
+}
+
+/// Every kind eave models, minus `Unknown`.
+///
+/// Written out rather than derived because `PermissionKind` carries an
+/// `Unknown(String)` and so cannot be a `const` slice. **A new variant must
+/// be added here**; `notifications_are_the_only_thing_eave_refuses` is what
+/// notices when one is not, because a list that silently misses a kind is
+/// exactly how a default-block rule stops covering what it claims to.
+pub fn all_kinds() -> Vec<PermissionKind> {
+    vec![
+        PermissionKind::Camera,
+        PermissionKind::Microphone,
+        PermissionKind::Geolocation,
+        PermissionKind::Notifications,
+        PermissionKind::Clipboard,
+        PermissionKind::MidiSysex,
+        PermissionKind::PointerLock,
+        PermissionKind::KeyboardLock,
+        PermissionKind::WindowManagement,
+        PermissionKind::LocalFonts,
+        PermissionKind::IdleDetection,
+        PermissionKind::StorageAccess,
+        PermissionKind::LocalNetwork,
+        PermissionKind::VrSession,
+        PermissionKind::ArSession,
+        PermissionKind::ScreenAudio,
+        PermissionKind::ScreenVideo,
+    ]
+}
+
+/// Compile-time guard on [`all_kinds`]: adding a `PermissionKind` variant
+/// breaks this match, which is the reminder to add it to the list above.
+///
+/// A test that counted `all_kinds().len()` against a literal was the first
+/// thing written here and it was worthless — it compared the list to
+/// itself, and it passed while the list was missing `ScreenAudio` and
+/// `ScreenVideo`. Exhaustiveness is the compiler's job; only the compiler
+/// can see a variant nobody wrote down.
+#[cfg(test)]
+fn _every_variant_is_accounted_for(kind: &PermissionKind) {
+    match kind {
+        PermissionKind::Camera
+        | PermissionKind::Microphone
+        | PermissionKind::Geolocation
+        | PermissionKind::Notifications
+        | PermissionKind::Clipboard
+        | PermissionKind::MidiSysex
+        | PermissionKind::PointerLock
+        | PermissionKind::KeyboardLock
+        | PermissionKind::WindowManagement
+        | PermissionKind::LocalFonts
+        | PermissionKind::IdleDetection
+        | PermissionKind::StorageAccess
+        | PermissionKind::LocalNetwork
+        | PermissionKind::VrSession
+        | PermissionKind::ArSession
+        | PermissionKind::ScreenAudio
+        | PermissionKind::ScreenVideo => {}
+        // Never in `all_kinds`: it is not a kind, it is a bit this build
+        // has no word for, and it is never persisted either.
+        PermissionKind::Unknown(_) => {}
+    }
+}
+
+/// Everything eave cannot deliver, enumerated.
+///
+/// The per-origin callers ask `can_deliver` about one kind. Chromium's
+/// DEFAULT content setting has no origin to key on, so that caller needs
+/// the whole set — and gets it by filtering [`all_kinds`] through the same
+/// predicate, so the two cannot disagree.
+pub fn undeliverable_kinds() -> Vec<PermissionKind> {
+    undeliverable(&all_kinds())
+}
+
+/// The kinds in `kinds` that eave cannot honour, in order.
+///
+/// Returned rather than a bool because the callers want to *say* which one
+/// stopped them — a trace line naming `Notifications` is the difference
+/// between "the handler is broken" and "eave refused on purpose".
+pub fn undeliverable(kinds: &[PermissionKind]) -> Vec<PermissionKind> {
+    kinds.iter().filter(|k| !can_deliver(k)).cloned().collect()
+}
+
 pub fn verdict(origin: &str, kinds: &[PermissionKind]) -> Verdict {
     match mirror().read() {
         Ok(m) => m.verdict(origin, kinds),
@@ -380,5 +487,48 @@ mod tests {
         }
         assert!(take_replay_request());
         assert!(!take_replay_request());
+    }
+
+    // ---- G2: what eave can actually deliver on ----
+
+    /// The whole point of the row, stated as an assertion: eave must not be
+    /// able to say yes to a notification while nothing can display one.
+    #[test]
+    fn notifications_are_not_deliverable() {
+        assert!(!can_deliver(&PermissionKind::Notifications));
+    }
+
+    /// ...and the refusal is exactly one kind wide. A capability rule that
+    /// quietly took the rest of the list with it would be a much larger
+    /// change wearing G2's name.
+    #[test]
+    fn notifications_are_the_only_thing_eave_refuses() {
+        assert_eq!(
+            undeliverable_kinds(),
+            vec![PermissionKind::Notifications],
+            "the capability refusal grew or shrank; if a kind was added to \
+             PermissionKind it also needs adding to all_kinds()"
+        );
+        // That the enumeration is the WHOLE enum is checked by the
+        // compiler, in `_every_variant_is_accounted_for` — not here. A
+        // length assertion against a literal compares the list to itself
+        // and passes while it is incomplete, which is exactly what it did.
+        assert!(
+            all_kinds().iter().all(|k| k.is_storable()),
+            "all_kinds picked up Unknown, which is never a real kind"
+        );
+    }
+
+    /// `undeliverable` names what stopped it rather than answering yes/no,
+    /// because a trace line that says `Notifications` is the difference
+    /// between "eave refused on purpose" and "the handler is broken".
+    #[test]
+    fn undeliverable_names_the_kind_that_stopped_it() {
+        assert_eq!(
+            undeliverable(&[PermissionKind::Geolocation, PermissionKind::Notifications]),
+            vec![PermissionKind::Notifications]
+        );
+        assert!(undeliverable(&[PermissionKind::Camera]).is_empty());
+        assert!(undeliverable(&[]).is_empty());
     }
 }
