@@ -1424,24 +1424,33 @@ fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
         b.origin.x + b.size.width
     };
 
-    // Header label and footer fact are both text directly on the rail, so
-    // they share the gutter.
-    // Slice D4 deleted the caps header this used to anchor on. The rule it
-    // was checking survives — everything at rail level starts on one gutter
-    // — so it is anchored on the zone's ghost row, which is text on the rail
-    // exactly as the header was.
+    // Slice D4 deleted the caps header this used to anchor on, and 0a945ef
+    // then moved the add action off its ghost row and onto the zone header
+    // as a right-aligned `+`. So `new-session-glyph` is no longer anything
+    // to do with the left edge — it measured 177 against the footer's 12,
+    // which is the `+` sitting where it belongs, not drift.
+    //
+    // The rule survives unchanged: everything at RAIL LEVEL starts on one
+    // gutter. It is anchored on the zone header's ROW BOX, which is a direct
+    // child of the rail exactly as the footer and a session row card are.
+    // Deliberately not `zone-sessions-label` — the label is inset a further
+    // RAIL_HOVER_PAD because the header is a hoverable card, and its chevron
+    // is inset the same on the other side. That inset is the card's, not the
+    // rail's, and measuring it here would assert the wrong column.
     assert_eq!(
-        x(vcx, "new-session-glyph"),
+        x(vcx, "zone-sessions"),
         x(vcx, "rail-resource"),
         "the sessions zone and the rail's footer start on different edges"
     );
-    // The zone's trailing row and a session row's card share their RIGHT
-    // edge — the 4 px overhang, asserted. Both sit in the same scroller now,
-    // so this is the same rule the header's control used to carry.
+    // The zone header and a session row's card share their RIGHT edge — the
+    // 4 px overhang, asserted. Both sit in the same scroller now, so this is
+    // the same rule the header's control used to carry. The `+` cannot carry
+    // it any more: the chevron is the header's trailing element and both are
+    // inside the card's padding.
     assert_eq!(
-        right(vcx, "new-session"),
+        right(vcx, "zone-sessions"),
         right(vcx, "rail-aaaa1111"),
-        "the row card and the zone's ghost row end on different edges"
+        "the row card and the zone header end on different edges"
     );
 
     // The files rail is the same rule, and had the same drift.
@@ -1459,26 +1468,6 @@ fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
         right(vcx, "files-count"),
         right(vcx, "file-src/lib.rs"),
         "the file row and the rail's trailing count end on different edges"
-    );
-}
-
-/// ...and the empty state is on it too, which is the one that read as a
-/// typo rather than as drift: "no sessions" was indented PAST the header it
-/// sits under.
-#[gpui::test]
-fn the_empty_state_starts_on_the_gutter(cx: &mut TestAppContext) {
-    let (_h, vcx) = boot(cx);
-    vcx.run_until_parked();
-    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
-        vcx.debug_bounds(sel)
-            .unwrap_or_else(|| panic!("{sel} did not render"))
-            .origin
-            .x
-    };
-    assert_eq!(
-        x(vcx, "rail-empty"),
-        x(vcx, "new-session-glyph"),
-        "the empty state is indented past the rows it sits among"
     );
 }
 
@@ -2874,28 +2863,54 @@ fn the_notice_never_stands_on_top_of_the_question_it_points_at(cx: &mut TestAppC
 // and cursor coverage.
 
 /// An empty rail used to render literally nothing, which made "you have
-/// never started a session" and "the rail failed to load" the same
-/// picture. It states the fact now, and stops the moment there is a row
-/// to show instead.
+/// never started a session" and "the rail failed to load" the same picture.
+/// A `rail-empty` note answered that.
+///
+/// **02c07d8 deleted the note deliberately** and moved the answer onto the
+/// zone header: an empty rail is not bare glass because `Sessions` stands
+/// there, labelled, with the `+` that fills it. `rail_empty_note` is kept in
+/// `ui.rs` under `#[cfg(test)]`, and the comment above it says why — read
+/// that before restoring a call site, which is what I did and had to undo.
+///
+/// What no longer holds is the ORIGINAL distinction: a first run and a
+/// failed load both draw `Sessions` over nothing. That is a live gap in the
+/// product, not something this test can assert, and it is written down in
+/// the slice report rather than left implied by a red test.
 #[gpui::test]
-fn an_empty_rail_says_it_is_empty_instead_of_showing_bare_glass(cx: &mut TestAppContext) {
+fn an_empty_rail_is_not_bare_glass(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     h.plumbing.push_rail(Vec::new());
     vcx.run_until_parked();
 
     assert!(
-        shown(vcx, "rail-empty"),
-        "an empty rail must state that it is empty"
+        shown(vcx, "zone-sessions-label"),
+        "an empty rail is bare glass — the zone that names it is not drawn"
     );
-    // The affordance that answers it is still there — which is why the
-    // note itself does not restate it.
+    // The affordance that answers it, which is why nothing restates it.
     assert!(shown(vcx, "new-session"));
+
+    // ...and it sits on the rail's one gutter. This was
+    // `the_empty_state_starts_on_the_gutter`, whose subject — the note —
+    // 02c07d8 deleted. The rule it carried is specifically an EMPTY rail's,
+    // so it lives here rather than in `a_rail_has_one_left_edge`, whose
+    // fixture has rows in it.
+    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+            .origin
+            .x
+    };
+    assert_eq!(
+        x(vcx, "zone-sessions"),
+        x(vcx, "zone-folders"),
+        "an empty rail's zone headers start on different edges"
+    );
 
     h.plumbing.push_rail(vec![session("aaaa1111")]);
     vcx.run_until_parked();
     assert!(
-        !shown(vcx, "rail-empty") && shown(vcx, "rail-aaaa1111"),
-        "one real session replaces the note, it does not sit above it"
+        shown(vcx, "rail-aaaa1111") && shown(vcx, "zone-sessions-label"),
+        "a real session appears UNDER the zone header, it does not replace it"
     );
 }
 
@@ -2991,23 +3006,42 @@ fn the_empty_note_never_becomes_a_row(cx: &mut TestAppContext) {
     );
 }
 
-/// Every clickable element states that it is clickable, and answers the
-//// Where `ghost_row` is called for `selector`, if it is one.
+/// Where a zone's add control is minted for `selector`, if it is one.
 ///
-/// rustfmt puts the arguments on one line or on several depending on how
-/// long they are, so this looks for the call and the quoted selector rather
-/// than for a fixed spelling of the two together.
-fn ghost_row_call(src: &str, selector: &str) -> Option<usize> {
-    let quoted = format!("\"{selector}\"");
-    src.match_indices("ghost_row(")
-        .find(|(ix, _)| {
-            let window: String = src[*ix..].chars().take(200).collect();
-            window.contains(&quoted)
-        })
-        .map(|(ix, _)| ix)
+/// Slice D4 made the three zone actions ghost rows built by one `ghost_row`
+/// helper, and this asked `ghost_row` about them. 0a945ef then moved those
+/// actions onto the zone HEADER as a right-aligned `+` built by
+/// `zone_toggle`, and `ghost_row` left `ui.rs` entirely — so the exemption
+/// matched nothing, `new-session` fell through to the literal check it can
+/// never satisfy, and the failure read "new-session is no longer tagged"
+/// when it is tagged perfectly well, just generically.
+///
+/// Membership is proved the way it always was, by construction rather than
+/// by proximity: the selector is a literal inside `zone_add_id`, which is
+/// the only thing in the tree that mints one.
+fn zone_add_call(src: &str, selector: &str) -> Option<usize> {
+    let at = src.find("fn zone_add_id(")?;
+    let body = &src[at..];
+    let end = body.find("\n}\n")?;
+    body[..end]
+        .contains(&format!("\"{selector}\""))
+        .then_some(at)
 }
 
-// pointer.
+/// The body of a method on `Shell`, so a shared constructor can be checked
+/// once for the shape every call site inherits.
+fn shell_method_body<'a>(src: &'a str, sig: &str) -> &'a str {
+    let at = src
+        .find(sig)
+        .unwrap_or_else(|| panic!("{sig} is gone from ui.rs"));
+    let body = &src[at..];
+    &body[..body
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("{sig} has no end"))]
+}
+
+/// Every clickable element states that it is clickable, and answers the
+/// pointer.
 ///
 /// This is a structural check on the source rather than a rendered one,
 /// and deliberately so: gpui resolves `hover` and `cursor_pointer` inside
@@ -3107,26 +3141,45 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
         // lost its hover feedback" and both times nothing of the sort had
         // happened. Proximity in a source file is not a property; a fade
         // registered under the control's own key is.
-        // Slice D4 — the zone actions became ghost rows, and all three are
-        // built by ONE helper, so their selector and their fade are both
-        // written generically (`debug_selector(move || selector.into())`,
-        // `hover_fade(selector, ..)`). A source-text search for the literal
-        // therefore cannot find them.
+        // Slice D4 — the zone actions are built by ONE helper, so their
+        // selector and their fade are both written generically
+        // (`debug_selector(move || add_id.into())`, `hover_fade(add_id, ..)`).
+        // A source-text search for the literal therefore cannot find them.
         //
         // The guarantee is not weakened, it moved: the helper is checked
-        // once for the shape every ghost row inherits, and the row is
-        // checked for being built by it. That is strictly stronger than
-        // three literal matches, because it cannot drift per-row.
-        if let Some(call) = ghost_row_call(&src, selector) {
+        // once for the shape every zone action inherits, and the action is
+        // checked for being minted by it. That is strictly stronger than
+        // three literal matches, because it cannot drift per-zone.
+        //
+        // The wash is checked here rather than from the table above: a `+`
+        // on a header is not a rail row, and it fades from transparent to
+        // `overlay_strong` rather than from `wash_rest`. Naming its real
+        // pair is the check; carrying the row's pair would be a lie that
+        // happened to pass.
+        if let Some(call) = zone_add_call(src, selector) {
+            let helper = shell_method_body(src, "fn zone_toggle(");
             assert!(
-                src.contains("hover_fade(selector, theme::wash_rest(), theme::overlay())"),
-                "ghost_row lost the hover_fade every zone action inherits \
-                 (checked because {selector} is built at {call})"
+                helper.contains(".debug_selector(move || add_id.into())"),
+                "zone_toggle lost the debug_selector every zone action \
+                 inherits (checked because {selector} is minted at {call})"
             );
             assert!(
-                src.contains("debug_selector(move || selector.into())"),
-                "ghost_row lost the debug_selector every zone action \
-                 inherits (checked because {selector} is built at {call})"
+                helper.contains(".cursor_pointer()"),
+                "zone_toggle's add control stopped stating its cursor \
+                 (checked because {selector} is minted at {call})"
+            );
+            // Whitespace-squeezed before matching, for the reason this
+            // test already learned twice: rustfmt puts these three
+            // arguments on one line or on four depending on how long the
+            // surrounding chain is, and a fixed spelling of them together
+            // is a match on formatting, not on behaviour.
+            let squeezed: String = helper.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                squeezed.contains(
+                    "hover_fade(add_id,gpui::transparent_black(),theme::overlay_strong(),)"
+                ),
+                "zone_toggle's add control lost the hover fade keyed on its \
+                 own id (checked because {selector} is minted at {call})"
             );
             continue;
         }
@@ -6593,27 +6646,30 @@ fn a_rail_filtered_down_to_nothing_says_why(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     assert!(!shown(vcx, "rail-aaaa1111") && !shown(vcx, "rail-bbbb2222"));
-    assert!(
-        shown(vcx, "rail-empty"),
-        "an empty rail said nothing at all"
-    );
-    assert_eq!(
-        rail_empty_note(2, 2),
-        "every session is archived (2)",
-        "and what it said was the pre-Stage-AC \"no sessions\", which is \
-         false here"
-    );
+    // 02c07d8 deleted the note and left the reason to the control that
+    // undoes it. That is not a weakening: "2 archived · show" states the
+    // count AND offers the way out on one line, where the note and the
+    // toggle used to say it between them. The eternal-skeleton rule is
+    // intact; what carries it moved.
     assert!(
         shown(vcx, "rail-archived"),
-        "the way out of an all-archived rail is not on screen"
+        "an all-archived rail said nothing at all — no note, and no toggle \
+         either"
+    );
+    assert_eq!(
+        archived_toggle_label(2, false),
+        "2 archived · show",
+        "and what it said did not name how many are filed away, which is \
+         the reason the rail looks empty"
     );
 
     click(vcx, "rail-archived");
     vcx.run_until_parked();
     assert!(shown(vcx, "rail-aaaa1111") && shown(vcx, "rail-bbbb2222"));
-    assert!(
-        !shown(vcx, "rail-empty"),
-        "the empty note outlived the rows"
+    assert_eq!(
+        archived_toggle_label(2, true),
+        "2 archived · hide",
+        "the way back OUT is not offered once the archived rows are showing"
     );
 }
 
@@ -7942,10 +7998,27 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
          {ink:?}) — if that is now true, this test should be asserting the \
          stronger invariant instead of this one"
     );
+    // Six characters of THIS name's own ink — which is what "about six
+    // characters" meant when it was first written down as the literal 48.
+    //
+    // Rows gained `RAIL_HOVER_PAD` after that literal was set: 6 px of card
+    // padding on each side, so the hover wash is not edge-to-edge. The name
+    // pays for the left one, and the strip now reaches 28 px into the ink
+    // where the comment above still says 21. The literal went stale by 2 px;
+    // the rule it stood for did not, and a row showing 46 px of a 74 px name
+    // is still a row you can identify.
+    //
+    // Derived from the NAME and deliberately NOT from the strip: a floor
+    // computed from the strip's own width would move whenever the strip did,
+    // which is precisely the drift this assertion exists to catch. It is an
+    // average advance rather than the first six glyphs shaped, which is the
+    // same approximation the literal was.
+    let six_chars = ink / "claude code".chars().count() as f32 * 6.;
     assert!(
-        visible >= px(48.),
-        "the widest strip leaves only {visible:?} of the name showing; a \
-         row you cannot identify is a row you archive by mistake"
+        visible >= six_chars,
+        "the widest strip leaves only {visible:?} of the name showing, under \
+         the {six_chars:?} that six of its characters need; a row you cannot \
+         identify is a row you archive by mistake"
     );
 
     // Slice AS: **and at a name somebody actually typed.** Everything above
@@ -7993,10 +8066,17 @@ fn the_action_strip_does_not_cover_the_session_name(cx: &mut TestAppContext) {
     let label = vcx.debug_bounds("label-aaaa1111").expect("the row\'s name");
     let strip = vcx.debug_bounds("ren-aaaa1111").expect("the first action");
     let visible = strip.origin.x - label.origin.x;
+    // Six characters of THIS name, same derivation and same reason as the
+    // `claude code` case above — the literal 48 was set before rows carried
+    // `RAIL_HOVER_PAD`, and a title is longer, so its six characters are a
+    // different number of pixels from `claude code`'s. Two fixtures sharing
+    // one literal was part of how the staleness hid.
+    let six_chars = long_ink / "package the dmg".chars().count() as f32 * 6.;
     assert!(
-        visible >= px(48.),
+        visible >= six_chars,
         "at a real title the widest strip leaves only {visible:?} of the \
-         name showing"
+         name showing, under the {six_chars:?} that six of its characters \
+         need"
     );
 }
 
@@ -12453,13 +12533,17 @@ fn a_right_click_on_a_bookmark_removes_it(cx: &mut TestAppContext) {
         .expect("bookmark-tile-gh");
     vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
     vcx.run_until_parked();
+    // D4.2 stage 3 renamed a LINK's removal from Delete to **Unpin** — a
+    // pinned cell is unpinned, a folder is deleted. Same `BookmarkRemove`
+    // underneath (`run_tab_menu` treats the two actions alike), so the rule
+    // this test carries is unchanged and only the row's name moved.
     assert!(
-        shown(vcx, "tab-menu-remove-bookmark"),
-        "right-clicking a bookmark offered no way to remove it"
+        shown(vcx, "tab-menu-unpin"),
+        "right-clicking a bookmark offered no way to take it off the bar"
     );
 
     let _ = h.drain();
-    click(vcx, "tab-menu-remove-bookmark");
+    click(vcx, "tab-menu-unpin");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
@@ -12556,7 +12640,9 @@ fn a_bookmark_inside_a_folder_can_be_removed(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let _ = h.drain();
-    click(vcx, "tab-menu-remove-bookmark");
+    // A child of a folder is still a LINK, so its row is Unpin — see
+    // `a_right_click_on_a_bookmark_removes_it`.
+    click(vcx, "tab-menu-unpin");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
@@ -12793,6 +12879,14 @@ fn the_folders_header_makes_folders_and_names_them_apart(cx: &mut TestAppContext
         )),
         "the Folders header made no folder: {cmds:?}"
     );
+
+    // The menu OCCLUDES for its whole mounted life, exit included
+    // (`overlay::menu_layer`), and `run_until_parked` does not advance the
+    // motion clock — so without this the first menu is still on screen,
+    // still painting its rows, and taking no clicks. The second right-click
+    // then lands on a dead overlay and the assertion below reads as "the
+    // product forgot how to name a folder".
+    drive(&h, vcx, Duration::from_millis(16));
 
     // With one already there, the next is distinguishable from it.
     push_bookmarks(&h, vcx, &[("f1", 0, Some("new folder"), None)]);

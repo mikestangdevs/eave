@@ -10636,37 +10636,36 @@ impl Shell {
                             .child(SharedString::from(child.label.clone()))
                             .into_any_element()
                     });
-                if nested {
-                    row = row
-                        .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                // One click site, branching inside, rather than two rows
+                // built by an if/else. The row already declares its
+                // `.cursor_pointer()` once, above, and both handlers hang
+                // off that same row — so two `.on_click(` calls here read
+                // to `every_clickable_element_says_it_is_clickable` as a
+                // click site with no stated cursor. It was a miscount, but
+                // the honest fix is the one that removes the duplication
+                // rather than an exemption: the right-click wiring was
+                // identical in both arms and is now written once.
+                row = row
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                        if nested {
                             cx.stop_propagation();
                             if ev.click_count() >= 2 {
                                 this.open_bookmark_menu(&cmenu_dbl, ev.position(), cx);
                             }
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_bookmark_menu(&cmenu_right, ev.position, cx);
-                            }),
-                        );
-                } else {
-                    row = row
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(url) = curl.clone() {
-                                this.open_bookmark(url, cx);
-                            }
-                            cx.notify();
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_bookmark_menu(&cmenu_right, ev.position, cx);
-                            }),
-                        );
-                }
+                            return;
+                        }
+                        if let Some(url) = curl.clone() {
+                            this.open_bookmark(url, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_bookmark_menu(&cmenu_right, ev.position, cx);
+                        }),
+                    );
                 out.push(rail_inset().child(row).into_any_element());
             }
         }

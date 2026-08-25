@@ -842,6 +842,17 @@ wrap_dialog_handler! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `dialogs` re-exports the ask VOCABULARY from `ask` (line 57) but not
+    // the store, because nothing in the CEF half reads it — the callbacks
+    // live here, the map lives there. These tests do read it, and they are
+    // the only thing in this file that does, so the import is theirs.
+    //
+    // Nothing caught this: the feature-off suite never compiles this module
+    // and `cargo check --features web` does not build `#[cfg(test)]` code,
+    // which is the same blind spot Slice R1 recorded. It has been broken
+    // since 4260180 — the commit whose report claimed a green
+    // `--features web` run.
+    use crate::web::pending;
 
     #[test]
     fn an_alert_has_nothing_to_refuse() {
