@@ -53,9 +53,9 @@ use crate::{icons, theme};
 // pixel itself and hosts no AppKit widget anywhere. So the imitation is
 // the spec: solid dark chrome, grouped cards on hairlines, a centered
 // title, native-shaped segmented controls. Values eyeballed against the
-// frame-refs and Apple's dark grouped-list colors; the ACCENT stays
-// eave's (`Theme::of`), because the accent is the one thing macOS itself
-// lets an app keep.
+// frame-refs and Apple's dark grouped-list colors; the ACCENT is the
+// user's own `AppleAccentColor` (a later ruling, same day) — see
+// [`system_accent`] below.
 // ---------------------------------------------------------------------------
 
 /// The window and content ground — solid, like System Settings, not
