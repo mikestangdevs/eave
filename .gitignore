@@ -23,3 +23,6 @@ spike/zed-fork
 # because the script that DID write here (`package-web.sh`, Slice C1) was
 # deleted in C3 and a stray .icns is not worth a commit.
 crates/eave-app/resources/mac/eave.icns
+
+# stop-eave.py bytecode. Untracked noise in three sessions' `git status`.
+__pycache__/
