@@ -211,6 +211,16 @@ pub struct Transcript {
     /// on its own. Folding them together would let a gauge erase the last
     /// turn's cost, and a bill erase the level.
     pub context: Option<ContextWindow>,
+    /// The current turn's reasoning, accumulated from `agent_thought_chunk`
+    /// System events. Empty when the provider drops thoughts (Grok) or
+    /// never sent any. Cleared on the next `UserSent` so a new turn does
+    /// not inherit the last one. Kept after `TurnCompleted` so the
+    /// activity box can still show "what it thought" the way bezel's
+    /// Takeover does.
+    pub thought: String,
+    /// When the first thought chunk of this turn arrived, so the activity
+    /// header can say how long it thought without inventing a clock.
+    pub thought_started_ms: Option<u64>,
     rev_counter: u64,
 }
 
@@ -276,10 +286,14 @@ impl Transcript {
     fn apply_event(&mut self, event: &JournalEvent) {
         match event {
             JournalEvent::Provider { event } => self.apply_provider(event),
-            JournalEvent::UserSent { text } => self.push_row(Row::User {
-                text: text.clone(),
-                delivery: Delivery::Pending,
-            }),
+            JournalEvent::UserSent { text } => {
+                self.thought.clear();
+                self.thought_started_ms = None;
+                self.push_row(Row::User {
+                    text: text.clone(),
+                    delivery: Delivery::Pending,
+                });
+            }
             JournalEvent::UserDelivered {} => {
                 // Order-paired: confirm the oldest pending send.
                 for ix in 0..self.rows.len() {
@@ -467,7 +481,16 @@ impl Transcript {
                     self.context = *context;
                 }
             }
-            SessionEvent::System { .. } => {}
+            SessionEvent::System { subtype, raw } => {
+                if subtype == "agent_thought_chunk" {
+                    if let Some(text) = thought_text(raw) {
+                        if self.thought_started_ms.is_none() {
+                            self.thought_started_ms = Some(eave_core::journal::now_ms());
+                        }
+                        self.thought.push_str(&text);
+                    }
+                }
+            }
             // Slice CJ. A child thread's frame is recorded, never
             // rendered: eave has no subagent surface, and painting a
             // child's prose or tool row into the parent's transcript is
@@ -612,6 +635,19 @@ impl Transcript {
             }
         }
     }
+}
+
+/// Pull the thought text out of an ACP `agent_thought_chunk` frame. The
+/// journal stores the raw line; the activity box wants the words.
+fn thought_text(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let update = v.pointer("/params/update").unwrap_or(&v);
+    let text = update
+        .get("content")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .or_else(|| update.get("text").and_then(|t| t.as_str()))?;
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

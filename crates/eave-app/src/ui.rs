@@ -2072,62 +2072,15 @@ fn diff_pane(f: &ChangedFile, fetch: &DiffFetch, phase: Option<f32>) -> AnyEleme
                 // `DiffLine` carries `op` and `text` and no number, so they
                 // would have to be invented. That is a wire change, not a
                 // styling one.
-                let bz = crate::bezel_theme::theme();
                 'hunks: for hunk in hunks {
                     children.push(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACE_2))
-                            .px(px(theme::SPACE_2))
-                            .py(px(theme::SPACE_1))
-                            .border_b_1()
-                            .border_color(bz.border)
-                            .font_family(theme::MONO)
-                            .text_size(px(theme::MICRO_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(bz.text_muted)
-                            .truncate()
-                            .child(SharedString::from(hunk.header.clone()))
-                            .into_any_element(),
+                        crate::bezel_diff::skip(&hunk.header).into_any_element(),
                     );
+                    let (mut old, mut new) =
+                        crate::bezel_diff::hunk_starts(&hunk.header).unwrap_or((0, 0));
                     for line in hunk.lines.iter().take(budget) {
-                        let (wash, mark, sign) = match line.op {
-                            DiffOp::Add => (theme::diff_add_bg(), bz.success, "+"),
-                            DiffOp::Del => (theme::diff_del_bg(), bz.danger, "-"),
-                            DiffOp::Ctx => (gpui::transparent_black(), bz.text_faint, " "),
-                        };
-                        children.push(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_start()
-                                .gap(px(theme::SPACE_2))
-                                .px(px(theme::SPACE_2))
-                                .bg(wash)
-                                .font_family(theme::MONO)
-                                .text_size(px(theme::DIFF_SIZE))
-                                .line_height(px(theme::DIFF_LINE))
-                                .child(
-                                    div()
-                                        .w(px(theme::DIFF_SIGN_W))
-                                        .flex_none()
-                                        .text_color(mark)
-                                        .child(sign),
-                                )
-                                .child(
-                                    div()
-                                        .min_w(px(0.))
-                                        .text_color(if line.op == DiffOp::Ctx {
-                                            bz.text_muted
-                                        } else {
-                                            theme::text_secondary_on_wash()
-                                        })
-                                        .child(SharedString::from(line.text.clone())),
-                                )
-                                .into_any_element(),
-                        );
+                        let (o, n) = crate::bezel_diff::numbers(line.op, &mut old, &mut new);
+                        children.push(crate::bezel_diff::line(line, o, n).into_any_element());
                         budget -= 1;
                         if budget == 0 {
                             break 'hunks;
@@ -3573,6 +3526,12 @@ struct TranscriptState {
     /// on a real session switch, with everything else that belongs to the
     /// session that left.
     open_tools: std::collections::HashSet<String>,
+    /// Activity box: opens with the run until the header is pressed
+    /// (bezel's `Takeover`). Scroll/follow pin the reasoning to its
+    /// newest line.
+    thought: bezel::ui::widgets::Takeover,
+    thought_scroll: ScrollHandle,
+    thought_follow: bezel::ui::scroll::FollowState,
     /// Slice N3 — the live-turn clock behind the working trailer.
     ///
     /// **Slice CF made this the engine's own state machine rather than a
@@ -3615,6 +3574,9 @@ impl TranscriptState {
             composer: None,
             shell: None,
             open_tools: std::collections::HashSet::new(),
+            thought: bezel::ui::widgets::Takeover::default(),
+            thought_scroll: ScrollHandle::new(),
+            thought_follow: bezel::ui::scroll::FollowState::new(),
             turn: eave_core::turn::TurnLedger::new(eave_core::journal::now_ms()),
             th: eave_core::thresholds::AttentionThresholds::from_env(),
         }
@@ -13648,25 +13610,54 @@ impl Shell {
                 theme::text_secondary(),
             ),
         };
+        let thought = state.transcript.thought.clone();
+        let running = true;
+        let open = state.thought.get(running);
+        let thought_scroll = state.thought_scroll.clone();
+        let thought_follow = state.thought_follow.clone();
+        let transcript = self.transcript.clone();
+        let header = div()
+            .id("thought-header")
+            .debug_selector(|| "work-trailer".into())
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .pb(px(theme::SPACE_2))
+            .text_size(px(theme::SMALL_SIZE))
+            .line_height(px(theme::SMALL_LINE))
+            .text_color(ink)
+            .when(!thought.is_empty(), |d| {
+                d.cursor_pointer().on_click(move |_, _, cx| {
+                    transcript.update(cx, |t, cx| {
+                        t.thought.toggle(true);
+                        cx.notify();
+                    });
+                })
+            })
+            .child(loaders::work_bar(theme::live(), phase))
+            .child(
+                div()
+                    .debug_selector(move || selector.into())
+                    .child(SharedString::from(words)),
+            );
         Some(
             Self::column(
                 div()
-                    .debug_selector(|| "work-trailer".into())
-                    .w_full()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .pb(px(theme::SPACE_2))
-                    .text_size(px(theme::SMALL_SIZE))
-                    .line_height(px(theme::SMALL_LINE))
-                    .text_color(ink)
-                    .child(loaders::work_bar(theme::live(), phase))
-                    .child(
-                        div()
-                            .debug_selector(move || selector.into())
-                            .child(SharedString::from(words)),
-                    ),
+                    .flex_col()
+                    .child(header)
+                    .when(open && !thought.is_empty(), |zone| {
+                        zone.child(crate::bezel_activity::reasoning_box(
+                            &thought,
+                            &thought_scroll,
+                            &thought_follow,
+                            theme::content_plate(),
+                            theme::border(),
+                            theme::text_tertiary(),
+                        ))
+                    }),
             )
             .into_any_element(),
         )
@@ -14019,6 +14010,10 @@ impl Shell {
                 // tests that asserted it now assert the fact at the model
                 // level instead, and say so.
                 let bz = crate::bezel_theme::theme();
+                let run = crate::bezel_tools::run_at(
+                    &state.transcript.rows,
+                    id.msg as usize,
+                );
                 let head = {
                     use bezel::ui::widgets::Status as _;
                     bz.step_row(
@@ -14052,11 +14047,11 @@ impl Shell {
                             }
                         })
                 });
-                div()
+                crate::bezel_tools::box_(run.first, run.last)
                     .debug_selector(|| "tool-row".into())
-                    .pt(px(theme::SPACE_2))
-                    .pb(px(theme::SPACE_1))
-                    .pl(px(theme::TOOL_INDENT))
+                    .when(run.first, |d| d.mt(px(theme::SPACE_2)))
+                    .when(run.last, |d| d.mb(px(theme::SPACE_1)))
+                    .ml(px(theme::TOOL_INDENT))
                     .flex()
                     .flex_col()
                     .gap(px(theme::SPACE_1))
@@ -18679,6 +18674,7 @@ pub fn run(data_dir: PathBuf) -> ! {
     // Recorded before anything renders: the friction log resolves against
     // it (Stage L), and it must not differ from the dir the feed loop uses.
     let _ = DATA_DIR.set(data_dir.clone());
+    crate::theme::set_brand_path(data_dir.join("theme-brand.json"));
     // Slice CK. **A probe is a spawn, so only a process with a window is
     // allowed to make one.** The test harness never reaches here, which is
     // what keeps `cargo test` from starting six vendor CLIs every time a
@@ -19084,6 +19080,12 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     // `set_menus`, so without this `NSApp.mainMenu` is nil and the
     // auto-hidden system bar has nothing to reveal.
     crate::app_menus::init(cx); // handlers only — the bar goes in last
+    crate::theme_editor::init(cx);
+    cx.bind_keys([KeyBinding::new(
+        "cmd-,",
+        crate::theme_editor::OpenThemeEditor,
+        None,
+    )]);
 
     // Slice BZ: bezel's Theme global, built from `theme.rs`. Installed in
     // `bootstrap` rather than in `run` for the reason the two lines around it
@@ -19416,6 +19418,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                             // session that left can collide with one in the
                             // session arriving.
                             state.open_tools.clear();
+                            state.thought = bezel::ui::widgets::Takeover::default();
+                            state.thought_follow.follow();
                             let key = state.session_id.clone().unwrap_or_default();
                             state.composer.clone().map(|c| (c, key))
                         });

@@ -84,6 +84,12 @@ pub mod bezel_theme;
 /// bezel's `TextField`, vendored — the editing engine eave never had. See the
 /// module doc for the provenance and the enumerated delta.
 pub mod text_field;
+/// Activity / tool-call / diff presentation ported from bezel's gallery.
+mod bezel_activity;
+mod bezel_diff;
+mod bezel_tools;
+/// The theme editor (bezel's Create page). A window, opened from the menu.
+pub mod theme_editor;
 
 pub mod ui;
 

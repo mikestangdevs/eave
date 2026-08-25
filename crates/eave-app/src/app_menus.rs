@@ -14,9 +14,9 @@
 //! for without thinking and which nothing in eave answered.
 //!
 //! Structure ported from comet's `app_menus.rs` (MIT), which ports zed's.
-//! Narrower than either: eave has no settings surface, no appearance modes
-//! and no multi-window story, so a menu naming any of them would be a menu
-//! that lies.
+//! Narrower than either: eave has no appearance-mode picker and no
+//! document-style New Window. It does have a Theme Editor (bezel's Create
+//! page) — a second window, opened from this bar.
 
 use gpui::{actions, App, Menu, MenuItem, Window};
 
@@ -93,6 +93,8 @@ fn menus() -> Vec<Menu> {
                 // nothing yet" is the honest middle.
                 MenuItem::action("About eave", About).disabled(true),
                 MenuItem::separator(),
+                MenuItem::action("Theme Editor", crate::theme_editor::OpenThemeEditor),
+                MenuItem::separator(),
                 MenuItem::action("Hide eave", Hide),
                 MenuItem::action("Hide Others", HideOthers),
                 MenuItem::action("Show All", ShowAll),
@@ -123,8 +125,8 @@ mod tests {
     /// unit test can observe the result — `NSApp.mainMenu` is platform
     /// state. What IS checkable is the structure handed over, and the thing
     /// worth checking is the omission: a menu naming a Settings window or
-    /// an appearance mode would be a menu that lies, because eave has
-    /// neither.
+    /// an appearance mode would be a menu that lies. Theme Editor is
+    /// present because eave now has that surface.
     #[test]
     fn the_bar_names_only_what_eave_has() {
         let m = menus();
@@ -139,6 +141,19 @@ mod tests {
             "the window menu lost items: {window_items}"
         );
 
+        let app_names: Vec<String> = m[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            app_names.iter().any(|n| n == "Theme Editor"),
+            "the app menu lost the Theme Editor: {app_names:?}"
+        );
+
         // Nothing in either menu may claim a surface eave does not have.
         // This is a NEGATIVE test on purpose: the failure it prevents is
         // someone porting another row out of comet's menu, which has a
@@ -147,13 +162,7 @@ mod tests {
             for item in &menu.items {
                 if let MenuItem::Action { name, .. } = item {
                     let n = name.to_lowercase();
-                    for absent in [
-                        "settings",
-                        "preferences",
-                        "appearance",
-                        "theme",
-                        "new window",
-                    ] {
+                    for absent in ["settings", "preferences", "appearance", "new window"] {
                         assert!(
                             !n.contains(absent),
                             "the menu offers {name:?}, and eave has no such surface"

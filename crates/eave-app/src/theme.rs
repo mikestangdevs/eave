@@ -40,7 +40,7 @@ use gpui::{hsla, px, rgb, BoxShadow, FontWeight, Hsla, Pixels};
 /// An exact achromatic tone from an 8-bit channel value: `grey(0x0d)` is
 /// `#0d0d0d`. For surfaces and inks matched against a sampled reference.
 fn grey(value: u8) -> Hsla {
-    hsla(0.0, 0.0, value as f32 / 255.0, 1.0)
+    apply_tint(hsla(0.0, 0.0, value as f32 / 255.0, 1.0))
 }
 
 /// A neutral (chroma 0) oklch tone. Chroma 0 means `r == g == b` exactly, so
@@ -48,7 +48,7 @@ fn grey(value: u8) -> Hsla {
 /// would otherwise return float-noise saturation.
 fn neutral(lightness: f32) -> Hsla {
     let [v, _, _] = oklch_to_srgb(lightness, 0.0, 0.0);
-    hsla(0.0, 0.0, v, 1.0)
+    apply_tint(hsla(0.0, 0.0, v, 1.0))
 }
 
 /// Translucent neutral fill ink — every hover wash, selection wash, hairline
@@ -147,6 +147,260 @@ fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (h, s, l)
 }
 
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s < f32::EPSILON {
+        return (l, l, l);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hue = |mut t: f32| {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    (hue(h + 1.0 / 3.0), hue(h), hue(h - 1.0 / 3.0))
+}
+
+fn gamma_decode(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x <= 0.040_449_936 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// oklch lightness of an achromatic tone: [`neutral`] inverted.
+fn lightness(color: Hsla) -> f32 {
+    gamma_decode(color.l).cbrt()
+}
+
+fn fit_chroma(l: f32, chroma: f32, hue: f32) -> f32 {
+    let fits = |c: f32| {
+        let [r, g, b] = oklch_to_srgb(l, c, hue);
+        [r, g, b].iter().all(|x| (-1e-4..=1.0 + 1e-4).contains(x))
+    };
+    if fits(chroma) {
+        return chroma;
+    }
+    let (mut lo, mut hi) = (0.0, chroma);
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Re-emit an achromatic tone at `hue`, carrying as much `chroma` as its
+/// lightness can hold. Alpha rides through. Ported from bezel's `color::tint`
+/// (`apps/gallery` Create page / `crates/theme/src/brand.rs`).
+fn tint(color: Hsla, hue: f32, chroma: f32) -> Hsla {
+    if chroma <= 0.0 {
+        return color;
+    }
+    let l = lightness(color);
+    let mut out = oklch(l, fit_chroma(l, chroma, hue), hue);
+    out.a = color.a;
+    out
+}
+
+fn apply_tint(color: Hsla) -> Hsla {
+    let b = brand();
+    if b.tint.chroma <= f32::EPSILON {
+        color
+    } else {
+        tint(color, b.tint.hue, b.tint.chroma)
+    }
+}
+
+/// WCAG 2.1 contrast ratio of two tokens (1.0..=21.0). Translucent tokens
+/// are treated as already composited — the theme editor uses it on the
+/// pairings a brand can break.
+pub fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let lum = |c: Hsla| {
+        let (r, g, b) = hsl_to_rgb(c.h, c.s, c.l);
+        fn lin(u: f32) -> f32 {
+            if u <= 0.04045 {
+                u / 12.92
+            } else {
+                ((u + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    };
+    let (la, lb) = (lum(a), lum(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+// ---------------------------------------------------------------------------
+// Brand — the theme editor's one knob-set.
+//
+// Ported from bezel's Create page (`bezel/apps/gallery/src/create.rs` and
+// `crates/theme/src/brand.rs`). Lightness is never a knob: a brand rotates
+// hue and leaves the contrast ratios the shipped palette was verified at.
+// Default is identity — every existing token test stays true until someone
+// opens the editor.
+
+/// A hue and how much of it, in oklch terms. `chroma: 0.0` is the shipped
+/// neutral, so [`Brand::default`] reproduces the built-in palette exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Tint {
+    pub hue: f32,
+    pub chroma: f32,
+}
+
+impl Tint {
+    pub const NONE: Self = Self {
+        hue: 0.0,
+        chroma: 0.0,
+    };
+
+    pub const fn new(hue: f32, chroma: f32) -> Self {
+        Self { hue, chroma }
+    }
+}
+
+/// Tailwind's five neutral families at their 500 step — the same list
+/// bezel's Create page offers, quoted rather than invented.
+pub const BASE_COLORS: [(&str, Tint); 5] = [
+    ("Neutral", Tint::NONE),
+    ("Stone", Tint::new(58.071, 0.013)),
+    ("Zinc", Tint::new(285.938, 0.016)),
+    ("Gray", Tint::new(264.364, 0.027)),
+    ("Slate", Tint::new(257.417, 0.046)),
+];
+
+/// The shipped radius every other corner is a ratio of. Matches bezel's
+/// `Theme::BUTTON_RADIUS` / Create-page default, which is also
+/// [`RADIUS_SELECT`].
+pub const BRAND_RADIUS_DEFAULT: f32 = 8.0;
+/// Window frost — alpha of the wash over the blurred desktop. `1.0` is
+/// opaque (glass off). Comet-parity `#0A0A0A` @ 0.80.
+pub const CANVAS_GLASS_ALPHA: f32 = 0.80;
+
+/// What the operator changes about the shipped palette without redesigning
+/// it. Stored process-wide so the free-function tokens can read it without
+/// an `App` (the same constraint [`crate::bezel_theme::theme`] has).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Brand {
+    pub tint: Tint,
+    pub accent: Tint,
+    pub radius: f32,
+    /// Window frost alpha (`1.0` is opaque). Default is
+    /// [`CANVAS_GLASS_ALPHA`]. This is the wash over the blurred desktop
+    /// — rails, titlebar, the editor itself — not the floating chrome
+    /// plates, which stay at [`CHROME_GLASS_ALPHA`].
+    pub glass: f32,
+}
+
+impl Default for Brand {
+    fn default() -> Self {
+        Self {
+            tint: Tint::NONE,
+            accent: Tint::NONE,
+            radius: BRAND_RADIUS_DEFAULT,
+            glass: CANVAS_GLASS_ALPHA,
+        }
+    }
+}
+
+static BRAND: std::sync::Mutex<Brand> = std::sync::Mutex::new(Brand {
+    tint: Tint::NONE,
+    accent: Tint::NONE,
+    radius: BRAND_RADIUS_DEFAULT,
+    glass: CANVAS_GLASS_ALPHA,
+});
+static BRAND_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn brand_lock() -> std::sync::MutexGuard<'static, Brand> {
+    BRAND.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The installed brand. Identity until the theme editor writes one.
+pub fn brand() -> Brand {
+    *brand_lock()
+}
+
+/// Scale a shipped radius by the brand. At the default brand this is `base`.
+pub fn scaled_radius(base: f32) -> f32 {
+    base * (brand().radius / BRAND_RADIUS_DEFAULT)
+}
+
+/// Where a brand is remembered across launches. Called from `ui::run`
+/// before the window opens; the harness never sets it, so tests keep the
+/// identity brand.
+pub fn set_brand_path(path: std::path::PathBuf) {
+    let _ = BRAND_PATH.set(path);
+    if let Some(path) = BRAND_PATH.get() {
+        if let Ok(bytes) = std::fs::read_to_string(path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&bytes) {
+                let mut next = Brand::default();
+                if let Some(n) = v.get("tint_hue").and_then(|x| x.as_f64()) {
+                    next.tint.hue = n as f32;
+                }
+                if let Some(n) = v.get("tint_chroma").and_then(|x| x.as_f64()) {
+                    next.tint.chroma = n as f32;
+                }
+                if let Some(n) = v.get("accent_hue").and_then(|x| x.as_f64()) {
+                    next.accent.hue = n as f32;
+                }
+                if let Some(n) = v.get("accent_chroma").and_then(|x| x.as_f64()) {
+                    next.accent.chroma = n as f32;
+                }
+                if let Some(n) = v.get("radius").and_then(|x| x.as_f64()) {
+                    next.radius = n as f32;
+                }
+                if let Some(n) = v.get("glass").and_then(|x| x.as_f64()) {
+                    next.glass = n as f32;
+                }
+                *brand_lock() = next;
+            }
+        }
+    }
+}
+
+fn persist_brand(next: Brand) {
+    let Some(path) = BRAND_PATH.get() else {
+        return;
+    };
+    let body = serde_json::json!({
+        "tint_hue": next.tint.hue,
+        "tint_chroma": next.tint.chroma,
+        "accent_hue": next.accent.hue,
+        "accent_chroma": next.accent.chroma,
+        "radius": next.radius,
+        "glass": next.glass,
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Install a brand, rebuild bezel's global from the new tokens, and
+/// refresh every window. This is the only writer.
+pub fn set_brand(next: Brand, cx: &mut gpui::App) {
+    *brand_lock() = next;
+    persist_brand(next);
+    crate::bezel_theme::reinstall(cx);
+    cx.refresh_windows();
+}
+
 // ---------------------------------------------------------------------------
 // The glass ground — ruled by the user 2026-08-17, and since 2026-08-19
 // the ONLY ground: the opaque build was deleted outright ("i never want
@@ -194,7 +448,7 @@ fn glass_canvas() -> Hsla {
     // own app background, which is where the 2026-08-17 "comet parity"
     // ruling actually came from. Written achromatically now rather than as
     // an rgba literal that happened to be neutral.
-    grey(0x0a).opacity(0.80)
+    grey(0x0a).opacity(brand().glass.clamp(0.0, 1.0))
 }
 /// The content well's darkening wash, behind [`content_plate`].
 fn wash_content() -> Hsla {
@@ -701,7 +955,12 @@ pub fn inverse_hover() -> Hsla {
 /// The PATTERN is the port — a saturated fill is usable without desaturating
 /// it as long as its ink is named — not the token's value.
 pub fn accent() -> Hsla {
-    oklch(0.702, 0.183, 293.541)
+    let b = brand();
+    if b.accent.chroma > 0.0 {
+        oklch(0.702, b.accent.chroma, b.accent.hue)
+    } else {
+        oklch(0.702, 0.183, 293.541)
+    }
 }
 
 /// Ring around the focused split pane.
@@ -723,7 +982,25 @@ pub fn pane_focus_ring() -> Hsla {
 /// call site, the armed send button, and lost it when that button became the
 /// accent's.
 pub fn accent_hover() -> Hsla {
-    oklch(0.811, 0.111, 293.571)
+    let b = brand();
+    if b.accent.chroma > 0.0 {
+        oklch(0.811, b.accent.chroma, b.accent.hue)
+    } else {
+        oklch(0.811, 0.111, 293.571)
+    }
+}
+
+/// Label on an accent plate. At the shipped violet this is [`on_solid`];
+/// a brand that lands a dark plate picks [`solid`] instead. Measured, so a
+/// yellow plate never takes a light label.
+pub fn on_accent() -> Hsla {
+    let plate = accent();
+    let (a, b) = (solid(), on_solid());
+    if contrast_ratio(plate, a) >= contrast_ratio(plate, b) {
+        a
+    } else {
+        b
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,6 +1606,9 @@ pub const TOOL_DOT: f32 = 5.0;
 /// own fixed column survives both, and being fixed is what keeps the text
 /// left edges aligned down the pane whatever the sign is.
 pub const DIFF_SIGN_W: f32 = 10.0;
+/// Line-number column in the diff pane (bezel's `NUMBERS`, five mono
+/// figures so a 99,999-line file still lines up).
+pub const DIFF_NUM_W: f32 = 30.0;
 
 // ---------------------------------------------------------------------------
 // Icons (Slices P3, Q1) — the box a glyph is drawn into.

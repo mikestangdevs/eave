@@ -41,7 +41,7 @@ use crate::theme as eave;
 /// than asked to pick one of its own two. Without it the only options would
 /// have been bezel's palette (a second token system by definition) or a fork.
 pub fn install(cx: &mut App) {
-    Theme::install_custom(from_eave_tokens(), cx);
+    reinstall(cx);
 }
 
 /// The asset source, once, for both icon sets.
@@ -94,9 +94,29 @@ impl gpui::AssetSource for Assets {
 /// built once. `the_global_and_the_context_free_theme_are_the_same` is what
 /// keeps that sentence true — if eave ever grows a second appearance, that
 /// test fails and this function is the thing that has to change.
-pub fn theme() -> &'static Theme {
-    static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
-    THEME.get_or_init(from_eave_tokens)
+pub fn theme() -> Theme {
+    if let Ok(g) = CACHE.read() {
+        if let Some(t) = g.as_ref() {
+            return t.clone();
+        }
+    }
+    let t = from_eave_tokens();
+    if let Ok(mut g) = CACHE.write() {
+        *g = Some(t.clone());
+    }
+    t
+}
+
+static CACHE: std::sync::RwLock<Option<Theme>> = std::sync::RwLock::new(None);
+
+/// Rebuild bezel's global from the current eave tokens. Called at boot
+/// and whenever the theme editor writes a brand.
+pub fn reinstall(cx: &mut App) {
+    let t = from_eave_tokens();
+    if let Ok(mut g) = CACHE.write() {
+        *g = Some(t.clone());
+    }
+    Theme::install_custom(t, cx);
 }
 
 /// eave's tokens, in the shape bezel reads them.
@@ -160,7 +180,7 @@ fn from_eave_tokens() -> Theme {
         // is the line where that choice reaches bezel's components.
         accent: eave::accent(),
         accent_strong: eave::accent_hover(),
-        on_accent: eave::on_solid(),
+        on_accent: eave::on_accent(),
 
         // ---- state pigment ----
         // `danger_ink` is eave's quiet-tier danger text, sampled by Slice AQ
