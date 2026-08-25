@@ -784,6 +784,12 @@ const USER_AGENT: Option<&str> = None;
 /// The product token half of [`USER_AGENT`]. Same decision, same reason.
 const USER_AGENT_PRODUCT: Option<&str> = None;
 
+/// The DevTools protocol port, localhost-only (Chromium binds 127.0.0.1
+/// for remote debugging unless told otherwise). 9223 rather than the
+/// conventional 9222 so a developer's ordinary Chrome debugging session
+/// on this machine cannot collide with eave's.
+pub(crate) const DEVTOOLS_PORT: u16 = 9223;
+
 /// The settings eave starts Chromium with.
 ///
 /// # This function cannot be called from a test, and that is not a choice
@@ -803,6 +809,13 @@ fn browser_settings(cache: &std::path::Path) -> Settings {
         // gpui owns [NSApp run]; CEF gets pumped instead of running its own.
         external_message_pump: 1,
         root_cache_path: cache.to_string_lossy().as_ref().into(),
+        // The DevTools protocol endpoint, bound to localhost by Chromium.
+        // This is what makes a DOCKED frontend possible at all: CEF 151's
+        // ShowDevTools rejects windowless rendering outright, so the
+        // bundled frontend is loaded into an eave-owned OSR browser and
+        // connected to the tab's target over this port instead. See
+        // `tabs::show_devtools`.
+        remote_debugging_port: DEVTOOLS_PORT as i32,
         ..Default::default()
     };
     if let Some(ua) = USER_AGENT {

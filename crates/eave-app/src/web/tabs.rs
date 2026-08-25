@@ -545,16 +545,20 @@ pub fn close_browser_for(tab_id: &str) {
         super::evict::borrows_clear(),
         "close_browser_for({tab_id}) with an eviction cell borrowed — see `evict::tick`"
     );
+    // The dock browser dies with its tab (a close or an eviction alike):
+    // it has no snapshot row, so nothing else would close it, and a
+    // frontend over a dead target is noise. One level of recursion,
+    // guarded by the prefix check.
+    if super::devtools_parent(tab_id).is_none() {
+        let dt = super::devtools_id(tab_id);
+        if has_browser(&dt) {
+            close_browser_for(&dt);
+        }
+    }
     // Through `with_browser`, so the borrow is dropped before CEF is
     // entered. See its doc comment for what holding it costs.
     with_browser(tab_id, |b| {
         if let Some(host) = b.host() {
-            // A DevTools browser opened from this tab is NOT in `BROWSERS`
-            // (it was created with no client), so nothing else ever closes
-            // it — and `CefShutdown` blocks while any browser is live.
-            if host.has_dev_tools() != 0 {
-                host.close_dev_tools();
-            }
             host.close_browser(1);
         }
     });
@@ -712,8 +716,10 @@ pub fn drive(snapshot: &TabsSnapshot) {
     // permanently unwarmable — `drive_tab` would return early forever — so
     // the mark is pruned against the strip rather than against the map.
     CREATING.with(|c| {
-        c.borrow_mut()
-            .retain(|id| snapshot.tabs.iter().any(|t| &t.id == id))
+        c.borrow_mut().retain(|id| {
+            let key = super::devtools_parent(id).unwrap_or(id);
+            snapshot.tabs.iter().any(|t| t.id == key)
+        })
     });
 
     let live: Vec<String> = BROWSERS.with(|b| b.borrow().keys().cloned().collect());
@@ -1005,63 +1011,144 @@ pub fn copy_selection(tab_id: &str) {
     super::host::request_pump();
 }
 
-/// Open DevTools for this tab's page, inspecting the element at `(x, y)`
-/// in PAGE space — the menu's "Inspect" row.
+/// Open DevTools for this tab's page, docked — the menu's "Inspect" row.
 ///
-/// The DevTools browser is **another OSR surface, docked in eave's own
-/// window** — Chrome's default, and what the operator asked for after the
-/// first cut opened a separate native window. `show_dev_tools` opens "its
-/// own browser", and that browser's windowing comes from the `WindowInfo`
-/// passed HERE: windowless, with a `PageClient` keyed `devtools:<tab>`, so
-/// it registers into `BROWSERS`, paints through `osr`, and takes input
-/// through `page_element` — the identical pipeline the page rides, for the
-/// price of the id. The engine never hears about it: facts for an id the
-/// tab store does not hold are dropped without creating state.
+/// # Why this does NOT call `show_dev_tools`
+/// It did, twice, and both shapes were wrong. A windowed `WindowInfo`
+/// opens a separate native window (the operator rejected it). A windowless
+/// one is REJECTED by CEF 151 itself — `chrome_browser_delegate.cc`,
+/// branch 7922: *"Windowless rendering is not supported for this DevTools
+/// window"*, after which it builds a Chrome-style native window regardless
+/// (`CHECK(platform_delegate->IsChromeStyle())`). The association API
+/// cannot produce a docked frontend in this CEF, full stop.
 ///
-/// If DevTools is already open for this browser, CEF focuses it and still
-/// honours the inspect point — so a second "Inspect" retargets rather than
-/// stacking a second frontend.
-pub fn show_devtools(tab_id: &str, x: i32, y: i32) {
+/// # What it does instead
+/// The frontend is just a web app, bundled inside the Chromium framework
+/// we already ship, that speaks the DevTools protocol over a websocket.
+/// eave runs the protocol endpoint on localhost ([`host::DEVTOOLS_PORT`]),
+/// asks it for this tab's target, and loads the frontend URL into an
+/// ordinary windowless browser keyed `devtools:<tab>` — the identical OSR
+/// pipeline the page rides, for the price of the id. Chrome's own dock is
+/// this exact architecture plus window chrome eave doesn't have.
+///
+/// The inspect point is accepted but UNUSED for now: aiming the frontend
+/// at a node needs the CDP channel (E9's surface). The row still opens the
+/// dock; it just doesn't pre-select the element under the pointer.
+pub fn show_devtools(tab_id: &str, _x: i32, _y: i32) {
     let dt_id = super::devtools_id(tab_id);
-    with_browser(tab_id, |b| {
-        let Some(host) = b.host() else {
-            return;
-        };
-        // Mirrors `create` exactly: windowless (which also forces Alloy),
-        // shared texture, born at whatever size the dock pane last
-        // published — 800×600 default before first paint, corrected by the
-        // pane's first `WasResized` like every page.
-        let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
-        window_info.shared_texture_enabled = 1;
-        let v = super::osr::view(&dt_id);
-        window_info.bounds = Rect {
-            x: 0,
-            y: 0,
-            width: v.width,
-            height: v.height,
-        };
-        let settings = BrowserSettings {
-            windowless_frame_rate: FRAME_RATE,
-            ..Default::default()
-        };
-        let mut client = PageClient::new(dt_id.clone());
-        let at = Point { x, y };
-        host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), Some(&at));
-    });
+    if has_browser(&dt_id) || CREATING.with(|c| c.borrow().contains(&dt_id)) {
+        // Already docked, or on its way — a second Inspect is "make sure
+        // it is open", nothing more.
+        return;
+    }
+    let page_url = with_browser(tab_id, |b| {
+        b.main_frame()
+            .map(|f| CefString::from(&f.url()).to_string())
+    })
+    .flatten()
+    .filter(|u| !u.is_empty());
+    let Some(frontend) = devtools_frontend_url(page_url.as_deref()) else {
+        if std::env::var("EAVE_WEB_TRACE").is_ok() {
+            eprintln!("[web] devtools: no frontend url for {tab_id} (endpoint down or no target)");
+        }
+        return;
+    };
+    if std::env::var("EAVE_WEB_TRACE").is_ok() {
+        eprintln!("[web] devtools: docking {dt_id} at {frontend}");
+    }
+    // From here it is `create` verbatim, for the devtools id.
+    let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
+    window_info.shared_texture_enabled = 1;
+    let v = super::osr::view(&dt_id);
+    window_info.bounds = Rect {
+        x: 0,
+        y: 0,
+        width: v.width,
+        height: v.height,
+    };
+    let settings = BrowserSettings {
+        windowless_frame_rate: FRAME_RATE,
+        ..Default::default()
+    };
+    CREATING.with(|c| c.borrow_mut().insert(dt_id.clone()));
+    let mut client = PageClient::new(dt_id.clone());
+    let start = CefString::from(frontend.as_str());
+    browser_host_create_browser(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&start),
+        Some(&settings),
+        None,
+        None,
+    );
     super::host::request_pump();
+}
+
+/// The frontend URL for a tab's target, from the local protocol endpoint.
+///
+/// Matching is by the tab's CURRENT URL against the target list, falling
+/// back to the first page target when nothing matches (one tab open is the
+/// common case). Exact target identity needs the CDP channel (E9) —
+/// `/json/list` does not know eave's tab ids.
+fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
+    let body = devtools_targets_json()?;
+    let targets: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let list = targets.as_array()?;
+    let candidates: Vec<&serde_json::Value> = list
+        .iter()
+        .filter(|t| {
+            t["type"].as_str() == Some("page")
+                && t["url"]
+                    .as_str()
+                    .is_some_and(|u| !u.starts_with("devtools://"))
+        })
+        .collect();
+    let pick = page_url
+        .and_then(|u| {
+            candidates
+                .iter()
+                .find(|t| t["url"].as_str() == Some(u))
+                .copied()
+        })
+        .or_else(|| candidates.first().copied())?;
+    let path = pick["devtoolsFrontendUrl"].as_str()?;
+    Some(if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!(
+            "http://127.0.0.1:{}{}",
+            super::host::DEVTOOLS_PORT,
+            path
+        )
+    })
+}
+
+/// `GET /json/list` from the local endpoint. Blocking but bounded — it is
+/// localhost, 300 ms to connect and 700 ms to read, and it runs once per
+/// Inspect click, not per frame.
+fn devtools_targets_json() -> Option<String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], super::host::DEVTOOLS_PORT));
+    let mut s =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).ok()?;
+    s.set_read_timeout(Some(std::time::Duration::from_millis(700)))
+        .ok()?;
+    s.write_all(b"GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    text.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
 }
 
 /// Close a tab's DevTools browser, if it has one. The state half lives in
 /// `super::close_devtools`; the map entry disappears in the devtools
 /// browser's own `on_before_close`, like any browser's.
 pub fn close_devtools(tab_id: &str) {
-    with_browser(tab_id, |b| {
-        if let Some(host) = b.host() {
-            if host.has_dev_tools() != 0 {
-                host.close_dev_tools();
-            }
-        }
-    });
+    let dt = super::devtools_id(tab_id);
+    if has_browser(&dt) {
+        close_browser_for(&dt);
+    }
     super::host::request_pump();
 }
 

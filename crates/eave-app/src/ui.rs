@@ -7400,9 +7400,28 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The page OR its DevTools dock — two surfaces, one tab. The dock
+        // keeps the keyboard exactly while ITS gpui handle is focused
+        // (page_element focuses it on mouse-down); everything below then
+        // treats whichever surface won as "the page". Without this, the
+        // re-assert on every render would yank both gpui and CEF focus
+        // back to the page, and typing in the DevTools console would land
+        // in the document being inspected.
+        let page_surface: Option<String> = page_tab.map(|id| {
+            let dock = crate::web::devtools_id(id);
+            let dock_focused = crate::web::devtools_open(id)
+                && crate::web::page_focus_handle(&dock, cx)
+                    .is_some_and(|h| h.is_focused(window));
+            if dock_focused {
+                dock
+            } else {
+                id.to_string()
+            }
+        });
+        let page_surface = page_surface.as_deref();
         let wanted = if self.composer_owns_keyboard(mounted, cx) {
             gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx)
-        } else if let Some(id) = page_tab.filter(|_| !self.chrome_holds_keyboard(cx)) {
+        } else if let Some(id) = page_surface.filter(|_| !self.chrome_holds_keyboard(cx)) {
             crate::web::page_focus_handle(id, cx).unwrap_or_else(|| self.focus.clone())
         } else {
             self.focus.clone()
@@ -7410,7 +7429,7 @@ impl Shell {
         if !wanted.is_focused(window) {
             window.focus(&wanted, cx);
         }
-        let cef = page_tab.filter(|_| {
+        let cef = page_surface.filter(|_| {
             !self.chrome_holds_keyboard(cx) && !self.composer_owns_keyboard(mounted, cx)
         });
         crate::web::set_keyboard_page(cef);
