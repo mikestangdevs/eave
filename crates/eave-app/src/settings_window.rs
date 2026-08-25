@@ -43,6 +43,154 @@ use crate::settings::{self, AppearanceSetting, SearchEngine};
 use crate::text_field::TextField;
 use crate::{icons, theme};
 
+// ---------------------------------------------------------------------------
+// The macOS System Settings dark palette — literals, not theme tokens.
+//
+// This window deliberately does NOT wear eave's chrome. The operator's
+// ruling (2026-08-25): a settings window should read as macOS system UI,
+// like the frame-refs — which are themselves app-drawn mimicry of the
+// System Settings look, since eave (like the reference app) renders every
+// pixel itself and hosts no AppKit widget anywhere. So the imitation is
+// the spec: solid dark chrome, grouped cards on hairlines, a centered
+// title, native-shaped segmented controls. Values eyeballed against the
+// frame-refs and Apple's dark grouped-list colors; the ACCENT stays
+// eave's (`Theme::of`), because the accent is the one thing macOS itself
+// lets an app keep.
+// ---------------------------------------------------------------------------
+
+/// The window and content ground — solid, like System Settings, not
+/// eave's frosted glass. The glass ruling governs the product frame; a
+/// settings window that must read "system" reads solid.
+fn win_bg() -> gpui::Rgba {
+    gpui::rgb(0x242426)
+}
+/// A grouped card's plate.
+fn card_bg() -> gpui::Rgba {
+    gpui::rgb(0x2e2e31)
+}
+/// Hairlines: card borders and row separators.
+fn hairline() -> gpui::Rgba {
+    gpui::rgba(0xffffff17)
+}
+/// Primary label.
+fn label_color() -> gpui::Rgba {
+    gpui::rgba(0xfffffff2)
+}
+/// Secondary text — captions, values, unselected toolbar items.
+fn secondary() -> gpui::Rgba {
+    gpui::rgb(0x9d9da3)
+}
+/// A segmented control's container well.
+fn seg_well() -> gpui::Rgba {
+    gpui::rgba(0xffffff12)
+}
+/// The selected segment's raised knob.
+fn seg_knob() -> gpui::Rgba {
+    gpui::rgb(0x636367)
+}
+/// The selected toolbar item's plate.
+fn toolbar_sel() -> gpui::Rgba {
+    gpui::rgba(0xffffff14)
+}
+
+/// The USER'S macOS accent colour (System Settings → Appearance), not
+/// eave's brand accent — the operator's ruling: this window wears the
+/// system's colour like a system window would. Read once per process
+/// exactly like `reduce_motion` in `ui.rs` (`AppleAccentColor` in the
+/// global domain via CFPreferences; cfprefsd caches per process, so a
+/// change lands on relaunch — stated, not papered over with a poller).
+/// The dark-appearance variants of Apple's palette, since this window is
+/// dark. An absent key is the default: systemBlue. ("Multicolour" also
+/// reads as absent and so lands on blue — the one wrinkle, noted here.)
+fn system_accent() -> gpui::Rgba {
+    static ACCENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    gpui::rgb(*ACCENT.get_or_init(|| accent_rgb(read_apple_accent())))
+}
+
+/// `AppleAccentColor`'s integer → Apple's dark-appearance accent, as a
+/// pure map so both rungs are testable without touching cfprefsd.
+fn accent_rgb(pref: Option<i64>) -> u32 {
+    match pref {
+        Some(-1) => 0x98989d, // graphite
+        Some(0) => 0xff453a,  // red
+        Some(1) => 0xff9f0a,  // orange
+        Some(2) => 0xffd60a,  // yellow
+        Some(3) => 0x32d74b,  // green
+        Some(5) => 0xbf5af2,  // purple
+        Some(6) => 0xff375f,  // pink
+        // 4 is blue; absent is the un-chosen default, also blue.
+        _ => 0x0a84ff,
+    }
+}
+
+/// `CFPreferencesCopyAppValue("AppleAccentColor", any-application)` as an
+/// integer. `None` is a machine where the user never chose — the normal
+/// state, not an error. Shape lifted from `macos_reduce_motion` (ui.rs).
+#[cfg(target_os = "macos")]
+fn read_apple_accent() -> Option<i64> {
+    use std::ffi::c_void;
+    type CFTypeRef = *const c_void;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithBytes(
+            alloc: CFTypeRef,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CFTypeRef;
+        fn CFPreferencesCopyAppValue(key: CFTypeRef, application_id: CFTypeRef) -> CFTypeRef;
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFNumberGetValue(number: CFTypeRef, the_type: isize, value_ptr: *mut c_void) -> u8;
+        fn CFRelease(cf: CFTypeRef);
+    }
+    const UTF8: u32 = 0x0800_0100;
+    /// `kCFNumberSInt64Type`.
+    const SINT64: isize = 4;
+    // SAFETY: same contract as `macos_reduce_motion` — every pointer is
+    // null-checked or released, none outlives this function.
+    unsafe {
+        let mk = |s: &str| -> CFTypeRef {
+            CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as isize, UTF8, 0)
+        };
+        let key = mk("AppleAccentColor");
+        let domain = mk("kCFPreferencesAnyApplication");
+        if key.is_null() || domain.is_null() {
+            if !key.is_null() {
+                CFRelease(key);
+            }
+            if !domain.is_null() {
+                CFRelease(domain);
+            }
+            return None;
+        }
+        let value = CFPreferencesCopyAppValue(key, domain);
+        CFRelease(key);
+        CFRelease(domain);
+        if value.is_null() {
+            return None;
+        }
+        let out = if CFGetTypeID(value) == CFNumberGetTypeID() {
+            let mut n: i64 = 0;
+            if CFNumberGetValue(value, SINT64, &mut n as *mut i64 as *mut c_void) != 0 {
+                Some(n)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        CFRelease(value);
+        out
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_apple_accent() -> Option<i64> {
+    None
+}
+
 gpui::actions!(eave_settings, [OpenSettings]);
 
 struct SettingsWindows(Option<WindowHandle<SettingsWindow>>);
@@ -75,7 +223,9 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<SettingsWindow>> {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(560.0), px(440.0))),
-            window_background: WindowBackgroundAppearance::Blurred,
+            // Solid, not eave's glass: System Settings is opaque, and the
+            // ruling this window answers to is "reads as macOS system UI".
+            window_background: WindowBackgroundAppearance::Opaque,
             titlebar: Some(TitlebarOptions {
                 title: Some("Settings".into()),
                 appears_transparent: true,
@@ -175,8 +325,8 @@ impl Render for SettingsWindow {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.bg)
-            .text_color(theme.text)
+            .bg(win_bg())
+            .text_color(label_color())
             .font_family(theme.font_sans.clone())
             .track_focus(&self.focus)
             // ⌘W: see the module doc. The Shell is the only other handler
@@ -186,19 +336,21 @@ impl Render for SettingsWindow {
                 window.remove_window();
             }))
             .child(
+                // A centered semibold title, the reference's shape — not
+                // the muted left-parked label the Theme Editor wears.
                 div()
                     .flex_none()
                     .h(px(theme::TITLEBAR_H))
-                    .px(px(theme::SPACE_4))
                     .flex()
                     .flex_row()
                     .items_center()
+                    .justify_center()
                     .window_control_area(gpui::WindowControlArea::Drag)
                     .child(
                         div()
-                            .ml(px(72.0))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .text_color(theme.text_muted)
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(label_color())
                             .child("Settings"),
                     ),
             )
@@ -233,24 +385,28 @@ impl SettingsWindow {
     /// The pane toolbar: icon over label, the active pane on a quiet
     /// plate. The reference grammar, minus its panes eave has no backing
     /// features for.
-    fn toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn toolbar(&self, _theme: &Theme, cx: &mut Context<Self>) -> Div {
         div()
             .flex_none()
             .px(px(16.0))
-            .pb(px(10.0))
+            .pb(px(8.0))
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(hairline())
             .flex()
             .flex_row()
             .justify_center()
-            .gap(px(6.0))
+            .gap(px(2.0))
             .children(PANES.iter().map(|(pane, glyph, label)| {
                 let selected = self.pane == *pane;
                 let pane = *pane;
-                let color = if selected {
-                    theme.accent
+                // The reference's selection: accent icon AND label on a
+                // quiet plate; everything unselected is the secondary
+                // gray. The accent is the USER'S system accent, not the
+                // brand's — see `system_accent`.
+                let color: gpui::Hsla = if selected {
+                    system_accent().into()
                 } else {
-                    theme.text_muted
+                    secondary().into()
                 };
                 div()
                     .id(SharedString::from(format!("settings-pane-{label}")))
@@ -259,19 +415,19 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(3.0))
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .rounded(px(theme::RADIUS_MENU))
-                    .when(selected, |d| d.bg(theme.element_active))
+                    .gap(px(2.0))
+                    .px(px(13.0))
+                    .py(px(5.0))
+                    .rounded(px(8.0))
+                    .when(selected, |d| d.bg(toolbar_sel()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pane = pane;
                         cx.notify();
                     }))
-                    .child(icons::icon(glyph, 18.0, color))
+                    .child(icons::icon(glyph, 19.0, color))
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(px(11.0))
                             .text_color(color)
                             .child(SharedString::from(*label)),
                     )
@@ -280,37 +436,39 @@ impl SettingsWindow {
 }
 
 /// A group's title over its card.
-pub(crate) fn section_heading(theme: &Theme, label: &'static str) -> Div {
+pub(crate) fn section_heading(_theme: &Theme, label: &'static str) -> Div {
     div()
         .pt(px(6.0))
-        .text_size(px(11.5))
+        .px(px(2.0))
+        .text_size(px(12.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme.text_muted)
+        .text_color(secondary())
         .child(label)
 }
 
-/// A grouped card: rows stacked with hairlines between them.
-pub(crate) fn card(theme: &Theme, rows: Vec<gpui::AnyElement>) -> Div {
+/// A grouped card: rows stacked with hairlines between them — the macOS
+/// grouped-list plate, hairline-bordered, radius 10.
+pub(crate) fn card(_theme: &Theme, rows: Vec<gpui::AnyElement>) -> Div {
     let last = rows.len().saturating_sub(1);
     div()
-        .rounded(px(Theme::PANEL_RADIUS))
-        .bg(theme.surface_card)
+        .rounded(px(10.0))
+        .bg(card_bg())
         .border_1()
-        .border_color(theme.border)
+        .border_color(hairline())
         .flex()
         .flex_col()
         .children(rows.into_iter().enumerate().map(move |(i, row)| {
             div()
-                .px(px(14.0))
-                .py(px(10.0))
-                .when(i != last, |d| d.border_b_1().border_color(theme.border))
+                .px(px(16.0))
+                .py(px(11.0))
+                .when(i != last, |d| d.border_b_1().border_color(hairline()))
                 .child(row)
                 .into_any_element()
         }))
 }
 
 /// Label left, control right — the row grammar every pane speaks.
-pub(crate) fn row(theme: &Theme, label: impl Into<SharedString>, control: gpui::AnyElement) -> gpui::AnyElement {
+pub(crate) fn row(_theme: &Theme, label: impl Into<SharedString>, control: gpui::AnyElement) -> gpui::AnyElement {
     div()
         .flex()
         .flex_row()
@@ -319,7 +477,7 @@ pub(crate) fn row(theme: &Theme, label: impl Into<SharedString>, control: gpui::
         .child(
             div()
                 .text_size(px(13.0))
-                .text_color(theme.text)
+                .text_color(label_color())
                 .child(label.into()),
         )
         .child(div().ml_auto().child(control))
@@ -327,36 +485,55 @@ pub(crate) fn row(theme: &Theme, label: impl Into<SharedString>, control: gpui::
 }
 
 /// One quiet line under a control — the honest footnote, never a promise.
-pub(crate) fn caption(theme: &Theme, text: impl Into<SharedString>) -> gpui::AnyElement {
+pub(crate) fn caption(_theme: &Theme, text: impl Into<SharedString>) -> gpui::AnyElement {
     div()
         .text_size(px(11.5))
-        .text_color(theme.text_faint)
+        .text_color(secondary())
         .child(text.into())
         .into_any_element()
 }
 
-/// A segmented choice on bezel's toggle group.
+/// A segmented choice, drawn as macOS draws one: a recessed well, the
+/// chosen segment a raised gray knob with white text. Bezel's toggle
+/// group (chips in a row) is what made the first cut read as app UI; the
+/// ids and debug selectors are unchanged, so the harness cannot tell.
 fn segmented<T: PartialEq + Copy + 'static>(
-    theme: &Theme,
+    _theme: &Theme,
     current: T,
     items: &[(T, &'static str)],
     on_pick: impl Fn(T, &mut App) + Clone + 'static,
     cx: &mut Context<SettingsWindow>,
 ) -> gpui::AnyElement {
-    theme
-        .toggle_group()
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .p(px(2.0))
+        .rounded(px(7.0))
+        .bg(seg_well())
         .children(items.iter().map(|(value, label)| {
             let value = *value;
+            let selected = current == value;
             let on_pick = on_pick.clone();
-            theme
-                .toggle_group_item(*label, current == value)
+            div()
                 .id(SharedString::from(format!("settings-seg-{label}")))
                 .debug_selector(|| format!("settings-seg-{label}"))
                 .cursor_pointer()
+                .px(px(11.0))
+                .py(px(3.0))
+                .rounded(px(5.0))
+                .text_size(px(12.0))
+                .when(selected, |d| {
+                    d.bg(seg_knob())
+                        .text_color(label_color())
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                })
+                .when(!selected, |d| d.text_color(gpui::rgba(0xebebf5b8)))
                 .on_click(cx.listener(move |_, _, _, cx| {
                     on_pick(value, cx);
                     cx.notify();
                 }))
+                .child(SharedString::from(*label))
         }))
         .into_any_element()
 }
@@ -515,9 +692,8 @@ impl SettingsWindow {
                             .child(
                                 div()
                                     .w(px(52.0))
-                                    .text_size(px(12.0))
-                                    .font_family(theme.font_mono.clone())
-                                    .text_color(theme.text_faint)
+                                    .text_size(px(12.5))
+                                    .text_color(secondary())
                                     .child(SharedString::from(format!("{rail_w:.0} px"))),
                             )
                             .into_any_element(),
@@ -540,16 +716,16 @@ impl SettingsWindow {
 #[derive(Clone)]
 struct RailKnobDrag;
 
-/// A text field in the card grammar: bordered plate, the field inside.
-fn input_box(theme: &Theme, field: Entity<TextField>) -> gpui::AnyElement {
+/// A text field in the card grammar: a recessed plate, the field inside.
+fn input_box(_theme: &Theme, field: Entity<TextField>) -> gpui::AnyElement {
     div()
         .w(px(280.0))
         .px(px(8.0))
         .py(px(4.0))
-        .rounded(px(theme::RADIUS_CHIP))
-        .bg(theme.input_bg)
+        .rounded(px(6.0))
+        .bg(gpui::rgba(0xffffff0f))
         .border_1()
-        .border_color(theme.border)
+        .border_color(hairline())
         .child(field)
         .into_any_element()
 }
@@ -880,16 +1056,16 @@ impl SettingsWindow {
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .child(icons::icon(icons::MAGNIFER, 14.0, theme.text_faint))
+                .child(icons::icon(icons::MAGNIFER, 14.0, secondary().into()))
                 .child(
                     div()
                         .flex_1()
                         .px(px(8.0))
                         .py(px(4.0))
-                        .rounded(px(theme::RADIUS_CHIP))
-                        .bg(theme.input_bg)
+                        .rounded(px(6.0))
+                        .bg(gpui::rgba(0xffffff0f))
                         .border_1()
-                        .border_color(theme.border)
+                        .border_color(hairline())
                         .child(self.query.clone()),
                 )
                 .into_any_element(),
@@ -910,10 +1086,12 @@ impl SettingsWindow {
                             row(
                                 theme,
                                 r.label,
+                                // System font for the chords, as the
+                                // reference shows them — mono was the
+                                // "app UI" tell here.
                                 div()
-                                    .text_size(px(12.0))
-                                    .font_family(theme.font_mono.clone())
-                                    .text_color(theme.text_muted)
+                                    .text_size(px(13.0))
+                                    .text_color(secondary())
                                     .child(SharedString::from(r.chords.join(" · ")))
                                     .into_any_element(),
                             )
@@ -1011,9 +1189,8 @@ fn info_row(theme: &Theme, label: &'static str, value: String) -> gpui::AnyEleme
         theme,
         label,
         div()
-            .text_size(px(12.5))
-            .font_family(theme.font_mono.clone())
-            .text_color(theme.text_muted)
+            .text_size(px(13.0))
+            .text_color(secondary())
             .child(SharedString::from(value))
             .into_any_element(),
     )
