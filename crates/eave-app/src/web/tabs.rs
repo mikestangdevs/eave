@@ -718,7 +718,17 @@ pub fn drive(snapshot: &TabsSnapshot) {
 
     let live: Vec<String> = BROWSERS.with(|b| b.borrow().keys().cloned().collect());
     for id in live {
-        if snapshot.tabs.iter().any(|t| t.id == id) {
+        // A devtools browser has no snapshot row of its own — its life is
+        // its PARENT's. While the parent tab stands, keep it and drive its
+        // visibility (nothing else calls `set_visibility` for it, and a
+        // browser never told `was_hidden` renders at full rate forever);
+        // when the parent departs the strip, fall through to the close.
+        if let Some(parent) = super::devtools_parent(&id) {
+            if snapshot.tabs.iter().any(|t| t.id == parent) {
+                set_visibility(&id, is_on_screen(&id));
+                continue;
+            }
+        } else if snapshot.tabs.iter().any(|t| t.id == id) {
             continue;
         }
         if std::env::var("EAVE_WEB_TRACE").is_ok() {
@@ -998,37 +1008,59 @@ pub fn copy_selection(tab_id: &str) {
 /// Open DevTools for this tab's page, inspecting the element at `(x, y)`
 /// in PAGE space — the menu's "Inspect" row.
 ///
-/// The DevTools browser is a **native window, not another OSR surface**:
-/// `show_dev_tools` opens "its own browser", and that browser's windowing
-/// comes from the `WindowInfo` passed HERE, not from the windowless parent.
-/// So this is the one place eave asks CEF for a real window — which is also
-/// why `client` is `None`: a windowless `WindowInfo` would demand a client
-/// with a `RenderHandler` (the same assertion `PageClient` documents), and
-/// a windowed one needs nothing from us.
+/// The DevTools browser is **another OSR surface, docked in eave's own
+/// window** — Chrome's default, and what the operator asked for after the
+/// first cut opened a separate native window. `show_dev_tools` opens "its
+/// own browser", and that browser's windowing comes from the `WindowInfo`
+/// passed HERE: windowless, with a `PageClient` keyed `devtools:<tab>`, so
+/// it registers into `BROWSERS`, paints through `osr`, and takes input
+/// through `page_element` — the identical pipeline the page rides, for the
+/// price of the id. The engine never hears about it: facts for an id the
+/// tab store does not hold are dropped without creating state.
 ///
-/// `runtime_style` is pinned to ALLOY explicitly. A default `WindowInfo`
-/// requests Chrome style, while every page browser here is forced Alloy by
-/// `windowless_rendering_enabled` — mixing the two styles across the
-/// devtools association is the untried combination, matching them is not.
+/// If DevTools is already open for this browser, CEF focuses it and still
+/// honours the inspect point — so a second "Inspect" retargets rather than
+/// stacking a second frontend.
 pub fn show_devtools(tab_id: &str, x: i32, y: i32) {
+    let dt_id = super::devtools_id(tab_id);
     with_browser(tab_id, |b| {
         let Some(host) = b.host() else {
             return;
         };
-        let mut window_info = WindowInfo::default();
-        window_info.window_name = CefString::from("DevTools");
-        // Zero bounds on a top-level window is a 0×0 window. Two-thirds of
-        // the ~1720×1080pt windows this app actually runs in (D1's machine
-        // fact), not a derived constant.
+        // Mirrors `create` exactly: windowless (which also forces Alloy),
+        // shared texture, born at whatever size the dock pane last
+        // published — 800×600 default before first paint, corrected by the
+        // pane's first `WasResized` like every page.
+        let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
+        window_info.shared_texture_enabled = 1;
+        let v = super::osr::view(&dt_id);
         window_info.bounds = Rect {
             x: 0,
             y: 0,
-            width: 1140,
-            height: 720,
+            width: v.width,
+            height: v.height,
         };
-        window_info.runtime_style = RuntimeStyle::ALLOY;
+        let settings = BrowserSettings {
+            windowless_frame_rate: FRAME_RATE,
+            ..Default::default()
+        };
+        let mut client = PageClient::new(dt_id.clone());
         let at = Point { x, y };
-        host.show_dev_tools(Some(&window_info), None, None, Some(&at));
+        host.show_dev_tools(Some(&window_info), Some(&mut client), Some(&settings), Some(&at));
+    });
+    super::host::request_pump();
+}
+
+/// Close a tab's DevTools browser, if it has one. The state half lives in
+/// `super::close_devtools`; the map entry disappears in the devtools
+/// browser's own `on_before_close`, like any browser's.
+pub fn close_devtools(tab_id: &str) {
+    with_browser(tab_id, |b| {
+        if let Some(host) = b.host() {
+            if host.has_dev_tools() != 0 {
+                host.close_dev_tools();
+            }
+        }
     });
     super::host::request_pump();
 }
@@ -1225,6 +1257,11 @@ wrap_life_span_handler! {
             // same reason `close_browser` is reached at all, which is that
             // the tab itself has left the strip.
             super::forget_page(&self.tab_id);
+            // A no-op for page browsers. For a devtools browser — closed
+            // by the frontend's own ✕, its parent's close, or an eviction
+            // — this clears the dock state, so the pane does not stand
+            // empty over a browser that no longer exists.
+            super::devtools_note_closed(&self.tab_id);
             // If this close was an eviction, the strip may want the tab
             // back already. Sets a flag; nothing is created on this stack.
             super::evict::note_closed(&self.tab_id);

@@ -748,14 +748,80 @@ fn cef_set_zoom(tab_id: &str, percent: u32) {
 #[cfg(not(feature = "web"))]
 fn cef_set_zoom(_tab_id: &str, _percent: u32) {}
 
+/// The devtools browser's id for a tab: a NAMESPACE, not a tab id.
+///
+/// The docked DevTools frontend is a second windowless browser riding the
+/// same per-id OSR pipeline as the page (`BROWSERS`, `osr::PAGES`,
+/// `page_element` all key by bare string and consult the strip nowhere).
+/// The prefix is what keeps the two worlds apart: real tab ids are bare
+/// UUIDs, so `devtools:` collides with nothing — and `drive`'s reaper and
+/// the shown-pages feed recognise it explicitly.
+pub fn devtools_id(tab_id: &str) -> String {
+    format!("devtools:{tab_id}")
+}
+
+/// The tab a devtools id belongs to, or `None` for a real tab id.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) fn devtools_parent(id: &str) -> Option<&str> {
+    id.strip_prefix("devtools:")
+}
+
+thread_local! {
+    /// Tabs whose DevTools dock is open, by PARENT tab id. Ungated — the
+    /// dock's open/closed state is view state the feature-OFF suite must
+    /// see, exactly like [`ask`]'s vocabulary. The browser behind it is
+    /// gated; this bit is not.
+    static DEVTOOLS_OPEN: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Whether this tab's DevTools dock is open.
+pub fn devtools_open(tab_id: &str) -> bool {
+    DEVTOOLS_OPEN.with(|d| d.borrow().contains(tab_id))
+}
+
+/// Close a tab's DevTools dock: state first (the pane is gone on this
+/// render), then Chromium's half.
+pub fn close_devtools(tab_id: &str) {
+    DEVTOOLS_OPEN.with(|d| {
+        d.borrow_mut().remove(tab_id);
+    });
+    cef_close_devtools(tab_id);
+}
+
+/// The devtools BROWSER closed — the frontend's own ✕, the parent tab's
+/// close, or an eviction. Clears the dock state so the pane does not
+/// stand empty over a browser that no longer exists.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) fn devtools_note_closed(id: &str) {
+    if let Some(parent) = devtools_parent(id) {
+        let parent = parent.to_string();
+        DEVTOOLS_OPEN.with(|d| {
+            d.borrow_mut().remove(&parent);
+        });
+    }
+}
+
+#[cfg(feature = "web")]
+fn cef_close_devtools(tab_id: &str) {
+    tabs::close_devtools(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_close_devtools(_tab_id: &str) {}
+
 /// Open DevTools for this tab's page, inspecting the element at the given
 /// PAGE-space point — the menu's "Inspect" row.
 ///
 /// The shim shape (state out here, Chromium behind `cef_*`) is what lets
-/// the feature-OFF suite see the dispatch happen at all.
+/// the feature-OFF suite see the dispatch happen at all. Marks the dock
+/// open before the CEF half runs: the pane should stand on the very next
+/// render, not when Chromium gets around to `on_after_created`.
 pub fn inspect_element(tab_id: &str, x: i32, y: i32) {
     #[cfg(test)]
     TEST_INSPECTS.with(|i| *i.borrow_mut() = Some((tab_id.to_string(), x, y)));
+    DEVTOOLS_OPEN.with(|d| {
+        d.borrow_mut().insert(tab_id.to_string());
+    });
     cef_inspect_element(tab_id, x, y);
 }
 

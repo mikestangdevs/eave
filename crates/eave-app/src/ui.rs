@@ -4594,6 +4594,24 @@ impl Render for SplitResize {
     }
 }
 
+/// The DevTools dock's launch share of its page well: Chrome's initial
+/// right dock is about a third of the window, and there is no reason for
+/// eave's to open anywhere else. The divider makes it the operator's after
+/// that.
+const DEVTOOLS_RATIO: f32 = 1.0 / 3.0;
+
+/// Payload type for the DevTools dock divider. Same shape as
+/// [`SplitResize`], separate type so the two `on_drag_move` listeners can
+/// never hear each other's drags.
+#[derive(Clone, Copy, Debug)]
+struct DevtoolsResize;
+
+impl Render for DevtoolsResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 /// A rail tab being dragged. Drop on another tab, or on the content well,
 /// opens a split; drop on itself is a no-op. Drop on the bookmarks grid
 /// files the page when [`Self::url`] is a real address — a session tab or
@@ -4809,6 +4827,12 @@ struct Shell {
     split: Option<Split>,
     /// The split-divider drag in progress, or `None`.
     split_drag: Option<SplitDrag>,
+    /// The DevTools dock's share of its page well. One ratio for the app,
+    /// not one per tab — the dock is a workbench the operator sizes once,
+    /// which is how Chrome treats it too. Clamped like [`Split::ratio`].
+    devtools_ratio: f32,
+    /// The dock-divider drag in progress, or `None`.
+    devtools_drag: Option<SplitDrag>,
     /// Slice AS — the session-tab strip's scroll offset.
     ///
     /// Unlike the two above, this one is *written* as well as read: the
@@ -8613,6 +8637,143 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Wrap a page element in the DevTools dock when the tab's dock is
+    /// open — page left, frontend right, a divider between, Chrome's
+    /// default arrangement. When the dock is closed this is the identity
+    /// function, so both mounts pay nothing for it.
+    ///
+    /// The dock lives INSIDE the page well rather than as a second
+    /// `Split`: a `Split` is two TABS, checked against the strip, dropped
+    /// on, activated — a dock is furniture of one tab and must follow it
+    /// between panes. The frontend surface is an ordinary
+    /// `page_element` on the `devtools:<tab>` id; while its browser is
+    /// still being created the pane stands empty for a frame or two, the
+    /// same creation gap every page tab has.
+    fn devtools_dock(
+        &self,
+        tab_id: &str,
+        page_el: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !crate::web::devtools_open(tab_id) {
+            return page_el;
+        }
+        let dt_id = crate::web::devtools_id(tab_id);
+        let devtools_el = crate::web::page_element(&dt_id, cx);
+        let r = self
+            .devtools_ratio
+            .clamp(theme::SPLIT_RATIO_MIN, 1.0 - theme::SPLIT_RATIO_MIN);
+        div()
+            .id(SharedString::from(format!("devtools-dock-{tab_id}")))
+            .debug_selector(|| "devtools-dock".into())
+            .size_full()
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .on_drag_move(
+                cx.listener(|this, e: &DragMoveEvent<DevtoolsResize>, _window, cx| {
+                    let Some(drag) = this.devtools_drag else {
+                        return;
+                    };
+                    // The ratio is the DOCK's share, so pointer-right
+                    // shrinks it: same direction Chrome's divider moves.
+                    let delta = (f32::from(e.event.position.x) - drag.grab_x) / drag.well_w;
+                    let r = (drag.start_ratio - delta)
+                        .clamp(theme::SPLIT_RATIO_MIN, 1.0 - theme::SPLIT_RATIO_MIN);
+                    if (r - this.devtools_ratio).abs() >= 0.002 {
+                        this.devtools_ratio = r;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                    if this.devtools_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .flex_basis(px(0.))
+                    .flex_grow(1.0 - r)
+                    .min_w(px(0.))
+                    .h_full()
+                    .overflow_hidden()
+                    .child(page_el),
+            )
+            .child(self.devtools_handle(tab_id, cx))
+            .child(
+                div()
+                    .id(SharedString::from(format!("devtools-pane-{tab_id}")))
+                    .debug_selector(|| "devtools-pane".into())
+                    .flex_basis(px(0.))
+                    .flex_grow(r)
+                    .min_w(px(0.))
+                    .h_full()
+                    .overflow_hidden()
+                    .children(devtools_el),
+            )
+            .into_any_element()
+    }
+
+    fn devtools_handle(&self, tab_id: &str, cx: &Context<Self>) -> AnyElement {
+        let for_tab = tab_id.to_string();
+        div()
+            .id(SharedString::from(format!("devtools-handle-{tab_id}")))
+            .debug_selector(|| "devtools-handle".into())
+            .flex_none()
+            .w(px(theme::RAIL_HANDLE_W))
+            .h_full()
+            .cursor_col_resize()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    // The well here is the PAGE WELL this dock divides,
+                    // not the whole window: start from `split_handle`'s
+                    // arithmetic and take this pane's share of a
+                    // horizontal split. An approximation only in where
+                    // the clamp lands mid-drag; the ratio itself is
+                    // anchored to the grab, like every divider here.
+                    let rail = if this.sessions.read(cx).collapsed {
+                        0.0
+                    } else {
+                        this.rail_w
+                    };
+                    let mut well_w = f32::from(window.viewport_size().width)
+                        - rail
+                        - 2.0 * theme::CARD_GUTTER
+                        - theme::RAIL_HANDLE_W;
+                    if let Some(s) = this.split.as_ref() {
+                        if !s.vertical {
+                            well_w -= theme::RAIL_HANDLE_W;
+                            let share = if s.left == for_tab {
+                                s.ratio
+                            } else if s.right == for_tab {
+                                1.0 - s.ratio
+                            } else {
+                                1.0
+                            };
+                            well_w *= share;
+                        }
+                    }
+                    this.devtools_drag = Some(SplitDrag {
+                        grab_x: f32::from(e.position.x),
+                        start_ratio: this.devtools_ratio,
+                        well_w: well_w.max(1.0),
+                    });
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(DevtoolsResize, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| DevtoolsResize)
+            })
+            .into_any_element()
+    }
+
     fn split_pane(
         &self,
         tab_id: &str,
@@ -8633,6 +8794,7 @@ impl Shell {
             .any(|t| t.id == tab_id && t.content == eave_wire::TabContent::Page);
         let page_el = if is_page {
             crate::web::page_element(tab_id, cx)
+                .map(|el| self.devtools_dock(tab_id, el, cx))
         } else {
             None
         };
@@ -16867,13 +17029,25 @@ impl Render for Shell {
             } else if let Some(a) = strip_snapshot.active.as_deref() {
                 push_page(a);
             }
+            // A shown page's open dock is shown WITH it. This is the only
+            // feed `was_hidden` has for a devtools browser (the reconciler
+            // derives its visibility from here), so omitting it would
+            // leave every dock rendering at full rate behind other tabs.
+            let docks: Vec<String> = ids
+                .iter()
+                .filter(|id| crate::web::devtools_open(id))
+                .map(|id| crate::web::devtools_id(id))
+                .collect();
+            ids.extend(docks);
             ids
         };
         crate::web::set_shown_pages(shown_pages);
 
         let page_el = {
             let active = strip_snapshot.active.clone();
-            active.and_then(|id| crate::web::page_element(&id, cx))
+            active.and_then(|id| {
+                crate::web::page_element(&id, cx).map(|el| self.devtools_dock(&id, el, cx))
+            })
         };
         // The page's own dialog. Computed here beside `page_el` because it
         // belongs to the same tab and is mounted in the same well — and
@@ -19048,6 +19222,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         rail_drag: None,
                         split: None,
                         split_drag: None,
+                        devtools_ratio: DEVTOOLS_RATIO,
+                        devtools_drag: None,
                         files_scroll: ScrollHandle::new(),
                         tabs_scroll: ScrollHandle::new(),
                         tab_scrolled_to: RefCell::new(None),

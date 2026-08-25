@@ -13716,6 +13716,39 @@ fn inspect_carries_the_page_space_point(cx: &mut TestAppContext) {
         Some((tab.to_string(), 240, 275)),
         "Inspect never reached the web module, or lost the point"
     );
+    // And the dock is OPEN from the click itself, not from Chromium's
+    // later `on_after_created` — the pane must stand on the next render.
+    assert!(
+        crate::web::devtools_open(tab),
+        "Inspect did not open the DevTools dock"
+    );
+}
+
+/// The dock's state machine, which is all a build without Chromium can
+/// see of it: Inspect opens, a second Inspect leaves it open (CEF
+/// retargets the existing frontend), and closing clears it for exactly
+/// that tab. The pane itself is a `page_element` on the `devtools:` id
+/// and only exists with the feature on.
+#[gpui::test]
+fn the_devtools_dock_opens_once_and_closes(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+    assert!(!crate::web::devtools_open(tab), "a dock nobody asked for");
+
+    crate::web::inspect_element(tab, 10, 10);
+    crate::web::inspect_element(tab, 20, 20);
+    assert!(crate::web::devtools_open(tab));
+    assert!(
+        !crate::web::devtools_open("someone-else"),
+        "one tab's Inspect opened every tab's dock"
+    );
+
+    crate::web::close_devtools(tab);
+    assert!(
+        !crate::web::devtools_open(tab),
+        "the dock survived its own close"
+    );
+    let _ = (h, vcx);
 }
 
 // Slice D3 stage 1 — the rail's geometry, and the fact that it moves.
