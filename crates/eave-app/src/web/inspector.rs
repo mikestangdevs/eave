@@ -51,6 +51,22 @@ thread_local! {
 /// green" for a day before the operator opened Inspect and settled it in a
 /// second. Read once — an env var that changed mid-session would make two
 /// runs of the same build disagree.
+///
+/// # It prints to stderr, and the documented launch path THROWS STDERR AWAY
+/// eave is launched with `open -n`, and a LaunchServices-launched app has no
+/// terminal attached. Without `--stderr` this probe runs, works, and shows
+/// you nothing — which reads exactly like the channel being broken. Both
+/// flags are needed, and the env one is `--env` rather than a shell prefix:
+///
+/// ```text
+/// open -n --env EAVE_CDP_EVAL=document.title \
+///         --stderr /tmp/eave.log <path>/eave.app
+/// ```
+///
+/// (A neighbouring doc claimed `open -n` passes no environment at all. It
+/// was never measured and is false; the missing terminal was the real
+/// cause. One symptom, wrong cause — worth knowing, because the same
+/// mistake would make this probe look dead.)
 fn probe_expression() -> Option<&'static str> {
     static EXPR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     EXPR.get_or_init(|| std::env::var("EAVE_CDP_EVAL").ok())
