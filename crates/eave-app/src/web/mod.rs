@@ -112,6 +112,13 @@ mod favicon_adapt;
 /// for why (06-browser G26).
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 mod ask;
+/// The DevTools protocol eave speaks: what goes on the wire, how a call is
+/// matched to its answer, and what an answer means. Compiled in BOTH
+/// feature states — `inspector`, the CEF half, is gated; this is not, so
+/// the default test run exercises the protocol rather than skipping it.
+/// See its module docs (06-browser E9).
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub mod cdp;
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
@@ -133,6 +140,8 @@ mod find;
 mod host;
 #[cfg(feature = "web")]
 mod input;
+#[cfg(feature = "web")]
+mod inspector;
 #[cfg(feature = "web")]
 mod menu;
 #[cfg(feature = "web")]
@@ -722,6 +731,14 @@ pub(crate) fn forget_page(tab_id: &str) {
     if !page_was_evicted(tab_id) {
         favicon::forget(tab_id);
     }
+    // Slice E9. A CDP call whose tab has gone is a caller waiting on an
+    // answer that can never arrive, so `forget_tab` answers them `Gone`
+    // rather than dropping them. Ungated on purpose: a tab closes in both
+    // feature states, and a cleanup only the `web` build ran would be one
+    // the default suite could never see fail.
+    #[cfg(feature = "web")]
+    inspector::forget_registration(tab_id);
+    cdp::forget_tab(tab_id);
 }
 
 // ── The four shims: everything above this line is eave's, everything
@@ -842,6 +859,90 @@ thread_local! {
 #[cfg(test)]
 pub fn take_inspect_for_test() -> Option<(String, i32, i32)> {
     TEST_INSPECTS.with(|i| i.borrow_mut().take())
+}
+
+// ---------------------------------------------------------------------------
+// E9 — the agent-drivable page
+// ---------------------------------------------------------------------------
+
+/// Send one CDP call to a tab's page; returns the id its answer will carry.
+///
+/// The send side of E9 in one function. Collect the answer with
+/// [`cdp::take`], which yields `None` until it lands — nothing here blocks,
+/// because the answer arrives on a later pump and blocking the UI thread
+/// waiting for Chromium is the deadlock this module is shaped to avoid.
+pub fn cdp_call(tab_id: &str, method: &str, params: &serde_json::Value) -> u32 {
+    #[cfg(test)]
+    TEST_CDP.with(|c| {
+        c.borrow_mut()
+            .push((tab_id.to_string(), method.to_string(), params.to_string()))
+    });
+    cef_cdp_send(tab_id, method, params)
+}
+
+#[cfg(feature = "web")]
+fn cef_cdp_send(tab_id: &str, method: &str, params: &serde_json::Value) -> u32 {
+    inspector::send(tab_id, method, params)
+}
+#[cfg(not(feature = "web"))]
+fn cef_cdp_send(tab_id: &str, method: &str, _params: &serde_json::Value) -> u32 {
+    // No Chromium, so nothing will answer on its own. The call is still
+    // ISSUED rather than refused, so the harness drives the real lifecycle
+    // — issue, answer, collect — against the same state the `web` build
+    // uses. A test supplies the answer with `cdp::complete`.
+    cdp::begin(tab_id, method)
+}
+
+/// Run JavaScript in a tab and get its value back. See [`cdp::evaluate`]
+/// for why the value and not a handle.
+pub fn cdp_evaluate(tab_id: &str, expression: &str) -> u32 {
+    let (method, params) = cdp::evaluate(expression);
+    cdp_call(tab_id, method, &params)
+}
+
+/// Click a point in page space. Two ids, because a click is two events and
+/// the release is the half a page's `click` listener waits for.
+pub fn cdp_click(tab_id: &str, x: f64, y: f64) -> [u32; 2] {
+    let [down, up] = cdp::click_events(x, y);
+    [
+        cdp_call(tab_id, down.0, &down.1),
+        cdp_call(tab_id, up.0, &up.1),
+    ]
+}
+
+/// Type text into whatever the page has focused.
+pub fn cdp_type(tab_id: &str, text: &str) -> u32 {
+    let (method, params) = cdp::insert_text(text);
+    cdp_call(tab_id, method, &params)
+}
+
+/// Capture the page as a PNG; the answer carries `"data"`, base64.
+pub fn cdp_screenshot(tab_id: &str) -> u32 {
+    let (method, params) = cdp::screenshot();
+    cdp_call(tab_id, method, &params)
+}
+
+/// Turn on the domains that make a tab report what it is doing — the E8
+/// half. Until this runs, Chromium says nothing unprompted, and the
+/// silence is indistinguishable from a page doing nothing.
+pub fn cdp_watch(tab_id: &str) -> Vec<u32> {
+    cdp::event_enables()
+        .iter()
+        .map(|(method, params)| cdp_call(tab_id, method, params))
+        .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CDP: std::cell::RefCell<Vec<(String, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test seam: every `cdp_call` since the last take, as
+/// `(tab_id, method, params-json)`.
+#[cfg(test)]
+pub fn take_cdp_calls_for_test() -> Vec<(String, String, String)> {
+    TEST_CDP.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// What Chromium currently has this tab's page at, as a zoom LEVEL.
@@ -1284,5 +1385,142 @@ mod tests {
             settled: false,
         };
         assert_eq!(f.tally().as_deref(), Some("1 of 17"));
+    }
+
+    // -----------------------------------------------------------------
+    // E9 — the agent-drivable page, through the public surface
+    // -----------------------------------------------------------------
+
+    /// The whole lifecycle: a call is issued, an answer is filed against
+    /// it, and it is collected once.
+    ///
+    /// Issued with [`cdp::begin`] rather than [`cdp_call`] on purpose. The
+    /// two builds legitimately differ at the send — with `web` on and no
+    /// browser, the call is answered `NotSent` before this test could look
+    /// at it — and that divergence is asserted directly by the pair of
+    /// tests below rather than smuggled into this one.
+    #[test]
+    fn a_cdp_call_is_issued_answered_and_collected_once() {
+        let id = cdp::begin("tab-e9", "Page.reload");
+        assert!(cdp::is_pending(id), "an issued call is outstanding");
+        assert_eq!(cdp::take(id), None, "no answer has arrived yet");
+
+        cdp::complete(id, cdp::Outcome::Ok(r#"{"ok":true}"#.into()));
+        assert!(!cdp::is_pending(id), "an answered call is no longer waiting");
+        assert_eq!(
+            cdp::take(id),
+            Some(cdp::Outcome::Ok(r#"{"ok":true}"#.into()))
+        );
+        assert_eq!(cdp::take(id), None, "an answer is collected once");
+    }
+
+    /// Closing a tab must ANSWER its outstanding calls, not drop them: a
+    /// caller polling for an answer that can never arrive is a hang, and
+    /// this is exactly when it would happen.
+    #[test]
+    fn closing_a_tab_answers_the_calls_it_owed() {
+        let mine = cdp::begin("tab-closing", "Page.captureScreenshot");
+        let other = cdp::begin("tab-staying", "Page.captureScreenshot");
+        forget_page("tab-closing");
+        assert_eq!(cdp::take(mine), Some(cdp::Outcome::Gone));
+        assert!(
+            cdp::is_pending(other),
+            "another tab's call is not collateral"
+        );
+    }
+
+    /// **The two builds diverge here, deliberately.** With no Chromium
+    /// there is nothing to answer, so the call stays open and the harness
+    /// supplies the answer — which is what lets the feature-OFF suite drive
+    /// the real lifecycle instead of a mock of it.
+    #[cfg(not(feature = "web"))]
+    #[test]
+    fn with_no_chromium_a_call_stays_open_for_the_harness_to_answer() {
+        let id = cdp_call("tab-e9", "Page.reload", &serde_json::json!({}));
+        assert!(cdp::is_pending(id));
+        assert_eq!(cdp::take(id), None);
+    }
+
+    /// The other half of that divergence, and the property that matters in
+    /// the shipping build: a call to a tab with **no live browser** is
+    /// answered `NotSent` at once rather than left outstanding. A caller
+    /// polling [`cdp::take`] therefore terminates whether or not the page
+    /// was evicted between deciding to call and calling.
+    #[cfg(feature = "web")]
+    #[test]
+    fn with_no_browser_a_call_answers_not_sent_rather_than_hanging() {
+        let id = cdp_call("tab-with-no-browser", "Page.reload", &serde_json::json!({}));
+        assert!(!cdp::is_pending(id), "it did not stay outstanding");
+        assert_eq!(cdp::take(id), Some(cdp::Outcome::NotSent));
+    }
+
+    /// `cdp_evaluate` must ask for a value. Without `returnByValue` the
+    /// call SUCCEEDS and hands back an object handle, so an agent reading
+    /// `result.value` gets nothing with no error anywhere.
+    #[test]
+    fn evaluating_asks_chromium_for_a_value() {
+        let _ = take_cdp_calls_for_test();
+        cdp_evaluate("tab-e9", "document.title");
+        let calls = take_cdp_calls_for_test();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "Runtime.evaluate");
+        let params: serde_json::Value = serde_json::from_str(&calls[0].2).unwrap();
+        assert_eq!(params["returnByValue"], true);
+        assert_eq!(params["expression"], "document.title");
+    }
+
+    /// A click is two calls. One `mousePressed` is not a click, and a page
+    /// listening for `click` never fires on it.
+    #[test]
+    fn a_click_reaches_the_page_as_two_calls() {
+        let _ = take_cdp_calls_for_test();
+        let ids = cdp_click("tab-e9", 4.0, 9.0);
+        assert_ne!(ids[0], ids[1], "each half has its own id to answer on");
+        let calls = take_cdp_calls_for_test();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|c| c.1 == "Input.dispatchMouseEvent"));
+    }
+
+    /// Typing is one call whatever the length, and it carries the text
+    /// verbatim — including characters no keycode names.
+    #[test]
+    fn typing_is_one_call_that_carries_the_text() {
+        let _ = take_cdp_calls_for_test();
+        cdp_type("tab-e9", "héllo ⌘");
+        let calls = take_cdp_calls_for_test();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "Input.insertText");
+        let params: serde_json::Value = serde_json::from_str(&calls[0].2).unwrap();
+        assert_eq!(params["text"], "héllo ⌘");
+    }
+
+    /// Nothing is reported until the domains are enabled, so `cdp_watch`
+    /// is what makes E8 a feed rather than a silence.
+    #[test]
+    fn watching_a_tab_enables_the_three_reporting_domains() {
+        let _ = take_cdp_calls_for_test();
+        let ids = cdp_watch("tab-e9");
+        assert_eq!(ids.len(), 3);
+        let methods: Vec<String> = take_cdp_calls_for_test()
+            .into_iter()
+            .map(|c| c.1)
+            .collect();
+        assert!(methods.contains(&"Network.enable".to_string()));
+        assert!(methods.contains(&"Log.enable".to_string()));
+        assert!(methods.contains(&"Runtime.enable".to_string()));
+    }
+
+    /// Every call goes to the tab it names — one queue serves them all, so
+    /// a screenshot must not answer another tab's page.
+    #[test]
+    fn a_call_is_addressed_to_the_tab_it_names() {
+        let _ = take_cdp_calls_for_test();
+        cdp_screenshot("tab-alpha");
+        cdp_screenshot("tab-beta");
+        let tabs: Vec<String> = take_cdp_calls_for_test()
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(tabs, vec!["tab-alpha".to_string(), "tab-beta".to_string()]);
     }
 }

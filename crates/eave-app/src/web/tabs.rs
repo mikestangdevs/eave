@@ -1608,6 +1608,10 @@ wrap_load_handler! {
             // default and the header would say 100% over a zoomed page,
             // which is the bug this replaced.
             super::zoom_sync(&self.tab_id);
+            // E9's instrument. `EAVE_CDP_EVAL=<expr>` drives this page once
+            // per load and prints its own answer; a no-op with the var
+            // unset, which is every ordinary run.
+            super::inspector::probe_on_load(&self.tab_id);
             // A loaded page means some browser is usable, which is what a
             // bookmark's favicon fetch needs and could not assume at boot.
             super::favicon::note_page_loaded();
