@@ -9306,9 +9306,11 @@ impl Shell {
         };
         // The card paints one `content_plate` behind this strip AND the
         // page, so without a seam the toolbar and the document are one
-        // surface. 1 px, inside the existing height — a sibling rule
-        // would move the page, and a `border_b` on a rounded card
-        // curved at the ends (the rail's `zone_rule` finding).
+        // surface. Same ink as the card's own rim (`card_border`) —
+        // `border_strong` read as a second, lighter line. 2 px (operator),
+        // inside the existing height — a sibling rule would move the
+        // page, and a `border_b` on a rounded card curved at the ends
+        // (the rail's `zone_rule` finding).
         div()
             .debug_selector(move || tag.into())
             .w_full()
@@ -9323,8 +9325,8 @@ impl Shell {
                     .left_0()
                     .right_0()
                     .bottom_0()
-                    .h(px(theme::HAIRLINE))
-                    .bg(theme::border_strong()),
+                    .h(px(theme::HAIRLINE * 2.0))
+                    .bg(theme::card_border()),
             )
     }
 
