@@ -803,6 +803,10 @@ pub fn close_devtools(tab_id: &str) {
     DEVTOOLS_OPEN.with(|d| {
         d.borrow_mut().remove(tab_id);
     });
+    // A rect outlives its frontend otherwise, and the NEXT dock would
+    // open with the page already placed where the last one had it — before
+    // this frontend has said anything.
+    clear_dock_page_rect(tab_id);
     cef_close_devtools(tab_id);
 }
 
@@ -816,6 +820,7 @@ pub(crate) fn devtools_note_closed(id: &str) {
         DEVTOOLS_OPEN.with(|d| {
             d.borrow_mut().remove(&parent);
         });
+        clear_dock_page_rect(&parent);
         // The browser closed itself (or finished a Close we asked for).
         // Nothing else would redraw: a dying frontend delivers no frame.
         #[cfg(feature = "web")]
@@ -1266,6 +1271,75 @@ pub fn page_focus_handle(
 /// No page engine, so Chromium has nothing to focus.
 #[cfg(not(feature = "web"))]
 pub fn set_keyboard_page(_tab_id: Option<&str>) {}
+
+/// Where the DevTools frontend says the inspected page belongs, in CSS
+/// pixels of the frontend's viewport — which are the well's logical
+/// pixels, because the frontend browser covers the whole well.
+///
+/// **This is eave being the embedder.** Chrome's DevTools window is
+/// driven by C++ that answers `setInspectedPageBounds`; a frontend served
+/// over http gets `InspectorFrontendHostStub`, where that method is
+/// literally `setInspectedPageBounds(r){}`. The rect therefore comes back
+/// the only way it can — measured off the placeholder element and printed
+/// on the console, since the host object is not reachable from page
+/// script. See `tabs::DOCK_SHIM_JS`.
+///
+/// Ungated and parsed here rather than in `tabs.rs` so the default suite
+/// holds the decision: a malformed rect must be REFUSED, not clamped into
+/// something plausible, because a plausible-but-wrong rect puts the page
+/// somewhere quietly incorrect and the failure is only visible.
+pub fn parse_dock_bounds(s: &str) -> Option<(f32, f32, f32, f32)> {
+    let mut it = s.split(',');
+    let mut next = || it.next()?.trim().parse::<f32>().ok();
+    let (x, y, w, h) = (next()?, next()?, next()?, next()?);
+    if it.next().is_some() {
+        return None;
+    }
+    // A zero or negative extent is not a placement, and neither is a
+    // non-finite one. Refusing leaves the last good rect standing.
+    if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) {
+        return None;
+    }
+    if w <= 0.0 || h <= 0.0 || x < 0.0 || y < 0.0 {
+        return None;
+    }
+    Some((x, y, w, h))
+}
+
+thread_local! {
+    static DOCK_PAGE_RECTS: std::cell::RefCell<
+        std::collections::HashMap<String, (f32, f32, f32, f32)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record where a tab's page should sit inside its dock. Returns whether
+/// this actually moved anything, so a caller can avoid asking for a
+/// repaint on every unchanged report.
+pub fn set_dock_page_rect(tab_id: &str, rect: (f32, f32, f32, f32)) -> bool {
+    DOCK_PAGE_RECTS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.get(tab_id) == Some(&rect) {
+            return false;
+        }
+        m.insert(tab_id.to_string(), rect);
+        true
+    })
+}
+
+/// `None` until the frontend has reported — which is what the shell's
+/// fallback keys off, so a dock whose frontend never reports stays on the
+/// old side-by-side layout instead of losing the page entirely.
+pub fn dock_page_rect(tab_id: &str) -> Option<(f32, f32, f32, f32)> {
+    DOCK_PAGE_RECTS.with(|m| m.borrow().get(tab_id).copied())
+}
+
+/// Dropped when the dock closes: a stale rect would place the page inside
+/// a frontend that is no longer there the next time one opens.
+pub fn clear_dock_page_rect(tab_id: &str) {
+    DOCK_PAGE_RECTS.with(|m| {
+        m.borrow_mut().remove(tab_id);
+    });
+}
 
 /// No page engine, so there is no stale frame to stretch — but the
 /// SHELL's half of the rule is still worth pinning here, which is why

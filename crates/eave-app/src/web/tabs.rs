@@ -1116,6 +1116,25 @@ static PENDING_DOCKS: std::sync::Mutex<Vec<(String, Option<String>)>> =
 /// same reason: this creates browsers, and browser creation is not
 /// something to do from a worker thread or from inside a CEF callback.
 pub(super) fn run_queued_docks() {
+    // Closes first, and BEFORE the early return below — the dock queue is
+    // empty on almost every pump, so draining closes after it would mean
+    // the frontend's ✕ only worked while another dock was being opened.
+    let closing = match PENDING_DOCK_CLOSES.lock() {
+        Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+        _ => Vec::new(),
+    };
+    for dt_id in closing {
+        if let Some(parent) = super::devtools_parent(&dt_id) {
+            // The same call the page-menu row and ⌘⌥I make. The close path
+            // itself stays untouched.
+            super::close_devtools(parent);
+        }
+        // No page frame is coming to carry the pane's disappearance onto
+        // the screen — the shell has to be told the chrome changed, the
+        // same reason the context menu says so. See `note_chrome_change`.
+        super::host::note_chrome_change();
+    }
+
     let queued = match PENDING_DOCKS.lock() {
         Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
         _ => return,
@@ -1221,30 +1240,39 @@ fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
     // also the one that must be used on principle: a browser's devtools
     // should not be a fetch from a third-party host.
     let ws = pick["webSocketDebuggerUrl"].as_str()?.strip_prefix("ws://")?;
-    // **`devtools_app.html`, and deliberately NO `can_dock`.** Both were
-    // measured against the live dock; both were wrong the other way first.
+    // **`devtools_app.html` WITH `can_dock=true`.** Both halves were
+    // wrong the other way first, and the second one twice.
     //
     // `inspector.html` is Chrome's FALLBACK entrypoint
     // (`devtools_window.cc`: `kFallbackFrontendURL`); `devtools_app.html`
     // is `kDefaultFrontendURL`, the one every docked window actually gets.
     //
-    // `can_dock=true` looked right — it is what Chrome appends, and it did
-    // stop the frontend opening the screencast app. But the frontend then
-    // runs `AdvancedApp`, which keeps a pane for the INSPECTED PAGE and
-    // only gives it up once the embedder confirms the dock. eave is not
-    // that embedder — the host object here is the stub every hosted
-    // frontend gets — so the confirmation never came, `document.body`
-    // stayed `undocked`, and the pane stood empty: 150 px of grey between
-    // eave's page and the panels. Without the flag the frontend is the
-    // screencast app instead, whose empty pane DOES collapse, once the
-    // screencast setting is off — which is what `devtools_settle_frontend`
-    // does from inside the page.
+    // **`can_dock` is not optional, because DevTools' own close button is
+    // gated on it.** Read from the frontend this build serves
+    // (`ui/legacy/legacy.js`, `DockController`):
     //
-    // Measured: with `can_dock` the split is `151:350 , 0:150` and the
-    // body class is `undocked`; without it, and with screencast off, there
-    // is no split at all and the panels have the full 501.
+    //   if (!canDock) { this.#dockSide = "undocked";
+    //                   this.closeButton.setVisible(false); return; }
+    //   ...
+    //   this.closeButton.setVisible(this.#dockSide !== "undocked");
+    //
+    // So the real ✕ exists only with `can_dock` AND an actual dock side.
+    // There is no configuration with the button and without docking, and
+    // no button eave appends by hand is ever in the right place — the
+    // button is a registered toolbar ITEM, positioned by DevTools.
+    //
+    // The cost, which an earlier pass measured and blamed correctly:
+    // `can_dock` loads `AdvancedApp`, whose root split reserves a pane for
+    // the INSPECTED PAGE and asks the embedder to size it through
+    // `setInspectedPageBounds` — a literal no-op on the stub host every
+    // hosted frontend gets. Nothing sized it, so it stood empty: the 150 px
+    // grey band.
+    //
+    // eave now fills that pane, which is what makes the flag affordable:
+    // the frontend browser covers the whole well and eave paints its page
+    // into the rect the placeholder reports. See `DOCK_SHIM_JS`.
     Some(format!(
-        "http://127.0.0.1:{}/devtools/devtools_app.html?ws={}",
+        "http://127.0.0.1:{}/devtools/devtools_app.html?ws={}&can_dock=true",
         super::host::DEVTOOLS_PORT,
         ws
     ))
@@ -1259,30 +1287,209 @@ fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
 /// **once per profile**, after which the value persists and this is a
 /// no-op. `getItem` immediately after `setItem` is what makes it exactly
 /// once rather than a reload loop.
+/// The sentinel the injected close prints. Matched exactly, and only on a
+/// `devtools:` browser, so a page that logs the same string cannot shut
+/// anyone's panel.
+pub(super) const DOCK_CLOSE_SENTINEL: &str = "EAVE_DOCK_CLOSE";
+
+/// The rect DevTools reserves for the inspected page, in CSS pixels of
+/// the frontend's own viewport. Because the frontend browser covers the
+/// whole well, those are the well's logical pixels, which is what makes
+/// the mapping in `ui.rs` a straight copy rather than a conversion.
+pub(super) const DOCK_BOUNDS_SENTINEL: &str = "EAVE_DOCK_BOUNDS";
+
+/// Two shims, injected into the frontend on every load of a `devtools:`
+/// browser.
+///
+/// **1. `screencast-enabled=false`.** Without `can_dock` the frontend runs
+/// the screencast app, whose pane collapses only once this is off. It
+/// lives in `localStorage` on the frontend's own origin, so nothing
+/// outside the page can seed it: the page sets it and reloads once per
+/// profile.
+///
+/// **2. The close button, appended to the frontend's own toolbar.**
+///
+/// The operator asked for Chrome's placement — in the panel, in the row
+/// with the gear and the kebab — and eave cannot get there any other way.
+/// Chrome's own ✕ exists only under `can_dock`, which is ruled out (it
+/// makes the frontend hold a permanently empty pane waiting for an
+/// embedder confirmation a hosted frontend can never send; dock report
+/// §4). An eave-drawn ✕ floated over that corner would cover the kebab,
+/// and an eave-drawn strip above the panel — the first thing tried — is
+/// what the operator rejected as "outside of the panel".
+///
+/// So the button is a child of `.tabbed-pane-header`, appended after the
+/// frontend's own controls. It inherits the toolbar's colour and metrics,
+/// which is why it tracks the DevTools theme for free and why there is no
+/// geometry for eave to get wrong. **This replaces the reserved
+/// `paddingRight` strip**, which existed only to keep an eave overlay off
+/// the gear and would now be a gap.
+///
+/// **This is a second load-bearing shim into a versioned Chromium bundle,
+/// and that is a real cost, taken deliberately.** The dead-end report
+/// argued against exactly this. What changes the answer is that the
+/// operator has now twice asked for the in-panel placement, and the
+/// alternatives that avoid injection cannot produce it. The dependency is
+/// one selector — `.tabbed-pane-header`, which the padding shim already
+/// relied on — and it degrades visibly rather than silently: if the
+/// selector stops matching after a Chromium bump, the retry loop gives up
+/// and the panel simply has no ✕, leaving ⌘⌥I and the page-menu row. It
+/// cannot break Inspect, and it cannot close a dock nobody asked to close.
+///
+/// The `MutationObserver` is not belt-and-braces: the frontend rebuilds
+/// that header when panels change, and a button appended once would
+/// quietly vanish the first time the operator clicked Network.
+/// **The toolbar is inside a SHADOW ROOT, which is why this walks.**
+/// `TabbedPane` is constructed `{useShadowDom: !0}`, so
+/// `document.querySelector('.tabbed-pane-header')` returns `null` no
+/// matter how long it is retried. The padding shim that shipped in
+/// `67515c6` used exactly that selector from `document` and has therefore
+/// **never done anything** — a silent no-op nobody could see, since its
+/// only effect would have been a gap. Verified against the frontend this
+/// build actually serves (`GET /devtools/ui/legacy/legacy.js`): the class
+/// is present, the header is `display:flex; flex:0 0 27px`, and the
+/// gear/kebab arrive through a `<slot name="right">`, so a child appended
+/// to the header lands after them — which is the placement asked for.
+///
+/// `__EAVE_SENTINEL__` is substituted rather than `format!`-interpolated
+/// so the JavaScript can be read without every brace doubled.
+const DOCK_SHIM_JS: &str = r#"
+(function(){
+  try{
+    // Seeded once, then never fought again: if the operator later docks
+    // left or bottom, `eave-dock-seeded` stops us forcing it back.
+    var need=false;
+    if(localStorage.getItem('screencast-enabled')!=='false'){
+      localStorage.setItem('screencast-enabled','false'); need=true;
+    }
+    if(!localStorage.getItem('eave-dock-seeded')){
+      localStorage.setItem('currentDockState','"right"');
+      localStorage.setItem('eave-dock-seeded','1');
+      need=true;
+    }
+    if(need){ location.reload(); return; }
+
+    var deep=function(sel,root,depth){
+      root=root||document; depth=depth||0;
+      if(depth>12) return null;
+      var el=root.querySelector(sel);
+      if(el) return el;
+      var all=root.querySelectorAll('*');
+      for(var i=0;i<all.length;i++){
+        var sr=all[i].shadowRoot;
+        if(sr){ var r=deep(sel,sr,depth+1); if(r) return r; }
+      }
+      return null;
+    };
+
+    // The placeholder is the hole DevTools reserves for the inspected
+    // page. `AdvancedApp` is on globalThis, which is the cheap route;
+    // `.split-widget-main` is the fallback if that ever stops being
+    // exported. NOTE the host object itself is NOT reachable from page
+    // script, so overriding `setInspectedPageBounds` is not an option —
+    // we read the rect off the element instead.
+    var cachedPh=null;
+    var placeholderEl=function(){
+      if(cachedPh&&cachedPh.isConnected) return cachedPh;
+      try{
+        var A=globalThis.Emulation&&globalThis.Emulation.AdvancedApp;
+        if(A&&A.instance){
+          var app=A.instance();
+          if(app&&app.inspectedPagePlaceholder&&app.inspectedPagePlaceholder.element){
+            cachedPh=app.inspectedPagePlaceholder.element;
+            return cachedPh;
+          }
+        }
+      }catch(e){}
+      cachedPh=deep('.split-widget-main');
+      return cachedPh;
+    };
+
+    var lastB='';
+    var report=function(){
+      var el=placeholderEl();
+      if(!el) return;
+      var r=el.getBoundingClientRect();
+      if(!r.width||!r.height) return;
+      var m=Math.round(r.left)+','+Math.round(r.top)+','+
+            Math.round(r.width)+','+Math.round(r.height);
+      if(m===lastB) return;
+      lastB=m;
+      console.log('__EAVE_BOUNDS__ '+m);
+    };
+
+    // DevTools' OWN close button. Its Click handler is bound to the host
+    // stub at construction, so the method cannot be overridden after the
+    // fact — a DOM listener beside it is the version-stable way in. The
+    // bound no-op still runs and does nothing, which is what it did
+    // before.
+    var closeEl=null;
+    var wireClose=function(){
+      if(closeEl&&closeEl.isConnected) return true;
+      var b=deep('.close-devtools');
+      if(!b) return false;
+      closeEl=b;
+      if(!b.getAttribute('data-eave-wired')){
+        b.setAttribute('data-eave-wired','1');
+        b.addEventListener('click',function(){ console.log('__EAVE_CLOSE__'); },true);
+      }
+      return true;
+    };
+
+    // Device mode arrives with can_dock, but eave does not apply the
+    // emulation parameters to the page, so the frame would lie. Hidden
+    // until it is real.
+    var dmDone=false;
+    var hideDeviceMode=function(){
+      if(dmDone) return true;
+      var d=deep('[jslog*="toggle-device-mode"]')||deep('[aria-label*="device toolbar"]');
+      if(!d||!d.style) return false;
+      d.style.display='none';
+      dmDone=true;
+      return true;
+    };
+
+    var tick=function(){ wireClose(); hideDeviceMode(); report(); };
+    tick();
+    setInterval(tick,250);
+    if(window.ResizeObserver){
+      try{
+        var ro=new ResizeObserver(report);
+        var el=placeholderEl();
+        if(el) ro.observe(el);
+      }catch(e){}
+    }
+    window.addEventListener('resize',report);
+  }catch(e){}
+})();
+"#;
+
 fn devtools_settle_frontend(frame: &mut Frame) {
-    // The overlay close sits in a reserved strip on the header's trailing
-    // edge so it does not cover the frontend's gear. Size is the overlay
-    // itself ([`theme::ICON_TOGGLE`]) plus its inset ([`theme::SPACE_1`]).
-    let pad = crate::theme::ICON_TOGGLE + crate::theme::SPACE_1;
-    let shim = format!(
-        "(function(){{\
-           try {{\
-             if (localStorage.getItem('screencast-enabled') !== 'false') {{\
-               localStorage.setItem('screencast-enabled', 'false');\
-               location.reload();\
-               return;\
-             }}\
-             var n=0;\
-             var f=function(){{\
-               var h=document.querySelector('.tabbed-pane-header');\
-               if(h) h.style.paddingRight='{pad:.0}px';\
-               else if(++n<60) requestAnimationFrame(f);\
-             }};\
-             f();\
-           }} catch (e) {{}}\
-         }})();"
-    );
+    let shim = DOCK_SHIM_JS
+        .replace("__EAVE_CLOSE__", DOCK_CLOSE_SENTINEL)
+        .replace("__EAVE_BOUNDS__", DOCK_BOUNDS_SENTINEL);
     frame.execute_java_script(Some(&CefString::from(shim.as_str())), None, 0);
+}
+
+/// Docks whose frontend asked to be closed, drained on the UI thread by
+/// [`run_queued_docks`].
+///
+/// **Queued rather than closed on the spot, deliberately.** The request
+/// arrives inside `on_console_message` — a CEF callback, on Chromium's own
+/// stack, for the very browser that would be destroyed. Closing a browser
+/// from inside one of its own callbacks is the shape this process has
+/// already been bitten by, and the close/resize dead end is explicit that
+/// the close path is not to be improvised on. This puts the close exactly
+/// where the *open* already happens.
+static PENDING_DOCK_CLOSES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn queue_dock_close(dt_id: &str) {
+    if let Ok(mut q) = PENDING_DOCK_CLOSES.lock() {
+        if !q.iter().any(|x| x == dt_id) {
+            q.push(dt_id.to_string());
+        }
+    }
+    super::host::request_pump();
 }
 
 /// `GET /json/list` from the local endpoint. Blocking but bounded — it is
@@ -2482,6 +2689,32 @@ wrap_display_handler! {
             source: Option<&CefString>,
             line: i32,
         ) -> i32 {
+            // The frontend's own close, asking to be shut. Two conditions,
+            // both required: the exact sentinel, and a `devtools:` browser
+            // — so an ordinary page that happens to log the same string
+            // cannot close anybody's panel. Answering 1 keeps it out of
+            // Chromium's log, since it is a message to eave and not a
+            // console line anyone wants to read.
+            if let Some(parent) = super::devtools_parent(&self.tab_id) {
+                let msg = message.map(|m| m.to_string()).unwrap_or_default();
+                if msg == DOCK_CLOSE_SENTINEL {
+                    queue_dock_close(&self.tab_id);
+                    return 1;
+                }
+                if let Some(rest) = msg.strip_prefix(DOCK_BOUNDS_SENTINEL) {
+                    // The frontend telling eave where the page goes. eave
+                    // is the embedder for this one call, which is the
+                    // whole of the docking contract it can honour.
+                    if let Some(rect) = super::parse_dock_bounds(rest.trim()) {
+                        if super::set_dock_page_rect(parent, rect) {
+                            // Only the page MOVED — no page frame is
+                            // coming to carry that onto the screen.
+                            super::host::note_chrome_change();
+                        }
+                    }
+                    return 1;
+                }
+            }
             if trace() {
                 eprintln!(
                     "[web] console {:?} {}:{} {}",

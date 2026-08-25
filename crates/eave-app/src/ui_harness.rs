@@ -13751,6 +13751,68 @@ fn the_devtools_dock_opens_once_and_closes(cx: &mut TestAppContext) {
     let _ = (h, vcx);
 }
 
+/// **A rect eave cannot trust is refused, not clamped.**
+///
+/// This is the one place the docking contract can be held by a test: the
+/// rect arrives as text on the frontend's console, and everything after
+/// it is pixels. A malformed report that got clamped into something
+/// plausible would put the page somewhere quietly wrong — and the only
+/// symptom is visual, so nothing downstream would catch it. Refusing
+/// leaves the last good rect standing, which is the safe wrong answer.
+#[gpui::test]
+fn a_malformed_dock_rect_is_refused_rather_than_guessed(_cx: &mut TestAppContext) {
+    use crate::web::parse_dock_bounds as p;
+
+    assert_eq!(p("0,0,800,600"), Some((0., 0., 800., 600.)));
+    assert_eq!(p(" 12 , 34 , 56 , 78 "), Some((12., 34., 56., 78.)));
+
+    for bad in [
+        "",              // nothing at all
+        "0,0,800",       // short — three numbers is not a rect
+        "0,0,800,600,7", // long — an extra field means a different format
+        "0,0,800,abc",   // not a number
+        "0,0,0,600",     // zero width is not a placement
+        "0,0,800,0",     // zero height either
+        "0,0,-800,600",  // negative extent
+        "-1,0,800,600",  // outside the frontend's own viewport
+        "0,0,NaN,600",   // non-finite
+        "0,0,inf,600",
+    ] {
+        assert_eq!(p(bad), None, "{bad:?} was accepted as a page rect");
+    }
+}
+
+/// **No rect means the old layout, not a lost page.**
+///
+/// `dock_page_rect` is `None` for every frame between Inspect and the
+/// frontend's first report — and for ever if the shim never runs at all,
+/// which a Chromium bump could cause without any eave change. The shell
+/// must fall back to the side-by-side dock rather than render a page with
+/// nowhere to be.
+#[gpui::test]
+fn a_dock_with_no_reported_rect_keeps_the_old_layout(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    assert_eq!(
+        crate::web::dock_page_rect(tab),
+        None,
+        "a rect before any frontend said anything"
+    );
+
+    crate::web::set_dock_page_rect(tab, (100., 0., 700., 600.));
+    assert_eq!(crate::web::dock_page_rect(tab), Some((100., 0., 700., 600.)));
+
+    // Closing must drop it: the next dock would otherwise open with the
+    // page already placed where the last one had it.
+    crate::web::close_devtools(tab);
+    assert_eq!(
+        crate::web::dock_page_rect(tab),
+        None,
+        "the rect outlived the frontend that reported it"
+    );
+}
+
 /// **A divider that is let go stops stretching.** While one of eave's
 /// dividers is dragged, the page surfaces paint their last CEF frame
 /// stretched to the new bounds — without that, the pane that is growing
