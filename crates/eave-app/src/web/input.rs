@@ -32,11 +32,13 @@
 //! Japanese cannot be typed at all. That is the next slice, and it is
 //! deliberately not started in this one.
 
+use std::cell::Cell;
+
 use cef::sys::cef_event_flags_t;
 use cef::{
     Browser, ImplBrowser, ImplBrowserHost, KeyEvent, KeyEventType, MouseButtonType, MouseEvent,
 };
-use gpui::{Keystroke, Modifiers, Pixels, Point};
+use gpui::{Keystroke, Modifiers, Pixels, Point, ScrollDelta, ScrollWheelEvent};
 
 /// CEF's modifier bitfield from gpui's modifiers.
 pub fn flags(m: &Modifiers) -> u32 {
@@ -91,9 +93,80 @@ pub fn mouse_button(
     }
 }
 
-pub fn wheel(browser: &Browser, at: Point<Pixels>, m: &Modifiers, dx: i32, dy: i32) {
+/// Chromium `ui::kScrollbarPixelsPerCocoaTick` — pixels per notchy-wheel
+/// tick on macOS (`ui/events/cocoa/cocoa_event_utils.h`). Arc/Chrome
+/// convert `-[NSEvent deltaY]` with this; gpui reports those ticks as
+/// `ScrollDelta::Lines`. We used to multiply by the window line-height
+/// (~21) instead, so a mouse wheel was about half of Arc.
+const COCOA_TICK_PX: f32 = 40.0;
+
+thread_local! {
+    /// Sub-pixel remainder of the last wheel. CEF's `SendMouseWheelEvent`
+    /// takes `int`; a trackpad tick is often 0.3–0.9 px, which truncated
+    /// to 0 and was dropped (`deltaX == 0 && deltaY == 0` is a no-op in
+    /// CEF). Gentle scrolls felt sticky and a flick lost the small events
+    /// in the gesture.
+    static WHEEL_FRAC: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+fn take_pixels(dx: f32, dy: f32) -> (i32, i32) {
+    WHEEL_FRAC.with(|cell| {
+        let (mut rx, mut ry) = cell.get();
+        if dx != 0.0 && rx != 0.0 && dx.signum() != rx.signum() {
+            rx = 0.0;
+        }
+        if dy != 0.0 && ry != 0.0 && dy.signum() != ry.signum() {
+            ry = 0.0;
+        }
+        let x = rx + dx;
+        let y = ry + dy;
+        let ix = x.trunc();
+        let iy = y.trunc();
+        cell.set((x - ix, y - iy));
+        (ix as i32, iy as i32)
+    })
+}
+
+/// Pixel deltas for `SendMouseWheelEvent`, plus whether they are
+/// trackpad-precise (so we can set `EVENTFLAG_PRECISION_SCROLLING_DELTA`).
+///
+/// Trackpad / Magic Mouse: gpui already reports pixels — NSEvent
+/// `scrollingDelta`, which Chromium treats as
+/// `kCGScrollWheelEventPointDelta`. Notchy wheel: gpui reports lines;
+/// Chrome multiplies by [`COCOA_TICK_PX`], not font size.
+pub fn wheel_delta(ev: &ScrollWheelEvent) -> (i32, i32, bool) {
+    match ev.delta {
+        ScrollDelta::Pixels(p) => {
+            let (dx, dy) = take_pixels(f32::from(p.x), f32::from(p.y));
+            (dx, dy, true)
+        }
+        ScrollDelta::Lines(l) => {
+            let (dx, dy) = take_pixels(l.x * COCOA_TICK_PX, l.y * COCOA_TICK_PX);
+            (dx, dy, false)
+        }
+    }
+}
+
+pub fn wheel(
+    browser: &Browser,
+    at: Point<Pixels>,
+    m: &Modifiers,
+    dx: i32,
+    dy: i32,
+    precise: bool,
+) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
     if let Some(host) = browser.host() {
-        host.send_mouse_wheel_event(Some(&event(at, m)), dx, dy);
+        let mut ev = event(at, m);
+        if precise {
+            // Tells Chromium the deltas are pixels, not WHEEL_DELTA ticks.
+            // CEF's Mac translator already hardcodes `kScrollByPrecisePixel`,
+            // but Aura (and anything that reads the modifier) does not.
+            ev.modifiers |= cef_event_flags_t::EVENTFLAG_PRECISION_SCROLLING_DELTA.0;
+        }
+        host.send_mouse_wheel_event(Some(&ev), dx, dy);
     }
 }
 

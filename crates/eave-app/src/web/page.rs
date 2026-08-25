@@ -236,19 +236,21 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 super::host::note_activity();
                 super::host::request_pump();
             })
-            .on_scroll_wheel(move |ev, window, _cx| {
+            .on_scroll_wheel(move |ev, _window, cx| {
                 super::tabs::with_browser(&wheel_id, |b| {
-                    let d = ev.delta.pixel_delta(window.line_height());
+                    let (dx, dy, precise) = input::wheel_delta(ev);
                     input::wheel(
                         b,
                         to_page(&wheel_id, ev.position),
                         &ev.modifiers,
-                        f32::from(d.x) as i32,
-                        f32::from(d.y) as i32,
+                        dx,
+                        dy,
+                        precise,
                     );
                 });
                 super::host::note_activity();
                 super::host::request_pump();
+                cx.stop_propagation();
             })
             .on_key_down(move |ev, _window, _cx| {
                 // **Not while the find bar is up, and the capture rig is
