@@ -32,6 +32,10 @@ thread_local! {
     /// render would mean focus was lost on every frame — which is not a
     /// subtle bug, it is "typing does nothing".
     static FOCUS: RefCell<HashMap<String, FocusHandle>> = RefCell::new(HashMap::new());
+    /// Which tab last had `CefBrowserHost::SetFocus(true)`. Gated so a
+    /// render that already put the keyboard here does not re-enter
+    /// Chromium every frame.
+    static CEF_FOCUS: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn focus_handle(tab_id: &str, cx: &mut App) -> FocusHandle {
@@ -41,6 +45,46 @@ fn focus_handle(tab_id: &str, cx: &mut App) -> FocusHandle {
             .or_insert_with(|| cx.focus_handle())
             .clone()
     })
+}
+
+/// This tab's gpui focus handle — the same one [`page_element`] tracks.
+///
+/// `None` when the tab has no live browser. Focusing a handle whose
+/// element is not in the tree is how the whole window's actions go
+/// silent (Slice CM); callers must only use this when the page is
+/// mounted.
+pub fn page_focus_handle(tab_id: &str, cx: &mut App) -> Option<FocusHandle> {
+    if !super::tabs::has_browser(tab_id) {
+        return None;
+    }
+    Some(focus_handle(tab_id, cx))
+}
+
+/// Tell Chromium which page, if any, owns the keyboard.
+///
+/// gpui focus and CEF focus are two knobs. Clicking the page already
+/// turns both; `Shell::sync_composer_focus` used to turn only gpui's,
+/// and it turned it onto the *shell*, so a document never kept either.
+/// Site shortcuts (`/` on GitHub, `j`/`k` on a feed) listen in the
+/// page and never fired.
+pub fn set_keyboard_page(tab_id: Option<&str>) {
+    CEF_FOCUS.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.as_deref() == tab_id {
+            return;
+        }
+        // Record first: `SetFocus` can re-enter this render, and a
+        // second pass that still sees the old slot would recurse.
+        let old = slot.clone();
+        *slot = tab_id.map(str::to_string);
+        drop(slot);
+        if let Some(old) = old.as_deref() {
+            super::tabs::with_browser(old, |b| input::focus(b, false));
+        }
+        if let Some(id) = tab_id {
+            super::tabs::with_browser(id, |b| input::focus(b, true));
+        }
+    });
 }
 
 /// Window-space point to page space.
@@ -266,6 +310,12 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 // and while it is up it owns the text. Everything else
                 // still reaches the page — see `Shell::find_key`, which
                 // deliberately answers `false` for the keys that scroll.
+                //
+                // This listener only runs while THIS handle is on the
+                // dispatch path. `Shell::sync_composer_focus` used to
+                // steal gpui focus back to the shell on every render
+                // whenever the composer was unmounted, so a page tab
+                // never stayed here and site shortcuts never fired.
                 if super::find_is_open(&key_id) {
                     return;
                 }

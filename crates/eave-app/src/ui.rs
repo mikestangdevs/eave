@@ -7169,6 +7169,16 @@ impl Shell {
             }
             return;
         }
+        // A live page owns the keys a site binds — GitHub `/`, j/k on a
+        // feed, space to scroll. Those used to fall through into the
+        // composer path (and, after Slice CM, never reached the page at
+        // all: `sync_composer_focus` parked gpui on the shell whenever
+        // the composer was unmounted). ⌘-chords are actions and have
+        // already fired. Enter must not Send to a session sitting behind
+        // this tab.
+        if self.page_owns_keyboard(cx) {
+            return;
+        }
         // Slice Q2 unmounted the composer at the launcher (`show_launcher`
         // below) but left this handler open, so keystrokes still landed in
         // the buffer behind it — invisible, because the element is not
@@ -7342,29 +7352,68 @@ impl Shell {
         // Chromium mid-callback; the omnibox and the menus were opened
         // *instead of* typing; the rename field and the find bar are fields of
         // their own.
-        self.page_ask(cx).is_none()
-            && !self.omnibox_open()
-            && self.find_here(cx).is_none()
-            && !self.launcher.models.is_open()
-            && !self.demo.menu.is_open()
-            && self.rename.is_none()
+        !self.chrome_holds_keyboard(cx)
     }
 
-    /// Put the keyboard where [`Self::composer_owns_keyboard`] says it belongs.
+    /// Chrome that owns the whole keyboard, in the same order `on_key`
+    /// returns early for it. Shared so the composer and the page cannot
+    /// disagree about who yields.
+    fn chrome_holds_keyboard(&self, cx: &App) -> bool {
+        self.page_ask(cx).is_some()
+            || self.omnibox_open()
+            || self.find_here(cx).is_some()
+            || self.launcher.models.is_open()
+            || self.demo.menu.is_open()
+            || self.rename.is_some()
+    }
+
+    /// A document is on screen and nothing of ours is sitting in front of
+    /// it. Site shortcuts (`/` to search, `j`/`k` to move, space to
+    /// scroll) belong to that document — they are not eave chords.
+    fn page_owns_keyboard(&self, cx: &App) -> bool {
+        if self.chrome_holds_keyboard(cx) {
+            return false;
+        }
+        let snap = self.web_tabs.read(cx);
+        strip::active_is_page(&snap.snapshot) && !strip::active_is_blank_page(&snap.snapshot)
+    }
+
+    /// Put the keyboard where it belongs this frame: composer, page, or
+    /// the shell.
     ///
     /// Called from `render`, which is the one place that has both the window
     /// and the whole of the state this depends on. It is a no-op whenever the
     /// answer already holds — `Window::focus` returns early on an unchanged
     /// handle — so the steady state costs a comparison and schedules nothing.
-    fn sync_composer_focus(&mut self, mounted: bool, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// The third landing is the page. Slice CM's else-branch focused the
+    /// *shell* whenever the composer was unmounted, which is every page
+    /// tab. gpui then dispatched keys along the shell's path, never the
+    /// page's, so `page_element`'s `on_key_down` never ran and Chromium
+    /// never saw `/`. `page_tab` is `Some` only when that element is in
+    /// the tree this frame — focusing a handle that is not mounted is
+    /// how the whole window's actions go silent.
+    fn sync_composer_focus(
+        &mut self,
+        mounted: bool,
+        page_tab: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let wanted = if self.composer_owns_keyboard(mounted, cx) {
             gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx)
+        } else if let Some(id) = page_tab.filter(|_| !self.chrome_holds_keyboard(cx)) {
+            crate::web::page_focus_handle(id, cx).unwrap_or_else(|| self.focus.clone())
         } else {
             self.focus.clone()
         };
         if !wanted.is_focused(window) {
             window.focus(&wanted, cx);
         }
+        let cef = page_tab.filter(|_| {
+            !self.chrome_holds_keyboard(cx) && !self.composer_owns_keyboard(mounted, cx)
+        });
+        crate::web::set_keyboard_page(cef);
     }
 
     /// §1.20's blink anchor: the typist is still here.
@@ -8923,10 +8972,7 @@ impl Shell {
         };
 
         let row = div()
-            .debug_selector(move || tag.into())
-            .w_full()
-            .h(px(theme::PANE_HEADER_H))
-            .flex_none()
+            .size_full()
             .pl(px(lead))
             .pr(px(theme::SPACE_3))
             .flex()
@@ -8948,7 +8994,7 @@ impl Shell {
 
         let row = if show_rail { row.child(rail) } else { row };
 
-        match active.map(|t| (t, t.content.clone())) {
+        let inner = match active.map(|t| (t, t.content.clone())) {
             // ── a page: the browser toolbar ──────────────────────────────
             Some((tab, eave_wire::TabContent::Page)) => {
                 let back = tab.can_go_back;
@@ -9257,7 +9303,29 @@ impl Shell {
             _ => row
                 .child(div().flex_1())
                 .when(show_files, |d| d.child(self.files_toggle(cx))),
-        }
+        };
+        // The card paints one `content_plate` behind this strip AND the
+        // page, so without a seam the toolbar and the document are one
+        // surface. 1 px, inside the existing height — a sibling rule
+        // would move the page, and a `border_b` on a rounded card
+        // curved at the ends (the rail's `zone_rule` finding).
+        div()
+            .debug_selector(move || tag.into())
+            .w_full()
+            .h(px(theme::PANE_HEADER_H))
+            .flex_none()
+            .relative()
+            .child(inner)
+            .child(
+                div()
+                    .debug_selector(|| "pane-header-rule".into())
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(theme::HAIRLINE))
+                    .bg(theme::border_strong()),
+            )
     }
 
     /// One arrow on the pane header, in the state the ENGINE says it is in.
@@ -9439,6 +9507,15 @@ impl Shell {
         }
         if self.rename.is_some() {
             return Some(Field::Rename);
+        }
+        // A page tab has no composer on screen. Claiming the composer
+        // here would lease the blink clock for a caret that is not
+        // drawn, and tell `note_keystroke` the typist is in a box they
+        // cannot see.
+        if strip::active_is_page(&self.web_tabs.read(cx).snapshot)
+            && !strip::active_is_blank_page(&self.web_tabs.read(cx).snapshot)
+        {
+            return None;
         }
         // The composer is mounted with a session and not before, and that
         // is what keeps N4's idle floor reachable: a window sitting at the
@@ -17218,6 +17295,15 @@ impl Render for Shell {
         // tab wants, and what T1's own harness asserts by checking `send` is
         // absent there.
         let composer_mounted = !show_launcher && !showing_page;
+        // Only when the page element is actually in the tree this frame.
+        // Focusing a handle that is not mounted is how the whole
+        // window's actions go silent (Slice CM). A blank ⌘T tab is a
+        // page tab with the launcher in the well, not a document.
+        let keyboard_page = if page_el.is_some() && active_is_page && !blank_page {
+            strip_snapshot.active.clone()
+        } else {
+            None
+        };
         let launch_error = state.launch_error.clone();
         let empty_state: Option<EmptyState> = if !state.display.is_empty() {
             None
@@ -17241,7 +17327,7 @@ impl Render for Shell {
         // Here rather than beside `composer_mounted` above: that read of the
         // transcript is still borrowed at that point, and this needs `cx`
         // mutably to move focus.
-        self.sync_composer_focus(composer_mounted, window, cx);
+        self.sync_composer_focus(composer_mounted, keyboard_page.as_deref(), window, cx);
 
         // **Slice CM2 — the composer is bezel's control bar.**
         //

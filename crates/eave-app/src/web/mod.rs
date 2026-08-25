@@ -150,7 +150,7 @@ pub use dialogs::answer;
 #[cfg(feature = "web")]
 pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 #[cfg(feature = "web")]
-pub use page::page_element;
+pub use page::{page_element, page_focus_handle, set_keyboard_page};
 #[cfg(feature = "web")]
 pub use tabs::{
     chrome, copy_selection, downloads, drive, install_fact_sink, install_request_sink,
@@ -1078,6 +1078,19 @@ pub fn web_memory() -> Option<(usize, u64)> {
 pub fn page_element(_tab_id: &str, _cx: &mut gpui::App) -> Option<gpui::AnyElement> {
     None
 }
+
+/// No page engine, so there is no handle to focus.
+#[cfg(not(feature = "web"))]
+pub fn page_focus_handle(
+    _tab_id: &str,
+    _cx: &mut gpui::App,
+) -> Option<gpui::FocusHandle> {
+    None
+}
+
+/// No page engine, so Chromium has nothing to focus.
+#[cfg(not(feature = "web"))]
+pub fn set_keyboard_page(_tab_id: Option<&str>) {}
 
 /// No page engine, so nothing is on screen as a page.
 #[cfg(not(feature = "web"))]
