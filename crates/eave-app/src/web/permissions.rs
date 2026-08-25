@@ -30,6 +30,7 @@
 //! a map and the decision is a pure function of it, so both live here and
 //! the gated caller in `dialogs.rs` is a handful of lines.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 pub use eave_wire::{Grant, PermissionDecision, PermissionKind, Permissions, Verdict};
@@ -46,6 +47,34 @@ pub fn install(grants: Vec<Grant>) {
     if let Ok(mut m) = mirror().write() {
         *m = Permissions::from_grants(grants);
     }
+    // G28: Chromium keeps its own copy and this snapshot has just made
+    // eave's disagree with it. The reconciliation cannot happen here —
+    // see `NEEDS_REPLAY`.
+    NEEDS_REPLAY.store(true, Ordering::Release);
+}
+
+/// Set when a snapshot lands; cleared by whoever replays it into Chromium.
+///
+/// # Why a flag and not just doing it
+/// [`install`] runs on a **tokio task** (`ui.rs`'s `watch_permissions`
+/// subscriber). Reconciling with Chromium means
+/// `CefRequestContext::SetContentSetting`, which is a browser-process
+/// UI-thread call — from anywhere else it is undefined behaviour rather
+/// than an error. So the task raises a flag and the main thread's drive
+/// pass does the work, the same handoff the preload queue uses.
+///
+/// An `AtomicBool` and not a channel because the payload is "the mirror
+/// changed" and the mirror is already shared; coalescing several snapshots
+/// into one replay is correct, not a compromise.
+static NEEDS_REPLAY: AtomicBool = AtomicBool::new(false);
+
+/// Whether a snapshot has landed since the last replay. Clears the flag.
+///
+/// **Main thread only**, and the caller must be able to reach Chromium —
+/// clearing this without replaying loses the reconciliation until the next
+/// snapshot, which for a browser left open is never.
+pub fn take_replay_request() -> bool {
+    NEEDS_REPLAY.swap(false, Ordering::AcqRel)
 }
 
 /// What to do about an ask, without disturbing anybody.
@@ -151,6 +180,7 @@ fn reset() {
     if let Ok(mut m) = mirror().write() {
         *m = Permissions::new();
     }
+    NEEDS_REPLAY.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -309,5 +339,46 @@ mod tests {
         note_answer("https://x.test", &odd, PermissionDecision::Allow);
         assert_eq!(verdict("https://x.test", &odd), Verdict::Ask);
         assert!(grants().is_empty());
+    }
+    /// G28: a snapshot landing is what makes eave's store and Chromium's
+    /// disagree, so it is what has to raise the flag. Nothing else does —
+    /// an answer given in this process already synced on its way out.
+    #[test]
+    fn a_snapshot_asks_for_a_replay() {
+        let _g = serial();
+        assert!(!take_replay_request(), "reset should leave it clear");
+        install(vec![grant(
+            "https://a.test",
+            PermissionKind::Notifications,
+            PermissionDecision::Allow,
+        )]);
+        assert!(take_replay_request());
+    }
+
+    /// Taking it clears it. A replay that ran must not run again on the
+    /// next drive pass — that is a `SetContentSetting` per frame.
+    #[test]
+    fn taking_the_replay_request_clears_it() {
+        let _g = serial();
+        install(Vec::new());
+        assert!(take_replay_request());
+        assert!(!take_replay_request());
+    }
+
+    /// Several snapshots before anyone looks are ONE replay. The payload
+    /// is the mirror, not the delta, so coalescing is the correct answer
+    /// rather than a dropped update.
+    #[test]
+    fn snapshots_arriving_in_a_burst_ask_once() {
+        let _g = serial();
+        for _ in 0..5 {
+            install(vec![grant(
+                "https://b.test",
+                PermissionKind::Geolocation,
+                PermissionDecision::Deny,
+            )]);
+        }
+        assert!(take_replay_request());
+        assert!(!take_replay_request());
     }
 }

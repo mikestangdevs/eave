@@ -697,14 +697,7 @@ pub fn initialize(data_dir: &std::path::Path) -> bool {
     // its cache root as territory it owns.
     let cache = data_dir.join("browser").join("chromium");
     let _ = std::fs::create_dir_all(&cache);
-    let settings = Settings {
-        no_sandbox: 1,
-        windowless_rendering_enabled: 1,
-        // gpui owns [NSApp run]; CEF gets pumped instead of running its own.
-        external_message_pump: 1,
-        root_cache_path: cache.to_string_lossy().as_ref().into(),
-        ..Default::default()
-    };
+    let settings = browser_settings(&cache);
     let ok = cef::initialize(
         Some(args.as_main_args()),
         Some(&settings),
@@ -725,6 +718,69 @@ pub fn initialize(data_dir: &std::path::Path) -> bool {
     std::mem::forget(app);
     RUNNING.store(ok, Ordering::SeqCst);
     ok
+}
+
+/// **The User-Agent decision (06-browser G6), as a constant.**
+///
+/// `None` means "leave Chromium's alone", and that is the decision.
+///
+/// # Why not just set it
+/// - `user_agent_product` is the tempting field and it is a trap. CEF
+///   documents it as "the product portion of the default User-Agent
+///   string", which means `eave/0.1.0` **replaces** `Chrome/151.0.0.0`
+///   rather than appending to it. A large amount of the web gates on that
+///   token, so the field that reads as "identify ourselves politely" is
+///   really "stop being Chrome".
+/// - `user_agent` replaces the whole string, which hands eave ownership of
+///   a hard-coded Chromium version number. A UA claiming `Chrome/151` on a
+///   build linking Chromium 153 is worse than no decision, because it is a
+///   decision that rots silently.
+///
+/// **Brave — the reference implementation sitting in this workspace —
+/// does exactly this.** Its only User-Agent patch is
+/// `chromium_src/components/embedder_support/user_agent_utils.cc`, and
+/// that file rewrites the **Client Hints brand list** (hard-coding the
+/// brand, forcing `major.0.0.0`, emptying `BuildModelInfo`) while leaving
+/// the legacy `User-Agent` header exactly as Chromium built it. The
+/// reasoning is fingerprinting: a browser with its own UA string is a
+/// browser whose users can be picked out by it.
+///
+/// So the place to revisit this is Client Hints, not here. Changing either
+/// constant fails `the_user_agent_decision_is_still_chromiums`, which is
+/// the point — the test exists to make somebody read the paragraph above.
+const USER_AGENT: Option<&str> = None;
+
+/// The product token half of [`USER_AGENT`]. Same decision, same reason.
+const USER_AGENT_PRODUCT: Option<&str> = None;
+
+/// The settings eave starts Chromium with.
+///
+/// # This function cannot be called from a test, and that is not a choice
+/// Building a [`Settings`] populates `CefString` fields, and a `CefString`
+/// is allocated by the Chromium framework. In a process that never ran
+/// `CefInitialize` — which is every test in this crate, including the
+/// `--features web` ones — that is **a SIGSEGV, not a `None`**: no
+/// assertion, no failing test name, just signal 11 taking the whole lib
+/// test binary with it. `sync_to_chromium` in `dialogs.rs` carries the
+/// same warning for `request_context_get_global_context`; this is the
+/// second place it bites, and the reason the G6 guard below asserts on the
+/// CONSTANTS rather than on the struct they feed.
+fn browser_settings(cache: &std::path::Path) -> Settings {
+    let mut settings = Settings {
+        no_sandbox: 1,
+        windowless_rendering_enabled: 1,
+        // gpui owns [NSApp run]; CEF gets pumped instead of running its own.
+        external_message_pump: 1,
+        root_cache_path: cache.to_string_lossy().as_ref().into(),
+        ..Default::default()
+    };
+    if let Some(ua) = USER_AGENT {
+        settings.user_agent = ua.into();
+    }
+    if let Some(product) = USER_AGENT_PRODUCT {
+        settings.user_agent_product = product.into();
+    }
+    settings
 }
 
 /// Stop CEF.
@@ -877,3 +933,30 @@ const SHUTDOWN_STEP_MS: u64 = 1;
 const SHUTDOWN_QUIET_ROUNDS: u32 = 50;
 /// How long `CefShutdown` gets before the watchdog exits the process anyway.
 const SHUTDOWN_DEADLINE_MS: u64 = 1500;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **G6, as a guard rather than a comment.**
+    ///
+    /// Both User-Agent knobs must stay `None`. Filling either is the
+    /// change that looks like an improvement and is not — read
+    /// [`USER_AGENT`] before making this test pass.
+    ///
+    /// Asserted on the constants and **not** on `browser_settings`,
+    /// because calling that from a test segfaults: see its doc comment.
+    #[test]
+    fn the_user_agent_decision_is_still_chromiums() {
+        assert!(
+            USER_AGENT.is_none(),
+            "eave took ownership of the whole User-Agent string, and now owns \
+             a Chromium version number that nothing updates"
+        );
+        assert!(
+            USER_AGENT_PRODUCT.is_none(),
+            "user_agent_product REPLACES the Chrome/<version> token rather than \
+             appending to it — see the comment on USER_AGENT"
+        );
+    }
+}

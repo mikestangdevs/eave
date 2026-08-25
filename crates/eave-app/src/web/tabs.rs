@@ -572,6 +572,14 @@ pub fn drive(snapshot: &TabsSnapshot) {
     if !super::host::running() {
         return;
     }
+    // G28: the permission mirror is filled by a tokio task, and reaching
+    // Chromium's content settings is a UI-thread call. This is the first
+    // main-thread pass after a snapshot lands, so it is where the two
+    // stores are reconciled. Cheap when nothing changed — one relaxed
+    // swap of an `AtomicBool`.
+    if super::permissions::take_replay_request() {
+        super::dialogs::replay_into_chromium();
+    }
     // The eviction clock reads the strip between snapshots — which tab is
     // active, which tabs are pages, which are pinned — so it is handed the
     // strip here, at the one place that knows a fold has finished.
@@ -1722,6 +1730,85 @@ wrap_request_handler! {
         /// silently reloaded itself into a loop would be worse than one
         /// that says what happened. `drive` will rebuild the browser when
         /// the operator navigates or reloads.
+        /// **D7 — HTTP basic/digest auth, and proxy auth.**
+        ///
+        /// Without this a page behind a 401 is a blank tab: CEF's default
+        /// is to decline, Chromium turns that into the server's own 401
+        /// body (usually empty), and there is nowhere to type a password.
+        ///
+        /// # The return value is the whole contract
+        /// `1` means **eave has taken the callback and will answer it**,
+        /// and Chromium will wait indefinitely for that. `0` means it did
+        /// not, and Chromium cancels. So the only unsafe thing here is
+        /// returning 1 down a path that drops the callback — which is why
+        /// the callback is cloned into `PENDING` before anything can fail,
+        /// and why a missing callback returns 0 rather than pretending.
+        fn auth_credentials(
+            &self,
+            _browser: Option<&mut Browser>,
+            origin_url: Option<&CefString>,
+            is_proxy: ::std::os::raw::c_int,
+            host: Option<&CefString>,
+            port: ::std::os::raw::c_int,
+            realm: Option<&CefString>,
+            _scheme: Option<&CefString>,
+            callback: Option<&mut AuthCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else { return 0 };
+            let host = host.map(|h| h.to_string()).unwrap_or_default();
+            if host.is_empty() {
+                // A password prompt that cannot say who is asking is a
+                // phishing surface, not a feature. Decline instead.
+                return 0;
+            }
+            let origin = origin_url.map(|o| o.to_string()).unwrap_or_default();
+            if trace() {
+                eprintln!(
+                    "[web] auth challenge for {} from {host} (proxy={})",
+                    self.tab_id,
+                    is_proxy != 0
+                );
+            }
+            let raised = super::dialogs::raise_auth(
+                &self.tab_id,
+                &origin,
+                &host,
+                port,
+                realm.map(|r| r.to_string()),
+                is_proxy != 0,
+                callback,
+            );
+            raised as ::std::os::raw::c_int
+        }
+
+        /// **D8 — a TLS certificate that did not check out.**
+        ///
+        /// Same contract as `auth_credentials`: `1` keeps the callback and
+        /// the load waits; `0` lets Chromium cancel. The difference is
+        /// which way the silence falls — declining here is *safe*, so a
+        /// path that cannot raise the interstitial returns 0 and the load
+        /// simply fails, exactly as it does today.
+        fn on_certificate_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            cert_error: Errorcode,
+            request_url: Option<&CefString>,
+            _ssl_info: Option<&mut Sslinfo>,
+            callback: Option<&mut Callback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else { return 0 };
+            let url = request_url.map(|u| u.to_string()).unwrap_or_default();
+            if url.is_empty() {
+                return 0;
+            }
+            let reason = cert_error_reason(cert_error);
+            if trace() {
+                eprintln!("[web] certificate error for {}: {reason} ({url})", self.tab_id);
+            }
+            super::dialogs::raise_cert(&self.tab_id, &url, reason, callback);
+            1
+        }
+
         fn on_render_process_terminated(
             &self,
             _browser: Option<&mut Browser>,
@@ -1783,6 +1870,39 @@ fn termination_reason(status: TerminationStatus) -> &'static str {
         TerminationStatus::LAUNCH_FAILED => "the page's renderer could not start",
         TerminationStatus::INTEGRITY_FAILURE => "the page's renderer failed an integrity check",
         _ => "the page's renderer stopped",
+    }
+}
+
+/// Chromium's own name for a certificate failure (D8).
+///
+/// **The `ERR_` name, not a sentence.** It is what every other browser
+/// prints, what a search finds, and what a server operator needs to fix
+/// their configuration — `ask::certificate_explanation` turns it into
+/// words for the person reading the interstitial, and that mapping lives
+/// outside the feature gate so the suite can check it.
+///
+/// The catch-all keeps the shape rather than inventing a name: an
+/// unrecognised code is still a certificate error and still must not be
+/// waved through.
+fn cert_error_reason(code: Errorcode) -> &'static str {
+    match code {
+        Errorcode::CERT_COMMON_NAME_INVALID => "ERR_CERT_COMMON_NAME_INVALID",
+        Errorcode::CERT_DATE_INVALID => "ERR_CERT_DATE_INVALID",
+        Errorcode::CERT_AUTHORITY_INVALID => "ERR_CERT_AUTHORITY_INVALID",
+        Errorcode::CERT_CONTAINS_ERRORS => "ERR_CERT_CONTAINS_ERRORS",
+        Errorcode::CERT_NO_REVOCATION_MECHANISM => "ERR_CERT_NO_REVOCATION_MECHANISM",
+        Errorcode::CERT_UNABLE_TO_CHECK_REVOCATION => "ERR_CERT_UNABLE_TO_CHECK_REVOCATION",
+        Errorcode::CERT_REVOKED => "ERR_CERT_REVOKED",
+        Errorcode::CERT_INVALID => "ERR_CERT_INVALID",
+        Errorcode::CERT_WEAK_SIGNATURE_ALGORITHM => "ERR_CERT_WEAK_SIGNATURE_ALGORITHM",
+        Errorcode::CERT_NON_UNIQUE_NAME => "ERR_CERT_NON_UNIQUE_NAME",
+        Errorcode::CERT_WEAK_KEY => "ERR_CERT_WEAK_KEY",
+        Errorcode::CERT_NAME_CONSTRAINT_VIOLATION => "ERR_CERT_NAME_CONSTRAINT_VIOLATION",
+        Errorcode::CERT_VALIDITY_TOO_LONG => "ERR_CERT_VALIDITY_TOO_LONG",
+        Errorcode::CERTIFICATE_TRANSPARENCY_REQUIRED => "ERR_CERTIFICATE_TRANSPARENCY_REQUIRED",
+        Errorcode::CERT_KNOWN_INTERCEPTION_BLOCKED => "ERR_CERT_KNOWN_INTERCEPTION_BLOCKED",
+        Errorcode::CERT_SELF_SIGNED_LOCAL_NETWORK => "ERR_CERT_SELF_SIGNED_LOCAL_NETWORK",
+        _ => "ERR_CERT_INVALID",
     }
 }
 
@@ -2132,6 +2252,58 @@ mod tests {
     /// The counter is process-wide (the pump reads it from gpui's executor),
     /// so the tests that assert on it take a turn rather than racing.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// **The two halves of D8's naming, pinned to each other.** This side
+    /// maps `Errorcode` onto a string; `ask::certificate_explanation` maps
+    /// that string onto words. Nothing in the type system connects them,
+    /// so a code named here and absent from `CERTIFICATE_REASONS` would
+    /// silently get the generic sentence in front of a person deciding
+    /// whether they are being attacked.
+    #[test]
+    fn every_certificate_code_eave_names_is_one_the_explanations_know() {
+        let codes = [
+            Errorcode::CERT_COMMON_NAME_INVALID,
+            Errorcode::CERT_DATE_INVALID,
+            Errorcode::CERT_AUTHORITY_INVALID,
+            Errorcode::CERT_CONTAINS_ERRORS,
+            Errorcode::CERT_NO_REVOCATION_MECHANISM,
+            Errorcode::CERT_UNABLE_TO_CHECK_REVOCATION,
+            Errorcode::CERT_REVOKED,
+            Errorcode::CERT_INVALID,
+            Errorcode::CERT_WEAK_SIGNATURE_ALGORITHM,
+            Errorcode::CERT_NON_UNIQUE_NAME,
+            Errorcode::CERT_WEAK_KEY,
+            Errorcode::CERT_NAME_CONSTRAINT_VIOLATION,
+            Errorcode::CERT_VALIDITY_TOO_LONG,
+            Errorcode::CERTIFICATE_TRANSPARENCY_REQUIRED,
+            Errorcode::CERT_KNOWN_INTERCEPTION_BLOCKED,
+            Errorcode::CERT_SELF_SIGNED_LOCAL_NETWORK,
+        ];
+        for code in codes {
+            let named = cert_error_reason(code);
+            assert!(
+                super::super::ask::CERTIFICATE_REASONS.contains(&named),
+                "{named} is produced by cert_error_reason and unknown to the explanations"
+            );
+        }
+        // …and the list has nothing in it the mapping cannot produce.
+        let produced: Vec<&str> = codes.iter().map(|c| cert_error_reason(*c)).collect();
+        for reason in super::super::ask::CERTIFICATE_REASONS {
+            assert!(
+                produced.contains(reason),
+                "{reason} is explained but no Errorcode maps to it"
+            );
+        }
+    }
+
+    /// An unrecognised code must not become "not a certificate error".
+    /// It keeps the shape, and the interstitial still refuses by default.
+    #[test]
+    fn an_unknown_certificate_code_is_still_a_certificate_error() {
+        let named = cert_error_reason(Errorcode::FAILED);
+        assert!(named.starts_with("ERR_CERT"), "{named}");
+        assert!(super::super::ask::CERTIFICATE_REASONS.contains(&named));
+    }
 
     #[test]
     fn the_first_url_for_a_tab_is_a_change() {

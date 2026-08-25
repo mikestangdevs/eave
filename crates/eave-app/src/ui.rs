@@ -4886,6 +4886,25 @@ struct Shell {
     /// buffer lives here, and those two would otherwise drift the moment
     /// somebody switched tabs mid-dialog.
     dialog_text: Option<(String, String)>,
+    /// The password half of an [`Ask::Credentials`] (D7), and its tab.
+    ///
+    /// **A separate field, not a second entry in `dialog_text`**, so that
+    /// every existing path which reads, seeds or clears the prompt buffer
+    /// cannot accidentally read a password — including
+    /// `dialog_buffer`, which is what the `prompt()` surface renders
+    /// verbatim on screen.
+    ///
+    /// Cleared by `answer_dialog` with the rest. It is never traced, never
+    /// stored, and never leaves this struct except as
+    /// `Answer::Credentials`, whose `Debug` elides it.
+    dialog_secret: Option<(String, String)>,
+    /// Which of the two credential fields the keyboard is in (D7).
+    ///
+    /// A `bool` rather than a focus handle: these are not real gpui inputs
+    /// — the dialog owns the whole keyboard while it is up, exactly as the
+    /// `prompt()` field already did — so "which one gets the next
+    /// character" is the entire state there is.
+    dialog_on_secret: bool,
     /// Slice E1 — the page's context menu, when it is up.
     ///
     /// P1's `Popup`, carrying the whole request rather than just an anchor:
@@ -6399,10 +6418,57 @@ impl Shell {
                 "",
                 "Cancel",
             ),
+            // D7. The HOST is the title, because it is the only thing on
+            // this card worth deciding on — a person about to type a
+            // password needs to read who is asking before anything else.
+            crate::web::Ask::Credentials {
+                host,
+                realm,
+                is_proxy,
+            } => (
+                Some(if *is_proxy {
+                    format!("The proxy {host} wants a password")
+                } else {
+                    format!("Sign in to {host}")
+                }),
+                match realm {
+                    // The server's own words, quoted so it is visibly the
+                    // server talking and not eave. It is attacker-controlled
+                    // text and gets no more authority than that.
+                    Some(realm) => format!("The server says: “{realm}”"),
+                    None => String::new(),
+                },
+                "Sign in",
+                "Cancel",
+            ),
+            // D8. Chrome's own title, because it is the sentence people
+            // have been trained on for a decade and this is not the place
+            // to be original.
+            crate::web::Ask::Certificate { reason, .. } => (
+                Some("This connection is not private".to_string()),
+                format!(
+                    "{}\n\n{reason}",
+                    crate::web::certificate_explanation(reason)
+                ),
+                // **The labels are swapped relative to every other ask, and
+                // so are the answers below.** The primary button is the
+                // safe one. A cert interstitial whose most prominent
+                // control is "proceed" is a cert interstitial that does not
+                // work — which is why Chrome buries proceeding behind
+                // "Advanced".
+                "Back to safety",
+                "Proceed anyway",
+            ),
         };
 
         let is_prompt = matches!(pending.ask, crate::web::Ask::Prompt { .. });
+        let is_credentials = matches!(pending.ask, crate::web::Ask::Credentials { .. });
+        let is_certificate = matches!(pending.ask, crate::web::Ask::Certificate { .. });
         let typed = self.dialog_buffer(&tab, &pending);
+        // Rendered as bullets and never as itself. The rule is one
+        // function (`ask::masked`) so that it is stated once and can be
+        // asserted without a window.
+        let secret_dots = crate::web::masked(&self.dialog_secret_buffer(&tab));
 
         let button =
             |label: &str, primary: bool, answer: crate::web::Answer, cx: &mut Context<Self>| {
@@ -6439,10 +6505,28 @@ impl Shell {
                     }))
             };
 
-        let confirm_answer = if is_prompt {
+        let confirm_answer = if is_credentials {
+            crate::web::Answer::Credentials {
+                user: typed.clone(),
+                password: self.dialog_secret_buffer(&tab),
+            }
+        } else if is_prompt {
             crate::web::Answer::Text(typed.clone())
+        } else if is_certificate {
+            // The primary button is "Back to safety" (D8), and `Cancel` is
+            // what makes `reply_with` call `Callback::cancel` and block the
+            // load. See the label comment above.
+            crate::web::Answer::Cancel
         } else {
             crate::web::Answer::Ok
+        };
+        // …and its opposite. Every other ask refuses with `Cancel`; the
+        // certificate interstitial is the one where refusing the SAFE
+        // option is what proceeds.
+        let refuse_answer = if is_certificate {
+            crate::web::Answer::Ok
+        } else {
+            crate::web::Answer::Cancel
         };
 
         Some(
@@ -6543,18 +6627,73 @@ impl Shell {
                                     .child(typed.clone()),
                             )
                         })
+                        // ── D7: two fields, and the second one is bullets ──
+                        //
+                        // Which one has the keyboard is drawn, because
+                        // these are not real inputs and there is no caret
+                        // to give it away: the ring is the only thing that
+                        // says where the next character lands, and typing a
+                        // password into the user field in front of somebody
+                        // is the failure this prevents.
+                        .when(is_credentials, |d| {
+                            let field = |tag: &'static str,
+                                         label: &'static str,
+                                         value: String,
+                                         focused: bool| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_1))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .text_color(theme::text_secondary())
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(move || tag.into())
+                                            .px(px(theme::SPACE_2))
+                                            .py(px(theme::SPACE_2))
+                                            .rounded(px(theme::RADIUS_SELECT))
+                                            .bg(theme::wash_rest())
+                                            .border_1()
+                                            .border_color(if focused {
+                                                theme::card_border()
+                                            } else {
+                                                gpui::transparent_black()
+                                            })
+                                            .text_size(px(theme::BODY_SIZE))
+                                            .text_color(theme::text())
+                                            .child(value),
+                                    )
+                            };
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_2))
+                                    .child(field(
+                                        "page-dialog-user",
+                                        "User name",
+                                        typed.clone(),
+                                        !self.dialog_on_secret,
+                                    ))
+                                    .child(field(
+                                        "page-dialog-password",
+                                        "Password",
+                                        secret_dots.clone(),
+                                        self.dialog_on_secret,
+                                    )),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()
                                 .gap(px(theme::SPACE_2))
                                 .justify_end()
                                 .when(refusable && !refuse_label.is_empty(), |d| {
-                                    d.child(button(
-                                        refuse_label,
-                                        false,
-                                        crate::web::Answer::Cancel,
-                                        cx,
-                                    ))
+                                    d.child(button(refuse_label, false, refuse_answer.clone(), cx))
                                 })
                                 .when(!confirm_label.is_empty(), |d| {
                                     d.child(button(confirm_label, true, confirm_answer.clone(), cx))
@@ -6579,9 +6718,17 @@ impl Shell {
     /// The keyboard, while a page dialog is up.
     ///
     /// Escape and Return are the two that matter and they are wired to the
-    /// SAFE answers: escape always cancels, and Return commits. An
+    /// SAFE answers: escape **dismisses**, and Return commits. An
     /// `alert()` has one button, so both keys dismiss it — there is no
     /// refusal to express.
+    ///
+    /// # Escape is not "Don't allow" (G27)
+    /// It used to send `Answer::Cancel`, which `dialogs::answer` filed as
+    /// a durable **Deny** — so one Escape on a camera prompt denied that
+    /// origin the camera for ever, silently, from a gesture that meant
+    /// "not now". The button labelled "Don't allow" still sends `Cancel`
+    /// and is still durable; the key that means "go away" now says so.
+    /// See `web/ask.rs`.
     fn dialog_key(
         &mut self,
         ks: &gpui::Keystroke,
@@ -6590,23 +6737,46 @@ impl Shell {
     ) {
         let tab = pending.tab_id.clone();
         let is_prompt = matches!(pending.ask, crate::web::Ask::Prompt { .. });
+        // D7 — two fields rather than one, so the typing arms below have to
+        // know which buffer they are writing into.
+        let is_credentials = matches!(pending.ask, crate::web::Ask::Credentials { .. });
+        let typing = is_prompt || is_credentials;
         match ks.key.as_str() {
-            "escape" => self.answer_dialog(&tab, crate::web::Answer::Cancel, cx),
+            "escape" => self.answer_dialog(&tab, crate::web::Answer::Dismiss, cx),
+            // ⇥ moves between user and password, which is the one thing
+            // every person will try without being told. It is NOT focus
+            // traversal — the dialog owns the whole keyboard — so it does
+            // not need to reach anything outside this card.
+            "tab" if is_credentials => {
+                self.dialog_on_secret = !self.dialog_on_secret;
+                cx.notify();
+            }
             "enter" => {
-                let answer = if is_prompt {
+                let answer = if is_credentials {
+                    crate::web::Answer::Credentials {
+                        user: self.dialog_buffer(&tab, pending),
+                        password: self.dialog_secret_buffer(&tab),
+                    }
+                } else if is_prompt {
                     crate::web::Answer::Text(self.dialog_buffer(&tab, pending))
                 } else {
                     crate::web::Answer::Ok
                 };
                 self.answer_dialog(&tab, answer, cx);
             }
-            "backspace" if is_prompt => {
-                let mut text = self.dialog_buffer(&tab, pending);
-                text.pop();
-                self.dialog_text = Some((tab, text));
+            "backspace" if typing => {
+                if is_credentials && self.dialog_on_secret {
+                    let mut text = self.dialog_secret_buffer(&tab);
+                    text.pop();
+                    self.dialog_secret = Some((tab, text));
+                } else {
+                    let mut text = self.dialog_buffer(&tab, pending);
+                    text.pop();
+                    self.dialog_text = Some((tab, text));
+                }
                 cx.notify();
             }
-            _ if is_prompt => {
+            _ if typing => {
                 // The printable half. `key_char` is what gpui already
                 // resolved for this keystroke, so dead keys and layouts are
                 // its problem rather than a table here.
@@ -6616,9 +6786,15 @@ impl Shell {
                     .filter(|c| !c.is_empty() && !c.chars().any(|c| c.is_control()))
                 {
                     if !ks.modifiers.platform && !ks.modifiers.control {
-                        let mut text = self.dialog_buffer(&tab, pending);
-                        text.push_str(ch);
-                        self.dialog_text = Some((tab, text));
+                        if is_credentials && self.dialog_on_secret {
+                            let mut text = self.dialog_secret_buffer(&tab);
+                            text.push_str(ch);
+                            self.dialog_secret = Some((tab, text));
+                        } else {
+                            let mut text = self.dialog_buffer(&tab, pending);
+                            text.push_str(ch);
+                            self.dialog_text = Some((tab, text));
+                        }
                         cx.notify();
                     }
                 }
@@ -6645,7 +6821,22 @@ impl Shell {
     fn answer_dialog(&mut self, tab: &str, answer: crate::web::Answer, cx: &mut Context<Self>) {
         crate::web::answer(tab, answer);
         self.dialog_text = None;
+        // **Dropped on every answer, including a dismissal.** A password
+        // that outlived its dialog would be a password in memory with
+        // nothing on screen accounting for it.
+        self.dialog_secret = None;
+        self.dialog_on_secret = false;
         cx.notify();
+    }
+
+    /// This tab's password buffer. Never seeded from anything — unlike
+    /// `dialog_buffer`, which takes `prompt()`'s suggested default, there
+    /// is no such thing as a suggested password.
+    fn dialog_secret_buffer(&self, tab: &str) -> String {
+        match &self.dialog_secret {
+            Some((for_tab, text)) if for_tab == tab => text.clone(),
+            _ => String::new(),
+        }
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -17030,6 +17221,32 @@ impl Render for Shell {
             // all of them.
             .capture_key_down(cx.listener(Self::note_keystroke))
             .on_key_down(cx.listener(Self::on_key))
+            // ── THE MOUSE'S OWN BACK AND FORWARD (G24) ────────────────
+            //
+            // The two extra buttons on almost every mouse sold. gpui has
+            // always delivered them — `MouseButton::Navigate(Back|Forward)`,
+            // macOS `buttonNumber` 3 and 4 — and eave matched on `Left`,
+            // `Right` and `Middle` and dropped the rest on the floor.
+            //
+            // **Window-wide, and deliberately not forwarded to the page.**
+            // Chrome does not give mouse 4/5 to the document either: they
+            // are chrome gestures, so a page cannot swallow one and a
+            // click over the session pane navigates the page tab the same
+            // as a click over the page. `go` reads the ACTIVE tab and
+            // `go_tab` refuses anything that is not a page and anything
+            // the engine says is not available, so both guards already
+            // exist and this adds no third opinion about history.
+            //
+            // The DOWN edge, which is where every browser acts — the
+            // gesture is over by the time the button comes back up.
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.go(-1, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.go(1, cx)),
+            )
             // Slice K: answering is a real action with a real binding, not
             // a character the composer happens not to want.
             // Slice C5. Real actions with real bindings, and mounted on
@@ -18553,6 +18770,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         slash: SlashPalette::default(),
                         omni: Omnibox::default(),
                         dialog_text: None,
+                        dialog_secret: None,
+                        dialog_on_secret: false,
                         page_menu: Popup::default(),
                         tab_menu: Popup::default(),
                         typeahead: typeahead.clone(),

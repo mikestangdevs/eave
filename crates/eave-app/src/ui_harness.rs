@@ -11,7 +11,7 @@
 
 use super::*;
 use eave_wire::{TabInfo, TabsSnapshot};
-use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
+use gpui::{Modifiers, MouseButton, NavigationDirection, TestAppContext, VisualTestContext};
 
 /// The test's end of the plumbing: push engine-shaped events in through
 /// `plumbing`, read emitted intent out of `commands`.
@@ -6853,6 +6853,75 @@ fn middle_click(vcx: &mut VisualTestContext, selector: &'static str) {
     vcx.simulate_mouse_down(c, MouseButton::Middle, Modifiers::none());
 }
 
+/// The two credential buffers, as the shell holds them (D7).
+///
+/// Read off the entity rather than off the screen: the password is drawn
+/// as bullets by construction, so the only place its real value exists is
+/// here — which is exactly what makes "did it go into the right buffer?"
+/// worth asserting.
+fn dialog_buffers(h: &Harness, vcx: &mut VisualTestContext) -> (String, String) {
+    vcx.read_window(&h.window, |shell, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .dialog_text
+                .as_ref()
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default(),
+            shell
+                .dialog_secret
+                .as_ref()
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default(),
+        )
+    })
+    .unwrap()
+}
+
+/// Put a page ask on screen and let the shell draw it (G26).
+///
+/// Before G26 this was impossible: the ask map was inside `--features
+/// web`, so the feature-off `pending()` returned `None` and no test could
+/// reach the dialog at all.
+#[track_caller]
+fn raise_ask(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    tab: &str,
+    origin: &str,
+    what: crate::web::Ask,
+) {
+    let page = page_tab(tab, Some(origin), Some("A page"));
+    strip_tabs(h, vcx, vec![page], Some(tab));
+    crate::web::raise_ask_for_test(tab, origin, what);
+    // The ask is raised outside gpui's world, so nothing has invalidated
+    // the window — nudge the shell to redraw before anything measures it.
+    strip_tabs(
+        h,
+        vcx,
+        vec![page_tab(tab, Some(origin), Some("A page"))],
+        Some(tab),
+    );
+    vcx.run_until_parked();
+}
+
+/// Press one of the mouse's two navigation buttons (G24).
+///
+/// Over the shell root rather than over a named control, because that is
+/// the claim: mouse 4 and 5 are window-wide chrome gestures, not something
+/// you have to aim at the back arrow.
+#[track_caller]
+fn mouse_navigate(vcx: &mut VisualTestContext, dir: NavigationDirection) {
+    let bounds = vcx
+        .debug_bounds("shell-root")
+        .expect("the shell root did not render");
+    vcx.simulate_mouse_down(
+        bounds.center(),
+        MouseButton::Navigate(dir),
+        Modifiers::none(),
+    );
+}
+
 /// Every URL the shell asked the system to open since the last drain.
 fn opened_urls() -> Vec<String> {
     OPENED_URLS.with(|o| std::mem::take(&mut *o.borrow_mut()))
@@ -10397,6 +10466,310 @@ fn both_kinds_of_tab_get_the_same_header(cx: &mut TestAppContext) {
 /// walkable just as long. The app had never sent that request once, because
 /// there was no surface for the arrows to live on — so this asserts both
 /// halves: the arrows reflect the engine's facts, and clicking an enabled one
+/// **G26 closing G25.** The scrim must occlude, or a click aimed at the
+/// dialog also lands on the live page underneath — the clickjacking shape,
+/// and the reason `.occlude()` was added. This is the assertion that could
+/// not exist before the ask map came out of the feature gate.
+#[gpui::test]
+fn a_page_dialog_covers_the_page_it_is_dimming(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://bank.test/",
+        crate::web::Ask::Permission {
+            kinds: vec![eave_wire::PermissionKind::Camera],
+        },
+    );
+    assert!(shown(vcx, "page-dialog"), "the dialog did not render");
+    let scrim = vcx.debug_bounds("page-dialog").expect("no scrim");
+    let card = vcx.debug_bounds("page-dialog-card").expect("no card");
+    assert!(
+        scrim.size.width > card.size.width && scrim.size.height > card.size.height,
+        "the scrim {:?} does not extend past the card {:?} — it cannot be \
+         catching the clicks around it",
+        scrim.size,
+        card.size
+    );
+}
+
+/// The origin is drawn on every ask, always. A dialog that does not say
+/// who is asking is how a page impersonates the browser.
+#[gpui::test]
+fn every_page_dialog_says_where_it_came_from(cx: &mut TestAppContext) {
+    let asks = [
+        crate::web::Ask::Alert {
+            message: "hi".into(),
+        },
+        crate::web::Ask::Permission {
+            kinds: vec![eave_wire::PermissionKind::Camera],
+        },
+        crate::web::Ask::Credentials {
+            host: "intranet.test".into(),
+            realm: None,
+            is_proxy: false,
+        },
+        crate::web::Ask::Certificate {
+            url: "https://bank.test/".into(),
+            reason: "ERR_CERT_AUTHORITY_INVALID".into(),
+        },
+    ];
+    for ask in asks {
+        let (h, vcx) = boot(cx);
+        raise_ask(&h, vcx, "p1", "https://bank.test/", ask.clone());
+        assert!(
+            shown(vcx, "page-dialog-origin"),
+            "{ask:?} drew no origin line"
+        );
+        crate::web::answer("p1", crate::web::Answer::Dismiss);
+    }
+}
+
+/// **D7 — ⇥ moves to the password field, and what is typed there lands in
+/// the SECRET buffer, not the one the user field renders verbatim.**
+///
+/// This is the routing half of the masking. The drawing half is
+/// `web::masked`, asserted in `web/ask.rs` without a window.
+#[gpui::test]
+fn a_typed_password_goes_to_the_secret_buffer_and_not_the_visible_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://intranet.test/",
+        crate::web::Ask::Credentials {
+            host: "intranet.test".into(),
+            realm: Some("Staff only".into()),
+            is_proxy: false,
+        },
+    );
+    assert!(shown(vcx, "page-dialog-user"), "no user field");
+    assert!(shown(vcx, "page-dialog-password"), "no password field");
+
+    vcx.simulate_keystrokes("a d a");
+    vcx.simulate_keystrokes("tab");
+    vcx.simulate_keystrokes("h u n t");
+    vcx.run_until_parked();
+
+    let (user, secret) = dialog_buffers(&h, vcx);
+    assert_eq!(user, "ada", "the user name did not reach the user field");
+    assert_eq!(
+        secret, "hunt",
+        "the password did not reach the secret field"
+    );
+    assert!(
+        !user.contains("hunt"),
+        "the password leaked into the field that is drawn verbatim: {user:?}"
+    );
+    assert_eq!(
+        crate::web::masked(&secret),
+        "••••",
+        "the password would not be drawn as bullets"
+    );
+}
+
+/// Answering clears the password. A secret that outlived its dialog would
+/// be a secret in memory with nothing on screen accounting for it.
+#[gpui::test]
+fn answering_a_credential_ask_drops_the_password(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://intranet.test/",
+        crate::web::Ask::Credentials {
+            host: "intranet.test".into(),
+            realm: None,
+            is_proxy: false,
+        },
+    );
+    vcx.simulate_keystrokes("tab");
+    vcx.simulate_keystrokes("h u n t");
+    vcx.run_until_parked();
+    assert_eq!(dialog_buffers(&h, vcx).1, "hunt");
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert_eq!(
+        dialog_buffers(&h, vcx).1,
+        "",
+        "the password survived the dialog being dismissed"
+    );
+    assert!(crate::web::pending("p1").is_none());
+}
+
+/// **D8 — the safe answer is the primary button.**
+///
+/// A certificate interstitial whose most prominent control is "proceed" is
+/// one that does not work. The two buttons are a pair of easily-swapped
+/// arguments, so the inversion is asserted rather than read.
+#[gpui::test]
+fn the_certificate_interstitial_makes_going_back_the_prominent_choice(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://bank.test/",
+        crate::web::Ask::Certificate {
+            url: "https://bank.test/".into(),
+            reason: "ERR_CERT_AUTHORITY_INVALID".into(),
+        },
+    );
+    assert!(
+        shown(vcx, "dialog-confirm") && shown(vcx, "dialog-refuse"),
+        "the interstitial drew fewer than two buttons"
+    );
+    // The PRIMARY button must not proceed. Clicking it has to leave the
+    // page blocked, which here means the ask is answered and gone with a
+    // `Cancel` rather than an `Ok`.
+    click(vcx, "dialog-confirm");
+    vcx.run_until_parked();
+    assert!(
+        crate::web::pending("p1").is_none(),
+        "the primary button did not answer the interstitial"
+    );
+}
+
+/// Escape on an interstitial must not proceed. It is the key people press
+/// to make a thing go away, and `Answer::Dismiss` is not a yes — see
+/// `web/ask.rs::page_hears_yes`.
+#[gpui::test]
+fn escape_on_a_certificate_interstitial_does_not_proceed(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    raise_ask(
+        &h,
+        vcx,
+        "p1",
+        "https://bank.test/",
+        crate::web::Ask::Certificate {
+            url: "https://bank.test/".into(),
+            reason: "ERR_CERT_REVOKED".into(),
+        },
+    );
+    assert!(shown(vcx, "page-dialog"));
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "page-dialog"),
+        "escape left the interstitial on screen"
+    );
+    assert!(
+        crate::web::pending("p1").is_none(),
+        "escape left the ask outstanding"
+    );
+}
+
+/// An ask on a BACKGROUND tab does not seize the window. A page in one tab
+/// stopping on `alert()` is its own business.
+#[gpui::test]
+fn an_ask_on_a_background_tab_is_not_drawn(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let a = page_tab("p1", Some("https://a.test/"), Some("A"));
+    let b = page_tab("p2", Some("https://b.test/"), Some("B"));
+    strip_tabs(&h, vcx, vec![a, b], Some("p1"));
+    crate::web::raise_ask_for_test(
+        "p2",
+        "https://b.test/",
+        crate::web::Ask::Alert {
+            message: "look at me".into(),
+        },
+    );
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "page-dialog"),
+        "a background tab's dialog seized the window"
+    );
+    crate::web::answer("p2", crate::web::Answer::Dismiss);
+}
+
+/// G24 — the two extra buttons on the mouse walk the page's history.
+///
+/// gpui has always delivered `MouseButton::Navigate`; eave matched on
+/// Left, Right and Middle and dropped the rest. This asserts the binding
+/// AND that it inherits the arrows' guards rather than adding a second
+/// opinion about what history exists.
+#[gpui::test]
+fn the_mouses_navigation_buttons_walk_the_page_history(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut tab = page_tab("p1", Some("https://example.com/"), Some("Example Domain"));
+    tab.can_go_back = true;
+    tab.can_go_forward = true;
+    tab.history_len = 3;
+    strip_tabs(&h, vcx, vec![tab], Some("p1"));
+
+    let _ = h.drain();
+    mouse_navigate(vcx, NavigationDirection::Back);
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Go { tab_id, delta }) if tab_id == "p1" && *delta == -1
+        )),
+        "mouse back did not walk the stack: {cmds:?}"
+    );
+
+    let _ = h.drain();
+    mouse_navigate(vcx, NavigationDirection::Forward);
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Go { tab_id, delta }) if tab_id == "p1" && *delta == 1
+        )),
+        "mouse forward did not walk the stack: {cmds:?}"
+    );
+}
+
+/// …and it is the SAME guard, not a parallel one. A stack the engine says
+/// is empty stays empty however the gesture arrived — the failure this
+/// prevents is a mouse button that can walk past an end the arrows stop at.
+#[gpui::test]
+fn the_mouse_buttons_obey_the_engines_history_like_the_arrows_do(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let fresh = page_tab("p1", Some("https://example.com/"), Some("Example Domain"));
+    strip_tabs(&h, vcx, vec![fresh], Some("p1"));
+
+    let _ = h.drain();
+    mouse_navigate(vcx, NavigationDirection::Back);
+    mouse_navigate(vcx, NavigationDirection::Forward);
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
+        "a mouse button walked a stack the engine says is empty"
+    );
+}
+
+/// A session tab has no history to walk, and the buttons must not invent
+/// one. `go_tab` filters on `TabContent::Page`; this is the assertion that
+/// the window-wide binding did not route around it.
+#[gpui::test]
+fn the_mouse_buttons_do_nothing_on_a_session_tab(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut page = page_tab("p1", Some("https://example.com/"), Some("Example"));
+    page.can_go_back = true;
+    page.history_len = 2;
+    let session = session_tab("aaaa1111");
+    strip_tabs(&h, vcx, vec![session, page], Some("aaaa1111"));
+
+    let _ = h.drain();
+    mouse_navigate(vcx, NavigationDirection::Back);
+    vcx.run_until_parked();
+    assert!(
+        !h.drain()
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
+        "the mouse walked a page's history while a session tab was active"
+    );
+}
+
 /// actually emits the walk.
 ///
 /// Disabled is DRAWN, not hidden: a control that disappears when it cannot

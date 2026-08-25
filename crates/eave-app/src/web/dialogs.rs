@@ -22,7 +22,7 @@
 //!   notifications and clipboard are all auto-denied without asking.
 //!
 //! # The rule this module keeps
-//! **A held callback is a stopped page.** Every entry in [`PENDING`] is a
+//! **A held callback is a stopped page.** Every entry in [`REPLIES`] is a
 //! renderer waiting on a person, so the two ways to leak one are both
 //! serious: dropping the callback without answering leaves the page stopped
 //! forever, and answering twice is a use-after-free in Chromium. Everything
@@ -51,70 +51,10 @@ use cef::*;
 
 use super::permissions::{PermissionDecision, PermissionKind, Verdict};
 
-/// What the page is asking for.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Ask {
-    /// `alert()` — one button, and no answer to give back.
-    Alert { message: String },
-    /// `confirm()` — yes or no.
-    Confirm { message: String },
-    /// `prompt()` — text, with a default the page suggested.
-    Prompt { message: String, default: String },
-    /// `beforeunload` — the page would rather you did not leave.
-    ///
-    /// Separate from [`Ask::Confirm`] because the buttons are not "yes/no"
-    /// and the stakes are not symmetric: the destructive answer is the one
-    /// that leaves. `reloading` distinguishes ⌘R from a close, which is the
-    /// difference between "Reload?" and "Leave?".
-    Leave { message: String, reloading: bool },
-    /// Camera, microphone, geolocation, notifications, clipboard…
-    ///
-    /// **Structured, not phrased.** The words come from
-    /// [`PermissionKind::label`] at the point of drawing; carrying the
-    /// strings instead would mean the answer had no stable key to be filed
-    /// under, which is how D9 ended up unable to remember anything.
-    Permission { kinds: Vec<PermissionKind> },
-    /// `<input type=file>`, or a download asking where to go.
-    Files {
-        title: String,
-        multiple: bool,
-        folder: bool,
-        save: bool,
-    },
-}
-
-impl Ask {
-    /// Whether this ask can be refused. An `alert()` cannot — it has one
-    /// button — and a surface that drew a Cancel beside it would be
-    /// offering a choice the page will never hear about.
-    pub fn is_refusable(&self) -> bool {
-        !matches!(self, Ask::Alert { .. })
-    }
-}
-
-/// An outstanding ask, and which tab is stopped on it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Pending {
-    pub tab_id: String,
-    /// Where it came from. **Shown, always** — a dialog with no origin is
-    /// how a page impersonates the browser, and it is the whole reason
-    /// Chrome puts the origin above the message rather than beside it.
-    pub origin: String,
-    pub ask: Ask,
-}
-
-/// What a person answered.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Answer {
-    /// OK / yes / allow / leave.
-    Ok,
-    /// Cancel / no / deny / stay.
-    Cancel,
-    /// A `prompt()`'s text.
-    Text(String),
-    /// Chosen files, as paths.
-    Files(Vec<String>),
-}
+/// The vocabulary lives in [`super::ask`], **outside the feature gate**,
+/// so `cargo test` can assert on it without Chromium in the binary. This
+/// module is the CEF half only. See that module for why (06-browser G26).
+pub use super::ask::{decision_of, page_hears_yes, Answer, Ask, Pending};
 
 /// The CEF side of an outstanding ask — the thing that has to be called
 /// exactly once.
@@ -123,48 +63,60 @@ enum Reply {
     File(FileDialogCallback),
     Permission(PermissionPromptCallback),
     Media(MediaAccessCallback, u32),
+    /// D7. `cont(user, password)` or `cancel()`, exactly once.
+    Auth(AuthCallback),
+    /// D8. `cont()` proceeds past a bad certificate; `cancel()` blocks the
+    /// load. **`cancel` is the safe direction and every path that is not an
+    /// explicit "proceed" takes it** — see `reply_with`.
+    Cert(Callback),
 }
 
 thread_local! {
-    /// One ask per tab. Main thread only, like every other map in this
-    /// module's neighbours.
-    static PENDING: std::cell::RefCell<HashMap<String, (Pending, Reply)>> =
+    /// The CEF half of every outstanding ask — the thing that must be
+    /// called exactly once.
+    ///
+    /// **The ASK itself is not in here** (G26): it lives in
+    /// `super::ask::PENDING`, outside the feature gate, so the suite can
+    /// render and drive the dialog. This map holds only what cannot leave
+    /// the gate — a live Chromium continuation. The two are kept in step
+    /// by `raise` and `answer`, which are the only writers.
+    ///
+    /// Main thread only, like every other map in this module's neighbours.
+    static REPLIES: std::cell::RefCell<HashMap<String, Reply>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
-/// What this tab is stopped on, if anything.
-pub fn pending(tab_id: &str) -> Option<Pending> {
-    PENDING.with(|p| p.borrow().get(tab_id).map(|(ask, _)| ask.clone()))
-}
-
-/// Whether any tab is stopped on an ask.
-pub fn any_pending() -> bool {
-    PENDING.with(|p| !p.borrow().is_empty())
-}
+pub use super::ask::{any_pending, pending};
 
 fn raise(tab_id: &str, origin: String, ask: Ask, reply: Reply) {
     if super::tabs::trace() {
         eprintln!("[web] ask from {origin}: {ask:?}");
     }
-    let entry = (
-        Pending {
-            tab_id: tab_id.to_string(),
-            origin,
-            ask,
-        },
-        reply,
-    );
     // Replacing an outstanding ask would strand its callback and stop that
     // renderer forever. Chromium serialises dialogs per frame so this should
     // not happen — but "should not" is not "cannot", and the honest answer
     // to a second ask is to refuse the FIRST properly and then take it.
-    let displaced = PENDING.with(|p| p.borrow_mut().insert(tab_id.to_string(), entry));
-    if let Some((old, reply)) = displaced {
+    //
+    // The reply goes in FIRST and the displaced one comes back out of the
+    // same map, so the two maps cannot end up holding different tabs' idea
+    // of what is outstanding.
+    let displaced_reply = REPLIES.with(|r| r.borrow_mut().insert(tab_id.to_string(), reply));
+    let displaced = super::ask::note_raised(Pending {
+        tab_id: tab_id.to_string(),
+        origin,
+        ask,
+    });
+    if let Some(old) = displaced {
         eprintln!(
-            "eave: a second ask arrived for {tab_id} — cancelling {:?}",
+            "eave: a second ask arrived for {tab_id} — dismissing {:?}",
             old.ask
         );
-        reply_with(reply, Answer::Cancel);
+    }
+    if let Some(reply) = displaced_reply {
+        // A dismissal, not a refusal: nobody was asked, so nobody
+        // answered, and G27's rule is that only a person's answer is
+        // written down.
+        reply_with(reply, Answer::Dismiss);
     }
     super::tabs::bump_chrome_revision();
 }
@@ -172,8 +124,9 @@ fn raise(tab_id: &str, origin: String, ask: Ask, reply: Reply) {
 /// Answer a tab's outstanding ask. Does nothing if there is none, which is
 /// what makes a double-answer safe rather than a crash in Chromium.
 pub fn answer(tab_id: &str, answer: Answer) {
-    let taken = PENDING.with(|p| p.borrow_mut().remove(tab_id));
-    let Some((pending, reply)) = taken else {
+    let taken = super::ask::take(tab_id);
+    let reply = REPLIES.with(|r| r.borrow_mut().remove(tab_id));
+    let (Some(pending), Some(reply)) = (taken, reply) else {
         return;
     };
     if super::tabs::trace() {
@@ -181,8 +134,19 @@ pub fn answer(tab_id: &str, answer: Answer) {
     }
     // G1: write the answer down before replying, so a page that re-asks
     // the instant it is unblocked finds it already there.
+    //
+    // **G27: only if it IS an answer.** This used to be
+    // `matches!(answer, Answer::Ok)`, which filed every dismissal as a
+    // durable deny — see `ask::decision_of` for the whole shape of it.
     if let Ask::Permission { kinds } = &pending.ask {
-        remember(&pending.origin, kinds, matches!(answer, Answer::Ok));
+        if let Some(allowed) = decision_of(&answer) {
+            remember(&pending.origin, kinds, allowed);
+        } else if super::tabs::trace() {
+            eprintln!(
+                "[web] dismissed {kinds:?} from {} — nothing written down",
+                pending.origin
+            );
+        }
     }
     reply_with(reply, answer);
     super::tabs::bump_chrome_revision();
@@ -193,17 +157,27 @@ pub fn answer(tab_id: &str, answer: Answer) {
 /// browser is going away anyway, because the page it would have unblocked
 /// is going with it.
 pub fn forget(tab_id: &str) {
-    let taken = PENDING.with(|p| p.borrow_mut().remove(tab_id));
-    if let Some((_, reply)) = taken {
+    super::ask::take(tab_id);
+    let taken = REPLIES.with(|r| r.borrow_mut().remove(tab_id));
+    if let Some(reply) = taken {
         // Still answered, not dropped. A callback released without a reply
         // is a renderer left stopped, and on a browser that is closing that
         // is the difference between a clean teardown and a hang.
-        reply_with(reply, Answer::Cancel);
+        //
+        // `Dismiss` rather than `Cancel` (G27): closing a tab with a
+        // camera prompt up is not the operator refusing the camera.
+        reply_with(reply, Answer::Dismiss);
     }
 }
 
 fn reply_with(reply: Reply, answer: Answer) {
-    let ok = matches!(answer, Answer::Ok | Answer::Text(_) | Answer::Files(_));
+    let ok = page_hears_yes(&answer);
+    // A dismissal is told to Chromium AS a dismissal, not as a refusal.
+    // Chromium's `PermissionDecisionAutoBlocker` counts dismissals and
+    // embargoes an origin only after three of them
+    // (`kDefaultDismissalsBeforeBlock`), which is the behaviour eave wants
+    // and cannot get by writing the block itself.
+    let dismissed = matches!(answer, Answer::Dismiss);
     match reply {
         Reply::Js(cb) => {
             let text = match &answer {
@@ -225,9 +199,30 @@ fn reply_with(reply: Reply, answer: Answer) {
         },
         Reply::Permission(cb) => cb.cont(if ok {
             PermissionRequestResult::ACCEPT
+        } else if dismissed {
+            PermissionRequestResult::DISMISS
         } else {
             PermissionRequestResult::DENY
         }),
+        Reply::Auth(cb) => match answer {
+            Answer::Credentials { user, password } => {
+                cb.cont(
+                    Some(&CefString::from(user.as_str())),
+                    Some(&CefString::from(password.as_str())),
+                );
+            }
+            // Anything else — Cancel, Dismiss, a stray Ok with no fields —
+            // is "no credentials", and Chromium turns that into the 401 the
+            // server already sent.
+            _ => cb.cancel(),
+        },
+        Reply::Cert(cb) => {
+            if ok {
+                cb.cont();
+            } else {
+                cb.cancel();
+            }
+        }
         Reply::Media(cb, requested) => {
             if ok {
                 // Grant exactly what was asked for and nothing more. CEF
@@ -397,6 +392,65 @@ fn remember(origin: &str, kinds: &[PermissionKind], allowed: bool) {
     });
 }
 
+/// A server (or a proxy) is demanding a username and a password (D7).
+///
+/// Returns whether the ask was raised. `false` means the callback was NOT
+/// taken and the caller must return 0 so Chromium cancels the request
+/// itself — a held callback nobody can answer is a stopped load forever.
+pub(super) fn raise_auth(
+    tab_id: &str,
+    origin_url: &str,
+    host: &str,
+    port: i32,
+    realm: Option<String>,
+    is_proxy: bool,
+    callback: &AuthCallback,
+) -> bool {
+    // The host as the operator has to judge it. A port is part of the
+    // identity of a server and omitting it is how two different services on
+    // one machine become indistinguishable in a password prompt.
+    let where_from = match port {
+        0 | 80 | 443 => host.to_string(),
+        p => format!("{host}:{p}"),
+    };
+    // An empty realm is not a realm. Servers send `realm=""` routinely and
+    // rendering it would draw an empty quoted string under the host.
+    let realm = realm.filter(|r| !r.trim().is_empty());
+    raise(
+        tab_id,
+        // For a proxy the origin is NOT where the password goes, so the
+        // dialog states the proxy as its subject and keeps the page's
+        // origin only as the context line the surface always shows.
+        origin_url.to_string(),
+        Ask::Credentials {
+            host: where_from,
+            realm,
+            is_proxy,
+        },
+        Reply::Auth(callback.clone()),
+    );
+    true
+}
+
+/// The TLS certificate for this navigation did not check out (D8).
+///
+/// # Why this is raised at all, when not raising it is also safe
+/// CEF's default for an unhandled `on_certificate_error` is to cancel the
+/// request. That is the safe outcome and it is also a **silent** one: the
+/// operator gets a failed load with no way to tell a bad certificate from
+/// a dead host. The interstitial exists to say which.
+pub(super) fn raise_cert(tab_id: &str, url: &str, reason: &str, callback: &Callback) {
+    raise(
+        tab_id,
+        url.to_string(),
+        Ask::Certificate {
+            url: url.to_string(),
+            reason: reason.to_string(),
+        },
+        Reply::Cert(callback.clone()),
+    );
+}
+
 /// Answer an ask from what is already known, or `false` if nobody has
 /// answered this before and a person must be disturbed.
 ///
@@ -506,6 +560,66 @@ pub fn clear_in_chromium(origin: &str, kinds: &[PermissionKind]) {
     sync_to_chromium(origin, kinds, ContentSettingValues::DEFAULT);
 }
 
+/// Push everything eave remembers into Chromium's content settings (G28).
+///
+/// # The defect this closes
+/// [`sync_to_chromium`] ran on **answer** and on **revoke**, so the two
+/// stores agreed only for the session in which the answer was given.
+/// Measured on 2026-08-23: with a durable `allow` for
+/// `http://127.0.0.1:8765/` in `permissions.jsonl`, a fresh launch reported
+/// `Notification.permission === 'default'` and
+/// `profile.content_settings.exceptions.notifications` was `{}`.
+///
+/// `requestPermission()` still resolved correctly, because that path
+/// consults [`super::permissions`] first — which is exactly why this hid.
+/// **The capability worked and the introspection lied**, and a page that
+/// *reads* the state rather than calling the request API — the common
+/// pattern for notifications — saw a permission it had been granted as
+/// unset, for ever.
+///
+/// # What it does NOT do
+/// This writes; it does not reconcile. An ALLOW that exists only in
+/// Chromium — the shape G1b fixed for the revoke path — is not visible
+/// from here, because the CEF seam offers `set_content_setting` and
+/// `get_content_setting` but **no way to enumerate what an origin already
+/// has**, and eave does not know which origins to ask about. Revocation
+/// clears Chromium at the moment it happens ([`clear_in_chromium`]), so
+/// the remaining hole is a store edited behind eave's back.
+///
+/// Camera and microphone are absent by construction: [`content_type`]
+/// returns `None` for them and eave's store is deliberately the only one.
+pub fn replay_into_chromium() {
+    if !super::host::running() {
+        return;
+    }
+    let grants = super::permissions::grants();
+    let mut written = 0usize;
+    for grant in &grants {
+        if !grant.permission.is_storable() {
+            continue;
+        }
+        if content_type(&grant.permission).is_none() {
+            continue;
+        }
+        let value = match grant.decision {
+            PermissionDecision::Allow => ContentSettingValues::ALLOW,
+            PermissionDecision::Deny => ContentSettingValues::BLOCK,
+        };
+        sync_to_chromium(
+            &grant.origin,
+            std::slice::from_ref(&grant.permission),
+            value,
+        );
+        written += 1;
+    }
+    if super::tabs::trace() {
+        eprintln!(
+            "[web] replayed {written} of {} grants into chromium",
+            grants.len()
+        );
+    }
+}
+
 fn trace_remembered(origin: &str, kinds: &[PermissionKind], allowed: bool) {
     // Worth a line of its own: a prompt that does NOT appear is invisible
     // by construction, so without this the difference between "remembered"
@@ -600,8 +714,9 @@ wrap_jsdialog_handler! {
         /// Anything outstanding will never be answered by the page, so it
         /// must not sit on screen waiting for a person either.
         fn on_reset_dialog_state(&self, _browser: Option<&mut Browser>) {
-            PENDING.with(|p| {
-                p.borrow_mut().remove(&self.tab_id);
+            super::ask::take(&self.tab_id);
+            REPLIES.with(|r| {
+                r.borrow_mut().remove(&self.tab_id);
             });
             super::tabs::bump_chrome_revision();
         }
@@ -688,8 +803,9 @@ wrap_permission_handler! {
             _prompt_id: u64,
             _result: PermissionRequestResult,
         ) {
-            PENDING.with(|p| {
-                p.borrow_mut().remove(&self.tab_id);
+            super::ask::take(&self.tab_id);
+            REPLIES.with(|r| {
+                r.borrow_mut().remove(&self.tab_id);
             });
             super::tabs::bump_chrome_revision();
         }

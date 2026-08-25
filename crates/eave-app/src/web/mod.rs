@@ -106,6 +106,12 @@ pub mod quarantine;
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 mod favicon_adapt;
 
+/// The ask VOCABULARY and the rule that decides what an answer means,
+/// compiled in both feature states so the default test run exercises them.
+/// `dialogs` — the CEF half — is gated; this is not. See its module docs
+/// for why (06-browser G26).
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+mod ask;
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
@@ -138,8 +144,9 @@ mod tabs;
 #[cfg(feature = "web")]
 mod zoom;
 
+pub use ask::{any_pending, certificate_explanation, masked, pending, Answer, Ask, Pending};
 #[cfg(feature = "web")]
-pub use dialogs::{answer, any_pending, pending, Answer, Ask, Pending};
+pub use dialogs::answer;
 #[cfg(feature = "web")]
 pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 #[cfg(feature = "web")]
@@ -847,76 +854,37 @@ pub fn downloads() -> Vec<Download> {
     Vec::new()
 }
 
-/// What a page is asking a person. Nothing asks here.
+/// Answer a tab's outstanding ask.
+///
+/// **06-browser G26 is closed here.** This used to be an empty function
+/// beside a `pending()` that returned `None` unconditionally, so the whole
+/// ask surface was invisible to `cargo test` and G25's modality fix
+/// shipped code-verified only. The map now lives in `ask.rs` outside the
+/// gate, so this really does take the ask off the screen and the harness
+/// can drive the dialog end to end.
+///
+/// What is missing in this build is only what was always missing: there is
+/// no Chromium continuation to reply to, because there is no page.
 #[cfg(not(feature = "web"))]
-#[derive(Debug, Clone, PartialEq)]
-pub enum Ask {
-    Alert {
-        message: String,
-    },
-    Confirm {
-        message: String,
-    },
-    Prompt {
-        message: String,
-        default: String,
-    },
-    Leave {
-        message: String,
-        reloading: bool,
-    },
-    Permission {
-        kinds: Vec<permissions::PermissionKind>,
-    },
-    Files {
-        title: String,
-        multiple: bool,
-        folder: bool,
-        save: bool,
-    },
+pub fn answer(tab_id: &str, _answer: Answer) {
+    ask::take(tab_id);
 }
 
-#[cfg(not(feature = "web"))]
-impl Ask {
-    pub fn is_refusable(&self) -> bool {
-        !matches!(self, Ask::Alert { .. })
-    }
+/// Raise an ask against a tab, for tests.
+///
+/// **Compiled in both feature states**, because the harness runs in both
+/// and the map it writes to is ungated. What it deliberately does not do
+/// is register a `Reply` — there is no Chromium continuation behind a
+/// test's ask, and `dialogs::answer` handles that by removing the ask and
+/// replying to nothing, which is exactly what should happen.
+#[cfg(test)]
+pub fn raise_ask_for_test(tab_id: &str, origin: &str, what: Ask) {
+    ask::note_raised(Pending {
+        tab_id: tab_id.to_string(),
+        origin: origin.to_string(),
+        ask: what,
+    });
 }
-
-/// An outstanding ask, and which tab is stopped on it.
-#[cfg(not(feature = "web"))]
-#[derive(Debug, Clone, PartialEq)]
-pub struct Pending {
-    pub tab_id: String,
-    pub origin: String,
-    pub ask: Ask,
-}
-
-/// What a person answered.
-#[cfg(not(feature = "web"))]
-#[derive(Debug, Clone, PartialEq)]
-pub enum Answer {
-    Ok,
-    Cancel,
-    Text(String),
-    Files(Vec<String>),
-}
-
-/// What this tab is stopped on. `None` — there is no page to stop.
-#[cfg(not(feature = "web"))]
-pub fn pending(_tab_id: &str) -> Option<Pending> {
-    None
-}
-
-/// Whether any tab is stopped on an ask.
-#[cfg(not(feature = "web"))]
-pub fn any_pending() -> bool {
-    false
-}
-
-/// Answer a tab's outstanding ask. Nothing is outstanding here.
-#[cfg(not(feature = "web"))]
-pub fn answer(_tab_id: &str, _answer: Answer) {}
 
 /// Resident bytes across the CEF process tree, and how many processes that
 /// is. `None` when nothing is running or the probe failed — the same
