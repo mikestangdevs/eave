@@ -66,6 +66,15 @@ pub struct ConsoleLine {
     pub text: String,
     /// Where it came from, when Chromium says. Empty when it does not.
     pub source: String,
+    /// The line in [`source`](Self::source), 1-based, when Chromium says.
+    ///
+    /// `None` for `console.log` — Chromium reports a *stack* for those, not
+    /// a line, and picking a frame out of it here would be guessing. It is
+    /// present for `Log.entryAdded` and for thrown exceptions, which are
+    /// the two an agent is usually chasing. **Kept separate from `source`
+    /// rather than formatted into it**: an agent that wants to open the
+    /// file needs the number, not `a.js:3` to parse back apart.
+    pub line: Option<u32>,
 }
 
 /// One request a page made, folded from up to three CDP events.
@@ -169,6 +178,7 @@ fn fold(tab_id: &str, method: &str, params: &Value) {
                     level,
                     text: clamp(&flatten_args(params.get("args")), TEXT_MAX),
                     source: String::new(),
+                    line: None,
                 },
             );
         }
@@ -192,6 +202,14 @@ fn fold(tab_id: &str, method: &str, params: &Value) {
                         .and_then(Value::as_str)
                         .map(|u| clamp(u, URL_MAX))
                         .unwrap_or_default(),
+                    // CDP counts exception lines from ZERO and every editor
+                    // counts from one. Converting here rather than at each
+                    // reader is the difference between an agent opening the
+                    // right line and the one above it.
+                    line: details
+                        .and_then(|d| d.get("lineNumber"))
+                        .and_then(Value::as_u64)
+                        .map(|n| n as u32 + 1),
                 },
             );
         }
@@ -216,6 +234,13 @@ fn fold(tab_id: &str, method: &str, params: &Value) {
                         .and_then(Value::as_str)
                         .map(|u| clamp(u, URL_MAX))
                         .unwrap_or_default(),
+                    // `Log.entryAdded`'s lineNumber is already 1-based —
+                    // unlike `exceptionThrown`'s above. Two fields, same
+                    // name, different origin, in one protocol.
+                    line: entry
+                        .get("lineNumber")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as u32),
                 },
             );
         }
@@ -576,6 +601,58 @@ mod tests {
         assert_eq!(line.level, "error");
         assert!(line.text.contains("TypeError"), "{}", line.text);
         assert_eq!(line.source, "https://example.com/a.js");
+    }
+
+    /// **CDP counts exception lines from zero and log entries from one.**
+    ///
+    /// Two fields with the same name in one protocol, with different
+    /// origins — and the failure is an agent opening the line above the
+    /// bug, which looks like the agent being wrong rather than the reader.
+    #[test]
+    fn line_numbers_are_one_based_whichever_event_they_came_from() {
+        reset();
+        let snap = snapshot("o13");
+        drive(&snap);
+        // `exceptionThrown`: 0-based, so line 2 means the third line.
+        raise(
+            "o13",
+            "Runtime.exceptionThrown",
+            json!({"exceptionDetails": {
+                "lineNumber": 2,
+                "url": "https://example.com/a.js",
+                "exception": {"description": "TypeError: boom"}
+            }}),
+        );
+        // `Log.entryAdded`: already 1-based.
+        raise(
+            "o13",
+            "Log.entryAdded",
+            json!({"entry": {"level": "error", "text": "404", "url": "https://example.com/b.css", "lineNumber": 7}}),
+        );
+        drive(&snap);
+        let lines = console("o13");
+        assert_eq!(lines[0].line, Some(3), "exception lines are 0-based in CDP");
+        assert_eq!(
+            lines[1].line,
+            Some(7),
+            "log entry lines are already 1-based"
+        );
+    }
+
+    /// `console.log` has a stack, not a line, and guessing a frame from it
+    /// would be inventing a location.
+    #[test]
+    fn a_console_log_reports_no_line_rather_than_a_wrong_one() {
+        reset();
+        let snap = snapshot("o14");
+        drive(&snap);
+        raise(
+            "o14",
+            "Runtime.consoleAPICalled",
+            json!({"type": "log", "args": [{"value": "hi"}]}),
+        );
+        drive(&snap);
+        assert_eq!(console("o14")[0].line, None);
     }
 
     /// The two consumers share one queue and must not eat each other.
