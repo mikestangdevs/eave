@@ -2150,9 +2150,14 @@ wrap_download_handler! {
 fn tab_disposition(disposition: WindowOpenDisposition) -> Option<bool> {
     match disposition {
         // ⌘-click, middle-click, `target="_blank" rel=noopener` from a
-        // background context. **Not activated** — that is the whole point
-        // of the gesture: keep this, I am still reading.
-        WindowOpenDisposition::NEW_BACKGROUND_TAB => Some(false),
+        // background context. Not activated by default — that is the whole
+        // point of the gesture: keep this, I am still reading. Slice S1
+        // makes the exception a choice rather than a hardcode: the Tabs
+        // pane's "switch to it immediately" flips this arm and only this
+        // arm — a FOREGROUND disposition was already an ask to switch.
+        WindowOpenDisposition::NEW_BACKGROUND_TAB => {
+            Some(crate::settings::switch_to_background_tabs())
+        }
         WindowOpenDisposition::NEW_FOREGROUND_TAB => Some(true),
         // eave is one window and a page is a tab in it (the C3 ruling), so
         // "new window" and "new popup" are tabs too. A page cannot make

@@ -170,9 +170,44 @@ fn env_duration(key: &str, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
-/// [`PAGE_IDLE_EVICT_AFTER`], overridable via `EAVE_THRESH_PAGE_EVICT_MS`.
+/// The operator's eviction threshold (Slice S1), pushed here by the
+/// settings store because the eviction clock reads thresholds, not the
+/// app's settings module. `0` is the unset sentinel — a real threshold of
+/// zero milliseconds would evict the instant a tab deactivates, which no
+/// setting offers; `u64::MAX` is the off position, an idle age no tab
+/// reaches.
+static PAGE_EVICT_OVERRIDE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Install (or with `None` clear) the settings-chosen eviction threshold.
+pub fn set_page_evict_override(ms: Option<u64>) {
+    PAGE_EVICT_OVERRIDE_MS.store(ms.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`PAGE_IDLE_EVICT_AFTER`], through two overrides in precedence order:
+/// the `EAVE_THRESH_PAGE_EVICT_MS` env knob first — it exists so a test
+/// can scale a twenty-minute clock down, and a test that sets it must win
+/// over whatever settings.json happens to hold on the machine — then the
+/// operator's setting, then the constant.
 pub fn page_idle_evict_after() -> Duration {
-    env_duration("EAVE_THRESH_PAGE_EVICT_MS", PAGE_IDLE_EVICT_AFTER)
+    resolve_page_evict(
+        std::env::var("EAVE_THRESH_PAGE_EVICT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok()),
+        PAGE_EVICT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// The env-then-setting-then-constant ladder, pure so both rungs are
+/// testable without touching process env (the same split as
+/// `reduce_motion_override` in eave-app).
+fn resolve_page_evict(env_ms: Option<u64>, override_ms: u64) -> Duration {
+    if let Some(ms) = env_ms {
+        return Duration::from_millis(ms);
+    }
+    if override_ms != 0 {
+        return Duration::from_millis(override_ms);
+    }
+    PAGE_IDLE_EVICT_AFTER
 }
 
 /// [`PAGE_AUDIO_HOLD`], overridable via `EAVE_THRESH_PAGE_AUDIO_MS`.
@@ -214,4 +249,28 @@ pub fn page_preload_max() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(PAGE_PRELOAD_MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ladder: env wins over the setting, the setting over the
+    /// constant, and the off sentinel really is an age no tab reaches.
+    #[test]
+    fn the_evict_ladder_holds() {
+        assert_eq!(resolve_page_evict(None, 0), PAGE_IDLE_EVICT_AFTER);
+        assert_eq!(
+            resolve_page_evict(None, 5 * 60_000),
+            Duration::from_millis(5 * 60_000)
+        );
+        assert_eq!(
+            resolve_page_evict(Some(250), 5 * 60_000),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            resolve_page_evict(None, u64::MAX),
+            Duration::from_millis(u64::MAX)
+        );
+    }
 }

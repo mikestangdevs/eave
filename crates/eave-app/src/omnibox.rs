@@ -78,7 +78,11 @@ pub fn search_prefix() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SEARCH.to_string())
+        // Slice S1: the durable choice lives in settings.json; the env var
+        // stays above it as the per-run override it has always been. The
+        // settings store owns the engine→prefix mapping; tests see the
+        // default store, which resolves to [`DEFAULT_SEARCH`] as before.
+        .unwrap_or_else(|| crate::settings::snapshot().search.prefix())
 }
 
 /// The host a search prefix points at, for the sentence in the interface.

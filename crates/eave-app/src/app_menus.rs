@@ -15,8 +15,9 @@
 //!
 //! Structure ported from comet's `app_menus.rs` (MIT), which ports zed's.
 //! Narrower than either: eave has no appearance-mode picker and no
-//! document-style New Window. It does have a Theme Editor (bezel's Create
-//! page) — a second window, opened from this bar.
+//! document-style New Window. It does have two second windows opened from
+//! this bar: Settings (⌘,, Slice S1) and the Theme Editor (bezel's Create
+//! page, ⌘⇧,).
 
 use gpui::{actions, App, Menu, MenuItem, Window};
 
@@ -93,6 +94,11 @@ fn menus() -> Vec<Menu> {
                 // nothing yet" is the honest middle.
                 MenuItem::action("About eave", About).disabled(true),
                 MenuItem::separator(),
+                // Where every macOS app keeps it, chord glyph derived from
+                // the ⌘, binding in `bootstrap`. Present because eave now
+                // HAS the surface — see the negative test below, which
+                // guarded this exact row until S1 built the window.
+                MenuItem::action("Settings…", crate::settings_window::OpenSettings),
                 MenuItem::action("Theme Editor", crate::theme_editor::OpenThemeEditor),
                 MenuItem::separator(),
                 MenuItem::action("Hide eave", Hide),
@@ -153,16 +159,25 @@ mod tests {
             app_names.iter().any(|n| n == "Theme Editor"),
             "the app menu lost the Theme Editor: {app_names:?}"
         );
+        // Present since S1 built the window; before that, this very test
+        // forbade the word. The row and the surface must arrive together,
+        // and this assertion plus the negative list below is that contract
+        // from both sides.
+        assert!(
+            app_names.iter().any(|n| n == "Settings…"),
+            "the app menu lost Settings: {app_names:?}"
+        );
 
         // Nothing in either menu may claim a surface eave does not have.
         // This is a NEGATIVE test on purpose: the failure it prevents is
-        // someone porting another row out of comet's menu, which has a
-        // Settings window and three appearance modes.
+        // someone porting another row out of comet's menu, which has three
+        // appearance modes and a document-style New Window. "settings" and
+        // "preferences" left this list when S1 built the real window.
         for menu in &m {
             for item in &menu.items {
                 if let MenuItem::Action { name, .. } = item {
                     let n = name.to_lowercase();
-                    for absent in ["settings", "preferences", "appearance", "new window"] {
+                    for absent in ["appearance", "new window"] {
                         assert!(
                             !n.contains(absent),
                             "the menu offers {name:?}, and eave has no such surface"

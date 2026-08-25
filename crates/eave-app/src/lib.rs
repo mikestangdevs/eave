@@ -90,6 +90,10 @@ mod bezel_diff;
 mod bezel_tools;
 /// The theme editor (bezel's Create page). A window, opened from the menu.
 pub mod theme_editor;
+/// settings.json — one struct, every pane reads and writes through it (S1).
+pub mod settings;
+/// The Settings window (⌘,): frame + the real panes.
+pub mod settings_window;
 
 pub mod ui;
 

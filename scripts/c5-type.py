@@ -42,6 +42,8 @@ KEYCODES = {
     # / `kVK_ANSI_RightBracket`), not the characters, same as every other
     # entry here.
     "[": 33, "]": 30,
+    # Slice S1 — ⌘, opens Settings. `kVK_ANSI_Comma`.
+    ",": 43,
 }
 
 # Named keys, which are neither characters nor chords. `send` taps these

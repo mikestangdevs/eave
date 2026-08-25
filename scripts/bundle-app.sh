@@ -136,6 +136,16 @@ fi
 # ------------------------------------------------------------- the build ----
 
 echo "── build ($PROFILE) ──"
+# Slice S1: stamp the tree's HEAD into the binary for the Info pane. Into
+# the Mach-O (via eave-app's build.rs), NOT the plist — this machine's
+# workflow restamps binaries into existing bundles, and a plist stamp
+# would survive that as yesterday's sha. rev-parse only: `git status` and
+# `git diff` hang on this checkout (CloudDocs), so the stamp names HEAD
+# and says nothing about uncommitted edits — the Info pane's label states
+# that.
+EAVE_BUILD_SHA="$(git -C "$ROOT" rev-parse --short=9 HEAD 2>/dev/null || true)"
+export EAVE_BUILD_SHA
+
 BUILD_FLAGS=(--manifest-path "$MANIFEST" "${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}")
 [[ "$PROFILE" == release ]] && BUILD_FLAGS+=(--release)
 # THE FEATURES GO ON BOTH BINARIES. This is the whole of what Slice C1's

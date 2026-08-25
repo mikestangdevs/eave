@@ -61,8 +61,15 @@ for reduced in inherit 0; do
       # Slice C4 diagnosed the approvals anchor jump in an afternoon once
       # the line was visible. Capture everything; summarise; and on
       # anything that is not a clean PASS, print the whole conversation.
+      # EAVE_REPLAY_BIN (S1): run a binary OTHER than the shared
+      # target/debug/eave. Three sessions share this checkout's target
+      # dir, and any one of them running a `--features web` build swaps
+      # a cef-linked loose binary under a sweep mid-run — which panics in
+      # cef-rs library_loader.rs:20 and reads as "the app did not boot"
+      # from run N onward. A sweep that must be trustworthy builds to its
+      # own CARGO_TARGET_DIR and names the binary here.
       all="$(EAVE_REPLAY="$fixture" EAVE_REPLAY_SPEED="$SPEED" EAVE_REPLAY_ASSERT=1 \
-             "$PWD/target/debug/eave" 2>/dev/null | grep -E '^REPLAY_' || true)"
+             "${EAVE_REPLAY_BIN:-$PWD/target/debug/eave}" 2>/dev/null | grep -E '^REPLAY_' || true)"
       out="$(printf '%s\n' "$all" | grep REPLAY_ASSERT || true)"
       tag="rm=$reduced $(basename "$fixture" .tap.jsonl) #$i"
       # A refusal is not a failure by itself — the assert re-arms — but it

@@ -41,6 +41,12 @@ SPEED=30
 BUNDLED=1
 CEF=auto
 WEB=0
+# --out=DIR: assemble the bundles somewhere other than target/bundle —
+# Slice S1 added it because the standing rule on this machine is "do not
+# bundle-app.sh onto in-tree target/bundle" (EAVE_CURRENT; the iCloud
+# rm -rf wedge), and a smoke gate that violates the rule it runs under is
+# a gate nobody can run.
+SMOKE_OUT=""
 for arg in "$@"; do
   case "$arg" in
     --unbundled) BUNDLED=0 ;;
@@ -48,6 +54,7 @@ for arg in "$@"; do
     --cef)       CEF=1 ;;
     --no-cef)    CEF=0 ;;
     --web)       WEB=1 ;;
+    --out=*)     SMOKE_OUT="${arg#--out=}" ;;
     [0-9]*)      SPEED="$arg" ;;
     *) echo "boot-smoke: unknown argument $arg" >&2; exit 2 ;;
   esac
@@ -65,6 +72,7 @@ done
 # failed statement. Silent, and it looks like the smoke passed with no output.
 BUNDLE_FLAGS=()
 if [ "$WEB" = 1 ]; then BUNDLE_FLAGS+=(--features web); fi
+if [ -n "$SMOKE_OUT" ]; then BUNDLE_FLAGS+=(--out "$SMOKE_OUT"); fi
 
 # Two fixtures:
 #   real-claude   — a genuine capture; the pacing and markdown the
@@ -95,7 +103,7 @@ if [ "$BUNDLED" = 1 ]; then
   BUILD_LOG="${TMPDIR:-/tmp}/eave-boot-smoke-build.log"
   scripts/bundle-app.sh "${BUNDLE_FLAGS[@]+"${BUNDLE_FLAGS[@]}"}" >"$BUILD_LOG" 2>&1 ||
     { echo "boot-smoke: bundle failed" >&2; tail -30 "$BUILD_LOG" >&2; exit 1; }
-  APP="$ROOT/target/bundle/eave.app"
+  APP="${SMOKE_OUT:-$ROOT/target/bundle}/eave.app"
   EAVE="$APP/Contents/MacOS/eave"
   echo "boot-smoke: running from the bundle ($APP)"
 else
@@ -191,7 +199,7 @@ fi
 # real page. This stage stays anyway, and is worth keeping precisely because
 # eave now has its own: when a page breaks, the two together answer "is it
 # Chromium or is it us?" in one run. The spike is the control.
-CEF_APP="$ROOT/target/bundle/cef-osr-spike.app"
+CEF_APP="${SMOKE_OUT:-$ROOT/target/bundle}/cef-osr-spike.app"
 if [ "$CEF" = auto ]; then
   [ -d "$CEF_APP" ] && CEF=1 || CEF=0
 fi
@@ -206,7 +214,7 @@ elif [ ! -d "${CEF_PATH:-$HOME/.local/share/cef}/Chromium Embedded Framework.fra
 else
   echo "── cef: bundle + boot ──"
   BUILD_LOG="${TMPDIR:-/tmp}/eave-boot-smoke-cef.log"
-  if ! scripts/bundle-app.sh cef-osr-spike >"$BUILD_LOG" 2>&1; then
+  if ! scripts/bundle-app.sh ${SMOKE_OUT:+--out "$SMOKE_OUT"} cef-osr-spike >"$BUILD_LOG" 2>&1; then
     echo "cef: bundle failed" >&2; tail -30 "$BUILD_LOG" >&2; fail=1
   fi
   grep -E '^(  ✓|  ✗|  ·)' "$BUILD_LOG" || true

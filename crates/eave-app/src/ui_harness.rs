@@ -15214,3 +15214,163 @@ fn a_notification_without_permission_never_reaches_the_screen(cx: &mut TestAppCo
     );
     assert!(!shown(vcx, "notification-stack"));
 }
+
+/// S1: the Shortcuts pane is a viewer of the keymap the app actually
+/// boots — asserted against the REAL `bootstrap`, not a hand-bound
+/// replica. The chords the directive names must be present under the
+/// labels the pane will print, ⌘, must now be Settings (not the Theme
+/// Editor, which moved to ⌘⇧,), and no group may come out empty.
+#[gpui::test]
+fn the_shortcut_viewer_sees_the_booted_keymap(cx: &mut TestAppContext) {
+    let (_h, _vcx) = boot(cx);
+    cx.update(|cx| {
+        let groups = crate::settings_window::shortcut_groups(cx, "");
+        let find = |label: &str| -> Option<String> {
+            groups.iter().flat_map(|g| g.rows.iter()).find_map(|r| {
+                (r.label == label).then(|| r.chords.join(" · "))
+            })
+        };
+        for (label, chord) in [
+            ("New tab", "⌘T"),
+            ("Close the tab — the window when none is open", "⌘W"),
+            ("Open the omnibox", "⌘L"),
+            ("Find in page", "⌘F"),
+            ("Back", "⌘["),
+            ("Forward", "⌘]"),
+            ("Reload the page", "⌘R"),
+            ("Reopen the closed tab", "⇧⌘T"),
+            ("Switch to the last tab", "⌘9"),
+            ("Settings", "⌘,"),
+            ("Theme Editor", "⇧⌘,"),
+        ] {
+            assert_eq!(
+                find(label).as_deref(),
+                Some(chord),
+                "the viewer lost or mis-chords {label:?}"
+            );
+        }
+        assert!(
+            find("Switch to tab 1–8").is_some(),
+            "the ⌘1–8 run collapsed wrong: {:?}",
+            groups
+                .iter()
+                .flat_map(|g| g.rows.iter().map(|r| r.label.clone()))
+                .collect::<Vec<_>>()
+        );
+        for g in &groups {
+            assert!(!g.rows.is_empty(), "group {} rendered empty", g.name);
+        }
+    });
+}
+
+/// S1: every settings row round-trips — clicked in the real window,
+/// applied live, written to disk, and the file parses back to exactly the
+/// state on screen (which is what a relaunch reads; `set_settings_path`
+/// is one `serde_json::from_str` over this same file). The rail width is
+/// asserted live-side only: its persistence is `frame.json`, whose
+/// `DATA_DIR` is deliberately unset under the harness.
+#[gpui::test]
+fn every_settings_row_round_trips(cx: &mut TestAppContext) {
+    use crate::settings::{self, AppearanceSetting, SearchEngine};
+
+    // S2 added sibling tests that also mutate the process-global store;
+    let (h, _vcx) = boot(cx);
+
+    // A real file in the test temp dir. `set_settings_path` is a OnceLock:
+    // this is the only test that sets it, and the tests that never do are
+    // unaffected (their writes stay in the mirror).
+    let dir = std::env::temp_dir().join(format!("eave-s1-roundtrip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("settings.json");
+    let _ = std::fs::remove_file(&path);
+    settings::set_settings_path(path.clone());
+
+    let handle = cx
+        .update(crate::settings_window::open)
+        .expect("the settings window opens");
+    let svcx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    svcx.update(|window, _| window.refresh());
+    svcx.run_until_parked();
+
+    let on_disk = |path: &std::path::Path| -> crate::settings::Settings {
+        serde_json::from_str(&std::fs::read_to_string(path).expect("settings.json written"))
+            .expect("settings.json parses")
+    };
+
+    // Tabs pane: the eviction dial applies live — the thresholds the
+    // eviction clock reads move with the click, no relaunch anywhere.
+    click(svcx, "settings-pane-Tabs");
+    click(svcx, "settings-seg-5 min");
+    assert_eq!(settings::snapshot().evict_after_min, Some(5));
+    assert_eq!(
+        eave_core::thresholds::page_idle_evict_after(),
+        std::time::Duration::from_secs(5 * 60),
+        "the clicked threshold did not reach the eviction clock"
+    );
+    click(svcx, "settings-seg-Off");
+    assert_eq!(settings::snapshot().evict_after_min, None);
+    assert_eq!(
+        eave_core::thresholds::page_idle_evict_after(),
+        std::time::Duration::from_millis(u64::MAX),
+        "Off must be an idle age no tab reaches"
+    );
+    assert_eq!(on_disk(&path).evict_after_min, None, "Off did not persist");
+
+    click(svcx, "settings-seg-Is switched to");
+    assert!(settings::snapshot().switch_to_background_tabs);
+    assert!(settings::switch_to_background_tabs(), "the no-cx door lags");
+
+    // General pane: appearance and search engine, with the live-apply
+    // proof on the fact that actually moves — the prefix the omnibox
+    // sends queries to.
+    click(svcx, "settings-pane-General");
+    click(svcx, "settings-seg-Dark");
+    assert_eq!(settings::snapshot().appearance, AppearanceSetting::Dark);
+    click(svcx, "settings-seg-DuckDuckGo");
+    assert_eq!(settings::snapshot().search, SearchEngine::DuckDuckGo);
+    assert_eq!(
+        crate::omnibox::search_prefix(),
+        crate::settings::DUCKDUCKGO_SEARCH,
+        "the picked engine did not reach the omnibox"
+    );
+    // Custom with nothing typed falls back rather than searching "".
+    click(svcx, "settings-seg-Custom");
+    assert!(matches!(
+        settings::snapshot().search,
+        SearchEngine::Custom { ref prefix } if prefix.is_empty()
+    ));
+    assert_eq!(crate::omnibox::search_prefix(), crate::omnibox::DEFAULT_SEARCH);
+
+    // The file now holds every change made above, and parses back to the
+    // exact state on screen — the half of quit→relaunch that is code
+    // rather than process lifecycle.
+    let persisted = on_disk(&path);
+    assert_eq!(persisted, settings::snapshot());
+    assert_eq!(persisted.appearance, AppearanceSetting::Dark);
+    assert!(persisted.switch_to_background_tabs);
+
+    // Rail width: the settings store moves the live Shell — the frame
+    // follows a write it did not make.
+    cx.update(|cx| settings::set_rail_w(cx, 250.0));
+    cx.run_until_parked();
+    let shell_rail = h.window.update(cx, |shell, _, _| shell.rail_w).unwrap();
+    assert_eq!(shell_rail, 250.0, "the Shell did not follow the store");
+
+    // The Shortcuts and Info panes render from the state the other tests
+    // pin; switching to them must not disturb the struct.
+    click(svcx, "settings-pane-Shortcuts");
+    click(svcx, "settings-pane-Info");
+    assert_eq!(on_disk(&path), settings::snapshot());
+
+    // Restore defaults — the store is process-global and one harness
+    // assertion reads `search_prefix()` live.
+    click(svcx, "settings-pane-General");
+    click(svcx, "settings-seg-Google");
+    click(svcx, "settings-seg-System");
+    click(svcx, "settings-pane-Tabs");
+    click(svcx, "settings-seg-20 min");
+    click(svcx, "settings-seg-Stays in the background");
+    cx.update(|cx| settings::set_rail_w(cx, theme::RAIL_W));
+    assert_eq!(settings::snapshot(), crate::settings::Settings::default());
+    assert_eq!(on_disk(&path), crate::settings::Settings::default());
+}

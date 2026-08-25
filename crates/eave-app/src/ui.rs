@@ -3727,6 +3727,32 @@ impl TranscriptState {
                 ReplayAnchor::Held { ix, off, px } => {
                     ra.batch += 1;
                     ra.checks += 1;
+                    // The batch's splice was applied to the list above, and
+                    // `ListState::splice` renumbers its stored anchor when
+                    // rows land at or above it — correctly: the same content
+                    // row now wears a bigger index. The held copy must
+                    // follow the same arithmetic, or every splice at-or-above
+                    // the anchor reads as a jump with `d=0.0`. C4's report
+                    // NAMED this shape ("the same id at a new index is a
+                    // splice renumbering") and its witness line prints both
+                    // row ids for exactly this diagnosis — but its fix only
+                    // ever verified anchors ABOVE the splice point, so the
+                    // held index was never taught to move. S1's sweep caught
+                    // it: approvals can hold the last row and then append.
+                    // An anchor INSIDE the replaced range is left alone —
+                    // its row was removed, and that is a real event the
+                    // comparison should report.
+                    let ix = match &ops.splice {
+                        Some((range, count)) if range.end <= ix => {
+                            let moved = ix - (range.end - range.start) + count;
+                            // Written back, not just shadowed: a second
+                            // batch before the next frame must renumber
+                            // from the moved index, not the stale one.
+                            REPLAY_ANCHOR.with(|c| c.set(ReplayAnchor::Held { ix: moved, off, px }));
+                            moved
+                        }
+                        _ => ix,
+                    };
                     let cur = self.list.logical_scroll_top();
                     let cur_off = f32::from(cur.offset_in_item);
                     if replay_trace() {
@@ -4344,13 +4370,14 @@ impl Element for LinkText {
                     if let Some(href) = Self::href_at(&links, ix) {
                         // ⌘-click: a background tab, not the system
                         // browser, and not a steal of the active tab.
-                        // B1 modelled `activate: false` for this.
+                        // B1 modelled `activate: false` for this; S1 made
+                        // the exception a setting.
                         if ev.modifiers.platform {
                             if let Some(tx) = &commands {
                                 if markdown::web_url(href).is_some() {
                                     let _ = tx.send(Command::Browser(BrowserCmd::OpenAt {
                                         url: href.to_string(),
-                                        activate: false,
+                                        activate: crate::settings::switch_to_background_tabs(),
                                     }));
                                 }
                             }
@@ -5286,7 +5313,7 @@ fn frame_prefs_path() -> Option<PathBuf> {
 /// read from disk and once per mouse-move while dragging. A saved width
 /// written by a build with wider bounds is clamped rather than rejected —
 /// the frame should open narrow, not refuse to open.
-fn clamp_rail_w(w: f32) -> f32 {
+pub(crate) fn clamp_rail_w(w: f32) -> f32 {
     if !w.is_finite() {
         return theme::RAIL_W;
     }
@@ -5296,7 +5323,7 @@ fn clamp_rail_w(w: f32) -> f32 {
 /// Read the saved rail width, or [`theme::RAIL_W`] if there is nothing
 /// readable to read. Every failure path lands on the default deliberately:
 /// a corrupt preference file may not stop the window opening.
-fn load_rail_w() -> f32 {
+pub(crate) fn load_rail_w() -> f32 {
     let Some(path) = frame_prefs_path() else {
         return theme::RAIL_W;
     };
@@ -5451,7 +5478,7 @@ impl Render for NewTabTip {
 /// worth a footer notice (the width is already applied and the session is
 /// unharmed), but a preference that silently never persists is exactly the
 /// kind of thing that gets rediscovered as "the drag doesn't work".
-fn save_rail_w(w: f32) {
+pub(crate) fn save_rail_w(w: f32) {
     let Some(path) = frame_prefs_path() else {
         return;
     };
@@ -15497,10 +15524,11 @@ impl Shell {
                     // row have meant in every browser for twenty years: the
                     // operator asked for the link to be kept, not to be
                     // followed. Foregrounding it would be the behaviour of
-                    // an ordinary click, which they did not do.
+                    // an ordinary click, which they did not do — unless the
+                    // Tabs pane's "switch immediately" says otherwise (S1).
                     let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                         url,
-                        activate: false,
+                        activate: crate::settings::switch_to_background_tabs(),
                     }));
                 }
             }
@@ -16056,10 +16084,11 @@ impl Shell {
                     if let Some(url) = pinned_url {
                         // A background open is what "Open in New Tab" means
                         // in every browser, and it is the answer E1 added
-                        // the field for.
+                        // the field for — S1's policy setting is the one
+                        // exception, everywhere at once.
                         let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                             url,
-                            activate: false,
+                            activate: crate::settings::switch_to_background_tabs(),
                         }));
                     }
                 }
@@ -16152,7 +16181,7 @@ impl Shell {
                 if let Some(url) = self.tab_url(&tab_id, cx) {
                     let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                         url,
-                        activate: false,
+                        activate: crate::settings::switch_to_background_tabs(),
                     }));
                 }
             }
@@ -18023,7 +18052,11 @@ impl Render for Shell {
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                             if this.rail_drag.take().is_some() {
-                                save_rail_w(this.rail_w);
+                                // Through the settings store rather than
+                                // straight to disk (S1): same
+                                // `save_rail_w`, but an open settings
+                                // pane's rail row sees the drag land.
+                                crate::settings::set_rail_w(cx, this.rail_w);
                                 cx.notify();
                             }
                         }),
@@ -18621,6 +18654,9 @@ pub fn run(data_dir: PathBuf) -> ! {
     // it (Stage L), and it must not differ from the dir the feed loop uses.
     let _ = DATA_DIR.set(data_dir.clone());
     crate::theme::set_brand_path(data_dir.join("theme-brand.json"));
+    // Slice S1: same shape as the brand — the path is set before anything
+    // renders, the harness never sets it, so tests read defaults.
+    crate::settings::set_settings_path(data_dir.join("settings.json"));
     // Slice CK. **A probe is a spawn, so only a process with a window is
     // allowed to make one.** The test harness never reaches here, which is
     // what keeps `cargo test` from starting six vendor CLIs every time a
@@ -19027,11 +19063,16 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     // auto-hidden system bar has nothing to reveal.
     crate::app_menus::init(cx); // handlers only — the bar goes in last
     crate::theme_editor::init(cx);
-    cx.bind_keys([KeyBinding::new(
-        "cmd-,",
-        crate::theme_editor::OpenThemeEditor,
-        None,
-    )]);
+    // Slice S1: ⌘, is Settings — the chord every macOS app spends there —
+    // and the Theme Editor, which held it while it was the only second
+    // window, moves to ⌘⇧, beside it. The settings store itself is
+    // installed here so the harness boots the same wiring production does.
+    crate::settings::init(cx);
+    crate::settings_window::init(cx);
+    cx.bind_keys([
+        KeyBinding::new("cmd-,", crate::settings_window::OpenSettings, None),
+        KeyBinding::new("cmd-shift-,", crate::theme_editor::OpenThemeEditor, None),
+    ]);
 
     // Slice BZ: bezel's Theme global, built from `theme.rs`. Installed in
     // `bootstrap` rather than in `run` for the reason the two lines around it
@@ -19453,6 +19494,20 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         },
                     )
                     .detach();
+                    // S1: the rail width can move from the settings window
+                    // as well as from the drag; both write one store, and
+                    // this is how the frame follows a write it did not make
+                    // itself. Every other settings change repaints too —
+                    // the omnibox's search sentence reads the store per
+                    // render, so a stale frame is the only failure mode.
+                    cx.observe_global::<crate::settings::SettingsStore>(|shell: &mut Shell, cx| {
+                        let w = cx.global::<crate::settings::SettingsStore>().rail_w;
+                        if (shell.rail_w - w).abs() > f32::EPSILON {
+                            shell.rail_w = w;
+                        }
+                        cx.notify();
+                    })
+                    .detach();
                     cx.observe(&conn, |_, _, cx| cx.notify()).detach();
                     cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();
@@ -19518,7 +19573,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         // the launch value and the shell is the live one from
                         // then on. A per-frame read would also make an
                         // external edit fight the pointer mid-drag.
-                        rail_w: load_rail_w(),
+                        rail_w: cx.global::<crate::settings::SettingsStore>().rail_w,
                         rail_drag: None,
                         split: None,
                         split_drag: None,

@@ -170,6 +170,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 futures = "0.3"
+# Slice S1: `settings.json` is a typed struct (serde-defaulted so old files
+# parse forever), unlike `frame.json`'s untyped merged read-modify-write.
+# Same serde the other crates already compile.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 

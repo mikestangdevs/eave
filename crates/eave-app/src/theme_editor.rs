@@ -160,6 +160,13 @@ impl Render for ThemeEditor {
             .bg(theme.bg)
             .text_color(theme.text)
             .font_family(theme.font_sans.clone())
+            // ⌘W. The chord is bound to `eave::CloseTab` globally and only
+            // the Shell handles it, so in this window it used to dispatch
+            // into silence (S1 found it building the Settings window,
+            // which shares the shape). Here it means the window.
+            .on_action(cx.listener(|_, _: &crate::ui::CloseTab, window, _| {
+                window.remove_window();
+            }))
             .child(
                 div()
                     .flex_none()
