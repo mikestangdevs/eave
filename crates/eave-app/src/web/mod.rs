@@ -236,6 +236,12 @@ pub struct PageMenu {
     pub tab_id: String,
     pub x: f32,
     pub y: f32,
+    /// The click, still in PAGE space — what `x`/`y` were before the
+    /// window-space conversion. Inspect needs it: `show_dev_tools`'s
+    /// `inspect_element_at` is a question about the page, and the element
+    /// under the pointer is found by Blink, not by eave's window.
+    pub page_x: i32,
+    pub page_y: i32,
     /// The link under the pointer, if the pointer was over one.
     pub link_url: Option<String>,
     /// The selected text, if any. Carried whole; the row that shows it
@@ -741,6 +747,36 @@ fn cef_set_zoom(tab_id: &str, percent: u32) {
 }
 #[cfg(not(feature = "web"))]
 fn cef_set_zoom(_tab_id: &str, _percent: u32) {}
+
+/// Open DevTools for this tab's page, inspecting the element at the given
+/// PAGE-space point — the menu's "Inspect" row.
+///
+/// The shim shape (state out here, Chromium behind `cef_*`) is what lets
+/// the feature-OFF suite see the dispatch happen at all.
+pub fn inspect_element(tab_id: &str, x: i32, y: i32) {
+    #[cfg(test)]
+    TEST_INSPECTS.with(|i| *i.borrow_mut() = Some((tab_id.to_string(), x, y)));
+    cef_inspect_element(tab_id, x, y);
+}
+
+#[cfg(feature = "web")]
+fn cef_inspect_element(tab_id: &str, x: i32, y: i32) {
+    tabs::show_devtools(tab_id, x, y);
+}
+#[cfg(not(feature = "web"))]
+fn cef_inspect_element(_tab_id: &str, _x: i32, _y: i32) {}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INSPECTS: std::cell::RefCell<Option<(String, i32, i32)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: the last `inspect_element` call, taken.
+#[cfg(test)]
+pub fn take_inspect_for_test() -> Option<(String, i32, i32)> {
+    TEST_INSPECTS.with(|i| i.borrow_mut().take())
+}
 
 /// What Chromium currently has this tab's page at, as a zoom LEVEL.
 ///

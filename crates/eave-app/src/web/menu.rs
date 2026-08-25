@@ -83,6 +83,8 @@ cef::wrap_context_menu_handler! {
                 tab_id: self.tab_id.clone(),
                 x: params.xcoord() as f32 + view.origin_x,
                 y: params.ycoord() as f32 + view.origin_y,
+                page_x: params.xcoord(),
+                page_y: params.ycoord(),
                 link_url: string_of(params.link_url()),
                 selection: string_of(params.selection_text()),
                 editable: params.is_editable() == 1,

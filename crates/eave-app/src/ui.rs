@@ -6469,30 +6469,6 @@ impl Shell {
                 "Sign in",
                 "Cancel",
             ),
-
-            // D7. The HOST is the title, because it is the only thing on
-            // this card worth deciding on — a person about to type a
-            // password needs to read who is asking before anything else.
-            crate::web::Ask::Credentials {
-                host,
-                realm,
-                is_proxy,
-            } => (
-                Some(if *is_proxy {
-                    format!("The proxy {host} wants a password")
-                } else {
-                    format!("Sign in to {host}")
-                }),
-                match realm {
-                    // The server's own words, quoted so it is visibly the
-                    // server talking and not eave. It is attacker-controlled
-                    // text and gets no more authority than that.
-                    Some(realm) => format!("The server says: “{realm}”"),
-                    None => String::new(),
-                },
-                "Sign in",
-                "Cancel",
-            ),
             // D8. Chrome's own title, because it is the sentence people
             // have been trained on for a decade and this is not the place
             // to be original.
@@ -14968,6 +14944,22 @@ impl Shell {
                 }));
             }
         }
+        // The developer pair, last — where every Chromium browser keeps
+        // them. "View Page Source" is **disabled rather than absent** off
+        // the web, and the gate is Chromium's own: `view-source:` wraps
+        // only http(s) and file, anything else is rewritten to
+        // `about:blank` — a row that navigates to a blank page is worse
+        // than a grey one.
+        let source_ok = tab.and_then(|t| t.url.as_deref()).is_some_and(|u| {
+            u.starts_with("http://") || u.starts_with("https://") || u.starts_with("file://")
+        });
+        let view_source = MenuItem::new("View Page Source");
+        items.push(if source_ok {
+            view_source
+        } else {
+            view_source.disabled()
+        });
+        items.push(MenuItem::new("Inspect"));
         items
     }
 
@@ -15048,6 +15040,31 @@ impl Shell {
                         activate: false,
                     }));
                 }
+            }
+            "View Page Source" => {
+                let url = self
+                    .strip_snapshot(cx)
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.url.clone());
+                if let Some(url) = url {
+                    // **Foregrounded**, unlike "Open Link in New Tab": the
+                    // operator asked to read this page's source now, not to
+                    // set it aside — the same reason the search row
+                    // activates. The `view-source:` rewrite is Chromium's;
+                    // eave just navigates to it in a fresh tab.
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                        url: format!("view-source:{url}"),
+                        activate: true,
+                    }));
+                }
+            }
+            "Inspect" => {
+                // Page-space, deliberately: the element under the pointer
+                // is found by Blink, and Blink was told where the click was
+                // in ITS coordinates. The DevTools window itself is CEF's.
+                crate::web::inspect_element(&tab_id, req.page_x, req.page_y);
             }
             _ if label.starts_with("Reset ") && label.ends_with(" for this site") => {
                 // Locally first, so the row is gone on the click; then to

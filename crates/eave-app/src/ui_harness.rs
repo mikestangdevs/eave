@@ -13277,7 +13277,8 @@ fn the_page_menu_says_what_was_clicked(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let tab = page_shell(&h, vcx, Some("https://example.com/"));
 
-    // Bare text: the three navigation rows plus Copy, and nothing else.
+    // Bare text: the three navigation rows, Copy, and the developer pair
+    // — and nothing else.
     request_page_menu(
         &h,
         vcx,
@@ -13285,6 +13286,8 @@ fn the_page_menu_says_what_was_clicked(cx: &mut TestAppContext) {
             tab_id: tab.to_string(),
             x: 200.,
             y: 200.,
+            page_x: 200,
+            page_y: 200,
             link_url: None,
             selection: None,
             editable: false,
@@ -13292,8 +13295,10 @@ fn the_page_menu_says_what_was_clicked(cx: &mut TestAppContext) {
     );
     assert!(shown(vcx, "menu-row-0"), "the page menu never opened");
     assert!(shown(vcx, "menu-row-3"), "Copy is missing");
+    assert!(shown(vcx, "menu-row-4"), "View Page Source is missing");
+    assert!(shown(vcx, "menu-row-5"), "Inspect is missing");
     assert!(
-        !shown(vcx, "menu-row-4"),
+        !shown(vcx, "menu-row-6"),
         "a menu over bare text offered a link row"
     );
 
@@ -13315,15 +13320,18 @@ fn a_link_and_a_selection_each_add_their_own_rows(cx: &mut TestAppContext) {
             tab_id: tab.to_string(),
             x: 200.,
             y: 200.,
+            page_x: 200,
+            page_y: 200,
             link_url: Some("https://linked.example/".into()),
             selection: Some("some words".into()),
             editable: false,
         },
     );
-    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab, Search.
+    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab,
+    // Search, View Page Source, Inspect.
     assert!(shown(vcx, "menu-row-6"), "the search row is missing");
     assert!(
-        !shown(vcx, "menu-row-7"),
+        !shown(vcx, "menu-row-9"),
         "the menu grew a row nothing asked for"
     );
 }
@@ -13348,15 +13356,18 @@ fn a_site_with_no_answers_offers_nothing_to_reset(cx: &mut TestAppContext) {
             tab_id: tab.to_string(),
             x: 200.,
             y: 200.,
+            page_x: 200,
+            page_y: 200,
             link_url: None,
             selection: None,
             editable: false,
         },
     );
-    // Back, Forward, Reload, Copy — and nothing after them.
+    // Back, Forward, Reload, Copy, View Page Source, Inspect — and
+    // nothing after them.
     assert!(shown(vcx, "menu-row-3"), "the Copy row is missing");
     assert!(
-        !shown(vcx, "menu-row-4"),
+        !shown(vcx, "menu-row-6"),
         "a reset row appeared for a site with no answers"
     );
 }
@@ -13383,13 +13394,15 @@ fn a_sites_permissions_can_be_reset_from_the_page_menu(cx: &mut TestAppContext) 
             tab_id: tab.to_string(),
             x: 200.,
             y: 200.,
+            page_x: 200,
+            page_y: 200,
             link_url: None,
             selection: None,
             editable: false,
         },
     );
     let _ = h.drain();
-    // Back, Forward, Reload, Copy, Reset.
+    // Back, Forward, Reload, Copy, Reset, View Page Source, Inspect.
     assert!(
         shown(vcx, "menu-row-4"),
         "a site with two answers offered no way to take them back"
@@ -13431,13 +13444,16 @@ fn opening_a_link_in_a_new_tab_does_not_steal_the_window(cx: &mut TestAppContext
             tab_id: tab.to_string(),
             x: 200.,
             y: 200.,
+            page_x: 200,
+            page_y: 200,
             link_url: Some("https://linked.example/".into()),
             selection: None,
             editable: false,
         },
     );
     let _ = h.drain();
-    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab.
+    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab,
+    // View Page Source, Inspect.
     click(vcx, "menu-row-5");
     vcx.run_until_parked();
     let cmds = h.drain();
@@ -13468,13 +13484,15 @@ fn the_search_row_searches_for_the_whole_selection(cx: &mut TestAppContext) {
             tab_id: tab.to_string(),
             x: 200.,
             y: 200.,
+            page_x: 200,
+            page_y: 200,
             link_url: None,
             selection: Some("example.com".into()),
             editable: false,
         },
     );
     let _ = h.drain();
-    // Back, Forward, Reload, Copy, Search.
+    // Back, Forward, Reload, Copy, Search, View Page Source, Inspect.
     click(vcx, "menu-row-4");
     vcx.run_until_parked();
     let cmds = h.drain();
@@ -13510,6 +13528,8 @@ fn the_page_menu_disables_history_rows_rather_than_dropping_them(cx: &mut TestAp
             tab_id: tab.to_string(),
             x: 200.,
             y: 200.,
+            page_x: 200,
+            page_y: 200,
             link_url: None,
             selection: None,
             editable: false,
@@ -13528,6 +13548,79 @@ fn the_page_menu_disables_history_rows_rather_than_dropping_them(cx: &mut TestAp
             .iter()
             .any(|c| matches!(c, Command::Browser(BrowserCmd::Go { .. }))),
         "a disabled Back row walked the history anyway: {cmds:?}"
+    );
+}
+
+/// **View Page Source opens `view-source:` in a new FOREGROUND tab.** The
+/// rewrite is Chromium's own; eave's half is only the navigation — and it
+/// activates, unlike "Open Link in New Tab", because the operator asked to
+/// read the source now, not to set it aside for later.
+#[gpui::test]
+fn view_page_source_opens_the_source_in_a_new_tab(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/page"));
+
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 200.,
+            y: 200.,
+            page_x: 200,
+            page_y: 200,
+            link_url: None,
+            selection: None,
+            editable: false,
+        },
+    );
+    let _ = h.drain();
+    // Back, Forward, Reload, Copy, View Page Source, Inspect.
+    click(vcx, "menu-row-4");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::OpenAt { url, activate: true })
+                if url == "view-source:https://example.com/page"
+        )),
+        "View Page Source opened nothing, or the wrong thing: {cmds:?}"
+    );
+}
+
+/// **Inspect reaches the web module with the click's PAGE-space point.**
+/// The element under the pointer is found by Blink from its own
+/// coordinates; the window-space pair the menu is drawn at would name the
+/// wrong element the moment the page element is not at the window origin.
+#[gpui::test]
+fn inspect_carries_the_page_space_point(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    // Window-space and page-space deliberately differ, so a dispatch that
+    // grabbed the wrong pair cannot pass.
+    request_page_menu(
+        &h,
+        vcx,
+        crate::web::PageMenu {
+            tab_id: tab.to_string(),
+            x: 264.,
+            y: 331.,
+            page_x: 240,
+            page_y: 275,
+            link_url: None,
+            selection: None,
+            editable: false,
+        },
+    );
+    let _ = crate::web::take_inspect_for_test();
+    click(vcx, "menu-row-5");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::take_inspect_for_test(),
+        Some((tab.to_string(), 240, 275)),
+        "Inspect never reached the web module, or lost the point"
     );
 }
 

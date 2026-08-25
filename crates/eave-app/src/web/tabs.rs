@@ -549,6 +549,12 @@ pub fn close_browser_for(tab_id: &str) {
     // entered. See its doc comment for what holding it costs.
     with_browser(tab_id, |b| {
         if let Some(host) = b.host() {
+            // A DevTools browser opened from this tab is NOT in `BROWSERS`
+            // (it was created with no client), so nothing else ever closes
+            // it — and `CefShutdown` blocks while any browser is live.
+            if host.has_dev_tools() != 0 {
+                host.close_dev_tools();
+            }
             host.close_browser(1);
         }
     });
@@ -985,6 +991,44 @@ pub fn copy_selection(tab_id: &str) {
         if let Some(frame) = b.main_frame() {
             frame.copy();
         }
+    });
+    super::host::request_pump();
+}
+
+/// Open DevTools for this tab's page, inspecting the element at `(x, y)`
+/// in PAGE space — the menu's "Inspect" row.
+///
+/// The DevTools browser is a **native window, not another OSR surface**:
+/// `show_dev_tools` opens "its own browser", and that browser's windowing
+/// comes from the `WindowInfo` passed HERE, not from the windowless parent.
+/// So this is the one place eave asks CEF for a real window — which is also
+/// why `client` is `None`: a windowless `WindowInfo` would demand a client
+/// with a `RenderHandler` (the same assertion `PageClient` documents), and
+/// a windowed one needs nothing from us.
+///
+/// `runtime_style` is pinned to ALLOY explicitly. A default `WindowInfo`
+/// requests Chrome style, while every page browser here is forced Alloy by
+/// `windowless_rendering_enabled` — mixing the two styles across the
+/// devtools association is the untried combination, matching them is not.
+pub fn show_devtools(tab_id: &str, x: i32, y: i32) {
+    with_browser(tab_id, |b| {
+        let Some(host) = b.host() else {
+            return;
+        };
+        let mut window_info = WindowInfo::default();
+        window_info.window_name = CefString::from("DevTools");
+        // Zero bounds on a top-level window is a 0×0 window. Two-thirds of
+        // the ~1720×1080pt windows this app actually runs in (D1's machine
+        // fact), not a derived constant.
+        window_info.bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1140,
+            height: 720,
+        };
+        window_info.runtime_style = RuntimeStyle::ALLOY;
+        let at = Point { x, y };
+        host.show_dev_tools(Some(&window_info), None, None, Some(&at));
     });
     super::host::request_pump();
 }
