@@ -1188,8 +1188,18 @@ fn devtools_frontend_url(page_url: Option<&str>) -> Option<String> {
     // also the one that must be used on principle: a browser's devtools
     // should not be a fetch from a third-party host.
     let ws = pick["webSocketDebuggerUrl"].as_str()?.strip_prefix("ws://")?;
+    // **`can_dock=true` is what makes this a DOCK rather than a remote
+    // debugging session.** A `?ws=` frontend assumes it is inspecting a
+    // device somewhere else, so it opens the SCREENCAST app: the page
+    // arrives as a picture in a phone-shaped frame, next to the panels,
+    // and eave's own copy of the page sits behind it. Chrome appends this
+    // for every docked window it opens (`devtools_window.cc`
+    // `GetDevToolsURL`: `if (can_dock) url += "&can_dock=true"`).
+    //
+    // Measured against the live dock before it was written here:
+    // `.screencast` present without it, absent with it.
     Some(format!(
-        "http://127.0.0.1:{}/devtools/inspector.html?ws={}",
+        "http://127.0.0.1:{}/devtools/inspector.html?ws={}&can_dock=true",
         super::host::DEVTOOLS_PORT,
         ws
     ))

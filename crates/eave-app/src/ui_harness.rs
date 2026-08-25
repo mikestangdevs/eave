@@ -13751,6 +13751,40 @@ fn the_devtools_dock_opens_once_and_closes(cx: &mut TestAppContext) {
     let _ = (h, vcx);
 }
 
+/// **The dock can be shut from the same row that opened it.** The
+/// frontend's own ✕ cannot do it — that button asks a host window eave
+/// does not provide — so if this row did not toggle, the dock would be a
+/// one-way door.
+#[gpui::test]
+fn the_inspect_row_becomes_the_close_row_while_the_dock_is_open(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    let menu = crate::web::PageMenu {
+        tab_id: tab.to_string(),
+        x: 200.,
+        y: 200.,
+        page_x: 200,
+        page_y: 200,
+        link_url: None,
+        selection: None,
+        editable: false,
+    };
+    request_page_menu(&h, vcx, menu.clone());
+    // Back, Forward, Reload, Copy, View Page Source, Inspect.
+    click(vcx, "menu-row-5");
+    vcx.run_until_parked();
+    assert!(crate::web::devtools_open(tab), "the dock never opened");
+
+    request_page_menu(&h, vcx, menu);
+    click(vcx, "menu-row-5");
+    vcx.run_until_parked();
+    assert!(
+        !crate::web::devtools_open(tab),
+        "the row that opened the dock did not close it"
+    );
+}
+
 // Slice D3 stage 1 — the rail's geometry, and the fact that it moves.
 
 /// **The rail may never be dragged narrower than the traffic lights it

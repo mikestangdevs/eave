@@ -100,6 +100,13 @@ actions!(
         ReopenClosedTab,
         /// Slice E1 — ⌘F, the find bar over the page.
         FindInPage,
+        /// ⌘⌥I — open the DevTools dock, or close it. Chrome's chord, and
+        /// a TOGGLE because the frontend's own ✕ cannot help here: that
+        /// button asks its host window to close, and eave hosts the
+        /// frontend as an ordinary page rather than as a devtools window,
+        /// so nothing is listening. Without this the dock could be opened
+        /// and never shut.
+        ToggleDevtools,
         /// Slice E1 — ⌘+ / ⌘- / ⌘0, per-tab page zoom.
         ZoomIn,
         ZoomOut,
@@ -8705,6 +8712,33 @@ impl Shell {
             .into_any_element()
     }
 
+    /// ⌘⌥I on the page in front: open the dock, or close it.
+    ///
+    /// Only for a PAGE tab — a session transcript has no document to
+    /// inspect, and opening a dock beside one would be furniture attached
+    /// to nothing.
+    fn toggle_devtools(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let Some(tab_id) = snapshot.active.clone() else {
+            return;
+        };
+        let is_page = snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == tab_id && t.content == eave_wire::TabContent::Page);
+        if !is_page {
+            return;
+        }
+        if crate::web::devtools_open(&tab_id) {
+            crate::web::close_devtools(&tab_id);
+        } else {
+            // No point under the pointer — a chord is not a click, so the
+            // frontend opens on whatever it opens on.
+            crate::web::inspect_element(&tab_id, 0, 0);
+        }
+        cx.notify();
+    }
+
     /// Wrap a page element in the DevTools dock when the tab's dock is
     /// open — page left, frontend right, a divider between, Chrome's
     /// default arrangement. When the dock is closed this is the identity
@@ -15218,7 +15252,18 @@ impl Shell {
         } else {
             view_source.disabled()
         });
-        items.push(MenuItem::new("Inspect"));
+        // The same row both ways, because the dock is one thing that is
+        // either up or not — and the frontend's own ✕ cannot close it (it
+        // asks a host window that eave does not provide). Without this the
+        // dock opens and never shuts.
+        items.push(
+            MenuItem::new(if crate::web::devtools_open(&req.tab_id) {
+                "Close DevTools"
+            } else {
+                "Inspect"
+            })
+            .trailing("⌘⌥I"),
+        );
         items
     }
 
@@ -15325,6 +15370,7 @@ impl Shell {
                 // in ITS coordinates. The DevTools window itself is CEF's.
                 crate::web::inspect_element(&tab_id, req.page_x, req.page_y);
             }
+            "Close DevTools" => crate::web::close_devtools(&tab_id),
             _ if label.starts_with("Reset ") && label.ends_with(" for this site") => {
                 // Locally first, so the row is gone on the click; then to
                 // the engine, which is where the answer actually lived.
@@ -17807,6 +17853,7 @@ impl Render for Shell {
                 this.close_slash_palette(cx);
             }))
             .on_action(cx.listener(|this, _: &FindInPage, _, cx| this.find_in_page(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDevtools, _, cx| this.toggle_devtools(cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0, cx)))
@@ -18767,6 +18814,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // ⌘F is find-in-page and nothing else. eave has no other find, so
         // there is no collision to resolve here — unlike ⌘L, which had one.
         KeyBinding::new("cmd-f", FindInPage, None),
+        KeyBinding::new("cmd-alt-i", ToggleDevtools, None),
         // **Three chords for zoom-in, and all three are needed.** On a US
         // layout ⌘+ requires shift, so the keystroke that reaches gpui is
         // `cmd-shift-=`; the bare `cmd-=` is what people actually press;
