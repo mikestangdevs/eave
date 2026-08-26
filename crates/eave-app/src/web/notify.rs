@@ -519,9 +519,22 @@ fn handle_events(snapshot: &eave_wire::TabsSnapshot) {
         match message {
             Message::Request { seq } => {
                 let Some(origin) = origin.as_deref() else {
-                    // No origin eave can name, so nothing to remember an
-                    // answer against and nothing honest to put on a prompt.
-                    let (method, params) = permission_call("denied");
+                    // No origin eave can name — nothing to remember an
+                    // answer against, and nothing honest to put on a
+                    // prompt's first line.
+                    //
+                    // **`"default"`, not `"denied"`.** This is usually
+                    // TRANSIENT: a page can call `requestPermission()`
+                    // before its tab's URL has reached the snapshot, and
+                    // answering `denied` there is a refusal the person
+                    // never made, which the page then caches and acts on
+                    // for the rest of its life. Observed live — the test
+                    // page read `denied` while eave's own prompt for the
+                    // same origin was still on screen behind it.
+                    // `"default"` is the one answer that is true in both
+                    // the transient case and the permanent one, and it is
+                    // the only one a page may ask again from.
+                    let (method, params) = permission_call("default");
                     super::cdp_call(&event.tab_id, method, &params);
                     continue;
                 };
@@ -784,6 +797,35 @@ mod tests {
             pending.ask
         );
         super::super::ask::take("t-ask");
+    }
+
+    /// **Found by launching, not by testing.** A page that asks before its
+    /// tab's URL reaches the snapshot used to hear `denied` — a refusal
+    /// nobody made, which the page caches and acts on for ever. Seen live:
+    /// the test page read `permission: denied` while eave's own prompt for
+    /// that very origin was still on screen behind it.
+    #[test]
+    fn an_origin_eave_cannot_name_yet_is_default_not_denied() {
+        reset();
+        super::super::ask::take("t-noorigin");
+        // A page tab with no URL yet — exactly the boot-race shape.
+        let mut snap = snapshot("t-noorigin", "https://x.example/");
+        snap.tabs[0].url = None;
+        let now = std::time::Instant::now();
+        drive(&snap, now);
+        let _ = calls();
+        raise("t-noorigin", r#"{"kind":"request","seq":1}"#);
+        drive(&snap, now);
+
+        let sent = calls();
+        assert!(
+            sent.iter().any(|(_, _, p)| p.contains("default")),
+            "a transient miss must be re-askable, not a refusal: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(_, _, p)| p.contains("denied")),
+            "eave must not report a refusal no person made: {sent:?}"
+        );
     }
 
     /// An answered origin is not asked again — G1's rule, through this path.
