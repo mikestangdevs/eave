@@ -2301,15 +2301,25 @@ fn page_globe(id: &str, resident: bool) -> AnyElement {
     .into_any_element()
 }
 
-fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
-    // `about:blank` wears NO mark (operator ruling 2026-08-25): it is
-    // eave's own empty page, a globe there claims a site that does not
-    // exist, and the slot is reserved for eave's logo once one exists.
-    // The slot itself stays — same size, no plate wash, nothing in it —
-    // so the row's text keeps the one left edge every other row has.
+fn tab_plate(tab: &strip::StripTab, id: &str) -> Option<gpui::Div> {
+    // `about:blank` wears NO mark AND NO slot (operator ruling 2026-08-25,
+    // amended same night): it is eave's own empty page, a globe there
+    // claims a site that does not exist, and an empty reserved slot put
+    // the label a column right of where the operator wanted it — the row
+    // is just its label, starting where New Tab's `+` starts. A page
+    // whose URL the engine has not reported yet gets the same absence:
+    // it IS about:blank until a navigation says otherwise, and drawing
+    // the globe for those first frames is the pop-in-and-vanish flash
+    // the operator saw.
     let blank = matches!(tab.kind, strip::TabKind::Page)
-        && tab.url.as_deref() == Some("about:blank");
-    div()
+        && tab
+            .url
+            .as_deref()
+            .is_none_or(|u| u.is_empty() || u == "about:blank");
+    if blank {
+        return None;
+    }
+    Some(div()
         // `RAIL_MARK`, not `PROVIDER_CHIP` (Slice D3). The rail row's leading
         // slot is one size whatever fills it — a provider chip here, a
         // favicon from stage 2 — because the references' rails read as ONE
@@ -2318,17 +2328,11 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
         .size(px(theme::RAIL_MARK))
         .flex_none()
         .rounded(px(theme::RADIUS_CHIP))
-        .when(!blank, |d| d.bg(theme::chip_plate()))
+        .bg(theme::chip_plate())
         .flex()
         .items_center()
         .justify_center()
         .child(match &tab.kind {
-            strip::TabKind::Page if blank => div()
-                .debug_selector({
-                    let id = id.to_string();
-                    move || format!("tab-chip-blank-{id}")
-                })
-                .into_any_element(),
             // A page's mark is its favicon when Chromium has given us a
             // URL, and the globe when it has not — or when the image fails
             // to decode. Session rows keep the provider chip. The globe
@@ -2387,7 +2391,7 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
                         .into_any_element(),
                 }
             }
-        })
+        }))
 }
 
 fn provider_identity(provider: &str) -> (String, String) {
@@ -11824,8 +11828,9 @@ impl Shell {
             // The plate is the site mark — a favicon when Chromium has
             // given us one, the globe otherwise. Compact chips keep it:
             // "always display favicons" is the identity of a page tab,
-            // split or not.
-            .child(tab_plate(tab, &id))
+            // split or not. `about:blank` has no plate AT ALL (see
+            // `tab_plate`), so its label starts on New Tab's `+` column.
+            .children(tab_plate(tab, &id))
             .child(
                 // A FIXED slot, not `flex_1`. Every tab is the same width,
                 // so the name gets the same room on every one of them.

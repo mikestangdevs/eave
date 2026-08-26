@@ -10546,31 +10546,38 @@ fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     set_resident_for_test(None);
 }
 
-/// `about:blank` wears NO mark (operator ruling 2026-08-25): a globe there
-/// claims a site that does not exist. The slot stays — reserved for eave's
-/// logo once one exists — so the row's text keeps the shared left edge,
-/// and the empty slot carries its own selector so this state is visible
-/// to the suite rather than being an absence nothing can assert.
+/// `about:blank` wears NO mark and NO slot (operator ruling 2026-08-25,
+/// amended the same night): a globe there claims a site that does not
+/// exist, and an empty reserved slot put the label a column right of
+/// where the operator wanted it. The row is just its label, and the
+/// label starts on New Tab's `+` column. A page whose URL has not been
+/// reported yet gets the same absence — drawing the globe for those
+/// first frames was the pop-in-and-vanish flash the operator saw.
 #[gpui::test]
 fn a_blank_page_tab_wears_no_mark(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
-    set_resident_for_test(Some(&["p1", "p2"]));
+    set_resident_for_test(Some(&["p1", "p2", "p3"]));
     strip_tabs(
         &h,
         vcx,
         vec![
             page_tab("p1", Some("about:blank"), None),
             page_tab("p2", Some("https://example.com/"), Some("Example Domain")),
+            // The not-yet-reported URL is the flash case: it IS
+            // about:blank until a navigation says otherwise.
+            page_tab("p3", None, None),
         ],
         Some("aaaa1111"),
     );
-    assert!(
-        shown(vcx, "tab-chip-blank-p1"),
-        "the blank tab lost its reserved slot"
-    );
-    for sel in ["tab-chip-p1", "tab-chip-unloaded-p1", "tab-favicon-p1"] {
-        assert!(!shown(vcx, sel), "{sel} — about:blank grew a mark back");
+    for sel in [
+        "tab-chip-p1",
+        "tab-chip-unloaded-p1",
+        "tab-favicon-p1",
+        "tab-chip-p3",
+        "tab-chip-unloaded-p3",
+    ] {
+        assert!(!shown(vcx, sel), "{sel} — a blank tab grew a mark back");
     }
     // A page with a real URL keeps its mark; the rule is about about:blank,
     // not about pages.
@@ -10578,15 +10585,21 @@ fn a_blank_page_tab_wears_no_mark(cx: &mut TestAppContext) {
         shown(vcx, "tab-chip-p2") || shown(vcx, "tab-favicon-p2"),
         "the rule leaked onto a real page"
     );
-    // The reserved slot and a real mark share the box, so the two rows'
-    // labels start on one edge.
+    // "The text should be even with the + on New Tab" — the operator's
+    // words, asserted literally: with no plate in the row, the blank
+    // label's left edge is the `+` glyph's left edge.
     let x = |vcx: &mut VisualTestContext, sel: &'static str| {
         vcx.debug_bounds(sel).expect(sel).origin.x
     };
     assert_eq!(
-        x(vcx, "tab-p1"),
-        x(vcx, "tab-p2"),
-        "the blank row drifted off the strip's edge"
+        x(vcx, "tab-label-p1"),
+        x(vcx, "tab-new-glyph"),
+        "the blank label does not start on New Tab's + column"
+    );
+    // And a real page's label still sits one mark-column further right.
+    assert!(
+        x(vcx, "tab-label-p2") > x(vcx, "tab-label-p1"),
+        "the marked row's label lost its column"
     );
     set_resident_for_test(None);
 }
@@ -10654,12 +10667,19 @@ fn an_unloaded_page_tab_does_not_look_like_a_loaded_one(cx: &mut TestAppContext)
 fn eviction_never_recedes_a_session_tab(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
-    // Nothing is resident, page engine or not.
+    // Nothing is resident, page engine or not. The page carries a REAL
+    // url: a url-less page is the about:blank case now and wears no mark
+    // at all (`a_blank_page_tab_wears_no_mark`), which would leave this
+    // test nothing to find — and its claim is about eviction, not
+    // blankness.
     set_resident_for_test(Some(&[]));
     strip_tabs(
         &h,
         vcx,
-        vec![session_tab("aaaa1111"), page_tab("p1", None, None)],
+        vec![
+            session_tab("aaaa1111"),
+            page_tab("p1", Some("https://example.com/"), None),
+        ],
         Some("aaaa1111"),
     );
 
