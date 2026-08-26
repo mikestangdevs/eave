@@ -39,7 +39,34 @@ use gpui::{hsla, px, rgb, BoxShadow, FontWeight, Hsla, Pixels};
 /// An exact achromatic tone from an 8-bit channel value: `grey(0x0d)` is
 /// `#0d0d0d`. For surfaces and inks matched against a sampled reference.
 fn grey(value: u8) -> Hsla {
-    apply_tint(hsla(0.0, 0.0, value as f32 / 255.0, 1.0))
+    apply_tint(ink_tone(value))
+}
+
+/// The same tone as [`grey`], with the brand tint deliberately **not**
+/// applied — the ladder every ink is drawn from.
+///
+/// **Surfaces carry the brand; inks never do** (operator, 2026-08-26: "it
+/// should not change text — text should stay white/black according to
+/// light/dark mode"). Every text tier used to be a `grey`, so choosing a
+/// colour re-emitted the prose at that hue: at `text`'s own lightness a
+/// mid-strength tint moves the red and blue channels ~30/255 apart, which
+/// is a pink or green page of text, not a themed app. No shipping browser
+/// tints its prose, and the two roles were never the same question — a
+/// surface is *what the app is made of*, an ink is *what it says*.
+///
+/// This is the second half of the finding [`ink`] already records from the
+/// other direction. `ink` — every wash, hairline and rung — has always been
+/// achromatic by construction and was never routed through `apply_tint`; the
+/// text ladder was, and the inconsistency is the bug. The rule now has one
+/// statement: `grey` for a surface, `ink_tone` for something a person reads.
+///
+/// Lightness is untouched, so the whole contrast argument above
+/// ([`TEXT_CONTRAST_FLOOR`] and every ratio derived against it) stands
+/// exactly as measured — this removes a hue, not a step. At the default
+/// brand (`chroma: 0.0`) `apply_tint` is the identity, so no pinned token
+/// value moves and this changes nothing until someone opens Customize Theme.
+fn ink_tone(value: u8) -> Hsla {
+    hsla(0.0, 0.0, value as f32 / 255.0, 1.0)
 }
 
 /// A neutral (chroma 0) oklch tone. Chroma 0 means `r == g == b` exactly, so
@@ -1014,9 +1041,9 @@ pub fn card_border() -> Hsla {
 
 pub fn text() -> Hsla {
     if is_light() {
-        grey(0x2a)
+        ink_tone(0x2a)
     } else {
-        grey(0xe2)
+        ink_tone(0xe2)
     }
 }
 /// The secondary tier on a BARE surface — the glass ground, the content
@@ -1027,9 +1054,9 @@ pub fn text() -> Hsla {
 /// land — see [`text_tertiary`].
 pub fn text_secondary() -> Hsla {
     if is_light() {
-        grey(0x5c)
+        ink_tone(0x5c)
     } else {
-        grey(0xac)
+        ink_tone(0xac)
     }
 }
 /// Placeholders, disabled, structural hints — the quietest tier that is
@@ -1055,9 +1082,9 @@ pub fn text_secondary() -> Hsla {
 /// The ladder shifts up one rung; it does not gain a rung at the bottom.
 pub fn text_tertiary() -> Hsla {
     if is_light() {
-        grey(0x78)
+        ink_tone(0x78)
     } else {
-        grey(0x8e)
+        ink_tone(0x8e)
     }
 }
 
@@ -1084,9 +1111,9 @@ pub fn text_tertiary() -> Hsla {
 /// call Slice AD made for the markdown table header).
 pub fn text_secondary_on_wash() -> Hsla {
     if is_light() {
-        grey(0x3d)
+        ink_tone(0x3d)
     } else {
-        grey(0xce)
+        ink_tone(0xce)
     }
 }
 
@@ -1127,9 +1154,9 @@ pub fn solid() -> Hsla {
 /// retired `text_ghost`.
 pub fn on_solid() -> Hsla {
     if is_light() {
-        grey(0xf4)
+        ink_tone(0xf4)
     } else {
-        grey(0x0e)
+        ink_tone(0x0e)
     }
 }
 /// **The plate a vendor mark sits on** (Slice AO).
@@ -4120,6 +4147,64 @@ mod tests {
             h <= 15.0 || h >= 345.0,
             "danger drifted to hue {h:.1} degrees — it has to read as red"
         );
+    }
+
+    /// **A brand colours the surfaces and never the prose** (operator,
+    /// 2026-08-26). Every text tier used to be a `grey`, so picking a
+    /// colour in Customize Theme re-emitted the whole app's text at that
+    /// hue; they are drawn from [`ink_tone`] now, which `apply_tint` does
+    /// not reach.
+    ///
+    /// **What this test does and does not prove.** It is written against
+    /// the pure pair rather than against `text()` — the brand lives behind
+    /// a process-global `Mutex` that `brand()` takes itself, so a test that
+    /// installed a tint would race every exact-pin token test on a sibling
+    /// thread (the standing trap this file records at [`bend_lightness`]).
+    /// So it proves the two halves: that the tint is *real* at exactly the
+    /// lightnesses the text ladder occupies — without which the test could
+    /// pass while asserting nothing — and that `ink_tone` is immune to it.
+    /// That `text()` and its siblings call `ink_tone` is held by reading
+    /// them, and by `neutrals_are_achromatic_and_pigments_are_not` above.
+    #[test]
+    fn a_brand_tint_colours_surfaces_but_never_ink() {
+        // The dark and light rungs of all five ink roles, as written.
+        const INKS: [u8; 10] = [0xe2, 0x2a, 0xac, 0x5c, 0x8e, 0x78, 0xce, 0x3d, 0x0e, 0xf4];
+        // Channel spread, NOT red-minus-blue: magenta is high red AND high
+        // blue, so `r - b` reads ~2/255 on a tint that has visibly moved
+        // every rung. The first draft of this test used it and its own
+        // vacuity guard caught it.
+        let spread = |c: Rgba| c.r.max(c.g).max(c.b) - c.r.min(c.g).min(c.b);
+        // Four hues a person could plausibly pick, at a mid-strength chroma
+        // well inside the slider's range.
+        let chroma = 0.09_f32;
+
+        for v in INKS {
+            let plain: Rgba = ink_tone(v).into();
+            assert_eq!(
+                (plain.r, plain.g),
+                (plain.g, plain.b),
+                "ink_tone({v:#04x}) is not achromatic: {} {} {}",
+                plain.r,
+                plain.g,
+                plain.b
+            );
+        }
+
+        // ...and the tint that no longer reaches them is a large effect, so
+        // none of the above is vacuous. Measured on the mid rungs only: the
+        // near-black (`0x0e`) and near-white (`0xf4`) ends legitimately hold
+        // almost no chroma at any hue.
+        for hue in [30.0_f32, 150.0, 250.0, 330.0] {
+            for v in [0xe2_u8, 0xac, 0x8e, 0xce] {
+                let moved = spread(tint(ink_tone(v), hue, chroma).into());
+                assert!(
+                    moved > 24.0 / 255.0,
+                    "the tint moved {v:#04x} at hue {hue} by only {:.0}/255 — \
+                     if this is the real magnitude, ink immunity is not worth a token",
+                    moved * 255.0
+                );
+            }
+        }
     }
 
     /// The reason rungs are washes, not plates: over EVERY backdrop
