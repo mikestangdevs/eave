@@ -255,15 +255,17 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<SettingsWindow>> {
 pub enum Pane {
     General,
     Tabs,
+    Agents,
     Shortcuts,
     Info,
 }
 
 /// Toolbar order, icon, label — one table so the toolbar and the panes
 /// cannot disagree about what exists.
-const PANES: [(Pane, &str, &str); 4] = [
+const PANES: [(Pane, &str, &str); 5] = [
     (Pane::General, icons::SETTINGS_MINIMALISTIC, "General"),
     (Pane::Tabs, icons::WIDGET, "Tabs"),
+    (Pane::Agents, icons::CHAT_ROUND_LINE, "Agents"),
     (Pane::Shortcuts, icons::KEYBOARD, "Shortcuts"),
     (Pane::Info, icons::INFO_CIRCLE, "Info"),
 ];
@@ -370,6 +372,7 @@ impl Render for SettingsWindow {
                     .children(match self.pane {
                         Pane::General => self.general_pane(&theme, cx),
                         Pane::Tabs => self.tabs_pane(&theme, cx),
+                        Pane::Agents => crate::settings_agents::render(&theme, cx),
                         Pane::Shortcuts => self.shortcuts_pane(&theme, cx),
                         Pane::Info => info_pane(&theme),
                     }),
@@ -498,7 +501,23 @@ pub(crate) fn caption(_theme: &Theme, text: impl Into<SharedString>) -> gpui::An
 /// group (chips in a row) is what made the first cut read as app UI; the
 /// ids and debug selectors are unchanged, so the harness cannot tell.
 fn segmented<T: PartialEq + Copy + 'static>(
+    theme: &Theme,
+    current: T,
+    items: &[(T, &'static str)],
+    on_pick: impl Fn(T, &mut App) + Clone + 'static,
+    cx: &mut Context<SettingsWindow>,
+) -> gpui::AnyElement {
+    segmented_with_ids(theme, "settings-seg", current, items, on_pick, cx)
+}
+
+/// The same control with the id/selector prefix chosen by the caller —
+/// for a pane drawing several groups that share labels (S2's Agents
+/// pane repeats "CLI default" once per provider). `debug_bounds` is one
+/// map keyed by selector, last-painted wins, so a fixed prefix would
+/// let a harness click land on the wrong provider's segment.
+pub(crate) fn segmented_with_ids<T: PartialEq + Copy + 'static>(
     _theme: &Theme,
+    id_prefix: &str,
     current: T,
     items: &[(T, &'static str)],
     on_pick: impl Fn(T, &mut App) + Clone + 'static,
@@ -515,9 +534,10 @@ fn segmented<T: PartialEq + Copy + 'static>(
             let value = *value;
             let selected = current == value;
             let on_pick = on_pick.clone();
+            let selector = format!("{id_prefix}-{label}");
             div()
-                .id(SharedString::from(format!("settings-seg-{label}")))
-                .debug_selector(|| format!("settings-seg-{label}"))
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector)
                 .cursor_pointer()
                 .px(px(11.0))
                 .py(px(3.0))
@@ -717,7 +737,7 @@ impl SettingsWindow {
 struct RailKnobDrag;
 
 /// A text field in the card grammar: a recessed plate, the field inside.
-fn input_box(_theme: &Theme, field: Entity<TextField>) -> gpui::AnyElement {
+pub(crate) fn input_box(_theme: &Theme, field: Entity<TextField>) -> gpui::AnyElement {
     div()
         .w(px(280.0))
         .px(px(8.0))

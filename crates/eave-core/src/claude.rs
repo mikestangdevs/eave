@@ -513,7 +513,11 @@ impl AgentSession for ClaudeCodeSession {
 /// and it is the one the capture proves asks. `manual` is accepted on the
 /// command line and the CLI reports it back AS `default` (capture M), so it
 /// is listed for the day that stops being true.
-const ASKING_MODES: [&str; 2] = ["default", "manual"];
+///
+/// `pub` since Slice S2, read-only: the Agents pane's test walks it to
+/// hold the pane's posture words and the rail's to the same fact. The
+/// gate itself still lives here, in [`posture_refusal`].
+pub const ASKING_MODES: [&str; 2] = ["default", "manual"];
 
 fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
     match mode {

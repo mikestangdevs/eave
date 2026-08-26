@@ -94,6 +94,8 @@ pub mod theme_editor;
 pub mod settings;
 /// The Settings window (⌘,): frame + the real panes.
 pub mod settings_window;
+/// The Agents pane (S2): P2's defaults surface + provider status facts.
+pub mod settings_agents;
 
 pub mod ui;
 

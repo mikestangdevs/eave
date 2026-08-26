@@ -5356,10 +5356,15 @@ fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
             provider,
             model,
             cwd,
+            extra_args,
         } => {
             assert_eq!(provider, "claude-code");
             assert_eq!(*model, None, "eave invented a model nobody chose");
             assert_eq!(*cwd, None, "eave invented a worktree nobody chose");
+            assert!(
+                extra_args.is_empty(),
+                "eave invented flags nobody configured: {extra_args:?}"
+            );
         }
         other => panic!("start emitted {other:?}"),
     }
@@ -15274,6 +15279,8 @@ fn every_settings_row_round_trips(cx: &mut TestAppContext) {
     use crate::settings::{self, AppearanceSetting, SearchEngine};
 
     // S2 added sibling tests that also mutate the process-global store;
+    // whoever writes settings holds this (see `settings_test_lock`).
+    let _settings_turn = crate::settings::settings_test_lock();
     let (h, _vcx) = boot(cx);
 
     // A real file in the test temp dir. `set_settings_path` is a OnceLock:
@@ -15373,4 +15380,195 @@ fn every_settings_row_round_trips(cx: &mut TestAppContext) {
     cx.update(|cx| settings::set_rail_w(cx, theme::RAIL_W));
     assert_eq!(settings::snapshot(), crate::settings::Settings::default());
     assert_eq!(on_disk(&path), crate::settings::Settings::default());
+}
+
+/// S2: a stored default model pre-selects the launcher's picker —
+/// visibly — and start carries exactly what the picker shows. The
+/// default reaches the launch by PRESELECTION only: `launch()` sends
+/// `launcher.model` and never consults the store for a model, so what
+/// starts is always what was on screen.
+#[gpui::test]
+fn a_default_model_preselects_the_launcher_and_reaches_the_launch(cx: &mut TestAppContext) {
+    // Lock order: probes first, then settings — every test taking both
+    // must agree or two of them deadlock.
+    let _probes = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
+    let _settings = crate::settings::settings_test_lock();
+    let (mut h, vcx) = boot(cx);
+    cx.update(|cx| {
+        crate::settings_agents::write_defaults(cx, |d| {
+            d.set_model("claude-code", Some("opus".into()))
+        })
+    });
+    // The Shell's launcher state predates the write above, so re-enter
+    // the tile: `pick_provider` re-reads the store — the same call
+    // `LauncherUi::default()` makes at boot.
+    click(vcx, "provider-tile-3"); // grok — live, so the click lands
+    vcx.run_until_parked();
+    click(vcx, "provider-tile-0"); // claude again
+    vcx.run_until_parked();
+    let chosen = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
+        .unwrap();
+    assert_eq!(chosen, Some("opus"), "the stored default did not pre-select");
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+    match &h.drain()[0] {
+        Command::Launch { model, .. } => assert_eq!(model.as_deref(), Some("opus")),
+        other => panic!("start emitted {other:?}"),
+    }
+    cx.update(|cx| {
+        crate::settings_agents::write_defaults(cx, |d| d.set_model("claude-code", None))
+    });
+}
+
+/// S2: an explicit "CLI default" pick beats the stored default. The
+/// picker moved off its preselection must not be refilled at start —
+/// an operator's explicit no-model choice stays chosen, which is the
+/// whole reason the default is a preselection and not a launch-time
+/// fill.
+#[gpui::test]
+fn an_explicit_cli_default_choice_beats_the_stored_default(cx: &mut TestAppContext) {
+    let _probes = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
+    let _settings = crate::settings::settings_test_lock();
+    let (mut h, vcx) = boot(cx);
+    cx.update(|cx| {
+        crate::settings_agents::write_defaults(cx, |d| {
+            d.set_model("claude-code", Some("opus".into()))
+        })
+    });
+    click(vcx, "provider-tile-3");
+    vcx.run_until_parked();
+    click(vcx, "provider-tile-0");
+    vcx.run_until_parked();
+    click(vcx, "launcher-model");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "overlay-menu"), "the model menu never opened");
+    click(vcx, "menu-row-0"); // "CLI default" — send no --model at all
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+    let chosen = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
+        .unwrap();
+    assert_eq!(chosen, None, "the explicit CLI-default pick did not stick");
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+    match &h.drain()[0] {
+        Command::Launch { model, .. } => assert_eq!(
+            *model, None,
+            "the stored default resurrected behind an explicit choice"
+        ),
+        other => panic!("start emitted {other:?}"),
+    }
+    cx.update(|cx| {
+        crate::settings_agents::write_defaults(cx, |d| d.set_model("claude-code", None))
+    });
+}
+
+/// S2: default flags reach the launch — and the launcher SAYS so before
+/// the click, because they apply with no per-session picker. Both halves
+/// asserted: nothing configured → nothing claimed, configured → stated
+/// and carried.
+#[gpui::test]
+fn default_flags_reach_the_launch_and_are_stated(cx: &mut TestAppContext) {
+    let _settings = crate::settings::settings_test_lock();
+    let (mut h, vcx) = boot(cx);
+    assert!(
+        !shown(vcx, "launcher-default-flags"),
+        "the launcher claims default flags nobody configured"
+    );
+    cx.update(|cx| {
+        crate::settings_agents::write_defaults(cx, |d| {
+            d.set_extra_args("claude-code", vec!["--verbose".into()])
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "launcher-default-flags"),
+        "flags will apply at start and nothing on the launcher says so"
+    );
+    let _ = h.drain();
+    click(vcx, "launcher-start");
+    vcx.run_until_parked();
+    match &h.drain()[0] {
+        Command::Launch {
+            model, extra_args, ..
+        } => {
+            assert_eq!(extra_args, &["--verbose".to_string()]);
+            assert_eq!(*model, None, "flags must not drag a model along");
+        }
+        other => panic!("start emitted {other:?}"),
+    }
+    cx.update(|cx| {
+        crate::settings_agents::write_defaults(cx, |d| d.set_extra_args("claude-code", vec![]))
+    });
+}
+
+/// S2: the Agents pane writes a default with one click, refuses a
+/// posture-defeating flag at entry, and keeps the last accepted flags
+/// standing — driven through the real window, the real field entity and
+/// the real observer, not through the module's internals.
+#[gpui::test]
+fn the_agents_pane_takes_a_default_and_refuses_a_posture_flag(cx: &mut TestAppContext) {
+    let _probes = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
+    let _settings = crate::settings::settings_test_lock();
+    let (_h, _vcx) = boot(cx);
+    let handle = cx
+        .update(crate::settings_window::open)
+        .expect("the settings window opens");
+    let svcx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    svcx.update(|window, _| window.refresh());
+    svcx.run_until_parked();
+    click(svcx, "settings-pane-Agents");
+    svcx.run_until_parked();
+
+    // "opus" is on claude's static list (the harness never arms probes,
+    // so the static list is what the segments show).
+    click(svcx, "agents-model-claude-code-opus");
+    svcx.run_until_parked();
+    assert_eq!(
+        crate::settings::snapshot().agents.model_for("claude-code"),
+        Some("opus")
+    );
+    // "CLI default" clears the default rather than storing the sentinel.
+    click(svcx, "agents-model-claude-code-CLI default");
+    svcx.run_until_parked();
+    assert_eq!(
+        crate::settings::snapshot().agents.model_for("claude-code"),
+        None
+    );
+
+    let field = svcx
+        .update(|_, cx| crate::settings_agents::flags_field(cx, "claude-code"))
+        .expect("the pane rendered claude's flags field");
+    svcx.update(|_, cx| field.update(cx, |f, cx| f.set_content("--verbose", cx)));
+    svcx.run_until_parked();
+    assert_eq!(
+        crate::settings::snapshot().agents.extra_args_for("claude-code"),
+        ["--verbose"]
+    );
+    // A posture-defeating flag is refused at ENTRY: settings keep the
+    // last accepted value, exactly what the caption tells the operator.
+    svcx.update(|_, cx| {
+        field.update(cx, |f, cx| {
+            f.set_content("--verbose --permission-mode acceptEdits", cx)
+        })
+    });
+    svcx.run_until_parked();
+    assert_eq!(
+        crate::settings::snapshot().agents.extra_args_for("claude-code"),
+        ["--verbose"],
+        "a flag that undoes the posture reached settings"
+    );
+
+    svcx.update(|_, cx| field.update(cx, |f, cx| f.set_content("", cx)));
+    svcx.run_until_parked();
+    assert!(
+        crate::settings::snapshot().agents.is_empty(),
+        "cleared defaults left residue in the store"
+    );
 }

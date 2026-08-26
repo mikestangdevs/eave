@@ -137,6 +137,12 @@ pub struct Settings {
     /// you where you are — the gesture's meaning, and the default —
     /// `true` switches to the new tab immediately.
     pub switch_to_background_tabs: bool,
+    /// Defaults for NEW sessions — per-provider model and extra flags
+    /// (Slice S2). The Agents pane owns the type and is its only writer;
+    /// see `settings_agents.rs`. Skipped when empty so a file that never
+    /// set a default is byte-identical to a pre-S2 one.
+    #[serde(skip_serializing_if = "crate::settings_agents::AgentDefaults::is_empty")]
+    pub agents: crate::settings_agents::AgentDefaults,
     /// Keys this build does not know, preserved across a rewrite.
     /// **Keep this field last**; typed fields added later go above it.
     #[serde(flatten)]
@@ -150,6 +156,7 @@ impl Default for Settings {
             search: SearchEngine::default(),
             evict_after_min: default_evict_min(),
             switch_to_background_tabs: false,
+            agents: Default::default(),
             extra: serde_json::Map::new(),
         }
     }
@@ -189,6 +196,17 @@ pub fn set_settings_path(path: PathBuf) {
 /// The current settings, cloned. The no-`cx` read door.
 pub fn snapshot() -> Settings {
     store().clone()
+}
+
+/// Serialise tests that MUTATE the process-global settings store —
+/// `cargo test` runs a crate's tests in parallel threads of one process,
+/// so two tests writing settings race and the loser asserts against the
+/// other's state. Same rule and shape as `capabilities::probe_test_lock`
+/// (which is lock-ordered FIRST in any test taking both). **Test-only.**
+#[doc(hidden)]
+pub fn settings_test_lock() -> MutexGuard<'static, ()> {
+    static TEST_TURN: Mutex<()> = Mutex::new(());
+    TEST_TURN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// [`Settings::switch_to_background_tabs`], for the decision sites in

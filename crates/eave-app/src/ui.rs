@@ -288,6 +288,14 @@ enum Command {
         /// chat started wherever the engine defaulted no matter which
         /// project you launched it from.
         cwd: Option<String>,
+        /// Slice S2: the stored default flags for this provider
+        /// (`Settings::agents`), read at the button by `launch()` so the
+        /// command carries — and the harness can assert — exactly what
+        /// the session will be opened with. The connection loop forwards
+        /// this verbatim into `AgentConfig::extra_args`; the engine's
+        /// posture gate refuses anything smuggled that it would refuse
+        /// from any other caller.
+        extra_args: Vec<String>,
     },
     /// Files-rail basis toggle (Slice AA): re-open the `files`
     /// subscription against the other basis. It is a resubscribe, not a
@@ -1204,10 +1212,12 @@ async fn feed_loop(
                                 provider,
                                 model,
                                 cwd,
+                                extra_args,
                             }) => {
                                 let agent = AgentConfig {
                                     provider: Some(provider),
                                     model,
+                                    extra_args,
                                     ..AgentConfig::default()
                                 };
                                 match client.open_with_agent(None, cwd, Some(agent)).await {
@@ -2602,7 +2612,7 @@ fn take_deny_reason(composer: Option<&Entity<ComposerState>>, cx: &mut App) -> S
 /// The permission posture as a rail fact (Slice K amendment 3). A session
 /// running in a mode that never asks must not look like one that does —
 /// this is the line that makes the difference visible without opening it.
-fn posture_line(mode: &str) -> String {
+pub(crate) fn posture_line(mode: &str) -> String {
     match mode {
         "default" | "manual" => format!("asks before it writes · {mode}"),
         other => format!("NEVER ASKS · {other}"),
@@ -5232,10 +5242,14 @@ struct LauncherUi {
 
 impl Default for LauncherUi {
     fn default() -> Self {
+        let provider = launcher::default_provider();
         Self {
-            provider: launcher::default_provider(),
+            provider,
             models: Popup::default(),
-            model: None,
+            // Slice S2: open on the stored default for the default
+            // provider — pre-selected into the picker, never filled in
+            // behind it (see `Shell::launch`).
+            model: crate::settings_agents::preselected_model(PROVIDERS[provider].id),
         }
     }
 }
@@ -16478,7 +16492,13 @@ impl Shell {
     fn pick_provider(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.launcher.provider != ix {
             self.launcher.provider = ix;
-            self.launcher.model = None;
+            // Slice S2: the cleared picker opens on the NEW provider's
+            // stored default (visible, overridable) rather than bare
+            // None — carrying the old provider's model across would send
+            // a flag the new vendor never heard of, which is why this
+            // used to clear unconditionally.
+            self.launcher.model =
+                crate::settings_agents::preselected_model(PROVIDERS[ix].id);
         }
         cx.notify();
     }
@@ -16506,6 +16526,14 @@ impl Shell {
             provider: p.id.to_string(),
             model: self.launcher.model.map(str::to_string),
             cwd,
+            // Slice S2: default flags are FILLED here (no per-session
+            // flags picker exists), unlike the model, which is only ever
+            // PRE-SELECTED into the picker above — an invisible model
+            // fill would resurrect a default the operator explicitly
+            // overrode. The launcher states these under the model button.
+            extra_args: crate::settings_agents::current_defaults()
+                .extra_args_for(p.id)
+                .to_vec(),
         });
         cx.notify();
     }
@@ -16801,6 +16829,27 @@ impl Shell {
                             .text_color(theme::text_tertiary())
                             .child(note)
                     }))
+                    // Slice S2: default flags apply at start with no
+                    // per-session picker, so the screen that starts the
+                    // session is the screen that states them — a default
+                    // applied where nothing says so would be invisible
+                    // configuration.
+                    .children({
+                        let flags =
+                            crate::settings_agents::current_defaults().extra_args_for(p.id).to_vec();
+                        (!flags.is_empty()).then(|| {
+                            div()
+                                .debug_selector(|| "launcher-default-flags".into())
+                                .max_w(px(theme::LAUNCHER_MAX_W))
+                                .text_size(px(theme::MICRO_SIZE))
+                                .line_height(px(theme::MICRO_LINE))
+                                .text_color(theme::text_tertiary())
+                                .child(format!(
+                                    "starts with {} — Settings → Agents",
+                                    flags.join(" ")
+                                ))
+                        })
+                    })
                     // The engine's own words on a refusal. Not a toast and
                     // not a log line: the screen that asked is the screen
                     // that answers.
