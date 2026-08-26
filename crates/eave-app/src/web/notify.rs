@@ -353,6 +353,14 @@ thread_local! {
     /// calls per frame per tab.
     static INSTALLED: std::cell::RefCell<std::collections::HashMap<String, String>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Pages waiting on a `requestPermission()` prompt: tab -> (seq, origin).
+    ///
+    /// The page's promise is open for as long as this entry lives, which is
+    /// why the answer path must reach every exit — allowed, denied, and
+    /// dismissed. A tab that closes mid-prompt drops the entry with
+    /// `forget_tab`; there is no page left to hear an answer.
+    static ASKING: std::cell::RefCell<std::collections::HashMap<String, (u64, String)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// What is on screen now, oldest first.
@@ -379,6 +387,9 @@ pub fn dismiss(seq: u64) {
 /// and `cdp_call` on a dead browser would answer `NotSent` on a later pump
 /// for nothing.
 pub fn forget_tab(tab_id: &str) {
+    ASKING.with(|a| {
+        a.borrow_mut().remove(tab_id);
+    });
     LIVE.with(|l| l.borrow_mut().retain(|n| n.tab_id != tab_id));
     INSTALLED.with(|i| {
         i.borrow_mut().remove(tab_id);
@@ -414,7 +425,43 @@ pub fn origin_of(url: &str) -> Option<String> {
 pub fn drive(snapshot: &eave_wire::TabsSnapshot, now: std::time::Instant) {
     install_where_needed(snapshot);
     handle_events(snapshot);
+    answer_asks();
     expire(now);
+}
+
+/// Tell any page whose permission prompt has been answered.
+///
+/// **Without this the capability is unreachable.** The shim replaces
+/// `window.Notification`, so `requestPermission()` never reaches Chromium
+/// and Chromium never raises its own prompt — and eave's notification
+/// content setting is forced to BLOCK besides. So eave has to ask, and eave
+/// has to answer. A version of this slice without it grants nothing, ever,
+/// by any path a person has: every notification is refused for want of a
+/// permission there was no way to give.
+///
+/// Polled rather than pushed because the answer arrives on the UI's
+/// timeline, through the same `ask` surface every other dialog uses, and a
+/// callback from there into here would be a second way to answer a prompt.
+fn answer_asks() {
+    let done: Vec<(String, u64, String)> = ASKING.with(|a| {
+        a.borrow()
+            .iter()
+            .filter(|(tab, _)| super::ask::pending(tab).is_none())
+            .map(|(tab, (seq, origin))| (tab.clone(), *seq, origin.clone()))
+            .collect()
+    });
+    for (tab, seq, origin) in done {
+        ASKING.with(|a| {
+            a.borrow_mut().remove(&tab);
+        });
+        let _ = seq;
+        // A dismissal leaves the store on `Ask`, so this answers
+        // `"default"` — which is exactly what the web API means by a
+        // prompt the person walked away from, and is a state a page can
+        // ask again from.
+        let (method, params) = permission_call(permission_state(&origin));
+        super::cdp_call(&tab, method, &params);
+    }
 }
 
 /// Give the shim to any page tab that does not have it at its current URL.
@@ -471,13 +518,38 @@ fn handle_events(snapshot: &eave_wire::TabsSnapshot) {
             .and_then(origin_of);
         match message {
             Message::Request { seq } => {
-                let state = match origin.as_deref() {
-                    Some(origin) => permission_state(origin),
-                    None => "denied",
+                let Some(origin) = origin.as_deref() else {
+                    // No origin eave can name, so nothing to remember an
+                    // answer against and nothing honest to put on a prompt.
+                    let (method, params) = permission_call("denied");
+                    super::cdp_call(&event.tab_id, method, &params);
+                    continue;
                 };
-                let _ = seq;
-                let (method, params) = permission_call(state);
-                super::cdp_call(&event.tab_id, method, &params);
+                match permission_state(origin) {
+                    // Already answered, either way: the page hears it now.
+                    // G1's rule — a stored answer is not re-asked.
+                    state @ ("granted" | "denied") => {
+                        let (method, params) = permission_call(state);
+                        super::cdp_call(&event.tab_id, method, &params);
+                    }
+                    // Unanswered: raise eave's own prompt. The reply goes
+                    // out from `answer_asks` once a person has decided.
+                    _ => {
+                        super::ask::note_raised(super::ask::Pending {
+                            tab_id: event.tab_id.clone(),
+                            origin: origin.to_string(),
+                            ask: super::ask::Ask::Permission {
+                                kinds: vec![
+                                    eave_core::browser::permissions::PermissionKind::Notifications,
+                                ],
+                            },
+                        });
+                        ASKING.with(|a| {
+                            a.borrow_mut()
+                                .insert(event.tab_id.clone(), (seq, origin.to_string()));
+                        });
+                    }
+                }
             }
             Message::Close { seq } => {
                 LIVE.with(|l| l.borrow_mut().retain(|n| n.seq != seq));
@@ -678,6 +750,89 @@ mod tests {
         assert!(
             sent.iter().any(|(_, _, p)| p.contains("error")),
             "the page must be told it was blocked, not left waiting: {sent:?}"
+        );
+    }
+
+    /// **The gap that made the whole capability unreachable.**
+    ///
+    /// The shim replaces `window.Notification`, so `requestPermission()`
+    /// never reaches Chromium and Chromium never prompts — and eave forces
+    /// its notification content setting to BLOCK besides. If eave does not
+    /// raise its own prompt, there is NO path by which a person can grant,
+    /// so every notification is refused for want of a permission nobody
+    /// could give. Every other test in this file passed with that hole in
+    /// it, because they all seed the grant directly.
+    #[test]
+    fn asking_for_permission_raises_eaves_own_prompt() {
+        reset();
+        super::super::ask::take("t-ask");
+        let snap = snapshot("t-ask", "https://unanswered.example/app");
+        let now = std::time::Instant::now();
+        drive(&snap, now);
+        raise("t-ask", r#"{"kind":"request","seq":1}"#);
+        drive(&snap, now);
+
+        let pending = super::super::ask::pending("t-ask").expect(
+            "requestPermission must put a prompt on screen; without one the \
+             permission can never be granted by any path a person has",
+        );
+        assert_eq!(pending.origin, "https://unanswered.example");
+        assert!(
+            matches!(&pending.ask, super::super::ask::Ask::Permission { kinds }
+                if kinds == &[eave_core::browser::permissions::PermissionKind::Notifications]),
+            "{:?}",
+            pending.ask
+        );
+        super::super::ask::take("t-ask");
+    }
+
+    /// An answered origin is not asked again — G1's rule, through this path.
+    #[test]
+    fn an_origin_that_already_answered_is_not_prompted_again() {
+        reset();
+        super::super::ask::take("t-ask2");
+        let origin = "https://already.example";
+        grant(origin);
+        let snap = snapshot("t-ask2", "https://already.example/app");
+        let now = std::time::Instant::now();
+        drive(&snap, now);
+        let _ = calls();
+        raise("t-ask2", r#"{"kind":"request","seq":1}"#);
+        drive(&snap, now);
+
+        assert!(
+            super::super::ask::pending("t-ask2").is_none(),
+            "a stored answer must not raise a second prompt"
+        );
+        assert!(
+            calls().iter().any(|(_, _, p)| p.contains("granted")),
+            "the page must be told the answer it already has"
+        );
+    }
+
+    /// Once the prompt is gone the page is told, whichever way it went.
+    #[test]
+    fn the_page_hears_the_answer_once_the_prompt_closes() {
+        reset();
+        super::super::ask::take("t-ask3");
+        let snap = snapshot("t-ask3", "https://waiting.example/app");
+        let now = std::time::Instant::now();
+        drive(&snap, now);
+        raise("t-ask3", r#"{"kind":"request","seq":4}"#);
+        drive(&snap, now);
+        let _ = calls();
+        assert!(super::super::ask::pending("t-ask3").is_some());
+
+        // A person answers: the ask leaves the screen and the store gains
+        // the decision. That is what `dialogs::answer` does for a prompt
+        // eave raised itself.
+        super::super::ask::take("t-ask3");
+        grant("https://waiting.example");
+        drive(&snap, now);
+
+        assert!(
+            calls().iter().any(|(_, _, p)| p.contains("granted")),
+            "a promise left open is a page stalled for ever"
         );
     }
 

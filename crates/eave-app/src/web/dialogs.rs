@@ -128,7 +128,26 @@ fn raise(tab_id: &str, origin: String, ask: Ask, reply: Reply) {
 pub fn answer(tab_id: &str, answer: Answer) {
     let taken = super::ask::take(tab_id);
     let reply = REPLIES.with(|r| r.borrow_mut().remove(tab_id));
-    let (Some(pending), Some(reply)) = (taken, reply) else {
+    let Some(pending) = taken else {
+        return;
+    };
+    // **An ask with no Chromium continuation is not a bug.** G2's
+    // notification prompt is raised by eave itself (`notify::handle_events`)
+    // because the shim intercepts `requestPermission()` before Chromium ever
+    // sees it — so there is a person to answer and a decision to store, but
+    // nothing to call back into. Bailing here, as this did, took the prompt
+    // off the screen and wrote nothing down, which made the permission
+    // unanswerable and the capability unreachable by any path a person has.
+    let Some(reply) = reply else {
+        if let Ask::Permission { kinds } = &pending.ask {
+            if let Some(allowed) = decision_of(&answer) {
+                remember(&pending.origin, kinds, allowed);
+            }
+        }
+        if super::tabs::trace() {
+            eprintln!("[web] answered {:?} with {answer:?} — eave's own ask", pending.ask);
+        }
+        super::host::note_chrome_change();
         return;
     };
     if super::tabs::trace() {
