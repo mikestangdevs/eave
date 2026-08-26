@@ -98,7 +98,15 @@ fn oklch(l: f32, c: f32, h_deg: f32) -> Hsla {
 /// oklch → sRGB, each channel 0..1 and gamut-clipped.
 /// Reference: Björn Ottosson's OKLab definition — the matrices CSS Color 4
 /// uses. `oklch_accents_match_reference` pins the ones this file relies on.
-fn oklch_to_srgb(l: f32, c: f32, h_deg: f32) -> [f32; 3] {
+/// Linear-light sRGB channels, UNCLAMPED. This is the gamut oracle:
+/// `gamma_encode` clamps each channel, so the encoded triple can never
+/// confess to being out of gamut — `fit_chroma` tested through the
+/// encoded values and was a silent no-op (every ask "fit"), and
+/// out-of-gamut tints were channel-clipped instead of fitted, which both
+/// washes and hue-shifts them. Found 2026-08-26 while giving the light
+/// appearance its near-white bend; the bend never fired because nothing
+/// ever failed to "fit".
+fn oklch_to_linear(l: f32, c: f32, h_deg: f32) -> [f32; 3] {
     let h = h_deg.to_radians();
     let a = c * h.cos();
     let b = c * h.sin();
@@ -113,7 +121,11 @@ fn oklch_to_srgb(l: f32, c: f32, h_deg: f32) -> [f32; 3] {
     let r = 4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_93 * s3;
     let g = -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_4 * s3;
     let b = -0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3;
+    [r, g, b]
+}
 
+fn oklch_to_srgb(l: f32, c: f32, h_deg: f32) -> [f32; 3] {
+    let [r, g, b] = oklch_to_linear(l, c, h_deg);
     [gamma_encode(r), gamma_encode(g), gamma_encode(b)]
 }
 
@@ -191,8 +203,10 @@ fn lightness(color: Hsla) -> f32 {
 }
 
 fn fit_chroma(l: f32, chroma: f32, hue: f32) -> f32 {
+    // Tested on the UNCLAMPED linear channels — the encoded triple can
+    // never fail this test (see `oklch_to_linear`).
     let fits = |c: f32| {
-        let [r, g, b] = oklch_to_srgb(l, c, hue);
+        let [r, g, b] = oklch_to_linear(l, c, hue);
         [r, g, b].iter().all(|x| (-1e-4..=1.0 + 1e-4).contains(x))
     };
     if fits(chroma) {
