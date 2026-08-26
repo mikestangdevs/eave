@@ -132,6 +132,28 @@ fn clamp(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+/// `EAVE_OBSERVE_TRACE=1` — print each line and exchange as it is folded.
+///
+/// E8's store has **no user interface at all**: it is read by an agent, so
+/// a person watching eave run cannot tell working from silent. That is the
+/// exact state G9 sat in for a day, and the state this row sat in while
+/// `cdp_watch`'s only caller was a test. So there is an instrument, and it
+/// is opt-in for the same reason E9's `EAVE_CDP_EVAL` is.
+///
+/// It prints to **stderr**, and the documented launch path throws stderr
+/// away — `open -n` gives a LaunchServices process with no terminal. Both
+/// flags are needed:
+///
+/// ```text
+/// open -n --env EAVE_OBSERVE_TRACE=1 --stderr /tmp/eave.log <path>/eave.app
+/// ```
+///
+/// Read once, so two runs of one build cannot disagree.
+fn traced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EAVE_OBSERVE_TRACE").is_ok())
+}
+
 /// One turn: enable what is not yet enabled, then fold what has arrived.
 pub fn drive(snapshot: &eave_wire::TabsSnapshot) {
     watch_new_tabs(snapshot);
@@ -333,6 +355,13 @@ fn flatten_args(args: Option<&Value>) -> String {
 }
 
 fn push_line(tab_id: &str, line: ConsoleLine) {
+    if traced() {
+        let at = line.line.map(|n| format!(":{n}")).unwrap_or_default();
+        eprintln!(
+            "[web] console {} {} {}{} {}",
+            tab_id, line.level, line.source, at, line.text
+        );
+    }
     CONSOLE.with(|c| {
         let mut c = c.borrow_mut();
         let lines = c.entry(tab_id.to_string()).or_default();
@@ -344,6 +373,9 @@ fn push_line(tab_id: &str, line: ConsoleLine) {
 }
 
 fn push_exchange(tab_id: &str, exchange: Exchange) {
+    if traced() {
+        eprintln!("[web] net {} {} {}", tab_id, exchange.method, exchange.url);
+    }
     NETWORK.with(|n| {
         let mut n = n.borrow_mut();
         let list = n.entry(tab_id.to_string()).or_default();
@@ -372,6 +404,12 @@ fn update(tab_id: &str, params: &Value, apply: impl FnOnce(&mut Exchange)) {
         };
         if let Some(e) = list.iter_mut().rev().find(|e| e.request_id == id) {
             apply(e);
+            if traced() {
+                eprintln!(
+                    "[web] net {} {} -> {:?} {} {:?}{}",
+                    tab_id, e.url, e.status, e.mime, e.bytes, e.failed
+                );
+            }
         }
     });
 }
