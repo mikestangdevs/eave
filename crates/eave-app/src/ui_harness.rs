@@ -438,26 +438,45 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
     // And absence is still absence: no agents, no browser, no line.
     assert!(resource_line(&[dead.clone()], Some(32 * GB), None).is_none());
 
-    // Now through the shell.
+    // Now through the shell. The facts render as disabled rows in the
+    // footer's library menu (operator directive 2026-08-25 replaced the
+    // rail's resource lines with the icon footer) — the footer is standing
+    // chrome, the Memory section appears only when something reports.
     let (h, vcx) = boot(cx);
     h.plumbing.push_rail(vec![dead.clone(), unprobed.clone()]);
     vcx.run_until_parked();
     assert!(
-        !shown(vcx, "rail-resource"),
-        "nothing live reports memory — the rail must state nothing rather \
+        shown(vcx, "rail-footer"),
+        "the footer is standing chrome at the rail's foot"
+    );
+    click(vcx, "footer-library");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-menu-open-settings"),
+        "the library menu opens, and Settings is in it"
+    );
+    assert!(
+        !shown(vcx, "tab-menu-memory-fact"),
+        "nothing live reports memory — the menu must state nothing rather \
          than a zero"
     );
 
+    // The menu's entries are re-derived per render, so a fleet arriving
+    // while it is open appears without a reopen.
     h.plumbing.push_rail(all.clone());
     vcx.run_until_parked();
-    let bounds = vcx
-        .debug_bounds("rail-resource")
-        .expect("the aggregate fact renders once a live agent reports");
+    assert!(
+        shown(vcx, "tab-menu-memory-fact"),
+        "the aggregate fact renders once a live agent reports"
+    );
 
     // The fact must fit the room it renders in, at REAL metrics (Stage J
-    // amendment 1). Room is the element's box minus its own horizontal
-    // padding — measuring the padded box would flatter the fit.
-    let room = bounds.size.width - px(theme::SPACE_3 * 2.);
+    // amendment 1). The room is now a menu row's: the surface caps at
+    // MENU_MAX_W and a row loses its inset and padding on both sides —
+    // a ceiling that truncates against the menu edge is stated half way,
+    // which is the same failure the rail check existed to catch.
+    let room = px(theme::MENU_MAX_W
+        - 2. * (theme::MENU_ROW_INSET + theme::MENU_ROW_PAD_X));
     // Worst case that can actually appear here: a big fleet, a big
     // machine, and every number at its widest.
     let fleet: Vec<eave_wire::SessionInfo> = (0..30)
@@ -483,10 +502,10 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
         .chain(widest_web)
         .chain(["2 agents · 0.5 GB of 32.0 GB".to_string()])
     {
-        let w = real_text_width(&line, ".SystemUIFont", theme::MICRO_SIZE);
+        let w = real_text_width(&line, ".SystemUIFont", theme::DETAIL_SIZE);
         assert!(
             w <= room,
-            "the resource fact {line:?} needs {w:?} but the rail gives \
+            "the resource fact {line:?} needs {w:?} but a menu row gives \
              {room:?} — a ceiling stated half way is not stated"
         );
     }
@@ -1437,11 +1456,14 @@ fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
     // RAIL_HOVER_PAD because the header is a hoverable card, and its chevron
     // is inset the same on the other side. That inset is the card's, not the
     // rail's, and measuring it here would assert the wrong column.
-    assert_eq!(
-        x(vcx, "zone-sessions"),
-        x(vcx, "rail-resource"),
-        "the sessions zone and the rail's footer start on different edges"
-    );
+    //
+    // This used to anchor against the resource lines (`rail-resource`),
+    // the other text at rail level. They moved into the footer's library
+    // menu (2026-08-25) and the footer is a PANEL, not a text line — it
+    // wears its own SPACE_2 inset the way a session row's card wears its
+    // overhang, so the one-gutter rule no longer has a second text column
+    // at rail level to measure. The rule itself is still asserted below
+    // against the files rail.
     // The zone header and a session row's card share their RIGHT edge — the
     // 4 px overhang, asserted. Both sit in the same scroller now, so this is
     // the same rule the header's control used to carry. The `+` cannot carry
@@ -6848,8 +6870,13 @@ fn an_archived_agent_still_counts_against_the_memory_ceiling(cx: &mut TestAppCon
         !shown(vcx, "rail-aaaa1111"),
         "the row is not hidden — then this measures nothing"
     );
+    // The ceiling lives in the footer's library menu now; the fact under
+    // test is unchanged — `library_menu` computes over every session the
+    // engine reports, never the filtered list.
+    click(vcx, "footer-library");
+    vcx.run_until_parked();
     assert!(
-        shown(vcx, "rail-resource"),
+        shown(vcx, "tab-menu-memory-fact"),
         "the only live agent was archived and the machine's ceiling went \
          with it: two gigabytes of resident memory stopped being reported \
          because a row stopped being drawn"
@@ -10519,6 +10546,51 @@ fn page_tabs_and_session_tabs_share_one_strip(cx: &mut TestAppContext) {
     set_resident_for_test(None);
 }
 
+/// `about:blank` wears NO mark (operator ruling 2026-08-25): a globe there
+/// claims a site that does not exist. The slot stays — reserved for eave's
+/// logo once one exists — so the row's text keeps the shared left edge,
+/// and the empty slot carries its own selector so this state is visible
+/// to the suite rather than being an absence nothing can assert.
+#[gpui::test]
+fn a_blank_page_tab_wears_no_mark(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    set_resident_for_test(Some(&["p1", "p2"]));
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("about:blank"), None),
+            page_tab("p2", Some("https://example.com/"), Some("Example Domain")),
+        ],
+        Some("aaaa1111"),
+    );
+    assert!(
+        shown(vcx, "tab-chip-blank-p1"),
+        "the blank tab lost its reserved slot"
+    );
+    for sel in ["tab-chip-p1", "tab-chip-unloaded-p1", "tab-favicon-p1"] {
+        assert!(!shown(vcx, sel), "{sel} — about:blank grew a mark back");
+    }
+    // A page with a real URL keeps its mark; the rule is about about:blank,
+    // not about pages.
+    assert!(
+        shown(vcx, "tab-chip-p2") || shown(vcx, "tab-favicon-p2"),
+        "the rule leaked onto a real page"
+    );
+    // The reserved slot and a real mark share the box, so the two rows'
+    // labels start on one edge.
+    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel).expect(sel).origin.x
+    };
+    assert_eq!(
+        x(vcx, "tab-p1"),
+        x(vcx, "tab-p2"),
+        "the blank row drifted off the strip's edge"
+    );
+    set_resident_for_test(None);
+}
+
 /// Slice E3. A tab whose page eave has thrown away must not look like one
 /// holding a live page — otherwise the strip is claiming something it cannot
 /// back up, and the operator has no way to know why clicking costs a reload.
@@ -12030,6 +12102,152 @@ fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
         cmds.iter()
             .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
         "the strip's + is not ⌘T: {cmds:?}"
+    );
+}
+
+/// The rail footer (operator directive 2026-08-25): three icons, and each
+/// one is a door that actually opens.
+///
+/// The `+` menu's rows are asserted against the SAME commands the acts
+/// they name send elsewhere — `New Tab` is ⌘T's `BrowserCmd::NewTab`,
+/// `New Session` is `+ new`'s `Command::NewSession` — because a menu row
+/// that reaches its goal by a different route is a second code path
+/// pretending to be a shortcut. The library and theme icons are asserted
+/// as windows/menus that exist after the click.
+#[gpui::test]
+fn the_footer_panel_is_a_door_to_library_theme_and_new(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    for sel in ["footer-library", "footer-theme", "footer-plus"] {
+        assert!(shown(vcx, sel), "{sel} is standing chrome and must render");
+    }
+
+    // The `+` menu: every row is an act eave has, and nothing else.
+    click(vcx, "footer-plus");
+    vcx.run_until_parked();
+    for sel in [
+        "tab-menu-new-session",
+        "tab-menu-new-project",
+        "tab-menu-new-folder",
+        "tab-menu-add-tab",
+    ] {
+        assert!(shown(vcx, sel), "{sel} missing from the + menu");
+    }
+
+    let _ = h.drain();
+    click(vcx, "tab-menu-add-tab");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+        "the + menu's New Tab is not ⌘T's act: {cmds:?}"
+    );
+    assert!(
+        shown(vcx, "omnibox"),
+        "New Tab from the + menu opened a tab with no way to aim it"
+    );
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    // The closed menu's catcher stays mounted through its 100 ms exit and
+    // occludes the window; a reopen click before the reap lands on the
+    // catcher, not the button.
+    vcx.executor().advance_clock(Duration::from_millis(200));
+    vcx.run_until_parked();
+
+    click(vcx, "footer-plus");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-menu-new-session"),
+        "the + menu did not reopen"
+    );
+    let _ = h.drain();
+    click(vcx, "tab-menu-new-session");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(c, Command::NewSession)),
+        "the + menu's New Session is not `+ new`'s act: {cmds:?}"
+    );
+
+    // The library icon is ALWAYS present (operator ruling), so on a fresh
+    // run it opens onto the No-downloads row plus the Settings row — and
+    // the Settings row opens the real ⌘, window.
+    vcx.executor().advance_clock(Duration::from_millis(200));
+    vcx.run_until_parked();
+    let windows_before = cx.update(|cx| cx.windows().len());
+    click(vcx, "footer-library");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-menu-download-inert"),
+        "an empty download history is stated, not hidden"
+    );
+    click(vcx, "tab-menu-open-settings");
+    vcx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before + 1,
+        "the library menu's Settings row did not open the settings window"
+    );
+
+    // The brush opens the Customize Theme window.
+    vcx.executor().advance_clock(Duration::from_millis(200));
+    vcx.run_until_parked();
+    let windows_before = cx.update(|cx| cx.windows().len());
+    click(vcx, "footer-theme");
+    vcx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before + 1,
+        "the footer's brush did not open Customize Theme"
+    );
+}
+
+/// The Customize Theme window renders its whole grammar, and the tabs
+/// switch what the field edits.
+///
+/// Deliberately MUTATION-FREE: a click on a swatch or the field writes
+/// `theme::set_brand`, and the brand is process-global — a test that
+/// installed a green accent would race `oklch_accents_match_reference`
+/// and every other exact-pin token test running on a sibling thread.
+/// Tab switching is view state, so it is the interactive surface this
+/// test may drive; the write path is covered by the pure tests in
+/// `theme_editor` and was proven live (seeded theme-brand.json, walked
+/// 2026-08-25).
+#[gpui::test]
+fn the_customize_theme_panel_renders_and_switches_tabs(cx: &mut TestAppContext) {
+    let (_h, _vcx) = boot(cx);
+    let handle = cx
+        .update(crate::theme_editor::open)
+        .expect("the Customize Theme window opens");
+    let tvcx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    tvcx.update(|window, _| window.refresh());
+    tvcx.run_until_parked();
+
+    for sel in [
+        "customize-tab-Background",
+        "customize-tab-Accent",
+        "customize-field",
+        "customize-swatch-Neutral",
+        "customize-swatch-Slate",
+        "theme-reset",
+    ] {
+        assert!(shown(tvcx, sel), "{sel} missing from the Background tab");
+    }
+
+    click(tvcx, "customize-tab-Accent");
+    tvcx.run_until_parked();
+    assert!(
+        shown(tvcx, "customize-swatch-Violet"),
+        "the Accent tab did not bring the accent swatches"
+    );
+    assert!(
+        !shown(tvcx, "customize-swatch-Slate"),
+        "the Background presets leaked onto the Accent tab"
+    );
+    assert_eq!(
+        theme::brand(),
+        crate::theme::Brand::default(),
+        "switching tabs must not write the brand"
     );
 }
 
@@ -15246,7 +15464,7 @@ fn the_shortcut_viewer_sees_the_booted_keymap(cx: &mut TestAppContext) {
             ("Reopen the closed tab", "⇧⌘T"),
             ("Switch to the last tab", "⌘9"),
             ("Settings", "⌘,"),
-            ("Theme Editor", "⇧⌘,"),
+            ("Customize Theme", "⇧⌘,"),
         ] {
             assert_eq!(
                 find(label).as_deref(),
@@ -15570,5 +15788,213 @@ fn the_agents_pane_takes_a_default_and_refuses_a_posture_flag(cx: &mut TestAppCo
     assert!(
         crate::settings::snapshot().agents.is_empty(),
         "cleared defaults left residue in the store"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice D4 — the downloads panel
+// ---------------------------------------------------------------------------
+
+/// A download the harness hands the panel. There is no Chromium in the
+/// default feature state to produce one, which is the whole reason
+/// `web::set_downloads_for_test` exists — the panel has to be drivable in
+/// the build the suite actually runs.
+fn download(
+    id: u32,
+    name: &str,
+    percent: i32,
+    done: bool,
+    cancelled: bool,
+) -> crate::web::Download {
+    crate::web::Download {
+        id,
+        url: format!("https://example.com/{name}"),
+        file_name: name.to_string(),
+        path: format!("/tmp/{name}"),
+        received: 0,
+        total: 0,
+        percent,
+        done,
+        cancelled,
+    }
+}
+
+/// A page tab, with `list` already in the download map when it renders.
+fn page_with_downloads(h: &Harness, vcx: &mut VisualTestContext, list: Vec<crate::web::Download>) {
+    crate::web::set_downloads_for_test(list);
+    strip_tabs(
+        h,
+        vcx,
+        vec![page_tab("p1", Some("https://example.com/"), None)],
+        Some("p1"),
+    );
+}
+
+/// **The control arrives with the first download, and says whether one is
+/// still running.**
+///
+/// Absent on an empty list on purpose: eave's downloads live in a
+/// `thread_local!` map with no durable model behind it, so a standing
+/// control would open onto `No downloads` for the whole of every fresh run
+/// and promise a history eave does not keep. What it says while it is
+/// there is exactly what eave knows.
+///
+/// The running/settled distinction is asserted through the SELECTOR
+/// because the harness cannot read ink, and a lit state only the eye can
+/// check is a lit state no test can defend.
+#[gpui::test]
+fn the_downloads_control_arrives_with_the_first_download(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    page_with_downloads(&h, vcx, Vec::new());
+    assert!(
+        !shown(vcx, "downloads-button"),
+        "a session that has downloaded nothing offered a downloads control"
+    );
+
+    page_with_downloads(&h, vcx, vec![download(7, "report.pdf", 42, false, false)]);
+    assert!(
+        shown(vcx, "downloads-button"),
+        "a running download put no control on the toolbar"
+    );
+    assert!(
+        shown(vcx, "downloads-glyph-running"),
+        "a transfer in flight is drawn as settled"
+    );
+
+    page_with_downloads(&h, vcx, vec![download(7, "report.pdf", 100, true, false)]);
+    assert!(
+        shown(vcx, "downloads-button"),
+        "the control left with the transfer"
+    );
+    assert!(
+        shown(vcx, "downloads-glyph"),
+        "a finished transfer is still drawn as running"
+    );
+}
+
+/// **The two things a download row can do, done from the panel.**
+///
+/// This is the assertion `574d4a3` could not make: cancel and reveal were
+/// built and unit-tested, and there was no surface that could reach
+/// either. A capability nothing can invoke is the shape E8 sat in for a
+/// day.
+///
+/// **Reveal, never Open.** Chromium quarantines every download so that
+/// Gatekeeper gets a say before anything executes (06-browser G4), and a
+/// browser that launches its own downloads on one click hands that away.
+/// The seam records the path rather than spawning, because a suite that
+/// reveals is a suite that opens Finder on the machine running it.
+#[gpui::test]
+fn a_download_row_cancels_what_is_running_and_reveals_what_finished(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    page_with_downloads(
+        &h,
+        vcx,
+        vec![
+            download(7, "report.pdf", 42, false, false),
+            download(8, "notes.md", 100, true, false),
+        ],
+    );
+
+    click(vcx, "downloads-button");
+    vcx.run_until_parked();
+    // Row 0 is the `Downloads` header; the transfers follow it.
+    assert!(shown(vcx, "menu-row-1"), "the panel drew no rows");
+    assert!(shown(vcx, "menu-row-2"), "the second download is missing");
+    assert!(
+        !shown(vcx, "menu-row-3"),
+        "the panel invented a row for a download that does not exist"
+    );
+
+    let _ = crate::web::take_cancelled_downloads_for_test();
+    click(vcx, "tab-menu-download-cancel");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::take_cancelled_downloads_for_test(),
+        vec![7],
+        "the running row stopped nothing"
+    );
+
+    // **Let the first menu finish leaving before opening the second.** A
+    // closing popup is still painted and still occluding, so a click
+    // aimed at the button lands on the corpse and the row that follows is
+    // clicked on a layer that is no longer live — the exact
+    // painted-but-dead shape that cost red main a day. `drive` runs until
+    // the window stops asking for frames, which is when the exit is over.
+    drive(&h, vcx, Duration::from_millis(16));
+    click(vcx, "downloads-button");
+    vcx.run_until_parked();
+    let _ = crate::web::take_revealed_downloads_for_test();
+    click(vcx, "tab-menu-download-reveal");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::take_revealed_downloads_for_test(),
+        vec!["/tmp/notes.md".to_string()],
+        "the finished row showed nothing in Finder"
+    );
+}
+
+/// **A transfer whose total Chromium does not know still offers to stop,
+/// and a stopped one offers nothing.**
+///
+/// `percent_complete` is `-1` when the receive total is unknown
+/// (`cef_download_item_capi.h:102`) — the ordinary case for a chunked
+/// response, not a rare one. What that does to the LABEL is
+/// `download_rows`' business and is asserted there; what it must not do is
+/// cost the row its cancel, which is the only control a download with no
+/// end in sight has.
+///
+/// The inert half carries a **positive control**, because "clicking it did
+/// nothing" is what a test that missed the row entirely also reports. A
+/// live cancel row sits beside the dead one and is clicked on the same
+/// open menu: if that fires, the panel was reachable, and the silence
+/// belongs to the disabled row rather than to the click.
+#[gpui::test]
+fn an_unknown_total_still_cancels_and_a_cancelled_row_is_inert(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    page_with_downloads(&h, vcx, vec![download(9, "stream.bin", -1, false, false)]);
+    click(vcx, "downloads-button");
+    vcx.run_until_parked();
+    let _ = crate::web::take_cancelled_downloads_for_test();
+    click(vcx, "tab-menu-download-cancel");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::take_cancelled_downloads_for_test(),
+        vec![9],
+        "a download with no known total could not be stopped"
+    );
+
+    drive(&h, vcx, Duration::from_millis(16));
+    page_with_downloads(
+        &h,
+        vcx,
+        vec![
+            download(9, "stream.bin", 12, false, true),
+            download(10, "other.bin", 30, false, false),
+        ],
+    );
+    click(vcx, "downloads-button");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-menu-download-inert"),
+        "a cancelled transfer vanished from the panel instead of saying so"
+    );
+
+    let _ = crate::web::take_cancelled_downloads_for_test();
+    let _ = crate::web::take_revealed_downloads_for_test();
+    click(vcx, "tab-menu-download-inert");
+    vcx.run_until_parked();
+    assert!(
+        crate::web::take_cancelled_downloads_for_test().is_empty()
+            && crate::web::take_revealed_downloads_for_test().is_empty(),
+        "a disabled row acted"
+    );
+    // The control: same menu, same frame, a row that is supposed to work.
+    click(vcx, "tab-menu-download-cancel");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::take_cancelled_downloads_for_test(),
+        vec![10],
+        "the panel was not reachable at all, so the inert row proved nothing"
     );
 }

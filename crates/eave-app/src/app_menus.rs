@@ -99,7 +99,7 @@ fn menus() -> Vec<Menu> {
                 // HAS the surface — see the negative test below, which
                 // guarded this exact row until S1 built the window.
                 MenuItem::action("Settings…", crate::settings_window::OpenSettings),
-                MenuItem::action("Theme Editor", crate::theme_editor::OpenThemeEditor),
+                MenuItem::action("Customize Theme", crate::theme_editor::OpenThemeEditor),
                 MenuItem::separator(),
                 MenuItem::action("Hide eave", Hide),
                 MenuItem::action("Hide Others", HideOthers),
@@ -156,8 +156,8 @@ mod tests {
             })
             .collect();
         assert!(
-            app_names.iter().any(|n| n == "Theme Editor"),
-            "the app menu lost the Theme Editor: {app_names:?}"
+            app_names.iter().any(|n| n == "Customize Theme"),
+            "the app menu lost Customize Theme: {app_names:?}"
         );
         // Present since S1 built the window; before that, this very test
         // forbade the word. The row and the surface must arrive together,

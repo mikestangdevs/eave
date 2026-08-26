@@ -895,7 +895,7 @@ fn describe(action: &str) -> Option<(&'static str, &'static str)> {
         "eave_app::Minimize" => ("Application", "Minimize the window"),
         "eave_app::Hide" => ("Application", "Hide eave"),
         "eave_settings::OpenSettings" => ("Application", "Settings"),
-        "eave_theme::OpenThemeEditor" => ("Application", "Theme Editor"),
+        "eave_theme::OpenThemeEditor" => ("Application", "Customize Theme"),
         "eave::NewTab" => ("Tabs", "New tab"),
         "eave::CloseTab" => ("Tabs", "Close the tab — the window when none is open"),
         "eave::NextTab" => ("Tabs", "Next tab"),

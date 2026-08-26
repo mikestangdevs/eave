@@ -220,6 +220,15 @@ fn tint(color: Hsla, hue: f32, chroma: f32) -> Hsla {
     out
 }
 
+/// The color a `(hue, chroma)` pair produces at a fixed preview
+/// lightness, gamut-fitted the same way [`tint`] fits a surface. The
+/// theme editor's 2-D field paints with this, so the swatch a person
+/// clicks and the palette that lands are the SAME conversion — a field
+/// painted with plain HSL would promise colors oklch never produces.
+pub(crate) fn field_sample(l: f32, chroma: f32, hue: f32) -> Hsla {
+    oklch(l, fit_chroma(l, chroma, hue), hue)
+}
+
 fn apply_tint(color: Hsla) -> Hsla {
     let b = brand();
     if b.tint.chroma <= f32::EPSILON {
@@ -547,6 +556,35 @@ pub fn danger_plate_glass() -> Hsla {
 /// the same lift; nothing in the frame paints it now.
 pub fn rail_plate() -> Hsla {
     ink(0.055)
+}
+
+/// The rail footer's plate — the ONE surface that wears the brand's color
+/// at display strength rather than wash strength (operator directive
+/// 2026-08-25: "the footer takes the theme color and changes live").
+///
+/// Reads [`brand`] per paint, so a Customize Theme drag re-inks it the
+/// same frame with no subscription. Background tint first, the accent as
+/// the fallback voice, and with neither set it is an ordinary raised wash
+/// — a colored plate over an uncolored theme would be claiming a brand
+/// the operator never picked. Chroma is boosted over the tint's own
+/// (a footer at wash chroma is indistinguishable from the glass), capped
+/// where the dark ground can still hold it, and gamut-fitted like every
+/// other tinted surface.
+pub fn footer_plate() -> Hsla {
+    let b = brand();
+    let t = if b.tint.chroma > f32::EPSILON {
+        b.tint
+    } else {
+        b.accent
+    };
+    if t.chroma <= f32::EPSILON {
+        return overlay();
+    }
+    let l = 0.30;
+    let boosted = (t.chroma * 3.0).clamp(0.04, 0.12);
+    let mut out = oklch(l, fit_chroma(l, boosted, t.hue), t.hue);
+    out.a = 0.85;
+    out
 }
 
 /// The content card: a near-black well, darker than the window surface.

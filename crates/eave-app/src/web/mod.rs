@@ -1375,13 +1375,84 @@ pub fn download_rows(all: &[Download]) -> Vec<DownloadRow> {
         .collect()
 }
 
-/// Stop a download in flight.
-#[cfg(feature = "web")]
-pub fn cancel_download(id: u32) {
-    tabs::cancel_download(id);
+/// The download list the panel is looking at.
+///
+/// **One reader, so the control that appears and the rows inside it can
+/// never disagree** about whether this session has downloaded anything.
+/// Two call sites reading two different things is how the tab rows and the
+/// bookmark grid came to draw different favicons for one page.
+///
+/// Ungated. With `--features web` the list is Chromium's, from `tabs`;
+/// without it there is nothing to download and the list is empty — which
+/// would leave the whole panel unreachable in the DEFAULT feature state,
+/// the one the suite runs. The `#[cfg(test)]` override is what lets the
+/// harness drive it there, and it is the same seam shape `favicon_image`
+/// already uses for the same reason.
+pub fn download_list() -> Vec<Download> {
+    #[cfg(test)]
+    {
+        let injected = TEST_DOWNLOADS.with(|d| d.borrow().clone());
+        if !injected.is_empty() {
+            return injected;
+        }
+    }
+    downloads()
 }
-#[cfg(not(feature = "web"))]
-pub fn cancel_download(_id: u32) {}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DOWNLOADS: std::cell::RefCell<Vec<Download>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test seam: hand the panel a list without a browser to produce one.
+///
+/// An empty list clears the override rather than pinning the panel to
+/// empty — [`download_list`] falls through to the real reader, so a test
+/// that never calls this sees exactly what the product sees.
+#[cfg(test)]
+pub fn set_downloads_for_test(list: Vec<Download>) {
+    TEST_DOWNLOADS.with(|d| *d.borrow_mut() = list);
+}
+
+/// Stop a download in flight.
+///
+/// One ungated function rather than a gated pair, so the panel's click
+/// path is the same code in both feature states and the default suite can
+/// see that a row actually fired.
+pub fn cancel_download(id: u32) {
+    #[cfg(test)]
+    {
+        TEST_CANCELLED.with(|c| c.borrow_mut().push(id));
+    }
+    #[cfg(feature = "web")]
+    tabs::cancel_download(id);
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = id;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CANCELLED: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_REVEALED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test seam: every id [`cancel_download`] was asked to stop since the
+/// last take.
+#[cfg(test)]
+pub fn take_cancelled_downloads_for_test() -> Vec<u32> {
+    TEST_CANCELLED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Test seam: every path [`reveal_download`] was asked to show.
+#[cfg(test)]
+pub fn take_revealed_downloads_for_test() -> Vec<String> {
+    TEST_REVEALED.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
 
 /// Show a finished download in Finder.
 ///
@@ -1399,10 +1470,21 @@ pub fn reveal_download(path: &str) {
     if path.is_empty() {
         return;
     }
-    let _ = std::process::Command::new("/usr/bin/open")
-        .arg("-R")
-        .arg(path)
-        .spawn();
+    // Under test this RECORDS instead of spawning. Not squeamishness: a
+    // suite that reveals is a suite that opens Finder windows on the
+    // machine running it, and `cargo test` must not reach outside the
+    // process to be watched.
+    #[cfg(test)]
+    {
+        TEST_REVEALED.with(|r| r.borrow_mut().push(path.to_string()));
+    }
+    #[cfg(not(test))]
+    {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
 }
 
 /// Answer a tab's outstanding ask.

@@ -2302,6 +2302,13 @@ fn page_globe(id: &str, resident: bool) -> AnyElement {
 }
 
 fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
+    // `about:blank` wears NO mark (operator ruling 2026-08-25): it is
+    // eave's own empty page, a globe there claims a site that does not
+    // exist, and the slot is reserved for eave's logo once one exists.
+    // The slot itself stays — same size, no plate wash, nothing in it —
+    // so the row's text keeps the one left edge every other row has.
+    let blank = matches!(tab.kind, strip::TabKind::Page)
+        && tab.url.as_deref() == Some("about:blank");
     div()
         // `RAIL_MARK`, not `PROVIDER_CHIP` (Slice D3). The rail row's leading
         // slot is one size whatever fills it — a provider chip here, a
@@ -2311,11 +2318,17 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
         .size(px(theme::RAIL_MARK))
         .flex_none()
         .rounded(px(theme::RADIUS_CHIP))
-        .bg(theme::chip_plate())
+        .when(!blank, |d| d.bg(theme::chip_plate()))
         .flex()
         .items_center()
         .justify_center()
         .child(match &tab.kind {
+            strip::TabKind::Page if blank => div()
+                .debug_selector({
+                    let id = id.to_string();
+                    move || format!("tab-chip-blank-{id}")
+                })
+                .into_any_element(),
             // A page's mark is its favicon when Chromium has given us a
             // URL, and the globe when it has not — or when the image fails
             // to decode. Session rows keep the provider chip. The globe
@@ -4729,6 +4742,24 @@ enum TabMenuTarget {
     /// (and still on double-click / right-click), not on the bookmark
     /// grid's `+`.
     Folders,
+    /// The downloads panel — 06-browser D4.
+    ///
+    /// Not a right-click: this one is opened by a control on the pane
+    /// header. It is a `TabMenuTarget` anyway because the alternative is a
+    /// second popup with its own layer, its own keyboard walk and its own
+    /// close path — a second place for a menu to be left open, which is
+    /// the thing `open_bookmark_menu` already refused to build.
+    Downloads,
+    /// The rail footer's library icon (operator directive 2026-08-25):
+    /// the downloads rows, the Stage L memory facts, and the way into
+    /// Settings — one menu, because those are the things the operator
+    /// said live behind that icon.
+    Library,
+    /// The rail footer's `+`: everything eave can create from nothing —
+    /// a session, a project, a folder, a tab. Rows exist only for acts
+    /// eave actually has; the reference menu's Easel/Boost/Split rows do
+    /// not appear because nothing backs them.
+    Plus,
 }
 
 /// One choosable row on the tab menu. Separators and headers live beside
@@ -4766,6 +4797,24 @@ enum TabMenuAction {
     /// A top-level folder, from the Folders header menu.
     NewFolder,
     CopyFolderLinks,
+    /// One row of the downloads panel, carrying what `web::download_rows`
+    /// already decided this row does. The panel RENDERS that decision; it
+    /// does not make one, which is what keeps the decision in a pure
+    /// ungated function the default suite can run.
+    Download(crate::web::DownloadAction),
+    /// The Library menu's way into the Settings window — the same
+    /// `settings_window::open` that ⌘, reaches.
+    OpenSettings,
+    /// One Stage L memory fact as a row that is stated, never clickable.
+    /// The facts moved here when the footer replaced the rail's resource
+    /// lines: a ceiling stated nowhere is a ceiling met by surprise.
+    MemoryFact,
+    /// The `+` menu's launcher row — `Command::NewSession`, the same
+    /// route `+ new` takes.
+    NewSessionRow,
+    /// The `+` menu's project row — the same folder picker as the
+    /// projects zone's own `+` ([`Shell::pick_project`]).
+    NewProjectRow,
 }
 
 enum TabMenuEntry {
@@ -9465,6 +9514,7 @@ impl Shell {
                                 .child(format!("{pct}%"))
                         }),
                 )
+                .children(self.downloads_control(cx))
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── a session: the breadcrumb ────────────────────────────────
@@ -9990,6 +10040,66 @@ impl Shell {
     /// The files-rail collapse toggle. It sat in the titlebar until A′
     /// deleted that bar; it lives on the pane header's trailing edge now,
     /// which is the only chrome left on that side of the window.
+    /// The downloads control — 06-browser D4, the panel's way in.
+    ///
+    /// # It is here only when this session has downloaded something
+    /// `None` on an empty list, which is not a style choice: eave's
+    /// downloads live in a `thread_local!` map filled by Chromium's
+    /// `DownloadHandler` and there is **no durable model behind it**. A
+    /// standing control would therefore promise a history eave does not
+    /// keep, and open onto `No downloads` for the whole of every fresh
+    /// run. What it says while it is here is exactly what eave knows: this
+    /// session fetched a file. (The zoom chip two slots along makes the
+    /// same argument for the same slot — a standing readout of something
+    /// the operator already knows is a decoration.)
+    ///
+    /// # On the page toolbar, and nowhere else
+    /// Downloads come from pages, and this is the pages' header. A session
+    /// tab's header is a breadcrumb with no browser controls on it, so a
+    /// transfer running behind a session tab is not visible until you
+    /// return to a page — a known limit, recorded rather than discovered,
+    /// and the thing to revisit if downloads ever get a durable model.
+    ///
+    /// # The live state is in the SELECTOR
+    /// `ui_harness` cannot read ink. Whether anything is still in flight
+    /// is a fact a test has to be able to assert, so it rides on the
+    /// glyph's selector as well as its colour — the standard this file
+    /// already holds for every other lit control.
+    fn downloads_control(&self, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let live = crate::web::download_list();
+        if live.is_empty() {
+            return None;
+        }
+        let running = live.iter().any(|d| !d.done && !d.cancelled);
+        Some(
+            div()
+                .id("downloads-button")
+                .debug_selector(|| "downloads-button".into())
+                .flex_none()
+                .p(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_SELECT))
+                .hover_fade("downloads-button", theme::wash_rest(), theme::overlay())
+                .cursor_pointer()
+                .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                    this.open_downloads_menu(ev.position(), cx);
+                }))
+                .child(icons::tagged_icon(
+                    icons::ARROW_DOWN,
+                    theme::ICON_TOGGLE,
+                    if running {
+                        theme::text()
+                    } else {
+                        theme::text_secondary()
+                    },
+                    if running {
+                        "downloads-glyph-running"
+                    } else {
+                        "downloads-glyph"
+                    },
+                )),
+        )
+    }
+
     fn files_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
             .id("files-toggle")
@@ -11849,13 +11959,9 @@ impl Shell {
             .as_ref()
             .and_then(|e| (!e.bookmark).then(|| (e.session_id.clone(), e.text.clone())));
         let home = std::env::var("HOME").ok();
-        // Stage L's aggregate ceiling, computed over EVERY session and not
-        // over the filtered list. An archived agent still holding 2 GB is
-        // precisely the cost the operator has stopped thinking about, and
-        // dropping it out of the total the moment the row is hidden would
-        // make the ceiling quietly optimistic — the one thing a ceiling
-        // may not be.
-        let resource = resource_line(&all, physical_memory_cached(), crate::web::web_memory());
+        // Stage L's aggregate ceiling moved into the library menu
+        // (`library_menu`) when the footer took this slot — computed there,
+        // still over EVERY session and not the filtered list.
         let sessions: Vec<SessionInfo> = all
             .into_iter()
             .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
@@ -12692,51 +12798,86 @@ impl Shell {
             // Collapsible from the pane header's trailing toggle, which is
             // where the titlebar's `files-toggle` went.
             .children((!self.files.read(cx).collapsed).then(|| self.files_rail(cx, phase)))
-            // Stage L: the aggregate resource fact, under the list it
-            // aggregates and outside the scroller — a ceiling the
-            // operator has to scroll to find is a ceiling they meet by
-            // surprise. Absent entirely when nothing live reports memory.
-            .children(resource.map(|(lines, over)| {
-                // Slice C1: one row per fact — agent memory, then web
-                // memory. They share the group's spacing and the warning
-                // weight, because the ceiling they are measured against is
-                // one ceiling; they are two lines only because neither
-                // fits beside the other at the rail's width.
-                div()
-                    .flex_none()
-                    .px(px(theme::RAIL_GUTTER))
-                    .pb(px(theme::SPACE_3))
-                    .pt(px(theme::SPACE_1))
-                    .flex()
-                    .flex_col()
-                    .children(lines.into_iter().enumerate().map(|(i, line)| {
-                        div()
-                            // The FIRST row keeps the selector: it is the
-                            // one every existing assertion measures, and
-                            // renaming it would be a test edit pretending
-                            // to be a product change.
-                            .debug_selector(move || {
-                                if i == 0 {
-                                    "rail-resource".into()
-                                } else {
-                                    "rail-resource-web".into()
-                                }
-                            })
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .font_weight(if over {
-                                theme::WEIGHT_LABEL
-                            } else {
-                                theme::WEIGHT_BODY
-                            })
-                            .text_color(if over {
-                                theme::warning()
-                            } else {
-                                theme::text_tertiary()
-                            })
-                            .child(SharedString::from(line))
-                    }))
-            }))
+            // The rail footer (operator directive 2026-08-25) — the
+            // resource lines' old slot. The Stage L facts it displaced
+            // moved into the footer's library menu; see `library_menu`.
+            .child(self.rail_footer(cx))
+            .into_any_element()
+    }
+
+    /// One footer control: an icon in a small hover-washed hit target.
+    /// `hover_fade`, never the snapping hover form — the standing ban in
+    /// this file (and the words are chosen so the ban's own source scan
+    /// does not read this comment as a violation).
+    fn footer_button(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .flex_none()
+            .p(px(theme::SPACE_1))
+            .rounded(px(theme::scaled_radius(theme::RADIUS_SELECT)))
+            .hover_fade(id, gpui::transparent_black(), theme::overlay())
+            .cursor_pointer()
+            .on_click(cx.listener(on_click))
+            .child(icons::tagged_icon(
+                icon,
+                theme::ICON_TOGGLE,
+                theme::text_secondary(),
+                format!("{id}-glyph"),
+            ))
+    }
+
+    /// The rail footer (operator directive 2026-08-25): a small panel at
+    /// the rail's foot in the reference frame's grammar — library on the
+    /// left (downloads, the memory facts, Settings), the theme brush
+    /// beside it, `+` on the right. Three icons, not the reference's five:
+    /// the two middle dots are Arc's spaces switcher and eave has no
+    /// spaces, so nothing stands where nothing is.
+    ///
+    /// The plate is [`theme::footer_plate`] — the one surface that takes
+    /// the brand's color at display strength, live, which is the "footer
+    /// tinted by theme" half of the directive.
+    fn rail_footer(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "rail-footer".into())
+            .flex_none()
+            .mx(px(theme::SPACE_2))
+            .mb(px(theme::SPACE_2))
+            .px(px(theme::SPACE_1))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::scaled_radius(theme::RADIUS_PANEL)))
+            .bg(theme::footer_plate())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .child(self.footer_button(
+                "footer-library",
+                icons::ARCHIVE_MINIMALISTIC,
+                |this, ev, _, cx| this.open_library_menu(ev.position(), cx),
+                cx,
+            ))
+            .child(self.footer_button(
+                "footer-theme",
+                icons::PAINT_BRUSH,
+                |_, _, _, cx| {
+                    let _ = crate::theme_editor::open(cx);
+                },
+                cx,
+            ))
+            .child(div().flex_1())
+            .child(self.footer_button(
+                "footer-plus",
+                icons::ADD,
+                |this, ev, _, cx| this.open_plus_menu(ev.position(), cx),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -15688,6 +15829,56 @@ impl Shell {
         );
     }
 
+    /// The downloads panel — 06-browser D4.
+    ///
+    /// Anchored at the pointer, under the pane header, and **not** at the
+    /// window's top-right: the notification stack lives there
+    /// (`notification_toasts`), it is `absolute` over the page, and a
+    /// panel underneath it would be painted-but-dead — the occluding
+    /// overlay that cost red main a day.
+    fn open_downloads_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        self.open_tab_menu_at(
+            TabMenu {
+                target: TabMenuTarget::Downloads,
+                at,
+            },
+            cx,
+        );
+    }
+
+    /// The rail footer's library menu. Same popup, same layer, same close
+    /// path as every other menu; anchored at the pointer like the
+    /// downloads menu and for the downloads menu's reason.
+    fn open_library_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        self.open_tab_menu_at(
+            TabMenu {
+                target: TabMenuTarget::Library,
+                at,
+            },
+            cx,
+        );
+    }
+
+    /// The rail footer's `+` menu.
+    fn open_plus_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        self.open_tab_menu_at(
+            TabMenu {
+                target: TabMenuTarget::Plus,
+                at,
+            },
+            cx,
+        );
+    }
+
     /// A project row's menu (Slice D4.2 stage 3).
     ///
     /// Same popup, same layer, same close path as the tab and bookmark
@@ -15735,6 +15926,9 @@ impl Shell {
             TabMenuTarget::Split { left, right } => self.split_tab_menu(left, right, cx),
             TabMenuTarget::Bookmark(id) => self.bookmark_menu(id, cx),
             TabMenuTarget::Folders => self.folders_header_menu(),
+            TabMenuTarget::Downloads => self.downloads_menu(),
+            TabMenuTarget::Library => self.library_menu(cx),
+            TabMenuTarget::Plus => self.plus_menu(),
         }
     }
 
@@ -15743,6 +15937,108 @@ impl Shell {
             TabMenuAction::NewFolder,
             MenuItem::new("New Folder"),
         )]
+    }
+
+    /// The downloads panel's rows — 06-browser D4.
+    ///
+    /// # It renders a decision rather than making one
+    /// Every label and every action comes from `web::download_rows`, which
+    /// is pure, ungated and asserted in the default suite. That is what
+    /// keeps the measured trap out of this file: **`percent_complete` is
+    /// `-1` when Chromium does not know the total size**
+    /// (`cef_download_item_capi.h:102`), which is the ordinary case for a
+    /// chunked response, and a row rendered straight from that integer
+    /// reads `-1%`. `download_rows` answers `"name — downloading"` there
+    /// instead, and this function is not allowed to second-guess it.
+    ///
+    /// # The verb is in the trailing slot, because the label is a filename
+    /// A row reading `report.pdf — 42%` gives no clue that clicking it
+    /// stops the transfer, and a row reading `notes.md` none that clicking
+    /// reveals it. The label says WHICH file; the trailing slot says what
+    /// the click does. **`Show in Finder`, never `Open`** — opening runs
+    /// the file, and Chromium quarantines every download precisely so
+    /// Gatekeeper gets a say first (`web::reveal_download`, 06-browser G4).
+    ///
+    /// # Rebuilt per call, on purpose
+    /// `run_tab_menu` re-derives these before acting, so the action that
+    /// fires is the one the CURRENT list says — a transfer that finished
+    /// while the menu was open reveals rather than cancelling a download
+    /// that is already over. The cost is that the row under the pointer
+    /// can change between frames; the alternative is a menu holding a
+    /// stale id, and a stale id is the half that could act on the wrong
+    /// thing.
+    fn downloads_menu(&self) -> Vec<TabMenuEntry> {
+        let rows = crate::web::download_rows(&crate::web::download_list());
+        let mut entries = Vec::with_capacity(rows.len() + 1);
+        entries.push(TabMenuEntry::Header("Downloads"));
+        entries.extend(rows.into_iter().map(|row| {
+            let item = match &row.action {
+                crate::web::DownloadAction::Cancel(_) => {
+                    MenuItem::new(row.label).trailing("Cancel")
+                }
+                crate::web::DownloadAction::Reveal(_) => {
+                    MenuItem::new(row.label).trailing("Show in Finder")
+                }
+                crate::web::DownloadAction::Nothing => MenuItem::new(row.label),
+            };
+            let item = if row.enabled { item } else { item.disabled() };
+            TabMenuEntry::Action(TabMenuAction::Download(row.action), item)
+        }));
+        entries
+    }
+
+    /// The library menu (operator directive 2026-08-25): what lives behind
+    /// the rail footer's left icon.
+    ///
+    /// It COMPOSES [`Shell::downloads_menu`] rather than reading the
+    /// download list itself — one reader, one set of row decisions, so the
+    /// pane-header control and this icon can never disagree about what a
+    /// row says or does. The footer icon is always present (the operator's
+    /// ruling), so on a fresh run this opens onto the `No downloads` row —
+    /// a different judgement from the pane-header control's
+    /// appear-when-nonempty, recorded as such in both places.
+    ///
+    /// The Stage L memory facts render here as disabled rows: the footer
+    /// replaced the rail's resource lines, and a ceiling stated nowhere is
+    /// a ceiling the operator meets by surprise. Same computation
+    /// ([`resource_line`]), same lines, stated in a quieter place.
+    fn library_menu(&self, cx: &App) -> Vec<TabMenuEntry> {
+        let mut entries = self.downloads_menu();
+        let all = self.sessions.read(cx).sessions.clone();
+        if let Some((lines, _over)) =
+            resource_line(&all, physical_memory_cached(), crate::web::web_memory())
+        {
+            entries.push(TabMenuEntry::Separator);
+            entries.push(TabMenuEntry::Header("Memory"));
+            entries.extend(lines.into_iter().map(|line| {
+                TabMenuEntry::Action(TabMenuAction::MemoryFact, MenuItem::new(line).disabled())
+            }));
+        }
+        entries.push(TabMenuEntry::Separator);
+        entries.push(TabMenuEntry::Action(
+            TabMenuAction::OpenSettings,
+            MenuItem::new("Settings…").trailing("⌘,"),
+        ));
+        entries
+    }
+
+    /// The `+` menu: every act of creation eave actually has, in the
+    /// reference menu's order — container acts first, the tab last with
+    /// its chord. `New Split`/`Easel`/`Boost` from the reference do not
+    /// appear: a split needs a target tab this menu does not have, and the
+    /// other two name features eave does not.
+    fn plus_menu(&self) -> Vec<TabMenuEntry> {
+        vec![
+            TabMenuEntry::Action(TabMenuAction::NewSessionRow, MenuItem::new("New Session")),
+            TabMenuEntry::Action(TabMenuAction::NewProjectRow, MenuItem::new("New Project…")),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(TabMenuAction::NewFolder, MenuItem::new("New Folder")),
+            TabMenuEntry::Separator,
+            TabMenuEntry::Action(
+                TabMenuAction::AddTab,
+                MenuItem::new("New Tab").trailing("⌘T"),
+            ),
+        ]
     }
 
     /// The bookmarks bar's context menu.
@@ -16073,6 +16369,57 @@ impl Shell {
             self.close_tab_menu(cx);
             return;
         }
+        // Downloads, answered here for the same reason the three above
+        // are: the row carries everything the act needs — an id or a path
+        // — and there is no tab to derive one from.
+        if let TabMenuTarget::Downloads = &req.target {
+            if let TabMenuAction::Download(what) = &action {
+                match what {
+                    crate::web::DownloadAction::Cancel(id) => crate::web::cancel_download(*id),
+                    crate::web::DownloadAction::Reveal(path) => crate::web::reveal_download(path),
+                    // A cancelled transfer, a finished one whose path
+                    // Chromium never settled, or the empty-state row. The
+                    // row is drawn disabled and `run_tab_menu` has already
+                    // refused it above; this arm is what makes that true
+                    // rather than merely likely.
+                    crate::web::DownloadAction::Nothing => {}
+                }
+            }
+            self.close_tab_menu(cx);
+            return;
+        }
+        // The library target carries the downloads rows AND the Settings
+        // row, so it answers both shapes — the download half verbatim from
+        // the Downloads branch above, because the rows are literally the
+        // same rows (`library_menu` composes `downloads_menu`).
+        if let TabMenuTarget::Library = &req.target {
+            match &action {
+                TabMenuAction::Download(what) => match what {
+                    crate::web::DownloadAction::Cancel(id) => crate::web::cancel_download(*id),
+                    crate::web::DownloadAction::Reveal(path) => crate::web::reveal_download(path),
+                    crate::web::DownloadAction::Nothing => {}
+                },
+                TabMenuAction::OpenSettings => {
+                    let _ = crate::settings_window::open(cx);
+                }
+                // Disabled and refused above; the arm makes that a fact.
+                TabMenuAction::MemoryFact => {}
+                _ => {}
+            }
+            self.close_tab_menu(cx);
+            return;
+        }
+        if let TabMenuTarget::Plus = &req.target {
+            match action {
+                TabMenuAction::NewSessionRow => self.new_session(),
+                TabMenuAction::NewProjectRow => self.pick_project(cx),
+                TabMenuAction::NewFolder => self.new_bookmark_folder(cx),
+                TabMenuAction::AddTab => self.new_tab(cx),
+                _ => {}
+            }
+            self.close_tab_menu(cx);
+            return;
+        }
         if let TabMenuTarget::Bookmark(bookmark_id) = &req.target {
             // A pinned cell's url, read here for the same reason the branch
             // exists at all: the bookmark id is in hand and there is no tab
@@ -16138,7 +16485,12 @@ impl Shell {
             // than returning bare — an unreachable arm that would leave a
             // popup open if it ever stopped being unreachable is worse
             // than one extra line.
-            TabMenuTarget::Bookmark(_) | TabMenuTarget::Group(_) | TabMenuTarget::Folders => {
+            TabMenuTarget::Bookmark(_)
+            | TabMenuTarget::Group(_)
+            | TabMenuTarget::Folders
+            | TabMenuTarget::Downloads
+            | TabMenuTarget::Library
+            | TabMenuTarget::Plus => {
                 self.close_tab_menu(cx);
                 return;
             }
@@ -16228,7 +16580,10 @@ impl Shell {
                     TabMenuTarget::Tab(_)
                     | TabMenuTarget::Bookmark(_)
                     | TabMenuTarget::Group(_)
-                    | TabMenuTarget::Folders => Vec::new(),
+                    | TabMenuTarget::Folders
+                    | TabMenuTarget::Downloads
+                    | TabMenuTarget::Library
+                    | TabMenuTarget::Plus => Vec::new(),
                 };
                 if !urls.is_empty() {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(urls.join("\n")));
@@ -16264,7 +16619,16 @@ impl Shell {
             }
             TabMenuAction::NestedFolder
             | TabMenuAction::NewFolder
-            | TabMenuAction::CopyFolderLinks => {}
+            | TabMenuAction::CopyFolderLinks
+            // Answered above, where the row's own id or path is in hand.
+            | TabMenuAction::Download(_)
+            // Library and Plus rows, all answered in their own branches
+            // above — these arms exist so a target change that made them
+            // reachable would close the menu rather than leave it open.
+            | TabMenuAction::OpenSettings
+            | TabMenuAction::MemoryFact
+            | TabMenuAction::NewSessionRow
+            | TabMenuAction::NewProjectRow => {}
         }
         self.close_tab_menu(cx);
     }
@@ -16366,6 +16730,17 @@ fn tab_menu_tag(action: &TabMenuAction) -> &'static str {
         TabMenuAction::NestedFolder => "nested-folder",
         TabMenuAction::NewFolder => "new-folder",
         TabMenuAction::CopyFolderLinks => "copy-folder-links",
+        // Tagged by what the row DOES, not by which file it is about. Two
+        // running downloads therefore share a selector, exactly as two
+        // `SplitMember` rows already do; a test that needs one of them
+        // addresses it as `menu-row-N`.
+        TabMenuAction::Download(crate::web::DownloadAction::Cancel(_)) => "download-cancel",
+        TabMenuAction::Download(crate::web::DownloadAction::Reveal(_)) => "download-reveal",
+        TabMenuAction::Download(crate::web::DownloadAction::Nothing) => "download-inert",
+        TabMenuAction::OpenSettings => "open-settings",
+        TabMenuAction::MemoryFact => "memory-fact",
+        TabMenuAction::NewSessionRow => "new-session",
+        TabMenuAction::NewProjectRow => "new-project",
     }
 }
 

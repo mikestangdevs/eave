@@ -170,8 +170,13 @@ if [[ "$NEEDS_CEF" == 1 ]]; then
   cef_check_pin "$CEF_DIR" "" 1
 fi
 
-BIN_DIR="$ROOT/target/$PROFILE"
-[[ "$MANIFEST" == "Cargo.toml" ]] || BIN_DIR="$ROOT/$(dirname "$MANIFEST")/target/$PROFILE"
+# Honor CARGO_TARGET_DIR: cargo above already did, and reading the shared
+# target/ when the build went elsewhere would silently bundle a STALE
+# binary. It also lets a session bundle without clobbering the loose
+# target/debug/eave another session may be exec'ing (the 2026-08-25
+# shared-target trap; sweeps pin with EAVE_REPLAY_BIN for the same reason).
+BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/$PROFILE"
+[[ "$MANIFEST" == "Cargo.toml" ]] || BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/$(dirname "$MANIFEST")/target}/$PROFILE"
 for b in "$BIN" ${HELPER_BIN:+"$HELPER_BIN"}; do
   [[ -x "$BIN_DIR/$b" ]] || { echo "bundle-app: no $BIN_DIR/$b after build" >&2; exit 1; }
 done

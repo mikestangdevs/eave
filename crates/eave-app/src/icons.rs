@@ -167,6 +167,11 @@ Line {
     LOGOUT_2 => "logout-2.svg",
     MAGNIFER => "magnifer.svg",
     MONITOR => "monitor.svg",
+    /// Not from the vendored set: drawn in the family's own stroke
+    /// grammar (24-box, 1.5 stroke, no fill) for the rail footer's theme
+    /// control, because Solar's brush was not among the 55 vendored files
+    /// and the registry test holds it to the same parser either way.
+    PAINT_BRUSH => "paint-brush.svg",
     PAPERCLIP => "paperclip.svg",
     PEN_NEW_SQUARE => "pen-new-square.svg",
     PEN => "pen.svg",
@@ -473,10 +478,12 @@ mod tests {
         for (path, _, _) in REGISTRY {
             assert!(Icons.load(path).unwrap().is_some(), "{path}");
         }
-        assert_eq!(of(Class::Line).count(), 55, "the vendored Solar family");
+        // 55 vendored Solar files plus PAINT_BRUSH, eave's own drawing in
+        // the family's stroke grammar (see its registry comment).
+        assert_eq!(of(Class::Line).count(), 56, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 66);
+        assert_eq!(REGISTRY.len(), 67);
     }
 
     /// Every registered path is a file that exists on disk under exactly
