@@ -5004,6 +5004,17 @@ struct Shell {
     /// overlay machinery as the page menu; the rows are a function of
     /// whether that tab is alone in the well or sharing it.
     tab_menu: Popup<TabMenu>,
+    /// The Customize Theme popup (operator directive 2026-08-26: a popup,
+    /// not a second window — the first cut opened one, and second windows
+    /// also eat synthetic clicks, so this brings the panel back inside
+    /// the harness's reach). Same overlay machinery as the menus, mounted
+    /// through `overlay::panel_layer`; the data is only the anchor.
+    theme_popup: Popup<Point<Pixels>>,
+    /// The popup's content view, held HERE and not in the popup's data:
+    /// `Popup::finish_close` drops its data when the reap lands, and the
+    /// panel should reopen on the tab it was left on rather than forget
+    /// itself every close. Built lazily on the first open.
+    theme_editor_view: Option<Entity<crate::theme_editor::ThemeEditor>>,
     /// Slice C5 — the last typeahead answer the engine sent.
     typeahead: Entity<TypeaheadState>,
     /// Slice C5 — the session this window has already asked to select on
@@ -7259,6 +7270,16 @@ impl Shell {
                     None => self.close_demo_menu(cx),
                 },
                 _ => {}
+            }
+            return;
+        }
+        // The Customize Theme popup owns the keyboard while it is up, the
+        // way the menus below do — Escape closes it, and nothing falls
+        // through to a composer the panel is standing in front of. (⌘⇧,
+        // still toggles: a matched action fires before this listener.)
+        if self.theme_popup.is_open() {
+            if ks.key.as_str() == "escape" {
+                self.close_theme_popup(cx);
             }
             return;
         }
@@ -12871,9 +12892,7 @@ impl Shell {
             .child(self.footer_button(
                 "footer-theme",
                 icons::PAINT_BRUSH,
-                |_, _, _, cx| {
-                    let _ = crate::theme_editor::open(cx);
-                },
+                |this, _, window, cx| this.toggle_theme_popup(window, cx),
                 cx,
             ))
             .child(div().flex_1())
@@ -15786,6 +15805,68 @@ impl Shell {
         )
     }
 
+    /// Open the Customize Theme popup, or close it if it is up — the ⌘⇧,
+    /// toggle. The brush goes through here too and never needs the close
+    /// half: while the popup is open the full-window catcher occludes the
+    /// footer, so a click aimed at the brush dismisses on the catcher and
+    /// the button is only reachable when the popup is down.
+    fn toggle_theme_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_popup.is_open() {
+            self.close_theme_popup(cx);
+            return;
+        }
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        if self.tab_menu.is_open() {
+            self.close_tab_menu(cx);
+        }
+        // Anchored bottom-left just above the rail footer, where the brush
+        // lives — computed rather than taken from the pointer so ⌘⇧, and
+        // the click land the panel in the same place. The clearance is the
+        // footer's own arithmetic: mb SPACE_2 + py SPACE_1×2 + the
+        // button's p SPACE_1×2 around an ICON_TOGGLE glyph, plus SPACE_1
+        // of air.
+        let footer_h = 4.0 * theme::SPACE_1 + theme::ICON_TOGGLE;
+        let anchor = point(
+            px(theme::SPACE_2),
+            window.viewport_size().height - px(theme::SPACE_2 + footer_h + theme::SPACE_1),
+        );
+        if self.theme_editor_view.is_none() {
+            self.theme_editor_view = Some(cx.new(crate::theme_editor::ThemeEditor::new));
+        }
+        let now = cx.background_executor().now();
+        self.theme_popup.open(anchor, Vec::new(), now);
+        cx.notify();
+    }
+
+    fn close_theme_popup(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.theme_popup.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.theme_popup.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn theme_popup_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let anchor = *self.theme_popup.data()?;
+        let editor = self.theme_editor_view.clone()?;
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        overlay::panel_layer(
+            &self.theme_popup,
+            anchor,
+            gpui::Anchor::BottomLeft,
+            now,
+            reduced,
+            editor.into_any_element(),
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_theme_popup(cx)),
+        )
+    }
+
     fn open_tab_menu(&mut self, tab_id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
         if self.page_menu.is_open() {
             self.close_page_menu(cx);
@@ -18261,6 +18342,7 @@ impl Render for Shell {
         }
         let page_menu_layer = self.page_menu_layer(cx);
         let tab_menu_layer = self.tab_menu_layer(cx);
+        let theme_popup_layer = self.theme_popup_layer(cx);
         let find_bar = self.find_bar(cx);
         // Slice Q2, built here for the same reason: the launcher and its
         // model menu both need `self` and `cx`, and the element chain
@@ -18358,6 +18440,13 @@ impl Render for Shell {
             // launcher where there is no composer at all.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
             .on_action(cx.listener(|this, _: &FocusOmnibox, _, cx| this.open_omnibox(cx)))
+            // ⌘⇧, and the app menu's Customize Theme row, when THIS window
+            // is key. The global fallback in `bootstrap` covers the rest.
+            .on_action(cx.listener(
+                |this, _: &crate::theme_editor::OpenThemeEditor, window, cx| {
+                    this.toggle_theme_popup(window, cx)
+                },
+            ))
             .on_action(cx.listener(|this, _: &FrictionLog, _, cx| this.friction_log(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 let snapshot = this.strip_snapshot(cx);
@@ -18869,7 +18958,10 @@ impl Render for Shell {
             // something else is up is the thing on top — it was opened by
             // the most recent act.
             .children(page_menu_layer)
-            .children(tab_menu_layer);
+            .children(tab_menu_layer)
+            // The Customize Theme popup — same layer discipline as the
+            // menus above, opened from the footer they close over.
+            .children(theme_popup_layer);
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
         // claims this frame during the pass above; the root asks once, here,
@@ -19090,10 +19182,20 @@ pub fn run(data_dir: PathBuf) -> ! {
     // Recorded before anything renders: the friction log resolves against
     // it (Stage L), and it must not differ from the dir the feed loop uses.
     let _ = DATA_DIR.set(data_dir.clone());
-    crate::theme::set_brand_path(data_dir.join("theme-brand.json"));
-    // Slice S1: same shape as the brand — the path is set before anything
-    // renders, the harness never sets it, so tests read defaults.
+    // Slice S1: the path is set before anything renders, the harness
+    // never sets it, so tests read defaults. Settings load FIRST now: the
+    // brand's one-time migration (independent per-appearance colors →
+    // one shared theme) needs to know which appearance the operator was
+    // looking at, and settings.json is where that is written. `System`
+    // resolves Dark here — the window that would answer for the platform
+    // does not exist yet, and an explicit Light choice is the only case
+    // the migration must honor.
     crate::settings::set_settings_path(data_dir.join("settings.json"));
+    let prefer = match crate::settings::snapshot().appearance {
+        crate::settings::AppearanceSetting::Light => crate::theme::Appearance::Light,
+        _ => crate::theme::Appearance::Dark,
+    };
+    crate::theme::set_brand_path(data_dir.join("theme-brand.json"), prefer);
     // Slice CK. **A probe is a spawn, so only a process with a window is
     // allowed to make one.** The test harness never reaches here, which is
     // what keeps `cargo test` from starting six vendor CLIs every time a
@@ -19499,7 +19601,22 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     // `set_menus`, so without this `NSApp.mainMenu` is nil and the
     // auto-hidden system bar has nothing to reveal.
     crate::app_menus::init(cx); // handlers only — the bar goes in last
-    crate::theme_editor::init(cx);
+    // Customize Theme is a popup in a shell window, not a window of its
+    // own — so the global fallback (reached when ⌘⇧, or the menu row
+    // fires while a NON-shell window is key, e.g. Settings) routes to a
+    // shell and opens the popup there. When a shell window is key its own
+    // `on_action` handles the action first and this never runs.
+    cx.on_action(|_: &crate::theme_editor::OpenThemeEditor, cx| {
+        for window in cx.windows() {
+            if let Some(handle) = window.downcast::<Shell>() {
+                let _ = handle.update(cx, |shell, window, cx| {
+                    window.activate_window();
+                    shell.toggle_theme_popup(window, cx);
+                });
+                return;
+            }
+        }
+    });
     // Slice S1: ⌘, is Settings — the chord every macOS app spends there —
     // and the Theme Editor, which held it while it was the only second
     // window, moves to ⌘⇧, beside it. The settings store itself is
@@ -19967,6 +20084,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         dialog_on_secret: false,
                         page_menu: Popup::default(),
                         tab_menu: Popup::default(),
+                        theme_popup: Popup::default(),
+                        theme_editor_view: None,
                         typeahead: typeahead.clone(),
                         asked_for_session_tab: RefCell::new(HashSet::new()),
                         asked_for_project: RefCell::new(HashSet::new()),

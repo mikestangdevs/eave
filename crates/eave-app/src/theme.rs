@@ -12,6 +12,8 @@
 //! was deleted 2026-08-19. The waku lineage of the TYPE and hairlines
 //! stands; the surfaces are all washes now.)
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use gpui::{hsla, px, rgb, BoxShadow, FontWeight, Hsla, Pixels};
 
 // ---------------------------------------------------------------------------
@@ -26,16 +28,13 @@ use gpui::{hsla, px, rgb, BoxShadow, FontWeight, Hsla, Pixels};
 // chroma" are operations rather than guesses, and named every accent after
 // the Tailwind step it is. The values below are copied with their citations.
 //
-// **What is deliberately NOT ported**, because eave is dark-only and the
-// rest would double the surface for nothing: `Appearance::Light` and every
-// paired-light token, `INK_FILL_SCALE`, `INK_HAIRLINE_SCALE`, `band_for`.
-// And one thing that could have been ported and should not be — comet's
-// TEXT ramp (`neutral(0.922)`/`neutral(0.708)`/`neutral(0.556)`). Those are
-// solved against an opaque `grey(6)` panel; eave's are solved against a
-// translucent glass ground swept over 52 desktop brightnesses, and
-// `neutral(0.556)` is *darker* than eave's quiet tier, which already sits at
-// 3.42:1 against a 3.0 floor. Porting them would fail eave's own suite on
-// the first run. Method ported, values kept.
+// Light appearance is now a first-class switch (Customize Theme, 2026-08-26).
+// Dark values are the verified ones and must not move; light counterparts
+// reassign roles the way bezel does (content plane the brightest, ink
+// black) rather than mirroring the dark ladder. comet's TEXT ramp is still
+// not used — those numbers are solved against an opaque `grey(6)` panel;
+// eave's are solved against a translucent glass ground. Method ported,
+// dark values kept.
 
 /// An exact achromatic tone from an 8-bit channel value: `grey(0x0d)` is
 /// `#0d0d0d`. For surfaces and inks matched against a sampled reference.
@@ -82,7 +81,11 @@ fn neutral(lightness: f32) -> Hsla {
 /// blue at full strength and ≤ 0.5/255 through the densest wash. **No
 /// surface or ink assertion moved.** The tint was never buying contrast.
 fn ink(alpha: f32) -> Hsla {
-    hsla(0.0, 0.0, 0.90, alpha)
+    if is_light() {
+        hsla(0.0, 0.0, 0.12, alpha)
+    } else {
+        hsla(0.0, 0.0, 0.90, alpha)
+    }
 }
 
 /// An oklch colour (CSS Color 4 notation: L 0..1, C, H in degrees) as `Hsla`.
@@ -207,17 +210,59 @@ fn fit_chroma(l: f32, chroma: f32, hue: f32) -> f32 {
     lo
 }
 
+/// Where the light appearance's near-white bend begins, how far it may
+/// go, and how much of the asked chroma it must recover (operator,
+/// 2026-08-26: "the color needs to get richer at the top — it still
+/// stays rather light").
+///
+/// The gamut fact behind it: above L ≈ 0.9, sRGB holds almost no chroma
+/// at any hue, so a brand tint applied to bezel's near-white frost
+/// (`grey(0xfa)`, L ≈ 0.98) fits to a whisper and the window's ground
+/// reads as untinted white. A near-white tone therefore slides DOWN, at
+/// most [`TINT_BEND_MAX`], to the highest lightness that carries
+/// [`TINT_BEND_KEEP`] of the asked chroma — trading a few steps of
+/// lightness for actual color. Light appearance only: the dark ladder is
+/// the verified one and its near-black end was walked and approved as
+/// is. The walk stops at the FIRST lightness that fits, so the bend is
+/// monotone in the original lightness — the surface ladder compresses
+/// near white but can never invert.
+const TINT_BEND_FLOOR: f32 = 0.90;
+const TINT_BEND_MAX: f32 = 0.07;
+const TINT_BEND_KEEP: f32 = 0.8;
+
 /// Re-emit an achromatic tone at `hue`, carrying as much `chroma` as its
 /// lightness can hold. Alpha rides through. Ported from bezel's `color::tint`
-/// (`apps/gallery` Create page / `crates/theme/src/brand.rs`).
+/// (`apps/gallery` Create page / `crates/theme/src/brand.rs`) — plus the
+/// light appearance's near-white bend, documented at [`TINT_BEND_FLOOR`].
 fn tint(color: Hsla, hue: f32, chroma: f32) -> Hsla {
     if chroma <= 0.0 {
         return color;
     }
-    let l = lightness(color);
+    let mut l = lightness(color);
+    if is_light() {
+        l = bend_lightness(l, chroma, hue);
+    }
     let mut out = oklch(l, fit_chroma(l, chroma, hue), hue);
     out.a = color.a;
     out
+}
+
+/// The near-white bend itself, pure so it can be tested without touching
+/// the process-global appearance (a test that flipped it would race
+/// every exact-pin token test on a sibling thread — the standing trap).
+fn bend_lightness(l: f32, chroma: f32, hue: f32) -> f32 {
+    if l <= TINT_BEND_FLOOR || fit_chroma(l, chroma, hue) >= chroma * TINT_BEND_KEEP {
+        return l;
+    }
+    let floor = l - TINT_BEND_MAX;
+    let mut probe = l;
+    while probe - 0.01 > floor {
+        probe -= 0.01;
+        if fit_chroma(probe, chroma, hue) >= chroma * TINT_BEND_KEEP {
+            return probe;
+        }
+    }
+    floor
 }
 
 /// The color a `(hue, chroma)` pair produces at a fixed preview
@@ -302,6 +347,24 @@ pub const BRAND_RADIUS_DEFAULT: f32 = 8.0;
 /// Window frost — alpha of the wash over the blurred desktop. `1.0` is
 /// opaque (glass off). Comet-parity `#0A0A0A` @ 0.80.
 pub const CANVAS_GLASS_ALPHA: f32 = 0.80;
+/// Light frost. White @ 0.80 over a dark desktop composites to mid-grey
+/// and the window never reads as light; 0.92 is the point the well stays
+/// a light card on a black wallpaper. Same knob, different default.
+pub const CANVAS_GLASS_ALPHA_LIGHT: f32 = 0.92;
+
+/// Dark or light. Tokens branch on this; the setting that *chooses* it
+/// lives in [`crate::settings::AppearanceSetting`] (System/Light/Dark).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Appearance {
+    Dark,
+    Light,
+}
+
+impl Appearance {
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
+    }
+}
 
 /// What the operator changes about the shipped palette without redesigning
 /// it. Stored process-wide so the free-function tokens can read it without
@@ -318,32 +381,119 @@ pub struct Brand {
     pub glass: f32,
 }
 
-impl Default for Brand {
-    fn default() -> Self {
-        Self {
-            tint: Tint::NONE,
-            accent: Tint::NONE,
-            radius: BRAND_RADIUS_DEFAULT,
-            glass: CANVAS_GLASS_ALPHA,
+impl Brand {
+    /// Identity dark brand — every existing token test stays true until
+    /// someone opens the editor.
+    pub const DARK: Self = Self {
+        tint: Tint::NONE,
+        accent: Tint::NONE,
+        radius: BRAND_RADIUS_DEFAULT,
+        glass: CANVAS_GLASS_ALPHA,
+    };
+    /// Identity light brand. Frost starts higher so a light window over a
+    /// dark desktop still reads as light (see [`CANVAS_GLASS_ALPHA_LIGHT`]).
+    pub const LIGHT: Self = Self {
+        tint: Tint::NONE,
+        accent: Tint::NONE,
+        radius: BRAND_RADIUS_DEFAULT,
+        glass: CANVAS_GLASS_ALPHA_LIGHT,
+    };
+
+    pub const fn for_appearance(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Dark => Self::DARK,
+            Appearance::Light => Self::LIGHT,
         }
     }
 }
 
-static BRAND: std::sync::Mutex<Brand> = std::sync::Mutex::new(Brand {
-    tint: Tint::NONE,
-    accent: Tint::NONE,
-    radius: BRAND_RADIUS_DEFAULT,
-    glass: CANVAS_GLASS_ALPHA,
-});
-static BRAND_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
-fn brand_lock() -> std::sync::MutexGuard<'static, Brand> {
-    BRAND.lock().unwrap_or_else(|e| e.into_inner())
+impl Default for Brand {
+    fn default() -> Self {
+        Self::DARK
+    }
 }
 
-/// The installed brand. Identity until the theme editor writes one.
+struct BrandSet {
+    dark: Brand,
+    light: Brand,
+}
+
+static BRANDS: std::sync::Mutex<BrandSet> = std::sync::Mutex::new(BrandSet {
+    dark: Brand::DARK,
+    light: Brand::LIGHT,
+});
+static BRAND_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static APPEARANCE: AtomicU8 = AtomicU8::new(0);
+
+fn brands_lock() -> std::sync::MutexGuard<'static, BrandSet> {
+    BRANDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The resolved appearance the tokens are painting. Default Dark — tests
+/// and a first launch with no settings file stay on the verified palette.
+pub fn appearance() -> Appearance {
+    match APPEARANCE.load(Ordering::Relaxed) {
+        1 => Appearance::Light,
+        _ => Appearance::Dark,
+    }
+}
+
+pub fn is_light() -> bool {
+    appearance().is_light()
+}
+
+/// Point the tokens at an appearance and rebuild every window. No-op when
+/// the value is already installed, so a Settings write that did not move
+/// appearance does not thrash the bezel global.
+pub fn set_appearance(next: Appearance, cx: &mut gpui::App) {
+    let encoded = match next {
+        Appearance::Dark => 0,
+        Appearance::Light => 1,
+    };
+    if APPEARANCE.swap(encoded, Ordering::Relaxed) == encoded {
+        return;
+    }
+    crate::bezel_theme::reinstall(cx);
+    cx.refresh_windows();
+}
+
+/// The installed brand for the *active* appearance.
+///
+/// **The THEME is shared; the FROST is the appearance's** (operator,
+/// 2026-08-26: "when I switch light and dark mode the color should stay
+/// the same, not reset"). Tint, accent and radius are one choice that
+/// survives the Light/Dark switch — [`set_brand`] writes them to both
+/// slots. `glass` alone stays per-appearance, because its identity
+/// values legitimately differ ([`CANVAS_GLASS_ALPHA`] vs
+/// [`CANVAS_GLASS_ALPHA_LIGHT`]) and a shared frost would break
+/// whichever mode it wasn't tuned in.
 pub fn brand() -> Brand {
-    *brand_lock()
+    brand_for(appearance())
+}
+
+/// The brand stored for an appearance, whether or not it is showing.
+pub fn brand_for(which: Appearance) -> Brand {
+    let g = brands_lock();
+    match which {
+        Appearance::Dark => g.dark,
+        Appearance::Light => g.light,
+    }
+}
+
+/// The write half of the shared-theme rule: color and radius land on BOTH
+/// appearances, frost only on the active one. Pure, so the sharing is
+/// testable without the process-global store.
+fn apply_shared(set: &mut BrandSet, next: Brand, active: Appearance) {
+    let both = [&mut set.dark, &mut set.light];
+    for slot in both {
+        slot.tint = next.tint;
+        slot.accent = next.accent;
+        slot.radius = next.radius;
+    }
+    match active {
+        Appearance::Dark => set.dark.glass = next.glass,
+        Appearance::Light => set.light.glass = next.glass,
+    }
 }
 
 /// Scale a shipped radius by the brand. At the default brand this is `base`.
@@ -354,58 +504,95 @@ pub fn scaled_radius(base: f32) -> f32 {
 /// Where a brand is remembered across launches. Called from `ui::run`
 /// before the window opens; the harness never sets it, so tests keep the
 /// identity brand.
-pub fn set_brand_path(path: std::path::PathBuf) {
+///
+/// The on-disk shape is the dark brand at the top level (so a file written
+/// before Light existed still loads) plus an optional `"light"` object.
+/// Missing light keys take [`Brand::LIGHT`].
+///
+/// `prefer` is the one-time migration answer for files written while the
+/// appearances kept independent colors (a few hours on 2026-08-26): when
+/// the blocks disagree, the color the operator was LOOKING at — the block
+/// of the appearance settings.json names — is the one that survives onto
+/// both. Each block's frost is its own and is not migrated.
+pub fn set_brand_path(path: std::path::PathBuf, prefer: Appearance) {
     let _ = BRAND_PATH.set(path);
     if let Some(path) = BRAND_PATH.get() {
         if let Ok(bytes) = std::fs::read_to_string(path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&bytes) {
-                let mut next = Brand::default();
-                if let Some(n) = v.get("tint_hue").and_then(|x| x.as_f64()) {
-                    next.tint.hue = n as f32;
-                }
-                if let Some(n) = v.get("tint_chroma").and_then(|x| x.as_f64()) {
-                    next.tint.chroma = n as f32;
-                }
-                if let Some(n) = v.get("accent_hue").and_then(|x| x.as_f64()) {
-                    next.accent.hue = n as f32;
-                }
-                if let Some(n) = v.get("accent_chroma").and_then(|x| x.as_f64()) {
-                    next.accent.chroma = n as f32;
-                }
-                if let Some(n) = v.get("radius").and_then(|x| x.as_f64()) {
-                    next.radius = n as f32;
-                }
-                if let Some(n) = v.get("glass").and_then(|x| x.as_f64()) {
-                    next.glass = n as f32;
-                }
-                *brand_lock() = next;
+                let dark = brand_from_json(&v, Brand::DARK);
+                let light = match v.get("light") {
+                    Some(lv) => brand_from_json(lv, Brand::LIGHT),
+                    None => Brand::LIGHT,
+                };
+                let mut set = BrandSet { dark, light };
+                let src = match prefer {
+                    Appearance::Dark => set.dark,
+                    Appearance::Light => set.light,
+                };
+                apply_shared(&mut set, src, prefer);
+                *brands_lock() = set;
             }
         }
     }
 }
 
-fn persist_brand(next: Brand) {
+fn brand_from_json(v: &serde_json::Value, mut next: Brand) -> Brand {
+    if let Some(n) = v.get("tint_hue").and_then(|x| x.as_f64()) {
+        next.tint.hue = n as f32;
+    }
+    if let Some(n) = v.get("tint_chroma").and_then(|x| x.as_f64()) {
+        next.tint.chroma = n as f32;
+    }
+    if let Some(n) = v.get("accent_hue").and_then(|x| x.as_f64()) {
+        next.accent.hue = n as f32;
+    }
+    if let Some(n) = v.get("accent_chroma").and_then(|x| x.as_f64()) {
+        next.accent.chroma = n as f32;
+    }
+    if let Some(n) = v.get("radius").and_then(|x| x.as_f64()) {
+        next.radius = n as f32;
+    }
+    if let Some(n) = v.get("glass").and_then(|x| x.as_f64()) {
+        next.glass = n as f32;
+    }
+    next
+}
+
+fn brand_to_json(b: Brand) -> serde_json::Value {
+    serde_json::json!({
+        "tint_hue": b.tint.hue,
+        "tint_chroma": b.tint.chroma,
+        "accent_hue": b.accent.hue,
+        "accent_chroma": b.accent.chroma,
+        "radius": b.radius,
+        "glass": b.glass,
+    })
+}
+
+fn persist_brands() {
     let Some(path) = BRAND_PATH.get() else {
         return;
     };
-    let body = serde_json::json!({
-        "tint_hue": next.tint.hue,
-        "tint_chroma": next.tint.chroma,
-        "accent_hue": next.accent.hue,
-        "accent_chroma": next.accent.chroma,
-        "radius": next.radius,
-        "glass": next.glass,
-    });
+    let g = brands_lock();
+    let mut body = brand_to_json(g.dark);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("light".into(), brand_to_json(g.light));
+    }
     if let Ok(text) = serde_json::to_string_pretty(&body) {
         let _ = std::fs::write(path, text);
     }
 }
 
 /// Install a brand, rebuild bezel's global from the new tokens, and
-/// refresh every window. This is the only writer.
+/// refresh every window. This is the only writer. Color and radius land
+/// on both appearances ([`apply_shared`] — the theme survives the
+/// Light/Dark switch); frost lands on the active one.
 pub fn set_brand(next: Brand, cx: &mut gpui::App) {
-    *brand_lock() = next;
-    persist_brand(next);
+    {
+        let mut g = brands_lock();
+        apply_shared(&mut g, next, appearance());
+    }
+    persist_brands();
     crate::bezel_theme::reinstall(cx);
     cx.refresh_windows();
 }
@@ -453,15 +640,24 @@ pub fn set_brand(next: Brand, cx: &mut gpui::App) {
 /// Glass ground: α 0.80 (0xCC), source `#0A0A0A` — near-black so the
 /// blurred desktop's hue carries the surface (comet parity; see above).
 fn glass_canvas() -> Hsla {
-    // `grey(10)` is `oklch(0.145 0 0)` — Tailwind neutral-950, and comet's
-    // own app background, which is where the 2026-08-17 "comet parity"
-    // ruling actually came from. Written achromatically now rather than as
-    // an rgba literal that happened to be neutral.
-    grey(0x0a).opacity(brand().glass.clamp(0.0, 1.0))
+    // Dark: `grey(10)` is `oklch(0.145 0 0)` — Tailwind neutral-950, and
+    // comet's own app background (the 2026-08-17 "comet parity" ruling).
+    // Light: `grey(0xfa)`, bezel's light frost tint — near-white so the
+    // desktop's hue still carries, without washing the window gray.
+    let tint = if is_light() { grey(0xfa) } else { grey(0x0a) };
+    tint.opacity(brand().glass.clamp(0.0, 1.0))
 }
-/// The content well's darkening wash, behind [`content_plate`].
+/// The content well's wash, behind [`content_plate`].
+///
+/// Dark: a black wash that sinks the well (the hero is the darkest plane).
+/// Light: a white wash that lifts it (the hero is the brightest plane —
+/// bezel's role reassignment, not a mirror of the dark ladder).
 fn wash_content() -> Hsla {
-    hsla(0.0, 0.0, 0.0, 0.25)
+    if is_light() {
+        hsla(0.0, 0.0, 1.0, 0.55)
+    } else {
+        hsla(0.0, 0.0, 0.0, 0.25)
+    }
 }
 /// The raised rung's wash. The β values were solved for the old `#212121`
 /// ground's steps; over the darker comet-parity ground they give slightly
@@ -530,25 +726,25 @@ fn glass_tint(hex: u32) -> Hsla {
 /// pill, while α 0.72 keeps the occlusion that makes text legible over
 /// scrolled log content.
 pub fn chrome_glass() -> Hsla {
-    glass_tint(0x141414)
+    glass_tint(if is_light() { 0xf7f7f7 } else { 0x141414 })
 }
 /// The ↓-bottom pill under the pointer: the same glass, one step
 /// lighter. Alpha is unchanged — the pill's whole job is to occlude the
 /// log scrolling behind it, and a hover that thinned it would undo that
 /// (Slice M).
 pub fn chrome_glass_hover() -> Hsla {
-    glass_tint(0x232323)
+    glass_tint(if is_light() { 0xececec } else { 0x232323 })
 }
 /// Attention/connection plates as glass — same hexes as the opaque
 /// plates, same single chrome alpha.
 pub fn warning_plate_glass() -> Hsla {
-    glass_tint(0x312f2b)
+    glass_tint(if is_light() { 0xfaf6ee } else { 0x312f2b })
 }
 pub fn warning_plate_strong_glass() -> Hsla {
-    glass_tint(0x3e3930)
+    glass_tint(if is_light() { 0xf5edd8 } else { 0x3e3930 })
 }
 pub fn danger_plate_glass() -> Hsla {
-    glass_tint(0x332c2c)
+    glass_tint(if is_light() { 0xfaeeee } else { 0x332c2c })
 }
 /// Retired from the rail. The window surface *is* the sidebar: rail
 /// content paints directly on the glass, with no contrasting fill and no
@@ -580,7 +776,7 @@ pub fn footer_plate() -> Hsla {
     if t.chroma <= f32::EPSILON {
         return overlay();
     }
-    let l = 0.30;
+    let l = if is_light() { 0.82 } else { 0.30 };
     let boosted = (t.chroma * 3.0).clamp(0.04, 0.12);
     let mut out = oklch(l, fit_chroma(l, boosted, t.hue), t.hue);
     out.a = 0.85;
@@ -678,7 +874,11 @@ pub fn overlay_strongest() -> Hsla {
 /// other. This is the composite of [`overlay_strongest`] over black,
 /// baked opaque, so the middle card reads as a filled tile.
 pub fn bookmark_empty_front() -> Hsla {
-    grey(0x2e)
+    if is_light() {
+        grey(0xe4)
+    } else {
+        grey(0x2e)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +998,11 @@ pub fn card_border() -> Hsla {
 // it enumerates real `.bg(…)`/`.text_color(…)` sites, not tokens.
 
 pub fn text() -> Hsla {
-    grey(0xe2)
+    if is_light() {
+        grey(0x2a)
+    } else {
+        grey(0xe2)
+    }
 }
 /// The secondary tier on a BARE surface — the glass ground, the content
 /// well, a plate. Was `#a8a8a8`, which cleared [`TEXT_CONTRAST_FLOOR`] by
@@ -807,7 +1011,11 @@ pub fn text() -> Hsla {
 /// It is also the tier the QUIET ink resolves to wherever a state wash can
 /// land — see [`text_tertiary`].
 pub fn text_secondary() -> Hsla {
-    grey(0xac)
+    if is_light() {
+        grey(0x5c)
+    } else {
+        grey(0xac)
+    }
 }
 /// Placeholders, disabled, structural hints — the quietest tier that is
 /// still allowed to carry a fact.
@@ -831,7 +1039,11 @@ pub fn text_secondary() -> Hsla {
 /// [`text_secondary`] and the secondary ink to [`text_secondary_on_wash`].
 /// The ladder shifts up one rung; it does not gain a rung at the bottom.
 pub fn text_tertiary() -> Hsla {
-    grey(0x8e)
+    if is_light() {
+        grey(0x78)
+    } else {
+        grey(0x8e)
+    }
 }
 
 /// The secondary tier where a STATE WASH can land on it — the rail's session
@@ -856,7 +1068,11 @@ pub fn text_tertiary() -> Hsla {
 /// the row you are managing, so primary is the right ink anyway (the same
 /// call Slice AD made for the markdown table header).
 pub fn text_secondary_on_wash() -> Hsla {
-    grey(0xce)
+    if is_light() {
+        grey(0x3d)
+    } else {
+        grey(0xce)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +1093,11 @@ pub fn text_secondary_on_wash() -> Hsla {
 /// `neutral(0.922)`, the same tone with the cast taken out, and this is now
 /// that. The de-tint is 4/255 on the blue channel and nothing else.
 pub fn solid() -> Hsla {
-    neutral(0.922)
+    if is_light() {
+        neutral(0.205)
+    } else {
+        neutral(0.922)
+    }
 }
 /// The label on any bright fill — [`solid`], [`accent`], or a state pigment
 /// used as a chip.
@@ -891,7 +1111,11 @@ pub fn solid() -> Hsla {
 /// with the same value — two names for one colour is the criterion that
 /// retired `text_ghost`.
 pub fn on_solid() -> Hsla {
-    grey(0x0e)
+    if is_light() {
+        grey(0xf4)
+    } else {
+        grey(0x0e)
+    }
 }
 /// **The plate a vendor mark sits on** (Slice AO).
 ///
@@ -931,7 +1155,11 @@ pub fn chip_plate() -> Hsla {
 /// it is a place, not a moment). Two branches were each right about a call
 /// graph neither of them could see.
 pub fn inverse_hover() -> Hsla {
-    rgb(0xf4f6f9).into()
+    if is_light() {
+        rgb(0x2a2a2c).into()
+    } else {
+        rgb(0xf4f6f9).into()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -994,10 +1222,17 @@ pub fn inverse_hover() -> Hsla {
 /// it as long as its ink is named — not the token's value.
 pub fn accent() -> Hsla {
     let b = brand();
-    if b.accent.chroma > 0.0 {
-        oklch(0.702, b.accent.chroma, b.accent.hue)
+    // Dark: violet-400. Light: the 600 step at the same hue so it clears
+    // AA on white instead of glowing. A brand chroma rides the same L.
+    let (l, c_default) = if is_light() {
+        (0.541, 0.281)
     } else {
-        oklch(0.702, 0.183, 293.541)
+        (0.702, 0.183)
+    };
+    if b.accent.chroma > 0.0 {
+        oklch(l, fit_chroma(l, b.accent.chroma, b.accent.hue), b.accent.hue)
+    } else {
+        oklch(l, c_default, 293.541)
     }
 }
 
@@ -1021,10 +1256,17 @@ pub fn pane_focus_ring() -> Hsla {
 /// accent's.
 pub fn accent_hover() -> Hsla {
     let b = brand();
-    if b.accent.chroma > 0.0 {
-        oklch(0.811, b.accent.chroma, b.accent.hue)
+    // Dark brightens (violet-300). Light darkens — the only direction a
+    // filled plate on white can move without washing out.
+    let (l, c_default) = if is_light() {
+        (0.49, 0.25)
     } else {
-        oklch(0.811, 0.111, 293.571)
+        (0.811, 0.111)
+    };
+    if b.accent.chroma > 0.0 {
+        oklch(l, fit_chroma(l, b.accent.chroma, b.accent.hue), b.accent.hue)
+    } else {
+        oklch(l, c_default, 293.571)
     }
 }
 
@@ -1058,18 +1300,31 @@ pub fn on_accent() -> Hsla {
 /// **indigo-400** — and see [`accent`] for why this value is the interesting
 /// one in the file.
 pub fn live() -> Hsla {
-    oklch(0.673, 0.182, 276.935)
+    if is_light() {
+        oklch(0.511, 0.262, 276.935) // indigo-600, same hue as the 400
+    } else {
+        oklch(0.673, 0.182, 276.935)
+    }
 }
-/// **emerald-400.** Was `#62c987`.
+/// **emerald-400** (dark) / **emerald-600** (light). Was `#62c987`.
 pub fn success() -> Hsla {
-    oklch(0.765, 0.177, 163.223)
+    if is_light() {
+        oklch(0.596, 0.145, 163.225)
+    } else {
+        oklch(0.765, 0.177, 163.223)
+    }
 }
-/// **amber-400.** Was `#e0b36a`, a tan that read as a dimmed neutral beside
-/// the greys it sat in.
+/// **amber-400** (dark) / **amber-700** (light). Was `#e0b36a`, a tan that
+/// read as a dimmed neutral beside the greys it sat in. Light takes the
+/// 700 step because 400 on white cannot carry 12px text (bezel's finding).
 pub fn warning() -> Hsla {
-    oklch(0.828, 0.189, 84.429)
+    if is_light() {
+        oklch(0.555, 0.163, 48.998)
+    } else {
+        oklch(0.828, 0.189, 84.429)
+    }
 }
-/// **red-400.** Was `#e2726a`.
+/// **red-400** (dark) / **red-600** (light). Was `#e2726a`.
 ///
 /// This is the token the whole slice turns on, so the numbers are worth
 /// stating: as a *mark* on the rail's bare strip it goes 3.65:1 → **3.88:1**
@@ -1077,7 +1332,11 @@ pub fn warning() -> Hsla {
 /// louder AND more legible, in the same move that was previously thought to
 /// require desaturating it to `#f3c3bf`.
 pub fn danger() -> Hsla {
-    oklch(0.704, 0.191, 22.216)
+    if is_light() {
+        oklch(0.577, 0.245, 27.325)
+    } else {
+        oklch(0.704, 0.191, 22.216)
+    }
 }
 
 /// The selected row's leading-edge bar. Brighter than [`accent`] because
@@ -1143,7 +1402,11 @@ pub fn solid_hover() -> Hsla {
 /// re-solved for the hovered fill, and a keycap that changed contrast under
 /// the pointer is a hierarchy that moves when you look at it.
 pub fn on_solid_quiet() -> Hsla {
-    rgb(0x6a6d75).into()
+    if is_light() {
+        rgb(0xa8abb3).into()
+    } else {
+        rgb(0x6a6d75).into()
+    }
 }
 
 /// The danger pigment as an INK — a word rendered IN it, as opposed to a fill
@@ -1168,7 +1431,11 @@ pub fn on_solid_quiet() -> Hsla {
 /// not as contrast, and desaturating it would flatten the one hue the app
 /// uses to mean "this is destructive".
 pub fn danger_ink() -> Hsla {
-    rgb(0xf2a49e).into()
+    if is_light() {
+        rgb(0xb42318).into()
+    } else {
+        rgb(0xf2a49e).into()
+    }
 }
 // --- end Slice AQ ----------------------------------------------------------
 
@@ -1579,7 +1846,11 @@ pub const BAR_GAP: f32 = 8.0;
 /// the backdrop rather than a state channel. Slice CM2 moves that signal to the
 /// send button, which is where a "you have something to send" fact belongs.
 pub fn bar_hairline() -> Hsla {
-    hsla(0.0, 0.0, 1.0, 0.10)
+    if is_light() {
+        hsla(0.0, 0.0, 0.0, 0.14)
+    } else {
+        hsla(0.0, 0.0, 1.0, 0.10)
+    }
 }
 
 /// The bar's fill: bezel's `Theme::glass_overlay()` on a dark appearance,
@@ -1592,13 +1863,18 @@ pub fn bar_hairline() -> Hsla {
 /// carry the card. This is why the fill and [`BLUR_MENU`] are a pair and
 /// neither is tuneable alone.
 pub fn bar_glass() -> Hsla {
-    // `neutral`, not `oklch`, and not a hand-converted `hsla`. This file
-    // already carries the CSS Color 4 conversion bezel uses (same Ottosson
-    // matrices), so the tint is the reference value rather than my arithmetic
-    // about it — and `neutral` is the chroma-0 door through it, which skips the
-    // hue math that would otherwise return float-noise saturation for a grey.
-    // `the_bar_glass_is_bezels_glass_overlay` pins the two against each other.
-    neutral(0.33).opacity(0.34)
+    // Dark: bezel's `.glass-surface` menu tint verbatim — `oklch(0.33 0 0
+    // / 34%)`. Light: a near-white translucent plate (bezel's
+    // `surface_overlay` at 0.85), so the composer does not sit as a dark
+    // slab on a light window. `the_bar_glass_is_bezels_glass_overlay`
+    // pins the dark path against bezel.
+    if is_light() {
+        let mut c: Hsla = rgb(0xffffff).into();
+        c.a = 0.85;
+        c
+    } else {
+        neutral(0.33).opacity(0.34)
+    }
 }
 pub const RADIUS_BUTTON: f32 = 7.0;
 
@@ -2520,7 +2796,7 @@ pub const BLUR_MENU: f32 = 44.0;
 /// already going to zero. The tint is the lever. `#282828` puts the worst
 /// case — a white desktop — at **+8.4/255** and the best at +21.5.
 pub fn menu_glass() -> Hsla {
-    let c: Hsla = rgb(0x282828).into();
+    let c: Hsla = rgb(if is_light() { 0xffffff } else { 0x282828 }).into();
     c.opacity(MENU_GLASS_ALPHA)
 }
 
@@ -4926,6 +5202,60 @@ mod tests {
              stale and `menu_glass`'s doc comment should say so",
             worst_fill.0,
             worst_fill.1
+        );
+    }
+
+    /// The light appearance's near-white bend (operator, 2026-08-26: "the
+    /// color needs to get richer at the top"). Pure — `bend_lightness`
+    /// exists so this never touches the process-global appearance.
+    #[test]
+    fn a_tinted_near_white_bends_down_far_enough_to_carry_color() {
+        // The light canvas is grey(0xfa): L ≈ 0.98, where a green tint at
+        // the Background ceiling (0.06) fits to a whisper. The bend must
+        // find a lightness that carries most of the ask, within its bound.
+        let l = lightness(hsla(0.0, 0.0, 0xfa as f32 / 255.0, 1.0));
+        let bent = bend_lightness(l, 0.06, 158.0);
+        assert!(bent < l, "a near-white that cannot carry the tint must bend");
+        assert!(bent >= l - TINT_BEND_MAX - 1e-4, "the bend is bounded");
+        assert!(
+            fit_chroma(bent, 0.06, 158.0) >= 0.06 * TINT_BEND_KEEP,
+            "the bend exists to buy chroma room and it did not"
+        );
+        // Below the floor nothing moves — mid tones already have room,
+        // and dark-mode callers must be untouched by construction too.
+        assert_eq!(bend_lightness(0.3, 0.06, 158.0), 0.3);
+        // Monotone: a higher original lightness never bends below a lower
+        // one, so the surface ladder compresses but cannot invert.
+        let hi = bend_lightness(0.98, 0.06, 158.0);
+        let lo = bend_lightness(0.93, 0.06, 158.0);
+        assert!(hi >= lo - 1e-4, "the bend inverted the ladder: {hi} < {lo}");
+    }
+
+    /// The shared-theme rule (operator, 2026-08-26: switching Light/Dark
+    /// must not reset the color): a write lands tint, accent and radius
+    /// on BOTH appearances, and frost only on the active one.
+    #[test]
+    fn the_theme_is_shared_across_appearances_and_the_frost_is_not() {
+        let mut set = BrandSet {
+            dark: Brand::DARK,
+            light: Brand::LIGHT,
+        };
+        let picked = Brand {
+            tint: Tint::new(158.0, 0.05),
+            accent: Tint::new(25.0, 0.19),
+            radius: 12.0,
+            glass: 0.7,
+        };
+        apply_shared(&mut set, picked, Appearance::Light);
+        assert_eq!(set.light.tint, picked.tint);
+        assert_eq!(set.dark.tint, picked.tint, "the color must survive the switch");
+        assert_eq!(set.dark.accent, picked.accent);
+        assert_eq!(set.dark.radius, picked.radius);
+        assert_eq!(set.light.glass, 0.7);
+        assert_eq!(
+            set.dark.glass,
+            Brand::DARK.glass,
+            "frost is the appearance's own and must not migrate"
         );
     }
 }

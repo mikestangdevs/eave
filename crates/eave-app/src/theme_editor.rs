@@ -7,21 +7,35 @@
 //! entities; the contrast guard survives as a compact strip because it is
 //! a guard, not a gallery.
 //!
+//! **A popup, not a window** (operator directive 2026-08-26 — the first
+//! cut opened a second window). The [`ThemeEditor`] view is the popup's
+//! CONTENT; the shell owns the [`crate::overlay::Popup`] that mounts it
+//! over the rail footer through `overlay::panel_layer`, which is also why
+//! there is no titlebar and no ⌘W handler here — the catcher and Escape
+//! close it the way they close every menu. A welcome side effect: the
+//! main window takes synthetic clicks, so the panel is back inside the
+//! harness's reach (second windows eat them — the standing trap).
+//!
 //! Every control writes [`crate::theme::set_brand`], which persists and
 //! repaints every window — so there is no Save button: a Save that did
-//! anything beyond what already happened would be a lie, and the
-//! reference's Light/Dark toggle and Highlight tab are absent for the
-//! standing reason (eave has no light theme and no third tint).
+//! anything beyond what already happened would be a lie. The Light/Dark
+//! toggle pins [`crate::settings::AppearanceSetting`]; the THEME is
+//! shared across the switch and only the frost is per-appearance
+//! (operator, 2026-08-26 — see [`crate::theme::brand`]), which is why
+//! there is no Copy-from-Dark row: with one shared color there is
+//! nothing to copy. The reference's Highlight tab is still absent:
+//! the brand holds two tints, not three.
 
 use gpui::{
-    div, point, prelude::*, px, size, App, Bounds, Context, Div, DragMoveEvent, Empty, Hsla,
-    MouseButton, Render, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowOptions,
+    div, prelude::*, px, App, Context, Div, DragMoveEvent, Empty, Hsla, MouseButton, Render,
+    SharedString, Window,
 };
 
 use bezel::theme::Theme;
 use bezel::ui::widgets::{self, ButtonStyle, Buttons as _, Controls as _};
 
+use crate::icons;
+use crate::settings::{self, AppearanceSetting};
 use crate::theme::{self, Brand, Tint, BASE_COLORS};
 
 /// One knob's drag. gpui delivers a move to every listener of the
@@ -32,51 +46,6 @@ use crate::theme::{self, Brand, Tint, BASE_COLORS};
 struct BrandKnobDrag(&'static str);
 
 gpui::actions!(eave_theme, [OpenThemeEditor]);
-
-struct EditorWindows(Option<WindowHandle<ThemeEditor>>);
-impl gpui::Global for EditorWindows {}
-
-pub fn init(cx: &mut App) {
-    cx.on_action(|_: &OpenThemeEditor, cx| {
-        let _ = open(cx);
-    });
-}
-
-/// Open the editor, or raise it if it is already up. Returns the handle
-/// so the harness can drive the window, the same door
-/// `settings_window::open` gives it.
-pub fn open(cx: &mut App) -> Option<WindowHandle<ThemeEditor>> {
-    if let Some(handle) = cx.try_global::<EditorWindows>().and_then(|g| g.0) {
-        if handle
-            .update(cx, |_, window, _| {
-                window.activate_window();
-            })
-            .is_ok()
-        {
-            return Some(handle);
-        }
-    }
-    let bounds = Bounds::centered(None, size(px(384.0), px(680.0)), cx);
-    let opened = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(384.0), px(520.0))),
-            window_background: WindowBackgroundAppearance::Blurred,
-            titlebar: Some(TitlebarOptions {
-                title: Some("Customize Theme".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
-            }),
-            ..Default::default()
-        },
-        |_, cx| cx.new(ThemeEditor::new),
-    );
-    let handle = opened.ok();
-    if let Some(handle) = handle {
-        cx.set_global(EditorWindows(Some(handle)));
-    }
-    handle
-}
 
 /// Which of the brand's two tints the field is editing. These are the
 /// panel's tabs, and there are exactly two because the brand holds exactly
@@ -104,17 +73,6 @@ impl Target {
         }
     }
 
-    /// The lightness the field previews at. Not the lightness the brand
-    /// applies — surfaces are near-black and every hue is invisible down
-    /// there — but the conversion is the palette's own, so the hue and
-    /// chroma a click picks are exactly what lands.
-    fn preview_l(self) -> f32 {
-        match self {
-            Target::Background => 0.55,
-            Target::Accent => 0.702,
-        }
-    }
-
     fn read(self, b: &Brand) -> Tint {
         match self {
             Target::Background => b.tint,
@@ -136,6 +94,33 @@ const FIELD_W: f32 = 336.0;
 const FIELD_H: f32 = 160.0;
 const FIELD_COLS: usize = 24;
 const FIELD_ROWS: usize = 10;
+
+/// Visual chroma the field paints at — the sample's candy rainbow, not the
+/// quiet wash a click actually installs. Y still maps to
+/// [`Target::max_chroma`]: a click on the top row of Background is 0.06,
+/// even though the cell is painted at 0.22. Without this the Background
+/// grid is 24×10 cells of near-grey, which is a colour picker that cannot
+/// be read as one.
+const FIELD_PREVIEW_CHROMA: f32 = 0.22;
+/// Lightness at the top of the field (saturated) and the bottom (near
+/// black). The sample fades candy → black; a fixed mid-grey L made every
+/// hue look like mud.
+const FIELD_PREVIEW_L_TOP: f32 = 0.74;
+const FIELD_PREVIEW_L_BOT: f32 = 0.16;
+
+/// Paint a field cell. `chroma` is the brand value (0..=max); the sample
+/// conversion still goes through [`theme::field_sample`] so a click and
+/// the palette share one oklch path — only the *display* chroma and L
+/// are scaled up so the grid can be read.
+fn field_paint(chroma: f32, max: f32, hue: f32) -> Hsla {
+    let frac = if max <= f32::EPSILON {
+        0.0
+    } else {
+        (chroma / max).clamp(0.0, 1.0)
+    };
+    let l = FIELD_PREVIEW_L_BOT + frac * (FIELD_PREVIEW_L_TOP - FIELD_PREVIEW_L_BOT);
+    theme::field_sample(l, frac * FIELD_PREVIEW_CHROMA, hue)
+}
 
 struct Knob {
     label: &'static str,
@@ -202,7 +187,7 @@ pub struct ThemeEditor {
 }
 
 impl ThemeEditor {
-    fn new(_: &mut Context<Self>) -> Self {
+    pub(crate) fn new(_: &mut Context<Self>) -> Self {
         Self {
             target: Target::Background,
         }
@@ -222,85 +207,120 @@ impl ThemeEditor {
 }
 
 impl Render for ThemeEditor {
+    /// The popup's content: the panel body and nothing else. Material,
+    /// motion and dismissal belong to `overlay::panel_layer` in the shell
+    /// — this element brings only its own size, which is the one thing a
+    /// panel keeps that a menu delegates to its rows.
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let theme = Theme::of(cx).clone();
         let brand = theme::brand();
         let target = self.target;
         div()
-            .size_full()
+            .id("theme-editor-body")
+            .w(px(FIELD_W + 32.0))
+            .max_h(px(600.0))
+            .overflow_y_scroll()
+            .p(px(16.0))
             .flex()
             .flex_col()
-            .bg(theme.bg)
+            .gap(px(14.0))
             .text_color(theme.text)
             .font_family(theme.font_sans.clone())
-            // ⌘W. The chord is bound to `eave::CloseTab` globally and only
-            // the Shell handles it, so in this window it used to dispatch
-            // into silence (S1 found it building the Settings window,
-            // which shares the shape). Here it means the window.
-            .on_action(cx.listener(|_, _: &crate::ui::CloseTab, window, _| {
-                window.remove_window();
-            }))
             .child(
                 div()
-                    .flex_none()
-                    .h(px(theme::TITLEBAR_H))
-                    .px(px(theme::SPACE_4))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .window_control_area(gpui::WindowControlArea::Drag)
-                    .child(
-                        div()
-                            .ml(px(72.0))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Customize Theme"),
-                    ),
+                    .text_size(px(theme::SMALL_SIZE))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Customize Theme"),
             )
+            .child(self.appearance_toggle(&theme, cx))
+            .child(self.tabs(&theme, cx))
+            .child(self.field(target, &brand, cx))
+            .child(self.swatches(target, &brand, cx))
+            .child(slider(
+                &theme,
+                &brand,
+                match target {
+                    Target::Background => &INTENSITY_BG,
+                    Target::Accent => &INTENSITY_ACCENT,
+                },
+                cx,
+            ))
+            .children(matches!(target, Target::Background).then(|| slider(&theme, &brand, &ALPHA, cx)))
+            .child(slider(&theme, &brand, &RADIUS, cx))
             .child(
                 div()
-                    .id("theme-editor-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(24.0))
-                    .pb(px(24.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.0))
-                    .child(self.tabs(&theme, cx))
-                    .child(self.field(target, &brand, cx))
-                    .child(self.swatches(target, &brand, cx))
-                    .child(slider(
-                        &theme,
-                        &brand,
-                        match target {
-                            Target::Background => &INTENSITY_BG,
-                            Target::Accent => &INTENSITY_ACCENT,
-                        },
-                        cx,
-                    ))
-                    .children(matches!(target, Target::Background)
-                        .then(|| slider(&theme, &brand, &ALPHA, cx)))
-                    .child(slider(&theme, &brand, &RADIUS, cx))
-                    .child(
-                        div()
-                            .id("theme-reset")
-                            .debug_selector(|| "theme-reset".into())
-                            .self_start()
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                theme::set_brand(Brand::default(), cx);
-                                cx.notify();
-                            }))
-                            .child(theme.button("Reset", ButtonStyle::Ghost, Some("reset".into()))),
-                    )
-                    .child(heading(&theme, "Contrast"))
-                    .child(contrast(&theme)),
+                    .id("theme-reset")
+                    .debug_selector(|| "theme-reset".into())
+                    .self_start()
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        theme::set_brand(Brand::for_appearance(theme::appearance()), cx);
+                        cx.notify();
+                    }))
+                    .child(theme.button("Reset", ButtonStyle::Ghost, Some("reset".into()))),
             )
+            .child(heading(&theme, "Contrast"))
+            .child(contrast(&theme))
     }
 }
 
 impl ThemeEditor {
+    /// Light / Dark, as two equal pills. Pins the appearance setting
+    /// (not System) so a click is a choice, and writes through
+    /// [`settings::update`] so Settings and this panel stay one value.
+    fn appearance_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let current = theme::appearance();
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(8.0))
+            .children(
+                [
+                    (theme::Appearance::Light, "Light", icons::SUN),
+                    (theme::Appearance::Dark, "Dark", icons::MOON),
+                ]
+                .into_iter()
+                .map(|(mode, label, glyph)| {
+                    let selected = current == mode;
+                    let ink = if selected { theme.text } else { theme.text_muted };
+                    div()
+                        .id(SharedString::from(label))
+                        .debug_selector(move || format!("customize-appearance-{label}"))
+                        .flex_1()
+                        .h(px(36.0))
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .bg(if selected {
+                            crate::theme::overlay_strong()
+                        } else {
+                            crate::theme::overlay()
+                        })
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.0))
+                        .text_size(px(12.5))
+                        .font_weight(if selected {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .text_color(ink)
+                        .child(icons::icon(glyph, crate::theme::ICON_SM, ink))
+                        .child(label)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            settings::update(cx, |s| {
+                                s.appearance = match mode {
+                                    theme::Appearance::Light => AppearanceSetting::Light,
+                                    theme::Appearance::Dark => AppearanceSetting::Dark,
+                                };
+                            });
+                            cx.notify();
+                        }))
+                }),
+            )
+    }
+
     /// The target tabs — the reference's underline grammar: quiet labels,
     /// a 2 px rule under the active one in the palette's own accent.
     fn tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -336,11 +356,11 @@ impl ThemeEditor {
             }))
     }
 
-    /// The 2-D field: hue runs left→right, chroma runs bottom→top. Every
-    /// cell is painted through the palette's own oklch conversion
-    /// ([`theme::field_sample`]), gamut-fitted, so what a click promises is
-    /// what the brand delivers. A cell click lands exactly on that cell's
-    /// pair; a drag tracks the pointer continuously across the bounds.
+    /// The 2-D field: hue runs left→right, chroma runs bottom→top. Cells
+    /// paint through [`field_paint`] (vivid chroma, candy→black lightness)
+    /// so the grid can be read as a colour picker; a click still writes
+    /// `0..=max_chroma` through the same oklch conversion. A cell click
+    /// lands on that cell's pair; a drag tracks the pointer continuously.
     fn field(
         &self,
         target: Target,
@@ -348,7 +368,6 @@ impl ThemeEditor {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let max = target.max_chroma();
-        let l = target.preview_l();
         let current = target.read(brand);
         // The ring sits at the current pair. Chroma above the tab's own
         // ceiling (never writable from here) clamps to the top edge.
@@ -393,7 +412,7 @@ impl ThemeEditor {
                         let chroma = (1.0 - (row as f32 + 0.5) / FIELD_ROWS as f32) * max;
                         div()
                             .flex_1()
-                            .bg(crate::theme::field_sample(l, chroma, hue))
+                            .bg(field_paint(chroma, max, hue))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |view, _, _, cx| {
@@ -423,7 +442,7 @@ impl ThemeEditor {
     /// absent when the field picked something off-list, which is a fact,
     /// not a bug.
     fn swatches(&self, target: Target, brand: &Brand, cx: &mut Context<Self>) -> Div {
-        let l = target.preview_l();
+        let max = target.max_chroma();
         let current = target.read(brand);
         let items: Vec<(&'static str, Tint)> = match target {
             Target::Background => BASE_COLORS.to_vec(),
@@ -441,9 +460,9 @@ impl ThemeEditor {
                     // The Neutral swatch: chroma 0 has no hue to preview,
                     // and sampling it through the field's lightness would
                     // paint five identical grey dots. One grey dot.
-                    crate::theme::field_sample(0.45, 0.0, 0.0)
+                    crate::theme::field_sample(if crate::theme::is_light() { 0.62 } else { 0.45 }, 0.0, 0.0)
                 } else {
-                    crate::theme::field_sample(l, tint.chroma, tint.hue)
+                    field_paint(tint.chroma, max, tint.hue)
                 };
                 div()
                     .id(SharedString::from(name))
@@ -643,5 +662,23 @@ mod tests {
         assert_eq!(name, "Violet");
         assert!((tint.hue - 293.541).abs() < 1e-3);
         assert!((tint.chroma - 0.183).abs() < 1e-4);
+    }
+
+    /// The Background field must paint louder than it writes. A grid whose
+    /// cells use the 0.06 apply ceiling is a grey rectangle; the sample is
+    /// a rainbow. This pins the display ceiling above the apply one so a
+    /// later "make the field honest" cleanup cannot quietly grey it out.
+    #[test]
+    fn the_background_field_paints_louder_than_it_writes() {
+        assert!(
+            FIELD_PREVIEW_CHROMA > Target::Background.max_chroma(),
+            "preview chroma {} must exceed the Background apply ceiling {}",
+            FIELD_PREVIEW_CHROMA,
+            Target::Background.max_chroma()
+        );
+        assert!(
+            FIELD_PREVIEW_L_TOP > FIELD_PREVIEW_L_BOT,
+            "the field must fade bright→dark, not the other way"
+        );
     }
 }

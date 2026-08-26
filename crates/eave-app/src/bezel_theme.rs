@@ -89,11 +89,9 @@ impl gpui::AssetSource for Assets {
 /// folded and measured without a window.
 ///
 /// Threading an `App` down to it to fetch a constant would trade that property
-/// away for nothing, because eave's theme IS constant: there is one appearance
-/// and no runtime switch. So this hands back the same value the global holds,
-/// built once. `the_global_and_the_context_free_theme_are_the_same` is what
-/// keeps that sentence true — if eave ever grows a second appearance, that
-/// test fails and this function is the thing that has to change.
+/// away for a subscription the display list cannot hold. The cache is rebuilt
+/// on every [`reinstall`] (brand write or appearance switch), so the
+/// context-free value and the global stay the same palette.
 pub fn theme() -> Theme {
     if let Ok(g) = CACHE.read() {
         if let Some(t) = g.as_ref() {
@@ -128,17 +126,15 @@ pub fn reinstall(cx: &mut App) {
 /// bezel named a role eave had not, the token was added to `theme.rs` and
 /// derived there — see its Slice BZ block — rather than being written here.
 ///
-/// # eave is dark-only, and that is a fact about eave
-///
-/// bezel ships a designed light appearance; eave has never had one. The
-/// appearance is pinned to [`Appearance::Dark`] because every token below is
-/// a dark-ground value, and letting the OS flip bezel to Light would repaint
-/// its components against eave's dark surfaces — bezel's own light palette
-/// over eave's dark ground, the worst of both. When eave grows a light
-/// appearance, this is the line that learns about it.
+/// Appearance follows eave's. The tokens below are always eave's, so a
+/// Light switch does not leak bezel's own light palette over eave's
+/// surfaces — it paints eave's light tokens through the same mapping.
 fn from_eave_tokens() -> Theme {
     Theme {
-        appearance: Appearance::Dark,
+        appearance: match eave::appearance() {
+            eave::Appearance::Light => Appearance::Light,
+            eave::Appearance::Dark => Appearance::Dark,
+        },
 
         // ---- surfaces ----
         // eave's ladder is not bezel's, and it inverts on purpose: the
@@ -429,9 +425,9 @@ mod tests {
 
     /// The context-free theme and the installed global must not drift.
     ///
-    /// They are the same constructor today. The day eave grows a light
-    /// appearance they stop being the same value, and this is the test that
-    /// says so before a screen does.
+    /// Both come from [`from_eave_tokens`]; [`reinstall`] writes the cache
+    /// the same moment it writes the global, so a brand or appearance
+    /// switch cannot leave them on two palettes.
     #[test]
     fn the_global_and_the_context_free_theme_are_the_same() {
         let built = super::from_eave_tokens();

@@ -732,6 +732,70 @@ pub fn menu_layer<T>(
     )
 }
 
+/// [`menu_layer`]'s sibling for a floating PANEL — one caller-built
+/// surface instead of menu rows, and an anchor corner the caller chooses
+/// (a panel that opens upward from the rail footer anchors its
+/// bottom-left where a pointer menu anchors its top-left).
+///
+/// Same contract in every other respect, deliberately: root-mounted
+/// `deferred` over the full-window occluding catcher, the same
+/// entrance/exit motion off [`Popup::motion_at`], the same
+/// occludes-through-exit rule, and the pointer menu's own material —
+/// the panel floats over the chrome, which is the ground that material
+/// was measured against. The width constraints are the one thing NOT
+/// shared: a menu's width is its rows'; a panel sizes itself.
+pub fn panel_layer<T>(
+    popup: &Popup<T>,
+    anchor: Point<Pixels>,
+    corner: Anchor,
+    now: Instant,
+    reduced: bool,
+    content: AnyElement,
+    on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Option<AnyElement> {
+    let (opacity, dy) = popup.motion_at(now, reduced)?;
+    if popup.in_flight(now, reduced) {
+        motion::mark_active();
+    }
+    let live = popup.is_open();
+    Some(
+        deferred(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .occlude()
+                .when(live, |d| d.on_mouse_down(MouseButton::Left, on_dismiss))
+                .child(
+                    anchored()
+                        .anchor(corner)
+                        .position(anchor)
+                        .snap_to_window_with_margin(px(theme::MENU_SCREEN_MARGIN))
+                        .child(
+                            div()
+                                .id("overlay-panel")
+                                .debug_selector(|| "overlay-panel".into())
+                                .opacity(opacity)
+                                .relative()
+                                .top(px(dy))
+                                .rounded(px(theme::RADIUS_MENU))
+                                .border_1()
+                                .border_color(theme::edge_modal())
+                                .shadow(theme::shadow_modal())
+                                .bg(theme::menu_glass())
+                                .occlude()
+                                .flex()
+                                .flex_col()
+                                .child(content),
+                        ),
+                ),
+        )
+        .into_any_element(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

@@ -12209,21 +12209,33 @@ fn the_footer_panel_is_a_door_to_library_theme_and_new(cx: &mut TestAppContext) 
         "the library menu's Settings row did not open the settings window"
     );
 
-    // The brush opens the Customize Theme window.
+    // The brush opens Customize Theme as a popup in THIS window — the
+    // second window is exactly what the operator retired (2026-08-26),
+    // and second windows eat synthetic clicks besides.
     vcx.executor().advance_clock(Duration::from_millis(200));
     vcx.run_until_parked();
     let windows_before = cx.update(|cx| cx.windows().len());
     click(vcx, "footer-theme");
     vcx.run_until_parked();
+    assert!(
+        shown(vcx, "customize-field"),
+        "the footer's brush did not open the Customize Theme popup"
+    );
     assert_eq!(
         cx.update(|cx| cx.windows().len()),
-        windows_before + 1,
-        "the footer's brush did not open Customize Theme"
+        windows_before,
+        "Customize Theme must be a popup in the shell, not a second window"
     );
 }
 
-/// The Customize Theme window renders its whole grammar, and the tabs
-/// switch what the field edits.
+/// The Customize Theme popup renders its whole grammar over the shell,
+/// and the tabs switch what the field edits.
+///
+/// A POPUP, not a window (operator directive 2026-08-26): the brush and
+/// ⌘⇧, mount the panel over the rail footer through the menus' own
+/// overlay machinery — so the window count must not move, Escape must
+/// take it down, and the panel view survives a close (it reopens on the
+/// tab it was left on).
 ///
 /// Deliberately MUTATION-FREE: a click on a swatch or the field writes
 /// `theme::set_brand`, and the brand is process-global — a test that
@@ -12235,39 +12247,62 @@ fn the_footer_panel_is_a_door_to_library_theme_and_new(cx: &mut TestAppContext) 
 /// 2026-08-25).
 #[gpui::test]
 fn the_customize_theme_panel_renders_and_switches_tabs(cx: &mut TestAppContext) {
-    let (_h, _vcx) = boot(cx);
-    let handle = cx
-        .update(crate::theme_editor::open)
-        .expect("the Customize Theme window opens");
-    let tvcx = VisualTestContext::from_window(handle.into(), cx).into_mut();
-    tvcx.update(|window, _| window.refresh());
-    tvcx.run_until_parked();
+    let (_h, vcx) = boot(cx);
+    let windows_before = cx.update(|cx| cx.windows().len());
+    click(vcx, "footer-theme");
+    vcx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before,
+        "Customize Theme must mount as a popup, not a second window"
+    );
 
     for sel in [
+        "overlay-panel",
         "customize-tab-Background",
         "customize-tab-Accent",
+        "customize-appearance-Light",
+        "customize-appearance-Dark",
         "customize-field",
         "customize-swatch-Neutral",
         "customize-swatch-Slate",
         "theme-reset",
     ] {
-        assert!(shown(tvcx, sel), "{sel} missing from the Background tab");
+        assert!(shown(vcx, sel), "{sel} missing from the Background tab");
     }
 
-    click(tvcx, "customize-tab-Accent");
-    tvcx.run_until_parked();
+    click(vcx, "customize-tab-Accent");
+    vcx.run_until_parked();
     assert!(
-        shown(tvcx, "customize-swatch-Violet"),
+        shown(vcx, "customize-swatch-Violet"),
         "the Accent tab did not bring the accent swatches"
     );
     assert!(
-        !shown(tvcx, "customize-swatch-Slate"),
+        !shown(vcx, "customize-swatch-Slate"),
         "the Background presets leaked onto the Accent tab"
     );
     assert_eq!(
         theme::brand(),
         crate::theme::Brand::default(),
         "switching tabs must not write the brand"
+    );
+
+    // Escape takes the popup down the way it takes every menu down, and
+    // past the closed layer's occluding exit the brush reopens it — on
+    // the Accent tab, because the panel's view outlives its popup.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(Duration::from_millis(200));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "customize-field"),
+        "escape did not close the Customize Theme popup"
+    );
+    click(vcx, "footer-theme");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "customize-swatch-Violet"),
+        "the reopened popup forgot it was on the Accent tab"
     );
 }
 

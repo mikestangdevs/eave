@@ -172,6 +172,11 @@ Line {
     /// control, because Solar's brush was not among the 55 vendored files
     /// and the registry test holds it to the same parser either way.
     PAINT_BRUSH => "paint-brush.svg",
+    /// Drawn in the family's stroke grammar for the Customize Theme
+    /// Light/Dark toggle — Solar's sun/moon were not among the 55
+    /// vendored files. Held to the same registry parser.
+    SUN => "sun.svg",
+    MOON => "moon.svg",
     PAPERCLIP => "paperclip.svg",
     PEN_NEW_SQUARE => "pen-new-square.svg",
     PEN => "pen.svg",
@@ -478,12 +483,12 @@ mod tests {
         for (path, _, _) in REGISTRY {
             assert!(Icons.load(path).unwrap().is_some(), "{path}");
         }
-        // 55 vendored Solar files plus PAINT_BRUSH, eave's own drawing in
-        // the family's stroke grammar (see its registry comment).
-        assert_eq!(of(Class::Line).count(), 56, "the Line family");
+        // 55 vendored Solar files plus PAINT_BRUSH, SUN, MOON — eave's
+        // own drawings in the family's stroke grammar.
+        assert_eq!(of(Class::Line).count(), 58, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 67);
+        assert_eq!(REGISTRY.len(), 69);
     }
 
     /// Every registered path is a file that exists on disk under exactly

@@ -33,8 +33,10 @@
 //!
 //! # Live-apply
 //! No restart rows. Each field's route to taking effect immediately:
-//! - `appearance` — resolves to the one theme eave has (dark); the field
-//!   persists the operator's intent for the day a light theme exists.
+//! - `appearance` — System follows macOS (Dark in tests); Light and Dark
+//!   pin [`crate::theme::set_appearance`]. The theme (tint/accent/radius)
+//!   is shared across the switch; only the frost is per-appearance
+//!   (see [`crate::theme::brand`]).
 //! - `search` — `omnibox::search_prefix()` re-reads per call already
 //!   (deliberately uncached); it now falls back to this store instead of
 //!   straight to the Google constant.
@@ -51,22 +53,21 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-/// The operator's appearance intent. eave is dark-only today —
-/// `theme.rs` deliberately never ported `Appearance::Light`, and
-/// `bezel_theme.rs:141` pins bezel to `Dark` — so both variants resolve to
-/// the same paint. The variant that is missing is the point: a `Light`
-/// option that painted nothing different would be a row that lies, so it
-/// does not exist until the theme does.
+/// The operator's appearance intent. System follows the OS (Dark inside
+/// `cfg!(test)`, because gpui's test platform reports Light and would
+/// flip every token test). Light and Dark pin
+/// [`crate::theme::set_appearance`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppearanceSetting {
-    /// Follow macOS — which, with one theme, is dark either way. Kept as
-    /// the default so that when a light theme lands, operators who never
-    /// opened Settings get the system behaviour without a migration.
+    /// Follow macOS. Default so operators who never opened Settings get
+    /// the system behaviour without a migration.
     #[default]
     System,
     /// Dark, explicitly.
     Dark,
+    /// Light, explicitly.
+    Light,
 }
 
 /// Where a search leaves the omnibox. The custom variant carries a
@@ -232,6 +233,7 @@ impl gpui::Global for SettingsStore {}
 pub fn init(cx: &mut gpui::App) {
     let settings = snapshot();
     apply_side_effects(&settings);
+    apply_appearance(cx);
     cx.set_global(SettingsStore {
         settings,
         rail_w: crate::ui::load_rail_w(),
@@ -250,6 +252,7 @@ pub fn update(cx: &mut gpui::App, f: impl FnOnce(&mut Settings)) {
     *store() = next.clone();
     persist(&next);
     apply_side_effects(&next);
+    apply_appearance(cx);
     cx.global_mut::<SettingsStore>().settings = next;
     cx.refresh_windows();
 }
@@ -279,6 +282,29 @@ fn apply_side_effects(s: &Settings) {
         // path — `now - last_active < MAX` is simply always true.
         None => u64::MAX,
     }));
+}
+
+/// Resolve the appearance setting onto [`crate::theme::set_appearance`].
+/// System follows the platform except under `cfg!(test)`, where the test
+/// platform reports Light and would otherwise repaint every token test.
+pub(crate) fn apply_appearance(cx: &mut gpui::App) {
+    let next = match snapshot().appearance {
+        AppearanceSetting::Light => crate::theme::Appearance::Light,
+        AppearanceSetting::Dark => crate::theme::Appearance::Dark,
+        AppearanceSetting::System => {
+            if cfg!(test) {
+                crate::theme::Appearance::Dark
+            } else {
+                match cx.window_appearance() {
+                    gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => {
+                        crate::theme::Appearance::Light
+                    }
+                    _ => crate::theme::Appearance::Dark,
+                }
+            }
+        }
+    };
+    crate::theme::set_appearance(next, cx);
 }
 
 /// Write the whole file. Temp-then-rename like `Meta::save`
@@ -322,6 +348,16 @@ mod tests {
         assert_eq!(s.search, SearchEngine::DuckDuckGo);
         assert_eq!(s.evict_after_min, default_evict_min());
         assert_eq!(s.appearance, AppearanceSetting::System);
+    }
+
+    /// Light is a real variant, not a string that falls into extra.
+    #[test]
+    fn light_appearance_round_trips() {
+        let s: Settings = serde_json::from_str(r#"{"appearance":"light"}"#).unwrap();
+        assert_eq!(s.appearance, AppearanceSetting::Light);
+        let out = serde_json::to_string(&s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["appearance"], "light");
     }
 
     /// Keys this build does not know survive a decode→encode round trip.

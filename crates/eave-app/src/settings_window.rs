@@ -567,10 +567,8 @@ impl SettingsWindow {
         let s = settings::snapshot();
         let mut out: Vec<gpui::AnyElement> = Vec::new();
 
-        // Appearance. System/Dark only — the goal's own shape for a
-        // product with one theme. The caption is the row's honesty: the
-        // two choices paint the same today, and saying so beats a dead
-        // Light option or a silent no-op.
+        // Appearance. System follows macOS; Light and Dark pin. Customize
+        // Theme edits the active appearance's own brand.
         out.push(section_heading(theme, "Appearance").into_any_element());
         out.push(
             card(
@@ -584,6 +582,7 @@ impl SettingsWindow {
                             s.appearance,
                             &[
                                 (AppearanceSetting::System, "System"),
+                                (AppearanceSetting::Light, "Light"),
                                 (AppearanceSetting::Dark, "Dark"),
                             ],
                             |v, cx| settings::update(cx, |s| s.appearance = v),
@@ -592,7 +591,7 @@ impl SettingsWindow {
                     ),
                     caption(
                         theme,
-                        "Both resolve to eave's dark theme — no light theme exists yet.",
+                        "System follows macOS. Light and Dark share colors; frost is per appearance.",
                     ),
                 ],
             )
