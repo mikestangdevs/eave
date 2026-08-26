@@ -224,25 +224,30 @@ fn fit_chroma(l: f32, chroma: f32, hue: f32) -> f32 {
     lo
 }
 
-/// Where the light appearance's near-white bend begins, how far it may
-/// go, and how much of the asked chroma it must recover (operator,
-/// 2026-08-26: "the color needs to get richer at the top — it still
-/// stays rather light").
+/// The light appearance's near-white bend (operator, 2026-08-26: "the
+/// color needs to get richer at the top", then "should be able to reach
+/// a pink near [Arc's deep rail] — we are only at [pale]").
 ///
 /// The gamut fact behind it: above L ≈ 0.9, sRGB holds almost no chroma
 /// at any hue, so a brand tint applied to bezel's near-white frost
 /// (`grey(0xfa)`, L ≈ 0.98) fits to a whisper and the window's ground
-/// reads as untinted white. A near-white tone therefore slides DOWN, at
-/// most [`TINT_BEND_MAX`], to the highest lightness that carries
-/// [`TINT_BEND_KEEP`] of the asked chroma — trading a few steps of
-/// lightness for actual color. Light appearance only: the dark ladder is
-/// the verified one and its near-black end was walked and approved as
-/// is. The walk stops at the FIRST lightness that fits, so the bend is
-/// monotone in the original lightness — the surface ladder compresses
-/// near white but can never invert.
+/// reads as untinted white. Intensity therefore buys DEPTH as well as
+/// chroma: a tone above [`TINT_BEND_FLOOR`] slides toward a deep target
+/// in proportion to the asked chroma, reaching [`TINT_DEEP_L`] when the
+/// ask hits [`TINT_DEEP_AT`] (the Background slider's ceiling — at full
+/// intensity the ground lands where Arc's deep rails live). The ladder
+/// above the floor is compressed by [`TINT_DEEP_SPREAD`] rather than
+/// collapsed: each tone's target keeps its share of the original spread,
+/// and the map is monotone in the original lightness, so surfaces
+/// squeeze together at depth but can never invert. Light appearance
+/// only: the dark ladder is the verified one and was walked as is.
 const TINT_BEND_FLOOR: f32 = 0.90;
-const TINT_BEND_MAX: f32 = 0.07;
-const TINT_BEND_KEEP: f32 = 0.8;
+const TINT_DEEP_L: f32 = 0.62;
+const TINT_DEEP_SPREAD: f32 = 0.6;
+/// `pub(crate)` for one reason: the Customize Theme Background slider's
+/// ceiling must BE this number (full intensity = full depth), and the
+/// editor pins the two together in a test.
+pub(crate) const TINT_DEEP_AT: f32 = 0.15;
 
 /// Re-emit an achromatic tone at `hue`, carrying as much `chroma` as its
 /// lightness can hold. Alpha rides through. Ported from bezel's `color::tint`
@@ -254,7 +259,7 @@ fn tint(color: Hsla, hue: f32, chroma: f32) -> Hsla {
     }
     let mut l = lightness(color);
     if is_light() {
-        l = bend_lightness(l, chroma, hue);
+        l = bend_lightness(l, chroma);
     }
     let mut out = oklch(l, fit_chroma(l, chroma, hue), hue);
     out.a = color.a;
@@ -264,19 +269,15 @@ fn tint(color: Hsla, hue: f32, chroma: f32) -> Hsla {
 /// The near-white bend itself, pure so it can be tested without touching
 /// the process-global appearance (a test that flipped it would race
 /// every exact-pin token test on a sibling thread — the standing trap).
-fn bend_lightness(l: f32, chroma: f32, hue: f32) -> f32 {
-    if l <= TINT_BEND_FLOOR || fit_chroma(l, chroma, hue) >= chroma * TINT_BEND_KEEP {
+/// The result still goes through `fit_chroma` at the bent lightness, so
+/// a hue that cannot carry the ask even at depth clips honestly there.
+fn bend_lightness(l: f32, chroma: f32) -> f32 {
+    if l <= TINT_BEND_FLOOR || chroma <= 0.0 {
         return l;
     }
-    let floor = l - TINT_BEND_MAX;
-    let mut probe = l;
-    while probe - 0.01 > floor {
-        probe -= 0.01;
-        if fit_chroma(probe, chroma, hue) >= chroma * TINT_BEND_KEEP {
-            return probe;
-        }
-    }
-    floor
+    let strength = (chroma / TINT_DEEP_AT).clamp(0.0, 1.0);
+    let target = TINT_DEEP_L + (l - TINT_BEND_FLOOR) * TINT_DEEP_SPREAD;
+    l + (target - l) * strength
 }
 
 /// The color a `(hue, chroma)` pair produces at a fixed preview
@@ -1151,8 +1152,17 @@ pub fn on_solid() -> Hsla {
 /// ladder rather than on it. That is deliberate: the chip is not a raised
 /// card, it is a hole in the row with a logo in it, which is what an app
 /// icon is everywhere else a person has seen one.
+///
+/// Light appearance: one step off WHITE, same reasoning inverted
+/// (2026-08-26 — the hardcoded dark plate survived the appearance switch
+/// and sat as a black square in a pink rail). Through `grey`, so it
+/// carries the brand tint with the surfaces around it.
 pub fn chip_plate() -> Hsla {
-    rgb(0x121212).into()
+    if is_light() {
+        grey(0xf2)
+    } else {
+        rgb(0x121212).into()
+    }
 }
 
 /// The brightest fill in the app under the pointer: the same fill, lifted.
@@ -5220,29 +5230,38 @@ mod tests {
     }
 
     /// The light appearance's near-white bend (operator, 2026-08-26: "the
-    /// color needs to get richer at the top"). Pure — `bend_lightness`
+    /// color needs to get richer at the top", then "should be able to
+    /// reach a pink near [Arc's deep rail]"). Pure — `bend_lightness`
     /// exists so this never touches the process-global appearance.
     #[test]
-    fn a_tinted_near_white_bends_down_far_enough_to_carry_color() {
-        // The light canvas is grey(0xfa): L ≈ 0.98, where a green tint at
-        // the Background ceiling (0.06) fits to a whisper. The bend must
-        // find a lightness that carries most of the ask, within its bound.
+    fn intensity_buys_depth_and_full_intensity_reaches_a_deep_ground() {
         let l = lightness(hsla(0.0, 0.0, 0xfa as f32 / 255.0, 1.0));
-        let bent = bend_lightness(l, 0.06, 158.0);
-        assert!(bent < l, "a near-white that cannot carry the tint must bend");
-        assert!(bent >= l - TINT_BEND_MAX - 1e-4, "the bend is bounded");
+        // A quiet tint deepens a little, a loud one a lot.
+        let quiet = bend_lightness(l, 0.03);
+        let loud = bend_lightness(l, TINT_DEEP_AT);
+        assert!(quiet < l, "a tinted near-white must bend");
+        assert!(loud < quiet, "more intensity must mean more depth");
+        // At the slider's ceiling the ground lands in the deep band —
+        // Arc's rail, not a pastel — and genuinely carries color there
+        // (pink, hue 0, the reference's own family).
         assert!(
-            fit_chroma(bent, 0.06, 158.0) >= 0.06 * TINT_BEND_KEEP,
-            "the bend exists to buy chroma room and it did not"
+            (TINT_DEEP_L..=TINT_DEEP_L + 0.08).contains(&loud),
+            "full intensity landed at {loud}, outside the deep band"
+        );
+        assert!(
+            fit_chroma(loud, TINT_DEEP_AT, 0.0) >= 0.12,
+            "the deep ground cannot carry the color it exists for"
         );
         // Below the floor nothing moves — mid tones already have room,
         // and dark-mode callers must be untouched by construction too.
-        assert_eq!(bend_lightness(0.3, 0.06, 158.0), 0.3);
+        assert_eq!(bend_lightness(0.3, 0.06), 0.3);
         // Monotone: a higher original lightness never bends below a lower
         // one, so the surface ladder compresses but cannot invert.
-        let hi = bend_lightness(0.98, 0.06, 158.0);
-        let lo = bend_lightness(0.93, 0.06, 158.0);
-        assert!(hi >= lo - 1e-4, "the bend inverted the ladder: {hi} < {lo}");
+        for chroma in [0.03_f32, 0.08, 0.15] {
+            let hi = bend_lightness(0.98, chroma);
+            let lo = bend_lightness(0.93, chroma);
+            assert!(hi >= lo - 1e-4, "the bend inverted the ladder: {hi} < {lo}");
+        }
     }
 
     /// The shared-theme rule (operator, 2026-08-26: switching Light/Dark

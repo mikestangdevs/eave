@@ -64,11 +64,15 @@ impl Target {
         }
     }
 
-    /// The ceiling the intensity axis runs to — the same maxima the old
-    /// knob list used: surface tints stay quiet, accents may saturate.
+    /// The ceiling the intensity axis runs to. Background ran to 0.06
+    /// ("surface tints stay quiet") until the operator held Arc's deep
+    /// rail against it (2026-08-26): full Background intensity now rides
+    /// the light appearance's depth bend all the way down
+    /// (`theme::TINT_DEEP_AT` — the two numbers are one fact, pinned by
+    /// `the_background_ceiling_is_the_depth_bends_ceiling`).
     fn max_chroma(self) -> f32 {
         match self {
-            Target::Background => 0.06,
+            Target::Background => 0.15,
             Target::Accent => 0.2,
         }
     }
@@ -137,7 +141,7 @@ struct Knob {
 const INTENSITY_BG: Knob = Knob {
     label: "Intensity",
     id: "tint-chroma",
-    max: 0.06,
+    max: 0.15,
     decimals: 3,
     read: |b| b.tint.chroma,
     write: |b, v| b.tint.chroma = v,
@@ -651,6 +655,17 @@ mod tests {
         assert_eq!(Target::Accent.read(&b), Tint::new(200.0, 0.15));
         assert_eq!(b.tint, Tint::new(100.0, 0.05));
         assert_eq!(b.accent, Tint::new(200.0, 0.15));
+    }
+
+    /// Full Background intensity and full depth are ONE fact: the slider
+    /// ceiling is the chroma at which the light appearance's bend reaches
+    /// its deep target. If they drift apart, either the slider's top end
+    /// stops buying depth or depth arrives before the top — both read as
+    /// a broken scale.
+    #[test]
+    fn the_background_ceiling_is_the_depth_bends_ceiling() {
+        assert_eq!(Target::Background.max_chroma(), theme::TINT_DEEP_AT);
+        assert_eq!(INTENSITY_BG.max, theme::TINT_DEEP_AT);
     }
 
     /// The default the Reset button restores is the first accent swatch —
