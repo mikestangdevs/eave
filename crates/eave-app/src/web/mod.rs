@@ -123,6 +123,9 @@ pub mod cdp;
 /// is in it is ranges and rectangles, and the suite that runs by default
 /// has to be able to exercise it.
 pub mod ime;
+/// What the page has selected, as the chrome knows it (06-browser A4).
+/// Ungated for `ime`'s reason — it is a map and the rules for updating it.
+pub mod selection;
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
@@ -187,8 +190,8 @@ pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
 pub use page::{page_element, page_focus_handle, set_keyboard_page, set_live_divider};
 #[cfg(feature = "web")]
 pub use tabs::{
-    chrome, copy_selection, downloads, drive, install_fact_sink, install_request_sink,
-    is_on_screen, set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
+    chrome, downloads, drive, install_fact_sink, install_request_sink, is_on_screen,
+    set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
 };
 
 /// Clear Chromium's own copy of an origin's permission answers (G1).
@@ -754,6 +757,9 @@ pub(crate) fn forget_page(tab_id: &str) {
     // range would have every keystroke swallowed by the IME guard, with
     // nothing in any log to say why.
     ime::forget_tab(tab_id);
+    // And what it had selected, or a reused id offers to search for words
+    // from a page that is no longer open (A4).
+    selection::forget_tab(tab_id);
     FINDS.with(|f| {
         f.borrow_mut().remove(tab_id);
     });
@@ -821,6 +827,34 @@ fn cef_reload_hard(tab_id: &str) {
 }
 #[cfg(not(feature = "web"))]
 fn cef_reload_hard(_tab_id: &str) {}
+
+#[cfg(feature = "web")]
+fn cef_copy_selection(tab_id: &str) {
+    tabs::copy_selection(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_copy_selection(_tab_id: &str) {}
+
+#[cfg(feature = "web")]
+fn cef_cut_selection(tab_id: &str) {
+    tabs::cut_selection(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_cut_selection(_tab_id: &str) {}
+
+#[cfg(feature = "web")]
+fn cef_paste_into_page(tab_id: &str) {
+    tabs::paste_into_page(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_paste_into_page(_tab_id: &str) {}
+
+#[cfg(feature = "web")]
+fn cef_select_all(tab_id: &str) {
+    tabs::select_all(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_select_all(_tab_id: &str) {}
 
 #[cfg(feature = "web")]
 fn cef_set_muted(tab_id: &str, muted: bool) {
@@ -928,6 +962,63 @@ pub fn reload_hard(tab_id: &str) {
     cef_reload_hard(tab_id);
 }
 
+/// A4 — ⌘C. Copy the page's selection.
+///
+/// **Blink does this, not eave.** On macOS Chromium's editing commands
+/// arrive through the responder chain (`copy:`), and an OSR host has no
+/// responder chain — which is exactly why the chord did nothing before
+/// this slice even though the key event reached the page. `Frame::copy`
+/// is the substitute for the missing chain.
+///
+/// The page still receives the keystroke as well, so a site with its own
+/// ⌘C handler still runs it. That is Chrome's behaviour too. The one
+/// difference eave cannot yet match: a page that calls `preventDefault()`
+/// on the keydown suppresses Chrome's built-in copy, and here it does not,
+/// because CEF's `send_key_event` reports nothing back about it.
+pub fn copy_selection(tab_id: &str) {
+    #[cfg(test)]
+    TEST_NAV_CALLS.with(|n| n.borrow_mut().push(("copy".to_string(), tab_id.to_string())));
+    cef_copy_selection(tab_id);
+}
+
+/// A4 — ⌘X. Cut the page's selection, where the selection is editable.
+pub fn cut_selection(tab_id: &str) {
+    #[cfg(test)]
+    TEST_NAV_CALLS.with(|n| n.borrow_mut().push(("cut".to_string(), tab_id.to_string())));
+    cef_cut_selection(tab_id);
+}
+
+/// A4 — ⌘V into a page, which is NOT the composer's ⌘V.
+///
+/// The composer's reader interprets the pasteboard itself (an image is
+/// written to disk and staged as an attachment) because a gpui text field
+/// can only be handed a string. Blink needs no such help and must not get
+/// it: `Frame::paste` takes the pasteboard directly, so HTML stays HTML.
+/// The two never both run — `on_key`'s page gate returns before the
+/// composer arm, which is what keeps one chord from having two readers.
+pub fn paste_into_page(tab_id: &str) {
+    #[cfg(test)]
+    TEST_NAV_CALLS.with(|n| n.borrow_mut().push(("paste".to_string(), tab_id.to_string())));
+    cef_paste_into_page(tab_id);
+}
+
+/// A4 — ⌘A. Select the whole document, or the focused field.
+pub fn select_all(tab_id: &str) {
+    #[cfg(test)]
+    TEST_NAV_CALLS.with(|n| n.borrow_mut().push(("select-all".to_string(), tab_id.to_string())));
+    cef_select_all(tab_id);
+}
+
+/// What this tab has selected, for the chrome to reason about (A4).
+pub fn page_selection(tab_id: &str) -> Option<String> {
+    selection::text_for(tab_id)
+}
+
+/// Is there anything for ⌘C to act on? (A4)
+pub fn has_page_selection(tab_id: &str) -> bool {
+    selection::has_selection(tab_id)
+}
+
 #[cfg(test)]
 thread_local! {
     /// B4/B5 reaching Chromium, recorded so the feature-OFF suite can see
@@ -943,7 +1034,13 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Take what B4/B5 sent to Chromium since the last call.
+/// Take what the page-command path sent to Chromium since the last call —
+/// B4/B5's stop and hard reload, and A4's copy/cut/paste/select-all.
+///
+/// It exists because the feature-OFF twins are empty functions, so a chord
+/// that never fired and one that fired correctly are otherwise the same
+/// observation. That is G26's shape, and it is what localised B4's
+/// unreachable escape arm in two runs.
 #[cfg(test)]
 pub fn take_nav_calls_for_test() -> Vec<(String, String)> {
     TEST_NAV_CALLS.with(|n| std::mem::take(&mut *n.borrow_mut()))
@@ -1929,8 +2026,6 @@ pub fn is_on_screen(_tab_id: &str) -> bool {
     false
 }
 
-#[cfg(not(feature = "web"))]
-pub fn copy_selection(_tab_id: &str) {}
 
 // ---------------------------------------------------------------------------
 

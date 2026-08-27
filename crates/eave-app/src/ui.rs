@@ -4729,6 +4729,46 @@ enum FullscreenAction {
     TellPageToExit,
 }
 
+/// Which edit command a chord means to a page — A4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageEdit {
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+}
+
+/// A4's whole decision: does this keystroke mean an edit command?
+///
+/// Pure, and separate from `Shell::page_edit_chord` for `fullscreen_step`'s
+/// reason — the surrounding call needs a live page and a real clipboard,
+/// and none of that is what can be got wrong here. What CAN be got wrong is
+/// the modifier set, and it has three traps in four chords:
+///
+/// * **⌥⌘C must not copy.** Option is a compose modifier on macOS, and a
+///   keyboard layout that puts a letter behind ⌥ would silently copy while
+///   the operator was typing a character.
+/// * **⌃C must not copy.** It is the interrupt in every terminal a page
+///   might be emulating, and Chrome does not treat it as copy on macOS.
+/// * **⇧⌘A is Chrome's "search tabs", not select-all**, so a `shift`-blind
+///   match would take a chord that means something else. eave does not
+///   implement that row yet; refusing it here keeps it available rather
+///   than spending it.
+///
+/// `platform` alone, then, and the key must be exactly the letter.
+fn page_edit_command(ks: &gpui::Keystroke) -> Option<PageEdit> {
+    if !ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt || ks.modifiers.shift {
+        return None;
+    }
+    match ks.key.as_str() {
+        "c" => Some(PageEdit::Copy),
+        "x" => Some(PageEdit::Cut),
+        "v" => Some(PageEdit::Paste),
+        "a" => Some(PageEdit::SelectAll),
+        _ => None,
+    }
+}
+
 /// D10's whole decision, as a function of four bools.
 ///
 /// Pulled out of `Shell::drive_fullscreen` so the default suite can run it:
@@ -7571,6 +7611,31 @@ impl Shell {
             return;
         }
         if self.page_owns_keyboard(cx) {
+            // A4 — the edit chords, and this is the ONLY place they can go.
+            //
+            // On macOS Chromium's editing commands arrive through the
+            // responder chain (`copy:`, `paste:`), and an off-screen host
+            // has no responder chain. So the key event reaches the page,
+            // Blink dispatches `keydown` for it, and then nothing happens —
+            // which is exactly what the operator found: ⌘C, ⌘V and ⌘A did
+            // nothing on a page while the context menu's Copy row, which
+            // calls `Frame::copy` directly, worked.
+            //
+            // **Inside this gate rather than above it**, which is the
+            // opposite of B4's escape arm one block up. Escape belongs to
+            // the chrome first and the page second; these belong to
+            // whatever holds the keyboard, and when that is a text field of
+            // eave's own, `text_field.rs` already binds ⌘A/⌘C/⌘X in its own
+            // key context and must keep them.
+            //
+            // ⌘V is the one that would have bitten. It has exactly one
+            // reader in this function — the composer's arm below, which
+            // writes a pasted image to disk and stages it as an attachment
+            // — and `text_field.rs` documents that binding a second one
+            // would let ordering decide which runs. Nothing here changes
+            // that: this branch RETURNS before that arm, so the two readers
+            // are separated by control flow, not by a keymap race.
+            self.page_edit_chord(&ks, cx);
             return;
         }
         // Slice Q2 unmounted the composer at the launcher (`show_launcher`
@@ -7770,6 +7835,35 @@ impl Shell {
         }
         let snap = self.web_tabs.read(cx);
         strip::active_is_page(&snap.snapshot) && !strip::active_is_blank_page(&snap.snapshot)
+    }
+
+    /// A4 — ⌘C / ⌘X / ⌘V / ⌘A while a page holds the keyboard.
+    ///
+    /// The decision is pure and lives in [`page_edit_command`]; this is the
+    /// part that needs the shell. Called only from inside `on_key`'s page
+    /// gate, so "which surface" is already answered before it runs.
+    ///
+    /// **The keystroke still reaches the page as well**, and that is
+    /// deliberate — gpui dispatches leaf-first on the bubble phase and
+    /// neither listener stops the other, so a site that implements its own
+    /// ⌘C still runs it. Chrome does the same. The one behaviour eave
+    /// cannot match yet: a page that calls `preventDefault()` on the
+    /// keydown suppresses Chrome's built-in copy, and here it does not,
+    /// because `send_key_event` reports nothing back about it. That is
+    /// written down in `web::copy_selection` rather than left to be found.
+    fn page_edit_chord(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) {
+        let Some(cmd) = page_edit_command(ks) else {
+            return;
+        };
+        let Some(tab_id) = self.active_page(cx) else {
+            return;
+        };
+        match cmd {
+            PageEdit::Copy => crate::web::copy_selection(&tab_id),
+            PageEdit::Cut => crate::web::cut_selection(&tab_id),
+            PageEdit::Paste => crate::web::paste_into_page(&tab_id),
+            PageEdit::SelectAll => crate::web::select_all(&tab_id),
+        }
     }
 
     /// Put the keyboard where it belongs this frame: composer, page, or
@@ -16095,12 +16189,42 @@ impl Shell {
             }));
         }
 
+        // A4's edit group. `req.editable` has been read off
+        // `ContextMenuParams` since the menu was built and until now was
+        // never used for anything — Cut, Paste and Select All are the rows
+        // it was for.
+        //
+        // **Cut and Paste appear only in an editable field, Copy always**,
+        // which is Chrome's shape: offering to cut from an article is
+        // offering something that cannot happen. Select All is grouped with
+        // them rather than shown on every page for the same reason —
+        // Chrome's page menu has no Select All either.
+        if req.editable {
+            let cut = MenuItem::new("Cut").trailing("⌘X");
+            items.push(if req.selection.is_some() {
+                cut
+            } else {
+                cut.disabled()
+            });
+        }
         let copy = MenuItem::new("Copy").trailing("⌘C");
         items.push(if req.selection.is_some() {
             copy
         } else {
             copy.disabled()
         });
+        if req.editable {
+            // **Never disabled, and deliberately not conditioned on the
+            // clipboard having anything in it.** Chrome greys this row when
+            // the pasteboard is empty; answering that here would mean
+            // READING the pasteboard to draw a menu, and on recent macOS a
+            // pasteboard read is a privacy event the operator can be shown.
+            // Doing that on every right-click, to decide the colour of a
+            // row, is a worse trade than an enabled row that no-ops —
+            // which is what `Frame::paste` does with an empty clipboard.
+            items.push(MenuItem::new("Paste").trailing("⌘V"));
+            items.push(MenuItem::new("Select All").trailing("⌘A"));
+        }
 
         if req.link_url.is_some() {
             items.push(MenuItem::new("Copy Link"));
@@ -16228,6 +16352,12 @@ impl Shell {
                 cx.notify();
             }
             "Copy" => crate::web::copy_selection(&tab_id),
+            // A4. Same three calls the chords make — the menu and the
+            // keyboard are one path from here down, so a fix to either is
+            // a fix to both.
+            "Cut" => crate::web::cut_selection(&tab_id),
+            "Paste" => crate::web::paste_into_page(&tab_id),
+            "Select All" => crate::web::select_all(&tab_id),
             "Copy Link" => {
                 if let Some(url) = req.link_url.as_deref() {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.to_string()));
@@ -20810,6 +20940,59 @@ fn perf_fill_10k(state: &mut TranscriptState) {
 #[cfg(test)]
 #[path = "ui_harness.rs"]
 mod harness;
+
+#[cfg(test)]
+mod a4_tests {
+    use super::{page_edit_command, PageEdit};
+    use gpui::Keystroke;
+
+    fn ks(s: &str) -> Keystroke {
+        Keystroke::parse(s).expect("test keystroke should parse")
+    }
+
+    #[test]
+    fn the_four_chords_map_to_the_four_commands() {
+        assert_eq!(page_edit_command(&ks("cmd-c")), Some(PageEdit::Copy));
+        assert_eq!(page_edit_command(&ks("cmd-x")), Some(PageEdit::Cut));
+        assert_eq!(page_edit_command(&ks("cmd-v")), Some(PageEdit::Paste));
+        assert_eq!(page_edit_command(&ks("cmd-a")), Some(PageEdit::SelectAll));
+    }
+
+    #[test]
+    fn a_bare_letter_is_typing_and_not_a_command() {
+        // The positive control matters here: without it this test also
+        // passes against a `page_edit_command` that always answers None.
+        assert_eq!(page_edit_command(&ks("cmd-c")), Some(PageEdit::Copy));
+        for k in ["c", "x", "v", "a"] {
+            assert_eq!(page_edit_command(&ks(k)), None, "bare {k} was taken");
+        }
+    }
+
+    #[test]
+    fn option_and_control_variants_are_refused() {
+        // ⌥⌘C: option is a compose modifier, and a layout that puts a
+        // letter behind it would copy while somebody was typing.
+        assert_eq!(page_edit_command(&ks("alt-cmd-c")), None);
+        // ⌃C: the interrupt in every terminal a page might emulate.
+        assert_eq!(page_edit_command(&ks("ctrl-c")), None);
+        assert_eq!(page_edit_command(&ks("ctrl-cmd-c")), None);
+    }
+
+    #[test]
+    fn shift_cmd_a_is_left_alone_because_chrome_means_something_else_by_it() {
+        // Chrome's ⇧⌘A is "search tabs". eave does not implement that row
+        // yet, and taking the chord for select-all would spend it.
+        assert_eq!(page_edit_command(&ks("shift-cmd-a")), None);
+        assert_eq!(page_edit_command(&ks("shift-cmd-c")), None);
+    }
+
+    #[test]
+    fn unrelated_chords_are_not_edit_commands() {
+        for k in ["cmd-r", "cmd-l", "cmd-t", "cmd-w", "cmd-z", "escape"] {
+            assert_eq!(page_edit_command(&ks(k)), None, "{k} was taken");
+        }
+    }
+}
 
 #[cfg(test)]
 mod d10_tests {

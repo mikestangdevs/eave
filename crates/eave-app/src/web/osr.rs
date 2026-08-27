@@ -772,6 +772,35 @@ wrap_render_handler! {
             super::ime::note_range(&self.tab_id, selected, boxes);
         }
 
+        /// **What the page has selected** — 06-browser A4.
+        ///
+        /// The chrome's only standing answer. [`super::menu`] reads
+        /// `ContextMenuParams::selection_text` and that is authoritative,
+        /// but it exists only at the instant of a right-click — and ⌘C is
+        /// pressed with no menu open, with nothing to ask. This callback
+        /// is what makes the question answerable at any other moment.
+        ///
+        /// **Fires on DESELECTION too, with an empty string** rather than
+        /// going silent, which is why [`super::selection::note`] treats
+        /// empty as "clear" instead of storing it. A version that only
+        /// inserted would leave Copy live over a page with nothing
+        /// selected, still holding the previous selection's words.
+        fn on_text_selection_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_text: Option<&CefString>,
+            selected_range: Option<&cef::Range>,
+        ) {
+            let text = selected_text.map(|s| s.to_string());
+            let range = selected_range.map(|r| r.from as usize..r.to as usize);
+            super::selection::note(&self.tab_id, text.as_deref(), range);
+            // The selection is chrome-visible state and no page frame is
+            // coming to carry it onto the screen — dragging a selection
+            // repaints the page, but releasing the mouse on the last
+            // character does not. Same reason `menu.rs` says this.
+            super::host::note_chrome_change();
+        }
+
         /// The GPU path — the one that runs.
         /// A popup opened or closed.
         ///

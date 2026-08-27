@@ -1103,6 +1103,57 @@ pub fn copy_selection(tab_id: &str) {
     super::host::request_pump();
 }
 
+/// Cut the page's current selection — slice A4.
+///
+/// Only does anything in an editable field, and **Blink decides that**,
+/// not eave: `Frame::cut` on a read-only selection is a no-op rather than
+/// an error, which is the behaviour a chord wants. The alternative would
+/// be for the chrome to guess editability from the last
+/// `ContextMenuParams`, which is stale the moment the pointer moves.
+pub fn cut_selection(tab_id: &str) {
+    with_browser(tab_id, |b| {
+        if let Some(frame) = b.main_frame() {
+            frame.cut();
+        }
+    });
+    super::host::request_pump();
+}
+
+/// Paste the system clipboard into the page — slice A4.
+///
+/// **`paste` and not `paste_and_match_style`.** Chrome's plain ⌘V keeps
+/// the source's formatting and puts the stripped version on ⌥⇧⌘V; matching
+/// style here would silently discard formatting on every paste into a rich
+/// editor, which is a data loss the operator did not ask for and cannot
+/// undo from the chrome.
+///
+/// Nothing is read from the clipboard by eave on this path. Blink takes it
+/// directly, so an image or HTML on the pasteboard arrives as an image or
+/// HTML — unlike the composer's ⌘V, which has to interpret the pasteboard
+/// itself because a gpui text field can only be handed a string.
+pub fn paste_into_page(tab_id: &str) {
+    with_browser(tab_id, |b| {
+        if let Some(frame) = b.main_frame() {
+            frame.paste();
+        }
+    });
+    super::host::request_pump();
+}
+
+/// Select the whole document, or the whole field if one has focus — A4.
+///
+/// Routed through the MAIN frame for `copy_selection`'s reason: which
+/// element "all" means is Blink's question, and it resolves it from the
+/// focused frame downward.
+pub fn select_all(tab_id: &str) {
+    with_browser(tab_id, |b| {
+        if let Some(frame) = b.main_frame() {
+            frame.select_all();
+        }
+    });
+    super::host::request_pump();
+}
+
 /// Open DevTools for this tab's page, docked — the menu's "Inspect" row.
 ///
 /// # Why this does NOT call `show_dev_tools`
@@ -1918,6 +1969,15 @@ wrap_load_handler! {
             // (a reload does not move it), and it is `on_address_change`
             // that has to be quiet about the echo.
             note_url(&self.tab_id, &url);
+            // A4: a new main-frame document has nothing selected in it.
+            // Chromium fires `on_text_selection_changed` on a cross-document
+            // navigation, but not before the chrome has already drawn a
+            // frame of the new page — and on some same-document navigations
+            // not at all. Clearing here makes the answer only ever stale in
+            // the safe direction: offering nothing when there is something
+            // is a missing affordance; offering the PREVIOUS page's words
+            // is a wrong one.
+            super::selection::note_navigated(&self.tab_id);
             report(&self.tab_id, PageFact::Committed { url, title: None });
             report(
                 &self.tab_id,

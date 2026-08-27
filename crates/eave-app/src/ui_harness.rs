@@ -16243,3 +16243,144 @@ fn an_unknown_total_still_cancels_and_a_cancelled_row_is_inert(cx: &mut TestAppC
         "the panel was not reachable at all, so the inert row proved nothing"
     );
 }
+
+/// A4 — the four edit chords reach Chromium when a page holds the keyboard.
+///
+/// The seam is the whole point: feature-OFF, `web::copy_selection` is an
+/// empty function, so a chord that never fired and one that fired correctly
+/// are the same observation. This is what would have caught the gap the
+/// operator found by pressing ⌘C on a live page and getting nothing.
+#[gpui::test]
+fn the_edit_chords_reach_the_page_when_it_holds_the_keyboard(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://example.com/"), None)],
+        Some("p1"),
+    );
+    let _ = h.drain();
+    let _ = crate::web::take_nav_calls_for_test();
+
+    for (chord, want) in [
+        ("cmd-c", "copy"),
+        ("cmd-x", "cut"),
+        ("cmd-v", "paste"),
+        ("cmd-a", "select-all"),
+    ] {
+        vcx.simulate_keystrokes(chord);
+        vcx.run_until_parked();
+        assert_eq!(
+            crate::web::take_nav_calls_for_test(),
+            vec![(want.to_string(), "p1".to_string())],
+            "{chord} did not reach Chromium as {want}"
+        );
+        assert!(
+            h.drain().is_empty(),
+            "{chord} went through the engine — an edit command is a browser \
+             command, not a navigation"
+        );
+    }
+}
+
+/// …and they do NOT fire while a surface of eave's own holds the keyboard.
+///
+/// This is the half that protects the omnibox: `text_field.rs` binds ⌘A/⌘C/⌘X
+/// in its own key context, and if the page path took them first, selecting an
+/// address to retype it would instead select the whole document behind it.
+#[gpui::test]
+fn the_edit_chords_leave_the_omnibox_alone(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://example.com/"), None)],
+        Some("p1"),
+    );
+    let _ = h.drain();
+
+    // The positive control FIRST: with no chrome up, ⌘C reaches the page.
+    // Without this the assertion below also passes if the chord is simply
+    // broken everywhere — which is exactly the vacuity that bit two of the
+    // round-two tests.
+    let _ = crate::web::take_nav_calls_for_test();
+    vcx.simulate_keystrokes("cmd-c");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::take_nav_calls_for_test().len(),
+        1,
+        "control failed: ⌘C did not reach the page even with no chrome up"
+    );
+
+    // Now open the omnibox and try again.
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-c");
+    vcx.run_until_parked();
+    assert!(
+        crate::web::take_nav_calls_for_test().is_empty(),
+        "⌘C reached the page while the omnibox had the keyboard — the \
+         address bar's own copy is what that chord means there"
+    );
+}
+
+/// A4 — an editable field grows Cut / Paste / Select All, and a page does not.
+///
+/// `editable` came off `ContextMenuParams` when the menu was first built and
+/// nothing read it until this slice; these are the rows it was for. Asserted
+/// as a COUNT DELTA rather than by row index: the round-two slice shifted
+/// every index in this file by adding one row, and six tests failed for a
+/// reason that had nothing to do with what they were checking.
+#[gpui::test]
+fn an_editable_field_gets_the_edit_group_and_a_page_does_not(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tab = page_shell(&h, vcx, Some("https://example.com/"));
+
+    let menu = |editable: bool| crate::web::PageMenu {
+        tab_id: tab.to_string(),
+        x: 200.,
+        y: 200.,
+        page_x: 200,
+        page_y: 200,
+        link_url: None,
+        selection: Some("picked".to_string()),
+        editable,
+    };
+
+    request_page_menu(&h, vcx, menu(false));
+    assert!(shown(vcx, "menu-row-0"), "the page menu never opened");
+    let plain = menu_row_count(vcx);
+
+    request_page_menu(&h, vcx, menu(true));
+    assert!(shown(vcx, "menu-row-0"), "the editable menu never opened");
+    let editable = menu_row_count(vcx);
+
+    assert_eq!(
+        editable,
+        plain + 3,
+        "an editable field should add exactly Cut, Paste and Select All \
+         (plain={plain}, editable={editable})"
+    );
+    assert!(
+        plain > 0,
+        "control failed: the plain menu had no rows, so the delta above \
+         would pass against a menu that renders nothing"
+    );
+}
+
+/// How many rows the open page menu has. Counts by probing successive
+/// `debug_selector`s, because the harness resolves bounds and cannot read
+/// text — see the module note.
+fn menu_row_count(vcx: &mut VisualTestContext) -> usize {
+    const ROWS: [&str; 16] = [
+        "menu-row-0", "menu-row-1", "menu-row-2", "menu-row-3",
+        "menu-row-4", "menu-row-5", "menu-row-6", "menu-row-7",
+        "menu-row-8", "menu-row-9", "menu-row-10", "menu-row-11",
+        "menu-row-12", "menu-row-13", "menu-row-14", "menu-row-15",
+    ];
+    ROWS.iter()
+        .take_while(|s| vcx.debug_bounds(*s).is_some())
+        .count()
+}
