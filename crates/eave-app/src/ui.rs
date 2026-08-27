@@ -6685,9 +6685,22 @@ impl Shell {
                         .w(px(320.))
                         .p(px(theme::SPACE_3))
                         .rounded(px(theme::RADIUS_PANEL))
-                        .bg(theme::overlay_strong())
+                        // A toast floats over ARBITRARY web content with
+                        // nothing between it and the page, and a 14%-ink
+                        // card over a live page is the
+                        // see-through, barely-readable toast the first
+                        // live walk caught (2026-08-25, operator's words:
+                        // "they are clear, almost not readable").
+                        //
+                        // So it wears the floating-card recipe
+                        // `overlay::menu_layer` already uses, rather than
+                        // a new colour: `MENU_GLASS_ALPHA` was derived
+                        // from UNBLURRED text bleed, which is exactly the
+                        // condition here — nothing blurs a CEF page.
+                        .bg(theme::menu_glass())
                         .border_1()
-                        .border_color(theme::card_border())
+                        .border_color(theme::edge_modal())
+                        .shadow(theme::shadow_modal())
                         .flex()
                         .flex_col()
                         .gap(px(theme::SPACE_1))
@@ -6912,10 +6925,24 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                // A scrim, because for a JS dialog the page behind is
-                // STOPPED, and dimming it is the only thing on screen that
-                // says so.
-                .bg(theme::overlay_strongest())
+                // NO SCRIM FILL, deliberately. This used to be
+                // `overlay_strongest()`, "because for a JS dialog the page
+                // behind is STOPPED, and dimming it is the only thing on
+                // screen that says so". It never dimmed anything:
+                // `overlay_strongest` is `ink(0.20)`, a 20% LIGHT wash, so
+                // over a page it FROSTED rather than darkened — and on the
+                // one ask where the page is not stopped
+                // (`Ask::Permission`, see the note below) it was also
+                // saying something untrue. The operator called it
+                // unnecessary on sight, 2026-08-25.
+                //
+                // The card below carries its own opaque surface now, so
+                // nothing depends on this backdrop to be legible. What this
+                // element still does is `.occlude()` — the G25 click
+                // swallow — and that is INPUT, not paint, so dropping the
+                // fill does not weaken it. If a dim ever comes back for the
+                // four blocking JS dialogs, it needs a dark ink; this
+                // token could never have done the job.
                 // **And it must swallow the clicks it is dimming (G25).**
                 //
                 // Without this the scrim was decoration: `div().bg(..)`
@@ -6955,9 +6982,22 @@ impl Shell {
                         .w(px(420.))
                         .p(px(theme::SPACE_4))
                         .rounded(px(theme::RADIUS_PANEL))
-                        .bg(theme::overlay_strong())
+                        // Same reasoning as `notification_toasts`, and the
+                        // scrim above does NOT change it. `overlay_strongest`
+                        // is `ink(0.20)` — its own doc names it the hover
+                        // fill for the unarmed send button, not a backdrop —
+                        // so what sits between this card and live web content
+                        // is a 20% LIGHT wash, which lightens a page rather
+                        // than dimming it. A 14%-ink card over that is a
+                        // see-through prompt, caught in the same live walk as
+                        // the toast (2026-08-25). The clickjacking note above
+                        // is the reason this one matters more than looks: a
+                        // prompt you cannot read is a prompt you cannot
+                        // check the origin on before clicking Allow.
+                        .bg(theme::menu_glass())
                         .border_1()
-                        .border_color(theme::card_border())
+                        .border_color(theme::edge_modal())
+                        .shadow(theme::shadow_modal())
                         .flex()
                         .flex_col()
                         .gap(px(theme::SPACE_3))
