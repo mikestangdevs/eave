@@ -5075,6 +5075,141 @@ impl Render for PageTooltip {
 /// place on the page whose whole purpose is to be prose.
 const TOOLTIP_MAX_W: f32 = 320.0;
 
+/// A bookmark tile's hover card.
+///
+/// For every bookmark it is the title and host nothing else shows — a
+/// tile is a bare favicon by design (`bookmark_tile`). For a bookmarked
+/// SERVICE — Gmail, Google Calendar, Linear — it is Arc's peek: the
+/// inbox, today's events, your issues, read by `web::peek` through a
+/// page that already has the session.
+///
+/// A view because that is what `.tooltip()` takes (see [`PageTooltip`]).
+/// Rendering both READS and RENEWS: `request_peek(_, true)` on every
+/// frame the card is up is what keeps the fetch loop interested, and the
+/// card fills in as answers land because `drive_peek`'s busy signal
+/// keeps the window painting while one is in flight.
+struct BookmarkPeek {
+    label: SharedString,
+    host: SharedString,
+    url: String,
+}
+
+/// Wide enough for a sender + subject + snippet to read as a list, and
+/// still narrower than the menu cap so it never crowds the well.
+const BOOKMARK_PEEK_W: f32 = 300.0;
+
+impl Render for BookmarkPeek {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        crate::web::request_peek(&self.url, true);
+        let peek = crate::web::peek_view_for_url(&self.url);
+        let host = self.host.clone();
+        div()
+            .debug_selector(|| "bookmark-peek".into())
+            .max_w(px(TOOLTIP_MAX_W))
+            .when(peek.is_some(), |d| d.w(px(BOOKMARK_PEEK_W)))
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_MENU))
+            .bg(theme::menu_glass())
+            .border_1()
+            .border_color(theme::edge_modal())
+            .shadow(theme::shadow_modal())
+            .text_size(px(theme::DETAIL_SIZE))
+            .line_height(px(theme::DETAIL_LINE))
+            .child(
+                div()
+                    .px(px(theme::SPACE_3))
+                    .py(px(theme::SPACE_1))
+                    .flex()
+                    .items_baseline()
+                    .gap(px(theme::SPACE_2))
+                    .child(
+                        div()
+                            .text_color(theme::text())
+                            .truncate()
+                            .child(self.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme::text_tertiary())
+                            .truncate()
+                            .child(self.host.clone()),
+                    ),
+            )
+            .when_some(peek, |d, peek| {
+                d.child(bookmark_peek_body(&peek, &host))
+            })
+    }
+}
+
+/// The provider half of the card: a status line or the rows.
+///
+/// A free function rather than part of `Render` so the empty/signed-out/
+/// unavailable wordings sit in one place, next to each other.
+fn bookmark_peek_body(peek: &crate::web::peek::View, host: &SharedString) -> Div {
+    use crate::web::peek::Status;
+    let quiet = |text: String| {
+        div()
+            .px(px(theme::SPACE_3))
+            .py(px(theme::SPACE_1))
+            .text_color(theme::text_tertiary())
+            .child(SharedString::from(text))
+    };
+    let body = div()
+        .border_t_1()
+        .border_color(theme::border())
+        .py(px(theme::SPACE_1));
+    match peek.status {
+        Status::Loading => body.child(quiet(format!("Fetching {}…", peek.title.to_lowercase()))),
+        Status::Empty => body.child(quiet("Nothing new".to_string())),
+        Status::SignedOut => body.child(quiet(format!("Sign in to {host} to preview"))),
+        Status::Unavailable => body.child(quiet("Preview unavailable".to_string())),
+        Status::Ready => body.children(peek.rows.iter().enumerate().map(|(i, row)| {
+            div()
+                .debug_selector(move || format!("bookmark-peek-row-{i}"))
+                .px(px(theme::SPACE_3))
+                .py(px(theme::SPACE_1))
+                .when(i > 0, |d| d.border_t_1().border_color(theme::border()))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap(px(theme::SPACE_2))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(theme::text())
+                                .truncate()
+                                .child(SharedString::from(row.primary.clone())),
+                        )
+                        .when(!row.meta.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(row.meta.clone())),
+                            )
+                        }),
+                )
+                .when(!row.secondary.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_color(theme::text_secondary())
+                            .truncate()
+                            .child(SharedString::from(row.secondary.clone())),
+                    )
+                })
+                .when(!row.detail.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_color(theme::text_tertiary())
+                            .truncate()
+                            .child(SharedString::from(row.detail.clone())),
+                    )
+                })
+        })),
+    }
+}
+
 /// The bookmark zone while a page is held over it: a filled tray and a
 /// dashed rim, so the drop reads as going into that box.
 ///
@@ -11827,6 +11962,10 @@ impl Shell {
         // Idempotent per host, so calling it every frame costs one hash
         // lookup and starts at most one download.
         crate::web::request_favicon(&url);
+        // Same idiom for the peek: PASSIVE interest, which refreshes a
+        // bookmarked service's preview through pages that already exist
+        // and never creates anything. Only the hover card itself may.
+        crate::web::request_peek(&url, false);
         let mark = crate::web::favicon_for_url(&url);
         let host = crate::omnibox::engine_host(&url);
         let here = active_host.is_some_and(|h| h == host);
@@ -11886,6 +12025,23 @@ impl Shell {
                 )
                 .into_any_element(),
             })
+            // A tile is a bare favicon, so the hover card is the only
+            // place its NAME exists — and for a bookmarked service it is
+            // the peek (Arc's mail/calendar preview, plus Linear). The
+            // 400 ms delay is deliberately under gpui's 500 ms default:
+            // a peek is a glance, and the tile has no label to read
+            // meanwhile.
+            .tooltip({
+                let label = SharedString::from(item.label.clone());
+                let tip_host = SharedString::from(host.clone());
+                let tip_url = url.clone();
+                move |_, cx| {
+                    let (label, host, url) =
+                        (label.clone(), tip_host.clone(), tip_url.clone());
+                    cx.new(|_| BookmarkPeek { label, host, url }).into()
+                }
+            })
+            .tooltip_show_delay(Duration::from_millis(400))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_bookmark(open_url.clone(), cx);
                 cx.notify();
@@ -19936,6 +20092,18 @@ impl Render for Shell {
         // reported nothing and the silence looked exactly like a page
         // doing nothing.
         crate::web::drive_observation(&strip_snapshot);
+        // Bookmark peek rides the same pass, for the same reason. Its
+        // busy signal keeps frames coming while an answer is in flight:
+        // a tooltip's view renders only when its window paints, so
+        // without this the card would sit on "Fetching…" until the
+        // pointer happened to move. Bounded — busy is false the moment
+        // the hover's interest lapses.
+        if crate::web::drive_peek(&strip_snapshot) {
+            let entity = self.transcript.clone();
+            window.on_next_frame(move |_, cx| {
+                entity.update(cx, |_, cx| cx.notify());
+            });
+        }
 
         // **This is the page path that runs when the well is NOT split**,
         // which is the ordinary case — `split_pane` builds the other one.

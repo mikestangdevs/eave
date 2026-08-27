@@ -179,6 +179,15 @@ mod notify;
 /// `cdp_call` has a feature-off twin, so the whole loop runs in the default
 /// suite and only the Chromium at the far end is missing.
 mod audible;
+
+/// Bookmark peek — hover previews for bookmarked services (Gmail,
+/// Google Calendar, Linear), fetched over the CDP channel through a page
+/// that already has the operator's session. Ungated for `notify`'s
+/// reason: the providers, the fold and the cache are pure, `cdp_call`
+/// has a feature-off twin, and only the hidden-browser line is gated.
+/// `pub(crate)` unlike its siblings because the renderer matches on
+/// [`peek::Status`] — a facade that hid the enum would just re-state it.
+pub(crate) mod peek;
 #[cfg(feature = "web")]
 mod osr;
 #[cfg(feature = "web")]
@@ -1078,6 +1087,26 @@ pub(crate) fn devtools_parent(id: &str) -> Option<&str> {
     id.strip_prefix("devtools:")
 }
 
+/// The hidden peek browser's id for a provider host — the same NAMESPACE
+/// move as [`devtools_id`], for the same reason: it rides the per-id OSR
+/// pipeline without a strip row, and the prefix is what keeps `drive`'s
+/// reaper from reading it as a departed tab.
+pub fn peek_id(host: &str) -> String {
+    format!("peek:{host}")
+}
+
+/// Whether an id names a hidden peek browser.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) fn is_peek_id(id: &str) -> bool {
+    id.starts_with("peek:")
+}
+
+/// The provider host a peek id was made for, or `None` for anything else.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) fn peek_host(id: &str) -> Option<&str> {
+    id.strip_prefix("peek:")
+}
+
 thread_local! {
     /// Tabs whose DevTools dock is open, by PARENT tab id. Ungated — the
     /// dock's open/closed state is view state the feature-OFF suite must
@@ -1377,6 +1406,33 @@ pub fn cdp_watch(tab_id: &str) -> Vec<u32> {
         .iter()
         .map(|(method, params)| cdp_call(tab_id, method, params))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Bookmark peek — hover previews for bookmarked services
+// ---------------------------------------------------------------------------
+
+/// The render-ready peek for a bookmark's url, or `None` for a url no
+/// provider claims. Cheap: one host parse and one map read.
+pub fn peek_view_for_url(url: &str) -> Option<peek::View> {
+    let host = crate::omnibox::engine_host(url);
+    peek::view(&host, std::time::Instant::now())
+}
+
+/// Mark interest in a bookmark's peek. `active` means a card is up (a
+/// hover) and may boot the hidden source browser; passive interest only
+/// refreshes through pages that already exist. Idempotent per frame.
+pub fn request_peek(url: &str, active: bool) {
+    let host = crate::omnibox::engine_host(url);
+    peek::request(&host, active, std::time::Instant::now());
+}
+
+/// One turn of the peek loop, beside the frame's other reconciliations.
+/// Returns whether an answer is still being worked on for a live hover —
+/// the caller keeps frames coming while it is, so the card repaints when
+/// the answer lands.
+pub fn drive_peek(snapshot: &eave_wire::TabsSnapshot) -> bool {
+    peek::drive(snapshot, std::time::Instant::now())
 }
 
 #[cfg(test)]

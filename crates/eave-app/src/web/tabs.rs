@@ -845,6 +845,13 @@ pub fn drive(snapshot: &TabsSnapshot) {
     // the mark is pruned against the strip rather than against the map.
     CREATING.with(|c| {
         c.borrow_mut().retain(|id| {
+            // A peek browser has no strip row at any point in its life —
+            // pruning it against the strip would mark it unwanted the
+            // same pass it was asked for, and `ensure_peek_browser` would
+            // ask again forever. Its owner is the peek store.
+            if super::is_peek_id(id) {
+                return super::peek::browser_wanted(id);
+            }
             let key = super::devtools_parent(id).unwrap_or(id);
             snapshot.tabs.iter().any(|t| t.id == key)
         })
@@ -860,6 +867,17 @@ pub fn drive(snapshot: &TabsSnapshot) {
         if let Some(parent) = super::devtools_parent(&id) {
             if snapshot.tabs.iter().any(|t| t.id == parent) {
                 set_visibility(&id, is_on_screen(&id));
+                continue;
+            }
+        } else if super::is_peek_id(&id) {
+            // A peek browser's life is the peek store's keep-window, not
+            // a strip row. Nothing composites it, so it is told
+            // `was_hidden` here — safely, because this loop iterates
+            // `BROWSERS`: the browser exists, so the recorded value and
+            // the real call cannot diverge the way the warm pass's
+            // would (see the block comment in `drive`'s preload arm).
+            if super::peek::browser_wanted(&id) {
+                set_visibility(&id, false);
                 continue;
             }
         } else if snapshot.tabs.iter().any(|t| t.id == id) {
@@ -1085,6 +1103,29 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
             super::favicon::fetch(&tab.id, &ico, page);
         }
     }
+}
+
+/// Create the hidden browser a bookmark peek reads through — the
+/// `devtools:` move (a windowless browser whose id the strip has never
+/// heard of), owned by the peek store instead of a parent tab.
+///
+/// Same `create` as a page tab, so it shares the default request context
+/// — the cookies that make the peek show YOUR inbox — and the same
+/// `CREATING` guard, so asking on every retry tick makes one browser,
+/// not one per tick. Visibility is deliberately not touched here: the
+/// browser does not exist yet, and `set_visibility` records before it
+/// applies (the preload arm's trap). `drive`'s reaper hides it on the
+/// first pass after `on_after_created`.
+pub fn ensure_peek_browser(id: &str, url: &str) {
+    if !super::host::running() {
+        return;
+    }
+    if browser_wanted(id) {
+        return;
+    }
+    create(id, Some(url), false);
+    super::host::request_pump();
+    super::host::note_activity();
 }
 
 /// Create a windowless browser for a tab.
