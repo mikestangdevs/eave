@@ -13,12 +13,12 @@
 //! 1. **A row exists only for a provider eave can actually drive.** Rows
 //!    are read from [`eave_core::provider::ADAPTERS`] — the table the
 //!    engine spawns from — so a row cannot claim what the engine would
-//!    refuse. `cursor-agent` is catalogued but has no adapter, so it has
-//!    no row *here*: the launcher is where "eave names it and cannot
-//!    drive it" is already stated, and a defaults row for an agent that
-//!    cannot start would be a control wired to nothing. Codex has an
-//!    adapter and a deliberately unproven posture; its row states that
-//!    refusal and offers no defaults.
+//!    refuse. A catalogued provider with no adapter has no row *here*:
+//!    the launcher is where "eave names it and cannot drive it" is
+//!    already stated, and a defaults row for an agent that cannot start
+//!    would be a control wired to nothing. An adapter whose posture is
+//!    unproven still has a row — it states that refusal and offers no
+//!    defaults.
 //! 2. **Posture is a fact, never a setting.** Slice K's whole finding is
 //!    that supplying ANY `--permission-mode` stops the CLI asking, so
 //!    there is nothing here to choose: eave spawns with
@@ -274,8 +274,8 @@ impl AgentRow {
 }
 
 /// The pane's provider list: **exactly the registered adapters**, in
-/// strip order. Catalogued-but-adapterless providers (`cursor-agent`)
-/// are deliberately absent — see stance rule 1 in the module doc.
+/// strip order. Catalogued-but-adapterless providers are deliberately
+/// absent — see stance rule 1 in the module doc.
 pub fn agent_rows() -> Vec<AgentRow> {
     launcher::PROVIDERS
         .iter()
@@ -1207,7 +1207,7 @@ mod tests {
 
     /// Stance rule 1, held: the pane's rows are exactly the registered
     /// adapters — every row can be spawned or carries the registry's own
-    /// refusal, and `cursor-agent` (catalogued, no adapter) has no row.
+    /// refusal.
     #[test]
     fn the_rows_are_exactly_the_registered_adapters() {
         let rows = agent_rows();
@@ -1220,9 +1220,12 @@ mod tests {
             );
         }
         assert!(
-            !rows.iter().any(|r| r.id == "cursor-agent"),
-            "cursor-agent has no adapter: a defaults row for it would be a control wired to \
-             nothing (the launcher already states the absence)"
+            rows.iter().any(|r| r.id == "cursor-agent"),
+            "cursor-agent has an adapter: the pane must list it so defaults can be set"
+        );
+        assert!(
+            rows.iter().any(|r| r.id == "codex"),
+            "codex has an adapter: the pane must list it so defaults can be set"
         );
     }
 
@@ -1236,8 +1239,7 @@ mod tests {
 
     /// Defaults are offered exactly where the engine would spawn — the
     /// same predicate (`posture_is_verified`) the launcher's click and
-    /// the engine's gate use. Codex is today's negative case: adapter
-    /// present, posture deliberately unproven, so no defaults.
+    /// the engine's gate use.
     #[test]
     fn defaults_are_editable_exactly_where_the_engine_would_spawn() {
         for row in agent_rows() {
@@ -1249,13 +1251,10 @@ mod tests {
             );
         }
         let codex = agent_rows().into_iter().find(|r| r.id == "codex");
-        if let Some(codex) = codex {
-            assert!(
-                !codex.defaults_editable(),
-                "codex's posture is unproven on purpose (Slice AU); a defaults row would \
-                 promise a spawn the engine refuses"
-            );
-        }
+        assert!(
+            codex.is_some_and(|c| c.defaults_editable()),
+            "codex is posture-verified, so its defaults row must be editable"
+        );
     }
 
     /// Every row states something true about itself: ready rows have no

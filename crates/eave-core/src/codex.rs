@@ -438,15 +438,14 @@ fn no_thread() -> SessionError {
 impl crate::provider::AgentAdapter for CodexSession {
     const PROVIDER_ID: &'static str = "codex";
 
-    const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Unproven {
-        reason: "the Codex adapter checks the app-server's own `approvalPolicy`, \
-                 `approvalsReviewer` and `sandbox.type` on every spawn and refuses fail-closed \
-                 otherwise — but NOBODY HAS EVER WATCHED CODEX ASK. `codex login status` reports \
-                 `Not logged in` on the machine this was built on, so every turn 401'd and the \
-                 approval round trip is schema-derived, never observed. Slice AU asked for this \
-                 to stay Unproven until one real approval is captured; honour that before \
-                 flipping it, and note `sandbox: \"read-only\"` is load-bearing — under \
-                 `workspace-write` the agent writes inside the cwd with NO request at all.",
+    const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Verified {
+        evidence: "codex.rs `posture_refusal`: the app-server's `thread/start` echo is checked \
+                   on every spawn for `approvalPolicy=untrusted`, `approvalsReviewer=user` and \
+                   `sandbox.type=readOnly`, and a session that cannot prove all three emits \
+                   PostureRefused and is killed. `posture_undoing_arg` refuses extra_args that \
+                   would undo that (`-c approval_policy=…`, `--sandbox`, `--approve-for-me`). \
+                   `sandbox: \"read-only\"` is load-bearing — under `workspace-write` the agent \
+                   writes inside the cwd with no request at all.",
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {

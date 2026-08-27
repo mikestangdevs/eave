@@ -5379,10 +5379,9 @@ fn a_provider_with_no_adapter_takes_no_click(cx: &mut TestAppContext) {
     let dead: Vec<usize> = (0..crate::launcher::PROVIDERS.len())
         .filter(|ix| !live.contains(ix))
         .collect();
-    assert!(!dead.is_empty(), "nothing to prove if every tile is live");
 
     let before = picked(vcx);
-    for ix in dead {
+    for ix in &dead {
         click(
             vcx,
             Box::leak(format!("provider-tile-{ix}").into_boxed_str()),
@@ -5394,6 +5393,10 @@ fn a_provider_with_no_adapter_takes_no_click(cx: &mut TestAppContext) {
             "clicking tile {ix} moved the selection, but eave cannot start it",
         );
     }
+    assert!(
+        dead.is_empty(),
+        "every named provider now has a verified adapter; a dead tile would still take no click"
+    );
 }
 
 /// Start emits the command, carrying the chosen provider and — by default
@@ -5515,9 +5518,10 @@ fn the_launcher_says_whose_model_list_it_is_showing(cx: &mut TestAppContext) {
 /// of it — eave does not validate models (P2 caveat 5), so the flag would
 /// travel all the way to a child process before anything complained.
 ///
-/// Skipped rather than faked if a second provider is ever live: the test
-/// needs two live tiles, and inventing one would defeat the honesty this
-/// whole slice is built on.
+/// Codex is tile 1 and is live, so a switch lands on its own preselection
+/// rather than carrying Claude's id across — eave does not validate
+/// models (P2 caveat 5), so a leftover flag would travel all the way to
+/// a child process before anything complained.
 #[gpui::test]
 fn switching_provider_clears_a_model_it_would_not_understand(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -5531,9 +5535,6 @@ fn switching_provider_clears_a_model_it_would_not_understand(cx: &mut TestAppCon
         Some("claude-opus-5"),
     );
 
-    // No second live provider exists today, so drive the state directly —
-    // the clearing rule lives in `pick_provider`, and this reaches it the
-    // same way a click would.
     h.window
         .update(vcx, |shell, _, cx| shell.pick_provider(1, cx))
         .unwrap();
@@ -5541,8 +5542,8 @@ fn switching_provider_clears_a_model_it_would_not_understand(cx: &mut TestAppCon
     assert_eq!(
         vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
             .unwrap(),
-        None,
-        "a model alias survived a provider switch",
+        Some("gpt-5.6-terra"),
+        "Claude's model survived a switch onto Codex",
     );
 }
 

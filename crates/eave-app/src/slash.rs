@@ -1283,11 +1283,9 @@ mod tests {
 
     /// **The surveyed roots table, pinned.**
     ///
-    /// eave cannot start Codex, Cursor or Grok — `launcher::PROVIDERS`
-    /// gives five of six providers an empty `models` list and the launcher
-    /// says "no adapter yet". So nothing in the app can exercise these
-    /// paths, and without this test the survey behind them would rot
-    /// silently until the day an adapter lands.
+    /// The survey is load-bearing even when a provider is live: a wrong
+    /// root would silently miss skills. This pins the shape of that
+    /// knowledge rather than a directory listing.
     ///
     /// It asserts the SHAPE of the knowledge, not a directory listing:
     /// which roots exist per provider, in which order, and — the part that

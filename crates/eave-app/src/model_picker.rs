@@ -479,8 +479,18 @@ mod tests {
         let names: Vec<&str> = grok.iter().map(|e| e.model).collect();
         assert_eq!(names, vec!["grok-4.6", "grok-4.5"], "{names:?}");
         assert!(entries_for_provider(named_provider("hermes")).is_empty());
-        assert!(entries_for_provider(named_provider("codex")).is_empty());
-        assert!(entries_for_provider(named_provider("cursor-agent")).is_empty());
+        let codex: Vec<&str> = entries_for_provider(named_provider("codex"))
+            .iter()
+            .map(|e| e.model)
+            .collect();
+        assert_eq!(codex[0], "gpt-5.6-terra", "{codex:?}");
+        assert!(codex.contains(&"gpt-5.6-luna"), "{codex:?}");
+        let cursor: Vec<&str> = entries_for_provider(named_provider("cursor-agent"))
+            .iter()
+            .map(|e| e.model)
+            .collect();
+        assert_eq!(cursor[0], "composer-2.5", "{cursor:?}");
+        assert!(cursor.contains(&"grok-4.6"), "{cursor:?}");
     }
 
     #[test]
@@ -517,6 +527,12 @@ mod tests {
             display_name("cursor-agent", "grok-4.6"),
             "Cursor Grok 4.6"
         );
+        assert_eq!(
+            display_name("cursor-agent", "composer-2.5"),
+            "Composer 2.5"
+        );
+        assert_eq!(display_name("codex", "gpt-5.6-luna"), "GPT-5.6 Luna");
+        assert_eq!(display_name("codex", "gpt-5.6-terra"), "GPT-5.6 Terra");
         assert_eq!(display_name("grok", "grok-4.6"), "Grok 4.6");
         assert_eq!(
             display_name("pi", "anthropic/claude-opus-4-5"),

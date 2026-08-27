@@ -350,10 +350,13 @@ async fn a_provider_eave_cannot_drive_is_refused_and_leaves_no_session_behind() 
 /// chooses the binary.** They used to be one field, which is why the
 /// engine's default provider was called `fake-agent` in every test run.
 ///
-/// Driven with `EAVE_PROVIDER` pointed at a provider eave names and
-/// cannot drive: a session that configures nothing at all inherits it and
-/// is refused at spawn, naming it. That proves the default provider is
-/// really what selects the adapter rather than decoration on a header.
+/// Driven with `EAVE_PROVIDER` pointed at a catalogued provider that is
+/// not the shipped default: a session that configures nothing at all
+/// inherits it. That proves the default provider is really what selects
+/// the adapter rather than decoration on a header.
+///
+/// Does not send a turn — Cursor is a verified adapter now, and a send
+/// would spawn the real `cursor-agent` if it is on the machine.
 #[tokio::test]
 async fn the_engines_default_provider_selects_the_adapter() {
     let dir = scratch();
@@ -367,15 +370,13 @@ async fn the_engines_default_provider_selects_the_adapter() {
         info.provider, "cursor-agent",
         "the session inherited the engine's provider as a fact about itself"
     );
-
-    let err = tokio::time::timeout(Duration::from_secs(20), c.send(&sid, "hello"))
-        .await
-        .expect("the engine never answered")
-        .expect_err("a provider with no adapter must not spawn");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("cursor-agent"),
-        "the refusal must name the provider it inherited: {msg}"
+        eave_core::provider::adapter("cursor-agent").is_some(),
+        "cursor-agent must have an adapter for the inherited id to be drivable"
+    );
+    assert!(
+        eave_core::session::posture_is_verified("cursor-agent"),
+        "cursor-agent is the adapter this test inherited; its posture must be verified"
     );
 }
 

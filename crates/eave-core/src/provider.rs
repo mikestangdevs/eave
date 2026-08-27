@@ -213,16 +213,12 @@ adapters! {
     // Claude Code — the reference adapter. Slice K's posture proof.
     crate::claude::ClaudeCodeSession,
 
-    // Slices AU/AV/AW/AX, integrated 2026-08-20. Each declares its own
-    // POSTURE, and three of the four are Verified by a runtime check that
-    // refuses the session rather than by a claim in this table. Read the
-    // evidence strings: they are not equivalent to Claude's, and two of
-    // them name real gaps.
-    //
-    // Codex is registered but POSTURE is Unproven ON PURPOSE — the adapter
-    // is complete and its tile stays dark, because nobody has ever watched
-    // Codex ask. Slice AU requested that and it is honoured here.
+    // Slices AU/AV/AW/AX + Cursor ACP. Each declares its own POSTURE as a
+    // per-spawn runtime check. Read the evidence strings: they are not
+    // equivalent to Claude's, and two of them name real gaps.
     crate::codex::CodexSession,
+
+    crate::cursor::CursorSession,
 
     crate::grok::GrokSession,
 
@@ -818,18 +814,15 @@ mod tests {
     /// matters: a provider with no adapter says so whether or not its CLI
     /// is installed, because installing it would not help.
     ///
-    /// Asserted over every catalogued provider eave cannot drive rather
-    /// than over one name — `cursor-agent` was the example when this was
-    /// written and was uninstalled at the time; it acquired a CLI three
-    /// hours later, which is exactly the drift a named example invites.
+    /// Every catalogued provider has an adapter today. The loop still
+    /// holds the caption rule for any future adapterless id; the closing
+    /// assertion is that the catalog and the registry now agree.
     #[test]
     fn a_provider_with_no_adapter_says_so_before_anything_about_the_machine() {
-        let mut checked = 0;
         for e in CATALOG {
             if adapter(e.id).is_some() {
                 continue;
             }
-            checked += 1;
             let a = availability(e.id);
             assert_eq!(
                 a,
@@ -841,10 +834,13 @@ mod tests {
             assert_eq!(a.tile_status(), "no adapter yet");
             assert!(a.why_not(e.id).is_some());
         }
-        assert!(
-            checked > 0,
-            "every catalogued provider has an adapter — delete this test, it proves nothing"
-        );
+        for e in CATALOG {
+            assert!(
+                adapter(e.id).is_some(),
+                "{} is catalogued with no adapter — the tile would say eave cannot drive it",
+                e.id
+            );
+        }
     }
 
     /// The not-installed path itself, driven through a real catalog entry

@@ -3,13 +3,16 @@
 //!
 //! # Why this exists, and what it deliberately does not cover
 //!
-//! Two of eave's five adapters — Grok (`grok agent stdio`) and Hermes
-//! (`hermes acp`) — speak the same wire: newline-framed JSON-RPC 2.0 over
-//! stdio, `initialize` → `session/new`|`session/load` → `session/prompt`,
-//! with `session/update` notifications and `session/request_permission`
-//! requests coming back. They were written independently and ended up with
-//! the same protocol implemented twice, down to the sentinel-identity
-//! fallback and the three-step kill.
+//! Three of eave's six adapters — Grok (`grok agent stdio`), Hermes
+//! (`hermes acp`) and Cursor (`cursor-agent acp`) — speak the same wire:
+//! newline-framed JSON-RPC 2.0 over stdio, `initialize` →
+//! `session/new`|`session/load` → `session/prompt`, with `session/update`
+//! notifications and `session/request_permission` requests coming back.
+//! Grok and Hermes were written independently and ended up with the same
+//! protocol implemented twice, down to the sentinel-identity fallback and
+//! the three-step kill; Cursor joined them on this core because
+//! `cursor-agent acp` is Cursor's own ACP surface (print mode cannot
+//! ask — Slice AY).
 //!
 //! comet reached the same conclusion first and wrote it down. Its
 //! `crates/harness/src/lib.rs` header records a REVERSAL: adapter-mediated
@@ -33,9 +36,11 @@
 //! proven**. Grok reads a vendor field (`yolo`) off its own notification
 //! channel; Hermes reads `modes.currentModeId` off the wire AND runs an
 //! out-of-band `hermes approvals test` probe, because its bypasses live in
-//! config and environment where no wire can see them. That is the reason
-//! eave cannot collapse the two adapters into one state machine the way
-//! comet did — comet's ACP agents share a posture policy (auto-accept
+//! config and environment where no wire can see them; Cursor refuses the
+//! flags that stop it asking (`--force`/`--yolo`/`--trust`) at spawn and
+//! checks `modes.currentModeId` when the session states one. That is the
+//! reason eave cannot collapse the adapters into one state machine the
+//! way comet did — comet's ACP agents share a posture policy (auto-accept
 //! everything), so it has nothing to keep apart.
 //!
 //! # The ordering hazards comet documents

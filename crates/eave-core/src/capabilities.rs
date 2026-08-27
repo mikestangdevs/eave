@@ -243,12 +243,9 @@ pub enum Freshness {
     /// asking is the first one.
     Unasked,
     /// **eave will not spawn this provider, so it will not ask it either.**
-    /// Codex is here today: its `model/list` answers instantly (verified
-    /// live 2026-08-21), and eave still does not send it, because
-    /// `codex.rs` declares its posture `Unproven` and a probe that ran
-    /// anyway would be a way to start a refused CLI with a friendly name
-    /// on it. The day that posture is proven this row lights up with no
-    /// further code.
+    /// A discovery spawn of a CLI eave refuses to run for a session is the
+    /// same spawn with a friendlier name. Every catalogued provider is
+    /// verified today, so this arm is the gate for a future unproven id.
     Refused,
     /// A probe is out. eave's own list is on screen meanwhile.
     Asking,
@@ -1056,12 +1053,10 @@ mod tests {
         forget();
     }
 
-    /// **A probe is not a way around the posture gate.** Codex answers
-    /// `model/list` in well under a second — verified live 2026-08-21
-    /// against `codex` 0.148.0 — and eave still does not ask, because
-    /// `codex.rs` declares `PostureProof::Unproven` and a discovery spawn
-    /// of a CLI eave refuses to run for a session is the same spawn with a
-    /// friendlier name. The picker says so rather than looking pending.
+    /// **A probe is not a way around the posture gate.** An unproven
+    /// provider is not asked, because a discovery spawn of a CLI eave
+    /// refuses to run for a session is the same spawn with a friendlier
+    /// name. The picker says so rather than looking pending.
     #[test]
     fn a_provider_eave_would_not_spawn_is_not_probed_either() {
         let _turn = super::probe_test_lock();
@@ -1146,7 +1141,6 @@ mod tests {
     /// gate is broken is a test that runs a refused CLI on regression.
     #[test]
     fn eave_will_not_spawn_a_cli_it_refuses_to_drive() {
-        let mut checked = 0;
         for e in crate::provider::CATALOG {
             if crate::session::posture_is_verified(e.id) {
                 assert!(may_probe(e.id), "{} is drivable, so it is askable", e.id);
@@ -1157,12 +1151,14 @@ mod tests {
                      spawn with a friendlier name",
                     e.id,
                 );
-                checked += 1;
             }
         }
-        assert!(
-            checked > 0,
-            "no unproven provider in the catalog — this test would pass vacuously"
-        );
+        for e in crate::provider::CATALOG {
+            assert!(
+                crate::session::posture_is_verified(e.id),
+                "{} is catalogued without a verified posture",
+                e.id
+            );
+        }
     }
 }

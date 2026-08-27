@@ -166,20 +166,29 @@ pub const PROVIDERS: &[Provider] = &[
         // OpenAI's mark stands in: the set carries no separate Codex mark,
         // which is also what comet does.
         mark: icons::OPENAI_MARK,
-        // Empty: Codex posture is Unproven, and a picker of models for an
-        // agent eave will not spawn is a mocked-up UI
-        // (`a_provider_eave_cannot_drive_offers_no_models`). The CLI's
-        // `model/list` still fills this the day the posture is proven.
-        models: &[],
+        // Native ids `codex app-server`'s `model/list` takes, from
+        // MonoCode's `codexCatalog` / `codexProtocol` fixtures. First is
+        // the row those fixtures mark `isDefault`. The live probe
+        // outranks this the moment it answers (Slice CK).
+        models: &[
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.4",
+            "gpt-5.3-codex",
+        ],
     },
     Provider {
         id: "cursor-agent",
         name: "Cursor",
         mark: icons::CURSOR_MARK,
-        // Empty: no adapter. Native ids (composer-2.5, grok-4.6, …) live
-        // in `model_picker::display_name` so a future adapter lights up
-        // without a second catalog.
-        models: &[],
+        // Native ids `cursor-agent --list-models` / ACP catalog take, from
+        // MonoCode's `MODELS` (`cursor:composer-2.5` is their default).
+        models: &[
+            "composer-2.5",
+            "gpt-5.4",
+            "claude-sonnet-4-6",
+            "grok-4.6",
+        ],
     },
     Provider {
         id: "grok",
@@ -510,6 +519,13 @@ mod tests {
         assert_eq!(claude.models[0], "claude-sonnet-5");
         let grok = PROVIDERS.iter().find(|p| p.id == "grok").expect("grok");
         assert_eq!(grok.models, &["grok-4.6", "grok-4.5"]);
+        let codex = PROVIDERS.iter().find(|p| p.id == "codex").expect("codex");
+        assert_eq!(codex.models[0], "gpt-5.6-terra");
+        let cursor = PROVIDERS
+            .iter()
+            .find(|p| p.id == "cursor-agent")
+            .expect("cursor");
+        assert_eq!(cursor.models[0], "composer-2.5");
         let hermes = PROVIDERS.iter().find(|p| p.id == "hermes").expect("hermes");
         assert!(
             hermes.models.is_empty(),
@@ -584,24 +600,16 @@ mod tests {
     /// provider, and collapsing them would throw away the more useful one:
     ///
     /// - `NoAdapter` — nothing in `provider::ADAPTERS` can spawn it.
-    ///   `cursor-agent` today (Slice AY is an unreviewed WIP commit and is
-    ///   deliberately not registered).
     /// - `PostureUnproven` — the adapter exists and works, but eave has not
     ///   established the CLI asks before it writes, so it refuses to run
-    ///   it. **Codex today**: the adapter is complete and checks the
-    ///   app-server's own `approvalPolicy`/`approvalsReviewer`/`sandbox`
-    ///   on every spawn, but nobody has ever watched Codex ask, because
-    ///   `codex login status` said `Not logged in` on the machine it was
-    ///   built on. Slice AU asked for it to stay dark until one real
-    ///   approval is captured.
+    ///   it.
     ///
-    /// What the tile owes a person is unchanged and is what this still
-    /// checks: it draws, it says something true, and it says something
-    /// about **eave** rather than about this machine.
+    /// Every catalogued provider is live today. The loop still holds the
+    /// caption rule for any future undrivable tile; it no longer requires
+    /// one to exist.
     #[test]
     fn a_tile_eave_cannot_drive_still_draws_and_says_why() {
         let dead: Vec<&Provider> = PROVIDERS.iter().filter(|p| !eave_can_drive(p)).collect();
-        assert!(!dead.is_empty(), "nothing to prove if every tile is live");
         for p in dead {
             let a = availability(p);
             assert!(
@@ -619,6 +627,13 @@ mod tests {
                 p.id
             );
             assert!(a.why_not(p.id).is_some());
+        }
+        for p in PROVIDERS {
+            assert!(
+                eave_can_drive(p),
+                "{}: every named provider now has a verified adapter",
+                p.id
+            );
         }
     }
 
@@ -686,9 +701,9 @@ mod tests {
         eave_core::capabilities::forget();
     }
 
-    /// A provider whose static list is empty is exactly where discovery
-    /// pays. Codex stays empty because its posture is Unproven — the CLI's
-    /// `model/list` still fills the picker the moment someone records it.
+    /// A static list is what eave shows *before* the CLI answers. Once
+    /// the CLI has spoken, that list is not consulted — even when eave's
+    /// own guess was already populated (Slice CK).
     #[test]
     fn a_provider_with_no_static_list_still_gets_the_cli_s() {
         let _turn = cache_turn();
@@ -697,8 +712,11 @@ mod tests {
             .iter()
             .find(|p| p.id == "codex")
             .expect("codex tile");
-        assert!(codex.models.is_empty(), "codex has no hand-written list");
-        assert!(model_choices(codex).is_empty());
+        assert!(
+            !codex.models.is_empty(),
+            "codex has a MonoCode-backed static list"
+        );
+        assert_eq!(model_choices(codex), codex.models);
         eave_core::capabilities::record("codex", vec!["gpt-5.4".into(), "gpt-5.3-codex".into()]);
         assert_eq!(
             model_choices(codex),
