@@ -669,6 +669,66 @@ wrap_app! {
                     format!("http://127.0.0.1:{DEVTOOLS_PORT}").as_str(),
                 )),
             );
+            // ── The Google sign-in crash, and what it actually was ──
+            //
+            // Loading any accounts.google.com `signin/challenge/*` page
+            // took the whole app down with SIGSEGV, ~4 s after load, no
+            // interaction — and crash-LOOPED, because the tab journal
+            // restores the challenge page as the active tab. Four
+            // byte-identical crashes on 2026-08-27; reproduced headlessly.
+            //
+            // The symbolicated frame (dSYM for this exact pin) is
+            // `ReadAnythingSoftNavigationObserver::OnSoftNavigation` —
+            // Chrome's READING MODE, watching page-load metrics for SOFT
+            // navigations. Gaia's sign-in is an SPA: identifier →
+            // challenge/pwd (or /pk) is a soft navigation, the observer
+            // fires, and `tabs::TabInterface::GetFromContents` dies on a
+            // WebContents that has no Chrome tab model — which is every
+            // WebContents under alloy/OSR. Its own `if (!tab)` guard sits
+            // one line too late. Gated on `kImmersiveReadAnything`,
+            // ENABLED_BY_DEFAULT at this pin; disabled → the observer
+            // returns before touching anything.
+            //
+            // Two wrong fixes are recorded here so nobody re-walks them:
+            // WebAuthn (`--disable-features=WebAuthentication` did
+            // nothing; the FIDO "Touch ID unavailable" stderr line was a
+            // coincident symptom) and the client-certificate handler
+            // (`on_select_client_certificate` never fired). The crash
+            // reproduces with WebAuthn fully off, on the PASSWORD page.
+            // See docs/reports/bookmark-peek.md.
+            //
+            // MERGE with CEF's own value — an `append_switch_with_value`
+            // on a key CEF also sets REPLACES it (measured: eave's first
+            // attempt wiped `AutofillActorMode,GlicActorUi,…` off the
+            // helper command lines), and CEF's own disabled features are
+            // load-bearing for other alloy holes.
+            let disable_features = CefString::from("disable-features");
+            let existing =
+                CefString::from(&command_line.switch_value(Some(&disable_features)))
+                    .to_string();
+            let merged = if existing.is_empty() {
+                "ImmersiveReadAnything".to_string()
+            } else {
+                format!("{existing},ImmersiveReadAnything")
+            };
+            command_line.append_switch_with_value(
+                Some(&disable_features),
+                Some(&CefString::from(merged.as_str())),
+            );
+            // WebAuthn's API is removed from the renderer separately
+            // (`WebAuth` is a BLINK runtime feature, not a base::Feature).
+            // Not the crash — but the platform authenticator genuinely
+            // cannot work here: it needs the
+            // `.org.chromium.Chromium.webauthn` keychain-access-group
+            // entitlement, which an unsigned bundle cannot carry, so
+            // Chromium logs "Touch ID authenticator unavailable" and the
+            // passkey prompt can only fail. With the API absent, sites
+            // fall back to passwords, which work. Revisit when bundles
+            // are signed with the entitlement.
+            command_line.append_switch_with_value(
+                Some(&CefString::from("disable-blink-features")),
+                Some(&CefString::from("WebAuth")),
+            );
         }
     }
 }
