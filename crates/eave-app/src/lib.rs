@@ -47,6 +47,10 @@ pub mod mentions;
 /// because auto-approve policy is the part worth asserting without gpui.
 pub mod access;
 
+/// Model picker (MonoCode's ModelPicker). Public: tab/search/favorite
+/// logic is pure, so it is tested without a window.
+pub mod model_picker;
+
 /// Composer chrome helpers (placeholders, send/stop, context meter).
 mod composer;
 

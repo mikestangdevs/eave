@@ -57,6 +57,7 @@ use crate::launcher::{self, PROVIDERS};
 use crate::loaders;
 use crate::markdown::{self, inline_runs, Align, Block, InlineRun, Marker};
 use crate::mentions::{self, ProjectFile};
+use crate::model_picker;
 use crate::motion::{self, HoverFade as _};
 use crate::omnibox;
 use crate::overlay::{self, MenuItem, Popup};
@@ -2579,6 +2580,27 @@ fn model_chip_label(model: Option<&str>) -> String {
     model.unwrap_or(launcher::MODEL_DEFAULT).to_string()
 }
 
+/// Provider mark at a picker size. Colour rule is the launcher's: Claude
+/// is the one sourced brand, everyone else is eave's text ink.
+fn picker_mark(provider_id: &str, size: f32, selector: impl Into<String>) -> AnyElement {
+    let mark_ink = if provider_id == "claude-code" {
+        icons::claude_brand()
+    } else {
+        theme::text()
+    };
+    match provider_mark(provider_id) {
+        Some(path) => icons::tagged_icon(path, size, mark_ink, selector).into_any_element(),
+        None => {
+            let (glyph, _) = provider_identity(provider_id);
+            div()
+                .text_size(px(theme::MICRO_SIZE))
+                .text_color(theme::text_secondary_on_wash())
+                .child(SharedString::from(glyph))
+                .into_any_element()
+        }
+    }
+}
+
 /// T3 Code's `ComposerControl` as an eave chip: provider mark, model name,
 /// disclosure chevron.
 fn model_chip(
@@ -2972,6 +2994,57 @@ fn row_marks(info: &SessionInfo) -> Option<String> {
         parts.push(mark);
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Quiet first line of a session card: provider, plus the model when one
+/// was configured. The title stays the hero on the line below.
+fn provider_kicker(info: &SessionInfo, provider_label: &str) -> String {
+    match info.model.as_deref().filter(|m| !m.is_empty()) {
+        Some(model) => format!("{provider_label} {model}"),
+        None => provider_label.to_string(),
+    }
+}
+
+/// Branch when the session has a worktree (`repo/branch`); otherwise the
+/// home-relative cwd. Replaces stacking a files list under the sessions.
+fn row_repo_line(info: &SessionInfo, home: Option<&str>) -> String {
+    if let Some(wt) = info.worktree.as_ref() {
+        let repo = Path::new(&wt.base)
+            .file_name()
+            .or_else(|| Path::new(&info.cwd).file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty());
+        match (repo, wt.branch.as_str()) {
+            (Some(repo), branch) if !branch.is_empty() => format!("{repo}/{branch}"),
+            (Some(repo), _) => repo,
+            (None, branch) if !branch.is_empty() => branch.to_string(),
+            _ => short_cwd(&info.cwd, home),
+        }
+    } else {
+        short_cwd(&info.cwd, home)
+    }
+}
+
+/// Line +/− for a files snapshot. `None` when git did not answer, or when
+/// every file came without counts — never a fake `+0 −0`.
+fn files_diffstat(snap: &FilesSnapshot) -> Option<(u64, u64)> {
+    if !matches!(snap.state, GitState::Ok) {
+        return None;
+    }
+    let mut adds = 0u64;
+    let mut dels = 0u64;
+    for f in &snap.files {
+        adds += f.adds.unwrap_or(0);
+        dels += f.dels.unwrap_or(0);
+    }
+    (adds > 0 || dels > 0).then_some((adds, dels))
+}
+
+/// Age for the card's trailing clock. Fixture timestamps (`created_ts_ms
+/// == 1`) are not ages.
+fn session_age_ms(info: &SessionInfo, now: u64) -> Option<u64> {
+    let start = info.last_activity_ms.unwrap_or(info.created_ts_ms);
+    (start > 1_000).then(|| now.saturating_sub(start))
 }
 
 /// Where a row sorts: when this session's state last moved, or when it was
@@ -5301,6 +5374,9 @@ struct Shell {
     mention: MentionPalette,
     /// Access / runtime-mode menu, anchored on the composer chip.
     access: Popup<Point<Pixels>>,
+    /// MonoCode model picker — tab, search, favorites. The popup's
+    /// open/close/motion is still `launcher.models`.
+    model_picker: model_picker::State,
     /// Project files indexed for `@`, keyed by cwd.
     mention_files: HashMap<String, Vec<ProjectFile>>,
     mention_loading: bool,
@@ -7983,19 +8059,29 @@ impl Shell {
         // menu is not "the typist is still in the composer", and re-anchoring
         // the blink from here would make an arrow key look like a keystroke.
         if self.launcher.models.is_open() {
+            self.model_picker_key(ks, cx);
+            return;
+        }
+        if self.access.is_open() {
             match ks.key.as_str() {
-                "escape" => self.close_model_menu(cx),
+                "escape" => self.close_access_menu(cx),
                 "down" => {
-                    self.launcher.models.highlight_next();
+                    self.access.highlight_next();
                     cx.notify();
                 }
                 "up" => {
-                    self.launcher.models.highlight_prev();
+                    self.access.highlight_prev();
                     cx.notify();
                 }
-                "enter" => match self.launcher.models.highlighted() {
-                    Some(ix) => self.choose_model(ix, cx),
-                    None => self.close_model_menu(cx),
+                "enter" => match self.access.highlighted() {
+                    Some(ix) => {
+                        if let Some(mode) = access::MODES.get(ix).copied() {
+                            self.set_runtime_mode(mode, cx);
+                        } else {
+                            self.close_access_menu(cx);
+                        }
+                    }
+                    None => self.close_access_menu(cx),
                 },
                 _ => {}
             }
@@ -8778,7 +8864,15 @@ impl Shell {
     }
 
     /// ⌘1–⌘8. Strip order, 0-based. Past the end is a silent no-op.
+    ///
+    /// **While the model picker is open, the chord is a row pick.** Same
+    /// reason ⌘W is handled in the action, not in `on_key`: gpui
+    /// dispatches a matched action before bubble-phase listeners, so
+    /// the picker's `on_key` never saw ⌘1–⌘9 and the strip jumped.
     fn activate_nth(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.picker_takes_digit(index, cx) {
+            return;
+        }
         let snapshot = self.strip_snapshot(cx);
         let order = strip::cycle_order(&snapshot);
         let Some(id) = order.get(index) else {
@@ -8787,14 +8881,26 @@ impl Shell {
         self.activate_tab(id, cx);
     }
 
-    /// ⌘9 — the last tab in strip order.
+    /// ⌘9 — the last tab in strip order, or the ninth picker row.
     fn activate_last(&mut self, cx: &mut Context<Self>) {
+        if self.picker_takes_digit(8, cx) {
+            return;
+        }
         let snapshot = self.strip_snapshot(cx);
         let order = strip::cycle_order(&snapshot);
         let Some(id) = order.last() else {
             return;
         };
         self.activate_tab(id, cx);
+    }
+
+    /// ⌘N while MonoCode's picker is up picks visible row N, not a tab.
+    fn picker_takes_digit(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if !self.launcher.models.is_open() {
+            return false;
+        }
+        self.choose_visible_model(index, cx);
+        true
     }
 
     /// ⌘⇧T. The last-closed **page** tab, at the url it last held.
@@ -11109,21 +11215,40 @@ impl Shell {
         )
     }
 
+    /// Files/changes as a face of the rail, not a capped section under
+    /// the session list. `FilesState::collapsed` is inverted: collapsed
+    /// means the sessions face is showing.
+    fn files_face(&self, cx: &App) -> bool {
+        !self.files.read(cx).collapsed
+    }
+
+    fn toggle_files_face(&mut self, cx: &mut Context<Self>) {
+        self.files.update(cx, |f, cx| {
+            f.collapsed = !f.collapsed;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn files_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let open = self.files_face(cx);
         div()
             .id("files-toggle")
             .debug_selector(|| "files-toggle".into())
             .flex_none()
             .p(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS_SELECT))
-            .hover_fade("files-toggle", theme::wash_rest(), theme::overlay())
+            .hover_fade(
+                "files-toggle",
+                if open {
+                    theme::overlay()
+                } else {
+                    theme::wash_rest()
+                },
+                theme::overlay(),
+            )
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.files.update(cx, |f, cx| {
-                    f.collapsed = !f.collapsed;
-                    cx.notify();
-                });
-            }))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_files_face(cx)))
             .child(icons::tagged_icon(
                 icons::SIDEBAR_MINIMALISTIC,
                 theme::ICON_TOGGLE,
@@ -13099,12 +13224,21 @@ impl Shell {
         // whole instead of at 237.
         let meta_indent = theme::RAIL_STRIP_W;
         let sess_count = sessions.len();
+        let files_stat = match (self.files.read(cx).snapshot.clone(), selected.as_deref()) {
+            (Some((sid, Some(snap))), Some(sel)) if sid == sel => files_diffstat(&snap),
+            _ => None,
+        };
+        let now_ms = eave_core::journal::now_ms();
         let rows: Vec<AnyElement> = sessions
             .into_iter()
             .map(|info| {
                 let is_sel = selected.as_deref() == Some(info.session_id.as_str());
                 let (glyph, provider_label) = provider_identity(&info.provider);
                 let label = row_label(&info, &provider_label);
+                let kicker = provider_kicker(&info, &provider_label);
+                let repo_line = row_repo_line(&info, home.as_deref());
+                let age = session_age_ms(&info, now_ms).map(fmt_elapsed);
+                let stat = is_sel.then_some(files_stat).flatten();
                 let dot = state_color(&info.state);
                 // Slice K: the badge counts the open questions when there
                 // is more than one — "waiting on you (3)" is a different
@@ -13338,6 +13472,34 @@ impl Shell {
                                             .into_any_element(),
                                     }),
                             )
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("prov-{}", info.session_id))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(kicker)),
+                            )
+                            .children(age.map(|word| {
+                                div()
+                                    .debug_selector(|| format!("age-{}", info.session_id))
+                                    .flex_none()
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(word))
+                            })),
+                    )
+                    .child(
+                        div()
+                            .pl(px(meta_indent))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
                             .child(match editing_here {
                                 // Stage AC: the rename field, in the
                                 // label's own slot. Same box, same
@@ -13484,32 +13646,22 @@ impl Shell {
                                     .child(SharedString::from(word))
                             })),
                     )
-                    // Slice AO — LINE TWO, and the row ends here in the
-                    // common case. The folder is the thing the operator
-                    // recognises, so it gets the line and the rank; the
-                    // marks are `flex_none` beside it and the folder
-                    // truncates against them, because a path can be
-                    // half-read from its tail and a count cannot be
-                    // half-read at all.
-                    //
-                    // **Slice D3 tried to give the marks their own line so a
-                    // narrow rail could state both whole, and
-                    // `a_session_row_is_two_lines` refused it at 79 px
-                    // against a 64 px ceiling.** That ceiling is AO's entire
-                    // point — "the rail's whole problem was rows that cost
-                    // four lines apiece" — so height is not available to buy
-                    // width with, and the two facts keep sharing this line.
-                    // What that costs is written down in
-                    // `theme::RAIL_W_MIN`: it is the reason the rail's floor
-                    // is where it is rather than at the 180 the directive
-                    // asked for.
+                    // LINE THREE — branch / cwd, and the selected session's
+                    // diffstat. Files no longer sit under this list; the
+                    // +/− is the summary, the footer is the door.
                     .child(
                         div()
                             .pl(px(meta_indent))
                             .flex()
                             .flex_row()
-                            .items_baseline()
+                            .items_center()
                             .gap(px(theme::SPACE_2))
+                            .child(icons::tagged_icon(
+                                icons::GIT_BRANCH,
+                                theme::ICON_STATUS,
+                                theme::text_tertiary(),
+                                format!("git-{}", info.session_id),
+                            ))
                             .child(
                                 div()
                                     .debug_selector(|| format!("cwd-{}", info.session_id))
@@ -13519,11 +13671,39 @@ impl Shell {
                                     .text_size(px(theme::DETAIL_SIZE))
                                     .line_height(px(theme::DETAIL_LINE))
                                     .text_color(theme::text_secondary())
-                                    .child(SharedString::from(short_cwd(
-                                        &info.cwd,
-                                        home.as_deref(),
-                                    ))),
+                                    .child(SharedString::from(repo_line)),
                             )
+                            .children(stat.map(|(adds, dels)| {
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "stat-{}",
+                                        info.session_id
+                                    )))
+                                    .debug_selector(|| format!("stat-{}", info.session_id))
+                                    .flex_none()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(theme::SPACE_1))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_files_face(cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .text_color(theme::success())
+                                            .child(format!("+{adds}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .text_color(theme::danger())
+                                            .child(format!("-{dels}")),
+                                    )
+                            }))
                             .children(marks.map(|line| {
                                 div()
                                     .debug_selector(|| format!("marks-{}", info.session_id))
@@ -13878,7 +14058,12 @@ impl Shell {
             // the sessions scroller is what made these zones too far
             // apart; the rule carries its own 8 px of air.
             .child(self.zone_rule("sessions-divider"))
-            .child(
+            // Experiment: the session list and the files list are faces of
+            // the same slot. Footer library (and the pane-header toggle)
+            // swaps them. Sessions are the default; files take the full
+            // leftover height when open, so they are no longer a capped
+            // footer under the cards.
+            .children((!self.files_face(cx)).then(|| {
                 edge_faded(
                     theme::RAIL_FADE_BAND,
                     true,
@@ -13896,16 +14081,10 @@ impl Shell {
                         .gap(px(theme::RAIL_ROW_GAP))
                         .children(rows),
                 )
-                .fade_overflow_y(&self.rail_scroll),
-            )
-            // Slice D1: the changes section, between the session list it is
-            // about and the resource line that aggregates over all of them.
-            // Collapsible from the pane header's trailing toggle, which is
-            // where the titlebar's `files-toggle` went.
-            .children((!self.files.read(cx).collapsed).then(|| self.files_rail(cx, phase)))
-            // The rail footer (operator directive 2026-08-25) — the
-            // resource lines' old slot. The Stage L facts it displaced
-            // moved into the footer's library menu; see `library_menu`.
+                .fade_overflow_y(&self.rail_scroll)
+                .into_any_element()
+            }))
+            .children(self.files_face(cx).then(|| self.files_rail(cx, phase)))
             .child(self.rail_footer(cx))
             .into_any_element()
     }
@@ -13918,6 +14097,7 @@ impl Shell {
         &self,
         id: &'static str,
         icon: &'static str,
+        active: bool,
         on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -13927,7 +14107,15 @@ impl Shell {
             .flex_none()
             .p(px(theme::SPACE_1))
             .rounded(px(theme::scaled_radius(theme::RADIUS_SELECT)))
-            .hover_fade(id, gpui::transparent_black(), theme::overlay())
+            .hover_fade(
+                id,
+                if active {
+                    theme::overlay()
+                } else {
+                    gpui::transparent_black()
+                },
+                theme::overlay(),
+            )
             .cursor_pointer()
             .on_click(cx.listener(on_click))
             .child(icons::tagged_icon(
@@ -13965,12 +14153,14 @@ impl Shell {
             .child(self.footer_button(
                 "footer-library",
                 icons::ARCHIVE_MINIMALISTIC,
-                |this, ev, _, cx| this.open_library_menu(ev.position(), cx),
+                self.files_face(cx),
+                |this, _, _, cx| this.toggle_files_face(cx),
                 cx,
             ))
             .child(self.footer_button(
                 "footer-theme",
                 icons::PAINT_BRUSH,
+                false,
                 |this, _, window, cx| this.toggle_theme_popup(window, cx),
                 cx,
             ))
@@ -13978,6 +14168,7 @@ impl Shell {
             .child(self.footer_button(
                 "footer-plus",
                 icons::ADD,
+                false,
                 |this, ev, _, cx| this.open_plus_menu(ev.position(), cx),
                 cx,
             ))
@@ -14155,26 +14346,14 @@ impl Shell {
             }
             _ => None,
         };
-        // **Slice D1 — a SECTION of the rail, not a rail.**
-        //
-        // It was a second 248 px column on the right, `FILES_RAIL_W` defined
-        // literally as `= RAIL_W`, and that symmetry is what made the whole
-        // window read as an IDE: two panels docked either side of a document.
-        // All three frame proposals deleted it independently — the strongest
-        // signal in the D1 paper, because three different starting points
-        // agreeing is not taste.
-        //
-        // It keeps every fact and every affordance it had. What it loses is
-        // its own edge of the window and its own width; it is `flex_none`
-        // under the session list, capped, with its own scroller, so a repo
-        // with two hundred changed files cannot push the sessions off screen.
+        // Files face of the rail — full leftover height, not a capped
+        // section under the session list. Downloads / Memory / Settings
+        // stay on `files-library` (the old library menu).
         div()
             .debug_selector(|| "files-section".into())
             .w_full()
-            .flex_none()
-            .max_h(px(theme::files_section_max_h()))
-            .border_t_1()
-            .border_color(theme::border())
+            .flex_1()
+            .min_h(px(0.))
             .flex()
             .flex_col()
             .child(
@@ -14195,15 +14374,45 @@ impl Shell {
                             .text_color(theme::text_tertiary())
                             .child("changes"),
                     )
-                    .children(count_label.map(|n| {
+                    .child(
                         div()
-                            .debug_selector(|| "files-count".into())
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .font_family(theme::MONO)
-                            .text_color(theme::text_tertiary())
-                            .child(SharedString::from(n.to_string()))
-                    })),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .children(count_label.map(|n| {
+                                div()
+                                    .debug_selector(|| "files-count".into())
+                                    .text_size(px(theme::SMALL_SIZE))
+                                    .line_height(px(theme::SMALL_LINE))
+                                    .font_family(theme::MONO)
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(n.to_string()))
+                            }))
+                            .child(
+                                div()
+                                    .id("files-library")
+                                    .debug_selector(|| "files-library".into())
+                                    .flex_none()
+                                    .p(px(theme::SPACE_1))
+                                    .rounded(px(theme::scaled_radius(theme::RADIUS_SELECT)))
+                                    .hover_fade(
+                                        "files-library",
+                                        theme::wash_rest(),
+                                        theme::overlay(),
+                                    )
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                                        this.open_library_menu(ev.position(), cx);
+                                    }))
+                                    .child(icons::tagged_icon(
+                                        icons::SETTINGS_MINIMALISTIC,
+                                        theme::ICON_SM,
+                                        theme::text_tertiary(),
+                                        "files-library-glyph",
+                                    )),
+                            ),
+                    ),
             )
             // Slice AA: the basis toggle. Its own row rather than a third
             // item in the header — the labels are words, not glyphs, and
@@ -18276,29 +18485,76 @@ impl Shell {
         (self.provider(), self.launcher.model.map(str::to_string))
     }
 
-    fn model_items(&self, cx: &App) -> Vec<MenuItem> {
-        let (provider, current) = self.picker_target(cx);
-        launcher::model_choices(provider)
+    fn picker_provider_ix(&self, cx: &App) -> usize {
+        let (provider, _) = self.picker_target(cx);
+        PROVIDERS
             .iter()
-            .map(|m| {
-                let is_current = match current.as_deref() {
-                    Some(c) => c == *m,
-                    None => *m == launcher::MODEL_DEFAULT,
-                };
-                let row = MenuItem::new(*m);
-                if is_current {
-                    row.trailing("✓")
-                } else {
-                    row
-                }
-            })
-            .collect()
+            .position(|p| p.id == provider.id)
+            .unwrap_or(self.launcher.provider)
+    }
+
+    fn picker_visible(&self) -> Vec<model_picker::Entry> {
+        model_picker::visible(
+            self.model_picker.tab,
+            &self.model_picker.query,
+            &self.model_picker.favorites,
+        )
+    }
+
+    fn picker_store_path() -> Option<PathBuf> {
+        DATA_DIR
+            .get()
+            .map(|d| model_picker::store_path(d))
+    }
+
+    fn persist_model_picker(&self) {
+        let Some(path) = Self::picker_store_path() else {
+            return;
+        };
+        model_picker::save(
+            &path,
+            &model_picker::Persist {
+                favorites: self.model_picker.favorites.clone(),
+                tab: Some(self.model_picker.tab),
+            },
+        );
+    }
+
+    fn toggle_model_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.launcher.models.is_open() {
+            self.close_model_menu(cx);
+        } else {
+            self.open_model_menu(at, cx);
+        }
     }
 
     fn open_model_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.access.is_open() {
+            self.close_access_menu(cx);
+        }
         let now = cx.background_executor().now();
-        let enabled = self.model_items(cx).iter().map(|i| i.enabled).collect();
-        self.launcher.models.open(at, enabled, now);
+        let current_ix = self.picker_provider_ix(cx);
+        if let Some(path) = Self::picker_store_path() {
+            let stored = model_picker::load(&path);
+            self.model_picker.favorites = stored.favorites;
+            self.model_picker.tab = model_picker::opening_tab(stored.tab, current_ix);
+        } else {
+            self.model_picker.tab = model_picker::opening_tab(None, current_ix);
+        }
+        self.model_picker.query.clear();
+        let rows = self.picker_visible();
+        let (_, current) = self.picker_target(cx);
+        self.model_picker.active = rows
+            .iter()
+            .position(|e| {
+                e.provider_ix == current_ix
+                    && match current.as_deref() {
+                        Some(c) => e.model == c,
+                        None => e.model == launcher::MODEL_DEFAULT,
+                    }
+            })
+            .unwrap_or(0);
+        self.launcher.models.open(at, vec![true; rows.len()], now);
         cx.notify();
     }
 
@@ -18317,32 +18573,146 @@ impl Shell {
         cx.notify();
     }
 
-    fn choose_model(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let (provider, current) = self.picker_target(cx);
-        let Some(m) = launcher::model_choices(provider).get(ix).copied() else {
+    fn set_picker_tab(&mut self, tab: model_picker::Tab, cx: &mut Context<Self>) {
+        if let model_picker::Tab::Provider(ix) = tab {
+            if !model_picker::available_ix(ix) {
+                return;
+            }
+        }
+        self.model_picker.tab = tab;
+        self.model_picker.active = 0;
+        self.persist_model_picker();
+        cx.notify();
+    }
+
+    fn toggle_picker_favorite(&mut self, id: String, cx: &mut Context<Self>) {
+        self.model_picker.toggle_favorite(id);
+        self.persist_model_picker();
+        let n = self.picker_visible().len();
+        self.model_picker.clamp_active(n);
+        cx.notify();
+    }
+
+    fn choose_visible_model(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let rows = self.picker_visible();
+        let Some(entry) = rows.get(ix).copied() else {
             self.close_model_menu(cx);
             return;
         };
-        let model = if m == launcher::MODEL_DEFAULT {
+        self.choose_entry(entry, cx);
+    }
+
+    fn choose_entry(&mut self, entry: model_picker::Entry, cx: &mut Context<Self>) {
+        if !entry.enabled() {
+            return;
+        }
+        let model = if entry.model == launcher::MODEL_DEFAULT {
             None
         } else {
-            Some(m)
+            Some(entry.model)
         };
-        let same = current.as_deref() == model;
+        let (provider, current) = self.picker_target(cx);
+        let same_provider = provider.id == entry.provider().id;
+        let same_model = current.as_deref() == model;
         if self.transcript.read(cx).session_id.is_some() {
             // A session's agent is fixed at open (`Engine::reject_config_change`).
-            if !same {
-                if let Some(provider_ix) = PROVIDERS.iter().position(|p| p.id == provider.id) {
-                    self.launcher.provider = provider_ix;
-                }
+            if !(same_provider && same_model) {
+                self.launcher.provider = entry.provider_ix;
                 self.launcher.model = model;
                 self.new_session();
                 self.launch(cx);
             }
         } else {
+            self.launcher.provider = entry.provider_ix;
             self.launcher.model = model;
         }
         self.close_model_menu(cx);
+    }
+
+    fn model_picker_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) {
+        let n = self.picker_visible().len();
+        match ks.key.as_str() {
+            "escape" => {
+                self.close_model_menu(cx);
+                return;
+            }
+            "down" => {
+                self.model_picker.step_active(n, 1);
+                cx.notify();
+                return;
+            }
+            "up" => {
+                self.model_picker.step_active(n, -1);
+                cx.notify();
+                return;
+            }
+            "left" => {
+                self.set_picker_tab(
+                    model_picker::step_tab(
+                        self.model_picker.tab,
+                        -1,
+                        model_picker::available_ix,
+                    ),
+                    cx,
+                );
+                return;
+            }
+            "right" => {
+                self.set_picker_tab(
+                    model_picker::step_tab(
+                        self.model_picker.tab,
+                        1,
+                        model_picker::available_ix,
+                    ),
+                    cx,
+                );
+                return;
+            }
+            "enter" => {
+                self.choose_visible_model(self.model_picker.active, cx);
+                return;
+            }
+            "backspace" => {
+                self.model_picker.query.pop();
+                let n = self.picker_visible().len();
+                self.model_picker.clamp_active(n);
+                cx.notify();
+                return;
+            }
+            "v" if ks.modifiers.platform => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    self.model_picker.query.push_str(&text);
+                    let n = self.picker_visible().len();
+                    self.model_picker.clamp_active(n);
+                    cx.notify();
+                }
+                return;
+            }
+            key if ks.modifiers.platform
+                && !ks.modifiers.alt
+                && !ks.modifiers.shift
+                && key.len() == 1
+                && key.as_bytes()[0].is_ascii_digit() =>
+            {
+                let d = key.as_bytes()[0] - b'0';
+                if (1u8..=9u8).contains(&d) {
+                    self.choose_visible_model((d - 1) as usize, cx);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if ks.modifiers.platform || ks.modifiers.control {
+            return;
+        }
+        if let Some(ch) = ks.key_char.clone() {
+            if ch.chars().all(|c| !c.is_control()) {
+                self.model_picker.query.push_str(&ch);
+                let n = self.picker_visible().len();
+                self.model_picker.clamp_active(n);
+                cx.notify();
+            }
+        }
     }
 
     /// Pick a provider tile.
@@ -18450,29 +18820,363 @@ impl Shell {
         let now = cx.background_executor().now();
         let reduced = cx.reduce_motion();
         let live = self.launcher.models.is_open();
-        let highlighted = self.launcher.models.highlighted();
-        let rows = self
-            .model_items(cx)
-            .iter()
-            .enumerate()
-            .map(|(ix, item)| {
-                overlay::menu_row(
-                    ix,
-                    item,
-                    highlighted == Some(ix),
-                    live,
-                    cx.listener(move |this, _: &ClickEvent, _, cx| this.choose_model(ix, cx)),
+        let tab = self.model_picker.tab;
+        let query = self.model_picker.query.clone();
+        let active = self.model_picker.active;
+        let (cur_provider, cur_model) = self.picker_target(cx);
+        let current_id = match cur_model.as_deref() {
+            Some(m) => format!("{}:{m}", cur_provider.id),
+            None => format!("{}:{}", cur_provider.id, launcher::MODEL_DEFAULT),
+        };
+        let rows = self.picker_visible();
+        let empty = model_picker::empty_label(tab, &query);
+
+        let tabs = div()
+            .debug_selector(|| "model-picker-tabs".into())
+            .flex()
+            .flex_row()
+            .flex_none()
+            .w_full()
+            .border_b_1()
+            .border_color(theme::edge_modal())
+            .child(self.picker_tab_button(
+                "model-picker-tab-favorites",
+                tab == model_picker::Tab::Favorites,
+                true,
+                live,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.set_picker_tab(model_picker::Tab::Favorites, cx);
+                }),
+                icons::tagged_icon(
+                    if tab == model_picker::Tab::Favorites {
+                        icons::STAR_BOLD
+                    } else {
+                        icons::STAR
+                    },
+                    theme::ICON_SM,
+                    if tab == model_picker::Tab::Favorites {
+                        theme::text()
+                    } else {
+                        theme::text_secondary_on_wash()
+                    },
+                    "model-picker-tab-favorites-glyph",
                 )
-            })
-            .collect();
-        overlay::menu_layer(
+                .into_any_element(),
+            ))
+            .children(PROVIDERS.iter().enumerate().map(|(ix, p)| {
+                let selected = tab == model_picker::Tab::Provider(ix);
+                let enabled = model_picker::available_ix(ix);
+                let selector: SharedString = format!("model-picker-tab-{}", p.id).into();
+                self.picker_tab_button(
+                    selector,
+                    selected,
+                    enabled,
+                    live,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_picker_tab(model_picker::Tab::Provider(ix), cx);
+                    }),
+                    picker_mark(p.id, theme::ICON_SM, format!("model-picker-tab-{}-glyph", p.id)),
+                )
+            }));
+
+        let search = div()
+            .id("model-picker-search")
+            .debug_selector(|| "model-picker-search".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_2))
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_2))
+            .border_b_1()
+            .border_color(theme::edge_modal())
+            .child(icons::tagged_icon(
+                icons::MAGNIFER,
+                theme::ICON_STATUS,
+                theme::text_tertiary(),
+                "model-picker-search-glyph",
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(if query.is_empty() {
+                        theme::text_tertiary()
+                    } else {
+                        theme::text()
+                    })
+                    .child(if query.is_empty() {
+                        SharedString::from("Search models...")
+                    } else {
+                        SharedString::from(query)
+                    }),
+            );
+
+        let list = if rows.is_empty() {
+            div()
+                .debug_selector(|| "model-picker-empty".into())
+                .flex_1()
+                .px(px(theme::SPACE_3))
+                .py(px(theme::SPACE_4))
+                .text_size(px(theme::DETAIL_SIZE))
+                .text_color(theme::text_tertiary())
+                .child(SharedString::from(empty))
+                .into_any_element()
+        } else {
+            div()
+                .id("model-picker-list")
+                .debug_selector(|| "model-picker-list".into())
+                .flex_1()
+                .min_h(px(0.))
+                .px(px(theme::SPACE_1))
+                .pb(px(theme::SPACE_1))
+                .overflow_y_scroll()
+                .children(rows.iter().enumerate().map(|(ix, entry)| {
+                    self.picker_row(
+                        ix,
+                        *entry,
+                        ix == active,
+                        entry.id() == current_id,
+                        live,
+                        cx,
+                    )
+                }))
+                .into_any_element()
+        };
+
+        let content = div()
+            .id("model-picker")
+            .debug_selector(|| "model-picker".into())
+            .w(px(model_picker::WIDTH))
+            .h(px(model_picker::HEIGHT))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(tabs)
+            .child(search)
+            .child(list)
+            .into_any_element();
+
+        overlay::panel_layer(
             &self.launcher.models,
             anchor,
+            gpui::Anchor::BottomLeft,
             now,
             reduced,
-            rows,
+            content,
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_model_menu(cx)),
         )
+    }
+
+    fn picker_tab_button(
+        &self,
+        selector: impl Into<SharedString>,
+        selected: bool,
+        enabled: bool,
+        live: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        glyph: AnyElement,
+    ) -> AnyElement {
+        let selector = selector.into();
+        let id = selector.clone();
+        let fade = selector.to_string();
+        let rest = if selected {
+            theme::overlay()
+        } else {
+            theme::wash_rest()
+        };
+        let body = div()
+            .id(id)
+            .debug_selector({
+                let selector = selector.clone();
+                move || selector.to_string()
+            })
+            .relative()
+            .flex_1()
+            .min_w(px(0.))
+            .h(px(theme::ICON_SM + theme::SPACE_3 * 2.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover_fade(fade, rest, theme::overlay())
+            .child(glyph)
+            .when(selected && enabled, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(model_picker::TAB_UNDERLINE))
+                        .bg(theme::text()),
+                )
+            });
+        if enabled && live {
+            body.cursor_pointer()
+                .on_click(on_click)
+                .into_any_element()
+        } else if enabled {
+            body.into_any_element()
+        } else {
+            body.occlude().into_any_element()
+        }
+    }
+
+    fn picker_row(
+        &self,
+        ix: usize,
+        entry: model_picker::Entry,
+        highlighted: bool,
+        selected: bool,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = entry.id();
+        let favorited = self.model_picker.is_favorite(&id);
+        let enabled = entry.enabled();
+        let shortcut = model_picker::shortcut(ix, enabled);
+        let rest = if highlighted || selected {
+            theme::overlay()
+        } else {
+            theme::wash_rest()
+        };
+        let fade_id = format!("model-picker-row:{ix}");
+        let row_sel = format!("model-picker-row-{ix}");
+        let star_sel = format!("model-picker-star-{ix}");
+        let title = SharedString::from(entry.title());
+        let subtitle = SharedString::from(entry.subtitle());
+        let pick = cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.choose_visible_model(ix, cx);
+        });
+        let star = {
+            let id = id.clone();
+            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.toggle_picker_favorite(id.clone(), cx);
+            })
+        };
+        let hover = cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+            if this.model_picker.active != ix {
+                this.model_picker.active = ix;
+                cx.notify();
+            }
+        });
+        div()
+            .id(("model-picker-row", ix as u64))
+            .debug_selector({
+                let row_sel = row_sel.clone();
+                move || row_sel.clone()
+            })
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .px(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_MENU_ROW))
+            .hover_fade(fade_id, rest, theme::overlay())
+            .on_mouse_move(hover)
+            .child(
+                div()
+                    .id(("model-picker-pick", ix as u64))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .px(px(theme::SPACE_1))
+                    .py(px(theme::SPACE_2))
+                    .when(enabled && live, |d| d.cursor_pointer().on_click(pick))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(theme::LABEL_SIZE))
+                                    .line_height(px(theme::LABEL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(if enabled {
+                                        theme::text()
+                                    } else {
+                                        theme::text_disabled()
+                                    })
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(theme::SPACE_HALF))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_1))
+                                    .child(picker_mark(
+                                        entry.provider().id,
+                                        theme::ICON_STATUS,
+                                        format!("model-picker-row-{ix}-mark"),
+                                    ))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .text_color(theme::text_tertiary())
+                                            .child(subtitle),
+                                    ),
+                            ),
+                    )
+                    .children(shortcut.map(|s| {
+                        div()
+                            .flex_none()
+                            .rounded(px(theme::RADIUS_BUTTON))
+                            .px(px(theme::SPACE_1))
+                            .py(px(theme::SPACE_HALF))
+                            .bg(theme::overlay())
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::MICRO_SIZE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(s))
+                            .into_any_element()
+                    })),
+            )
+            .child(
+                div()
+                    .id(("model-picker-star", ix as u64))
+                    .debug_selector({
+                        let star_sel = star_sel.clone();
+                        move || star_sel.clone()
+                    })
+                    .flex_none()
+                    .size(px(theme::CONTROL_H - theme::SPACE_2))
+                    .rounded(px(theme::RADIUS_BUTTON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(live, |d| d.on_click(star))
+                    .child(icons::tagged_icon(
+                        if favorited {
+                            icons::STAR_BOLD
+                        } else {
+                            icons::STAR
+                        },
+                        theme::ICON_STATUS,
+                        if favorited {
+                            theme::text()
+                        } else {
+                            theme::text_tertiary()
+                        },
+                        format!("model-picker-star-{ix}-glyph"),
+                    )),
+            )
+            .into_any_element()
     }
 
     /// The launcher itself: what eave looks like when nothing is running.
@@ -18626,8 +19330,8 @@ impl Shell {
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                         let at = window.mouse_position();
-                                        this.open_model_menu(
-                                            point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
+                                        this.toggle_model_menu(
+                                            point(at.x, at.y - px(theme::MENU_ANCHOR_GAP)),
                                             cx,
                                         );
                                     }))
@@ -19645,8 +20349,8 @@ impl Render for Shell {
                             )
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 let at = window.mouse_position();
-                                this.open_model_menu(
-                                    point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
+                                this.toggle_model_menu(
+                                    point(at.x, at.y - px(theme::MENU_ANCHOR_GAP)),
                                     cx,
                                 );
                             }))
@@ -19971,6 +20675,16 @@ impl Render for Shell {
             // window-wide, not composer-wide, and they have to work at the
             // launcher where there is no composer at all.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
+            // ⌘N. **Registered on the shell, not only on the app**, because
+            // the handler needs the SOURCE window and this is the only
+            // place it is handed one. `window` here is the window the
+            // chord was pressed in, so `is_fullscreen()` is a direct read
+            // — not a `WindowHandle::update`, which cannot succeed on the
+            // window it is called from and silently answered `false`.
+            .on_action(cx.listener(|_this, _: &NewWindow, window, cx| {
+                let fullscreen = window.is_fullscreen();
+                cx.defer(move |cx| open_new_window(cx, fullscreen));
+            }))
             .on_action(cx.listener(|this, _: &NewIncognitoTab, _, cx| {
                 this.new_incognito_tab(cx)
             }))
@@ -21247,7 +21961,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // a cap-size expanded diff, so the long-diff render path is
         // measured at its worst, not at a friendly size.
         snapshot: perf_10k.then(|| ("perf:10k".to_string(), Some(synthetic_files_snapshot()))),
-        collapsed: false,
+        collapsed: !perf_10k,
         scope: FileScope::WorkingTree,
         diff: perf_10k.then(|| DiffSlot {
             session: "perf:10k".into(),
@@ -21590,31 +22304,15 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         cmd_tx,
         perf_10k,
     });
-    // ⌘N. Registered on the APP, not on a window: a new window has to be
-    // openable from whichever window is key, and from none of them — the
-    // chord works while Settings is frontmost too.
+    // ⌘N's FALLBACK, reached only when a NON-shell window is key (⌘N
+    // while Settings is frontmost). When a shell window is key its own
+    // `on_action` handles this first and this never runs — the same
+    // arrangement `OpenThemeEditor` above uses, and for a sharper reason
+    // here: the shell's handler is the only one that can read the source
+    // window's fullscreen state. See `source_is_fullscreen`.
     cx.on_action(|_: &NewWindow, cx: &mut App| {
-        // Asked before the open, because opening a window changes which
-        // one is frontmost.
         let fullscreen = source_is_fullscreen(cx);
-        let handle = open_shell_window(cx, new_window_id());
-        // A window opened by a chord is a window somebody wants to use.
-        // It comes up empty — no tab — and this is what makes ⌘N's first
-        // keystroke land in it rather than in the window behind.
-        let _ = handle.update(cx, |shell, window, cx| {
-            window.activate_window();
-            shell.new_tab(cx);
-            if fullscreen {
-                // **A frame later, not now.** `toggleFullScreen:` needs a
-                // window that is on screen; issued during `Window::new`
-                // — which is what `WindowBounds::Fullscreen` does — it is
-                // silently ignored, and ⌘N from fullscreen appears to do
-                // nothing at all because a windowed window cannot be seen
-                // over a fullscreen Space. By the next frame the window
-                // exists, has been ordered front, and AppKit takes it.
-                window.on_next_frame(|window, _| window.toggle_fullscreen());
-            }
-        });
+        open_new_window(cx, fullscreen);
     });
     let handle = open_shell_window(cx, eave_wire::PRIMARY_WINDOW.to_string());
     // The bar, last: a `setMainMenu_` issued before the window exists and
@@ -21685,12 +22383,48 @@ fn frontmost_shell(cx: &mut App) -> Option<WindowHandle<Shell>> {
 
 /// Is the window ⌘N was pressed in fullscreen? (Slice W1.)
 ///
+/// **Only correct when the key window is NOT a shell.**
+/// `WindowHandle::update` answers `Err` for the window you are already
+/// inside, and a ⌘N pressed in a shell window is dispatched from within
+/// that window's own update — so this answers `false` for a fullscreen
+/// window every single time. It did, and it is why two attempts at the
+/// fullscreen half failed: the toggle was never reached at all, and the
+/// debugging went into the half that already worked.
+///
+/// The shell's own handler reads `window.is_fullscreen()` off the
+/// `&mut Window` it is handed, which is the read that cannot lie. This is
+/// the fallback for a ⌘N arriving while Settings is key — there the
+/// active window is not a shell, so updating one is legal.
+///
 /// Read BEFORE the new window opens, because opening one moves what
 /// "frontmost" means.
 fn source_is_fullscreen(cx: &mut App) -> bool {
     frontmost_shell(cx)
         .and_then(|front| front.update(cx, |_, window, _| window.is_fullscreen()).ok())
         .unwrap_or(false)
+}
+
+/// Open a window for ⌘N: front, with a tab in it, fullscreen if the window
+/// it was asked from is (Slice W1).
+fn open_new_window(cx: &mut App, fullscreen: bool) {
+    let handle = open_shell_window(cx, new_window_id());
+    // A window opened by a chord is a window somebody wants to use. It
+    // comes up empty, and this is what makes ⌘N's first keystroke land in
+    // it rather than in the window behind.
+    let _ = handle.update(cx, |shell, window, cx| {
+        window.activate_window();
+        shell.new_tab(cx);
+        if fullscreen {
+            // **A frame later, not now.** `toggleFullScreen:` needs a
+            // window that is on screen; issued during `Window::new` —
+            // which is what `WindowBounds::Fullscreen` does — AppKit
+            // ignores it, and ⌘N from fullscreen appears to do nothing at
+            // all because a windowed window cannot be seen over a
+            // fullscreen Space. By the next frame the window exists and
+            // has been ordered front.
+            window.on_next_frame(|window, _| window.toggle_fullscreen());
+        }
+    });
 }
 
 /// Where a new shell window opens (Slice W1).
@@ -21968,6 +22702,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         slash: SlashPalette::default(),
                         mention: MentionPalette::default(),
                         access: Popup::default(),
+                        model_picker: model_picker::State::default(),
                         mention_files: HashMap::new(),
                         mention_loading: false,
                         branch_by_cwd: HashMap::new(),
@@ -23047,6 +23782,7 @@ mod tests {
             "composer-access",
             "composer-stop",
             "mention-palette",
+            "model-picker",
             "Command::Stop",
             "RuntimeMode",
         ] {

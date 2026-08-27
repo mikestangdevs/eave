@@ -199,6 +199,24 @@ fn shown(vcx: &mut VisualTestContext, selector: &'static str) -> bool {
     vcx.debug_bounds(selector).is_some()
 }
 
+/// Sessions are the default rail face. Tests that look at the files list
+/// have to open it — the footer library icon is the door.
+fn open_files_face(vcx: &mut VisualTestContext) {
+    if shown(vcx, "files-section") {
+        return;
+    }
+    click(vcx, "footer-library");
+    vcx.run_until_parked();
+}
+
+/// Downloads / Memory / Settings still live in the library menu, now
+/// opened from the files face header rather than the footer icon.
+fn open_library_menu(vcx: &mut VisualTestContext) {
+    open_files_face(vcx);
+    click(vcx, "files-library");
+    vcx.run_until_parked();
+}
+
 /// A worktree fact, present and `dirty` files dirty.
 fn worktree(branch: &str, dirty: Option<u64>, present: bool) -> eave_wire::WorktreeInfo {
     eave_wire::WorktreeInfo {
@@ -449,8 +467,7 @@ fn the_rail_states_what_every_live_agent_costs(cx: &mut TestAppContext) {
         shown(vcx, "rail-footer"),
         "the footer is standing chrome at the rail's foot"
     );
-    click(vcx, "footer-library");
-    vcx.run_until_parked();
+    open_library_menu(vcx);
     assert!(
         shown(vcx, "tab-menu-open-settings"),
         "the library menu opens, and Settings is in it"
@@ -1475,21 +1492,20 @@ fn a_rail_has_one_left_edge(cx: &mut TestAppContext) {
         "the row card and the zone header end on different edges"
     );
 
+    open_files_face(vcx);
+
     // The files rail is the same rule, and had the same drift.
     assert_eq!(
         x(vcx, "files-title"),
         x(vcx, "files-mode"),
         "the files rail's header and mode line start on different edges"
     );
-    // The files header's trailing slot holds a count, not a control — but
-    // it is still the trailing element, so the rule is the same one.
-    // (`files-toggle` is the TITLEBAR's collapse control and lives outside
-    // the rail entirely; asserting against it was measuring two different
-    // columns.)
+    // The files header's trailing slot is the library door. File rows
+    // share that right edge.
     assert_eq!(
-        right(vcx, "files-count"),
+        right(vcx, "files-library"),
         right(vcx, "file-src/lib.rs"),
-        "the file row and the rail's trailing count end on different edges"
+        "the file row and the files-face library door end on different edges"
     );
 }
 
@@ -2137,6 +2153,7 @@ fn the_diff_pane_opens_on_click_and_closes_when_the_file_stops_changing(cx: &mut
         .push_files(("aaaa1111".into(), Some(snapshot(vec![one.clone()]))));
     vcx.run_until_parked();
     let _ = h.drain();
+    open_files_face(vcx);
 
     click(vcx, "file-src/lib.rs");
     let cmds = h.drain();
@@ -2221,6 +2238,7 @@ fn cmd_clicking_a_changed_file_opens_it_without_launching_anything(cx: &mut Test
         }),
     ));
     vcx.run_until_parked();
+    open_files_face(vcx);
 
     click_with(
         vcx,
@@ -4534,6 +4552,7 @@ fn a_files_rail_with_no_snapshot_yet_shows_skeleton_rows(cx: &mut TestAppContext
         id: "aaaa1111".into(),
     });
     vcx.run_until_parked();
+    open_files_face(vcx);
     assert!(
         shown(vcx, "files-skeleton"),
         "a session whose file list has not arrived must say a list is coming"
@@ -4582,6 +4601,7 @@ fn a_diff_that_has_not_arrived_shows_skeleton_rows(cx: &mut TestAppContext) {
         }),
     ));
     vcx.run_until_parked();
+    open_files_face(vcx);
     assert!(!shown(vcx, "diff-skeleton"), "nothing is loading yet");
 
     click(vcx, "file-src/lib.rs");
@@ -4656,6 +4676,18 @@ fn every_swapped_control_draws_its_glyph_in_the_box_its_token_names(cx: &mut Tes
         ("new-session-glyph", theme::ICON_SM),
         ("rail-toggle-glyph", theme::ICON_TOGGLE),
         ("files-toggle-glyph", theme::ICON_TOGGLE),
+    ] {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} did not render"));
+        assert_eq!(
+            (b.size.width, b.size.height),
+            (px(expected), px(expected)),
+            "{selector} is not the square its token names",
+        );
+    }
+    open_files_face(vcx);
+    for (selector, expected) in [
         ("file-status-src/lib.rs", theme::ICON_STATUS),
     ] {
         let b = vcx
@@ -4703,6 +4735,7 @@ fn the_status_glyph_never_moves_the_path_beside_it(cx: &mut TestAppContext) {
         }),
     ));
     vcx.run_until_parked();
+    open_files_face(vcx);
 
     // Measure the GLYPH boxes, not the rows. A row is full-width, so its
     // bounds would be identical whatever the status drew inside it — an
@@ -5404,11 +5437,11 @@ fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     click(vcx, "launcher-model");
     vcx.run_until_parked();
-    assert!(shown(vcx, "overlay-menu"), "the model menu never opened");
+    assert!(shown(vcx, "model-picker"), "the model menu never opened");
 
     // Row 1 — row 0 is the CLI's own default, which is the state we are
     // trying to move away from.
-    click(vcx, "menu-row-1");
+    click(vcx, "model-picker-row-1");
     vcx.run_until_parked();
     // The exit has to PLAY before the next click can land. P1's surface
     // stays mounted and occluding for the whole 100 ms exit, so a click on
@@ -5461,7 +5494,7 @@ fn the_launcher_says_whose_model_list_it_is_showing(cx: &mut TestAppContext) {
     // And the menu it opens is the CLI's list, not the hand-written one.
     click(vcx, "launcher-model");
     vcx.run_until_parked();
-    click(vcx, "menu-row-1");
+    click(vcx, "model-picker-row-1");
     vcx.run_until_parked();
     assert_eq!(
         vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
@@ -5485,7 +5518,7 @@ fn switching_provider_clears_a_model_it_would_not_understand(cx: &mut TestAppCon
     let (h, vcx) = boot(cx);
     click(vcx, "launcher-model");
     vcx.run_until_parked();
-    click(vcx, "menu-row-1");
+    click(vcx, "model-picker-row-1");
     vcx.run_until_parked();
     assert_eq!(
         vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
@@ -5556,14 +5589,74 @@ fn escape_closes_the_model_menu_and_not_the_launcher(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     click(vcx, "launcher-model");
     vcx.run_until_parked();
-    assert!(shown(vcx, "overlay-menu"));
+    assert!(shown(vcx, "model-picker"));
     vcx.simulate_keystrokes("escape");
     drive(&h, vcx, Duration::from_millis(16));
     assert!(
-        !shown(vcx, "overlay-menu"),
+        !shown(vcx, "model-picker"),
         "escape did not dismiss the menu"
     );
     assert!(shown(vcx, "launcher"), "escape took the launcher with it");
+}
+
+/// MonoCode's picker: provider tabs, search, stars, two-line rows.
+#[gpui::test]
+fn the_model_picker_is_monocodes_card(cx: &mut TestAppContext) {
+    let _turn = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
+    let (h, vcx) = boot(cx);
+    click(vcx, "launcher-model");
+    vcx.run_until_parked();
+    for part in [
+        "model-picker",
+        "model-picker-tab-favorites",
+        "model-picker-tab-claude-code",
+        "model-picker-search",
+        "model-picker-row-0",
+        "model-picker-row-1",
+        "model-picker-star-1",
+    ] {
+        assert!(shown(vcx, part), "{part} missing from the model picker");
+    }
+    click(vcx, "model-picker-star-1");
+    vcx.run_until_parked();
+    click(vcx, "model-picker-tab-favorites");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "model-picker-row-0"),
+        "starring opus did not put it on the favorites tab"
+    );
+    vcx.read_window(&h.window, |shell, cx| {
+        assert!(
+            shell.read(cx).model_picker.is_favorite("claude-code:opus"),
+            "star did not stick"
+        );
+    })
+    .unwrap();
+}
+
+/// Typing in the open picker filters the list. Overlay owns the keyboard.
+#[gpui::test]
+fn the_model_picker_search_narrows_the_list(cx: &mut TestAppContext) {
+    let _turn = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
+    let (h, vcx) = boot(cx);
+    click(vcx, "launcher-model");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("o p u s");
+    vcx.run_until_parked();
+    vcx.read_window(&h.window, |shell, cx| {
+        assert_eq!(
+            shell.read(cx).model_picker.query, "opus",
+            "typed search never reached the picker"
+        );
+    })
+    .unwrap();
+    assert!(shown(vcx, "model-picker-row-0"));
+    assert!(
+        !shown(vcx, "model-picker-row-1"),
+        "search left extra rows on screen"
+    );
 }
 
 /// **No session, no composer.** The rest loop drops a `Send` — holding it
@@ -5622,6 +5715,7 @@ fn the_files_basis_toggle_resubscribes_and_drops_the_other_basis_list(cx: &mut T
     ));
     vcx.run_until_parked();
     let _ = h.drain();
+    open_files_face(vcx);
     assert!(
         shown(vcx, "file-src/lib.rs"),
         "the working-tree list renders"
@@ -5679,6 +5773,7 @@ fn an_unavailable_turn_basis_renders_words_not_an_empty_list(cx: &mut TestAppCon
         }),
     ));
     vcx.run_until_parked();
+    open_files_face(vcx);
     assert!(
         !shown(vcx, "files-count"),
         "a count of 0 under an unavailable basis would be a claim, not a fact"
@@ -6889,8 +6984,7 @@ fn an_archived_agent_still_counts_against_the_memory_ceiling(cx: &mut TestAppCon
     // The ceiling lives in the footer's library menu now; the fact under
     // test is unchanged — `library_menu` computes over every session the
     // engine reports, never the filtered list.
-    click(vcx, "footer-library");
-    vcx.run_until_parked();
+    open_library_menu(vcx);
     assert!(
         shown(vcx, "tab-menu-memory-fact"),
         "the only live agent was archived and the machine's ceiling went \
@@ -7473,6 +7567,8 @@ async fn the_changes_rail_offers_a_remedy_only_when_there_is_one(cx: &mut TestAp
     h.plumbing.push_feed(FeedEvent::Session {
         id: "aaaa1111".into(),
     });
+    vcx.run_until_parked();
+    open_files_face(vcx);
 
     let snap = |state: GitState| FilesSnapshot {
         state,
@@ -7720,6 +7816,7 @@ fn an_unanswered_files_rail_gives_up_the_clock_and_says_so(cx: &mut TestAppConte
         .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     // No `push_files`. That absence is the whole test.
+    open_files_face(vcx);
 
     assert!(
         shown(vcx, "files-skeleton"),
@@ -7836,6 +7933,7 @@ fn a_files_rail_with_no_engine_states_the_connection_and_waits_for_nothing(
     h.plumbing
         .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    open_files_face(vcx);
     assert!(shown(vcx, "files-skeleton"), "nothing was ever waiting");
     assert!(animating(vcx), "nothing was ever moving");
 
@@ -7896,6 +7994,7 @@ fn trying_again_re_asks_and_restarts_the_rails_patience(cx: &mut TestAppContext)
     h.plumbing
         .push_conn(ConnEvent::Connected { engine_pid: 4242 });
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    open_files_face(vcx);
     steps_until_parked(vcx, 300, "never gave up");
     assert!(shown(vcx, "files-retry"), "nothing to click");
 
@@ -8156,17 +8255,19 @@ fn a_session_row_is_two_lines(cx: &mut TestAppContext) {
     for row in ["rail-aaaa1111", "rail-bbbb2222"] {
         let h = vcx.debug_bounds(row).unwrap().size.height;
         assert!(
-            h <= px(64.),
-            "{row} is {h:?} tall; the rail's whole problem was rows that \
-             cost four lines apiece"
+            h <= px(88.),
+            "{row} is {h:?} tall; the card is three lines (provider, title, \
+             branch), not the four-line disease"
         );
     }
 
-    // Both lines are actually there — a ceiling met by dropping a fact is
-    // not the same slice.
+    // All three ranks are actually there — a ceiling met by dropping a
+    // fact is not the same slice.
     for sel in [
+        "prov-aaaa1111",
         "label-aaaa1111",
         "cwd-aaaa1111",
+        "prov-bbbb2222",
         "label-bbbb2222",
         "cwd-bbbb2222",
     ] {
@@ -11821,6 +11922,52 @@ fn cmd_digits_jump_the_strip_and_overflow_is_silent(cx: &mut TestAppContext) {
     );
 }
 
+/// ⌘1–⌘9 are strip actions, so they fire before the picker's `on_key`.
+/// While the picker is open they must pick a row, not a session/tab.
+#[gpui::test]
+fn cmd_digits_pick_a_model_while_the_picker_is_open(cx: &mut TestAppContext) {
+    let _turn = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    // A page sits at strip index 1 so a leaked ⌘2 would Activate it.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            page_tab("p1", Some("https://a.test/"), None),
+            page_tab("p2", Some("https://b.test/"), None),
+        ],
+        Some("aaaa1111"),
+    );
+    click(vcx, "composer-model");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "model-picker"),
+        "composer chip did not open the picker"
+    );
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-2");
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+    let chosen = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
+        .unwrap();
+    assert_eq!(
+        chosen,
+        Some("opus"),
+        "⌘2 with the picker open did not pick opus"
+    );
+    let cmds = h.drain();
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::Activate(_)))),
+        "⌘2 with the picker open jumped the strip: {cmds:?}"
+    );
+}
+
 #[gpui::test]
 fn cmd_shift_t_reopens_a_closed_page_tab_and_not_a_session_tab(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
@@ -12051,11 +12198,12 @@ fn the_changes_list_is_a_section_of_the_rail_not_a_second_column(cx: &mut TestAp
         }),
     ));
     vcx.run_until_parked();
+    open_files_face(vcx);
 
     let rail = vcx.debug_bounds("rail").expect("the rail");
     let files = vcx
         .debug_bounds("files-section")
-        .expect("the changes section did not render");
+        .expect("the changes face did not render");
     let well = vcx
         .debug_bounds("content-well")
         .expect("the content region");
@@ -12070,11 +12218,10 @@ fn the_changes_list_is_a_section_of_the_rail_not_a_second_column(cx: &mut TestAp
         rail.origin.x,
         rail.origin.x + rail.size.width
     );
-    // ...and it is BELOW the session list it is about, not beside it.
-    let rows = vcx.debug_bounds("rail-rows").expect("the session list");
     assert!(
-        files.origin.y >= rows.origin.y,
-        "the changes section sits above the sessions it describes"
+        !shown(vcx, "rail-rows"),
+        "the files face left the session list on screen — they are supposed \
+         to be two faces of one slot"
     );
     // The card sits a gutter in from the window's right edge — a second
     // column would fail this, and a full-bleed well would too.
@@ -12486,13 +12633,19 @@ fn the_footer_panel_is_a_door_to_library_theme_and_new(cx: &mut TestAppContext) 
         "the + menu's New Session is not `+ new`'s act: {cmds:?}"
     );
 
-    // The library icon is ALWAYS present (operator ruling), so on a fresh
-    // run it opens onto the No-downloads row plus the Settings row — and
-    // the Settings row opens the real ⌘, window.
+    // The library icon is ALWAYS present (operator ruling). It now opens
+    // the files face; Downloads / Settings live on `files-library` in
+    // that face's header.
     vcx.executor().advance_clock(Duration::from_millis(200));
     vcx.run_until_parked();
     let windows_before = cx.update(|cx| cx.windows().len());
     click(vcx, "footer-library");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "files-section"),
+        "the footer library icon did not open the files face"
+    );
+    click(vcx, "files-library");
     vcx.run_until_parked();
     assert!(
         shown(vcx, "tab-menu-download-inert"),
@@ -16057,8 +16210,8 @@ fn an_explicit_cli_default_choice_beats_the_stored_default(cx: &mut TestAppConte
     vcx.run_until_parked();
     click(vcx, "launcher-model");
     vcx.run_until_parked();
-    assert!(shown(vcx, "overlay-menu"), "the model menu never opened");
-    click(vcx, "menu-row-0"); // "CLI default" — send no --model at all
+    assert!(shown(vcx, "model-picker"), "the model menu never opened");
+    click(vcx, "model-picker-row-0"); // "CLI default" — send no --model at all
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
     let chosen = vcx
