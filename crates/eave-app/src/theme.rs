@@ -1041,7 +1041,12 @@ pub fn card_border() -> Hsla {
 
 pub fn text() -> Hsla {
     if is_light() {
-        ink_tone(0x2a)
+        // Near-black, and the whole light ladder below it darkened with
+        // it (2026-08-27): the operator's brand can make the light
+        // ground a saturated mid-tone — pink measured — and the old
+        // mid-grey tiers washed out against it ("almost unreadable").
+        // Darkening only INCREASES every contrast floor's margin.
+        ink_tone(0x1a)
     } else {
         ink_tone(0xe2)
     }
@@ -1054,7 +1059,7 @@ pub fn text() -> Hsla {
 /// land — see [`text_tertiary`].
 pub fn text_secondary() -> Hsla {
     if is_light() {
-        ink_tone(0x5c)
+        ink_tone(0x38)
     } else {
         ink_tone(0xac)
     }
@@ -1082,7 +1087,7 @@ pub fn text_secondary() -> Hsla {
 /// The ladder shifts up one rung; it does not gain a rung at the bottom.
 pub fn text_tertiary() -> Hsla {
     if is_light() {
-        ink_tone(0x78)
+        ink_tone(0x4f)
     } else {
         ink_tone(0x8e)
     }
@@ -1111,7 +1116,7 @@ pub fn text_tertiary() -> Hsla {
 /// call Slice AD made for the markdown table header).
 pub fn text_secondary_on_wash() -> Hsla {
     if is_light() {
-        ink_tone(0x3d)
+        ink_tone(0x2e)
     } else {
         ink_tone(0xce)
     }
