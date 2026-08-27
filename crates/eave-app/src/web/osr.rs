@@ -696,6 +696,30 @@ fn import_and_blit(
 // The handler CEF calls
 // ---------------------------------------------------------------------------
 
+fn string_of(s: CefStringUserfree) -> Option<String> {
+    let text = CefString::from(&s).to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn snapshot_kind(data: &DragData) -> super::drag::OutKind {
+    let mut paths = Vec::new();
+    if data.is_file() != 0 {
+        let mut list = CefStringList::new();
+        data.file_paths(Some(&mut list));
+        paths = list.into_iter().filter(|p| !p.is_empty()).collect();
+    }
+    super::drag::out_kind(
+        data.is_file() != 0,
+        paths,
+        data.is_link() != 0,
+        string_of(data.link_url()),
+        string_of(data.link_title()),
+        data.is_fragment() != 0,
+        string_of(data.fragment_text()),
+        string_of(data.fragment_html()),
+    )
+}
+
 wrap_render_handler! {
     pub struct PageRenderHandler {
         tab_id: String,
@@ -799,6 +823,39 @@ wrap_render_handler! {
             // repaints the page, but releasing the mouse on the last
             // character does not. Same reason `menu.rs` says this.
             super::host::note_chrome_change();
+        }
+
+        /// **A drag began inside the page** — 06-browser A5.
+        ///
+        /// Returning 1 takes the drag over. Returning 0 (the trait default)
+        /// aborts it, which is why dragging a link or an image out of a
+        /// page has always been a no-op: the callback existed, we never
+        /// filled it.
+        ///
+        /// We cannot start a gpui `on_drag` from here. That API starts a
+        /// drag from a mouse-down *on the element*, and putting one on the
+        /// page would steal text selection (the same gesture: down, then
+        /// past `DRAG_THRESHOLD`). The page's existing mouse-move/up
+        /// listeners drive `drag_target_*` instead. Taking the drag and
+        /// then never calling `drag_source_ended_at` hangs the renderer;
+        /// [`super::drag::end_out`] is the matching close.
+        fn start_dragging(
+            &self,
+            _browser: Option<&mut Browser>,
+            drag_data: Option<&mut DragData>,
+            _allowed_ops: DragOperationsMask,
+            _x: i32,
+            _y: i32,
+        ) -> i32 {
+            let Some(data) = drag_data else { return 0 };
+            let Some(held) = ImplDragData::clone(data) else { return 0 };
+            let kind = snapshot_kind(data);
+            super::input::hold_out(held);
+            super::drag::begin_out(&self.tab_id, kind);
+            if super::tabs::trace() {
+                eprintln!("[web] start_dragging tab={}", self.tab_id);
+            }
+            1
         }
 
         /// The GPU path — the one that runs.

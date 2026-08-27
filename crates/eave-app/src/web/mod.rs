@@ -126,6 +126,13 @@ pub mod ime;
 /// What the page has selected, as the chrome knows it (06-browser A4).
 /// Ungated for `ime`'s reason — it is a map and the rules for updating it.
 pub mod selection;
+/// Drag & drop as the chrome and the page share it (06-browser A5).
+/// Ungated for `selection`'s reason — it is a map and the rules for
+/// updating it. The four `drag_target_*` calls and `start_dragging` are
+/// gated; this is not. Feature-off, only [`drag::forget_tab`] is reached
+/// from `forget_page`; the rest is for tests and the gated callers.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub mod drag;
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
@@ -760,6 +767,13 @@ pub(crate) fn forget_page(tab_id: &str) {
     // And what it had selected, or a reused id offers to search for words
     // from a page that is no longer open (A4).
     selection::forget_tab(tab_id);
+    // An in-flight out-drag from this tab is the hang path: returning 1
+    // from `start_dragging` and never ending it leaves the renderer
+    // waiting. The gated half still has to tell Chromium; this forgets
+    // the chrome's half so a reused id does not inherit a live drag.
+    #[cfg(feature = "web")]
+    input::abort_out_for(tab_id);
+    drag::forget_tab(tab_id);
     FINDS.with(|f| {
         f.borrow_mut().remove(tab_id);
     });

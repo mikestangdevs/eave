@@ -21,8 +21,9 @@ use std::ops::Range;
 
 use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType, PaintElementType};
 use gpui::{
-    div, prelude::*, px, size, App, Bounds, ContentMask, Corners, Element, ElementId, FocusHandle,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
+    div, prelude::*, px, size, App, Bounds, ContentMask, Corners, Element, ElementId,
+    ExternalPaths, FocusHandle, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    Modifiers, Pixels, Point, Window,
 };
 
 use super::{input, osr};
@@ -108,6 +109,49 @@ fn to_page(tab_id: &str, at: Point<Pixels>) -> Point<Pixels> {
     gpui::point(at.x - gpui::px(v.origin_x), at.y - gpui::px(v.origin_y))
 }
 
+fn apply_in_step(
+    tab_id: &str,
+    is_over: bool,
+    at: Point<Pixels>,
+    m: &Modifiers,
+    paths: &[std::path::PathBuf],
+) {
+    match super::drag::note_in_over(tab_id, is_over) {
+        super::drag::InEvent::Enter => {
+            super::tabs::with_browser(tab_id, |b| {
+                input::files_enter(b, to_page(tab_id, at), m, paths);
+            });
+        }
+        super::drag::InEvent::Over => {
+            super::tabs::with_browser(tab_id, |b| {
+                input::files_over(b, to_page(tab_id, at), m);
+            });
+        }
+        super::drag::InEvent::Leave => {
+            super::tabs::with_browser(tab_id, |b| input::files_leave(b));
+        }
+        super::drag::InEvent::Quiet => return,
+    }
+    super::host::note_activity();
+    super::host::request_pump();
+}
+
+fn apply_out_events(at: Point<Pixels>, m: &Modifiers, events: Vec<(String, super::drag::InEvent)>) {
+    if events.is_empty() {
+        return;
+    }
+    for (id, ev) in events {
+        super::tabs::with_browser(&id, |b| match ev {
+            super::drag::InEvent::Enter => input::out_enter(b, to_page(&id, at), m),
+            super::drag::InEvent::Over => input::out_over(b, to_page(&id, at), m),
+            super::drag::InEvent::Leave => input::out_leave(b),
+            super::drag::InEvent::Quiet => {}
+        });
+    }
+    super::host::note_activity();
+    super::host::request_pump();
+}
+
 /// The page for a tab, or `None` if that tab has no live browser.
 ///
 /// A div carrying the input listeners, wrapping the surface. The listeners
@@ -129,6 +173,7 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let (right_down_id, right_up_id) = (id.clone(), id.clone());
     let (mid_down_id, mid_up_id) = (id.clone(), id.clone());
+    let (exit_id, drop_id, over_id) = (id.clone(), id.clone(), id.clone());
     let down_focus = focus.clone();
     let right_focus = focus.clone();
 
@@ -167,7 +212,27 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 super::host::note_activity();
                 super::host::request_pump();
             })
-            .on_mouse_up(gpui::MouseButton::Left, move |ev, _window, _cx| {
+            .on_mouse_up(gpui::MouseButton::Left, move |ev, _window, cx| {
+                if super::drag::take_eat_mouse_up() {
+                    return;
+                }
+                if super::drag::out_is_live() {
+                    super::tabs::with_browser(&up_id, |b| {
+                        input::out_drop(b, to_page(&up_id, ev.position), &ev.modifiers);
+                    });
+                    if let Some(source) = super::drag::out_source() {
+                        super::tabs::with_browser(&source, |b| {
+                            input::out_end(b, to_page(&source, ev.position));
+                        });
+                    }
+                    super::drag::end_out();
+                    super::host::note_activity();
+                    super::host::request_pump();
+                    return;
+                }
+                if cx.has_active_drag() {
+                    return;
+                }
                 super::tabs::with_browser(&up_id, |b| {
                     input::mouse_button(
                         b,
@@ -181,7 +246,27 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 super::host::note_activity();
                 super::host::request_pump();
             })
-            .on_mouse_move(move |ev, _window, _cx| {
+            .on_mouse_up_out(gpui::MouseButton::Left, move |_, _, _| {
+                // Capture-phase, and it fires *before* a drop on another
+                // pane. Queue a cancel; paint flushes it only if the drag
+                // is still live after that drop. See `drag::request_out_cancel`.
+                super::drag::request_out_cancel();
+            })
+            .on_mouse_move(move |ev, _window, cx| {
+                if cx.has_active_drag() {
+                    // An OS file drag (or a tab/bookmark drag) is in
+                    // flight. Forwarding this as a held mouse-move would
+                    // look like a selection to Blink.
+                    return;
+                }
+                if super::drag::out_is_live() {
+                    apply_out_events(
+                        ev.position,
+                        &ev.modifiers,
+                        super::drag::note_out_over(&move_id, true),
+                    );
+                    return;
+                }
                 super::tabs::with_browser(&move_id, |b| {
                     // A move with the button held is a DRAG. CEF has no
                     // separate drag event — the held button rides the same
@@ -196,6 +281,25 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                         false,
                     );
                 });
+                // `start_dragging` runs synchronously inside that
+                // mouse-move. If it took the drag, this move is already
+                // the first over.
+                if super::drag::out_is_live() {
+                    apply_out_events(
+                        ev.position,
+                        &ev.modifiers,
+                        super::drag::note_out_over(&move_id, true),
+                    );
+                }
+            })
+            .on_mouse_exit(move |ev, _, _| {
+                if super::drag::out_is_live() {
+                    apply_out_events(
+                        ev.position,
+                        &ev.modifiers,
+                        super::drag::note_out_over(&exit_id, false),
+                    );
+                }
             })
             // ── THE RIGHT BUTTON (Slice E1) ──────────────────────────
             //
@@ -342,6 +446,43 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 super::tabs::with_browser(&key_id, |b| {
                     input::key(b, &ev.keystroke);
                 });
+                super::host::note_activity();
+                super::host::request_pump();
+            })
+            // ── DROP TARGET (A5) ─────────────────────────────────────
+            //
+            // Finder file drops arrive as `ExternalPaths` plus synthetic
+            // mouse events (`window.rs` FileDrop). `TabDrag` is a different
+            // payload type and a different region, so it does not collide.
+            // The page has one mount (`page_element`), so unlike D11/D12
+            // this does not need duplicating across split vs unsplit.
+            .on_drag_move::<ExternalPaths>(move |ev, _, _| {
+                let Some(paths) = ev.dragged_item().downcast_ref::<ExternalPaths>() else {
+                    return;
+                };
+                let over = ev.bounds.contains(&ev.event.position);
+                apply_in_step(
+                    &over_id,
+                    over,
+                    ev.event.position,
+                    &ev.event.modifiers,
+                    paths.paths(),
+                );
+            })
+            .on_drop(move |paths: &ExternalPaths, window, _| {
+                let at = window.mouse_position();
+                let m = window.modifiers();
+                apply_in_step(&drop_id, true, at, &m, paths.paths());
+                super::tabs::with_browser(&drop_id, |b| {
+                    input::files_drop(b, to_page(&drop_id, at), &m);
+                });
+                let dropped = drop_id.clone();
+                for leftover in super::drag::end_in() {
+                    if leftover != dropped {
+                        super::tabs::with_browser(&leftover, |b| input::files_leave(b));
+                    }
+                }
+                super::drag::eat_next_mouse_up();
                 super::host::note_activity();
                 super::host::request_pump();
             })
@@ -619,6 +760,23 @@ impl Element for PageSurface {
                 },
                 cx,
             );
+        }
+
+        // An OS file drag that left the window (`FileDrop::Exited`)
+        // clears `active_drag` without a mouse event we hear. If we still
+        // think this page is over, tell Chromium it isn't.
+        if super::drag::in_is_over(&self.tab_id) && !cx.has_active_drag() {
+            super::tabs::with_browser(&self.tab_id, |b| input::files_leave(b));
+            let _ = super::drag::note_in_over(&self.tab_id, false);
+        }
+
+        // Mouse-up on chrome queued a cancel last event. If a drop on
+        // another pane already ended the drag, this is a no-op.
+        if super::drag::flush_out_cancel() {
+            if let Some(source) = super::drag::out_source() {
+                super::tabs::with_browser(&source, |b| input::out_cancel(b));
+            }
+            super::drag::end_out();
         }
 
         // The page is exactly the size of the space it was given, and the

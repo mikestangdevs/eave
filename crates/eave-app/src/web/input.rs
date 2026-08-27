@@ -32,12 +32,14 @@
 //! Japanese cannot be typed at all. That is the next slice, and it is
 //! deliberately not started in this one.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::path::Path;
 
-use cef::sys::cef_event_flags_t;
+use cef::sys::{cef_drag_operations_mask_t, cef_event_flags_t};
 use cef::{
-    Browser, CefString, CompositionUnderline, ImplBrowser, ImplBrowserHost, KeyEvent, KeyEventType,
-    MouseButtonType, MouseEvent, Range as CefRange,
+    drag_data_create, Browser, CefString, CompositionUnderline, DragData, DragOperationsMask,
+    ImplBrowser, ImplBrowserHost, ImplDragData, KeyEvent, KeyEventType, MouseButtonType,
+    MouseEvent, Range as CefRange,
 };
 use gpui::{Keystroke, Modifiers, Pixels, Point, ScrollDelta, ScrollWheelEvent};
 
@@ -498,4 +500,141 @@ pub fn ime_finish(browser: &Browser) {
     if let Some(host) = browser.host() {
         host.ime_finish_composing_text(1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Drag & drop — 06-browser A5
+// ---------------------------------------------------------------------------
+
+fn ops_every() -> DragOperationsMask {
+    DragOperationsMask::from(cef_drag_operations_mask_t::DRAG_OPERATION_EVERY)
+}
+
+fn ops_none() -> DragOperationsMask {
+    DragOperationsMask::from(cef_drag_operations_mask_t::DRAG_OPERATION_NONE)
+}
+
+fn ops_copy() -> DragOperationsMask {
+    DragOperationsMask::from(cef_drag_operations_mask_t::DRAG_OPERATION_COPY)
+}
+
+thread_local! {
+    /// The `DragData` `start_dragging` cloned. Lives until [`clear_out`] —
+    /// `drag_target_drag_enter` on another page needs the original, and
+    /// rebuilding from [`super::drag::OutKind`] would drop image bytes and
+    /// fragment HTML we did not project.
+    static OUT_DATA: RefCell<Option<DragData>> = const { RefCell::new(None) };
+}
+
+pub fn hold_out(data: DragData) {
+    OUT_DATA.with(|s| *s.borrow_mut() = Some(data));
+}
+
+fn clear_out() {
+    OUT_DATA.with(|s| *s.borrow_mut() = None);
+}
+
+fn with_out_data(f: impl FnOnce(&mut DragData)) {
+    OUT_DATA.with(|s| {
+        if let Some(data) = s.borrow_mut().as_mut() {
+            f(data);
+        }
+    });
+}
+
+/// OS files have entered this page. Builds a `DragData` from the paths
+/// gpui already collected; Chromium does the rest (an `<input type=file>`
+/// drop zone, a rich editor, whatever is under the pointer).
+pub fn files_enter(
+    browser: &Browser,
+    at: Point<Pixels>,
+    m: &Modifiers,
+    paths: &[impl AsRef<Path>],
+) {
+    let Some(host) = browser.host() else { return };
+    let Some(mut data) = drag_data_create() else {
+        return;
+    };
+    for p in paths {
+        let s = p.as_ref().to_string_lossy();
+        data.add_file(Some(&CefString::from(s.as_ref())), None);
+    }
+    host.drag_target_drag_enter(Some(&mut data), Some(&event(at, m)), ops_every());
+}
+
+pub fn files_over(browser: &Browser, at: Point<Pixels>, m: &Modifiers) {
+    if let Some(host) = browser.host() {
+        host.drag_target_drag_over(Some(&event(at, m)), ops_every());
+    }
+}
+
+pub fn files_leave(browser: &Browser) {
+    if let Some(host) = browser.host() {
+        host.drag_target_drag_leave();
+    }
+}
+
+pub fn files_drop(browser: &Browser, at: Point<Pixels>, m: &Modifiers) {
+    if let Some(host) = browser.host() {
+        host.drag_target_drop(Some(&event(at, m)));
+    }
+}
+
+/// An out-drag (from `start_dragging`) has entered this page — maybe the
+/// source, maybe another pane.
+pub fn out_enter(browser: &Browser, at: Point<Pixels>, m: &Modifiers) {
+    let Some(host) = browser.host() else { return };
+    with_out_data(|data| {
+        host.drag_target_drag_enter(Some(data), Some(&event(at, m)), ops_every());
+    });
+}
+
+pub fn out_over(browser: &Browser, at: Point<Pixels>, m: &Modifiers) {
+    if let Some(host) = browser.host() {
+        host.drag_target_drag_over(Some(&event(at, m)), ops_every());
+    }
+}
+
+pub fn out_leave(browser: &Browser) {
+    if let Some(host) = browser.host() {
+        host.drag_target_drag_leave();
+    }
+}
+
+pub fn out_drop(browser: &Browser, at: Point<Pixels>, m: &Modifiers) {
+    if let Some(host) = browser.host() {
+        host.drag_target_drop(Some(&event(at, m)));
+    }
+}
+
+/// The out-drag landed. `op` is COPY: we are not moving a file off disk
+/// when a page link is dropped on another page.
+pub fn out_end(browser: &Browser, at: Point<Pixels>) {
+    if let Some(host) = browser.host() {
+        let p = event(at, &Modifiers::default());
+        host.drag_source_ended_at(p.x, p.y, ops_copy());
+    }
+    clear_out();
+}
+
+/// The out-drag was cancelled (mouse-up on chrome, tab closed, pointer
+/// left the window). `drag_source_system_drag_ended` is the "not dropped
+/// on us" close; `ended_at` with NONE is the same hang if we skip it.
+pub fn out_cancel(browser: &Browser) {
+    if let Some(host) = browser.host() {
+        host.drag_source_ended_at(0, 0, ops_none());
+        host.drag_source_system_drag_ended();
+    }
+    clear_out();
+}
+
+/// A tab is closing while it is the source of an out-drag. Tell Chromium
+/// before the browser is gone; [`super::drag::forget_tab`] then forgets
+/// the chrome half.
+pub fn abort_out_for(tab_id: &str) {
+    if super::drag::out_source().as_deref() != Some(tab_id) {
+        return;
+    }
+    super::tabs::with_browser(tab_id, |b| out_cancel(b));
+    clear_out();
 }
