@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use cef::{ImplBrowser, ImplBrowserHost, MouseButtonType, PaintElementType};
 use gpui::{
@@ -79,6 +80,16 @@ pub fn set_keyboard_page(tab_id: Option<&str>) {
         *slot = tab_id.map(str::to_string);
         drop(slot);
         if let Some(old) = old.as_deref() {
+            // **A composition that loses focus is KEPT, not thrown away.**
+            // Half-typed kana is text the person meant; every native field
+            // on the platform commits it when focus moves, and discarding
+            // it would lose work silently. `ime_finish` is the "accept as
+            // is" call — `ime_cancel` is Escape, and the two are only a
+            // flag apart in CEF while being opposites to a user.
+            if super::ime::is_composing(old) {
+                super::tabs::with_browser(old, input::ime_finish);
+                super::ime::clear(old);
+            }
             super::tabs::with_browser(old, |b| input::focus(b, false));
         }
         if let Some(id) = tab_id {
@@ -317,6 +328,15 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 // whenever the composer was unmounted, so a page tab
                 // never stayed here and site shortcuts never fired.
                 if super::find_is_open(&key_id) {
+                    return;
+                }
+                // **Nor while an IME is composing** — the same shape as the
+                // find bar above, and the same defect if it is missing.
+                // While a composition is live those keystrokes belong to
+                // the IME: `PageInput` is already turning them into
+                // `ImeSetComposition`, and sending them here as well would
+                // type the romaji into the page *and* compose the kana.
+                if super::ime::is_composing(&key_id) {
                     return;
                 }
                 super::tabs::with_browser(&key_id, |b| {
@@ -582,8 +602,25 @@ impl Element for PageSurface {
         _: &mut (),
         _: &mut (),
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) {
+        // **The IME's way in — 06-browser A3.** Registered here rather than
+        // in `render` for this file's standing reason: it needs `bounds`,
+        // and geometry is decided in `paint`. `handle_input` keeps it only
+        // while this page's handle is focused, which is the same condition
+        // `on_key_down` needs to be on the dispatch path — so the two
+        // keyboard paths are live together or not at all, and there is no
+        // state in which text has nowhere to land.
+        if let Some(focus) = page_focus_handle(&self.tab_id, cx) {
+            window.handle_input(
+                &focus,
+                PageInput {
+                    tab_id: self.tab_id.clone(),
+                },
+                cx,
+            );
+        }
+
         // The page is exactly the size of the space it was given, and the
         // origin published here is what makes input coordinates exact: page
         // space and element space become the same space, so there is no
@@ -782,5 +819,204 @@ impl Element for PageSurface {
             };
             window.paint_surface(at, buffer);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The keyboard, the other half — IME (06-browser A3)
+// ---------------------------------------------------------------------------
+
+/// The page as a text input, so an IME can compose into it.
+///
+/// # Why this exists
+/// `gpui::InputHandler` is "a 1:1 exposure of `NSTextInputClient`" — the
+/// protocol AppKit talks to when text is being *composed* rather than
+/// typed. Registering one is what turns `k`,`a` into `か` and a candidate
+/// list instead of two Latin letters, and what makes `⌥e e` produce `é`.
+/// Without it, Japanese, Chinese and Korean cannot be entered into a page
+/// at all.
+///
+/// # Why it holds only a tab id
+/// Chromium owns the composition; it lives in the renderer. Everything
+/// here either forwards to CEF or answers from [`super::ime`]'s mirror of
+/// what Chromium last reported. There is no second copy of the text, for
+/// the same reason `ComposerState` keeps none: one draft, one home.
+///
+/// # Registered in `paint`, and only while focused
+/// `Window::handle_input` keeps the handler only `if focus_handle
+/// .is_focused(..)`, which is the same condition `on_key_down` needs to be
+/// on the dispatch path. So the two keyboard paths arrive and leave
+/// together — there is no state in which one is live and the other is not.
+struct PageInput {
+    tab_id: String,
+}
+
+impl gpui::InputHandler for PageInput {
+    /// Chromium's view of the selection, when it has offered one.
+    ///
+    /// `None` is a legitimate answer and not a gap: AppKit treats it as
+    /// "no selection known" and still composes. eave cannot do better —
+    /// CEF exposes no way to read the focused field's contents, so an
+    /// invented range would be a confident wrong answer where a `None` is
+    /// an honest missing one.
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<gpui::UTF16Selection> {
+        super::ime::selected_range(&self.tab_id).map(|range| gpui::UTF16Selection {
+            range,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Range<usize>> {
+        super::ime::marked_range(&self.tab_id)
+    }
+
+    /// **eave cannot read the page's text, and says so.**
+    ///
+    /// This is what an IME uses for reconversion and for context-aware
+    /// candidates. CEF has no API for the focused field's contents, so the
+    /// honest answer is `None`; composition works without it, reconversion
+    /// does not. Returning `Some("")` instead would tell macOS the field
+    /// is empty, which is a different and worse claim.
+    fn text_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Text lands in the page — **every character, not only IME commits.**
+    ///
+    /// See the `CHAR` note in [`super::input::key`]: with a handler
+    /// registered, macOS delivers ordinary printable keys here too. That
+    /// is not a quirk to work around, it is the fix for the other half of
+    /// A3 — the character now comes from AppKit's own interpretation of
+    /// the key, so a French or German layout finally types its own
+    /// letters instead of the US ones `windows_key_code` guessed at.
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+        // **Which call inserts depends on whether a composition is open,
+        // and getting this wrong is silent.** `ImeCommitText` *completes* a
+        // composition; with none open Chromium has nothing to complete and
+        // the call does nothing at all — no error, no text, no
+        // `beforeinput`. That was the first cut of A3, and it took a live
+        // walk to find because every test, the compile and the handler
+        // registration were all green while typing did nothing.
+        let kind = super::ime::insert_kind(&self.tab_id);
+        if super::tabs::trace() {
+            eprintln!("[web] ime insert {text:?} via={kind:?} tab={}", self.tab_id);
+        }
+        super::tabs::with_browser(&self.tab_id, |b| match kind {
+            super::ime::Insert::Commit => super::input::ime_commit(b, text),
+            super::ime::Insert::Char => super::input::char_text(b, text),
+        });
+        // The composition, if there was one, is over.
+        super::ime::clear(&self.tab_id);
+        super::host::note_activity();
+        super::host::request_pump();
+    }
+
+    /// The provisional stage: `か` on screen, underlined, uncommitted.
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+        if super::tabs::trace() {
+            eprintln!("[web] ime mark {new_text:?} tab={}", self.tab_id);
+        }
+        let units = new_text.encode_utf16().count();
+        let selection = new_selected_range.clone().unwrap_or(units..units);
+        super::tabs::with_browser(&self.tab_id, |b| {
+            super::input::ime_set_composition(b, new_text, selection.clone())
+        });
+        // Recorded AFTER the send, so a tab with no browser never looks
+        // like it is composing — `is_composing` gates the raw key path,
+        // and a tab stuck true there has a dead keyboard.
+        super::ime::set_marked(&self.tab_id, units, new_selected_range);
+        super::host::note_activity();
+        super::host::request_pump();
+    }
+
+    /// Composition abandoned — Escape, or a click elsewhere.
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut App) {
+        super::tabs::with_browser(&self.tab_id, super::input::ime_cancel);
+        super::ime::clear(&self.tab_id);
+        super::host::note_activity();
+        super::host::request_pump();
+    }
+
+    /// **Where the candidate window goes.**
+    ///
+    /// The one question whose wrong answer is unmistakable: get it wrong
+    /// and the IME panel sits in the window's top-left corner while you
+    /// type into a field in the middle of the page.
+    ///
+    /// Falls back to the element's own bounds when Chromium has reported
+    /// nothing yet — the first keystroke of a composition arrives before
+    /// `on_ime_composition_range_changed` does, and a panel on the page is
+    /// better than a panel in the corner.
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        let view = osr::view(&self.tab_id);
+        let boxes = super::ime::bounds(&self.tab_id);
+        let rect = super::ime::pick_rect(&boxes, &range_utf16)?;
+        let win = super::ime::to_window(&rect, view.origin_x, view.origin_y);
+        Some(Bounds {
+            origin: gpui::point(px(win.x), px(win.y)),
+            size: gpui::size(px(win.width), px(win.height)),
+        })
+    }
+
+    /// Not offered. This is for clicking *inside* composing text, and
+    /// answering it would need the page's own text layout, which lives in
+    /// the renderer.
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// The element's own box, so macOS has something to fall back to.
+    fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
+        let v = osr::view(&self.tab_id);
+        Some(Bounds {
+            origin: gpui::point(px(v.origin_x), px(v.origin_y)),
+            size: gpui::size(px(v.width as f32), px(v.height as f32)),
+        })
+    }
+
+    /// **`true`, and a browser is the case this flag was written for.**
+    ///
+    /// gpui's doc: printable keys route to the IME before keybinding
+    /// matching *when a non-ASCII input source is active*, so a
+    /// multi-stroke binding cannot intercept keys the IME should compose.
+    /// A page is exactly that: while a Japanese input source is on, `j`
+    /// belongs to the composition and not to any chord. It changes nothing
+    /// on a Latin layout, where no input source is claiming the keys.
+    fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        true
     }
 }

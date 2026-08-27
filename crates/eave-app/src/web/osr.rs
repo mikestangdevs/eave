@@ -740,6 +740,38 @@ wrap_render_handler! {
             1
         }
 
+        /// **Where the composing text is on screen** — 06-browser A3.
+        ///
+        /// The only way to answer macOS's `firstRectForCharacterRange:`,
+        /// and therefore the only thing standing between a candidate
+        /// window under the text and one pinned to the window's top-left
+        /// corner. Chromium volunteers nothing else about a composition;
+        /// this is the whole channel.
+        ///
+        /// The boxes arrive in **view coordinates**, the same space
+        /// `view_rect` publishes and `screen_point` answers identity for,
+        /// so page space and element space are already the same space and
+        /// [`super::ime::to_window`] only has to add the element origin.
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_range: Option<&cef::Range>,
+            character_bounds: Option<&[Rect]>,
+        ) {
+            let selected = selected_range.map(|r| r.from as usize..r.to as usize);
+            let boxes = character_bounds
+                .unwrap_or_default()
+                .iter()
+                .map(|r| super::ime::CharRect {
+                    x: r.x as f32,
+                    y: r.y as f32,
+                    width: r.width as f32,
+                    height: r.height as f32,
+                })
+                .collect();
+            super::ime::note_range(&self.tab_id, selected, boxes);
+        }
+
         /// The GPU path — the one that runs.
         /// A popup opened or closed.
         ///

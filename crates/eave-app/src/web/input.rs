@@ -36,7 +36,8 @@ use std::cell::Cell;
 
 use cef::sys::cef_event_flags_t;
 use cef::{
-    Browser, ImplBrowser, ImplBrowserHost, KeyEvent, KeyEventType, MouseButtonType, MouseEvent,
+    Browser, CefString, CompositionUnderline, ImplBrowser, ImplBrowserHost, KeyEvent, KeyEventType,
+    MouseButtonType, MouseEvent, Range as CefRange,
 };
 use gpui::{Keystroke, Modifiers, Pixels, Point, ScrollDelta, ScrollWheelEvent};
 
@@ -338,20 +339,163 @@ pub fn key(browser: &Browser, ks: &Keystroke) -> bool {
     };
     host.send_key_event(Some(&base));
 
-    if let Some(ch) = typed {
-        // No CHAR event when a command modifier is held: that is a shortcut,
-        // not typing, and inserting the character would be wrong.
-        if !ks.modifiers.platform && !ks.modifiers.control {
-            let mut ev = base.clone();
-            ev.type_ = KeyEventType::CHAR;
-            ev.character = ch;
-            ev.unmodified_character = ch;
-            host.send_key_event(Some(&ev));
-        }
-    }
+    // **No `CHAR` event. Text arrives through the IME instead — A3.**
+    //
+    // This is forced, not preferred. `page.rs` registers a
+    // `gpui::InputHandler` on the focused page, and gpui delivers ordinary
+    // printable keys to a registered handler as text: that is how eave's
+    // own composer works, where `TextField` binds no key handler for
+    // characters at all and every one arrives through
+    // `replace_text_in_range`. So with the handler live, a `CHAR` here
+    // would insert every letter a SECOND time. The two paths cannot both
+    // carry text, and the IME path is the one that has to win —
+    //
+    //   * it is the only one that can compose, so CJK works at all; and
+    //   * the character comes from AppKit's own interpretation of the key
+    //     rather than from `windows_key_code`'s US-layout table, so a
+    //     French or German keyboard finally types its own letters. That
+    //     was the *other* half of A3 and it is fixed by the same change.
+    //
+    // `RAWKEYDOWN` and `KEYUP` still go, so pages still get `keydown` and
+    // `keyup` — shortcuts, games and key handlers are untouched.
+    //
+    // **`keypress` still fires, and an earlier version of this comment
+    // said it would not.** That prediction was about a first cut which
+    // routed every character through `ImeCommitText`; committed IME text
+    // does not raise `keypress`. But that cut inserted nothing at all (see
+    // [`ime_commit`]), and the fix — [`char_text`], which sends a real
+    // `CHAR` — brings `keypress` back with it. **Measured on a live page,
+    // not reasoned:** `keydown`, `keypress` and `beforeinput` all fire.
+    // The claimed regression does not exist; it is recorded here only
+    // because it was written down as fact before it was checked.
+    let _ = typed;
 
     let mut up = base.clone();
     up.type_ = KeyEventType::KEYUP;
     host.send_key_event(Some(&up));
     true
+}
+
+// ---------------------------------------------------------------------------
+// IME — 06-browser A3
+// ---------------------------------------------------------------------------
+
+/// Set the provisional (marked) text — `ImeSetComposition`.
+///
+/// This is the "not yet committed" stage: `か` on screen, underlined, while
+/// the candidate list is open. Chromium shows it in the focused field and
+/// replaces it on every call, so eave sends the WHOLE composition each
+/// time rather than a delta.
+///
+/// **`replacement_range: None` means "replace the current composition"**,
+/// which is what macOS's own `setMarkedText:` semantics already give us:
+/// AppKit hands the full marked string every time. Passing a range here
+/// would mean tracking Chromium's document offsets, which eave does not
+/// have and does not need.
+///
+/// One underline over the whole run, `CEF_CUS_SOLID`. Chromium draws it;
+/// eave does not paint composing text itself and must not, because the
+/// text is inside the page's own field.
+pub fn ime_set_composition(browser: &Browser, text: &str, selection: std::ops::Range<usize>) {
+    let Some(host) = browser.host() else { return };
+    let units = text.encode_utf16().count() as u32;
+    let underline = CompositionUnderline {
+        size: std::mem::size_of::<cef::sys::_cef_composition_underline_t>(),
+        range: CefRange { from: 0, to: units },
+        color: 0,
+        background_color: 0,
+        thick: 0,
+        style: cef::sys::cef_composition_underline_style_t::CEF_CUS_SOLID.into(),
+    };
+    let sel = CefRange {
+        from: selection.start as u32,
+        to: selection.end as u32,
+    };
+    host.ime_set_composition(
+        Some(&CefString::from(text)),
+        Some(&[underline]),
+        None,
+        Some(&sel),
+    );
+}
+
+/// Commit a COMPOSITION into the page — `ImeCommitText`.
+///
+/// **Only valid while a composition is active, and that is measured, not
+/// assumed.** The first cut of A3 routed every character through here on
+/// the reasoning that one insertion path is better than two. It compiled,
+/// the handler registered, `replace_text_in_range` fired 72 times with the
+/// right text — and **not one character reached the page**. Nothing
+/// errored; `value` simply stayed empty and no `beforeinput` was raised.
+///
+/// `ImeCommitText` completes an *existing* composition. With none open
+/// Chromium has nothing to complete, and the call is a silent no-op. That
+/// is why CEF's own OSR sample still sends `CHAR` for ordinary typing and
+/// reserves this for the IME — see [`char_text`], which is the other half.
+///
+/// `relative_cursor_pos` is `0` — the caret lands after the inserted text,
+/// which is what every text field does and what AppKit assumes.
+pub fn ime_commit(browser: &Browser, text: &str) {
+    let Some(host) = browser.host() else { return };
+    host.ime_commit_text(Some(&CefString::from(text)), None, 0);
+}
+
+/// Insert text that is NOT completing a composition — one `CHAR` per
+/// UTF-16 unit.
+///
+/// The ordinary-typing half of A3, and the one that actually puts letters
+/// on the page — **confirmed live**: a page field takes ASCII, shifted
+/// characters, digits and punctuation, and raises `keydown`, `keypress`
+/// and `beforeinput` for each.
+///
+/// It is an improvement on the `CHAR` this replaced:
+/// the character comes from **AppKit's own interpretation of the key**,
+/// delivered through `NSTextInputClient`, rather than from
+/// `windows_key_code`'s US-layout table — so a French or German keyboard
+/// finally types its own letters, and a dead key (`⌥e` `e` → `é`) arrives
+/// as the composed character instead of two wrong ones.
+///
+/// Per UTF-16 unit because that is what `cef_key_event_t::character` is.
+/// A character outside the BMP arrives as a surrogate pair and Chromium
+/// reassembles it; splitting it here is correct rather than lossy.
+pub fn char_text(browser: &Browser, text: &str) {
+    let Some(host) = browser.host() else { return };
+    for unit in text.encode_utf16() {
+        let ev = KeyEvent {
+            size: std::mem::size_of::<cef::sys::_cef_key_event_t>(),
+            type_: KeyEventType::CHAR,
+            modifiers: 0,
+            // For a CHAR event Chromium reads `character`; the key code
+            // carries the same value, which is what CEF's own mac client
+            // does and what Blink expects for a synthesised character.
+            windows_key_code: unit as i32,
+            native_key_code: 0,
+            is_system_key: 0,
+            character: unit,
+            unmodified_character: unit,
+            focus_on_editable_field: 1,
+        };
+        host.send_key_event(Some(&ev));
+    }
+}
+
+/// Throw the composition away — `ImeCancelComposition`.
+///
+/// The provisional text disappears and nothing is inserted. This is
+/// Escape, and it is also what a click elsewhere means.
+pub fn ime_cancel(browser: &Browser) {
+    if let Some(host) = browser.host() {
+        host.ime_cancel_composition();
+    }
+}
+
+/// Accept whatever is composing as-is — `ImeFinishComposingText`.
+///
+/// Distinct from [`ime_cancel`] in the direction that matters: this keeps
+/// the text. Focus moving away mid-composition means "I meant that", the
+/// way every native field behaves.
+pub fn ime_finish(browser: &Browser) {
+    if let Some(host) = browser.host() {
+        host.ime_finish_composing_text(1);
+    }
 }

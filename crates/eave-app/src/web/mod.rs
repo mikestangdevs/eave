@@ -119,6 +119,10 @@ mod ask;
 /// See its module docs (06-browser E9).
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub mod cdp;
+/// IME composition state (06-browser A3). Ungated for `cdp`'s reason: what
+/// is in it is ranges and rectangles, and the suite that runs by default
+/// has to be able to exercise it.
+pub mod ime;
 #[cfg(feature = "web")]
 mod dialogs;
 #[cfg(feature = "web")]
@@ -746,6 +750,10 @@ pub(crate) fn forget_page(tab_id: &str) {
     // was watched, or a reused id would never have its domains enabled
     // again and would report nothing, with no error anywhere.
     observe::forget_tab(tab_id);
+    // Its composition too. A reused tab id that inherited a live marked
+    // range would have every keystroke swallowed by the IME guard, with
+    // nothing in any log to say why.
+    ime::forget_tab(tab_id);
     FINDS.with(|f| {
         f.borrow_mut().remove(tab_id);
     });
