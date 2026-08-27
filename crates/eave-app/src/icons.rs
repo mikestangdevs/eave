@@ -193,6 +193,7 @@ Line {
     TAG => "tag.svg",
     TRASH_BIN_MINIMALISTIC => "trash-bin-minimalistic.svg",
     TUNING => "tuning.svg",
+    VOLUME_CROSS => "volume-cross.svg",
     VOLUME_LOUD => "volume-loud.svg",
     WIDGET => "widget.svg",
     WIFI_OFF => "wifi-off.svg",
@@ -483,12 +484,16 @@ mod tests {
         for (path, _, _) in REGISTRY {
             assert!(Icons.load(path).unwrap().is_some(), "{path}");
         }
-        // 55 vendored Solar files plus PAINT_BRUSH, SUN, MOON — eave's
-        // own drawings in the family's stroke grammar.
-        assert_eq!(of(Class::Line).count(), 58, "the Line family");
+        // 55 vendored Solar files plus PAINT_BRUSH, SUN, MOON and
+        // VOLUME_CROSS — eave's own drawings in the family's stroke
+        // grammar. VOLUME_CROSS is C4's muted speaker: Solar ships
+        // `volume-loud` and neither it nor comet's vendored set has the
+        // crossed variant, so it is `volume-loud`'s cone with the two
+        // arcs replaced by an X at the same 1.5 stroke and round caps.
+        assert_eq!(of(Class::Line).count(), 59, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 69);
+        assert_eq!(REGISTRY.len(), 70);
     }
 
     /// Every registered path is a file that exists on disk under exactly

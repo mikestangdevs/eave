@@ -629,6 +629,37 @@ pub enum Failure {
     Unreachable,
 }
 
+/// Whether this failure is one the operator should be shown an error for.
+///
+/// # `ERR_ABORTED` must never reach `LoadState::Failed`
+/// An abort is not a site that would not load — it is a load that eave, the
+/// page, or the operator *stopped on purpose*, and there are three ordinary
+/// ways to get one:
+///
+/// - **B4.** The operator pressed ⎋ while the page was loading.
+/// - **A superseded navigation.** A link clicked while the previous page is
+///   still loading aborts the first. This is the common one, and it needs no
+///   new feature to reach — it has been reachable since B1.
+/// - **An HTTPS upgrade.** E2 performs an upgrade *by cancelling* the http
+///   navigation, so an abort arrives on every upgrade eave makes.
+///
+/// In all three the right screen is the one already there, and Chromium
+/// agrees: `ERR_ABORTED` is the one net error Chrome deliberately does not
+/// render an error page for.
+///
+/// # This is half a rule the file already had, applied in only one place
+/// [`fallback`] returns `None` for `Aborted` and `on_load_error`'s comment
+/// spells the reason out — "the tab is not failing, it is taking the other
+/// route… reporting `LoadState::Failed` here would flash an error state that
+/// the very next navigation replaces." That early return only guards the
+/// *upgrade* branch. An abort with no upgrade outstanding fell straight
+/// through it and was reported as a failure with the reason `ERR_ABORTED`,
+/// which is the same flash the comment refuses, arrived at by the other
+/// path. B4 is what made it worth fixing rather than what introduced it.
+pub fn reports_failure(why: Failure) -> bool {
+    why != Failure::Aborted
+}
+
 /// A load failed. If it was an upgrade eave made, returns the http URL to
 /// go back to — and remembers not to upgrade that host again.
 ///
@@ -680,6 +711,47 @@ pub fn forget(tab_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B4: an abort is never an error page, and an unreachable host always
+    /// is.
+    ///
+    /// The second assertion is the one that keeps this honest — a rule that
+    /// answered `false` for everything would satisfy the first half and
+    /// silence every real load failure in the product.
+    #[test]
+    fn a_stop_is_not_an_error_and_an_unreachable_host_still_is() {
+        assert!(!reports_failure(Failure::Aborted));
+        assert!(reports_failure(Failure::Unreachable));
+    }
+
+    /// The abort rule and the FALLBACK rule are separate, and an abort has
+    /// to satisfy both.
+    ///
+    /// They come from opposite directions and it would be easy to collapse
+    /// them: `fallback` refuses an abort so an upgrade is never undone,
+    /// while `reports_failure` refuses one so a stop never draws an error.
+    /// An abort with an upgrade outstanding must still be silent — that is
+    /// the case where BOTH rules fire on one event, and it is E2's every
+    /// upgrade.
+    #[test]
+    fn an_abort_mid_upgrade_neither_falls_back_nor_reports() {
+        note_upgrade("tab-b4", "https://up.test/", "http://up.test/");
+        assert_eq!(
+            fallback("tab-b4", "https://up.test/", Failure::Aborted),
+            None,
+            "an abort must never trigger the fallback that undoes the upgrade"
+        );
+        assert!(!reports_failure(Failure::Aborted));
+        // The upgrade is still outstanding — the abort answered nothing, so
+        // a REAL failure on the same url can still fall back. Without this
+        // the abort would have consumed the record and the fallback would
+        // be dead for the case it exists for.
+        assert_eq!(
+            fallback("tab-b4", "https://up.test/", Failure::Unreachable),
+            Some("http://up.test/".to_string())
+        );
+        forget("tab-b4");
+    }
 
     /// Cross-site, so the filter is actually reached.
     const FROM: Option<&str> = Some("https://example.net/");

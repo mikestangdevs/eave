@@ -240,6 +240,96 @@ pub fn with_browser<R>(tab_id: &str, f: impl FnOnce(&Browser) -> R) -> Option<R>
     Some(f(&browser))
 }
 
+/// B4 — stop loading this tab (⎋).
+///
+/// The abort this produces is folded as a stop rather than a failure; the
+/// argument is on [`super::nav_policy::reports_failure`], and without it ⎋
+/// would replace a half-drawn page with an error screen reading
+/// `ERR_ABORTED`.
+///
+/// Silent when the tab has no browser. A stop on a tab that is not loading
+/// is what Chromium already does with it: nothing.
+pub(super) fn stop_load(tab_id: &str) {
+    with_browser(tab_id, |b| b.stop_load());
+    super::host::request_pump();
+    super::host::note_activity();
+}
+
+/// B5 — reload this tab ignoring the cache (⇧⌘R).
+///
+/// **Not the same call as eave's ⌘R**, which goes through the engine's
+/// `pending` so the reload is a fact the engine folds and the nav stack
+/// stays the index of record (B1). A hard reload is a *cache* decision
+/// about the page already there, so it is a browser command like zoom —
+/// it re-fetches the current entry rather than pushing a new one, and the
+/// engine's stack is unchanged by it and must stay so.
+pub(super) fn reload_hard(tab_id: &str) {
+    with_browser(tab_id, |b| b.reload_ignore_cache());
+    super::host::request_pump();
+    super::host::note_activity();
+}
+
+/// D10 — tell the page to leave fullscreen.
+///
+/// The half that keeps the two states from drifting. eave puts the WINDOW
+/// into macOS fullscreen because the page asked, but the operator can take
+/// the window back out by hand (the green button, ⌃⌘F, a swipe) and
+/// Chromium never hears about it — the document would keep believing it is
+/// fullscreen, keep its fullscreen stylesheet applied, and its own exit
+/// control would toggle against a state nothing else agrees with.
+///
+/// `will_cause_resize: 1` because leaving fullscreen does change the page's
+/// size here: eave's chrome comes back around it.
+pub(super) fn exit_fullscreen(tab_id: &str) {
+    with_browser(tab_id, |b| {
+        if let Some(host) = b.host() {
+            host.exit_fullscreen(1);
+        }
+    });
+    super::host::request_pump();
+    super::host::note_activity();
+}
+
+/// C4 (half) — mute or unmute this tab's audio.
+///
+/// # Why only half of C4
+/// The row this serves cannot say "this tab is making noise", and that is a
+/// CEF constraint rather than unfinished work. Learning that a page is
+/// audible means accepting its stream through `AudioHandler`, and accepting
+/// it routes the audio to eave as PCM *instead of to the speakers* — see
+/// `PageAudioHandler::audio_parameters`, which declines for exactly that
+/// reason. So eave would silence every page in exchange for knowing which
+/// ones were making noise.
+///
+/// **Muting is unaffected by any of that.** `set_audio_muted` is a
+/// `BrowserHost` call that does not go near the capture path, and
+/// `is_audio_muted` reads back what eave itself set. The indicator is
+/// blocked; the control is not, and shipping the control alone is worth
+/// more than shipping neither.
+pub(super) fn set_muted(tab_id: &str, muted: bool) {
+    with_browser(tab_id, |b| {
+        if let Some(host) = b.host() {
+            host.set_audio_muted(i32::from(muted));
+        }
+    });
+    super::host::note_activity();
+    super::host::note_chrome_change();
+}
+
+/// Whether this tab is muted right now.
+///
+/// `false` when there is no browser. An evicted tab is not playing anything
+/// to mute, and Chromium does not carry the flag across the new browser
+/// that replaces it — which is [`super::evict`]'s standing warning about
+/// per-browser state, and the reason this reads Chromium rather than a map
+/// of eave's own that would go stale without saying so.
+pub(super) fn is_muted(tab_id: &str) -> bool {
+    with_browser(tab_id, |b| {
+        b.host().map(|h| h.is_audio_muted() != 0).unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 /// Run `f` against SOME live browser — whichever the map yields first.
 ///
 /// For work that needs Chromium's network stack but belongs to no tab: a
@@ -352,6 +442,8 @@ pub struct PageChrome {
     pub progress: f32,
     /// The link under the pointer.
     pub status: Option<String>,
+    /// The `title=` of whatever is under the pointer.
+    pub tooltip: Option<String>,
     /// The page has asked to be fullscreen.
     pub fullscreen: bool,
     /// What the pointer should look like over this page.
@@ -1922,6 +2014,27 @@ wrap_load_handler! {
                 // navigation replaces.
                 return;
             }
+            // An abort is not a failure, and there was no upgrade to fall
+            // back to — so the page that is already on screen is the right
+            // one. `nav_policy::reports_failure` carries the argument; it
+            // is the same one the early return above makes for the upgrade
+            // branch, which is the only branch that used to get it.
+            if !super::nav_policy::reports_failure(why) {
+                // Progress still has to land, or the address bar's loading
+                // wash never clears: `on_load_end` does not follow a load
+                // that was cancelled before it committed.
+                set_chrome(&self.tab_id, |c| c.progress = 1.0);
+                let (can_go_back, can_go_forward) = nav_flags(browser);
+                report(
+                    &self.tab_id,
+                    PageFact::Load {
+                        load: LoadState::Complete,
+                        can_go_back,
+                        can_go_forward,
+                    },
+                );
+                return;
+            }
             // The engine's own words, rendered verbatim — `LoadState::Failed`
             // exists to carry them rather than to be re-worded by eave.
             let reason = error_text.map(|t| t.to_string()).unwrap_or_default();
@@ -2507,6 +2620,10 @@ wrap_request_handler! {
             set_chrome(&self.tab_id, |c| {
                 c.progress = 0.;
                 c.status = None;
+                // The renderer that would have sent the clearing empty
+                // string is the one that just died, so nothing else will
+                // take this down.
+                c.tooltip = None;
                 c.fullscreen = false;
             });
             report(
@@ -2688,6 +2805,30 @@ wrap_display_handler! {
         fn on_status_message(&self, _browser: Option<&mut Browser>, value: Option<&CefString>) {
             let text = value.map(|v| v.to_string()).filter(|v| !v.is_empty());
             set_chrome(&self.tab_id, |c| c.status = text.clone());
+        }
+
+        /// D12 — the `title=` under the pointer.
+        ///
+        /// **Returns 1: handled.** CEF's contract is that 0 lets the
+        /// browser display its own tooltip, and a windowless browser has
+        /// no window to display one in — so 0 here would be eave declining
+        /// to draw a tooltip in favour of nobody drawing one. This is the
+        /// same shape as every other OSR callback: the default is not
+        /// "Chromium does it", it is "it does not happen".
+        ///
+        /// CEF sends an empty string on leaving an element, which clears
+        /// the field rather than leaving the last tooltip stuck to the
+        /// pointer.
+        fn on_tooltip(
+            &self,
+            _browser: Option<&mut Browser>,
+            text: Option<&mut CefString>,
+        ) -> ::std::os::raw::c_int {
+            let next = text
+                .map(|t| t.to_string())
+                .filter(|t| !t.is_empty());
+            set_chrome(&self.tab_id, |c| c.tooltip = next.clone());
+            1
         }
 
         /// The page asked for fullscreen (a video, usually).

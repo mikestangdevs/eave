@@ -502,7 +502,16 @@ fn install_where_needed(snapshot: &eave_wire::TabsSnapshot) {
 /// the same queue, and a plain drain would eat it. See
 /// [`super::cdp::take_events_matching`].
 fn handle_events(snapshot: &eave_wire::TabsSnapshot) {
-    let events = super::cdp::take_events_matching(|e| e.method == "Runtime.bindingCalled");
+    // Named, not just typed. `take_events_matching` REMOVES what it
+    // matches, so taking every `bindingCalled` and dropping the ones that do
+    // not parse would swallow `audible`'s events on the way past — and the
+    // symptom would be a speaker icon that never appears, with nothing in
+    // this module to suggest why. `parse_binding_called` checks the name
+    // too; that check protects the payload, this one protects the queue.
+    let events = super::cdp::take_events_matching(|e| {
+        e.method == "Runtime.bindingCalled"
+            && super::cdp::binding_name(&e.params).as_deref() == Some(BINDING)
+    });
     for event in events {
         let Some(message) = parse_binding_called(&event.params) else {
             continue;

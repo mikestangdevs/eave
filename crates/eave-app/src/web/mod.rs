@@ -158,6 +158,13 @@ mod observe;
 /// See its module docs.
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 mod notify;
+
+/// C4's indicator — which tabs are making a noise, learned over CDP.
+///
+/// Ungated for `notify`'s reason: the parse and the shim source are pure,
+/// `cdp_call` has a feature-off twin, so the whole loop runs in the default
+/// suite and only the Chromium at the far end is missing.
+mod audible;
 #[cfg(feature = "web")]
 mod osr;
 #[cfg(feature = "web")]
@@ -729,6 +736,12 @@ pub(crate) fn forget_page(tab_id: &str) {
     // page left to hear a `close`, and an ack to a dead browser answers
     // `NotSent` on a later pump for nothing. See `notify::forget_tab`.
     notify::forget_tab(tab_id);
+    // And its speaker. Both halves matter: a stale `AUDIBLE` entry would
+    // put an icon on a reused tab id that is silent, and a stale `INSTALLED`
+    // entry would convince the installer the shim was already there — so
+    // the reused tab would report nothing, for ever, with no error anywhere.
+    // That second failure is `observe::forget_tab`'s exactly.
+    audible::forget_tab(tab_id);
     // Its console and network record goes too — including the fact that it
     // was watched, or a reused id would never have its domains enabled
     // again and would report nothing, with no error anywhere.
@@ -786,6 +799,147 @@ fn cef_set_zoom(tab_id: &str, percent: u32) {
 }
 #[cfg(not(feature = "web"))]
 fn cef_set_zoom(_tab_id: &str, _percent: u32) {}
+
+#[cfg(feature = "web")]
+fn cef_stop_load(tab_id: &str) {
+    tabs::stop_load(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_stop_load(_tab_id: &str) {}
+
+#[cfg(feature = "web")]
+fn cef_reload_hard(tab_id: &str) {
+    tabs::reload_hard(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_reload_hard(_tab_id: &str) {}
+
+#[cfg(feature = "web")]
+fn cef_set_muted(tab_id: &str, muted: bool) {
+    tabs::set_muted(tab_id, muted);
+}
+#[cfg(not(feature = "web"))]
+fn cef_set_muted(_tab_id: &str, _muted: bool) {}
+
+#[cfg(feature = "web")]
+fn cef_is_muted(tab_id: &str) -> bool {
+    tabs::is_muted(tab_id)
+}
+#[cfg(all(not(feature = "web"), not(test)))]
+fn cef_is_muted(_tab_id: &str) -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Mute, as the feature-OFF suite sees it.
+    ///
+    /// The real answer comes from `is_audio_muted` on a browser that does
+    /// not exist in a test process, so without this the speaker control is
+    /// unreachable by the harness in either direction — it could never be
+    /// shown and never be clicked. That is G26's shape exactly, and the
+    /// cost of not having a seam is that the only proof the control works
+    /// is a person clicking it.
+    static TEST_MUTED: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Pretend a tab is audible, for the harness.
+#[cfg(test)]
+pub fn set_audible_for_test(tab_id: &str, audible: bool) {
+    audible::set_for_test(tab_id, audible);
+}
+
+#[cfg(feature = "web")]
+fn cef_exit_fullscreen(tab_id: &str) {
+    tabs::exit_fullscreen(tab_id);
+}
+#[cfg(not(feature = "web"))]
+fn cef_exit_fullscreen(_tab_id: &str) {}
+
+/// D10 — whether this tab's page has asked to be fullscreen.
+///
+/// Reads the chrome fold rather than Chromium, because Chromium has no
+/// getter for it: `on_fullscreen_mode_change` is the only report, so eave's
+/// record of the last one IS the state.
+pub fn page_fullscreen(tab_id: &str) -> bool {
+    chrome(tab_id).is_some_and(|c| c.fullscreen)
+}
+
+/// D10 — ask the page to leave fullscreen (`tabs::exit_fullscreen`).
+pub fn exit_page_fullscreen(tab_id: &str) {
+    cef_exit_fullscreen(tab_id);
+}
+
+/// C4 (half) — mute or unmute a tab.
+///
+/// The matching *indicator* is not available: knowing a page is audible
+/// means taking its audio away from the speakers. `tabs::set_muted` carries
+/// the account.
+pub fn set_tab_muted(tab_id: &str, muted: bool) {
+    #[cfg(test)]
+    TEST_MUTED.with(|m| {
+        let mut m = m.borrow_mut();
+        if muted {
+            m.insert(tab_id.to_string());
+        } else {
+            m.remove(tab_id);
+        }
+    });
+    cef_set_muted(tab_id, muted);
+}
+
+/// Whether a tab is muted. `false` when there is no browser to ask.
+pub fn tab_muted(tab_id: &str) -> bool {
+    #[cfg(test)]
+    {
+        return TEST_MUTED.with(|m| m.borrow().contains(tab_id));
+    }
+    #[cfg(not(test))]
+    cef_is_muted(tab_id)
+}
+
+/// B4 — ⎋ during a load: stop where it got to.
+///
+/// Chromium keeps whatever has already been parsed and painted, which is
+/// the point of the key — a stop is not a failure and not a blank page.
+pub fn stop_load(tab_id: &str) {
+    #[cfg(test)]
+    TEST_NAV_CALLS.with(|n| n.borrow_mut().push(("stop".to_string(), tab_id.to_string())));
+    cef_stop_load(tab_id);
+}
+
+/// B5 — ⇧⌘R: reload this tab without using the cache.
+///
+/// The plain ⌘R above this is the engine's reload and stays that way; this
+/// one is a browser command about the entry already loaded (see
+/// `tabs::reload_hard`).
+pub fn reload_hard(tab_id: &str) {
+    #[cfg(test)]
+    TEST_NAV_CALLS.with(|n| n.borrow_mut().push(("hard-reload".to_string(), tab_id.to_string())));
+    cef_reload_hard(tab_id);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// B4/B5 reaching Chromium, recorded so the feature-OFF suite can see
+    /// them.
+    ///
+    /// Without this the only thing testable about ⇧⌘R is that it compiles:
+    /// `cef_reload_hard`'s feature-OFF twin is an empty function, so a
+    /// binding that never fired and a binding that fired correctly are the
+    /// same observation. That is G26's shape — an ask nothing could
+    /// assert — and it is worth a seam rather than a live walk every time
+    /// the chord is touched.
+    static TEST_NAV_CALLS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take what B4/B5 sent to Chromium since the last call.
+#[cfg(test)]
+pub fn take_nav_calls_for_test() -> Vec<(String, String)> {
+    TEST_NAV_CALLS.with(|n| std::mem::take(&mut *n.borrow_mut()))
+}
 
 /// The devtools browser's id for a tab: a NAMESPACE, not a tab id.
 ///
@@ -1064,6 +1218,21 @@ pub fn tab_exchanges(tab_id: &str) -> Vec<observe::Exchange> {
 /// the `web` build adds is a Chromium on the other end.
 pub fn drive_notifications(snapshot: &eave_wire::TabsSnapshot) {
     notify::drive(snapshot, std::time::Instant::now());
+    // C4's indicator rides the same pass. Both are CDP shims over the same
+    // event queue, and both have to run before the queue's cap drops what
+    // they came for — a second timer would only add a way for one to starve
+    // the other.
+    audible::drive(snapshot);
+}
+
+/// C4 — whether this tab is making a noise.
+///
+/// **Not the same certainty as Chrome's indicator**, and the difference is
+/// worth carrying to the call site: this is what the page's own document
+/// reported over CDP, not what the audio output is doing. See
+/// `web/audible.rs` for what that covers and what it misses.
+pub fn tab_audible(tab_id: &str) -> bool {
+    audible::is_audible(tab_id)
 }
 
 /// The binding name a page calls to reach eave. Re-exported because
@@ -1260,6 +1429,7 @@ pub fn install_request_sink(_tx: tokio::sync::mpsc::UnboundedSender<PageRequest>
 pub struct PageChrome {
     pub progress: f32,
     pub status: Option<String>,
+    pub tooltip: Option<String>,
     pub fullscreen: bool,
     pub cursor: gpui::CursorStyle,
 }
@@ -1290,6 +1460,97 @@ pub struct Download {
 #[cfg(not(feature = "web"))]
 pub fn downloads() -> Vec<Download> {
     Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// D11 — the link under the pointer
+// ---------------------------------------------------------------------------
+
+/// The longest status eave will hand the text system, in characters.
+///
+/// The bubble is capped at a fraction of the pane and ellipsises visually
+/// anyway, so this is not the layout guard — it is the guard on shaping a
+/// megabyte of `href` sixty times a second while the pointer moves.
+const STATUS_MAX: usize = 512;
+
+/// What the status bubble says, or `None` for no bubble.
+///
+/// Ungated and pure, the [`download_rows`] shape: what the bubble SAYS is a
+/// decision about a string, and none of it needs Chromium. The pane renders
+/// this; it does not decide it. Without that split the feature-OFF suite
+/// could not see this function at all — `chrome()`'s twin returns `None`, so
+/// nothing about the bubble would be assertable (G26's lesson, applied
+/// before it becomes a finding rather than after).
+///
+/// **The string is the page's, not eave's.** `on_status_message` carries
+/// whatever the document put in `href`, which makes this attacker-controlled
+/// text drawn on eave's own chrome, and two classes of character have to go:
+///
+/// - **Line breaks, tabs and the Unicode line/paragraph separators.** A
+///   one-line bubble handed a `\n` is no longer one line, and U+2028/U+2029
+///   are *not* `char::is_control()` — Rust's is the `Cc` category, and those
+///   two are `Zl`/`Zp`. Testing `is_control()` alone reads as complete and
+///   is not.
+/// - **The bidi overrides** (U+202A–U+202E, U+2066–U+2069, plus the two
+///   marks). They let a page draw its url right-to-left, so
+///   `evil.com/moc.knab` renders as `bank.com/...` — the bubble exists to
+///   answer "where does this go", and these are exactly the characters that
+///   make it lie.
+///
+/// Truncation takes the TAIL and never the head, which is the same argument:
+/// the scheme and host are what a person checks a status bubble for, so a
+/// middle-elision that keeps a pretty path suffix would drop the only part
+/// that carries a decision.
+pub fn status_text(raw: &str) -> Option<String> {
+    sanitize_page_text(raw)
+}
+
+/// D12 — what a `title=` attribute is allowed to draw.
+///
+/// The same treatment as [`status_text`] and for the same reason: a tooltip
+/// is page-authored text on eave's chrome, so the newline and the bidi
+/// override are the same threats here that they are there.
+///
+/// **Browsers do render multi-line tooltips and this one does not.** That is
+/// a deliberate narrowing rather than an oversight — a `title` is not a
+/// layout surface, and one collapsed line cannot be used to paint over the
+/// window. If a real multi-line tooltip is ever wanted it needs a height cap
+/// and a line cap decided together, which is a different function from this
+/// one.
+pub fn tooltip_text(raw: &str) -> Option<String> {
+    sanitize_page_text(raw)
+}
+
+fn sanitize_page_text(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len().min(STATUS_MAX));
+    // Starts true so a leading run of space collapses to nothing at all.
+    let mut last_was_space = true;
+    for ch in raw.chars() {
+        if matches!(ch,
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        {
+            continue;
+        }
+        if ch.is_control() || ch.is_whitespace() || ch == '\u{2028}' || ch == '\u{2029}' {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        out.push(ch);
+        last_was_space = false;
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.chars().count() > STATUS_MAX {
+        out = out.chars().take(STATUS_MAX).collect::<String>() + "…";
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,6 +1943,80 @@ pub fn page_was_evicted(_tab_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D11: the bubble draws a string the PAGE chose, so the things it
+    /// refuses to draw are the feature.
+    ///
+    /// Each case asserts the threat is real in the same breath as the
+    /// immunity — a bidi case that contained no bidi character, or a
+    /// truncation case under the cap, would pass while asserting nothing.
+    #[test]
+    fn a_status_bubble_never_draws_what_a_page_asked_it_to() {
+        assert_eq!(status_text(""), None);
+        assert_eq!(status_text("   \t \n "), None);
+        assert_eq!(
+            status_text("  https://example.com/a  "),
+            Some("https://example.com/a".to_string())
+        );
+
+        // One line, whatever the page sent. U+2028 and U+2029 are the two
+        // that `is_control()` does NOT catch, which is why they are here
+        // beside `\n` rather than trusted to it.
+        let multi = "https://a.test/x\ny\u{2028}z\u{2029}w\tv";
+        assert!(multi.chars().any(|c| c == '\u{2028}'));
+        let one = status_text(multi).expect("a url with breaks still has text");
+        assert_eq!(one, "https://a.test/x y z w v");
+        assert!(!one.chars().any(|c| c.is_control()
+            || c == '\u{2028}'
+            || c == '\u{2029}'));
+
+        // The bidi overrides go, and the visible text survives them.
+        let spoof = "https://evil.test/\u{202E}moc.knab\u{202C}";
+        assert!(spoof.chars().any(|c| ('\u{202A}'..='\u{202E}').contains(&c)));
+        let clean = status_text(spoof).expect("stripping overrides leaves a url");
+        assert!(!clean.chars().any(|c| ('\u{202A}'..='\u{202E}').contains(&c)));
+        assert!(clean.starts_with("https://evil.test/"));
+
+        // Truncation keeps the HEAD — the part that carries the decision.
+        let long = format!("https://example.com/{}", "p".repeat(STATUS_MAX * 2));
+        assert!(long.chars().count() > STATUS_MAX);
+        let cut = status_text(&long).expect("a long url still has text");
+        assert_eq!(cut.chars().count(), STATUS_MAX + 1, "cap plus the ellipsis");
+        assert!(cut.starts_with("https://example.com/"));
+        assert!(cut.ends_with('…'));
+
+        // A url exactly at the cap is NOT truncated — the boundary, because
+        // an off-by-one here would ellipsise a url that fits.
+        let exact: String = std::iter::repeat('a').take(STATUS_MAX).collect();
+        assert_eq!(status_text(&exact), Some(exact));
+    }
+
+    /// D12 gets D11's treatment, and this pins that rather than trusting
+    /// the two functions to stay one line apart.
+    ///
+    /// A `title=` is as page-authored as an `href`, so a future edit that
+    /// gave the tooltip its own laxer path would reintroduce the newline
+    /// and the bidi override on the surface that draws nearest the pointer.
+    #[test]
+    fn a_tooltip_is_sanitised_exactly_as_a_status_is() {
+        for raw in [
+            "",
+            "  ",
+            "plain title",
+            "two\nlines",
+            "https://evil.test/\u{202E}moc.knab",
+            "tab\tseparated",
+        ] {
+            assert_eq!(
+                tooltip_text(raw),
+                status_text(raw),
+                "tooltip and status diverged on {raw:?}"
+            );
+        }
+        // …and the shared treatment is not the identity, or the loop above
+        // would hold for two functions that both did nothing.
+        assert_eq!(tooltip_text("two\nlines"), Some("two lines".to_string()));
+    }
 
     /// G5: every rung has to survive the round trip through CEF's float,
     /// because that float is what comes back out of Chromium and it is what

@@ -6034,6 +6034,15 @@ fn page_tab(id: &str, url: Option<&str>, title: Option<&str>) -> TabInfo {
     }
 }
 
+/// A page tab Chromium has committed and is still fetching — B4's
+/// precondition, and the state ⎋ is about.
+fn loading_page_tab(id: &str) -> TabInfo {
+    TabInfo {
+        load: eave_wire::LoadState::Loading,
+        ..page_tab(id, Some("https://slow.example/"), None)
+    }
+}
+
 /// The rail AND the strip, for the common case: every session gets a tab,
 /// and the selected one is active — which is what the running app
 /// reconciles to.
@@ -11488,6 +11497,183 @@ fn cmd_r_re_navigates_the_active_page_and_is_silent_without_a_url(cx: &mut TestA
     assert!(h.drain().is_empty(), "⌘[ fired on a session tab");
 }
 
+/// B5 — ⇧⌘R reaches Chromium, and it does NOT go through the engine.
+///
+/// Both halves matter. A hard reload that sent `BrowserCmd::Navigate` would
+/// look right on screen and be the wrong thing: it would push the engine's
+/// nav stack and re-fetch through the cache, which is precisely what ⇧⌘R
+/// exists not to do. So this asserts the CEF call happened AND that the
+/// command channel stayed silent.
+#[gpui::test]
+fn cmd_shift_r_reloads_past_the_cache_without_touching_the_nav_stack(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://example.com/"), None)],
+        Some("p1"),
+    );
+    let _ = h.drain();
+    let _ = crate::web::take_nav_calls_for_test();
+
+    vcx.simulate_keystrokes("cmd-shift-r");
+    vcx.run_until_parked();
+
+    assert_eq!(
+        crate::web::take_nav_calls_for_test(),
+        vec![("hard-reload".to_string(), "p1".to_string())],
+        "⇧⌘R did not reach Chromium"
+    );
+    assert!(
+        h.drain().is_empty(),
+        "⇧⌘R went through the engine — that is ⌘R's path, and it re-fetches \
+         through the cache"
+    );
+
+    // …and plain ⌘R still does the OTHER thing, or the chord above has
+    // simply stolen reload rather than added to it.
+    vcx.simulate_keystrokes("cmd-r");
+    vcx.run_until_parked();
+    assert!(
+        crate::web::take_nav_calls_for_test().is_empty(),
+        "⌘R went to Chromium directly instead of through the engine"
+    );
+    assert!(!h.drain().is_empty(), "⌘R stopped re-navigating");
+}
+
+/// C4 — the speaker appears when a tab makes a noise, mutes on click, and
+/// **stays while muted**.
+///
+/// That last clause is the whole design and the reason this test is worth
+/// its length. If the icon were shown on `audible` alone, muting would
+/// remove the only control that can unmute: the tab falls silent, the
+/// speaker goes with it, and the state is unreachable from the strip. So
+/// the interesting assertion is the one after the click, on a tab that is
+/// no longer making any sound.
+#[gpui::test]
+fn a_tab_that_makes_a_noise_gets_a_speaker_that_survives_being_used(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    // A session in the rail, because the rail is where the tab ROW is
+    // drawn — without one the strip renders nothing and every assertion
+    // below about an absent control passes for the wrong reason.
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+
+    // Audibility arrives out of band (a CDP event in the running app, this
+    // seam here), so nothing notifies gpui about it on its own. Re-pushing
+    // the strip is what the running app gets from `note_chrome_change`, and
+    // it is the same thing `set_favicon_for_test`'s caller relies on.
+    let show = |vcx: &mut VisualTestContext, audible: bool| {
+        crate::web::set_audible_for_test("p1", audible);
+        strip_tabs(
+            &h,
+            vcx,
+            vec![page_tab("p1", Some("https://noisy.example/"), Some("Noisy"))],
+            Some("p1"),
+        );
+    };
+
+    crate::web::set_tab_muted("p1", false);
+    show(vcx, false);
+    // The positive control for every `!shown` in this test.
+    assert!(shown(vcx, "tab-p1"), "the tab row itself never rendered");
+    assert!(
+        !shown(vcx, "tab-audio-p1"),
+        "a silent tab wears a speaker it has no use for"
+    );
+
+    // It starts playing.
+    show(vcx, true);
+    assert!(
+        shown(vcx, "tab-audio-p1"),
+        "a tab making a noise says nothing about it"
+    );
+
+    // Click mutes it, and does NOT activate the tab on the way through.
+    click(vcx, "tab-audio-p1");
+    vcx.run_until_parked();
+    assert!(crate::web::tab_muted("p1"), "the speaker did not mute");
+
+    // The page stops making sound — muted pages do. The control has to
+    // outlive that, or unmuting is unreachable from here.
+    show(vcx, false);
+    assert!(
+        shown(vcx, "tab-audio-p1"),
+        "muting removed the only control that could unmute"
+    );
+
+    // And it toggles back off.
+    click(vcx, "tab-audio-p1");
+    vcx.run_until_parked();
+    assert!(!crate::web::tab_muted("p1"), "the speaker did not unmute");
+    show(vcx, false);
+    assert!(
+        !shown(vcx, "tab-audio-p1"),
+        "an unmuted silent tab kept its speaker"
+    );
+}
+
+/// A session tab has no audio and must never grow the control — the strip
+/// holds both kinds and `tab_muted` would answer for any string.
+#[gpui::test]
+fn a_session_tab_never_grows_a_speaker(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+    // Claim both states a page would need, so the absence is the KIND
+    // check and not simply the absence of sound.
+    crate::web::set_audible_for_test("aaaa1111", true);
+    crate::web::set_tab_muted("aaaa1111", true);
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tab-aaaa1111"),
+        "the session tab row never rendered, so the absence below is vacuous"
+    );
+    assert!(
+        !shown(vcx, "tab-audio-aaaa1111"),
+        "a session tab grew an audio control"
+    );
+    crate::web::set_tab_muted("aaaa1111", false);
+}
+
+/// B4 — ⎋ stops a load, and only when there is one.
+#[gpui::test]
+fn escape_stops_a_load_in_flight_and_is_silent_otherwise(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::pretend_available_for_test();
+    // A session, because `Shell::on_key` returns early without one and the
+    // escape arm lives at the END of that function — the same reason
+    // `page_shell` seeds one.
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    // Settled: nothing to stop, so ⎋ must not fire. Without this half the
+    // test would pass for an escape arm that stopped every tab every time.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://example.com/"), None)],
+        Some("p1"),
+    );
+    let _ = crate::web::take_nav_calls_for_test();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        crate::web::take_nav_calls_for_test().is_empty(),
+        "⎋ stopped a page that was not loading"
+    );
+
+    strip_tabs(&h, vcx, vec![loading_page_tab("p2")], Some("p2"));
+    let _ = crate::web::take_nav_calls_for_test();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::web::take_nav_calls_for_test(),
+        vec![("stop".to_string(), "p2".to_string())],
+        "⎋ did not stop a load in flight"
+    );
+}
+
 #[gpui::test]
 fn cmd_digits_jump_the_strip_and_overflow_is_silent(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
@@ -13813,8 +13999,8 @@ fn the_page_menu_says_what_was_clicked(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let tab = page_shell(&h, vcx, Some("https://example.com/"));
 
-    // Bare text: the three navigation rows, Copy, and the developer pair
-    // — and nothing else.
+    // Bare text: the three navigation rows, Mute, Copy, and the developer
+    // pair — and nothing else.
     request_page_menu(
         &h,
         vcx,
@@ -13830,11 +14016,12 @@ fn the_page_menu_says_what_was_clicked(cx: &mut TestAppContext) {
         },
     );
     assert!(shown(vcx, "menu-row-0"), "the page menu never opened");
-    assert!(shown(vcx, "menu-row-3"), "Copy is missing");
-    assert!(shown(vcx, "menu-row-4"), "View Page Source is missing");
-    assert!(shown(vcx, "menu-row-5"), "Inspect is missing");
+    assert!(shown(vcx, "menu-row-3"), "Mute Tab is missing");
+    assert!(shown(vcx, "menu-row-4"), "Copy is missing");
+    assert!(shown(vcx, "menu-row-5"), "View Page Source is missing");
+    assert!(shown(vcx, "menu-row-6"), "Inspect is missing");
     assert!(
-        !shown(vcx, "menu-row-6"),
+        !shown(vcx, "menu-row-7"),
         "a menu over bare text offered a link row"
     );
 
@@ -13863,11 +14050,11 @@ fn a_link_and_a_selection_each_add_their_own_rows(cx: &mut TestAppContext) {
             editable: false,
         },
     );
-    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab,
-    // Search, View Page Source, Inspect.
-    assert!(shown(vcx, "menu-row-6"), "the search row is missing");
+    // Back, Forward, Reload, Mute Tab, Copy, Copy Link, Open Link in New
+    // Tab, Search, View Page Source, Inspect.
+    assert!(shown(vcx, "menu-row-7"), "the search row is missing");
     assert!(
-        !shown(vcx, "menu-row-9"),
+        !shown(vcx, "menu-row-10"),
         "the menu grew a row nothing asked for"
     );
 }
@@ -13899,11 +14086,11 @@ fn a_site_with_no_answers_offers_nothing_to_reset(cx: &mut TestAppContext) {
             editable: false,
         },
     );
-    // Back, Forward, Reload, Copy, View Page Source, Inspect — and
-    // nothing after them.
-    assert!(shown(vcx, "menu-row-3"), "the Copy row is missing");
+    // Back, Forward, Reload, Mute Tab, Copy, View Page Source, Inspect —
+    // and nothing after them.
+    assert!(shown(vcx, "menu-row-4"), "the Copy row is missing");
     assert!(
-        !shown(vcx, "menu-row-6"),
+        !shown(vcx, "menu-row-7"),
         "a reset row appeared for a site with no answers"
     );
 }
@@ -13938,12 +14125,13 @@ fn a_sites_permissions_can_be_reset_from_the_page_menu(cx: &mut TestAppContext) 
         },
     );
     let _ = h.drain();
-    // Back, Forward, Reload, Copy, Reset, View Page Source, Inspect.
+    // Back, Forward, Reload, Mute Tab, Copy, Reset, View Page Source,
+    // Inspect.
     assert!(
-        shown(vcx, "menu-row-4"),
+        shown(vcx, "menu-row-5"),
         "a site with two answers offered no way to take them back"
     );
-    click(vcx, "menu-row-4");
+    click(vcx, "menu-row-5");
     vcx.run_until_parked();
 
     let cmds = h.drain();
@@ -13988,9 +14176,9 @@ fn opening_a_link_in_a_new_tab_does_not_steal_the_window(cx: &mut TestAppContext
         },
     );
     let _ = h.drain();
-    // Back, Forward, Reload, Copy, Copy Link, Open Link in New Tab,
-    // View Page Source, Inspect.
-    click(vcx, "menu-row-5");
+    // Back, Forward, Reload, Mute Tab, Copy, Copy Link, Open Link in New
+    // Tab, View Page Source, Inspect.
+    click(vcx, "menu-row-6");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
@@ -14028,8 +14216,9 @@ fn the_search_row_searches_for_the_whole_selection(cx: &mut TestAppContext) {
         },
     );
     let _ = h.drain();
-    // Back, Forward, Reload, Copy, Search, View Page Source, Inspect.
-    click(vcx, "menu-row-4");
+    // Back, Forward, Reload, Mute Tab, Copy, Search, View Page Source,
+    // Inspect.
+    click(vcx, "menu-row-5");
     vcx.run_until_parked();
     let cmds = h.drain();
     let opened = cmds.iter().find_map(|c| match c {
@@ -14111,8 +14300,8 @@ fn view_page_source_opens_the_source_in_a_new_tab(cx: &mut TestAppContext) {
         },
     );
     let _ = h.drain();
-    // Back, Forward, Reload, Copy, View Page Source, Inspect.
-    click(vcx, "menu-row-4");
+    // Back, Forward, Reload, Mute Tab, Copy, View Page Source, Inspect.
+    click(vcx, "menu-row-5");
     vcx.run_until_parked();
     let cmds = h.drain();
     assert!(
@@ -14151,7 +14340,8 @@ fn inspect_carries_the_page_space_point(cx: &mut TestAppContext) {
         },
     );
     let _ = crate::web::take_inspect_for_test();
-    click(vcx, "menu-row-5");
+    // Back, Forward, Reload, Mute Tab, Copy, View Page Source, Inspect.
+    click(vcx, "menu-row-6");
     vcx.run_until_parked();
     assert_eq!(
         crate::web::take_inspect_for_test(),
@@ -14334,13 +14524,13 @@ fn the_inspect_row_becomes_the_close_row_while_the_dock_is_open(cx: &mut TestApp
         editable: false,
     };
     request_page_menu(&h, vcx, menu.clone());
-    // Back, Forward, Reload, Copy, View Page Source, Inspect.
-    click(vcx, "menu-row-5");
+    // Back, Forward, Reload, Mute Tab, Copy, View Page Source, Inspect.
+    click(vcx, "menu-row-6");
     vcx.run_until_parked();
     assert!(crate::web::devtools_open(tab), "the dock never opened");
 
     request_page_menu(&h, vcx, menu);
-    click(vcx, "menu-row-5");
+    click(vcx, "menu-row-6");
     vcx.run_until_parked();
     assert!(
         !crate::web::devtools_open(tab),

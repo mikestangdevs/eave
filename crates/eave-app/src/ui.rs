@@ -86,6 +86,11 @@ actions!(
         GoBack,
         GoForward,
         ReloadTab,
+        /// B5 — ⇧⌘R. **Not `ReloadTab` with a modifier**: that one goes
+        /// through the engine's `pending` so the nav stack stays the index
+        /// of record, and this one is a browser command about the entry
+        /// already loaded. See `web::reload_hard`.
+        HardReloadTab,
         /// Slice E2 — ⌘1–⌘8 jump to strip index N; ⌘9 is the last tab.
         ActivateTab1,
         ActivateTab2,
@@ -4676,6 +4681,149 @@ impl Render for TabDrag {
     }
 }
 
+/// D10 — how the macOS window came to be fullscreen.
+///
+/// Three states rather than a bool, and the middle one is the whole reason
+/// this is not a bool: **`toggle_fullscreen` is asynchronous and animated**,
+/// so `Window::is_fullscreen()` keeps answering `false` for the several
+/// frames after eave asks. A two-state version reads that gap as "the
+/// operator left fullscreen" and tells the page to exit — on the very frames
+/// where the video is still on its way in. The reconciliation below is
+/// therefore only allowed to run from [`Ours`](WindowFullscreen::Ours),
+/// which is entered only once the platform has confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowFullscreen {
+    /// eave has not asked. A fullscreen window in this state is the
+    /// operator's own and must be left alone.
+    No,
+    /// eave has asked and the platform has not confirmed yet.
+    Asked,
+    /// Confirmed fullscreen, put there by eave, so eave takes it back out.
+    Ours,
+}
+
+/// D10 — which page asked for fullscreen, and what eave did to the window
+/// about it.
+#[derive(Debug, Default)]
+struct PageFullscreenState {
+    /// The tab whose page is fullscreen, as of the last edge eave acted on.
+    /// Compared against the live answer to find the edges.
+    tab: Option<String>,
+    window: WindowFullscreen,
+}
+
+impl Default for WindowFullscreen {
+    fn default() -> Self {
+        Self::No
+    }
+}
+
+/// The one thing D10 does to the world this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenAction {
+    /// Leave the window and the page exactly as they are.
+    Nothing,
+    /// Ask macOS to enter or leave fullscreen.
+    ToggleWindow,
+    /// Tell the PAGE to exit — the operator took the window out by hand.
+    TellPageToExit,
+}
+
+/// D10's whole decision, as a function of four bools.
+///
+/// Pulled out of `Shell::drive_fullscreen` so the default suite can run it:
+/// the executor needs a real `Window` and a real fullscreen animation, and
+/// the bug this guards against lives entirely in the FRAMES BETWEEN asking
+/// and arriving — which is the one interval a live test is least able to
+/// hold still. Every case below is a frame that actually occurs.
+///
+/// `page_wants` is this frame's answer, `acted_tab` is the one eave last
+/// acted on; they differ exactly on an edge.
+fn fullscreen_step(
+    page_wants: bool,
+    acted_tab: bool,
+    window_is_fullscreen: bool,
+    state: WindowFullscreen,
+) -> (WindowFullscreen, FullscreenAction) {
+    if page_wants != acted_tab {
+        return if page_wants {
+            // Entering. A window the operator already fullscreened stays
+            // theirs — `No` — so ending the video does not drop them out of
+            // a fullscreen they chose.
+            if window_is_fullscreen {
+                (WindowFullscreen::No, FullscreenAction::Nothing)
+            } else {
+                (WindowFullscreen::Asked, FullscreenAction::ToggleWindow)
+            }
+        } else {
+            // Leaving. Only undo a fullscreen eave asked for.
+            let undo = state != WindowFullscreen::No && window_is_fullscreen;
+            (
+                WindowFullscreen::No,
+                if undo {
+                    FullscreenAction::ToggleWindow
+                } else {
+                    FullscreenAction::Nothing
+                },
+            )
+        };
+    }
+    match state {
+        // The platform arrived. Nothing to do but believe it — and only
+        // from here may the arm below conclude anything.
+        WindowFullscreen::Asked if window_is_fullscreen => {
+            (WindowFullscreen::Ours, FullscreenAction::Nothing)
+        }
+        // **The gap.** Still animating in: `is_fullscreen()` is false and
+        // it means "not yet", not "the operator left". Answering
+        // `TellPageToExit` here is the bug this enum exists to prevent, and
+        // it would fire on every fullscreen eave ever entered.
+        WindowFullscreen::Asked => (WindowFullscreen::Asked, FullscreenAction::Nothing),
+        // Confirmed ours, and now the window is not fullscreen: the green
+        // button, ⌃⌘F or a swipe. Chromium is never told about any of
+        // those, so eave tells the page.
+        WindowFullscreen::Ours if !window_is_fullscreen => {
+            (WindowFullscreen::No, FullscreenAction::TellPageToExit)
+        }
+        other => (other, FullscreenAction::Nothing),
+    }
+}
+
+/// D12 — a page's `title=`, drawn where the pointer is.
+///
+/// A view rather than an element because that is what `.tooltip()` takes:
+/// gpui owns the hover delay, the placement against the window edge and the
+/// dismissal, which is most of what a tooltip actually is and all of what a
+/// hand-rolled one gets wrong.
+struct PageTooltip {
+    text: SharedString,
+}
+
+impl Render for PageTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .max_w(px(TOOLTIP_MAX_W))
+            .rounded(px(theme::RADIUS_SELECT))
+            .bg(theme::menu_glass())
+            .border_1()
+            .border_color(theme::border())
+            .shadow(theme::shadow_panel())
+            .text_size(px(theme::DETAIL_SIZE))
+            .line_height(px(theme::DETAIL_LINE))
+            .text_color(theme::text())
+            .child(self.text.clone())
+    }
+}
+
+/// How wide a `title=` may get before it wraps.
+///
+/// A cap and not a truncation: the text is already length-limited by
+/// `web::tooltip_text`, and a long title is worth reading — it is the one
+/// place on the page whose whole purpose is to be prose.
+const TOOLTIP_MAX_W: f32 = 320.0;
+
 /// The bookmark zone while a page is held over it: a filled tray and a
 /// dashed rim, so the drop reads as going into that box.
 ///
@@ -4865,6 +5013,8 @@ struct Shell {
     /// number on screen.
     zoom_hud: Option<(u64, String)>,
     zoom_hud_gen: u64,
+    /// D10 — which page is fullscreen, and whose the window is.
+    fullscreen: PageFullscreenState,
     /// The rails' scroll offsets (Slice M). Held only so the scroll-edge
     /// fades can read overflow at PAINT time — nothing else reads them,
     /// and no scroll POSITION is authoritative here (spec 03: the UI
@@ -7356,6 +7506,30 @@ impl Shell {
         // the composer was unmounted). ⌘-chords are actions and have
         // already fired. Enter must not Send to a session sitting behind
         // this tab.
+        // ── D10 and B4: the two things ⎋ means when a PAGE has the keys ──
+        //
+        // **This must sit above the `page_owns_keyboard` return, and the
+        // first cut of it did not.** It was written at the end of this
+        // function, on the reasoning that ⎋ belongs to whichever surface is
+        // up and only means "stop" when none is — which is true, and which
+        // put it after the one gate that returns for exactly the case it is
+        // about. A live page owns the keyboard, so the arm was unreachable
+        // whenever there was a page to stop. It passed review, compiled,
+        // and did nothing; the operator found it in a second by pressing
+        // the key.
+        //
+        // So the placement rule is narrower than "last": **after every
+        // surface that owns ⎋, and before the page takes the rest.** Both
+        // halves are load-bearing — the gates above still get first refusal.
+        //
+        // The page receives this keystroke as well, and that is correct.
+        // gpui dispatches leaf-first on the bubble phase and neither
+        // listener stops the other (`web/page.rs`'s `on_key_down` says so),
+        // so a site's own escape handler still runs. Chrome behaves the
+        // same way: ⎋ stops the load *and* reaches the document.
+        if ks.key.as_str() == "escape" && (self.leave_fullscreen(cx) || self.stop_loading(cx)) {
+            return;
+        }
         if self.page_owns_keyboard(cx) {
             return;
         }
@@ -9116,6 +9290,84 @@ impl Shell {
             .into_any_element()
     }
 
+    /// D12 — wrap a page element so its `title=` draws at the pointer.
+    ///
+    /// Attached to a WRAPPER around the page, not to the page: a parent does
+    /// not intercept its child's mouse events, so the document still
+    /// receives every click and move, while gpui's hover tracking sees the
+    /// pointer over the subtree either way. The `.id()` is required because
+    /// `tooltip` is a stateful-interactive method, and `tag` keeps the two
+    /// split panes from sharing one hover state.
+    ///
+    /// Attached only when Chromium has actually reported a title. CEF sends
+    /// an empty string on leaving an element, `on_tooltip` turns that into
+    /// `None`, and the builder disappears with it rather than a stale tip
+    /// following the pointer across the page.
+    fn with_page_tooltip(&self, tab_id: &str, el: AnyElement, tag: &str) -> AnyElement {
+        let text = crate::web::chrome(tab_id)
+            .and_then(|c| c.tooltip)
+            .and_then(|t| crate::web::tooltip_text(&t));
+        let mut wrapper = div()
+            .id(SharedString::from(format!("page-tip-{tag}")))
+            .size_full()
+            .child(el);
+        if let Some(text) = text {
+            let text = SharedString::from(text);
+            wrapper = wrapper.tooltip(move |_, cx| {
+                let text = text.clone();
+                cx.new(|_| PageTooltip { text }).into()
+            });
+        }
+        wrapper.into_any_element()
+    }
+
+    /// D11 — the link under the pointer, bottom-right of the page.
+    ///
+    /// **Deliberately not interactive**: no `.id()`, no listeners, so
+    /// hit-testing falls straight through to the page beneath it. A bubble
+    /// that ate the click on the link it is describing would be its own
+    /// defect — the mirror image of G25, where a scrim that painted without
+    /// `.occlude()` let clicks through when it should have held them.
+    ///
+    /// The plate is opaque rather than a wash: it sits over arbitrary page
+    /// pixels, and secondary ink on a 34% overlay is legible against eave's
+    /// canvas and nothing else.
+    ///
+    /// # One helper, because there are TWO page render paths
+    /// A page is mounted from `split_pane` when the well is split and from
+    /// `render`'s own branch when it is not, and the second is the ordinary
+    /// case. The first cut of this put the bubble in `split_pane` alone, so
+    /// it drew only in a split and the operator's hover did nothing — the
+    /// find bar is duplicated across the same two paths and was the standing
+    /// example nobody read as a warning. Anything that floats over a page
+    /// belongs in a function both paths call.
+    fn page_status_bubble(&self, tab_id: &str) -> Option<AnyElement> {
+        let text = crate::web::chrome(tab_id)
+            .and_then(|c| c.status)
+            .and_then(|s| crate::web::status_text(&s))?;
+        Some(
+            div()
+                .debug_selector(|| "page-status".into())
+                .absolute()
+                .bottom_0()
+                .right_0()
+                .max_w(relative(0.6))
+                .px(px(theme::SPACE_2))
+                .py(px(theme::SPACE_1))
+                .rounded_tl(px(theme::RADIUS_BUTTON))
+                .bg(theme::menu_glass())
+                .border_t_1()
+                .border_l_1()
+                .border_color(theme::border())
+                .text_size(px(theme::DETAIL_SIZE))
+                .line_height(px(theme::DETAIL_LINE))
+                .text_color(theme::text_secondary())
+                .truncate()
+                .child(text)
+                .into_any_element(),
+        )
+    }
+
     fn split_pane(
         &self,
         tab_id: &str,
@@ -9140,6 +9392,7 @@ impl Shell {
         } else {
             None
         };
+        let page_el = page_el.map(|el| self.with_page_tooltip(tab_id, el, side));
         // Two statements rather than an `and_then`, because `find_bar`
         // takes `&mut Context` now (it leases the caret clock) and the
         // closure would still be holding the reborrow `find_here` took.
@@ -9197,15 +9450,21 @@ impl Shell {
                 cx.stop_propagation();
                 this.split_tabs(&drag.id, &drop_id, on_right, cx);
             }))
-            .child(self.pane_header(
-                cx,
-                rail_collapsed,
-                Some(tab_id),
-                show_rail,
-                show_files,
-                header_tag,
-                phase,
-            ))
+            // D10 — the pane's own header goes with the rest of the chrome.
+            // Read per TAB rather than from a flag passed down, because
+            // that is the honest scope: in a split it is the fullscreen
+            // pane that loses its header, and the other pane keeps its own.
+            .children((!crate::web::page_fullscreen(tab_id)).then(|| {
+                self.pane_header(
+                    cx,
+                    rail_collapsed,
+                    Some(tab_id),
+                    show_rail,
+                    show_files,
+                    header_tag,
+                    phase,
+                )
+            }))
             .child(
                 div()
                     .flex_1()
@@ -9214,6 +9473,7 @@ impl Shell {
                     .overflow_hidden()
                     .children(page_el)
                     .children(find)
+                    .children(self.page_status_bubble(tab_id))
                     .children(absence.map(|note| {
                         div()
                             .debug_selector(|| "page-absence".into())
@@ -11735,6 +11995,94 @@ impl Shell {
     /// `compact` is the split-pill chip: same identity, half the rail, so
     /// two (or more) tabs read as one group. Selection is only the focused
     /// pane — the pill itself is the split's mark.
+    /// C4 — the speaker on a tab that is making a noise, and the control
+    /// that silences it.
+    ///
+    /// # When it is there
+    /// **Audible OR muted**, and the second half is what stops the control
+    /// from being a trap. If the icon appeared only while sound was coming
+    /// out, muting would remove the only way to unmute: the tab falls
+    /// silent, the speaker vanishes with it, and the operator is left with
+    /// a page menu they have no reason to open. A muted tab keeps its
+    /// crossed speaker for as long as it is muted, which is also how it
+    /// stays legible as a *state* rather than a momentary event.
+    ///
+    /// # Why it is not always there
+    /// A speaker on every tab would be a control that does nothing on
+    /// almost all of them. This is the opposite call from the close button
+    /// above, whose slot is reserved at all times — close applies to every
+    /// tab and audio applies to a few, so reserving 18 px on every tab for
+    /// it would spend the title's width on a permanent absence.
+    ///
+    /// The layout cost is real and accepted: a tab that starts playing
+    /// gains a slot and its title reflows by that much. The alternative
+    /// pins the cost on every tab forever.
+    ///
+    /// # The ink does not fade with the row
+    /// `tab-close` rides the row's hover so it appears under the pointer.
+    /// This must not: it is a **status** first and a control second, and a
+    /// speaker only visible on hover would answer "which tab is that sound
+    /// coming from" only for someone who already knew. It carries its own
+    /// hover key so the plate lights under the pointer without the row's.
+    fn tab_audio_control(&self, tab: &strip::StripTab, cx: &Context<Self>) -> Option<AnyElement> {
+        if tab.kind != strip::TabKind::Page {
+            return None;
+        }
+        let muted = crate::web::tab_muted(&tab.id);
+        let audible = crate::web::tab_audible(&tab.id);
+        if !muted && !audible {
+            return None;
+        }
+        let id = tab.id.clone();
+        let toggling = tab.id.clone();
+        let key = format!("tab-audio-{id}");
+        Some(
+            div()
+                .id(SharedString::from(key.clone()))
+                .debug_selector({
+                    let id = id.clone();
+                    move || format!("tab-audio-{id}")
+                })
+                .mr(px(theme::SPACE_1))
+                .size(px(theme::TAB_CLOSE))
+                .flex_none()
+                .rounded(px(theme::RADIUS_CHIP))
+                .hover_fade(
+                    key.clone(),
+                    gpui::transparent_black(),
+                    theme::overlay_strong(),
+                )
+                .cursor_pointer()
+                // The tab under it must not activate on its way to being
+                // muted — the same reason `tab-close` stops propagation.
+                // Muting a background tab from the strip is the whole
+                // gesture; pulling it to the front first would undo it.
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    // Read-then-flip against the live answer rather than a
+                    // bool captured at render: the row was labelled a frame
+                    // ago, and an eviction can replace the browser under it.
+                    let muted = crate::web::tab_muted(&toggling);
+                    crate::web::set_tab_muted(&toggling, !muted);
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icons::tagged_icon(
+                    if muted {
+                        icons::VOLUME_CROSS
+                    } else {
+                        icons::VOLUME_LOUD
+                    },
+                    theme::ICON_SM,
+                    theme::text_secondary(),
+                    format!("tab-audio-glyph-{id}"),
+                ))
+                .into_any_element(),
+        )
+    }
+
     fn rail_tab(
         &self,
         tab: &strip::StripTab,
@@ -11852,6 +12200,11 @@ impl Shell {
             // split or not. `about:blank` has no plate AT ALL (see
             // `tab_plate`), so its label starts on New Tab's `+` column.
             .children(tab_plate(tab, &id))
+            // C4 — between the site mark and the title, where Chrome, Arc
+            // and Safari all put it: the plate says WHICH site, the speaker
+            // says what it is doing, and the title is the thing that gives
+            // way when both are present.
+            .children(self.tab_audio_control(tab, cx))
             .child(
                 // A FIXED slot, not `flex_1`. Every tab is the same width,
                 // so the name gets the same room on every one of them.
@@ -15326,6 +15679,117 @@ impl Shell {
         self.active_page(cx).filter(|t| crate::web::find_is_open(t))
     }
 
+    /// The active page, when there is still a load to stop — B4's whole
+    /// precondition.
+    ///
+    /// Two states, and neither implies the other: `pending` is a navigation
+    /// the engine has issued that nothing has answered yet, and
+    /// `LoadState::Loading` is one Chromium has committed and is fetching.
+    /// ⎋ can stop either, and testing only the second would make the key
+    /// dead for exactly the slowest case — a host that has not answered.
+    fn active_page_loading(&self, cx: &App) -> Option<String> {
+        let id = self.active_page(cx)?;
+        let snapshot = self.strip_snapshot(cx);
+        let tab = snapshot.tabs.iter().find(|t| t.id == id)?;
+        (tab.pending.is_some() || matches!(tab.load, eave_wire::LoadState::Loading))
+            .then_some(id)
+    }
+
+    /// B4 — ⎋ stops the load and keeps what has already painted.
+    ///
+    /// Answers whether it did anything, because ⎋ is the most contended key
+    /// in the shell and the arm that calls this is the LAST one: everything
+    /// with a surface to close has already had its turn by then.
+    ///
+    /// **The page gets this keystroke too, and that is correct.** gpui
+    /// dispatches leaf-first on the bubble phase and neither listener stops
+    /// the other (`web/page.rs`'s `on_key_down` says so), so a web app's own
+    /// escape handler still runs. Chrome behaves the same way — ⎋ stops the
+    /// load *and* reaches the document.
+    fn stop_loading(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.active_page_loading(cx) else {
+            return false;
+        };
+        crate::web::stop_load(&tab);
+        cx.notify();
+        true
+    }
+
+    /// D10 — the active page tab whose document has asked for fullscreen.
+    ///
+    /// Scoped to the ACTIVE tab on purpose: a background tab that left a
+    /// video fullscreen must not hold the window, and its own
+    /// `on_fullscreen_mode_change(false)` will arrive when it is next shown
+    /// or evicted.
+    fn fullscreen_page(&self, cx: &App) -> Option<String> {
+        self.active_page(cx)
+            .filter(|id| crate::web::page_fullscreen(id))
+    }
+
+    /// D10 — put the window where the page asked, and keep the two honest.
+    ///
+    /// Called once per frame from `render`, which is the only place holding
+    /// both the window and the strip. Every branch is an EDGE — a change
+    /// between the page's answer this frame and the one eave last acted on
+    /// — because `toggle_fullscreen` is a request, not a setter, and firing
+    /// it every frame while the animation runs would flap the window.
+    fn drive_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let want = self.fullscreen_page(cx);
+        let edge = want != self.fullscreen.tab;
+        let (next, action) = fullscreen_step(
+            want.is_some(),
+            self.fullscreen.tab.is_some(),
+            window.is_fullscreen(),
+            self.fullscreen.window,
+        );
+        self.fullscreen.window = next;
+        match action {
+            FullscreenAction::Nothing => {}
+            FullscreenAction::ToggleWindow => window.toggle_fullscreen(),
+            // The tab eave last acted on, not `want` — on this branch
+            // `want` is still `Some` (the page has not been told yet) and
+            // they are the same tab, but reading the acted one says which
+            // is meant.
+            FullscreenAction::TellPageToExit => {
+                if let Some(tab) = self.fullscreen.tab.clone() {
+                    crate::web::exit_page_fullscreen(&tab);
+                }
+            }
+        }
+        if edge {
+            self.fullscreen.tab = want;
+            cx.notify();
+        }
+    }
+
+    /// D10 — ⎋ leaves a fullscreen page. Answers whether it did.
+    ///
+    /// Ahead of B4's stop in the escape chain: while a video is fullscreen
+    /// the only thing ⎋ can sensibly mean is "come back", and a page that
+    /// went fullscreen mid-load would otherwise have ⎋ stop the load and
+    /// leave the operator stuck in a fullscreen window.
+    fn leave_fullscreen(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.fullscreen_page(cx) else {
+            return false;
+        };
+        // Asks the PAGE, and lets `drive_fullscreen` answer the window on
+        // the frame the page confirms. Toggling the window here as well
+        // would race the report and could leave the two disagreeing in the
+        // one direction this feature exists to prevent.
+        crate::web::exit_page_fullscreen(&tab);
+        cx.notify();
+        true
+    }
+
+    /// B5 — ⇧⌘R, reload without the cache.
+    fn hard_reload(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_page(cx) else {
+            return;
+        };
+        crate::web::reload_hard(&tab);
+        cx.notify();
+    }
+
     /// ⌘F. Opens the bar, or leaves an open one alone.
     ///
     /// **Idempotent on purpose.** ⌘F on a bar that is already up must not
@@ -15568,6 +16032,28 @@ impl Shell {
         if !has_url {
             items[2] = items[2].clone().disabled();
         }
+        // C4's control, with the navigation group rather than below the
+        // content rows: muting is a fact about the TAB, like reloading it,
+        // and not about whatever the pointer happened to be over. Chrome
+        // keeps "Mute site" in the same neighbourhood as Reload for the
+        // same reason. It must in any case come before the developer pair,
+        // which the comment further down pins as last.
+        //
+        // **Always present on a page with a url, never conditioned on the
+        // tab making noise** — forced rather than chosen: eave cannot learn
+        // that a page is audible without taking its audio off the speakers
+        // to find out (`web::tabs::set_muted` carries the account), so a
+        // row that appeared only for audible tabs would never appear at
+        // all. The label states which way the row will move, and that is
+        // what makes the missing indicator survivable — the operator reads
+        // the current state off the verb.
+        if has_url {
+            items.push(MenuItem::new(if crate::web::tab_muted(&req.tab_id) {
+                "Unmute Tab"
+            } else {
+                "Mute Tab"
+            }));
+        }
 
         let copy = MenuItem::new("Copy").trailing("⌘C");
         items.push(if req.selection.is_some() {
@@ -15691,6 +16177,16 @@ impl Shell {
                     .send(Command::Browser(BrowserCmd::Go { tab_id, delta: 1 }));
             }
             "Reload" => self.reload(cx),
+            // Read-then-flip against Chromium rather than against a
+            // remembered bool: the row was labelled from the same read one
+            // frame ago, so a toggle that trusted its own map could invert
+            // a tab whose browser had been evicted and replaced underneath
+            // it.
+            "Mute Tab" | "Unmute Tab" => {
+                let muted = crate::web::tab_muted(&tab_id);
+                crate::web::set_tab_muted(&tab_id, !muted);
+                cx.notify();
+            }
             "Copy" => crate::web::copy_selection(&tab_id),
             "Copy Link" => {
                 if let Some(url) = req.link_url.as_deref() {
@@ -17672,6 +18168,11 @@ impl Render for Shell {
         // every page stretched for ever.
         crate::web::set_live_divider(self.split_drag.is_some() || self.devtools_drag.is_some());
 
+        // D10 — reconcile the window with what the page asked for, before
+        // anything below reads `fullscreen_page` to decide what to draw.
+        self.drive_fullscreen(window, cx);
+        let fullscreen = self.fullscreen_page(cx).is_some();
+
         // Perf probe: measure inter-frame time while force-scrolling the
         // 10k transcript top to bottom (spec 04 §Acceptance).
         if let Some(perf) = &mut self.perf {
@@ -17811,12 +18312,26 @@ impl Render for Shell {
         // doing nothing.
         crate::web::drive_observation(&strip_snapshot);
 
+        // **This is the page path that runs when the well is NOT split**,
+        // which is the ordinary case — `split_pane` builds the other one.
+        // D11 and D12 have to be attached here as well as there; see
+        // `page_status_bubble` for what happened when they were not.
         let page_el = {
             let active = strip_snapshot.active.clone();
             active.and_then(|id| {
-                crate::web::page_element(&id, cx).map(|el| self.devtools_dock(&id, el, cx))
+                crate::web::page_element(&id, cx)
+                    .map(|el| self.devtools_dock(&id, el, cx))
+                    .map(|el| self.with_page_tooltip(&id, el, "well"))
             })
         };
+        // D11's bubble for the unsplit well. Keyed off the active tab like
+        // `page_el` above, and `None` whenever the page is not reporting a
+        // link — so it costs nothing on a session tab.
+        let page_status = strip_snapshot
+            .active
+            .as_deref()
+            .filter(|_| strip::active_is_page(&strip_snapshot))
+            .and_then(|id| self.page_status_bubble(id));
         // The page's own dialog. Computed here beside `page_el` because it
         // belongs to the same tab and is mounted in the same well — and
         // because the floating-surface rule below wants every overlay's
@@ -18500,6 +19015,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go(-1, cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
             .on_action(cx.listener(|this, _: &ReloadTab, _, cx| this.reload(cx)))
+            .on_action(cx.listener(|this, _: &HardReloadTab, _, cx| this.hard_reload(cx)))
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_nth(0, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| this.activate_nth(1, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| this.activate_nth(2, cx)))
@@ -18602,7 +19118,11 @@ impl Render for Shell {
                     // supposed to be a space for tabs when the sidebar was
                     // closed but idk about it now"), so this slice does not
                     // answer it — it gets the borders out of the way.
-                    .when(!rail_collapsed, |d| {
+                    // D10 — and fullscreen means fullscreen. The rail is
+                    // eave's, the video is the page's, and a black bar of
+                    // agent chrome down the side of a fullscreen film is
+                    // the thing every browser removes.
+                    .when(!rail_collapsed && !fullscreen, |d| {
                         d.child(self.rail(cx, pulse, rename_caret_lit))
                     })
                     .child(
@@ -18610,11 +19130,16 @@ impl Render for Shell {
                         // uniform gutter, rounded, darker than the glass.
                         // The pane header is the card's top strip, inside
                         // the radius. `content-well` is the card.
+                        //
+                        // The gutter goes to zero in fullscreen: a card
+                        // floating inside a fullscreen window would letterbox
+                        // the page it is supposed to be getting out of the
+                        // way of.
                         div()
                             .flex_1()
                             .min_w(px(0.))
                             .min_h(px(0.))
-                            .p(px(theme::CARD_GUTTER))
+                            .p(px(if fullscreen { 0.0 } else { theme::CARD_GUTTER }))
                             .child(content_card({
                                 if let Some(split) = self.split.clone() {
                                     self.render_split_well(
@@ -18739,6 +19264,7 @@ impl Render for Shell {
                                                 // anchoring and disturbs no
                                                 // layout.
                                                 .children(find_bar)
+                                                .children(page_status)
                                                 // Slice C5. A page tab with nothing to
                                                 // draw says which of the two absences
                                                 // it is, rather than showing an empty
@@ -19511,6 +20037,10 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-]", GoForward, None),
         KeyBinding::new("cmd-r", ReloadTab, None),
+        // B5. Listed AFTER ⌘R deliberately: gpui's matcher is not
+        // last-wins, and `cmd-shift-r` is a strictly more specific chord —
+        // it does not shadow the binding above and is not shadowed by it.
+        KeyBinding::new("cmd-shift-r", HardReloadTab, None),
         KeyBinding::new("cmd-1", ActivateTab1, None),
         KeyBinding::new("cmd-2", ActivateTab2, None),
         KeyBinding::new("cmd-3", ActivateTab3, None),
@@ -20122,6 +20652,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         friction: None,
                         friction_gen: 0,
                         friction_path_stated: false,
+                        fullscreen: PageFullscreenState::default(),
                         zoom_hud: None,
                         zoom_hud_gen: 0,
                         rail_scroll: ScrollHandle::new(),
@@ -20239,6 +20770,85 @@ fn perf_fill_10k(state: &mut TranscriptState) {
 #[cfg(test)]
 #[path = "ui_harness.rs"]
 mod harness;
+
+#[cfg(test)]
+mod d10_tests {
+    use super::{fullscreen_step, FullscreenAction, WindowFullscreen};
+
+    /// The whole life of one fullscreen video, frame by frame — including
+    /// the frames the window spends animating, which is where the bug is.
+    #[test]
+    fn entering_fullscreen_survives_the_frames_before_the_window_arrives() {
+        // The page asks. eave asks macOS.
+        let (state, act) = fullscreen_step(true, false, false, WindowFullscreen::No);
+        assert_eq!(act, FullscreenAction::ToggleWindow);
+        assert_eq!(state, WindowFullscreen::Asked);
+
+        // **The gap.** Several frames where the window is not fullscreen
+        // YET. Nothing may happen here — and in particular the page must
+        // not be told to exit the fullscreen it just entered.
+        let mut state = state;
+        for frame in 0..8 {
+            let (next, act) = fullscreen_step(true, true, false, state);
+            assert_eq!(
+                act,
+                FullscreenAction::Nothing,
+                "frame {frame} of the animation acted"
+            );
+            state = next;
+        }
+        assert_eq!(state, WindowFullscreen::Asked, "the gap moved the state on");
+
+        // The platform arrives.
+        let (state, act) = fullscreen_step(true, true, true, state);
+        assert_eq!(act, FullscreenAction::Nothing);
+        assert_eq!(state, WindowFullscreen::Ours);
+
+        // Steady state: the video plays for a while and nothing happens.
+        let (state, act) = fullscreen_step(true, true, true, state);
+        assert_eq!(act, FullscreenAction::Nothing);
+
+        // The page leaves fullscreen. eave takes the window back out.
+        let (state, act) = fullscreen_step(false, true, true, state);
+        assert_eq!(act, FullscreenAction::ToggleWindow);
+        assert_eq!(state, WindowFullscreen::No);
+    }
+
+    /// The operator leaves macOS fullscreen by hand. Chromium is never told
+    /// about the green button, so eave tells the page.
+    #[test]
+    fn leaving_the_window_by_hand_takes_the_page_out_too() {
+        let (state, _) = fullscreen_step(true, false, false, WindowFullscreen::No);
+        let (state, _) = fullscreen_step(true, true, true, state);
+        assert_eq!(state, WindowFullscreen::Ours, "not confirmed, so vacuous");
+
+        let (state, act) = fullscreen_step(true, true, false, state);
+        assert_eq!(act, FullscreenAction::TellPageToExit);
+        assert_eq!(state, WindowFullscreen::No);
+
+        // And it says it ONCE. A repeat every frame would spam Chromium
+        // for as long as the page took to answer.
+        let (_, act) = fullscreen_step(true, true, false, state);
+        assert_eq!(act, FullscreenAction::Nothing);
+    }
+
+    /// A window the OPERATOR fullscreened is not eave's to close.
+    ///
+    /// Without this, watching a video fullscreen inside an already
+    /// fullscreen eave would drop the whole window out of fullscreen when
+    /// the video ended — eave undoing something it never did.
+    #[test]
+    fn a_window_the_operator_fullscreened_stays_theirs() {
+        let (state, act) = fullscreen_step(true, false, true, WindowFullscreen::No);
+        assert_eq!(act, FullscreenAction::Nothing, "eave grabbed a window it did not own");
+        assert_eq!(state, WindowFullscreen::No);
+
+        // The video ends. The window is still fullscreen and stays that way.
+        let (state, act) = fullscreen_step(false, true, true, state);
+        assert_eq!(act, FullscreenAction::Nothing);
+        assert_eq!(state, WindowFullscreen::No);
+    }
+}
 
 #[cfg(test)]
 mod e1_tests {

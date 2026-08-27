@@ -409,6 +409,21 @@ pub fn add_binding(name: &str) -> (&'static str, Value) {
     ("Runtime.addBinding", json!({ "name": name }))
 }
 
+/// Which binding a `Runtime.bindingCalled` event names.
+///
+/// # Why this is not just each consumer's own business
+/// [`take_events_matching`] **removes** what it matches. A consumer that
+/// takes every `Runtime.bindingCalled` and then discards the payloads it
+/// cannot parse does not merely ignore another consumer's events — it eats
+/// them, and the second consumer sees silence with nothing to grep for.
+/// There are two bindings now (`notify`'s and `audible`'s), so every filter
+/// on this event has to name the binding it wants, and this is the one place
+/// that knows how to read it.
+pub fn binding_name(params: &str) -> Option<String> {
+    let event: Value = serde_json::from_str(params).ok()?;
+    Some(event.get("name")?.as_str()?.to_string())
+}
+
 /// Run `source` at the start of every document loaded from now on.
 ///
 /// For **future** documents only — it does nothing to the one already
