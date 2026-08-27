@@ -154,6 +154,20 @@ pub enum HistoryEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before_ms: Option<u64>,
     },
+    /// A batch from another browser. One line per url, carrying the
+    /// source's visit_count rather than emitting that many [`Self::Visited`]
+    /// events — Safari's history on this machine is 5k urls / 23k visits,
+    /// and the log is not the place to unroll it. Frecency
+    /// (`log2(visits) + last/H`) stays correct because reindex sums this
+    /// count the same way it sums Visited. A later Visited on the same url
+    /// still adds one.
+    Imported {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        visit_count: u32,
+        last_visit_ms: u64,
+    },
 }
 
 impl HistoryEvent {
@@ -572,12 +586,34 @@ impl History {
         changed
     }
 
+    /// Apply many events with one reindex at the end. Importing 5k urls
+    /// as 5k [`Self::apply`] calls would rebuild the index 5k times.
+    pub fn apply_many(&mut self, events: &[HistoryEvent]) -> usize {
+        let mut n = 0;
+        for event in events {
+            if self.absorb(event) {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.reindex();
+        }
+        n
+    }
+
     /// Fold without reindexing.
     fn absorb(&mut self, event: &HistoryEvent) -> bool {
         match event {
-            HistoryEvent::Visited { url, .. } | HistoryEvent::Titled { url, .. } => {
+            HistoryEvent::Visited { url, .. }
+            | HistoryEvent::Titled { url, .. }
+            | HistoryEvent::Imported { url, .. } => {
                 if normalize_url(url).is_none() {
                     return false;
+                }
+                if let HistoryEvent::Imported { visit_count, .. } = event {
+                    if *visit_count == 0 {
+                        return false;
+                    }
                 }
                 self.visits.push(event.clone());
                 true
@@ -585,9 +621,9 @@ impl History {
             HistoryEvent::Forgotten { url } => {
                 let before = self.visits.len();
                 self.visits.retain(|v| match v {
-                    HistoryEvent::Visited { url: u, .. } | HistoryEvent::Titled { url: u, .. } => {
-                        u != url
-                    }
+                    HistoryEvent::Visited { url: u, .. }
+                    | HistoryEvent::Titled { url: u, .. }
+                    | HistoryEvent::Imported { url: u, .. } => u != url,
                     _ => true,
                 });
                 before != self.visits.len()
@@ -599,11 +635,17 @@ impl History {
                 let before = self.visits.len();
                 // A range clear drops visits by time. A `Titled` carries no
                 // time of its own, so it goes when its url has no visits
-                // left — done in a second pass below.
+                // left — done in a second pass below. `Imported` has a
+                // last-visit time and is dropped the same way as Visited.
                 self.visits.retain(|v| match v {
                     HistoryEvent::Visited { ts_ms, .. } => {
                         let after_start = since_ms.is_none_or(|s| *ts_ms >= s);
                         let before_end = before_ms.is_none_or(|b| *ts_ms < b);
+                        !(after_start && before_end)
+                    }
+                    HistoryEvent::Imported { last_visit_ms, .. } => {
+                        let after_start = since_ms.is_none_or(|s| *last_visit_ms >= s);
+                        let before_end = before_ms.is_none_or(|b| *last_visit_ms < b);
                         !(after_start && before_end)
                     }
                     _ => true,
@@ -612,7 +654,8 @@ impl History {
                     .visits
                     .iter()
                     .filter_map(|v| match v {
-                        HistoryEvent::Visited { url, .. } => Some(url.as_str()),
+                        HistoryEvent::Visited { url, .. }
+                        | HistoryEvent::Imported { url, .. } => Some(url.as_str()),
                         _ => None,
                     })
                     .collect();
@@ -666,6 +709,27 @@ impl History {
                         e.title = normalize_tab_title(title);
                     }
                 }
+                HistoryEvent::Imported {
+                    url,
+                    title,
+                    visit_count,
+                    last_visit_ms,
+                } => {
+                    let title = title.as_deref().and_then(normalize_tab_title);
+                    let e = by_url.entry(url.as_str()).or_insert_with(|| HistoryEntry {
+                        url: url.clone(),
+                        title: None,
+                        visit_count: 0,
+                        first_visit_ms: *last_visit_ms,
+                        last_visit_ms: *last_visit_ms,
+                    });
+                    e.visit_count = e.visit_count.saturating_add(*visit_count);
+                    e.first_visit_ms = e.first_visit_ms.min(*last_visit_ms);
+                    e.last_visit_ms = e.last_visit_ms.max(*last_visit_ms);
+                    if title.is_some() {
+                        e.title = title;
+                    }
+                }
                 _ => {}
             }
         }
@@ -707,9 +771,9 @@ impl History {
             .map(|e| e.url.clone())
             .collect();
         self.visits.retain(|v| match v {
-            HistoryEvent::Visited { url, .. } | HistoryEvent::Titled { url, .. } => {
-                keep.contains(url)
-            }
+            HistoryEvent::Visited { url, .. }
+            | HistoryEvent::Titled { url, .. }
+            | HistoryEvent::Imported { url, .. } => keep.contains(url),
             _ => true,
         });
         self.reindex();
@@ -1169,6 +1233,52 @@ mod tests {
             before_ms: None
         }
         .requires_compaction());
+        assert!(!HistoryEvent::Imported {
+            url: "https://x/".into(),
+            title: None,
+            visit_count: 4,
+            last_visit_ms: 1,
+        }
+        .requires_compaction());
+    }
+
+    /// An imported url keeps the source's visit_count (so frecency is not
+    /// flattened to "once"), and a later real visit still adds one. The
+    /// threat this is immune to is "Imported is just Visited with extra
+    /// fields we ignore" — if visit_count were dropped, 4 and 1 would
+    /// rank the same after a month of half-life.
+    #[test]
+    fn imported_history_keeps_its_count_and_a_later_visit_adds_one() {
+        let mut h = History::new();
+        assert!(h.apply(&HistoryEvent::Imported {
+            url: "https://imported.example/".into(),
+            title: Some("Imported".into()),
+            visit_count: 4,
+            last_visit_ms: 10 * DAY,
+        }));
+        let e = h
+            .index()
+            .entries()
+            .iter()
+            .find(|e| e.url == "https://imported.example/")
+            .expect("imported url missing");
+        assert_eq!(e.visit_count, 4, "Imported dropped its visit_count");
+        assert_eq!(e.last_visit_ms, 10 * DAY);
+        assert_eq!(e.title.as_deref(), Some("Imported"));
+
+        assert!(h.apply(&visit(
+            "https://imported.example/",
+            Some("Imported now"),
+            11 * DAY
+        )));
+        let e = h
+            .index()
+            .entries()
+            .iter()
+            .find(|e| e.url == "https://imported.example/")
+            .unwrap();
+        assert_eq!(e.visit_count, 5);
+        assert_eq!(e.last_visit_ms, 11 * DAY);
     }
 
     /// Serde defaults: an event from a build predating `transition` reads

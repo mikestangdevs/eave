@@ -46,6 +46,7 @@
 
 pub mod bookmarks;
 pub mod history;
+pub mod import;
 pub mod log;
 pub mod permissions;
 pub mod snapshot;
@@ -184,8 +185,16 @@ impl BrowserStore {
     /// Apply and journal one tab event. Returns whether anything changed;
     /// a no-op is neither written nor broadcast.
     pub fn tab_event(&mut self, event: TabEvent) -> io::Result<bool> {
+        // Private tabs are in-memory only. Journaling one would write its
+        // url into tabs.jsonl, which is the opposite of private, and
+        // restoring it on the next launch would show the operator a tab
+        // they closed by quitting.
+        let incognito = self.tabs.event_is_incognito(&event);
         if !self.tabs.apply(&event) {
             return Ok(false);
+        }
+        if incognito {
+            return Ok(true);
         }
         self.tabs_log.append(&event)?;
         // Write-behind: the strip is worth a lost move, not an fsync per
@@ -204,6 +213,59 @@ impl BrowserStore {
         self.bookmarks_log.append(&event)?;
         self.bookmarks_log.sync()?;
         Ok(true)
+    }
+
+    /// Apply a batch of bookmark and history events from an import.
+    ///
+    /// One fsync at the end of the bookmarks, one flush at the end of
+    /// history — not one per row. Importing Safari's 5k urls as 5k
+    /// [`Self::bookmark_event`] calls would fsync 5k times for no extra
+    /// durability the operator can use: the import is one action, and
+    /// either the folder landed or it did not.
+    pub fn import_batch(
+        &mut self,
+        bookmarks: &[BookmarkEvent],
+        history: &[HistoryEvent],
+    ) -> io::Result<(usize, usize)> {
+        let mut bm = 0usize;
+        for event in bookmarks {
+            if self.bookmarks.apply(event) {
+                self.bookmarks_log.append(event)?;
+                bm += 1;
+            }
+        }
+        if bm > 0 {
+            self.bookmarks_log.sync()?;
+        }
+
+        let hist = self.history.apply_many(history);
+        for event in history {
+            // apply_many already folded; we still have to journal the
+            // events that actually landed. A no-op (empty url, zero
+            // visit_count) was not absorbed, so skip it here too.
+            match event {
+                HistoryEvent::Imported { url, visit_count, .. } => {
+                    if visit_count == &0 || tabs::normalize_url(url).is_none() {
+                        continue;
+                    }
+                }
+                HistoryEvent::Visited { url, .. } | HistoryEvent::Titled { url, .. } => {
+                    if tabs::normalize_url(url).is_none() {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+            self.history_log.append(event)?;
+        }
+        if hist > 0 {
+            self.history_log.flush()?;
+            if self.history.over_cap() {
+                self.history.prune_to_cap();
+                self.history_log.compact(self.history.retained())?;
+            }
+        }
+        Ok((bm, hist))
     }
 
     /// Apply and journal one history event.
@@ -286,6 +348,7 @@ mod tests {
                 content: TabContent::Page,
                 opener: None,
                 url: Some(url.into()),
+                incognito: false,
                 ts_ms: 1,
             })
             .unwrap();
@@ -463,5 +526,90 @@ mod tests {
             .unwrap();
         let after = std::fs::read_to_string(browser_dir(&dir).join("tabs.jsonl")).unwrap();
         assert_eq!(before, after, "a permission answer rewrote the tab strip");
+    }
+
+    #[test]
+    fn an_incognito_tab_is_never_written_to_the_log() {
+        let dir = scratch();
+        let (mut store, _) = BrowserStore::open(&dir).unwrap();
+        assert!(store
+            .tab_event(TabEvent::Opened {
+                id: "secret".into(),
+                group: None,
+                index: usize::MAX,
+                content: TabContent::Page,
+                opener: None,
+                url: Some("https://private.example/".into()),
+                incognito: true,
+                ts_ms: 1,
+            })
+            .unwrap());
+        store.sync().unwrap();
+        let tabs = std::fs::read_to_string(browser_dir(&dir).join("tabs.jsonl")).unwrap();
+        assert!(
+            !tabs.contains("private.example"),
+            "an incognito url landed in the tab log: {tabs}"
+        );
+        assert!(
+            !tabs.contains("secret"),
+            "an incognito tab id landed in the tab log: {tabs}"
+        );
+        assert!(store.tabs.tabs["secret"].incognito);
+        assert_eq!(
+            store.tabs.tabs["secret"].url(),
+            Some("https://private.example/")
+        );
+
+        // A restart must not restore it. The threat this is immune to is
+        // "we skipped the append but the fold still wrote it on compact".
+        drop(store);
+        let (store, _) = BrowserStore::open(&dir).unwrap();
+        assert!(
+            !store.tabs.tabs.contains_key("secret"),
+            "an incognito tab survived a restart"
+        );
+    }
+
+    #[test]
+    fn import_batch_files_a_tree_and_history_in_one_write() {
+        let dir = scratch();
+        let (mut store, _) = BrowserStore::open(&dir).unwrap();
+        let bm = vec![
+            bookmarks::BookmarkEvent::Added {
+                id: "wrap".into(),
+                parent: None,
+                index: 0,
+                title: Some("From Chrome".into()),
+                url: None,
+                ts_ms: 1,
+            },
+            bookmarks::BookmarkEvent::Added {
+                id: "link".into(),
+                parent: Some("wrap".into()),
+                index: 0,
+                title: Some("Rust".into()),
+                url: Some("https://www.rust-lang.org/".into()),
+                ts_ms: 1,
+            },
+        ];
+        let hist = vec![history::HistoryEvent::Imported {
+            url: "https://hist.example/".into(),
+            title: Some("Hist".into()),
+            visit_count: 4,
+            last_visit_ms: 9,
+        }];
+        let (n_bm, n_hist) = store.import_batch(&bm, &hist).unwrap();
+        assert_eq!(n_bm, 2);
+        assert_eq!(n_hist, 1);
+        assert_eq!(store.bookmarks.len(), 2);
+        assert_eq!(store.bookmarks.roots, vec!["wrap".to_string()]);
+        let e = store
+            .history
+            .index()
+            .entries()
+            .iter()
+            .find(|e| e.url == "https://hist.example/")
+            .expect("imported history missing");
+        assert_eq!(e.visit_count, 4);
     }
 }

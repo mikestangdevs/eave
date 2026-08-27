@@ -99,6 +99,10 @@ fn menus() -> Vec<Menu> {
                 // HAS the surface — see the negative test below, which
                 // guarded this exact row until S1 built the window.
                 MenuItem::action("Settings…", crate::settings_window::OpenSettings),
+                MenuItem::action(
+                    "Import from Another Browser…",
+                    crate::import_dialog::OpenImportDialog,
+                ),
                 MenuItem::action("Customize Theme", crate::theme_editor::OpenThemeEditor),
                 MenuItem::separator(),
                 MenuItem::action("Hide eave", Hide),
@@ -106,6 +110,14 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
                 MenuItem::action("Quit eave", crate::ui::Quit),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("New Tab", crate::ui::NewTab),
+                MenuItem::action("New Incognito Tab", crate::ui::NewIncognitoTab),
             ],
         },
         Menu {
@@ -137,10 +149,10 @@ mod tests {
     fn the_bar_names_only_what_eave_has() {
         let m = menus();
         let names: Vec<&str> = m.iter().map(|x| x.name.as_ref()).collect();
-        assert_eq!(names, vec!["eave", "Window"]);
+        assert_eq!(names, vec!["eave", "File", "Window"]);
 
         let app_items = m[0].items.len();
-        let window_items = m[1].items.len();
+        let window_items = m[2].items.len();
         assert!(app_items >= 5, "the app menu lost items: {app_items}");
         assert!(
             window_items >= 3,
@@ -158,6 +170,28 @@ mod tests {
         assert!(
             app_names.iter().any(|n| n == "Customize Theme"),
             "the app menu lost Customize Theme: {app_names:?}"
+        );
+        assert!(
+            app_names
+                .iter()
+                .any(|n| n == "Import from Another Browser…"),
+            "the app menu lost Import: {app_names:?}"
+        );
+        let file_names: Vec<String> = m[1]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            file_names.iter().any(|n| n == "New Tab"),
+            "the File menu lost New Tab: {file_names:?}"
+        );
+        assert!(
+            file_names.iter().any(|n| n == "New Incognito Tab"),
+            "the File menu lost New Incognito Tab: {file_names:?}"
         );
         // Present since S1 built the window; before that, this very test
         // forbade the word. The row and the surface must arrive together,

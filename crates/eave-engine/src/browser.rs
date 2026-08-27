@@ -38,7 +38,7 @@ use eave_core::browser::tabs::{
 };
 use eave_core::browser::{BrowserStore, OpenReport};
 use eave_core::journal::now_ms;
-use eave_wire::{HistoryQueryOk, PageFact};
+use eave_wire::{HistoryQueryOk, ImportOk, ImportedBookmark, ImportedVisit, PageFact};
 
 /// Snapshot pokes carry no payload — the snapshot is taken at emission —
 /// so the channel can be small and lag just coalesces, exactly as
@@ -219,6 +219,7 @@ impl Browser {
         content: TabContent,
         opener: Option<TabId>,
         activate: bool,
+        incognito: bool,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let ts_ms = now_ms();
@@ -229,20 +230,24 @@ impl Browser {
             content,
             opener,
             url: url.clone(),
+            incognito,
             ts_ms,
         })?;
         // Opening at a url is a visit. Recorded here rather than left to
         // the page engine because a tab restored into an address the
         // operator typed IS a visit, whoever renders it — and history that
         // depended on which engine won would be the exact coupling this
-        // slice exists to avoid.
+        // slice exists to avoid. A private tab is the exception: writing
+        // the url into history.jsonl is the opposite of private.
         if let Some(u) = url {
-            self.history(HistoryEvent::Visited {
-                url: u,
-                title: None,
-                ts_ms,
-                transition: Transition::Typed,
-            })?;
+            if !incognito {
+                self.history(HistoryEvent::Visited {
+                    url: u,
+                    title: None,
+                    ts_ms,
+                    transition: Transition::Typed,
+                })?;
+            }
         }
         if activate {
             self.tab(TabEvent::Activated { id: id.clone() })?;
@@ -409,12 +414,18 @@ impl Browser {
                     // The stack just moved (or refreshed). Drop any CEF
                     // overlay so the snapshot reads that stack until the
                     // matching Load fact restates the arrows.
-                    {
+                    let incognito = {
                         let mut s = self.store.lock().unwrap();
                         if let Some(t) = s.tabs.tabs.get_mut(&tab_id) {
                             t.page_can_go_back = None;
                             t.page_can_go_forward = None;
+                            t.incognito
+                        } else {
+                            false
                         }
+                    };
+                    if incognito {
+                        return Ok(true);
                     }
                     self.history(HistoryEvent::Visited {
                         url,
@@ -442,23 +453,26 @@ impl Browser {
                 Ok(changed)
             }
             PageFact::Titled { title } => {
-                let url = self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .tabs
-                    .tabs
-                    .get(&tab_id)
-                    .and_then(|t| t.url().map(str::to_string));
+                let (url, incognito) = {
+                    let s = self.store.lock().unwrap();
+                    match s.tabs.tabs.get(&tab_id) {
+                        Some(t) => (t.url().map(str::to_string), t.incognito),
+                        None => (None, false),
+                    }
+                };
                 let changed = self.tab(TabEvent::Titled {
                     id: tab_id,
                     title: title.clone(),
                 })?;
                 // A title that arrives after the commit is the ordinary
                 // case, so history learns it too — otherwise every entry
-                // in the omnibox would be searchable by url alone.
-                if let (Some(url), Some(title)) = (url, title) {
-                    self.history(HistoryEvent::Titled { url, title })?;
+                // in the omnibox would be searchable by url alone. A
+                // private tab's title stays out of history for the same
+                // reason its url does.
+                if !incognito {
+                    if let (Some(url), Some(title)) = (url, title) {
+                        self.history(HistoryEvent::Titled { url, title })?;
+                    }
                 }
                 Ok(changed)
             }
@@ -688,6 +702,40 @@ impl Browser {
         })
     }
 
+    /// File a parsed import in one batch. One bookmarks snapshot at the
+    /// end, not one per node — the tree is one action.
+    pub fn import(
+        &self,
+        bookmarks: Vec<ImportedBookmark>,
+        history: Vec<ImportedVisit>,
+    ) -> Result<ImportOk, String> {
+        let ts_ms = now_ms();
+        let mut bookmark_events = Vec::new();
+        emit_bookmarks(&bookmarks, None, &mut bookmark_events, ts_ms);
+        let history_events: Vec<HistoryEvent> = history
+            .into_iter()
+            .map(|v| HistoryEvent::Imported {
+                url: v.url,
+                title: v.title,
+                visit_count: v.visit_count,
+                last_visit_ms: v.last_visit_ms,
+            })
+            .collect();
+        let (bm, hist) = self
+            .store
+            .lock()
+            .unwrap()
+            .import_batch(&bookmark_events, &history_events)
+            .map_err(|e| format!("write import: {e}"))?;
+        if bm > 0 {
+            let _ = self.bookmarks_tx.send(());
+        }
+        Ok(ImportOk {
+            bookmarks: bm as u32,
+            history: hist as u32,
+        })
+    }
+
     // -----------------------------------------------------------------
     // Permissions (G1)
 
@@ -737,4 +785,26 @@ impl Browser {
     // tab writes are write-behind to the OS, which survives the engine
     // dying by any means, and the two things worth more than that — a
     // bookmark, and a forget — fsync on every write.
+}
+
+fn emit_bookmarks(
+    nodes: &[ImportedBookmark],
+    parent: Option<String>,
+    events: &mut Vec<BookmarkEvent>,
+    ts_ms: u64,
+) {
+    for (index, node) in nodes.iter().enumerate() {
+        let id = uuid::Uuid::new_v4().to_string();
+        events.push(BookmarkEvent::Added {
+            id: id.clone(),
+            parent: parent.clone(),
+            index,
+            title: node.title.clone(),
+            url: node.url.clone(),
+            ts_ms,
+        });
+        if !node.children.is_empty() {
+            emit_bookmarks(&node.children, Some(id), events, ts_ms);
+        }
+    }
 }

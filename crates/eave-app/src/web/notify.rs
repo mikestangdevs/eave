@@ -705,6 +705,7 @@ mod tests {
                 can_go_forward: false,
                 history_len: 0,
                 opener: None,
+                incognito: false,
                 created_ts_ms: 0,
             }],
             ..Default::default()

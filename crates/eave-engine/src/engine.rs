@@ -34,9 +34,10 @@ use eave_core::store::{normalize_title, EngineLock, LockError, Meta, Store, META
 use eave_core::thresholds::AttentionThresholds;
 use eave_wire::{
     socket_path, ArchiveOk, ChangedFile, ChangedOk, CreatedOk, Cursor, DecideOk, Decision,
-    DiffBasis, DiffOk, FileScope, FileStatus, FilesSnapshot, HelloOk, IsolateOk, KillOk, ListOk,
-    OpenOk, RemoveWorktreeOk, RenameOk, Request, RequestEnvelope, ResponseBody, ResponseEnvelope,
-    SendOk, SessionInfo, SubscriptionItem, TabNavOk, UnsubscribeOk, PROTO_VERSION,
+    DiffBasis, DiffOk, FileScope, FileStatus, FilesSnapshot, HelloOk, IsolateOk, KillOk,
+    ListOk, OpenOk, RemoveWorktreeOk, RenameOk, Request, RequestEnvelope, ResponseBody,
+    ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, TabNavOk, UnsubscribeOk,
+    PROTO_VERSION,
 };
 
 use crate::browser::{Browser, TabPoke};
@@ -2248,10 +2249,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 content,
                 opener,
                 activate,
-            } => match engine
-                .browser
-                .tab_open(url, group, index, content, opener, activate)
-            {
+                incognito,
+            } => match engine.browser.tab_open(
+                url, group, index, content, opener, activate, incognito,
+            ) {
                 Ok(id) => ok_value(&CreatedOk { id }),
                 Err(message) => ResponseBody::Err { message },
             },
@@ -2314,6 +2315,12 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
             }
             Request::BookmarkRetarget { bookmark_id, url } => {
                 changed(engine.browser.bookmark_retarget(bookmark_id, url))
+            }
+            Request::BrowserImport { bookmarks, history } => {
+                match engine.browser.import(bookmarks, history) {
+                    Ok(ok) => ok_value(&ok),
+                    Err(message) => ResponseBody::Err { message },
+                }
             }
             Request::HistoryForget { url } => changed(engine.browser.history_forget(url)),
             Request::HistoryClear {

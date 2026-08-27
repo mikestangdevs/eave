@@ -23,7 +23,7 @@
 //! was rejected for two reasons. It puts a live Chromium callback in the
 //! shell's state for as long as a menu is open, which is a lifetime this
 //! process has already been bitten by (`with_browser`'s note). And it buys
-//! nothing: of the six rows eave shows, `Open Link in New Tab` and
+//! nothing: of the rows eave shows, `Open Link in New Tab` and
 //! `Search for…` have no CEF command id, so the custom path is needed
 //! anyway and holding the callback would mean maintaining both.
 //!

@@ -144,6 +144,10 @@ pub struct Settings {
     /// set a default is byte-identical to a pre-S2 one.
     #[serde(skip_serializing_if = "crate::settings_agents::AgentDefaults::is_empty")]
     pub agents: crate::settings_agents::AgentDefaults,
+    /// The import-from-old-browser first-run has been shown (or skipped
+    /// with Maybe Later). Re-entry is the Settings row, which ignores this.
+    #[serde(default)]
+    pub import_offered: bool,
     /// Keys this build does not know, preserved across a rewrite.
     /// **Keep this field last**; typed fields added later go above it.
     #[serde(flatten)]
@@ -158,6 +162,7 @@ impl Default for Settings {
             evict_after_min: default_evict_min(),
             switch_to_background_tabs: false,
             agents: Default::default(),
+            import_offered: false,
             extra: serde_json::Map::new(),
         }
     }

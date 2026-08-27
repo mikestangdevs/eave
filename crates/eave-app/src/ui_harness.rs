@@ -6020,6 +6020,7 @@ fn session_tab(session_id: &str) -> TabInfo {
         can_go_forward: false,
         history_len: 0,
         opener: None,
+        incognito: false,
         created_ts_ms: 0,
     }
 }
@@ -11772,7 +11773,7 @@ fn cmd_shift_t_reopens_a_closed_page_tab_and_not_a_session_tab(cx: &mut TestAppC
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt { url, activate: true })
+            Command::Browser(BrowserCmd::OpenAt { url, activate: true, .. })
                 if url == "https://closed.test/"
         )),
         "⌘⇧T did not reopen the closed page tab: {cmds:?}"
@@ -11827,7 +11828,7 @@ fn cmd_click_a_link_opens_a_background_tab_and_does_not_steal_focus(cx: &mut Tes
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt { url, activate: false })
+            Command::Browser(BrowserCmd::OpenAt { url, activate: false, .. })
                 if url == "https://eave.sh/ok"
         )),
         "⌘-click did not open a background tab: {cmds:?}"
@@ -12267,7 +12268,7 @@ fn the_omnibox_opens_a_tab_when_the_active_one_is_a_session(cx: &mut TestAppCont
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt { url, activate: true })
+            Command::Browser(BrowserCmd::OpenAt { url, activate: true, .. })
                 if url == "https://example.com"
         )),
         "the omnibox dropped a navigation because the active tab was a \\
@@ -12308,6 +12309,36 @@ fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
         cmds.iter()
             .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
         "the strip's + is not ⌘T: {cmds:?}"
+    );
+}
+
+/// ⌘⇧N opens a private tab, not an ordinary one. The two must not
+/// collapse: a chord that meant incognito and issued NewTab would write
+/// the next navigation into history.
+#[gpui::test]
+fn cmd_shift_n_opens_an_incognito_tab(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-shift-n");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewIncognitoTab))),
+        "⌘⇧N opened nothing private: {cmds:?}"
+    );
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+        "⌘⇧N issued an ordinary NewTab: {cmds:?}"
+    );
+    assert!(
+        shown(vcx, "omnibox"),
+        "⌘⇧N opened a tab with no way to aim it"
     );
 }
 
@@ -12489,6 +12520,42 @@ fn the_customize_theme_panel_renders_and_switches_tabs(cx: &mut TestAppContext) 
     assert!(
         shown(vcx, "customize-swatch-Violet"),
         "the reopened popup forgot it was on the Accent tab"
+    );
+}
+
+/// Import from your old browser is a popup in the shell, lists all four
+/// sources, and Escape takes it down. Deliberately does not click Next:
+/// Next parses the operator's real browser profiles on disk.
+#[gpui::test]
+fn the_import_dialog_lists_four_sources_and_is_a_popup(cx: &mut TestAppContext) {
+    let (_h, vcx) = boot(cx);
+    let windows_before = cx.update(|cx| cx.windows().len());
+    vcx.dispatch_action(crate::import_dialog::OpenImportDialog);
+    vcx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before,
+        "Import must be a popup in the shell, not a second window"
+    );
+    for sel in [
+        "import-dialog",
+        "import-source-Brave",
+        "import-source-Chrome",
+        "import-source-Safari",
+        "import-source-Arc",
+        "import-maybe-later",
+        "import-next",
+        "import-close",
+    ] {
+        assert!(shown(vcx, sel), "{sel} missing from the import picker");
+    }
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(Duration::from_millis(200));
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "import-dialog"),
+        "escape did not close the import popup"
     );
 }
 
@@ -14184,7 +14251,7 @@ fn opening_a_link_in_a_new_tab_does_not_steal_the_window(cx: &mut TestAppContext
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt { url, activate: false })
+            Command::Browser(BrowserCmd::OpenAt { url, activate: false, .. })
                 if url == "https://linked.example/"
         )),
         "Open Link in New Tab did not open the link, or stole the window: {cmds:?}"
@@ -14307,7 +14374,7 @@ fn view_page_source_opens_the_source_in_a_new_tab(cx: &mut TestAppContext) {
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::OpenAt { url, activate: true })
+            Command::Browser(BrowserCmd::OpenAt { url, activate: true, .. })
                 if url == "view-source:https://example.com/page"
         )),
         "View Page Source opened nothing, or the wrong thing: {cmds:?}"
@@ -15700,6 +15767,7 @@ fn the_shortcut_viewer_sees_the_booted_keymap(cx: &mut TestAppContext) {
         };
         for (label, chord) in [
             ("New tab", "⌘T"),
+            ("New incognito tab", "⇧⌘N"),
             ("Close the tab — the window when none is open", "⌘W"),
             ("Open the omnibox", "⌘L"),
             ("Find in page", "⌘F"),

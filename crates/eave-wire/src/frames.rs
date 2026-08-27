@@ -330,6 +330,10 @@ pub enum Request {
         /// does not steal focus.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         activate: bool,
+        /// A private tab. Not journaled, not history, Chromium in-memory
+        /// storage. Skipped when false so an older engine still parses.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incognito: bool,
     },
     /// Close a tab. **A tab that views a session does not end that
     /// session** — see [`TabContent::Session`]. Closing a view is not
@@ -453,6 +457,16 @@ pub enum Request {
     BookmarkRetarget {
         bookmark_id: BookmarkId,
         url: String,
+    },
+
+    /// File a parsed import from another browser. The client parses (the
+    /// engine does not need `$HOME`, and a test can send a fixture tree);
+    /// the engine applies in one batch and answers [`ImportOk`].
+    BrowserImport {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bookmarks: Vec<ImportedBookmark>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        history: Vec<ImportedVisit>,
     },
 
     /// Forget one url. The visits are physically removed from the log,
@@ -1186,6 +1200,35 @@ pub struct CreatedOk {
     pub id: String,
 }
 
+/// One node of a [`Request::BrowserImport`] tree. `url` present makes a
+/// link, absent makes a folder — the same rule as [`Request::BookmarkAdd`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedBookmark {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ImportedBookmark>,
+}
+
+/// One url of a [`Request::BrowserImport`] history batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedVisit {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub visit_count: u32,
+    pub last_visit_ms: u64,
+}
+
+/// Reply to [`Request::BrowserImport`]: how many nodes / urls landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportOk {
+    pub bookmarks: u32,
+    pub history: u32,
+}
+
 /// Reply to every browser mutation that does not create something.
 ///
 /// `changed: false` is a FACT, not a failure: pinning an already-pinned
@@ -1712,6 +1755,7 @@ mod tests {
                 },
                 opener: Some("t0".into()),
                 activate: true,
+                incognito: false,
             },
             Request::TabGo {
                 tab_id: "t1".into(),
@@ -1753,6 +1797,23 @@ mod tests {
                 bookmark_id: "b1".into(),
                 url: "https://y/".into(),
             },
+            Request::BrowserImport {
+                bookmarks: vec![ImportedBookmark {
+                    title: Some("From Arc".into()),
+                    url: None,
+                    children: vec![ImportedBookmark {
+                        title: Some("Rust".into()),
+                        url: Some("https://www.rust-lang.org/".into()),
+                        children: Vec::new(),
+                    }],
+                }],
+                history: vec![ImportedVisit {
+                    url: "https://hist.example/".into(),
+                    title: Some("Hist".into()),
+                    visit_count: 4,
+                    last_visit_ms: 1,
+                }],
+            },
             Request::HistoryClear {
                 since_ms: Some(1),
                 before_ms: None,
@@ -1792,9 +1853,10 @@ mod tests {
             content: TabContent::Page,
             opener: None,
             activate: false,
+            incognito: false,
         })
         .unwrap();
-        for key in ["group", "index", "content", "opener", "activate"] {
+        for key in ["group", "index", "content", "opener", "activate", "incognito"] {
             assert!(!line.contains(key), "a plain tab_open wrote {key}: {line}");
         }
 
@@ -1880,6 +1942,7 @@ mod tests {
                 content: TabContent::Page,
                 opener: None,
                 activate: false,
+                incognito: false,
             }
         );
 

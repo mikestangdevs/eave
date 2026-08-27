@@ -117,6 +117,9 @@ pub struct StripTab {
     /// The group this tab is in, and where in its run it sits. `None` for a
     /// loose tab.
     pub run: Option<GroupRun>,
+    /// A private tab. The plate draws a hat instead of a site mark so the
+    /// strip can be read at a glance.
+    pub incognito: bool,
 }
 
 /// Where a tab sits inside its group's run, so the renderer can draw the
@@ -389,6 +392,7 @@ fn strip_tab(
             TabContent::Session { .. } => None,
         },
         run,
+        incognito: info.incognito,
     }
 }
 
@@ -620,6 +624,7 @@ mod tests {
             can_go_forward: false,
             history_len: 0,
             opener: None,
+            incognito: false,
             created_ts_ms: 0,
         }
     }

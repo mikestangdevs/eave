@@ -1507,6 +1507,7 @@ pub enum PageRequest {
         url: String,
         opener: String,
         activate: bool,
+        incognito: bool,
     },
     Navigate {
         tab_id: String,

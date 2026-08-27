@@ -82,6 +82,9 @@ pub struct TabInfo {
     pub history_len: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opener: Option<TabId>,
+    /// A private tab. Skipped when false so an older client still parses.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incognito: bool,
     pub created_ts_ms: u64,
 }
 
@@ -181,6 +184,7 @@ impl TabsState {
                     .unwrap_or_else(|| t.nav.can_go_forward()),
                 history_len: t.nav.entries.len(),
                 opener: t.opener.clone(),
+                incognito: t.incognito,
                 created_ts_ms: t.created_ts_ms,
             })
             .collect();

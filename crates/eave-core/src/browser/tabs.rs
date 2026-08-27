@@ -276,6 +276,12 @@ pub struct Tab {
     pub pinned: bool,
     #[serde(default, skip_serializing_if = "TabContent::is_default_content")]
     pub content: TabContent,
+    /// A private tab. Not journaled (see `BrowserStore::tab_event`), not
+    /// written to history, and not restored. The page engine attaches it
+    /// to Chromium's in-memory request context so cookies and storage
+    /// die with the last incognito tab.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incognito: bool,
     pub nav: NavStack,
     /// The tab's own title, when the page stated one. Falls back to the
     /// current nav entry's title, then to nothing — never to the url.
@@ -394,6 +400,8 @@ pub enum TabEvent {
         /// The url it opens at, when it opens at one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incognito: bool,
         ts_ms: u64,
     },
     /// A navigation COMMITTED. Not a request to navigate — this is the
@@ -561,6 +569,7 @@ impl TabsState {
                 content,
                 opener,
                 url,
+                incognito,
                 ts_ms,
             } => {
                 if self.tabs.contains_key(id) {
@@ -571,6 +580,7 @@ impl TabsState {
                     group: None,
                     pinned: false,
                     content: content.clone(),
+                    incognito: *incognito,
                     nav: NavStack::default(),
                     title: None,
                     favicon_url: None,
@@ -883,6 +893,29 @@ impl TabsState {
         out
     }
 
+    /// Whether this event is about a private tab — one that must not be
+    /// written to the log. Checked against the state *before* apply so a
+    /// Closed event can still see the tab.
+    pub fn event_is_incognito(&self, event: &TabEvent) -> bool {
+        match event {
+            TabEvent::Opened { incognito, .. } => *incognito,
+            TabEvent::Navigated { id, .. }
+            | TabEvent::Traversed { id, .. }
+            | TabEvent::Titled { id, .. }
+            | TabEvent::FaviconStated { id, .. }
+            | TabEvent::Pinned { id, .. }
+            | TabEvent::Moved { id, .. }
+            | TabEvent::Closed { id, .. }
+            | TabEvent::Activated { id, .. } => {
+                self.tabs.get(id).is_some_and(|t| t.incognito)
+            }
+            TabEvent::GroupCreated { .. }
+            | TabEvent::GroupUpdated { .. }
+            | TabEvent::GroupMoved { .. }
+            | TabEvent::GroupClosed { .. } => false,
+        }
+    }
+
     /// The tabs pointing at a given session, if any. The join in the one
     /// direction that is cheap; the reverse (a session naming its tabs) is
     /// deliberately absent, because it would make the session store depend
@@ -912,6 +945,7 @@ mod tests {
             content: TabContent::Page,
             opener: None,
             url: url.map(str::to_string),
+            incognito: false,
             ts_ms: 1,
         });
     }
@@ -1264,6 +1298,7 @@ mod tests {
             content: TabContent::Page,
             opener: None,
             url: None,
+            incognito: false,
             ts_ms: 0,
         });
         s.apply(&TabEvent::Activated { id: "t".into() });
@@ -1307,6 +1342,7 @@ mod tests {
                 content: TabContent::Page,
                 opener: None,
                 url: None,
+                incognito: false,
                 ts_ms: 0,
             });
         }
@@ -1337,6 +1373,7 @@ mod tests {
             content: TabContent::Page,
             opener: None,
             url: Some("https://x/".into()),
+            incognito: false,
             ts_ms: 0,
         });
         assert_eq!(s.tabs["t"].group, None);
@@ -1369,6 +1406,7 @@ mod tests {
                 content: TabContent::Page,
                 opener: None,
                 url: None,
+                incognito: false,
                 ts_ms: 0,
             });
         }
@@ -1401,6 +1439,7 @@ mod tests {
             },
             opener: None,
             url: None,
+            incognito: false,
             ts_ms: 0,
         });
         assert_eq!(s.tabs_for_session("sess-1").len(), 1);
@@ -1504,11 +1543,12 @@ mod tests {
                 content: TabContent::Page,
                 opener: None,
                 url: None,
+                incognito: false,
                 ts_ms: 7,
             }
         );
         let back = serde_json::to_string(&e).unwrap();
-        for key in ["content", "opener", "url", "group"] {
+        for key in ["content", "opener", "url", "group", "incognito"] {
             assert!(!back.contains(key), "a plain tab wrote a {key} key: {back}");
         }
         // A tab with nothing unusual about it serializes without the
@@ -1519,7 +1559,7 @@ mod tests {
             ..Tab::default()
         };
         let back = serde_json::to_string(&t).unwrap();
-        for key in ["pinned", "content", "load", "favicon_url", "opener"] {
+        for key in ["pinned", "content", "load", "favicon_url", "opener", "incognito"] {
             assert!(!back.contains(key), "a plain tab wrote a {key} key: {back}");
         }
     }

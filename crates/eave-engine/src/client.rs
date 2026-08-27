@@ -574,6 +574,7 @@ impl Client {
                 content: eave_wire::TabContent::Page,
                 opener: None,
                 activate,
+                incognito: false,
             })
             .await?
             .id)
@@ -596,6 +597,7 @@ impl Client {
                 },
                 opener: None,
                 activate: false,
+                incognito: false,
             })
             .await?
             .id)
@@ -633,6 +635,16 @@ impl Client {
             limit,
         })
         .await
+    }
+
+    /// File a parsed import from another browser.
+    pub async fn browser_import(
+        &self,
+        bookmarks: Vec<eave_wire::ImportedBookmark>,
+        history: Vec<eave_wire::ImportedVisit>,
+    ) -> Result<eave_wire::ImportOk, ClientError> {
+        self.request::<eave_wire::ImportOk>(Request::BrowserImport { bookmarks, history })
+            .await
     }
 
     /// Register a streaming request and hand back its receiver. The shape

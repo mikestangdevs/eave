@@ -70,6 +70,9 @@ actions!(
         DenyOldest,
         /// Slice C5 — ⌘T.
         NewTab,
+        /// ⌘⇧N — a page tab that is not journaled, not in history, and
+        /// lives in Chromium's in-memory request context.
+        NewIncognitoTab,
         /// Slice C5 — ⌘L, the omnibox.
         FocusOmnibox,
         /// Slice C5 — ⌘⇧L, the friction log. It used to be ⌘L; see
@@ -379,6 +382,8 @@ enum BrowserCmd {
     Close(String),
     /// ⌘T: an empty page tab, activated.
     NewTab,
+    /// ⌘⇧N: an empty private page tab.
+    NewIncognitoTab,
     /// The omnibox committing on a tab that already exists.
     Navigate { tab_id: String, url: String },
     /// Slice D1 — walk the back/forward stack. `-1` is back, `+1` forward.
@@ -404,7 +409,11 @@ enum BrowserCmd {
     /// I am still reading" in every browser for twenty years, and
     /// foregrounding it would be the behaviour of an ordinary click, which
     /// the operator did not do.
-    OpenAt { url: String, activate: bool },
+    OpenAt {
+        url: String,
+        activate: bool,
+        incognito: bool,
+    },
     /// A tab that views this session.
     ///
     /// Unconditional. **Whether one is needed is decided where the snapshot
@@ -516,6 +525,12 @@ enum BrowserCmd {
     /// argument for persisting is that the operator stays in charge of
     /// what this browser remembers about them.
     ForgetPermissions { origin: String },
+    /// File a parsed import from another browser. The dialog parsed; this
+    /// just ships the tree to the engine.
+    Import {
+        bookmarks: Vec<eave_wire::ImportedBookmark>,
+        history: Vec<eave_wire::ImportedVisit>,
+    },
 }
 
 #[derive(Default)]
@@ -555,6 +570,10 @@ struct WebTabsState {
 /// own subscription and have nothing to do with which session is selected.
 struct BookmarksState {
     snapshot: eave_wire::BookmarksSnapshot,
+    /// False until the engine's first `WatchBookmarks` snapshot arrives.
+    /// An empty default must not be read as "first run" — that would pop
+    /// the importer on every harness boot, before any engine existed.
+    received: bool,
 }
 
 /// Slice C5: the last typeahead answer, and the text it answered for.
@@ -665,6 +684,9 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 })
                 .await;
         }
+        BrowserCmd::Import { bookmarks, history } => {
+            let _ = client.browser_import(bookmarks, history).await;
+        }
         BrowserCmd::Close(tab_id) => {
             let _ = client
                 .browser_do(eave_wire::Request::TabClose { tab_id })
@@ -679,6 +701,20 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     content: eave_wire::TabContent::Page,
                     opener: None,
                     activate: true,
+                    incognito: false,
+                })
+                .await;
+        }
+        BrowserCmd::NewIncognitoTab => {
+            let _ = client
+                .browser_create(eave_wire::Request::TabOpen {
+                    url: None,
+                    group: None,
+                    index: None,
+                    content: eave_wire::TabContent::Page,
+                    opener: None,
+                    activate: true,
+                    incognito: true,
                 })
                 .await;
         }
@@ -734,6 +770,7 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     content: eave_wire::TabContent::Session { session_id },
                     opener: None,
                     activate: true,
+                    incognito: false,
                 })
                 .await
                 .is_ok()
@@ -785,7 +822,11 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 .browser_do(eave_wire::Request::TabGo { tab_id, delta })
                 .await;
         }
-        BrowserCmd::OpenAt { url, activate } => {
+        BrowserCmd::OpenAt {
+            url,
+            activate,
+            incognito,
+        } => {
             // Open at NOTHING, then ask. See `BrowserCmd::OpenAt`.
             if let Ok(tab_id) = client
                 .browser_create(eave_wire::Request::TabOpen {
@@ -795,6 +836,7 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     content: eave_wire::TabContent::Page,
                     opener: None,
                     activate,
+                    incognito,
                 })
                 .await
             {
@@ -838,6 +880,7 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     content: eave_wire::TabContent::Session { session_id },
                     opener: None,
                     activate,
+                    incognito: false,
                 })
                 .await;
         }
@@ -1010,6 +1053,7 @@ async fn feed_loop(
                                         content: eave_wire::TabContent::Page,
                                         opener: None,
                                         activate: true,
+                                        incognito: false,
                                     })
                                     .await
                                 {
@@ -1081,7 +1125,12 @@ async fn feed_loop(
                         // reason `BrowserCmd::OpenAt` states: opening a tab
                         // AT a url commits a navigation nobody has fetched.
                         req = req_rx.recv() => match req {
-                            Some(crate::web::PageRequest::OpenTab { url, opener, activate }) => {
+                            Some(crate::web::PageRequest::OpenTab {
+                                url,
+                                opener,
+                                activate,
+                                incognito,
+                            }) => {
                                 let opened = client
                                     .browser_create(eave_wire::Request::TabOpen {
                                         url: None,
@@ -1090,6 +1139,7 @@ async fn feed_loop(
                                         content: eave_wire::TabContent::Page,
                                         opener: Some(opener),
                                         activate,
+                                        incognito,
                                     })
                                     .await;
                                 if let Ok(tab_id) = opened {
@@ -2321,7 +2371,7 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> Option<gpui::Div> {
             .url
             .as_deref()
             .is_none_or(|u| u.is_empty() || u == "about:blank");
-    if blank {
+    if blank && !tab.incognito {
         return None;
     }
     Some(div()
@@ -2344,6 +2394,15 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> Option<gpui::Div> {
             // selector stays on the fallback so an unloaded page still
             // recedes under `tab-chip-unloaded-*`.
             strip::TabKind::Page => {
+                if tab.incognito {
+                    icons::tagged_icon(
+                        icons::INCOGNITO,
+                        12.0,
+                        theme::text(),
+                        format!("tab-incognito-{id}"),
+                    )
+                    .into_any_element()
+                } else {
                 let resident = tab.resident;
                 if let Some(page) = tab.url.as_deref() {
                     crate::web::request_favicon(page);
@@ -2368,6 +2427,7 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> Option<gpui::Div> {
                         )
                         .into_any_element(),
                     None => page_globe(id, resident),
+                }
                 }
             }
             strip::TabKind::Session { chip, .. } => {
@@ -4410,6 +4470,7 @@ impl Element for LinkText {
                                     let _ = tx.send(Command::Browser(BrowserCmd::OpenAt {
                                         url: href.to_string(),
                                         activate: crate::settings::switch_to_background_tabs(),
+                                        incognito: false,
                                     }));
                                 }
                             }
@@ -5205,6 +5266,14 @@ struct Shell {
     /// panel should reopen on the tab it was left on rather than forget
     /// itself every close. Built lazily on the first open.
     theme_editor_view: Option<Entity<crate::theme_editor::ThemeEditor>>,
+    /// Import-from-old-browser popup. Same overlay as Customize Theme;
+    /// centered rather than footered. The view outlives the popup so a
+    /// re-open from Settings does not rebuild detection.
+    import_popup: Popup<()>,
+    import_view: Option<Entity<crate::import_dialog::ImportDialog>>,
+    /// First-run auto-open fires at most once per process, even if the
+    /// operator dismisses without the settings flag landing.
+    import_auto_shown: bool,
     /// Slice C5 — the last typeahead answer the engine sent.
     typeahead: Entity<TypeaheadState>,
     /// Slice C5 — the session this window has already asked to select on
@@ -7513,6 +7582,12 @@ impl Shell {
             }
             return;
         }
+        if self.import_popup.is_open() {
+            if ks.key.as_str() == "escape" {
+                self.close_import_popup(cx);
+            }
+            return;
+        }
         if self.tab_menu.is_open() {
             match ks.key.as_str() {
                 "escape" => self.close_tab_menu(cx),
@@ -8129,7 +8204,7 @@ impl Shell {
     fn close_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
         if let Some(tab) = snapshot.tabs.iter().find(|t| t.id == tab_id) {
-            if tab.content == eave_wire::TabContent::Page {
+            if tab.content == eave_wire::TabContent::Page && !tab.incognito {
                 if let Some(url) = tab.url.clone() {
                     self.closed_pages.push_back(url);
                     // A bound, not a design: Chrome's stack is larger, and
@@ -8184,6 +8259,13 @@ impl Shell {
         self.open_omnibox(cx);
     }
 
+    fn new_incognito_tab(&mut self, cx: &mut Context<Self>) {
+        let _ = self
+            .commands
+            .send(Command::Browser(BrowserCmd::NewIncognitoTab));
+        self.open_omnibox(cx);
+    }
+
     /// ctrl-tab / ctrl-shift-tab.
     fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
@@ -8225,6 +8307,7 @@ impl Shell {
             .send(Command::Browser(BrowserCmd::OpenAt {
                 url,
                 activate: true,
+                incognito: false,
             }));
         cx.notify();
     }
@@ -8644,6 +8727,7 @@ impl Shell {
             None => BrowserCmd::OpenAt {
                 url,
                 activate: true,
+                incognito: false,
             },
         };
         let _ = self.commands.send(Command::Browser(cmd));
@@ -9001,6 +9085,7 @@ impl Shell {
             None => BrowserCmd::OpenAt {
                 url,
                 activate: true,
+                incognito: false,
             },
         };
         let _ = self.commands.send(Command::Browser(cmd));
@@ -11671,6 +11756,7 @@ impl Shell {
             None => BrowserCmd::OpenAt {
                 url,
                 activate: true,
+                incognito: false,
             },
         };
         let _ = self.commands.send(Command::Browser(cmd));
@@ -16229,6 +16315,7 @@ impl Shell {
         if req.link_url.is_some() {
             items.push(MenuItem::new("Copy Link"));
             items.push(MenuItem::new("Open Link in New Tab"));
+            items.push(MenuItem::new("Open Link in Incognito Tab"));
         }
         if let Some(selection) = req.selection.as_deref() {
             items.push(MenuItem::new(format!(
@@ -16371,9 +16458,26 @@ impl Shell {
                     // followed. Foregrounding it would be the behaviour of
                     // an ordinary click, which they did not do — unless the
                     // Tabs pane's "switch immediately" says otherwise (S1).
+                    // A private tab's "new tab" stays private.
+                    let incognito = self
+                        .strip_snapshot(cx)
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .is_some_and(|t| t.incognito);
                     let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                         url,
                         activate: crate::settings::switch_to_background_tabs(),
+                        incognito,
+                    }));
+                }
+            }
+            "Open Link in Incognito Tab" => {
+                if let Some(url) = req.link_url.clone() {
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+                        url,
+                        activate: true,
+                        incognito: true,
                     }));
                 }
             }
@@ -16393,6 +16497,7 @@ impl Shell {
                     let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                         url: format!("view-source:{url}"),
                         activate: true,
+                        incognito: false,
                     }));
                 }
             }
@@ -16426,6 +16531,7 @@ impl Shell {
                     let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                         url: target.url().to_string(),
                         activate: true,
+                        incognito: false,
                     }));
                 }
             }
@@ -16531,6 +16637,107 @@ impl Shell {
             editor.into_any_element(),
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_theme_popup(cx)),
         )
+    }
+
+    fn open_import_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import_popup.is_open() {
+            return;
+        }
+        if self.theme_popup.is_open() {
+            self.close_theme_popup(cx);
+        }
+        if self.page_menu.is_open() {
+            self.close_page_menu(cx);
+        }
+        if self.tab_menu.is_open() {
+            self.close_tab_menu(cx);
+        }
+        if self.import_view.is_none() {
+            let view = cx.new(crate::import_dialog::ImportDialog::new);
+            cx.subscribe(&view, |shell, _view, event, cx| match event {
+                crate::import_dialog::ImportEvent::Close => {
+                    crate::settings::update(cx, |s| s.import_offered = true);
+                    shell.close_import_popup(cx);
+                }
+                crate::import_dialog::ImportEvent::Apply {
+                    bookmarks,
+                    history,
+                } => {
+                    crate::settings::update(cx, |s| s.import_offered = true);
+                    let _ = shell.commands.send(Command::Browser(BrowserCmd::Import {
+                        bookmarks: bookmarks.clone(),
+                        history: history.clone(),
+                    }));
+                }
+            })
+            .detach();
+            self.import_view = Some(view);
+        } else if let Some(view) = &self.import_view {
+            view.update(cx, |d, cx| {
+                d.reset();
+                cx.notify();
+            });
+        }
+        let now = cx.background_executor().now();
+        self.import_popup.open((), Vec::new(), now);
+        let _ = window;
+        cx.notify();
+    }
+
+    fn close_import_popup(&mut self, cx: &mut Context<Self>) {
+        crate::settings::update(cx, |s| s.import_offered = true);
+        let now = cx.background_executor().now();
+        if self.import_popup.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.import_popup.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn import_popup_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let _ = self.import_popup.data()?;
+        let view = self.import_view.clone()?;
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let size = window.viewport_size();
+        let anchor = point(size.width / 2.0, size.height * 0.18);
+        overlay::panel_layer(
+            &self.import_popup,
+            anchor,
+            gpui::Anchor::TopCenter,
+            now,
+            reduced,
+            view.into_any_element(),
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_import_popup(cx)),
+        )
+    }
+
+    fn maybe_auto_open_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        if self.import_auto_shown || self.import_popup.is_open() {
+            return;
+        }
+        if crate::settings::snapshot().import_offered {
+            return;
+        }
+        let empty = {
+            let bookmarks = self.bookmarks.read(cx);
+            bookmarks.received && bookmarks.snapshot.nodes.is_empty()
+        };
+        if !empty {
+            return;
+        }
+        // Decide once. A missing-source machine must not stat $HOME
+        // on every frame for the rest of the session.
+        self.import_auto_shown = true;
+        if !crate::import_dialog::any_source_ready() {
+            return;
+        }
+        self.open_import_popup(window, cx);
     }
 
     fn open_tab_menu(&mut self, tab_id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
@@ -17202,6 +17409,7 @@ impl Shell {
                         let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                             url,
                             activate: crate::settings::switch_to_background_tabs(),
+                            incognito: false,
                         }));
                     }
                 }
@@ -17297,9 +17505,16 @@ impl Shell {
             }
             TabMenuAction::OpenInNewTab => {
                 if let Some(url) = self.tab_url(&tab_id, cx) {
+                    let incognito = self
+                        .strip_snapshot(cx)
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .is_some_and(|t| t.incognito);
                     let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                         url,
                         activate: crate::settings::switch_to_background_tabs(),
+                        incognito,
                     }));
                 }
             }
@@ -17315,9 +17530,16 @@ impl Shell {
             }
             TabMenuAction::Duplicate => {
                 if let Some(url) = self.tab_url(&tab_id, cx) {
+                    let incognito = self
+                        .strip_snapshot(cx)
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .is_some_and(|t| t.incognito);
                     let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                         url,
                         activate: true,
+                        incognito,
                     }));
                 }
             }
@@ -18322,6 +18544,7 @@ impl Render for Shell {
         // Time comes from the executor, never `Instant::now()` — N1's rule,
         // and what lets the harness drive every tween off the fake clock.
         motion::begin_frame(cx.background_executor().now(), cx.reduce_motion());
+        self.maybe_auto_open_import(window, cx);
 
         // While one of eave's dividers is moving, the page surfaces paint
         // their last CEF frame stretched instead of 1:1-and-clipped —
@@ -19028,6 +19251,7 @@ impl Render for Shell {
         let page_menu_layer = self.page_menu_layer(cx);
         let tab_menu_layer = self.tab_menu_layer(cx);
         let theme_popup_layer = self.theme_popup_layer(cx);
+        let import_popup_layer = self.import_popup_layer(window, cx);
         let find_bar = self.find_bar(cx);
         // Slice Q2, built here for the same reason: the launcher and its
         // model menu both need `self` and `cx`, and the element chain
@@ -19124,12 +19348,20 @@ impl Render for Shell {
             // window-wide, not composer-wide, and they have to work at the
             // launcher where there is no composer at all.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
+            .on_action(cx.listener(|this, _: &NewIncognitoTab, _, cx| {
+                this.new_incognito_tab(cx)
+            }))
             .on_action(cx.listener(|this, _: &FocusOmnibox, _, cx| this.open_omnibox(cx)))
             // ⌘⇧, and the app menu's Customize Theme row, when THIS window
             // is key. The global fallback in `bootstrap` covers the rest.
             .on_action(cx.listener(
                 |this, _: &crate::theme_editor::OpenThemeEditor, window, cx| {
                     this.toggle_theme_popup(window, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::import_dialog::OpenImportDialog, window, cx| {
+                    this.open_import_popup(window, cx)
                 },
             ))
             .on_action(cx.listener(|this, _: &FrictionLog, _, cx| this.friction_log(cx)))
@@ -19657,7 +19889,8 @@ impl Render for Shell {
             .children(tab_menu_layer)
             // The Customize Theme popup — same layer discipline as the
             // menus above, opened from the footer they close over.
-            .children(theme_popup_layer);
+            .children(theme_popup_layer)
+            .children(import_popup_layer);
 
         // Slice N1: the motion tail. Anything hand-driven that is mid-flight
         // claims this frame during the pass above; the root asks once, here,
@@ -20171,6 +20404,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         KeyBinding::new("cmd-l", FocusOmnibox, None),
         KeyBinding::new("cmd-shift-l", FrictionLog, None),
         KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-shift-n", NewIncognitoTab, None),
         // ctrl-tab, not ⌘⌥→. macOS has no single convention here and the
         // control-tab pair is what Chrome, Safari, Firefox and every
         // terminal emulator on this machine agree on.
@@ -20317,6 +20551,17 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             }
         }
     });
+    cx.on_action(|_: &crate::import_dialog::OpenImportDialog, cx| {
+        for window in cx.windows() {
+            if let Some(handle) = window.downcast::<Shell>() {
+                let _ = handle.update(cx, |shell, window, cx| {
+                    window.activate_window();
+                    shell.open_import_popup(window, cx);
+                });
+                return;
+            }
+        }
+    });
     // Slice S1: ⌘, is Settings — the chord every macOS app spends there —
     // and the Theme Editor, which held it while it was the only second
     // window, moves to ⌘⇧, beside it. The settings store itself is
@@ -20375,6 +20620,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
     });
     let bookmarks = cx.new(|_| BookmarksState {
         snapshot: eave_wire::BookmarksSnapshot::default(),
+        received: false,
     });
     let replay_assert = std::env::var("EAVE_REPLAY_ASSERT").is_ok();
     let transcript = cx.new(|_| {
@@ -20555,6 +20801,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 if let Some(snapshot) = bookmark_snapshots.into_iter().last() {
                     bookmarks.update(cx, |state, cx| {
                         state.snapshot = snapshot;
+                        state.received = true;
                         cx.notify();
                     });
                 }
@@ -20786,6 +21033,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         tab_menu: Popup::default(),
                         theme_popup: Popup::default(),
                         theme_editor_view: None,
+                        import_popup: Popup::default(),
+                        import_view: None,
+                        import_auto_shown: false,
                         typeahead: typeahead.clone(),
                         asked_for_session_tab: RefCell::new(HashSet::new()),
                         asked_for_project: RefCell::new(HashSet::new()),

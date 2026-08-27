@@ -243,6 +243,7 @@ mod tests {
             can_go_forward: false,
             history_len: 1,
             opener: None,
+            incognito: false,
             created_ts_ms: 0,
         }
     }

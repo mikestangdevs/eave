@@ -180,6 +180,41 @@ thread_local! {
     /// address twice would look like no change and the reload would be dead.
     static ACTED: std::cell::RefCell<HashMap<String, u64>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// Tab ids whose browser was created against the private request
+    /// context. The set, not the snapshot, because CEF callbacks cannot
+    /// read the engine's model from this stack.
+    static INCOGNITO_TABS: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+
+    /// The one in-memory Chromium profile all private tabs share, the
+    /// way one incognito window shares cookies. Empty `cache_path` is
+    /// CEF's incognito: nothing is written to disk. Dropped when the
+    /// last private tab's browser closes so the next private session
+    /// is a fresh one.
+    static INCOGNITO_CTX: std::cell::RefCell<Option<RequestContext>> =
+        std::cell::RefCell::new(None);
+}
+
+fn tab_is_incognito(tab_id: &str) -> bool {
+    INCOGNITO_TABS.with(|s| s.borrow().contains(tab_id))
+}
+
+fn incognito_context() -> Option<RequestContext> {
+    if !super::host::running() {
+        return None;
+    }
+    INCOGNITO_CTX.with(|slot| {
+        if slot.borrow().is_none() {
+            let settings = RequestContextSettings {
+                cache_path: CefString::from(""),
+                persist_session_cookies: 0,
+                ..Default::default()
+            };
+            *slot.borrow_mut() = request_context_create_context(Some(&settings), None);
+        }
+        slot.borrow().clone()
+    })
 }
 
 /// Whether any tab has a live browser. The pump parks when this is false.
@@ -365,6 +400,7 @@ pub enum PageRequest {
         url: String,
         opener: String,
         activate: bool,
+        incognito: bool,
     },
     /// A navigation eave rewrote before it started — a tracked link with
     /// its trackers removed (`nav_policy::Decision::Rewrite`).
@@ -987,7 +1023,7 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
         if let Some(url) = tab.url.as_deref() {
             note_url(&tab.id, url);
         }
-        create(&tab.id, start);
+        create(&tab.id, start, tab.incognito);
         // Creating a browser is work CEF has to be pumped to finish.
         super::host::request_pump();
         super::host::note_activity();
@@ -1052,7 +1088,7 @@ fn drive_tab(tab: &eave_wire::TabInfo) {
 }
 
 /// Create a windowless browser for a tab.
-fn create(tab_id: &str, url: Option<&str>) {
+fn create(tab_id: &str, url: Option<&str>, incognito: bool) {
     // `set_as_windowless` also forces Alloy runtime style — OSR and the
     // Chrome runtime style are mutually exclusive, which is a constraint
     // worth knowing before anything is built on Chrome-style UI.
@@ -1075,15 +1111,25 @@ fn create(tab_id: &str, url: Option<&str>) {
         eprintln!("[web] creating browser for {tab_id} at {url:?}");
     }
     CREATING.with(|c| c.borrow_mut().insert(tab_id.to_string()));
+    if incognito {
+        INCOGNITO_TABS.with(|s| {
+            s.borrow_mut().insert(tab_id.to_string());
+        });
+    }
     let mut client = PageClient::new(tab_id.to_string());
     let start = CefString::from(url.unwrap_or("about:blank"));
+    let mut ctx = if incognito {
+        incognito_context()
+    } else {
+        None
+    };
     browser_host_create_browser(
         Some(&window_info),
         Some(&mut client),
         Some(&start),
         Some(&settings),
         None,
-        None,
+        ctx.as_mut(),
     );
 }
 
@@ -1862,7 +1908,9 @@ wrap_life_span_handler! {
                 // content would be worse.
                 return 1;
             }
-            let Some(activate) = tab_disposition(target_disposition) else {
+            let Some((activate, incognito)) =
+                tab_disposition(target_disposition, tab_is_incognito(&self.tab_id))
+            else {
                 // Not a tab. Cancel the WINDOW — there is nowhere to put
                 // one — and leave whatever else is coming to see it.
                 return 1;
@@ -1871,6 +1919,7 @@ wrap_life_span_handler! {
                 url,
                 opener: self.tab_id.clone(),
                 activate,
+                incognito,
             });
             1
         }
@@ -1906,6 +1955,13 @@ wrap_life_span_handler! {
             // Removed, then dropped outside the borrow — see `with_browser`.
             let gone = BROWSERS.with(|b| b.borrow_mut().remove(&self.tab_id));
             drop(gone);
+            INCOGNITO_TABS.with(|s| {
+                s.borrow_mut().remove(&self.tab_id);
+            });
+            if INCOGNITO_TABS.with(|s| s.borrow().is_empty()) {
+                let ctx = INCOGNITO_CTX.with(|c| c.borrow_mut().take());
+                drop(ctx);
+            }
             super::osr::forget(&self.tab_id);
             super::page::forget_resize_state(&self.tab_id);
             forget_chrome(&self.tab_id);
@@ -2364,7 +2420,16 @@ wrap_download_handler! {
 /// Chromium routes those down different paths and hands eave the same
 /// vocabulary at the end of each, so the risk worth removing is the two
 /// sites disagreeing about what `NEW_BACKGROUND_TAB` means.
-fn tab_disposition(disposition: WindowOpenDisposition) -> Option<bool> {
+/// `Some((activate, incognito))` = open a page tab. `None` = not ours.
+///
+/// A link opened from an already-private tab stays private: putting it
+/// in the ordinary profile would be answering a request for privacy
+/// with a silent no, which is the defect this used to have for
+/// `OFF_THE_RECORD`.
+fn tab_disposition(
+    disposition: WindowOpenDisposition,
+    opener_incognito: bool,
+) -> Option<(bool, bool)> {
     match disposition {
         // ⌘-click, middle-click, `target="_blank" rel=noopener` from a
         // background context. Not activated by default — that is the whole
@@ -2372,22 +2437,22 @@ fn tab_disposition(disposition: WindowOpenDisposition) -> Option<bool> {
         // makes the exception a choice rather than a hardcode: the Tabs
         // pane's "switch to it immediately" flips this arm and only this
         // arm — a FOREGROUND disposition was already an ask to switch.
-        WindowOpenDisposition::NEW_BACKGROUND_TAB => {
-            Some(crate::settings::switch_to_background_tabs())
-        }
-        WindowOpenDisposition::NEW_FOREGROUND_TAB => Some(true),
+        WindowOpenDisposition::NEW_BACKGROUND_TAB => Some((
+            crate::settings::switch_to_background_tabs(),
+            opener_incognito,
+        )),
+        WindowOpenDisposition::NEW_FOREGROUND_TAB => Some((true, opener_incognito)),
         // eave is one window and a page is a tab in it (the C3 ruling), so
         // "new window" and "new popup" are tabs too. A page cannot make
         // eave grow a second window by asking.
-        WindowOpenDisposition::NEW_WINDOW | WindowOpenDisposition::NEW_POPUP => Some(true),
+        WindowOpenDisposition::NEW_WINDOW | WindowOpenDisposition::NEW_POPUP => {
+            Some((true, opener_incognito))
+        }
         // A download wearing a navigation's clothes. Not a tab — the
         // download handler is what should see it, and turning it into a
         // tab would open a page that closes itself.
         WindowOpenDisposition::SAVE_TO_DISK => None,
-        // "Open in incognito." eave has no private context, and opening an
-        // ordinary tab here would answer a request for privacy with a
-        // silent no. Declining leaves the link where it was.
-        WindowOpenDisposition::OFF_THE_RECORD => None,
+        WindowOpenDisposition::OFF_THE_RECORD => Some((true, true)),
         // An ordinary navigation, or Chromium telling us to do nothing.
         _ => None,
     }
@@ -2438,13 +2503,16 @@ wrap_request_handler! {
             if url.is_empty() {
                 return 0;
             }
-            let Some(activate) = tab_disposition(target_disposition) else {
+            let Some((activate, incognito)) =
+                tab_disposition(target_disposition, tab_is_incognito(&self.tab_id))
+            else {
                 return 0;
             };
             request(PageRequest::OpenTab {
                 url,
                 opener: self.tab_id.clone(),
                 activate,
+                incognito,
             });
             1
         }

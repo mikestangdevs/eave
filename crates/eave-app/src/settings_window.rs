@@ -598,6 +598,38 @@ impl SettingsWindow {
             .into_any_element(),
         );
 
+        out.push(section_heading(theme, "Import").into_any_element());
+        out.push(
+            card(
+                theme,
+                vec![
+                    row(
+                        theme,
+                        "Import from another browser",
+                        div()
+                            .id("settings-import")
+                            .debug_selector(|| "settings-import".into())
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .text_color(system_accent())
+                            .child("Import…")
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(crate::import_dialog::OpenImportDialog),
+                                    cx,
+                                );
+                            }))
+                            .into_any_element(),
+                    ),
+                    caption(
+                        theme,
+                        "Bring bookmarks and history from Brave, Chrome, Safari, or Arc.",
+                    ),
+                ],
+            )
+            .into_any_element(),
+        );
+
         // Search engine. The sentence under it is derived from the prefix
         // that will actually receive the query (`engine_host`), so the row
         // cannot drift from the wire — and when the EAVE_SEARCH_URL env
@@ -895,7 +927,9 @@ fn describe(action: &str) -> Option<(&'static str, &'static str)> {
         "eave_app::Hide" => ("Application", "Hide eave"),
         "eave_settings::OpenSettings" => ("Application", "Settings"),
         "eave_theme::OpenThemeEditor" => ("Application", "Customize Theme"),
+        "eave_import::OpenImportDialog" => ("Application", "Import from another browser"),
         "eave::NewTab" => ("Tabs", "New tab"),
+        "eave::NewIncognitoTab" => ("Tabs", "New incognito tab"),
         "eave::CloseTab" => ("Tabs", "Close the tab — the window when none is open"),
         "eave::NextTab" => ("Tabs", "Next tab"),
         "eave::PrevTab" => ("Tabs", "Previous tab"),

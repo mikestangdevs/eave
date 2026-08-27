@@ -231,6 +231,7 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
             content: TabContent::Page,
             opener: None,
             activate: false,
+            incognito: false,
         })
         .await
         .unwrap();
@@ -433,6 +434,7 @@ async fn closing_a_group_takes_its_tabs_and_leaves_its_sessions() {
             content: TabContent::Page,
             opener: None,
             activate: false,
+            incognito: false,
         })
         .await
         .unwrap();
