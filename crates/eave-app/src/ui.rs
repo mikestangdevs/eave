@@ -2576,8 +2576,16 @@ fn provider_mark_ink(provider: &str) -> Hsla {
     }
 }
 
-fn model_chip_label(model: Option<&str>) -> String {
-    model.unwrap_or(launcher::MODEL_DEFAULT).to_string()
+fn model_chip_label(provider_id: &str, model: Option<&str>) -> String {
+    if let Some(m) = model {
+        return model_picker::display_name(provider_id, m);
+    }
+    launcher::PROVIDERS
+        .iter()
+        .find(|p| p.id == provider_id)
+        .and_then(|p| launcher::model_choices(p).first().copied())
+        .map(|m| model_picker::display_name(provider_id, m))
+        .unwrap_or_else(|| provider_id.to_string())
 }
 
 /// Provider mark at a picker size. Colour rule is the launcher's: Claude
@@ -3000,7 +3008,7 @@ fn row_marks(info: &SessionInfo) -> Option<String> {
 /// was configured. The title stays the hero on the line below.
 fn provider_kicker(info: &SessionInfo, provider_label: &str) -> String {
     match info.model.as_deref().filter(|m| !m.is_empty()) {
-        Some(model) => format!("{provider_label} {model}"),
+        Some(model) => model_picker::display_name(&info.provider, model),
         None => provider_label.to_string(),
     }
 }
@@ -5730,8 +5738,8 @@ struct LauncherUi {
     /// The model menu — P1's `Popup`, anchored at the picker button. `T`
     /// is the anchor point in window coordinates.
     models: Popup<Point<Pixels>>,
-    /// The chosen `--model`. **`None` means pass no flag at all**, which
-    /// is `launcher::MODEL_DEFAULT` and is not the same as an empty one.
+    /// The chosen `--model`. **`None` means pass no flag at all** — only
+    /// when this provider has no catalog (Hermes / an empty CLI answer).
     model: Option<&'static str>,
 }
 
@@ -5744,7 +5752,8 @@ impl Default for LauncherUi {
             // Slice S2: open on the stored default for the default
             // provider — pre-selected into the picker, never filled in
             // behind it (see `Shell::launch`).
-            model: crate::settings_agents::preselected_model(PROVIDERS[provider].id),
+            model: crate::settings_agents::preselected_model(PROVIDERS[provider].id)
+                .or_else(|| launcher::model_choices(&PROVIDERS[provider]).first().copied()),
         }
     }
 }
@@ -18548,10 +18557,7 @@ impl Shell {
             .iter()
             .position(|e| {
                 e.provider_ix == current_ix
-                    && match current.as_deref() {
-                        Some(c) => e.model == c,
-                        None => e.model == launcher::MODEL_DEFAULT,
-                    }
+                    && current.as_deref().is_some_and(|c| e.model == c)
             })
             .unwrap_or(0);
         self.launcher.models.open(at, vec![true; rows.len()], now);
@@ -18606,11 +18612,7 @@ impl Shell {
         if !entry.enabled() {
             return;
         }
-        let model = if entry.model == launcher::MODEL_DEFAULT {
-            None
-        } else {
-            Some(entry.model)
-        };
+        let model = Some(entry.model);
         let (provider, current) = self.picker_target(cx);
         let same_provider = provider.id == entry.provider().id;
         let same_model = current.as_deref() == model;
@@ -18729,8 +18731,8 @@ impl Shell {
             // None — carrying the old provider's model across would send
             // a flag the new vendor never heard of, which is why this
             // used to clear unconditionally.
-            self.launcher.model =
-                crate::settings_agents::preselected_model(PROVIDERS[ix].id);
+            self.launcher.model = crate::settings_agents::preselected_model(PROVIDERS[ix].id)
+                .or_else(|| launcher::model_choices(&PROVIDERS[ix]).first().copied());
         }
         cx.notify();
     }
@@ -18826,7 +18828,7 @@ impl Shell {
         let (cur_provider, cur_model) = self.picker_target(cx);
         let current_id = match cur_model.as_deref() {
             Some(m) => format!("{}:{m}", cur_provider.id),
-            None => format!("{}:{}", cur_provider.id, launcher::MODEL_DEFAULT),
+            None => String::new(),
         };
         let rows = self.picker_visible();
         let empty = model_picker::empty_label(tab, &query);
@@ -19191,7 +19193,11 @@ impl Shell {
             .unwrap_or_else(|_| "the current directory".into());
         let selected = self.launcher.provider;
         let p = self.provider();
-        let model = self.launcher.model.unwrap_or(launcher::MODEL_DEFAULT);
+        let model = self
+            .launcher
+            .model
+            .map(|m| model_picker::display_name(p.id, m))
+            .unwrap_or_else(|| p.name.to_string());
         // The entrance rides an INNER div: this box is absolute, and
         // `relative()` on it would destroy that positioning outright (the
         // scar Slice M's note left).
@@ -19724,10 +19730,10 @@ struct EmptyState {
     /// Verbatim as the session reports it, for [`open_in_system`]; the
     /// displayed form is home-relative.
     cwd: String,
-    /// `None` = the CLI's own default. Omitted from the line rather than
-    /// rendered as a guess: the launcher's "CLI default" is vocabulary for
-    /// *choosing* not to pass `--model`, and repeating it here would
-    /// present the absence of a flag as the name of a model.
+    /// `None` = this session never named a `--model`. Omitted from the
+    /// line rather than rendered as a guess: presenting the absence of a
+    /// flag as the name of a model is the same class of lie as inventing
+    /// a session title.
     model: Option<String>,
 }
 
@@ -20345,7 +20351,7 @@ impl Render for Shell {
                             model_chip(
                                 "composer-model",
                                 &info.provider,
-                                model_chip_label(info.model.as_deref()),
+                                model_chip_label(&info.provider, info.model.as_deref()),
                             )
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 let at = window.mouse_position();
@@ -23665,11 +23671,9 @@ mod tests {
         );
     }
 
-    /// **An unset model is omitted, never rendered as a name.** The
-    /// launcher's "CLI default" is vocabulary for *choosing* not to pass
-    /// `--model`; repeated here it would present the absence of a flag as
-    /// the name of a model, which is the same class of lie as inventing a
-    /// session title.
+    /// **An unset model is omitted, never rendered as a name.** Presenting
+    /// the absence of a `--model` flag as the name of a model is the same
+    /// class of lie as inventing a session title.
     #[test]
     fn an_unset_model_is_left_off_rather_than_guessed() {
         let mut s = info("aaaa1111", 1, None);

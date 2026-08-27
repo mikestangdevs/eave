@@ -149,7 +149,7 @@ impl AgentDefaults {
     /// creator picks otherwise. **Consumed by pre-selecting the
     /// launcher's picker, never by filling in behind it** — a default
     /// applied invisibly at launch would resurrect itself after an
-    /// operator explicitly chose "CLI default", and a default you cannot
+    /// operator explicitly picked another model, and a default you cannot
     /// see is one you cannot override.
     pub fn model_for(&self, provider_id: &str) -> Option<&str> {
         self.providers.get(provider_id)?.model.as_deref()
@@ -710,7 +710,9 @@ pub fn write_defaults(cx: &mut gpui::App, f: impl FnOnce(&mut AgentDefaults)) {
 /// is `Option<&'static str>`.
 pub fn preselected_model(provider_id: &str) -> Option<&'static str> {
     let d = current_defaults();
-    d.model_for(provider_id).map(intern_model)
+    d.model_for(provider_id)
+        .filter(|m| !m.is_empty() && *m != "CLI default")
+        .map(intern_model)
 }
 
 // ---------------------------------------------------------------------------
@@ -926,12 +928,15 @@ fn defaults_rows(
     let current = defaults.model_for(id).map(str::to_string);
 
     let choices = launcher::model_choices(provider);
-    // `None` is "send no --model at all" (`MODEL_DEFAULT`'s meaning);
-    // the interned current keeps `T: Copy` for S1's segmented control,
+    if choices.is_empty() {
+        return rows;
+    }
+    // The interned current keeps `T: Copy` for S1's segmented control,
     // which draws this exactly as the window's other choices are drawn.
+    // Every chip is a native `--model` id — there is no send-no-flag row.
     let items: Vec<(Option<&'static str>, &'static str)> = choices
         .iter()
-        .map(|m| ((*m != launcher::MODEL_DEFAULT).then_some(*m), *m))
+        .map(|m| (Some(*m), *m))
         .collect();
     let current_static: Option<&'static str> = current.as_deref().map(intern_model);
     rows.push(row(

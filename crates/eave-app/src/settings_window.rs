@@ -512,7 +512,7 @@ fn segmented<T: PartialEq + Copy + 'static>(
 
 /// The same control with the id/selector prefix chosen by the caller —
 /// for a pane drawing several groups that share labels (S2's Agents
-/// pane repeats "CLI default" once per provider). `debug_bounds` is one
+/// pane repeats a model id once per provider). `debug_bounds` is one
 /// map keyed by selector, last-painted wins, so a fixed prefix would
 /// let a harness click land on the wrong provider's segment.
 pub(crate) fn segmented_with_ids<T: PartialEq + Copy + 'static>(

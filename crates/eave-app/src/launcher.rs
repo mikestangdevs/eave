@@ -64,10 +64,9 @@
 //!
 //! eave passes `--model` **verbatim** and does not check it (P2 caveat 5:
 //! an unknown model is the CLI's error to state, not eave's to guess).
-//! [`Provider::models`] is therefore a list of well-known aliases to save
-//! typing, not a claim about what the CLI will accept, and picking
-//! [`MODEL_DEFAULT`] sends **no `--model` flag at all** — which is not the
-//! same as sending an empty one.
+//! [`Provider::models`] is therefore a list of well-known native ids, not
+//! a claim about what the CLI will accept. There is no "CLI default" row:
+//! a pick always names a model.
 //!
 //! # Slice CK: the aliases stopped being eave's to choose
 //!
@@ -120,8 +119,8 @@ pub struct Provider {
     pub name: &'static str,
     /// A [`icons::Class::Mark`] path — the vendor's own logo.
     pub mark: &'static str,
-    /// Well-known `--model` aliases for the picker; when non-empty the
-    /// first entry is always [`MODEL_DEFAULT`].
+    /// Well-known `--model` values for the picker (native ids the CLI
+    /// actually takes). First entry is the preselection.
     ///
     /// **Slice CK: this is what eave shows before the CLI answers, not
     /// what it shows instead.** Once
@@ -130,42 +129,36 @@ pub struct Provider {
     /// CLI's answer is *no models at all*, which is a fact about the
     /// operator's credentials and beats anything typed here.
     ///
-    /// **Empty is legal and means "this CLI's own default only"** — see
-    /// [`model_choices`]. An adapter can land without anybody knowing
-    /// that vendor's aliases, and eave does not invent model names (it
-    /// passes `--model` verbatim and does not validate it, P2 caveat 5).
-    /// What stays forbidden is the reverse: a provider eave cannot drive
-    /// offering a menu of models, which is the exact texture of a
-    /// mocked-up UI ([`tests::a_provider_eave_cannot_drive_offers_no_models`]).
+    /// **Empty is legal** — Hermes takes no `--model` (ACP), and a
+    /// provider eave cannot drive must not offer a menu
+    /// ([`tests::a_provider_eave_cannot_drive_offers_no_models`]).
     pub models: &'static [&'static str],
 }
-
-/// The "let the CLI decide" entry. Selecting it means `AgentConfig::model`
-/// is `None` and **no `--model` flag is passed**.
-pub const MODEL_DEFAULT: &str = "CLI default";
 
 /// Every agent eave names, in strip order. Claude first because it is
 /// the reference adapter — the one whose permission posture was proven
 /// first and against which the others are written.
-/// Pi's picker: [`MODEL_DEFAULT`] followed by the adapter's own tested
-/// list. Not written out twice — the tail is asserted equal to
-/// `eave_core::pi::MODELS` in the tests below.
-const PI_MODELS: &[&str] = &[
-    MODEL_DEFAULT,
-    "anthropic/claude-opus-4-5",
-    "anthropic/claude-sonnet-4-5",
-    "anthropic/claude-haiku-4-5",
-    "openai/gpt-5.3-codex",
-    "google/gemini-3.1-pro-preview",
-    "xai/grok-4.6",
-];
-
 pub const PROVIDERS: &[Provider] = &[
     Provider {
         id: "claude-code",
         name: "Claude Code",
         mark: icons::CLAUDE_MARK,
-        models: &[MODEL_DEFAULT, "opus", "sonnet", "haiku"],
+        // Native `--model` values Claude Code actually takes, from
+        // MonoCode's `claudeCatalog` (the same ids `list_models` returns
+        // as `value`). Aliases `opus`/`sonnet`/`haiku` still work if the
+        // CLI reports them; they are not duplicated here. First is
+        // MonoCode's default (`claude:sonnet-5`).
+        models: &[
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ],
     },
     Provider {
         id: "codex",
@@ -173,40 +166,36 @@ pub const PROVIDERS: &[Provider] = &[
         // OpenAI's mark stands in: the set carries no separate Codex mark,
         // which is also what comet does.
         mark: icons::OPENAI_MARK,
+        // Empty: Codex posture is Unproven, and a picker of models for an
+        // agent eave will not spawn is a mocked-up UI
+        // (`a_provider_eave_cannot_drive_offers_no_models`). The CLI's
+        // `model/list` still fills this the day the posture is proven.
         models: &[],
     },
     Provider {
         id: "cursor-agent",
         name: "Cursor",
         mark: icons::CURSOR_MARK,
+        // Empty: no adapter. Native ids (composer-2.5, grok-4.6, …) live
+        // in `model_picker::display_name` so a future adapter lights up
+        // without a second catalog.
         models: &[],
     },
     Provider {
         id: "grok",
         name: "Grok",
         mark: icons::GROK_MARK,
-        models: &[],
+        // `grok models` on 2026-08-21: these two, default marked.
+        models: &["grok-4.6", "grok-4.5"],
     },
     Provider {
         id: "hermes",
         name: "Hermes",
         mark: icons::HERMES_MARK,
-        // Empty until the tile is live, which
-        // `tests::only_a_startable_provider_offers_models` enforces and
-        // which this slice deliberately did not break.
-        //
-        // Slice AW established what belongs here when it IS live, and it
-        // is exactly one entry: `hermes acp` takes no `--model` flag at
-        // all — ACP carries the model as protocol — and the list a live
-        // Hermes offers is whatever providers that machine holds
-        // credentials for (177 entries on the development machine, every
-        // one of them machine-specific). So `&[MODEL_DEFAULT]`, the "send
-        // no model, let the CLI decide" entry, is the only selection eave
-        // could honour, and it goes in with the line that makes the tile
-        // live rather than before it.
-        //
-        // Integrated 2026-08-20: the tile IS live, so the entry goes in.
-        models: &[MODEL_DEFAULT],
+        // Live, but `hermes acp` takes no `--model` — ACP carries the
+        // model as protocol (`session/set_model`). Empty, not a fake
+        // "let the CLI decide" row.
+        models: &[],
     },
     Provider {
         id: "pi",
@@ -217,13 +206,7 @@ pub const PROVIDERS: &[Provider] = &[
         // `--model` takes a `provider/id` pair, so the provider axis is
         // carried IN the model string and eave's picker needs no second
         // dimension. `--provider` is never sent.
-        //
-        // It cannot be used verbatim, because every list here must open
-        // with `MODEL_DEFAULT` — "send no --model at all", which is not
-        // the same as sending the first one. So the default is prepended
-        // and `pi_offers_exactly_the_adapters_tested_models` pins the tail
-        // to the adapter's list, which is what stops the two drifting.
-        models: PI_MODELS,
+        models: eave_core::pi::MODELS,
     },
 ];
 
@@ -269,13 +252,8 @@ pub fn default_provider() -> usize {
     PROVIDERS.iter().position(eave_can_drive).unwrap_or(0)
 }
 
-/// The model choices to offer for a provider: always at least
-/// [`MODEL_DEFAULT`], which sends no `--model` flag at all.
-///
-/// An adapter can land before anybody has catalogued that vendor's model
-/// aliases, and "let the CLI decide" is a real, correct choice for every
-/// agent — so the picker is never empty and never has to be special-cased
-/// by the caller.
+/// The model choices to offer for a provider. Empty when the CLI has
+/// none, or when eave cannot pass `--model` (Hermes).
 ///
 /// # Slice CK: the installed CLI outranks [`Provider::models`]
 ///
@@ -295,18 +273,9 @@ pub fn default_provider() -> usize {
 pub fn model_choices(p: &Provider) -> Vec<&'static str> {
     eave_core::capabilities::begin(p.id);
     if let Some(reported) = eave_core::capabilities::reported(p.id) {
-        // The CLI's own list, in the CLI's own order, behind eave's
-        // "send no flag" entry — which stays first because it is the one
-        // choice no CLI can offer, being the absence of a choice.
-        return std::iter::once(MODEL_DEFAULT)
-            .chain(reported.iter().copied())
-            .collect();
+        return reported.to_vec();
     }
-    if p.models.is_empty() {
-        vec![MODEL_DEFAULT]
-    } else {
-        p.models.to_vec()
-    }
+    p.models.to_vec()
 }
 
 /// **Who said what the picker is showing** — the sentence that sits under
@@ -518,29 +487,35 @@ mod tests {
     /// an agent that cannot spawn is the exact texture of a mocked-up UI.
     ///
     /// The converse is **not** asserted: an adapter may land before
-    /// anybody knows that vendor's aliases, and [`model_choices`] gives
-    /// it the CLI's own default rather than an empty menu.
+    /// anybody knows that vendor's native ids, and [`model_choices`] is
+    /// then empty until the CLI answers.
     #[test]
     fn a_provider_eave_cannot_drive_offers_no_models() {
         for p in PROVIDERS {
             if !eave_can_drive(p) {
                 assert!(p.models.is_empty(), "{} is not startable", p.id);
             }
-            if !p.models.is_empty() {
-                assert_eq!(
-                    p.models[0], MODEL_DEFAULT,
-                    "{}: the first choice must be the CLI's own default",
-                    p.id,
-                );
-            }
-            let offered = model_choices(p);
-            assert_eq!(
-                offered[0], MODEL_DEFAULT,
-                "{}: every picker opens on the CLI's own default",
-                p.id,
+            assert!(
+                !p.models.iter().any(|m| *m == "CLI default"),
+                "{} still offers a send-no-flag row",
+                p.id
             );
-            assert!(!offered.is_empty(), "{}: an empty model picker", p.id);
         }
+    }
+
+    #[test]
+    fn a_pick_names_a_native_id() {
+        let claude = &PROVIDERS[0];
+        assert_eq!(claude.id, "claude-code");
+        assert_eq!(claude.models[0], "claude-sonnet-5");
+        let grok = PROVIDERS.iter().find(|p| p.id == "grok").expect("grok");
+        assert_eq!(grok.models, &["grok-4.6", "grok-4.5"]);
+        let hermes = PROVIDERS.iter().find(|p| p.id == "hermes").expect("hermes");
+        assert!(
+            hermes.models.is_empty(),
+            "hermes acp takes no --model: {:?}",
+            hermes.models
+        );
     }
 
     /// The launcher opens on something eave has an adapter for — and on
@@ -648,21 +623,11 @@ mod tests {
     }
 
     /// The launcher's Pi list and the adapter's tested list must not drift.
-    ///
-    /// They cannot be one constant: every picker here opens with
-    /// [`MODEL_DEFAULT`] ("send no `--model` at all"), which the adapter's
-    /// list has no business carrying. So the launcher prepends it, and this
-    /// pins everything after it to `eave_core::pi::MODELS` — the list Slice
-    /// AX actually verified against `pi --list-models`.
     #[test]
     fn pi_offers_exactly_the_adapters_tested_models() {
+        let pi = PROVIDERS.iter().find(|p| p.id == "pi").expect("pi tile");
         assert_eq!(
-            PI_MODELS[0], MODEL_DEFAULT,
-            "the first choice must be the CLI's own default"
-        );
-        assert_eq!(
-            &PI_MODELS[1..],
-            eave_core::pi::MODELS,
+            pi.models, eave_core::pi::MODELS,
             "the launcher's Pi models drifted from the adapter's tested list"
         );
     }
@@ -711,8 +676,8 @@ mod tests {
         let offered = model_choices(claude);
         assert_eq!(
             offered,
-            vec![MODEL_DEFAULT, "claude-fable-5[1m]", "sonnet"],
-            "the CLI's answer, behind eave's send-no-flag entry",
+            vec!["claude-fable-5[1m]", "sonnet"],
+            "the CLI's answer, not eave's guess and not a send-no-flag row",
         );
         assert!(
             !offered.contains(&"opus"),
@@ -722,24 +687,22 @@ mod tests {
     }
 
     /// A provider whose static list is empty is exactly where discovery
-    /// pays: Codex and Grok offered nothing but "CLI default" until the
-    /// CLI was asked. Verified live 2026-08-21 — `grok models` names
-    /// `grok-4.6` and `grok-4.5`, `codex app-server`'s `model/list` names
-    /// five.
+    /// pays. Codex stays empty because its posture is Unproven — the CLI's
+    /// `model/list` still fills the picker the moment someone records it.
     #[test]
     fn a_provider_with_no_static_list_still_gets_the_cli_s() {
         let _turn = cache_turn();
         eave_core::capabilities::forget();
-        let grok = PROVIDERS
+        let codex = PROVIDERS
             .iter()
-            .find(|p| p.id == "grok")
-            .expect("grok tile");
-        assert!(grok.models.is_empty(), "grok has no hand-written list");
-        assert_eq!(model_choices(grok), vec![MODEL_DEFAULT]);
-        eave_core::capabilities::record("grok", vec!["grok-4.6".into(), "grok-4.5".into()]);
+            .find(|p| p.id == "codex")
+            .expect("codex tile");
+        assert!(codex.models.is_empty(), "codex has no hand-written list");
+        assert!(model_choices(codex).is_empty());
+        eave_core::capabilities::record("codex", vec!["gpt-5.4".into(), "gpt-5.3-codex".into()]);
         assert_eq!(
-            model_choices(grok),
-            vec![MODEL_DEFAULT, "grok-4.6", "grok-4.5"],
+            model_choices(codex),
+            vec!["gpt-5.4", "gpt-5.3-codex"],
         );
         eave_core::capabilities::forget();
     }
@@ -748,7 +711,7 @@ mod tests {
     /// machine 2026-08-21 `pi --list-models` answered *"No models
     /// available"* while `PI_MODELS` offered six `provider/id` pairs —
     /// every one of them a flag this operator's Pi would reject. The
-    /// picker keeps the one choice that always works and says who said so.
+    /// picker shows nothing and says who said so.
     #[test]
     fn a_cli_that_reports_no_models_retires_eaves_guess() {
         let _turn = cache_turn();
@@ -758,7 +721,7 @@ mod tests {
         eave_core::capabilities::record("pi", vec![]);
         assert_eq!(
             model_choices(pi),
-            vec![MODEL_DEFAULT],
+            Vec::<&str>::new(),
             "eave kept offering models the CLI says this operator does not have",
         );
         let note = model_source_note(pi).expect("naming zero models is worth a sentence");

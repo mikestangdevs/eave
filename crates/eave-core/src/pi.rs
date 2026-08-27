@@ -203,8 +203,8 @@ export default function (pi: ExtensionAPI) {
 /// "(latest)". The list is a convenience, not a validation: eave passes
 /// `--model` verbatim and an unknown model is Pi's error to state.
 ///
-/// It deliberately does not start with the launcher's `MODEL_DEFAULT`
-/// sentinel, which is an app-level concept; the launcher prepends it.
+/// Native `--model` values only. The picker used to prepend a
+/// send-no-flag sentinel; that row is gone, so this list is the list.
 pub const MODELS: &[&str] = &[
     "anthropic/claude-opus-4-5",
     "anthropic/claude-sonnet-4-5",

@@ -5414,7 +5414,11 @@ fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
             extra_args,
         } => {
             assert_eq!(provider, "claude-code");
-            assert_eq!(*model, None, "eave invented a model nobody chose");
+            assert_eq!(
+                model.as_deref(),
+                Some("claude-sonnet-5"),
+                "start must send the model the launcher already shows"
+            );
             assert_eq!(*cwd, None, "eave invented a worktree nobody chose");
             assert!(
                 extra_args.is_empty(),
@@ -5439,8 +5443,7 @@ fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!(shown(vcx, "model-picker"), "the model menu never opened");
 
-    // Row 1 — row 0 is the CLI's own default, which is the state we are
-    // trying to move away from.
+    // Row 1 is Opus 5 — row 0 is the preselected Sonnet 5.
     click(vcx, "model-picker-row-1");
     vcx.run_until_parked();
     // The exit has to PLAY before the next click can land. P1's surface
@@ -5451,13 +5454,15 @@ fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
     let chosen = vcx
         .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
         .unwrap();
-    assert_eq!(chosen, Some("opus"));
+    assert_eq!(chosen, Some("claude-opus-5"));
 
     let _ = h.drain();
     click(vcx, "launcher-start");
     vcx.run_until_parked();
     match &h.drain()[0] {
-        Command::Launch { model, .. } => assert_eq!(model.as_deref(), Some("opus")),
+        Command::Launch { model, .. } => {
+            assert_eq!(model.as_deref(), Some("claude-opus-5"))
+        }
         other => panic!("start emitted {other:?}"),
     }
 }
@@ -5494,7 +5499,7 @@ fn the_launcher_says_whose_model_list_it_is_showing(cx: &mut TestAppContext) {
     // And the menu it opens is the CLI's list, not the hand-written one.
     click(vcx, "launcher-model");
     vcx.run_until_parked();
-    click(vcx, "model-picker-row-1");
+    click(vcx, "model-picker-row-0");
     vcx.run_until_parked();
     assert_eq!(
         vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
@@ -5523,7 +5528,7 @@ fn switching_provider_clears_a_model_it_would_not_understand(cx: &mut TestAppCon
     assert_eq!(
         vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
             .unwrap(),
-        Some("opus"),
+        Some("claude-opus-5"),
     );
 
     // No second live provider exists today, so drive the state directly —
@@ -5614,21 +5619,24 @@ fn the_model_picker_is_monocodes_card(cx: &mut TestAppContext) {
         "model-picker-search",
         "model-picker-row-0",
         "model-picker-row-1",
-        "model-picker-star-1",
+        "model-picker-star-0",
     ] {
         assert!(shown(vcx, part), "{part} missing from the model picker");
     }
-    click(vcx, "model-picker-star-1");
+    click(vcx, "model-picker-star-0");
     vcx.run_until_parked();
     click(vcx, "model-picker-tab-favorites");
     vcx.run_until_parked();
     assert!(
         shown(vcx, "model-picker-row-0"),
-        "starring opus did not put it on the favorites tab"
+        "starring the first named model did not put it on the favorites tab"
     );
     vcx.read_window(&h.window, |shell, cx| {
         assert!(
-            shell.read(cx).model_picker.is_favorite("claude-code:opus"),
+            shell
+                .read(cx)
+                .model_picker
+                .is_favorite("claude-code:claude-sonnet-5"),
             "star did not stick"
         );
     })
@@ -5643,11 +5651,11 @@ fn the_model_picker_search_narrows_the_list(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     click(vcx, "launcher-model");
     vcx.run_until_parked();
-    vcx.simulate_keystrokes("o p u s");
+    vcx.simulate_keystrokes("f a b l e");
     vcx.run_until_parked();
     vcx.read_window(&h.window, |shell, cx| {
         assert_eq!(
-            shell.read(cx).model_picker.query, "opus",
+            shell.read(cx).model_picker.query, "fable",
             "typed search never reached the picker"
         );
     })
@@ -11956,8 +11964,8 @@ fn cmd_digits_pick_a_model_while_the_picker_is_open(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(
         chosen,
-        Some("opus"),
-        "⌘2 with the picker open did not pick opus"
+        Some("claude-opus-5"),
+        "⌘2 with the picker open did not pick the second row"
     );
     let cmds = h.drain();
     assert!(
@@ -16188,20 +16196,17 @@ fn a_default_model_preselects_the_launcher_and_reaches_the_launch(cx: &mut TestA
     });
 }
 
-/// S2: an explicit "CLI default" pick beats the stored default. The
-/// picker moved off its preselection must not be refilled at start —
-/// an operator's explicit no-model choice stays chosen, which is the
-/// whole reason the default is a preselection and not a launch-time
-/// fill.
+/// S2: an explicit picker choice beats the stored default. The picker
+/// moved off its preselection must not be refilled at start.
 #[gpui::test]
-fn an_explicit_cli_default_choice_beats_the_stored_default(cx: &mut TestAppContext) {
+fn an_explicit_picker_choice_beats_the_stored_default(cx: &mut TestAppContext) {
     let _probes = eave_core::capabilities::probe_test_lock();
     eave_core::capabilities::forget();
     let _settings = crate::settings::settings_test_lock();
     let (mut h, vcx) = boot(cx);
     cx.update(|cx| {
         crate::settings_agents::write_defaults(cx, |d| {
-            d.set_model("claude-code", Some("opus".into()))
+            d.set_model("claude-code", Some("claude-opus-5".into()))
         })
     });
     click(vcx, "provider-tile-3");
@@ -16211,19 +16216,24 @@ fn an_explicit_cli_default_choice_beats_the_stored_default(cx: &mut TestAppConte
     click(vcx, "launcher-model");
     vcx.run_until_parked();
     assert!(shown(vcx, "model-picker"), "the model menu never opened");
-    click(vcx, "model-picker-row-0"); // "CLI default" — send no --model at all
+    click(vcx, "model-picker-row-0"); // Sonnet 5, not the stored Opus 5
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
     let chosen = vcx
         .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
         .unwrap();
-    assert_eq!(chosen, None, "the explicit CLI-default pick did not stick");
+    assert_eq!(
+        chosen,
+        Some("claude-sonnet-5"),
+        "the explicit pick did not stick"
+    );
     let _ = h.drain();
     click(vcx, "launcher-start");
     vcx.run_until_parked();
     match &h.drain()[0] {
         Command::Launch { model, .. } => assert_eq!(
-            *model, None,
+            model.as_deref(),
+            Some("claude-sonnet-5"),
             "the stored default resurrected behind an explicit choice"
         ),
         other => panic!("start emitted {other:?}"),
@@ -16263,7 +16273,11 @@ fn default_flags_reach_the_launch_and_are_stated(cx: &mut TestAppContext) {
             model, extra_args, ..
         } => {
             assert_eq!(extra_args, &["--verbose".to_string()]);
-            assert_eq!(*model, None, "flags must not drag a model along");
+            assert_eq!(
+                model.as_deref(),
+                Some("claude-sonnet-5"),
+                "flags must not replace the model the launcher already shows"
+            );
         }
         other => panic!("start emitted {other:?}"),
     }
@@ -16291,20 +16305,19 @@ fn the_agents_pane_takes_a_default_and_refuses_a_posture_flag(cx: &mut TestAppCo
     click(svcx, "settings-pane-Agents");
     svcx.run_until_parked();
 
-    // "opus" is on claude's static list (the harness never arms probes,
+    // Native id on claude's static list (the harness never arms probes,
     // so the static list is what the segments show).
-    click(svcx, "agents-model-claude-code-opus");
+    click(svcx, "agents-model-claude-code-claude-sonnet-5");
     svcx.run_until_parked();
     assert_eq!(
         crate::settings::snapshot().agents.model_for("claude-code"),
-        Some("opus")
+        Some("claude-sonnet-5")
     );
-    // "CLI default" clears the default rather than storing the sentinel.
-    click(svcx, "agents-model-claude-code-CLI default");
+    click(svcx, "agents-model-claude-code-claude-opus-5");
     svcx.run_until_parked();
     assert_eq!(
         crate::settings::snapshot().agents.model_for("claude-code"),
-        None
+        Some("claude-opus-5")
     );
 
     let field = svcx
@@ -16330,6 +16343,9 @@ fn the_agents_pane_takes_a_default_and_refuses_a_posture_flag(cx: &mut TestAppCo
         "a flag that undoes the posture reached settings"
     );
 
+    cx.update(|cx| {
+        crate::settings_agents::write_defaults(cx, |d| d.set_model("claude-code", None))
+    });
     svcx.update(|_, cx| field.update(cx, |f, cx| f.set_content("", cx)));
     svcx.run_until_parked();
     assert!(
