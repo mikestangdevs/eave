@@ -1427,6 +1427,23 @@ pub fn request_peek(url: &str, active: bool) {
     peek::request(&host, active, std::time::Instant::now());
 }
 
+/// Whether an id's browser has finished a main-frame load — the gate
+/// that keeps peek's FIRST CDP message out of the creation gap, where
+/// it would attach the DevTools agent to the initial empty document
+/// (measured: the probe read `about:blank` off a browser whose page had
+/// committed). Feature-off there is no gap to fall into.
+pub fn page_has_loaded(id: &str) -> bool {
+    #[cfg(feature = "web")]
+    {
+        tabs::page_loaded(id)
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = id;
+        true
+    }
+}
+
 /// One turn of the peek loop, beside the frame's other reconciliations.
 /// Returns whether an answer is still being worked on for a live hover —
 /// the caller keeps frames coming while it is, so the card repaints when

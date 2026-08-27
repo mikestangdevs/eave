@@ -103,6 +103,13 @@ fn favicon_url_score(u: &str) -> (u8, u8) {
 /// produce far more. Set explicitly, so the number is a decision.
 const FRAME_RATE: i32 = 60;
 
+/// A peek browser's frame budget. It must stay VISIBLE (a never-shown
+/// browser's DevTools agent answers from an empty document — walk
+/// three), so the rate is where its cost is bounded instead: nothing
+/// composites its frames, they exist only so Chromium treats the page
+/// as real.
+const PEEK_FRAME_RATE: i32 = 2;
+
 #[cfg(test)]
 mod favicon_pick {
     use super::pick_favicon_url;
@@ -181,6 +188,12 @@ thread_local! {
     static ACTED: std::cell::RefCell<HashMap<String, u64>> =
         std::cell::RefCell::new(HashMap::new());
 
+    /// Ids whose browser has finished a MAIN-frame load at least once.
+    /// See `page_loaded` — the gate that keeps a first CDP message out
+    /// of the creation gap.
+    static LOADED: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+
     /// Tab ids whose browser was created against the private request
     /// context. The set, not the snapshot, because CEF callbacks cannot
     /// read the engine's model from this stack.
@@ -233,6 +246,12 @@ pub fn has_browser(tab_id: &str) -> bool {
 /// before deciding whether to create one. See [`CREATING`].
 pub fn browser_wanted(tab_id: &str) -> bool {
     has_browser(tab_id) || CREATING.with(|c| c.borrow().contains(tab_id))
+}
+
+/// Whether this id's browser has finished a main-frame load at least
+/// once since it was (re)created.
+pub fn page_loaded(tab_id: &str) -> bool {
+    LOADED.with(|l| l.borrow().contains(tab_id))
 }
 
 /// Page tabs the well is painting this frame. Not the engine's `active`:
@@ -673,6 +692,9 @@ pub fn close_browser_for(tab_id: &str) {
         super::evict::borrows_clear(),
         "close_browser_for({tab_id}) with an eviction cell borrowed — see `evict::tick`"
     );
+    LOADED.with(|l| {
+        l.borrow_mut().remove(tab_id);
+    });
     // The dock browser dies with its tab (a close or an eviction alike):
     // it has no snapshot row, so nothing else would close it, and a
     // frontend over a dead target is noise. One level of recursion,
@@ -870,14 +892,14 @@ pub fn drive(snapshot: &TabsSnapshot) {
                 continue;
             }
         } else if super::is_peek_id(&id) {
-            // A peek browser's life is the peek store's keep-window, not
-            // a strip row. Nothing composites it, so it is told
-            // `was_hidden` here — safely, because this loop iterates
-            // `BROWSERS`: the browser exists, so the recorded value and
-            // the real call cannot diverge the way the warm pass's
-            // would (see the block comment in `drive`'s preload arm).
+            // A peek browser stays VISIBLE — `was_hidden(1)` on a
+            // browser that was never shown left its DevTools agent
+            // answering from an empty document forever (walk three's
+            // `at=""` loop; the load-order gate did not change it, this
+            // did). The rendering it buys is bounded by
+            // `PEEK_FRAME_RATE` at creation, not by this loop.
             if super::peek::browser_wanted(&id) {
-                set_visibility(&id, false);
+                set_visibility(&id, true);
                 continue;
             }
         } else if snapshot.tabs.iter().any(|t| t.id == id) {
@@ -1128,6 +1150,29 @@ pub fn ensure_peek_browser(id: &str, url: &str) {
     super::host::note_activity();
 }
 
+/// Point a hidden peek browser back at its url — the parked-browser
+/// case: a calendar that redirected away from the agenda view, a feed
+/// that landed on a sign-in page the operator has since completed. The
+/// peek store bounds how often this is asked for; a no-op while the
+/// browser is still being created (`with_browser` finds nothing), which
+/// the store's retry clock absorbs.
+pub fn peek_navigate(id: &str, url: &str) {
+    if !super::host::running() {
+        return;
+    }
+    let landed = with_browser(id, |b| match b.main_frame() {
+        Some(frame) => {
+            frame.load_url(Some(&CefString::from(url)));
+            true
+        }
+        None => false,
+    });
+    if std::env::var("EAVE_WEB_TRACE").is_ok() {
+        eprintln!("[web] peek renavigate {id} -> {url} landed={landed:?}");
+    }
+    super::host::request_pump();
+}
+
 /// Create a windowless browser for a tab.
 fn create(tab_id: &str, url: Option<&str>, incognito: bool) {
     // `set_as_windowless` also forces Alloy runtime style — OSR and the
@@ -1144,7 +1189,11 @@ fn create(tab_id: &str, url: Option<&str>, incognito: bool) {
     };
 
     let settings = BrowserSettings {
-        windowless_frame_rate: FRAME_RATE,
+        windowless_frame_rate: if super::is_peek_id(tab_id) {
+            PEEK_FRAME_RATE
+        } else {
+            FRAME_RATE
+        },
         ..Default::default()
     };
 
@@ -1152,6 +1201,11 @@ fn create(tab_id: &str, url: Option<&str>, incognito: bool) {
         eprintln!("[web] creating browser for {tab_id} at {url:?}");
     }
     CREATING.with(|c| c.borrow_mut().insert(tab_id.to_string()));
+    // A recreated browser has not loaded anything yet, whatever its
+    // predecessor did.
+    LOADED.with(|l| {
+        l.borrow_mut().remove(tab_id);
+    });
     if incognito {
         INCOGNITO_TABS.with(|s| {
             s.borrow_mut().insert(tab_id.to_string());
@@ -2113,6 +2167,15 @@ wrap_load_handler! {
             // default and the header would say 100% over a zoomed page,
             // which is the bug this replaced.
             super::zoom_sync(&self.tab_id);
+            // The load is a fact other modules key on: peek holds its
+            // first CDP message until this, because a message sent in
+            // the CREATION GAP attaches the DevTools agent to the
+            // initial empty document — measured: `EAVE_CDP_EVAL` read
+            // `about:blank` off a browser whose feed had already
+            // committed with status 200.
+            LOADED.with(|l| {
+                l.borrow_mut().insert(self.tab_id.clone());
+            });
             // E9's instrument. `EAVE_CDP_EVAL=<expr>` drives this page once
             // per load and prints its own answer; a no-op with the var
             // unset, which is every ordinary run.
@@ -2555,6 +2618,48 @@ wrap_request_handler! {
                 activate,
                 incognito,
             });
+            1
+        }
+
+        /// A site asked for a TLS CLIENT certificate — and answering is
+        /// not optional, because the fall-through is a SEGFAULT.
+        ///
+        /// With no handler here, CEF falls back to
+        /// `ChromeContentBrowserClient::SelectClientCertificate` — the
+        /// Chrome certificate PICKER, which under alloy/OSR has none of
+        /// its tab UI and dies dereferencing null. That is how signing in
+        /// to Google took the whole app down: `accounts.google.com` is
+        /// one of the few sites that sends a TLS CertificateRequest, its
+        /// `signin/challenge/*` pages tripped it on load, and the tab
+        /// journal restored the page and crash-looped. Measured 4×
+        /// 2026-08-27 (byte-identical frames); reproduced headlessly with
+        /// an auto-filled identifier page; CEF #3972 is the same shape.
+        /// The first TWO attributions — WebAuthn's missing entitlement,
+        /// then `navigator.credentials` — were wrong: a password form and
+        /// the credentials API both load clean; the TLS handshake is the
+        /// trigger. See docs/reports/bookmark-peek.md §walk.
+        ///
+        /// Returning 1 without calling `Select` continues WITHOUT a
+        /// client certificate — the callback's destructor does exactly
+        /// that — which is what a consumer browser with no cert to offer
+        /// wants, and what Chrome itself does when you have none
+        /// installed. A cert-picker UI (enterprise) would be its own
+        /// slice; today the honest answer is "none".
+        fn on_select_client_certificate(
+            &self,
+            _browser: Option<&mut Browser>,
+            _is_proxy: ::std::os::raw::c_int,
+            host: Option<&CefString>,
+            _port: ::std::os::raw::c_int,
+            _certificates: Option<&[Option<X509Certificate>]>,
+            _callback: Option<&mut SelectClientCertificateCallback>,
+        ) -> ::std::os::raw::c_int {
+            if trace() {
+                let host = host.map(|h| h.to_string()).unwrap_or_default();
+                eprintln!(
+                    "[web] client certificate requested by {host} — continuing without one"
+                );
+            }
             1
         }
 

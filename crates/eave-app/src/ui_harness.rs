@@ -13639,10 +13639,15 @@ fn a_bookmark_folder_opens_its_children_under_it(cx: &mut TestAppContext) {
     );
 }
 
-/// Clicking a bookmark sends the tab you are looking at, which is what a
-/// bookmarks bar has meant in every browser.
+/// Clicking a bookmark opens the bookmark's OWN tab and leaves yours
+/// alone. This test used to pin the opposite — "sends the tab you are
+/// looking at, which is what a bookmarks bar has meant in every
+/// browser" — and the first live walk overruled it: a bookmark that
+/// eats the page in front of you reads as losing your place, and the
+/// Arc model (the tile IS the tab) is what the operator asked for by
+/// name. See `Shell::open_bookmark`.
 #[gpui::test]
-fn clicking_a_bookmark_sends_the_active_tab_to_it(cx: &mut TestAppContext) {
+fn clicking_a_bookmark_opens_its_own_tab_not_yours(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
@@ -13660,10 +13665,17 @@ fn clicking_a_bookmark_sends_the_active_tab_to_it(cx: &mut TestAppContext) {
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Command::Browser(BrowserCmd::Navigate { tab_id, url })
-                if tab_id == "p1" && url == "https://github.com/"
+            Command::Browser(BrowserCmd::OpenAt { url, activate: true, .. })
+                if url == "https://github.com/"
         )),
-        "the bookmark opened somewhere other than the tab in front of you: {cmds:?}"
+        "the bookmark should open into its own tab: {cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::Navigate { tab_id, .. }) if tab_id == "p1"
+        )),
+        "the operator's own tab must be left alone: {cmds:?}"
     );
 }
 

@@ -5075,78 +5075,110 @@ impl Render for PageTooltip {
 /// place on the page whose whole purpose is to be prose.
 const TOOLTIP_MAX_W: f32 = 320.0;
 
-/// A bookmark tile's hover card.
-///
-/// For every bookmark it is the title and host nothing else shows — a
-/// tile is a bare favicon by design (`bookmark_tile`). For a bookmarked
-/// SERVICE — Gmail, Google Calendar, Linear — it is Arc's peek: the
-/// inbox, today's events, your issues, read by `web::peek` through a
-/// page that already has the session.
-///
-/// A view because that is what `.tooltip()` takes (see [`PageTooltip`]).
-/// Rendering both READS and RENEWS: `request_peek(_, true)` on every
-/// frame the card is up is what keeps the fetch loop interested, and the
-/// card fills in as answers land because `drive_peek`'s busy signal
-/// keeps the window painting while one is in flight.
-struct BookmarkPeek {
-    label: SharedString,
-    host: SharedString,
-    url: String,
-}
-
 /// Wide enough for a sender + subject + snippet to read as a list, and
 /// still narrower than the menu cap so it never crowds the well.
 const BOOKMARK_PEEK_W: f32 = 300.0;
 
-impl Render for BookmarkPeek {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        crate::web::request_peek(&self.url, true);
-        let peek = crate::web::peek_view_for_url(&self.url);
-        let host = self.host.clone();
-        div()
-            .debug_selector(|| "bookmark-peek".into())
-            .max_w(px(TOOLTIP_MAX_W))
-            .when(peek.is_some(), |d| d.w(px(BOOKMARK_PEEK_W)))
-            .overflow_hidden()
-            .rounded(px(theme::RADIUS_MENU))
-            .bg(theme::menu_glass())
-            .border_1()
-            .border_color(theme::edge_modal())
-            .shadow(theme::shadow_modal())
-            .text_size(px(theme::DETAIL_SIZE))
-            .line_height(px(theme::DETAIL_LINE))
-            .child(
+thread_local! {
+    /// Where each bookmark tile actually PAINTED this frame, recorded by
+    /// a zero-cost canvas child of the tile. The peek card is anchored
+    /// at the tile's bottom-right corner FROM THESE: `anchored()`'s
+    /// local mode under `deferred` resolved every card to the grid's
+    /// origin, which stacked all of them over the first tile (the
+    /// walk's report, verbatim: "all popups are popping up over the
+    /// first bookmark").
+    static TILE_BOUNDS: RefCell<std::collections::HashMap<String, gpui::Bounds<Pixels>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// A bookmark open in flight — see `Shell::bookmark_tab_pending`.
+#[derive(Clone)]
+struct BookmarkPending {
+    host: String,
+    at: std::time::Instant,
+    /// Activate the tab the moment it is adopted.
+    activate: bool,
+    /// And send it here, when a card row named somewhere specific.
+    nav_url: Option<String>,
+}
+
+/// A bookmark tile's hover card — Arc's peek: the inbox, today's hour
+/// grid, your issues, read by `web::peek` through a page that already
+/// has the session. A plain bookmark gets its name, the only place a
+/// bare-favicon tile's name exists. A provider card is content and
+/// nothing else — no label, no host, no app furniture (three walks
+/// trimmed it to this).
+///
+/// An ELEMENT anchored to its tile, not a tooltip view: the walk's
+/// ruling is "fixed to the bottom right hand corner, not follow the
+/// cursor", which is `anchored()`'s local-position mode (the move the
+/// overlay demo documents for button-hung menus) — gpui's tooltip can
+/// only place at the pointer. `bookmark_tile` owns the show/hide
+/// hysteresis; the card's own hover key is what keeps it up while the
+/// pointer is inside it.
+///
+/// Rendering both READS and RENEWS: `request_peek(_, true)` on every
+/// frame the card is up keeps the fetch loop interested, and the card
+/// fills in as answers land because `drive_peek`'s busy signal keeps
+/// the window painting while one is in flight.
+fn bookmark_peek_card(id: &str, label: &str, host: &str, url: &str) -> impl IntoElement {
+    crate::web::request_peek(url, true);
+    let peek = crate::web::peek_view_for_url(url);
+    let host = SharedString::from(host.to_string());
+    div()
+        .id(SharedString::from(format!("bookmark-peek-{id}")))
+        .debug_selector({
+            let id = id.to_string();
+            move || format!("bookmark-peek-{id}")
+        })
+        .occlude()
+        .on_hover(crate::motion::hover_listener(format!("bookmark-peek-{id}")))
+        .max_w(px(TOOLTIP_MAX_W))
+        .when(peek.is_some(), |d| d.w(px(BOOKMARK_PEEK_W)))
+        .overflow_hidden()
+        .rounded(px(theme::RADIUS_MENU))
+        .bg(theme::menu_glass())
+        .border_1()
+        .border_color(theme::edge_modal())
+        .shadow(theme::shadow_modal())
+        .text_size(px(theme::DETAIL_SIZE))
+        .line_height(px(theme::DETAIL_LINE))
+        .map(|d| match peek {
+            Some(peek) => d.child(bookmark_peek_body(&peek, &host, url)),
+            None => d.child(
                 div()
                     .px(px(theme::SPACE_3))
                     .py(px(theme::SPACE_1))
-                    .flex()
-                    .items_baseline()
-                    .gap(px(theme::SPACE_2))
-                    .child(
-                        div()
-                            .text_color(theme::text())
-                            .truncate()
-                            .child(self.label.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme::text_tertiary())
-                            .truncate()
-                            .child(self.host.clone()),
-                    ),
-            )
-            .when_some(peek, |d, peek| {
-                d.child(bookmark_peek_body(&peek, &host))
-            })
-    }
+                    .text_color(theme::text())
+                    .truncate()
+                    .child(SharedString::from(label.to_string())),
+            ),
+        })
 }
 
 /// The provider half of the card: a status line or the rows.
 ///
 /// A free function rather than part of `Render` so the empty/signed-out/
 /// unavailable wordings sit in one place, next to each other.
-fn bookmark_peek_body(peek: &crate::web::peek::View, host: &SharedString) -> Div {
+///
+/// Rows are ACTIONABLE (the walk's ruling: "if I click an email that
+/// email should open"): each carries its own address or falls back to
+/// the bookmark's, and the click goes through `peek::note_click` — a
+/// queue the Shell drains, because the card element has no listener
+/// path to the entity that owns tabs.
+fn bookmark_peek_body(
+    peek: &crate::web::peek::View,
+    host: &SharedString,
+    fallback_url: &str,
+) -> Div {
     use crate::web::peek::Status;
+    // Timed events + a clock = the hour grid (Arc's calendar peek).
+    if peek.status == Status::Ready
+        && peek.now_min.is_some()
+        && peek.rows.iter().any(|r| r.start_min.is_some())
+    {
+        return calendar_hour_grid(peek, host, fallback_url);
+    }
     let quiet = |text: String| {
         div()
             .px(px(theme::SPACE_3))
@@ -5154,18 +5186,32 @@ fn bookmark_peek_body(peek: &crate::web::peek::View, host: &SharedString) -> Div
             .text_color(theme::text_tertiary())
             .child(SharedString::from(text))
     };
-    let body = div()
-        .border_t_1()
-        .border_color(theme::border())
-        .py(px(theme::SPACE_1));
+    let click_row = |i: usize, url: String, host: SharedString, inner: Div| {
+        inner
+            .id(SharedString::from(format!("bookmark-peek-row-{i}")))
+            .debug_selector(move || format!("bookmark-peek-row-{i}"))
+            .cursor_pointer()
+            .hover_fade(
+                format!("bookmark-peek-row-{i}"),
+                theme::wash_rest(),
+                theme::overlay(),
+            )
+            .on_click(move |_, _, _| {
+                crate::web::peek::note_click(&host, &url);
+            })
+    };
+    let body = div().py(px(theme::SPACE_1));
     match peek.status {
         Status::Loading => body.child(quiet(format!("Fetching {}…", peek.title.to_lowercase()))),
         Status::Empty => body.child(quiet("Nothing new".to_string())),
         Status::SignedOut => body.child(quiet(format!("Sign in to {host} to preview"))),
         Status::Unavailable => body.child(quiet("Preview unavailable".to_string())),
         Status::Ready => body.children(peek.rows.iter().enumerate().map(|(i, row)| {
-            div()
-                .debug_selector(move || format!("bookmark-peek-row-{i}"))
+            let url = row
+                .url
+                .clone()
+                .unwrap_or_else(|| fallback_url.to_string());
+            let inner = div()
                 .px(px(theme::SPACE_3))
                 .py(px(theme::SPACE_1))
                 .when(i > 0, |d| d.border_t_1().border_color(theme::border()))
@@ -5205,9 +5251,141 @@ fn bookmark_peek_body(peek: &crate::web::peek::View, host: &SharedString) -> Div
                             .truncate()
                             .child(SharedString::from(row.detail.clone())),
                     )
-                })
+                });
+            click_row(i, url, host.clone(), inner)
         })),
     }
+}
+
+/// Today as HOURS — Arc's calendar peek: a slot per hour from the
+/// current one, events as chips in the slot they start in, an accent
+/// mark on the hour it is now. Times come from the page's own clock
+/// and labels (`peek::Row::start_min`), because this process has no
+/// timezone database and the page does.
+fn calendar_hour_grid(
+    peek: &crate::web::peek::View,
+    host: &SharedString,
+    fallback_url: &str,
+) -> Div {
+    let now = peek.now_min.unwrap_or(0);
+    let start_h = (now / 60).min(23);
+    // At least six slots; stretched (to a cap) so a late event today is
+    // still on the card rather than silently after it.
+    let latest = peek
+        .rows
+        .iter()
+        .filter_map(|r| r.start_min)
+        .map(|s| (s / 60).max(start_h))
+        .max()
+        .unwrap_or(start_h);
+    let end_h = (start_h + 6).max(latest + 1).min(24).min(start_h + 10);
+    let hour_label = |h: u32| -> String {
+        match h {
+            0 => "12 AM".to_string(),
+            12 => "12 PM".to_string(),
+            h if h < 12 => format!("{h} AM"),
+            h => format!("{} PM", h - 12),
+        }
+    };
+    let mut grid = div().py(px(theme::SPACE_1));
+    // All-day (or unparsed) events first, as plain rows.
+    for (i, row) in peek
+        .rows
+        .iter()
+        .filter(|r| r.start_min.is_none())
+        .enumerate()
+    {
+        let url = row.url.clone().unwrap_or_else(|| fallback_url.to_string());
+        let host = host.clone();
+        grid = grid.child(
+            div()
+                .id(SharedString::from(format!("bookmark-peek-allday-{i}")))
+                .cursor_pointer()
+                .px(px(theme::SPACE_3))
+                .py(px(theme::SPACE_1))
+                .text_color(theme::text())
+                .truncate()
+                .child(SharedString::from(row.primary.clone()))
+                .on_click(move |_, _, _| {
+                    crate::web::peek::note_click(&host, &url);
+                }),
+        );
+    }
+    for h in start_h..end_h {
+        let current = now / 60 == h;
+        let mut slot = div()
+            .min_h(px(34.0))
+            .px(px(theme::SPACE_3))
+            .py(px(theme::SPACE_1))
+            .when(h > start_h, |d| d.border_t_1().border_color(theme::border()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .child(
+                        div()
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(hour_label(h))),
+                    )
+                    // The "it is now" mark: a hairline running from the
+                    // current hour's label to the card's edge.
+                    .when(current, |d| {
+                        d.child(
+                            div()
+                                .flex_1()
+                                .h(px(2.0))
+                                .rounded(px(1.0))
+                                .bg(theme::accent()),
+                        )
+                    }),
+            );
+        // Events land in the slot they start in; one already underway
+        // lands in the FIRST slot rather than off the top of the card.
+        for (i, row) in peek
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.start_min.is_some_and(|s| (s / 60).max(start_h) == h))
+        {
+            let url = row.url.clone().unwrap_or_else(|| fallback_url.to_string());
+            let host = host.clone();
+            slot = slot.child(
+                div()
+                    .id(SharedString::from(format!("bookmark-peek-event-{i}")))
+                    .debug_selector(move || format!("bookmark-peek-event-{i}"))
+                    .cursor_pointer()
+                    .mt(px(2.0))
+                    .px(px(theme::SPACE_2))
+                    .py(px(2.0))
+                    .rounded(px(theme::RADIUS_MENU_ROW))
+                    .bg(theme::overlay())
+                    .flex()
+                    .justify_between()
+                    .gap(px(theme::SPACE_2))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme::text())
+                            .truncate()
+                            .child(SharedString::from(row.primary.clone())),
+                    )
+                    .when(!row.meta.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_color(theme::text_tertiary())
+                                .child(SharedString::from(row.meta.clone())),
+                        )
+                    })
+                    .on_click(move |_, _, _| {
+                        crate::web::peek::note_click(&host, &url);
+                    }),
+            );
+        }
+        grid = grid.child(slot);
+    }
+    grid
 }
 
 /// The bookmark zone while a page is held over it: a filled tray and a
@@ -5625,6 +5803,36 @@ struct Shell {
     launched_from_tab: RefCell<Option<String>>,
     /// Which bookmark folder is open on the bar (Slice T1). One at a time.
     bookmark_folder_open: RefCell<Option<String>>,
+    /// Bookmark tabs (the operator's ruling on the first peek walk): a
+    /// page opened FROM a bookmark lives behind its tile, not as a row
+    /// in the Tabs zone — Arc's model. `host -> tab id`. CLIENT state,
+    /// like `bookmark_folder_open`: the engine's tab model is untouched,
+    /// which is what keeps ⌘W, eviction and ctrl-tab working on these
+    /// tabs unchanged. Pruned each frame against the strip; a tab that
+    /// navigates off its bookmark's host turns back into an ordinary
+    /// row, which is the un-hide and is on purpose. Not persisted: after
+    /// a restart the restored tab is an ordinary row again (recorded
+    /// limit — adopting by host at boot would swallow organic tabs).
+    bookmark_tabs: RefCell<std::collections::HashMap<String, String>>,
+    /// A bookmark open waiting for the engine to mint its tab — the
+    /// `asked_for_project` shape: an intention the reconciler consumes
+    /// when the tab shows up, expiring instead of lingering. The tail
+    /// carries what to do AT adoption: activate it (a click landed while
+    /// a hover-warm was still in flight — without this the click would
+    /// mint a second tab) and optionally navigate it to a card row's
+    /// address.
+    bookmark_tab_pending: RefCell<Option<BookmarkPending>>,
+    /// When this Shell was built — the prefetch's settling gate: the
+    /// first snapshots after boot are still restoring tabs, and warming
+    /// before they land would duplicate every restored bookmark tab.
+    born: std::time::Instant,
+    /// Which bookmark's peek card is up. One at a time, with hover
+    /// hysteresis — see the mount in `bookmark_tile`.
+    bookmark_peek_shown: RefCell<Option<String>>,
+    /// When the pointer settled on the tile it is on — the card's dwell
+    /// clock. The hover FADE saturates in 150 ms and the walk asked for
+    /// half a second, so the fade cannot be the timer.
+    bookmark_peek_hover_since: RefCell<Option<(String, std::time::Instant)>>,
     /// Which rail zones are collapsed (Slice D4.2 stage 2). Loaded from
     /// `frame.json` at construction and written back on the click, so the
     /// rail comes back the way it was left.
@@ -11545,6 +11753,20 @@ impl Shell {
                             continue;
                         }
                     }
+                    // A bookmark tab lives behind its tile, not in this
+                    // list (the peek-walk ruling). Membership already
+                    // implies "still on its bookmark's host" — the map
+                    // was pruned this same frame. After the split arm on
+                    // purpose: a split's row is the two panes together,
+                    // whatever else either of them is.
+                    if self
+                        .bookmark_tabs
+                        .borrow()
+                        .values()
+                        .any(|id| id == &tab.id)
+                    {
+                        continue;
+                    }
                     if tab.active {
                         active_row = Some(rows.len());
                     }
@@ -11966,6 +12188,51 @@ impl Shell {
         // bookmarked service's preview through pages that already exist
         // and never creates anything. Only the hover card itself may.
         crate::web::request_peek(&url, false);
+        // A settled hover WARMS the bookmark's tab: the page starts
+        // loading before the click, so the click activates something
+        // already underway — the walk's "gmail is taking forever" was
+        // a cold Gmail boot beginning only at the click. 0.9 of the
+        // 150 ms hover fade is the dwell gate, so brushing past tiles
+        // does not open anything.
+        let tile_t = crate::motion::hover_t(&format!("bookmark-tile-{}", item.id));
+        if !url.is_empty() && tile_t > 0.9 {
+            self.warm_bookmark(&url, cx);
+        }
+        // The card's show/hide hysteresis — see the mount below. Opening
+        // takes a real half-second DWELL (the walk: "it pops up too
+        // fast"); staying open takes either the tile or the card itself
+        // being hovered.
+        let card_t = crate::motion::hover_t(&format!("bookmark-peek-{}", item.id));
+        {
+            let mut since = self.bookmark_peek_hover_since.borrow_mut();
+            if tile_t > 0.9 {
+                let mine = since.as_ref().is_some_and(|(id, _)| id == &item.id);
+                if !mine {
+                    *since = Some((item.id.clone(), std::time::Instant::now()));
+                }
+            } else if tile_t <= 0.001
+                && since.as_ref().is_some_and(|(id, _)| id == &item.id)
+            {
+                *since = None;
+            }
+        }
+        let dwelled = self
+            .bookmark_peek_hover_since
+            .borrow()
+            .as_ref()
+            .is_some_and(|(id, at)| {
+                id == &item.id && at.elapsed() >= Duration::from_millis(500)
+            });
+        {
+            let mut shown = self.bookmark_peek_shown.borrow_mut();
+            let is_shown = shown.as_deref() == Some(item.id.as_str());
+            if !is_shown && dwelled && !url.is_empty() {
+                *shown = Some(item.id.clone());
+            } else if is_shown && tile_t <= 0.001 && card_t <= 0.001 {
+                *shown = None;
+            }
+        }
+        let show_card = self.bookmark_peek_shown.borrow().as_deref() == Some(item.id.as_str());
         let mark = crate::web::favicon_for_url(&url);
         let host = crate::omnibox::engine_host(&url);
         let here = active_host.is_some_and(|h| h == host);
@@ -12031,17 +12298,61 @@ impl Shell {
             // 400 ms delay is deliberately under gpui's 500 ms default:
             // a peek is a glance, and the tile has no label to read
             // meanwhile.
-            .tooltip({
-                let label = SharedString::from(item.label.clone());
-                let tip_host = SharedString::from(host.clone());
-                let tip_url = url.clone();
-                move |_, cx| {
-                    let (label, host, url) =
-                        (label.clone(), tip_host.clone(), tip_url.clone());
-                    cx.new(|_| BookmarkPeek { label, host, url }).into()
-                }
+            // A zero-paint canvas records where THIS tile actually is,
+            // because the card below is positioned from it.
+            .child({
+                let bid = item.id.clone();
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        TILE_BOUNDS.with(|m| {
+                            m.borrow_mut().insert(bid, bounds);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
             })
-            .tooltip_show_delay(Duration::from_millis(400))
+            // The peek card, HUNG OFF THE TILE — its top-left pinned a
+            // few px off the tile's bottom-right CORNER (the walk's
+            // ruling: fixed there, never at the cursor), positioned
+            // from the tile's recorded bounds. `deferred` lifts it over
+            // everything the rail would otherwise clip it with;
+            // `snap_to_window_with_margin` keeps it on screen at the
+            // rail's bottom. It stays while either the tile or the card
+            // itself is hovered — the gap is crossable because the
+            // hover fade takes 150 ms to let go.
+            .when(show_card, |d| {
+                let at = TILE_BOUNDS.with(|m| m.borrow().get(&item.id).copied());
+                let Some(bounds) = at else {
+                    return d;
+                };
+                // A hair inside the corner. The radii (tile 12, card 8)
+                // curve ~6 px of daylight between the visible corners
+                // when the boxes exactly touch, so the value is walked
+                // in, not derived: -6 read as touching, 0 as a gulf,
+                // and -4 is where the operator said "perfect".
+                let corner = gpui::Point {
+                    x: bounds.origin.x + bounds.size.width - px(4.0),
+                    y: bounds.origin.y + bounds.size.height - px(4.0),
+                };
+                let card_host = host.clone();
+                let card_url = url.clone();
+                let card_id = item.id.clone();
+                let card_label = item.label.clone();
+                d.child(gpui::deferred(
+                    gpui::anchored()
+                        .anchor(gpui::Anchor::TopLeft)
+                        .position(corner)
+                        .snap_to_window_with_margin(px(theme::MENU_SCREEN_MARGIN))
+                        .child(bookmark_peek_card(
+                            &card_id,
+                            &card_label,
+                            &card_host,
+                            &card_url,
+                        )),
+                ))
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_bookmark(open_url.clone(), cx);
                 cx.notify();
@@ -12541,21 +12852,241 @@ impl Shell {
         out
     }
 
+    /// Open a bookmark — into its OWN tab, never the operator's.
+    ///
+    /// The first walk's ruling: "if I click a bookmark it opens — not
+    /// opens and adds a tab in the Tabs section." A bookmark's page
+    /// lives behind its tile (which already carries the accent rim while
+    /// its host is active), so a click activates the tab the bookmark
+    /// owns, or opens a fresh one and adopts it. The behavior this
+    /// replaced — navigating whatever page tab happened to be active —
+    /// spent the operator's own tab, which read as the bookmark eating
+    /// their page.
     fn open_bookmark(&mut self, url: String, cx: &mut Context<Self>) {
+        let host = crate::omnibox::engine_host(&url);
+        self.bookmark_open(host, url, false, cx);
+    }
+
+    /// The shared engine of a tile click and a peek-card click.
+    /// `navigate` is the card's case: the row names one address (a mail
+    /// inbox, one issue) and the bookmark tab should GO there; a tile
+    /// click keeps whatever the tab was already showing, the way
+    /// switching to it would.
+    fn bookmark_open(
+        &mut self,
+        host: String,
+        url: String,
+        navigate: bool,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = self.strip_snapshot(cx);
-        let target = strip::active_is_page(&snapshot)
-            .then(|| snapshot.active.clone())
-            .flatten();
-        let cmd = match target {
-            Some(tab_id) => BrowserCmd::Navigate { tab_id, url },
-            None => BrowserCmd::OpenAt {
+        let mapped = self
+            .bookmark_tabs
+            .borrow()
+            .get(&host)
+            .cloned()
+            .filter(|id| snapshot.tabs.iter().any(|t| t.id == *id));
+        if let Some(tab_id) = mapped {
+            if navigate {
+                let there = snapshot
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.url.as_deref());
+                if there != Some(url.as_str()) {
+                    let _ = self.commands.send(Command::Browser(BrowserCmd::Navigate {
+                        tab_id: tab_id.clone(),
+                        url,
+                    }));
+                }
+            }
+            let _ = self
+                .commands
+                .send(Command::Browser(BrowserCmd::Activate(tab_id)));
+            return;
+        }
+        // A hover-warm for this host may already be in flight. Asking
+        // again would mint a SECOND tab; instead the pending adoption is
+        // told to activate (and where to go) when the tab lands.
+        {
+            let mut pending = self.bookmark_tab_pending.borrow_mut();
+            if let Some(p) = pending.as_mut() {
+                if p.host == host {
+                    p.activate = true;
+                    if navigate {
+                        p.nav_url = Some(url);
+                    }
+                    return;
+                }
+            }
+        }
+        *self.bookmark_tab_pending.borrow_mut() = Some(BookmarkPending {
+            host,
+            at: std::time::Instant::now(),
+            activate: false,
+            nav_url: None,
+        });
+        let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+            url,
+            activate: true,
+            incognito: false,
+            window: Some(self.window_key.clone()),
+        }));
+    }
+
+    /// Start a bookmark's page on hover, so the click activates a tab
+    /// that has been loading since the pointer settled. Opens with
+    /// `activate: false` — the operator is still reading the card — and
+    /// the adopted tab is a bookmark tab, so no row appears anywhere:
+    /// the warm is invisible until the click makes it the answer.
+    /// Idempotent per frame: a mapped tab or a pending adoption means
+    /// there is nothing to start.
+    fn warm_bookmark(&self, url: &str, cx: &Context<Self>) {
+        let host = crate::omnibox::engine_host(url);
+        if self.bookmark_tab_pending.borrow().is_some() {
+            return;
+        }
+        let snapshot = self.strip_snapshot(cx);
+        let mapped = self
+            .bookmark_tabs
+            .borrow()
+            .get(&host)
+            .cloned()
+            .is_some_and(|id| snapshot.tabs.iter().any(|t| t.id == id));
+        if mapped {
+            return;
+        }
+        *self.bookmark_tab_pending.borrow_mut() = Some(BookmarkPending {
+            host,
+            at: std::time::Instant::now(),
+            activate: false,
+            nav_url: None,
+        });
+        let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+            url: url.to_string(),
+            activate: false,
+            incognito: false,
+            window: Some(self.window_key.clone()),
+        }));
+    }
+
+    /// Keep every pinned bookmark's page ALIVE — adopted from the strip
+    /// when a matching tab already exists (the restart case: bookmark
+    /// tabs are journaled tabs, and re-warming them would duplicate
+    /// them), warmed open otherwise. "It needs to be prefetched.
+    /// already loaded. ready to go" — the walk's ruling, and Arc's
+    /// model: a favorite is a living tab, not an address.
+    ///
+    /// One warm per pass, `PAGE_PRELOAD`'s argument at the tab layer:
+    /// four cold Chromiums in one frame is a boot stampede. The single
+    /// pending slot is the serializer. Gated behind a settling delay so
+    /// boot restoration lands first, and adopting-by-host is done HERE
+    /// (deliberately, restart-only in effect) rather than on every
+    /// organic navigation — a tab the operator opened by hand is only
+    /// swallowed when a pinned bookmark claims its host and nothing
+    /// else does.
+    fn prefetch_bookmark_tabs(&self, snapshot: &eave_wire::TabsSnapshot, cx: &Context<Self>) {
+        if self.born.elapsed() < std::time::Duration::from_secs(3) {
+            return;
+        }
+        if self.bookmark_tab_pending.borrow().is_some() {
+            return;
+        }
+        for item in bookmarks::pinned(&self.bookmarks.read(cx).snapshot) {
+            let Some(url) = item.url else { continue };
+            let host = crate::omnibox::engine_host(&url);
+            if host.is_empty() || self.bookmark_tabs.borrow().contains_key(&host) {
+                continue;
+            }
+            let adopt = snapshot
+                .tabs
+                .iter()
+                .filter(|t| t.content == eave_wire::TabContent::Page && !t.incognito)
+                .filter(|t| !self.bookmark_tabs.borrow().values().any(|id| id == &t.id))
+                .find(|t| {
+                    t.url
+                        .as_deref()
+                        .is_some_and(|u| crate::omnibox::engine_host(u) == host)
+                });
+            if let Some(tab) = adopt {
+                self.bookmark_tabs
+                    .borrow_mut()
+                    .insert(host, tab.id.clone());
+                continue;
+            }
+            *self.bookmark_tab_pending.borrow_mut() = Some(BookmarkPending {
+                host,
+                at: std::time::Instant::now(),
+                activate: false,
+                nav_url: None,
+            });
+            let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
                 url,
-                activate: true,
+                activate: false,
                 incognito: false,
                 window: Some(self.window_key.clone()),
-            },
+            }));
+            return;
+        }
+    }
+
+    /// Adopt the tab a bookmark open minted; un-map the ones that no
+    /// longer qualify. Every frame, beside the other reconcilers.
+    fn reconcile_bookmark_tabs(&self, snapshot: &eave_wire::TabsSnapshot) {
+        let host_of = |t: &eave_wire::TabInfo| -> Option<String> {
+            // A just-opened tab has no committed url yet; its pending
+            // navigation is the address it is GOING to, which is the
+            // one the adoption below is waiting on.
+            t.url
+                .as_deref()
+                .or(t.pending.as_ref().map(|p| p.url.as_str()))
+                .map(crate::omnibox::engine_host)
         };
-        let _ = self.commands.send(Command::Browser(cmd));
+        let mut pending = self.bookmark_tab_pending.borrow_mut();
+        if let Some(p) = pending.clone() {
+            if p.at.elapsed() > std::time::Duration::from_secs(10) {
+                *pending = None;
+            } else {
+                let adopt = snapshot
+                    .tabs
+                    .iter()
+                    .filter(|t| t.content == eave_wire::TabContent::Page && !t.incognito)
+                    .filter(|t| {
+                        !self.bookmark_tabs.borrow().values().any(|id| id == &t.id)
+                    })
+                    .filter(|t| host_of(t).as_deref() == Some(p.host.as_str()))
+                    .max_by_key(|t| t.created_ts_ms);
+                if let Some(tab) = adopt {
+                    self.bookmark_tabs
+                        .borrow_mut()
+                        .insert(p.host.clone(), tab.id.clone());
+                    if let Some(url) = p.nav_url.clone() {
+                        let _ = self.commands.send(Command::Browser(BrowserCmd::Navigate {
+                            tab_id: tab.id.clone(),
+                            url,
+                        }));
+                    }
+                    if p.activate {
+                        let _ = self
+                            .commands
+                            .send(Command::Browser(BrowserCmd::Activate(tab.id.clone())));
+                    }
+                    *pending = None;
+                }
+            }
+        }
+        drop(pending);
+        self.bookmark_tabs.borrow_mut().retain(|host, id| {
+            snapshot.tabs.iter().any(|t| {
+                t.id == *id
+                    && match host_of(t) {
+                        // Mid-birth: nothing committed and nothing
+                        // pending. Keep; adoption or the 10 s decides.
+                        None => true,
+                        Some(h) => h == *host,
+                    }
+            })
+        });
     }
 
     fn toggle_bookmark_folder(&mut self, id: &str, _cx: &mut Context<Self>) {
@@ -20104,6 +20635,35 @@ impl Render for Shell {
                 entity.update(cx, |_, cx| cx.notify());
             });
         }
+        // A peek card's clicks land here: the card is a tooltip view
+        // with no path to this Shell, so a click is DATA in a queue (the
+        // ask-surface move) and this is the frame's writable moment.
+        for (host, url) in crate::web::peek::take_clicks() {
+            self.bookmark_open(host, url, true, cx);
+        }
+        // The card's dwell clock needs FRAMES to come due: the hover
+        // fade saturates in 150 ms and then stops asking for them, so
+        // without this the half-second timer would only be re-read on
+        // the next incidental repaint.
+        if self
+            .bookmark_peek_hover_since
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_millis(700))
+        {
+            let entity = self.transcript.clone();
+            window.on_next_frame(move |_, cx| {
+                entity.update(cx, |_, cx| cx.notify());
+            });
+        }
+        self.reconcile_bookmark_tabs(&strip_snapshot);
+        // Every pinned bookmark's page stays loaded and ready — in the
+        // PRIMARY window only, or every ⌘N window would boot its own
+        // copy of Gmail (recorded limit: a second window's tile click
+        // still opens fresh).
+        if self.window_key == eave_wire::PRIMARY_WINDOW {
+            self.prefetch_bookmark_tabs(&strip_snapshot, cx);
+        }
 
         // **This is the page path that runs when the well is NOT split**,
         // which is the ordinary case — `split_pane` builds the other one.
@@ -22896,6 +23456,11 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         asked_for_project: RefCell::new(HashSet::new()),
                         launched_from_tab: RefCell::new(None),
                         bookmark_folder_open: RefCell::new(None),
+                        bookmark_tabs: RefCell::new(std::collections::HashMap::new()),
+                        bookmark_tab_pending: RefCell::new(None),
+                        born: std::time::Instant::now(),
+                        bookmark_peek_shown: RefCell::new(None),
+                        bookmark_peek_hover_since: RefCell::new(None),
                         zone_projects_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_PROJECTS,
                         )),
