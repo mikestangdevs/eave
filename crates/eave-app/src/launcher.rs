@@ -181,8 +181,11 @@ pub const PROVIDERS: &[Provider] = &[
         id: "cursor-agent",
         name: "Cursor",
         mark: icons::CURSOR_MARK,
-        // Native ids `cursor-agent --list-models` / ACP catalog take, from
-        // MonoCode's `MODELS` (`cursor:composer-2.5` is their default).
+        // Native ids MonoCode's `MODELS` lists for cursor (default
+        // `cursor:composer-2.5`). `cursor-agent acp` takes no `--model`
+        // on argv — the adapter sends `session/set_model` `{ modelId }`
+        // the same way MonoCode's `applyModelSelection` does. The live
+        // `--list-models` / ACP catalog still replaces this (Slice CK).
         models: &[
             "composer-2.5",
             "gpt-5.4",
