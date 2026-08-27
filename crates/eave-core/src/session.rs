@@ -327,4 +327,11 @@ pub trait AgentSession: Send {
     /// group probe under the identity guard → one bounded straggler scan.
     /// `Err(KillUnproven)` when exit cannot be proven (spec 01 §Kill).
     async fn kill(&mut self) -> Result<KillReport, SessionError>;
+
+    /// Stop the in-flight turn without killing the process (composer Stop).
+    ///
+    /// Claude writes a `control_request` `{ subtype: "interrupt" }` on
+    /// stdin. Adapters with no interrupt on their wire return `Ok` and
+    /// do nothing — a no-op is honest; killing the session is not.
+    async fn interrupt(&mut self) -> Result<(), SessionError>;
 }

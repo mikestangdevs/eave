@@ -1791,6 +1791,15 @@ pub const WINDOW_H: f32 = 760.0;
 pub const WINDOW_MIN_W: f32 = 720.0;
 pub const WINDOW_MIN_H: f32 = 520.0;
 
+/// How far a second window steps down and right from the one it was
+/// opened from (Slice W1, ⌘N).
+///
+/// Every browser cascades, and the reason is not decoration: two windows
+/// at identical bounds are pixel-aligned, so the new one is
+/// indistinguishable from the old and ⌘N reads as ⌘T. 28 is one
+/// titlebar's worth — enough that the window behind is visibly there.
+pub const WINDOW_CASCADE: f32 = 28.0;
+
 /// Custom titlebar: bar height, traffic-light inset, and the clearance
 /// the content leaves for the lights (waku's numbers).
 pub const TITLEBAR_H: f32 = 48.0;

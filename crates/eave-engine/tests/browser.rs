@@ -212,6 +212,7 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
 
     let group = client
         .browser_create(Request::GroupCreate {
+            window: None,
             title: Some("work".into()),
             color: Some("blue".into()),
             workspace: Some("/repo/eave".into()),
@@ -220,11 +221,12 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
         .await
         .unwrap();
     let loose = client
-        .tab_open(Some("https://example.com/"), true)
+        .tab_open(None, Some("https://example.com/"), true)
         .await
         .unwrap();
     let grouped = client
         .browser_create(Request::TabOpen {
+            window: None,
             url: Some("https://docs.rs/serde".into()),
             group: Some(group.clone()),
             index: None,
@@ -358,7 +360,7 @@ async fn closing_a_tab_that_views_a_session_does_not_touch_the_session() {
         .await
         .unwrap();
     let sid = session.session_id.clone();
-    let tab = client.tab_open_session(&sid, None).await.unwrap();
+    let tab = client.tab_open_session(&sid, None, None).await.unwrap();
 
     let mut rx = client.watch_tabs().await.unwrap();
     let snap = next_tabs(&mut rx).await;
@@ -415,6 +417,7 @@ async fn closing_a_group_takes_its_tabs_and_leaves_its_sessions() {
         .unwrap();
     let group = client
         .browser_create(Request::GroupCreate {
+            window: None,
             title: Some("eave".into()),
             color: None,
             workspace: None,
@@ -423,11 +426,12 @@ async fn closing_a_group_takes_its_tabs_and_leaves_its_sessions() {
         .await
         .unwrap();
     client
-        .tab_open_session(&session.session_id, Some(&group))
+        .tab_open_session(&session.session_id, Some(&group), None)
         .await
         .unwrap();
     client
         .browser_create(Request::TabOpen {
+            window: None,
             url: Some("https://example.com/".into()),
             group: Some(group.clone()),
             index: None,
@@ -477,7 +481,7 @@ async fn back_and_forward_survive_a_restart_and_stay_off_the_snapshot() {
     let client = Client::connect(&dir).await.unwrap();
 
     let tab = client
-        .tab_open(Some("https://a.example/"), true)
+        .tab_open(None, Some("https://a.example/"), true)
         .await
         .unwrap();
     for url in ["https://b.example/", "https://c.example/"] {
@@ -674,7 +678,7 @@ async fn history_answers_typeahead_and_forgets_from_the_file_itself() {
     let client = Client::connect(&dir).await.unwrap();
 
     let tab = client
-        .tab_open(Some("https://github.com/eave"), true)
+        .tab_open(None, Some("https://github.com/eave"), true)
         .await
         .unwrap();
     client
@@ -781,7 +785,7 @@ async fn clearing_a_range_forgets_that_window_only() {
     let client = Client::connect(&dir).await.unwrap();
 
     let tab = client
-        .tab_open(Some("https://alpha.example/"), true)
+        .tab_open(None, Some("https://alpha.example/"), true)
         .await
         .unwrap();
     // Everything so far is "old". Take the boundary from the engine's own
@@ -837,7 +841,7 @@ async fn the_strip_is_a_snapshot_and_a_no_op_is_not_one() {
     assert!(first.tabs.is_empty(), "a fresh engine has no tabs");
 
     let tab = client
-        .tab_open(Some("https://example.com/"), true)
+        .tab_open(None, Some("https://example.com/"), true)
         .await
         .unwrap();
     tabs_until(&mut rx, "the new tab", |s| s.tabs.len() == 1).await;
@@ -891,6 +895,7 @@ async fn a_group_update_can_leave_alone_set_and_clear() {
 
     let group = client
         .browser_create(Request::GroupCreate {
+            window: None,
             title: Some("one".into()),
             color: Some("blue".into()),
             workspace: Some("/repo".into()),
@@ -974,7 +979,7 @@ async fn the_tabs_channel_never_carries_transcript_content() {
         .await
         .unwrap();
     let sid = session.session_id.clone();
-    client.tab_open_session(&sid, None).await.unwrap();
+    client.tab_open_session(&sid, None, None).await.unwrap();
     client
         .send(&sid, &format!("{CANARY} please do nothing"))
         .await
@@ -982,7 +987,7 @@ async fn the_tabs_channel_never_carries_transcript_content() {
     // Let the turn stream and the strip re-broadcast several times.
     for _ in 0..3 {
         client
-            .tab_open(Some("https://example.com/"), false)
+            .tab_open(None, Some("https://example.com/"), false)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1067,7 +1072,7 @@ async fn a_navigation_is_a_request_until_a_page_says_otherwise() {
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(None, true).await.unwrap();
+    let tab = client.tab_open(None, None, true).await.unwrap();
     let mut rx = client.watch_tabs().await.unwrap();
     tabs_until(&mut rx, "the new tab", |s| s.tabs.len() == 1).await;
 
@@ -1163,7 +1168,7 @@ async fn a_typed_address_is_still_typed_when_the_page_reports_back() {
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(None, true).await.unwrap();
+    let tab = client.tab_open(None, None, true).await.unwrap();
 
     // Asked for: this is a typed visit.
     land(&client, &tab, "https://typed.example/").await;
@@ -1216,7 +1221,7 @@ async fn a_refresh_is_recorded_as_a_reload_and_does_not_inflate_the_typeahead() 
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(None, true).await.unwrap();
+    let tab = client.tab_open(None, None, true).await.unwrap();
     // One typed visit, then the same address five more times: a refresh
     // loop, asked for exactly the way the omnibox asks.
     land(&client, &tab, "https://refreshed.example/").await;
@@ -1293,7 +1298,7 @@ async fn load_state_folds_but_a_structural_change_cuts_the_line() {
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(None, true).await.unwrap();
+    let tab = client.tab_open(None, None, true).await.unwrap();
     let mut rx = client.watch_tabs().await.unwrap();
     tabs_until(&mut rx, "the new tab", |s| s.tabs.len() == 1).await;
 
@@ -1371,7 +1376,7 @@ async fn load_facts_carry_history_flags_onto_the_snapshot() {
     let _engine = EngineProc::spawn(&dir);
     let client = Client::connect(&dir).await.unwrap();
 
-    let tab = client.tab_open(None, true).await.unwrap();
+    let tab = client.tab_open(None, None, true).await.unwrap();
     land(&client, &tab, "https://a.example/").await;
     land(&client, &tab, "https://b.example/").await;
 
@@ -1571,4 +1576,108 @@ async fn a_permission_answer_survives_a_restart() {
         next_permissions(&mut rx).await.grants.is_empty(),
         "a cleared store came back with answers in it"
     );
+}
+
+/// **Slice W1 acceptance: ⌘N, over the wire and across a restart.**
+///
+/// Three claims, and the third is the one that needed a real engine.
+///
+/// 1. Two windows are two strips: each carries its own tabs and its own
+///    active tab, and neither can see the other's.
+/// 2. A tab a PAGE opens lands beside the page that opened it. The client
+///    names no window for a `window.open` — it has an opener and the fold
+///    knows which window that is, so resolving it anywhere else would be
+///    a second, staler copy of a fact the engine already holds.
+/// 3. **Windows are durable.** A `kill -9` and the second window's tabs
+///    come back in the second window, not folded into the first. Windows
+///    have no event of their own — a window is its tabs — so this is also
+///    the assertion that the `window` on each `Opened` is really being
+///    journaled and really being read back.
+#[tokio::test]
+async fn two_windows_are_two_strips_and_both_survive_a_kill_9() {
+    let dir = scratch();
+    let mut engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+
+    let first = client
+        .tab_open(None, Some("https://first.example/"), true)
+        .await
+        .unwrap();
+    let second = client
+        .tab_open(Some("w-2"), Some("https://second.example/"), true)
+        .await
+        .unwrap();
+    // A page in the SECOND window opening a tab: no window named, an
+    // opener that is in w-2.
+    let child = client
+        .browser_create(Request::TabOpen {
+            window: None,
+            url: None,
+            group: None,
+            index: None,
+            content: TabContent::Page,
+            opener: Some(second.clone()),
+            activate: false,
+            incognito: false,
+        })
+        .await
+        .unwrap();
+
+    let mut rx = client.watch_tabs().await.unwrap();
+    let snap = next_tabs(&mut rx).await;
+    let window_of = |snap: &TabsSnapshot, id: &str| {
+        snap.tabs
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap_or_else(|| panic!("no tab {id}"))
+            .window
+            .clone()
+    };
+    assert_eq!(
+        window_of(&snap, &first),
+        None,
+        "the primary window is unnamed on the wire"
+    );
+    assert_eq!(window_of(&snap, &second).as_deref(), Some("w-2"));
+    assert_eq!(
+        window_of(&snap, &child).as_deref(),
+        Some("w-2"),
+        "a tab a page opened did not land beside the page that opened it"
+    );
+
+    let strip = |snap: &TabsSnapshot, id: &str| {
+        snap.windows
+            .iter()
+            .find(|w| w.id == id)
+            .unwrap_or_else(|| panic!("no window {id}"))
+            .clone()
+    };
+    assert_eq!(strip(&snap, "w-2").active.as_deref(), Some(second.as_str()));
+    assert_eq!(snap.windows.len(), 2, "two windows, got {:?}", snap.windows);
+    // The flat fields still answer for a client that has never heard of
+    // windows: the first window's strip, not every window's.
+    assert_eq!(snap.active.as_deref(), Some(first.as_str()));
+    assert_eq!(
+        snap.order.len(),
+        1,
+        "the flat order carried more than one window"
+    );
+
+    drop(rx);
+    drop(client);
+    engine.sigkill();
+    let _engine = EngineProc::spawn(&dir);
+    let client = Client::connect(&dir).await.unwrap();
+    let mut rx = client.watch_tabs().await.unwrap();
+    let after = next_tabs(&mut rx).await;
+
+    assert_eq!(after.tabs.len(), 3, "a tab was lost across the restart");
+    assert_eq!(window_of(&after, &first), None);
+    assert_eq!(window_of(&after, &second).as_deref(), Some("w-2"));
+    assert_eq!(
+        window_of(&after, &child).as_deref(),
+        Some("w-2"),
+        "the second window's tabs folded into the first on restore"
+    );
+    assert_eq!(after.windows.len(), 2);
 }

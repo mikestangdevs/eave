@@ -442,6 +442,22 @@ impl AgentSession for ClaudeCodeSession {
         Ok(true)
     }
 
+    async fn interrupt(&mut self) -> Result<(), SessionError> {
+        let request_id = format!(
+            "eave-interrupt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let frame = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": { "subtype": "interrupt" },
+        });
+        write_frame(&self.stdin, &frame.to_string()).await
+    }
+
     async fn kill(&mut self) -> Result<KillReport, SessionError> {
         self.shared.kill_initiated.store(true, Ordering::SeqCst);
         let already_exited = self.exited();

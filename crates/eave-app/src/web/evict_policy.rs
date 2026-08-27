@@ -244,6 +244,7 @@ mod tests {
             history_len: 1,
             opener: None,
             incognito: false,
+            window: None,
             created_ts_ms: 0,
         }
     }

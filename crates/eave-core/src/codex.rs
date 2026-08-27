@@ -563,6 +563,10 @@ impl AgentSession for CodexSession {
         Ok(true)
     }
 
+    async fn interrupt(&mut self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     async fn kill(&mut self) -> Result<KillReport, SessionError> {
         self.shared.kill_initiated.store(true, Ordering::SeqCst);
         let already_exited = self.exited();

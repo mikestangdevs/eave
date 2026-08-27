@@ -481,6 +481,7 @@ mod tests {
                 history_len: 0,
                 opener: None,
                 incognito: false,
+                window: None,
                 created_ts_ms: 0,
             }],
             ..Default::default()

@@ -46,14 +46,17 @@ use eave_wire::{
     WaitReason,
 };
 
+use crate::access::{self, RuntimeMode};
 use crate::attach::{self, StagedFile};
 use crate::bookmarks;
+use crate::composer;
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
 use crate::icons;
 use crate::launcher::{self, PROVIDERS};
 use crate::loaders;
 use crate::markdown::{self, inline_runs, Align, Block, InlineRun, Marker};
+use crate::mentions::{self, ProjectFile};
 use crate::motion::{self, HoverFade as _};
 use crate::omnibox;
 use crate::overlay::{self, MenuItem, Popup};
@@ -70,6 +73,14 @@ actions!(
         DenyOldest,
         /// Slice C5 — ⌘T.
         NewTab,
+        /// **Slice W1 — ⌘N, a second window.**
+        ///
+        /// Not a second eave: one process, one engine, one page engine,
+        /// one set of sessions. What is per-window is the STRIP — the
+        /// tabs, their order, and which one is active — which is what
+        /// makes two windows worth having and what the engine grew a
+        /// window dimension to hold.
+        NewWindow,
         /// ⌘⇧N — a page tab that is not journaled, not in history, and
         /// lives in Chromium's in-memory request context.
         NewIncognitoTab,
@@ -267,6 +278,8 @@ enum Command {
         images: Vec<PathBuf>,
     },
     Kill,
+    /// Composer Stop: interrupt the in-flight turn, keep the session.
+    Stop,
     /// Projection lost sync (seq gap): drop and fully resubscribe.
     Resubscribe,
     /// Rail row click: subscribe this session instead (cursorless — the
@@ -381,9 +394,12 @@ enum BrowserCmd {
     /// keeps running and stays in the rail (the B1 decision).
     Close(String),
     /// ⌘T: an empty page tab, activated.
-    NewTab,
+    ///
+    /// `window` is the strip it lands in (Slice W1). `None` means the
+    /// primary window — which is what ⌘T meant when there was only one.
+    NewTab { window: Option<eave_wire::WindowId> },
     /// ⌘⇧N: an empty private page tab.
-    NewIncognitoTab,
+    NewIncognitoTab { window: Option<eave_wire::WindowId> },
     /// The omnibox committing on a tab that already exists.
     Navigate { tab_id: String, url: String },
     /// Slice D1 — walk the back/forward stack. `-1` is back, `+1` forward.
@@ -413,6 +429,8 @@ enum BrowserCmd {
         url: String,
         activate: bool,
         incognito: bool,
+        /// Which window's strip it lands in (Slice W1).
+        window: Option<eave_wire::WindowId>,
     },
     /// A tab that views this session.
     ///
@@ -692,9 +710,10 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 .browser_do(eave_wire::Request::TabClose { tab_id })
                 .await;
         }
-        BrowserCmd::NewTab => {
+        BrowserCmd::NewTab { window } => {
             let _ = client
                 .browser_create(eave_wire::Request::TabOpen {
+                    window,
                     url: None,
                     group: None,
                     index: None,
@@ -705,9 +724,10 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 })
                 .await;
         }
-        BrowserCmd::NewIncognitoTab => {
+        BrowserCmd::NewIncognitoTab { window } => {
             let _ = client
                 .browser_create(eave_wire::Request::TabOpen {
+                    window,
                     url: None,
                     group: None,
                     index: None,
@@ -764,6 +784,10 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
         } => {
             if client
                 .browser_create(eave_wire::Request::TabOpen {
+                    // Slice W1: session tabs live in the primary
+                    // window. A second window is a browser window — see
+                    // `Shell::window_key` and the reconcile in `render`.
+                    window: None,
                     url: None,
                     group,
                     index: Some(index),
@@ -805,6 +829,10 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
         BrowserCmd::NewProject { workspace } => {
             let _ = client
                 .browser_create(eave_wire::Request::GroupCreate {
+                    // Slice W1: session tabs live in the primary
+                    // window. A second window is a browser window — see
+                    // `Shell::window_key` and the reconcile in `render`.
+                    window: None,
                     title: Some(strip::project_title(&workspace)),
                     color: None,
                     workspace: Some(workspace),
@@ -826,10 +854,12 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
             url,
             activate,
             incognito,
+            window,
         } => {
             // Open at NOTHING, then ask. See `BrowserCmd::OpenAt`.
             if let Ok(tab_id) = client
                 .browser_create(eave_wire::Request::TabOpen {
+                    window,
                     url: None,
                     group: None,
                     index: None,
@@ -860,6 +890,9 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 (Some(group), _) => Some(group),
                 (None, Some(workspace)) => client
                     .browser_create(eave_wire::Request::GroupCreate {
+                        // Slice W1: a project is a group in the primary
+                        // window, beside the session tabs it holds.
+                        window: None,
                         title: Some(strip::project_title(&workspace)),
                         color: None,
                         workspace: Some(workspace),
@@ -874,6 +907,10 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
             // helper would drop it on the floor.
             let _ = client
                 .browser_create(eave_wire::Request::TabOpen {
+                    // Slice W1: session tabs live in the primary
+                    // window. A second window is a browser window — see
+                    // `Shell::window_key` and the reconcile in `render`.
+                    window: None,
                     url: None,
                     group,
                     index: None,
@@ -1047,6 +1084,10 @@ async fn feed_loop(
                             None => {
                                 match client
                                     .browser_create(eave_wire::Request::TabOpen {
+                                        // Slice W1: the tab eave boots
+                                        // with belongs to the window eave
+                                        // boots with.
+                                        window: None,
                                         url: None,
                                         group: None,
                                         index: None,
@@ -1133,6 +1174,15 @@ async fn feed_loop(
                             }) => {
                                 let opened = client
                                     .browser_create(eave_wire::Request::TabOpen {
+                                        // Slice W1: **no window named,
+                                        // and that is the point.** A page
+                                        // that opens a tab opens it beside
+                                        // itself, so the engine takes the
+                                        // window from the OPENER — the
+                                        // one fact this path has and a
+                                        // window id here would only be a
+                                        // second, staler copy of.
+                                        window: None,
                                         url: None,
                                         group: None,
                                         index: None,
@@ -1366,6 +1416,7 @@ async fn feed_loop(
                             }
                             Some(Command::Send { .. })
                             | Some(Command::Kill)
+                            | Some(Command::Stop)
                             | Some(Command::Resubscribe)
                             | Some(Command::Diff(_))
                             | Some(Command::Decide { .. }) => {}
@@ -1476,6 +1527,9 @@ async fn feed_loop(
                         }
                         Some(Command::Kill) => {
                             let _ = client.kill(&session_id).await;
+                        }
+                        Some(Command::Stop) => {
+                            let _ = client.interrupt(&session_id).await;
                         }
                         Some(Command::Diff(path)) => {
                             // Off-loop: the reply lands on the diffs
@@ -2595,8 +2649,8 @@ fn attach_button() -> gpui::Stateful<gpui::Div> {
         .id("composer-attach")
         .debug_selector(|| "composer-attach".into())
         .flex_none()
-        .size(px(theme::CONTROL_H))
-        .rounded(px(theme::RADIUS_CONTROL))
+        .size(px(composer::TOOL))
+        .rounded(px(composer::TOOL_RADIUS))
         .flex()
         .items_center()
         .justify_center()
@@ -4136,6 +4190,9 @@ struct ComposerState {
     /// composer hint so a ninth file does not vanish. Cleared on send
     /// and on session switch (the files are the fact that travels).
     overflow: usize,
+    /// Composer access mode for THIS session. Parked like the draft.
+    runtime_mode: RuntimeMode,
+    parked_modes: HashMap<String, RuntimeMode>,
 }
 
 impl ComposerState {
@@ -4173,6 +4230,8 @@ impl ComposerState {
         self.field.update(cx, |f, cx| f.set_content(incoming, cx));
         self.attachments = self.parked_files.remove(&key).unwrap_or_default();
         self.overflow = 0;
+        self.parked_modes.insert(self.key.clone(), self.runtime_mode);
+        self.runtime_mode = self.parked_modes.remove(&key).unwrap_or_default();
         self.key = key;
     }
 }
@@ -4471,6 +4530,16 @@ impl Element for LinkText {
                                         url: href.to_string(),
                                         activate: crate::settings::switch_to_background_tabs(),
                                         incognito: false,
+                                        // A link ⌘-clicked in a transcript
+                                        // lands in the window you are
+                                        // looking at (Slice W1). Read at
+                                        // CLICK time, not threaded through
+                                        // the six `RenderOnce` layers
+                                        // between the shell and a run of
+                                        // styled text — six copies of
+                                        // "which window am I in" is six
+                                        // things that can disagree.
+                                        window: key_window(),
                                     }));
                                 }
                             }
@@ -5087,6 +5156,18 @@ impl TabMenuEntry {
 
 struct Shell {
     focus: FocusHandle,
+    /// **Which window's strip this shell draws (Slice W1, ⌘N).**
+    ///
+    /// Fixed for the life of the window and minted by the client, not the
+    /// engine — see [`eave_wire::WindowId`]. The first window is
+    /// [`eave_wire::PRIMARY_WINDOW`] by name rather than by discovery, so
+    /// that a restart puts the tabs that were in the first window back in
+    /// the first window whatever else is restored beside it.
+    ///
+    /// Everything this shell knows about tabs comes through
+    /// [`Shell::strip_snapshot`], which narrows the engine's whole-app
+    /// snapshot to this id. Nothing else in the shell reads the wide one.
+    window_key: eave_wire::WindowId,
     conn: Entity<ConnectionState>,
     sessions: Entity<SessionsState>,
     files: Entity<FilesState>,
@@ -5216,6 +5297,15 @@ struct Shell {
     files_wait_since: Cell<Option<(String, Instant)>>,
     /// Slice AR — the `/` palette.
     slash: SlashPalette,
+    /// `@file` palette. Same projection rule as slash.
+    mention: MentionPalette,
+    /// Access / runtime-mode menu, anchored on the composer chip.
+    access: Popup<Point<Pixels>>,
+    /// Project files indexed for `@`, keyed by cwd.
+    mention_files: HashMap<String, Vec<ProjectFile>>,
+    mention_loading: bool,
+    /// Git branch for a session cwd. `None` value = looked up, not a repo.
+    branch_by_cwd: HashMap<String, Option<String>>,
     /// Slice C5 — the omnibox, when it is up.
     omni: Omnibox,
     /// Text typed into a `prompt()`, and which tab it belongs to.
@@ -5465,6 +5555,12 @@ impl SlashCache {
     }
 }
 
+#[derive(Default)]
+struct MentionPalette {
+    popup: Popup<()>,
+    dismissed: bool,
+}
+
 /// What the palette says while the first scan of a directory is in flight.
 ///
 /// It says something rather than nothing because an empty menu is a claim
@@ -5581,6 +5677,65 @@ impl Default for LauncherUi {
 /// code below the feed loop can resolve paths against it (Stage L).
 /// Unset under the test harness, which never calls `run`.
 static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// **Which shell window the operator is looking at (Slice W1).**
+///
+/// A process global, and deliberately so. Almost everything that opens a
+/// tab is a `Shell` method and names its own window with no help from
+/// here — that is the honest path and it is the one nearly every call
+/// site takes. The exception is a `⌘`-click on a link inside a
+/// transcript, which happens six `RenderOnce` layers below the shell in a
+/// run of styled text; threading a window id down that chain would put
+/// the answer to "which window am I in" in six places that can disagree,
+/// to answer it in one.
+///
+/// What it holds is what macOS itself would answer and what every browser
+/// does with a link opened from outside a page: it lands in the window
+/// you are looking at. `None` before any window has been activated, which
+/// [`Request::TabOpen`] reads as the primary window.
+///
+/// Written by each shell window's activation observer, so it cannot go
+/// stale behind a window that is no longer key.
+static KEY_WINDOW: Mutex<Option<eave_wire::WindowId>> = Mutex::new(None);
+
+/// The window the operator is looking at, or `None` before any has been
+/// activated — see [`KEY_WINDOW`].
+fn key_window() -> Option<eave_wire::WindowId> {
+    KEY_WINDOW.lock().ok().and_then(|w| w.clone())
+}
+
+fn set_key_window(id: &str) {
+    if let Ok(mut w) = KEY_WINDOW.lock() {
+        *w = Some(id.to_string());
+    }
+}
+
+/// Windows this process has closed (Slice W1).
+///
+/// **The one race `adopt_windows` can lose.** Closing a window sends a
+/// `TabClose` per tab and then removes the surface; a tabs snapshot that
+/// was already in flight when that happened still names the window, and
+/// adopting it would open a fresh surface for tabs that are on their way
+/// out — leaving an empty window nobody asked for, from the gesture that
+/// asked for one fewer.
+///
+/// A list that only grows, which costs nothing and cannot go wrong: a
+/// window id is never reused (see [`new_window_id`]), so an entry here
+/// can only ever match the window it was written for.
+static CLOSED_WINDOWS: Mutex<Vec<eave_wire::WindowId>> = Mutex::new(Vec::new());
+
+fn note_window_closed(id: &str) {
+    if let Ok(mut closed) = CLOSED_WINDOWS.lock() {
+        closed.push(id.to_string());
+    }
+}
+
+fn window_was_closed(id: &str) -> bool {
+    CLOSED_WINDOWS
+        .lock()
+        .map(|c| c.iter().any(|w| w == id))
+        .unwrap_or(false)
+}
 
 /// Data dir per spec 02 §Layout — the default when neither `--data-dir`
 /// nor `EAVE_DATA_DIR` is given. Lives here rather than in `main.rs` so
@@ -5922,6 +6077,7 @@ impl Shell {
         // here as well as derived at the two read sites, so the popup does
         // not sit mounted-but-invisible until the next keystroke.
         self.sync_slash_palette(cx);
+        self.sync_mention_palette(cx);
     }
 
     fn selected_session(&self, cx: &App) -> Option<SessionInfo> {
@@ -6043,6 +6199,7 @@ impl Shell {
             c.field.update(cx, |f, cx| f.insert(&text, cx));
         });
         self.sync_slash_palette(cx);
+        self.sync_mention_palette(cx);
     }
 
     fn composer_files_row(&self, files: &[StagedFile], cx: &mut Context<Self>) -> AnyElement {
@@ -6376,6 +6533,296 @@ impl Shell {
             });
         }
         cx.notify();
+    }
+
+    fn mention_palette_live(&self, cx: &Context<Self>) -> bool {
+        self.mention.popup.is_open()
+            && !self.mention.dismissed
+            && !self.slash_palette_live(cx)
+            && self.mention_token(cx).is_some()
+    }
+
+    fn mention_token(&self, cx: &Context<Self>) -> Option<mentions::MentionToken> {
+        let field = self.composer.read(cx).field.read(cx);
+        mentions::mention_token_at(field.content(), field.cursor())
+    }
+
+    fn sync_mention_palette(&mut self, cx: &mut Context<Self>) {
+        if self.slash_palette_live(cx) {
+            self.close_mention_palette(cx);
+            return;
+        }
+        let token = self.mention_token(cx);
+        let Some(token) = token.filter(|_| !self.mention.dismissed) else {
+            self.close_mention_palette(cx);
+            return;
+        };
+        let Some(cwd) = self.selected_session(cx).map(|s| s.cwd) else {
+            self.close_mention_palette(cx);
+            return;
+        };
+        if !self.mention_files.contains_key(&cwd) && !self.mention_loading {
+            self.begin_mention_scan(cwd.clone(), cx);
+        }
+        let files = self.mention_files.get(&cwd).cloned().unwrap_or_default();
+        let ranked = mentions::rank_mention_files(&files, &token.query, &[], mentions::MAX_PICKER);
+        let enabled = if self.mention_files.contains_key(&cwd) {
+            vec![true; ranked.len().max(1)]
+        } else {
+            vec![false]
+        };
+        let now = cx.background_executor().now();
+        if self.mention.popup.is_open() {
+            self.mention.popup.resize(enabled);
+        } else {
+            self.mention.popup.open((), enabled, now);
+        }
+        if !self.slash_palette_live(cx) {
+            self.claim_slash_keys(true, cx);
+        }
+        cx.notify();
+    }
+
+    fn begin_mention_scan(&mut self, cwd: String, cx: &mut Context<Self>) {
+        self.mention_loading = true;
+        let root = PathBuf::from(cwd.clone());
+        cx.spawn(async move |view, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { mentions::list_project_files(&root) })
+                .await;
+            let _ = view.update(cx, |shell, cx| {
+                shell.mention_loading = false;
+                shell.mention_files.insert(cwd, files);
+                shell.sync_mention_palette(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn close_mention_palette(&mut self, cx: &mut Context<Self>) {
+        if !self.slash_palette_live(cx) {
+            self.claim_slash_keys(false, cx);
+        }
+        let now = cx.background_executor().now();
+        if self.mention.popup.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, move |shell, _| {
+                shell.mention.popup.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn choose_mention(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(token) = self.mention_token(cx) else {
+            return;
+        };
+        let Some(cwd) = self.selected_session(cx).map(|s| s.cwd) else {
+            return;
+        };
+        let files = self.mention_files.get(&cwd).cloned().unwrap_or_default();
+        let ranked = mentions::rank_mention_files(&files, &token.query, &[], mentions::MAX_PICKER);
+        let Some(file) = ranked.get(ix) else {
+            return;
+        };
+        let label = mentions::mention_label(file, &files);
+        let next = mentions::replace_mention_token(
+            self.composer.read(cx).field.read(cx).content(),
+            &token,
+            &label,
+        );
+        self.composer.update(cx, |c, cx| {
+            c.field.update(cx, |f, cx| f.set_content(next, cx));
+            cx.notify();
+        });
+        self.mention.dismissed = false;
+        self.sync_mention_palette(cx);
+    }
+
+    fn mention_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.mention_palette_live(cx) {
+            return None;
+        }
+        let now = cx.background_executor().now();
+        let (opacity, dy) = self.mention.popup.motion_at(now, cx.reduce_motion())?;
+        if self.mention.popup.in_flight(now, cx.reduce_motion()) {
+            motion::mark_active();
+        }
+        let token = self.mention_token(cx)?;
+        let cwd = self.selected_session(cx)?.cwd;
+        let files = self.mention_files.get(&cwd).cloned().unwrap_or_default();
+        let ranked = mentions::rank_mention_files(&files, &token.query, &[], mentions::MAX_PICKER);
+        let highlighted = self.mention.popup.highlighted();
+        let loading = !self.mention_files.contains_key(&cwd);
+        let rows: Vec<AnyElement> = if loading {
+            vec![overlay::menu_row(
+                0,
+                &MenuItem::new("Indexing files…").disabled(),
+                false,
+                false,
+                |_, _, _| {},
+            )]
+        } else if ranked.is_empty() {
+            let label = if token.query.trim().is_empty() {
+                "No files found"
+            } else {
+                "No matching files"
+            };
+            vec![overlay::menu_row(
+                0,
+                &MenuItem::new(label).disabled(),
+                false,
+                false,
+                |_, _, _| {},
+            )]
+        } else {
+            ranked
+                .iter()
+                .enumerate()
+                .map(|(ix, file)| {
+                    let mut item = MenuItem::new(file.name.clone());
+                    if file.relative != file.name {
+                        item = item.detail(file.relative.clone());
+                    }
+                    overlay::menu_row(
+                        ix,
+                        &item,
+                        highlighted == Some(ix),
+                        true,
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.choose_mention(ix, cx)
+                        }),
+                    )
+                })
+                .collect()
+        };
+        Some(
+            Self::column(frost(
+                theme::RADIUS_MENU,
+                overlay::menu_surface("mention-palette", opacity, dy)
+                    .w_full()
+                    .border_color(theme::border_strong())
+                    .shadow(theme::shadow_panel())
+                    .bg(theme::chrome_glass())
+                    .max_h(px(theme::SLASH_MAX_H))
+                    .overflow_y_hidden()
+                    .children(rows),
+            ))
+            .mb(px(theme::SPACE_2))
+            .into_any_element(),
+        )
+    }
+
+    fn warm_project_meta(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.selected_session(cx).map(|s| s.cwd) else {
+            return;
+        };
+        if !self.branch_by_cwd.contains_key(&cwd) {
+            let root = PathBuf::from(cwd.clone());
+            let key = cwd.clone();
+            cx.spawn(async move |view, cx| {
+                let branch = cx
+                    .background_executor()
+                    .spawn(async move { mentions::git_branch(&root) })
+                    .await;
+                let _ = view.update(cx, |shell, cx| {
+                    shell.branch_by_cwd.insert(key, branch);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn set_runtime_mode(&mut self, mode: RuntimeMode, cx: &mut Context<Self>) {
+        self.composer.update(cx, |c, cx| {
+            c.runtime_mode = mode;
+            cx.notify();
+        });
+        self.close_access_menu(cx);
+        self.maybe_auto_approve(cx);
+    }
+
+    fn open_access_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        self.access
+            .open(at, vec![true; access::MODES.len()], now);
+        cx.notify();
+    }
+
+    fn close_access_menu(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.access.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.access.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    fn access_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let anchor = *self.access.data()?;
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let live = self.access.is_open();
+        let highlighted = self.access.highlighted();
+        let current = self.composer.read(cx).runtime_mode;
+        let rows = access::MODES
+            .iter()
+            .enumerate()
+            .map(|(ix, mode)| {
+                let mut item = MenuItem::new(mode.label()).detail(mode.hint());
+                if *mode == current {
+                    item = item.trailing("✓");
+                }
+                overlay::menu_row(
+                    ix,
+                    &item,
+                    highlighted == Some(ix),
+                    live,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_runtime_mode(access::MODES[ix], cx);
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        overlay::menu_layer(
+            &self.access,
+            anchor,
+            now,
+            reduced,
+            rows,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_access_menu(cx)),
+        )
+    }
+
+    fn maybe_auto_approve(&mut self, cx: &mut Context<Self>) {
+        let mode = self.composer.read(cx).runtime_mode;
+        if mode == RuntimeMode::Supervised {
+            return;
+        }
+        let pending: Vec<(String, String)> = self
+            .transcript
+            .read(cx)
+            .transcript
+            .pending_approvals()
+            .filter_map(|row| match row {
+                Row::Approval {
+                    request_id, tool, ..
+                } => Some((request_id.clone(), tool.clone())),
+                _ => None,
+            })
+            .collect();
+        for (request_id, tool) in pending {
+            if mode.auto_allows(&tool) {
+                let _ = self.commands.send(Command::Decide {
+                    request_id,
+                    allow: true,
+                    message: String::new(),
+                });
+            }
+        }
     }
 
     /// Put the chosen command in the composer, and stop there.
@@ -7259,7 +7706,10 @@ impl Shell {
     /// `alert()` and that is its own business — surfacing it over whatever
     /// is in front would be a page in one tab seizing another's window.
     fn page_ask(&self, cx: &App) -> Option<crate::web::Pending> {
-        let snapshot = &self.web_tabs.read(cx).snapshot;
+        // This window's active tab. A dialog in another WINDOW is that
+        // window's business for the same reason a dialog in a background
+        // TAB is that tab's — see above, one scope wider (Slice W1).
+        let snapshot = self.strip_snapshot(cx);
         let active = snapshot.active.as_deref()?;
         crate::web::pending(active)
     }
@@ -7782,6 +8232,7 @@ impl Shell {
         // Any key that reaches here and changes the text is the operator
         // typing again, which retracts an escape.
         self.slash.dismissed = false;
+        self.mention.dismissed = false;
         // ── Slice CM: what is NOT here any more ───────────────────────
         //
         // Two arms are gone, and their absence is load-bearing rather than
@@ -7908,8 +8359,8 @@ impl Shell {
         if self.chrome_holds_keyboard(cx) {
             return false;
         }
-        let snap = self.web_tabs.read(cx);
-        strip::active_is_page(&snap.snapshot) && !strip::active_is_blank_page(&snap.snapshot)
+        let snap = self.strip_snapshot(cx);
+        strip::active_is_page(&snap) && !strip::active_is_blank_page(&snap)
     }
 
     /// A4 — ⌘C / ⌘X / ⌘V / ⌘A while a page holds the keyboard.
@@ -8032,6 +8483,12 @@ impl Shell {
     /// is what runs while the field has focus, and the `on_key` arm, which is
     /// what runs while a modal has taken it. One body, so they cannot drift.
     fn composer_enter(&mut self, cx: &mut Context<Self>) {
+        if self.mention_palette_live(cx) {
+            if let Some(ix) = self.mention.popup.highlighted() {
+                self.choose_mention(ix, cx);
+                return;
+            }
+        }
         match self.slash.popup.highlighted() {
             Some(ix) if self.slash_palette_live(cx) => self.choose_slash(ix, cx),
             _ => self.send_current(cx),
@@ -8082,8 +8539,50 @@ impl Shell {
     // ── Slice C5: the strip's acts ─────────────────────────────────────
 
     /// The strip as this window last saw it.
+    /// This window's strip.
+    ///
+    /// **The one place the engine's whole-app snapshot is narrowed to a
+    /// window (Slice W1), and the reason ⌘N cost the surfaces nothing.**
+    /// Every reader downstream of here — the strip, the well, ⌘W's
+    /// arithmetic, the omnibox's target, the page render's `active` — was
+    /// written against one window's worth of tabs and still is. A second
+    /// reader of `web_tabs` that skipped this would be a surface drawing
+    /// another window's tabs, which is the one defect this slice can
+    /// produce and the reason nothing else in `Shell` touches that entity.
     fn strip_snapshot(&self, cx: &App) -> eave_wire::TabsSnapshot {
-        self.web_tabs.read(cx).snapshot.clone()
+        strip::strip_for_window(&self.web_tabs.read(cx).snapshot, &self.window_key)
+    }
+
+    /// **A window's tabs go with it (Slice W1).**
+    ///
+    /// Closing the surface has to close the strip, or the tabs stay in
+    /// the engine's fold with nothing drawing them — reachable by no
+    /// chord, no click and no menu, and back on screen at the next
+    /// restart when `adopt_windows` opens a window for them.
+    /// Invisible-but-alive is the one state a tab must never be in.
+    ///
+    /// **Called from BOTH close paths, because there are two and they do
+    /// not meet.** `on_window_should_close` is AppKit's
+    /// `windowShouldClose:` and fires for the traffic light; ⌘W's
+    /// no-tabs fallback and the Window menu's Close row both go through
+    /// `Window::remove_window`, which does not raise it. Wiring only the
+    /// first left the other two orphaning a strip.
+    ///
+    /// The primary window is exempt. It is the shell — rail, composer,
+    /// sessions — and it is a surface with or without a page in it, so
+    /// closing it is not a statement about tabs. That is also why ⌘W's
+    /// fallback can close it safely on an empty strip.
+    fn release_tabs_on_close(&self, cx: &mut App) {
+        if self.window_key == eave_wire::PRIMARY_WINDOW {
+            return;
+        }
+        // Before the closes go out, not after: a snapshot already in
+        // flight still names this window, and `adopt_windows` must not
+        // open a second surface for tabs on their way out.
+        note_window_closed(&self.window_key);
+        for tab in self.strip_snapshot(cx).tabs {
+            let _ = self.commands.send(Command::Browser(BrowserCmd::Close(tab.id)));
+        }
     }
 
     /// Make a tab the active one.
@@ -8255,14 +8754,18 @@ impl Shell {
     /// the tab somehow has not arrived, [`Shell::commit_omnibox`] opens one
     /// at the address instead of dropping it.
     fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let _ = self.commands.send(Command::Browser(BrowserCmd::NewTab));
+        let _ = self.commands.send(Command::Browser(BrowserCmd::NewTab {
+            window: Some(self.window_key.clone()),
+        }));
         self.open_omnibox(cx);
     }
 
     fn new_incognito_tab(&mut self, cx: &mut Context<Self>) {
         let _ = self
             .commands
-            .send(Command::Browser(BrowserCmd::NewIncognitoTab));
+            .send(Command::Browser(BrowserCmd::NewIncognitoTab {
+                window: Some(self.window_key.clone()),
+            }));
         self.open_omnibox(cx);
     }
 
@@ -8308,6 +8811,7 @@ impl Shell {
                 url,
                 activate: true,
                 incognito: false,
+                window: Some(self.window_key.clone()),
             }));
         cx.notify();
     }
@@ -8728,6 +9232,7 @@ impl Shell {
                 url,
                 activate: true,
                 incognito: false,
+                window: Some(self.window_key.clone()),
             },
         };
         let _ = self.commands.send(Command::Browser(cmd));
@@ -9086,6 +9591,7 @@ impl Shell {
                 url,
                 activate: true,
                 incognito: false,
+                window: Some(self.window_key.clone()),
             },
         };
         let _ = self.commands.send(Command::Browser(cmd));
@@ -10287,9 +10793,8 @@ impl Shell {
         // here would lease the blink clock for a caret that is not
         // drawn, and tell `note_keystroke` the typist is in a box they
         // cannot see.
-        if strip::active_is_page(&self.web_tabs.read(cx).snapshot)
-            && !strip::active_is_blank_page(&self.web_tabs.read(cx).snapshot)
-        {
+        let strip_snapshot = self.strip_snapshot(cx);
+        if strip::active_is_page(&strip_snapshot) && !strip::active_is_blank_page(&strip_snapshot) {
             return None;
         }
         // The composer is mounted with a session and not before, and that
@@ -11757,6 +12262,7 @@ impl Shell {
                 url,
                 activate: true,
                 incognito: false,
+                window: Some(self.window_key.clone()),
             },
         };
         let _ = self.commands.send(Command::Browser(cmd));
@@ -14259,7 +14765,10 @@ impl Shell {
         }
         // The address pill's load fill: in flight, or still easing out
         // to 1 after Chromium said complete.
-        if self.web_tabs.read(cx).snapshot.tabs.iter().any(|t| {
+        // This window's tabs. A page loading in another window is that
+        // window's frame to schedule, and leasing the pulse clock for it
+        // here would make an idle window pay for a busy one (Slice W1).
+        if self.strip_snapshot(cx).tabs.iter().any(|t| {
             matches!(t.load, eave_wire::LoadState::Loading) || t.pending.is_some()
         }) || page_load_is_showing()
         {
@@ -16469,6 +16978,7 @@ impl Shell {
                         url,
                         activate: crate::settings::switch_to_background_tabs(),
                         incognito,
+                        window: Some(self.window_key.clone()),
                     }));
                 }
             }
@@ -16478,6 +16988,7 @@ impl Shell {
                         url,
                         activate: true,
                         incognito: true,
+                        window: Some(self.window_key.clone()),
                     }));
                 }
             }
@@ -16498,6 +17009,7 @@ impl Shell {
                         url: format!("view-source:{url}"),
                         activate: true,
                         incognito: false,
+                        window: Some(self.window_key.clone()),
                     }));
                 }
             }
@@ -16532,6 +17044,7 @@ impl Shell {
                         url: target.url().to_string(),
                         activate: true,
                         incognito: false,
+                        window: Some(self.window_key.clone()),
                     }));
                 }
             }
@@ -17407,6 +17920,7 @@ impl Shell {
                             url,
                             activate: crate::settings::switch_to_background_tabs(),
                             incognito: false,
+                            window: Some(self.window_key.clone()),
                         }));
                     }
                 }
@@ -17512,6 +18026,7 @@ impl Shell {
                         url,
                         activate: crate::settings::switch_to_background_tabs(),
                         incognito,
+                        window: Some(self.window_key.clone()),
                     }));
                 }
             }
@@ -17537,6 +18052,7 @@ impl Shell {
                         url,
                         activate: true,
                         incognito,
+                        window: Some(self.window_key.clone()),
                     }));
                 }
             }
@@ -17856,7 +18372,7 @@ impl Shell {
         // not exist yet: `Command::Launch` is a request and the rail
         // answers it later.
         let cwd = {
-            let snapshot = &self.web_tabs.read(cx).snapshot;
+            let snapshot = &self.strip_snapshot(cx);
             *self.launched_from_tab.borrow_mut() = strip::active_is_blank_page(snapshot)
                 .then(|| snapshot.active.clone())
                 .flatten();
@@ -18654,8 +19170,17 @@ impl Render for Shell {
         // and the rail's filtered order are readable. Both halves are
         // edge-guarded (`asked_to_select`, `asked_for_session_tab`) so a
         // per-frame call sends at most one of each — see `reconcile_strip`.
-        let strip_snapshot = self.web_tabs.read(cx).snapshot.clone();
-        self.reconcile_strip(&strip_snapshot, cx);
+        //
+        // Slice W1: the reconcile reads the WHOLE app's tabs and runs in
+        // the primary window only. "Which sessions have no view" is an
+        // app-wide question — a session tab in any window is a view — and
+        // asking it per window would have every window open a tab for
+        // every session. The render below reads this window's strip.
+        let strip_snapshot = self.strip_snapshot(cx);
+        if self.window_key == eave_wire::PRIMARY_WINDOW {
+            let every_window = self.web_tabs.read(cx).snapshot.clone();
+            self.reconcile_strip(&every_window, cx);
+        }
 
         let shown_pages: Vec<String> = {
             let mut ids = Vec::new();
@@ -18929,49 +19454,57 @@ impl Render for Shell {
         // transcript is still borrowed at that point, and this needs `cx`
         // mutably to move focus.
         self.sync_composer_focus(composer_mounted, keyboard_page.as_deref(), window, cx);
+        if composer_mounted {
+            self.warm_project_meta(cx);
+            let wanted = if empty_state.is_some() {
+                composer::PLACEHOLDER_EMPTY
+            } else {
+                composer::PLACEHOLDER_DOCKED
+            };
+            self.composer.update(cx, |c, cx| {
+                c.field.update(cx, |f, cx| {
+                    if f.placeholder() != wanted {
+                        f.set_placeholder(wanted, cx);
+                    }
+                });
+            });
+        }
 
-        // **Slice CM2 — the composer is bezel's control bar.**
-        //
-        // bezel's `ui::control_bar` builds its surface as, in order: a `div` at
-        // `BAR_HEIGHT` with `rounded(radius)`, `border_1` in `hairline(0.10)`,
-        // `shadow_lg`, `overflow_hidden`, `px(BAR_GAP)` and `glass_overlay` —
-        // all of it handed to `material(radius, MENU_BLUR, bar)`. Every one of
-        // those is reproduced here through `theme.rs` tokens (see its control
-        // bar block for why they are not read from bezel at this call site).
-        //
-        // **Composed rather than called**, and the reason is a feature, not a
-        // preference: `control_bar()` takes `leading/centre/trailing` clusters
-        // inside a fixed `.h(BAR_HEIGHT)` row. eave's composer grows to twelve
-        // rows and stacks an attachment strip above its text, so calling it
-        // would have deleted multi-line drafts and attachments to gain the
-        // look. `BAR_HEIGHT` therefore arrives as `min_h`. At rest the two
-        // surfaces are the same 56 px bar; typing is the only thing that tells
-        // them apart.
-        //
-        // The rim no longer answers `has_draft`. bezel's is uniform, and on a
-        // floating glass card the rim is what lifts it off the backdrop rather
-        // than a state channel — the draft signal lives on the send button,
-        // which is where a fact about sending belongs. `theme::bar_hairline`
-        // carries that argument in full.
+        let context_window = self.transcript.read(cx).transcript.context;
+        let runtime_mode = self.composer.read(cx).runtime_mode;
+        let home = home_dir();
+        let project_name = composer_session
+            .as_ref()
+            .map(|s| mentions::project_label(&s.cwd, &home.to_string_lossy()));
+        let branch_name = composer_session.as_ref().and_then(|s| {
+            self.branch_by_cwd
+                .get(&s.cwd)
+                .cloned()
+                .flatten()
+                .or_else(|| s.worktree.as_ref().map(|w| w.branch.clone()))
+        });
+        let session_busy = composer_session
+            .as_ref()
+            .is_some_and(|s| s.state == "running");
+
+        // MonoCode's composer card: project + branch + meter on top, the
+        // field, then + / model / access / send-or-stop. Frosted like the
+        // old bar so it still occludes the transcript.
         let composer = Self::column(frost_at(
-            theme::RADIUS_BAR,
+            composer::CARD_RADIUS,
             theme::BLUR_MENU,
             div()
                 .w_full()
                 .min_h(px(theme::BAR_HEIGHT))
-                .rounded(px(theme::RADIUS_BAR))
+                .rounded(px(composer::CARD_RADIUS))
                 .border_1()
                 .border_color(theme::bar_hairline())
                 .bg(theme::bar_glass())
                 .shadow_lg()
                 .debug_selector(|| "composer-card".into())
-                // bezel clips the bar so its glass never bleeds past the
-                // corner it just rounded. eave needs it for the same reason
-                // plus one of its own: the attachment strip is a child with
-                // its own fill.
                 .overflow_hidden()
-                .px(px(theme::BAR_GAP))
-                .pt(px(theme::BAR_GAP))
+                .px(px(theme::SPACE_3))
+                .pt(px(theme::SPACE_2))
                 .pb(px(theme::SPACE_2))
                 .drag_over::<ExternalPaths>(|style, _, _, _| {
                     style
@@ -18981,6 +19514,90 @@ impl Render for Shell {
                 .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                     this.stage_paths(paths.paths().to_vec(), cx);
                 }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACE_2))
+                        .pb(px(theme::SPACE_1))
+                        .children(project_name.map(|name| {
+                            let cwd = composer_session
+                                .as_ref()
+                                .map(|s| s.cwd.clone())
+                                .unwrap_or_default();
+                            div()
+                                .id("composer-project")
+                                .debug_selector(|| "composer-project".into())
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACE_1))
+                                .h(px(composer::TOOL))
+                                .px(px(theme::SPACE_2))
+                                .rounded(px(composer::TOOL_RADIUS))
+                                .hover_fade(
+                                    "composer-project",
+                                    theme::wash_rest(),
+                                    theme::overlay(),
+                                )
+                                .cursor_pointer()
+                                .on_click(move |_, _, _| {
+                                    open_in_system(Path::new(&cwd));
+                                })
+                                .child(icons::tagged_icon(
+                                    icons::FOLDER,
+                                    theme::ICON_STATUS,
+                                    theme::text_secondary_on_wash(),
+                                    "composer-project-glyph",
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(theme::LABEL_SIZE))
+                                        .text_color(theme::text_secondary_on_wash())
+                                        .child(SharedString::from(name)),
+                                )
+                                .into_any_element()
+                        }))
+                        .children(branch_name.map(|name| {
+                            div()
+                                .id("composer-branch")
+                                .debug_selector(|| "composer-branch".into())
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACE_1))
+                                .h(px(composer::TOOL))
+                                .px(px(theme::SPACE_2))
+                                .rounded(px(composer::TOOL_RADIUS))
+                                .child(icons::tagged_icon(
+                                    icons::GIT_BRANCH,
+                                    theme::ICON_STATUS,
+                                    theme::text_secondary_on_wash(),
+                                    "composer-branch-glyph",
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(theme::LABEL_SIZE))
+                                        .text_color(theme::text_secondary_on_wash())
+                                        .child(SharedString::from(name)),
+                                )
+                                .into_any_element()
+                        }))
+                        .child(div().flex_1())
+                        .children(composer::context_meter(context_window))
+                        .children((!usage.is_empty()).then(|| {
+                            div()
+                                .debug_selector(|| "composer-usage".into())
+                                .flex_none()
+                                .text_size(px(theme::MICRO_SIZE))
+                                .line_height(px(theme::MICRO_LINE))
+                                .text_color(theme::text_tertiary())
+                                .child(SharedString::from(usage))
+                        })),
+                )
                 .children(has_files.then(|| self.composer_files_row(&attachments, cx)))
                 .child(
                     div()
@@ -19014,7 +19631,7 @@ impl Render for Shell {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(theme::SPACE_2))
+                        .gap(px(theme::SPACE_1))
                         .child(attach_button().on_click(cx.listener(
                             |this, _: &ClickEvent, _, cx| {
                                 this.pick_attachments(cx);
@@ -19035,6 +19652,45 @@ impl Render for Shell {
                             }))
                             .into_any_element()
                         }))
+                        .child(
+                            div()
+                                .id("composer-access")
+                                .debug_selector(|| "composer-access".into())
+                                .flex_none()
+                                .h(px(theme::CONTROL_H))
+                                .px(px(theme::CONTROL_PAD_X))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::CONTROL_GAP))
+                                .hover_fade(
+                                    "composer-access",
+                                    theme::wash_rest(),
+                                    theme::overlay(),
+                                )
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    let at = window.mouse_position();
+                                    this.open_access_menu(
+                                        point(at.x, at.y + px(theme::MENU_ANCHOR_GAP)),
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    div()
+                                        .text_size(px(theme::LABEL_SIZE))
+                                        .line_height(px(theme::LABEL_LINE))
+                                        .text_color(theme::text_secondary_on_wash())
+                                        .child(SharedString::from(runtime_mode.label())),
+                                )
+                                .child(icons::tagged_icon(
+                                    icons::ALT_ARROW_DOWN,
+                                    MODEL_CHEVRON,
+                                    theme::text_secondary_on_wash(),
+                                    "composer-access-chevron",
+                                )),
+                        )
                         .child(
                             div()
                                 .debug_selector(|| "composer-hint".into())
@@ -19118,76 +19774,45 @@ impl Render for Shell {
                                 ))),
                         )
                         .child(div().flex_1())
-                        // Slice CC. The quietest rank in the application
-                        // (`MICRO`, tertiary ink) at the far end of a row
-                        // whose left half is already chrome: this is
-                        // instrumentation, and it must lose every contest
-                        // with the session name, the message text and the
-                        // send button.
-                        //
-                        // The slot follows `composer-hint`'s doctrine
-                        // rather than inventing one — when there is
-                        // nothing true to say, it says nothing, because a
-                        // permanent "0 tokens" caption over an adapter
-                        // that reports none would be a lie printed on
-                        // every frame forever. Unlike that slot this one
-                        // is not mounted when empty: no test probes for
-                        // it, and the row's height is `SEND_BUTTON` (26),
-                        // which `MICRO_LINE` (15) clears either way, so
-                        // nothing moves.
-                        .children((!usage.is_empty()).then(|| {
+                        .children(session_busy.then(|| {
                             div()
-                                .debug_selector(|| "composer-usage".into())
+                                .id("composer-stop")
+                                .debug_selector(|| "composer-stop".into())
                                 .flex_none()
-                                .mr(px(theme::SPACE_2))
-                                .text_size(px(theme::MICRO_SIZE))
-                                .line_height(px(theme::MICRO_LINE))
-                                .text_color(theme::text_tertiary())
-                                .child(SharedString::from(usage))
-                        }))
-                        .child(
-                            div()
-                                .size(px(theme::SEND_BUTTON))
-                                .rounded_full()
+                                .size(px(composer::TOOL))
+                                .rounded(px(composer::TOOL_RADIUS))
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                // Slice P3: no text_size/font_weight/text_color
-                                // — the child is a glyph, an SVG takes its size
-                                // from its own box, and gpui does NOT cascade
-                                // text colour into one (see `icons::icon`). The
-                                // arm colour is handed to the glyph directly.
+                                .bg(theme::solid())
+                                .hover_fade(
+                                    "composer-stop",
+                                    theme::solid(),
+                                    theme::inverse_hover(),
+                                )
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, _cx| {
+                                    let _ = this.commands.send(Command::Stop);
+                                }))
+                                .child(
+                                    div()
+                                        .size(px(10.0))
+                                        .rounded(px(2.0))
+                                        .bg(theme::on_solid())
+                                        .debug_selector(|| "composer-stop-glyph".into()),
+                                )
+                                .into_any_element()
+                        }))
+                        .child(
+                            div()
                                 .id("send")
                                 .debug_selector(|| "send".into())
-                                // Slice M (§2.2). A filled control REPLACES its bg
-                                // rather than compositing a wash over it, so both
-                                // states have to name a hovered fill.
-                                //
-                                // Arming the button (first character typed) swaps
-                                // BOTH ends of the fade under a pointer that may
-                                // be sitting on it. That is a step, not a tween —
-                                // the fade interpolates between whatever the two
-                                // ends are this frame, so the armed colour arrives
-                                // at once and only the hover progress is smooth.
-                                //
-                                // Slice AL: the ARMED fill is the accent, not
-                                // `solid`. The accent marks where you are acting,
-                                // not where you are — an armed send button is the
-                                // most literal case of that rule in the app.
-                                // Unarmed it stays neutral, because a button with
-                                // nothing to send is not an action.
-                                //
-                                // **Slice CM2 corrects the sentence that used to
-                                // end this paragraph.** It said the button "arms
-                                // together with the composer's rim and caret,
-                                // which are the same colour on purpose" — true
-                                // when written, false the moment the composer
-                                // became bezel's control bar, whose rim is a
-                                // uniform `hairline(0.10)` and does not answer
-                                // `has_draft` at all. The caret still does. So
-                                // this is now the ONE surface that arms, which
-                                // makes it carry the signal alone rather than
-                                // reinforce it — see `theme::bar_hairline`.
+                                .flex_none()
+                                .size(px(composer::TOOL))
+                                .rounded(px(composer::TOOL_RADIUS))
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .hover_fade(
                                     "send",
                                     if has_draft {
@@ -19272,10 +19897,11 @@ impl Render for Shell {
         // same subtree, so this must not consume `composer` before the
         // split/well branch.
         let launcher_menu = self.launcher_menu_layer(cx);
+        let access_layer = self.access_layer(cx);
         // Built here for the same reason the launcher and its menu are:
         // it needs `self` and `cx`, and the element chain below has
-        // neither to spare.
-        let slash_layer = self.slash_layer(cx);
+        // neither to spare. Slash and `@` never share a frame.
+        let slash_layer = self.slash_layer(cx).or_else(|| self.mention_layer(cx));
 
         // Opaque window by default, custom titlebar — locked decision
         // (spec 03 §No-fork consequences) plus the Stage F visual pass.
@@ -19384,25 +20010,36 @@ impl Render for Shell {
             // the rest of the time.
             .on_action(cx.listener(|this, _: &SendMessage, _, cx| this.composer_enter(cx)))
             .on_action(cx.listener(|this, _: &SlashNext, _, cx| {
-                this.slash.popup.highlight_next();
+                if this.mention_palette_live(cx) {
+                    this.mention.popup.highlight_next();
+                } else {
+                    this.slash.popup.highlight_next();
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SlashPrev, _, cx| {
-                this.slash.popup.highlight_prev();
+                if this.mention_palette_live(cx) {
+                    this.mention.popup.highlight_prev();
+                } else {
+                    this.slash.popup.highlight_prev();
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SlashAccept, _, cx| {
-                // Complete to the top match — the classic gesture, and the one
-                // that does not make the operator press down first just to
-                // accept what is already highlighted in front of them.
-                this.choose_slash(this.slash.popup.highlighted().unwrap_or(0), cx);
+                if this.mention_palette_live(cx) {
+                    this.choose_mention(this.mention.popup.highlighted().unwrap_or(0), cx);
+                } else {
+                    this.choose_slash(this.slash.popup.highlighted().unwrap_or(0), cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &SlashDismiss, _, cx| {
-                // Refusal, not a text edit: the draft is left exactly as typed.
-                // Escape must never be the only way to close a menu AND a way
-                // to lose what you wrote.
-                this.slash.dismissed = true;
-                this.close_slash_palette(cx);
+                if this.mention_palette_live(cx) {
+                    this.mention.dismissed = true;
+                    this.close_mention_palette(cx);
+                } else {
+                    this.slash.dismissed = true;
+                    this.close_slash_palette(cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &FindInPage, _, cx| this.find_in_page(cx)))
             .on_action(cx.listener(|this, _: &ToggleDevtools, _, cx| this.toggle_devtools(cx)))
@@ -19876,6 +20513,7 @@ impl Render for Shell {
             // the launcher's menu is on top — the launcher is the product
             // surface and the demo is a test fixture.
             .children(launcher_menu)
+            .children(access_layer)
             // Slice E1. Root-mounted for the reason `overlay::menu_layer`
             // gives: `deferred` fixes paint order but layout stays where it
             // is written, and this menu opens over a region that also holds
@@ -20401,6 +21039,12 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         KeyBinding::new("cmd-l", FocusOmnibox, None),
         KeyBinding::new("cmd-shift-l", FrictionLog, None),
         KeyBinding::new("cmd-t", NewTab, None),
+        // ⌘N — Slice W1. Where every browser keeps it, and the reason
+        // ⌘⇧N below is New Incognito Tab rather than New Incognito
+        // WINDOW: eave's private surface is a tab (`incognito` is a
+        // per-tab request context), and shifting a chord must not change
+        // what kind of thing it makes.
+        KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-shift-n", NewIncognitoTab, None),
         // ctrl-tab, not ⌘⌥→. macOS has no single convention here and the
         // control-tab pair is what Chrome, Safari, Firefox and every
@@ -20786,6 +21430,20 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     queues.tabs.lock().unwrap().drain(..).collect();
                 if let Some(snapshot) = tab_snapshots.into_iter().last() {
                     crate::web::drive(&snapshot);
+                    // Slice W1 — a strip with no window to draw it is a
+                    // strip nobody can reach. The engine restores tabs
+                    // into the windows they were in; this is what puts
+                    // those windows back on screen, and it is also the
+                    // backstop for a window opened by another client.
+                    //
+                    // Runs on every snapshot rather than once at boot,
+                    // because "the first snapshot" is not a moment this
+                    // task can identify — a reconnect delivers another
+                    // one — and opening a window that already exists is
+                    // the thing the check below refuses.
+                    let want: Vec<eave_wire::WindowId> =
+                        snapshot.windows.iter().map(|w| w.id.clone()).collect();
+                    let _ = cx.update(|cx| adopt_windows(cx, &want));
                     web_tabs.update(cx, |state, cx| {
                         state.snapshot = snapshot;
                         cx.notify();
@@ -20921,11 +21579,259 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         .detach();
     }
 
-    let bounds = Bounds::centered(None, size(px(theme::WINDOW_W), px(theme::WINDOW_H)), cx);
+    cx.set_global(ShellDeps {
+        conn,
+        sessions,
+        files,
+        transcript,
+        web_tabs,
+        bookmarks,
+        typeahead,
+        cmd_tx,
+        perf_10k,
+    });
+    // ⌘N. Registered on the APP, not on a window: a new window has to be
+    // openable from whichever window is key, and from none of them — the
+    // chord works while Settings is frontmost too.
+    cx.on_action(|_: &NewWindow, cx: &mut App| {
+        // Asked before the open, because opening a window changes which
+        // one is frontmost.
+        let fullscreen = source_is_fullscreen(cx);
+        let handle = open_shell_window(cx, new_window_id());
+        // A window opened by a chord is a window somebody wants to use.
+        // It comes up empty — no tab — and this is what makes ⌘N's first
+        // keystroke land in it rather than in the window behind.
+        let _ = handle.update(cx, |shell, window, cx| {
+            window.activate_window();
+            shell.new_tab(cx);
+            if fullscreen {
+                // **A frame later, not now.** `toggleFullScreen:` needs a
+                // window that is on screen; issued during `Window::new`
+                // — which is what `WindowBounds::Fullscreen` does — it is
+                // silently ignored, and ⌘N from fullscreen appears to do
+                // nothing at all because a windowed window cannot be seen
+                // over a fullscreen Space. By the next frame the window
+                // exists, has been ordered front, and AppKit takes it.
+                window.on_next_frame(|window, _| window.toggle_fullscreen());
+            }
+        });
+    });
+    let handle = open_shell_window(cx, eave_wire::PRIMARY_WINDOW.to_string());
+    // The bar, last: a `setMainMenu_` issued before the window exists and
+    // before activation does not stick (see `app_menus::install`).
+    crate::app_menus::install(cx);
+    cx.activate(true);
+    handle
+}
+
+/// Everything a shell window needs that is **not** its own (Slice W1).
+///
+/// The split ⌘N forced into the open: one engine connection, one set of
+/// sessions, one transcript, one page engine — and per window, a strip, a
+/// composer and a frame. Before there could be two windows this
+/// distinction had no way to be wrong, so it was never drawn; it lived as
+/// a run of locals in `bootstrap` that the one window closed over.
+///
+/// A gpui global rather than a value threaded from `bootstrap`, because
+/// ⌘N opens a window from an action handler and a restore opens one from
+/// the pump — neither is on `bootstrap`'s stack, and both need exactly
+/// this.
+#[derive(Clone)]
+struct ShellDeps {
+    conn: Entity<ConnectionState>,
+    sessions: Entity<SessionsState>,
+    files: Entity<FilesState>,
+    transcript: Entity<TranscriptState>,
+    web_tabs: Entity<WebTabsState>,
+    bookmarks: Entity<BookmarksState>,
+    typeahead: Entity<TypeaheadState>,
+    cmd_tx: tokio_mpsc::UnboundedSender<Command>,
+    perf_10k: bool,
+}
+
+impl gpui::Global for ShellDeps {}
+
+/// Close the shell window the keyboard is in, taking its tabs with it
+/// (Slice W1). `false` when the key window is not a shell — Settings and
+/// the theme popup are somebody else's to close.
+///
+/// This is the `remove_window` path: ⌘W with no tab left to close, and
+/// the Window menu's Close row. See [`Shell::release_tabs_on_close`] for
+/// why it cannot simply be left to `on_window_should_close`.
+pub(crate) fn close_active_shell_window(cx: &mut App) -> bool {
+    let Some(handle) = cx.active_window().and_then(|w| w.downcast::<Shell>()) else {
+        return false;
+    };
+    handle
+        .update(cx, |shell, window, cx| {
+            shell.release_tabs_on_close(cx);
+            window.remove_window();
+        })
+        .is_ok()
+}
+
+/// The shell window the keyboard is in, or any shell window, or none at
+/// all — which is boot, before the first one exists.
+fn frontmost_shell(cx: &mut App) -> Option<WindowHandle<Shell>> {
+    cx.active_window()
+        .and_then(|w| w.downcast::<Shell>())
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .rev()
+                .find_map(|w| w.downcast::<Shell>())
+        })
+}
+
+/// Is the window ⌘N was pressed in fullscreen? (Slice W1.)
+///
+/// Read BEFORE the new window opens, because opening one moves what
+/// "frontmost" means.
+fn source_is_fullscreen(cx: &mut App) -> bool {
+    frontmost_shell(cx)
+        .and_then(|front| front.update(cx, |_, window, _| window.is_fullscreen()).ok())
+        .unwrap_or(false)
+}
+
+/// Where a new shell window opens (Slice W1).
+///
+/// Three cases, and the middle one is why this is a function rather than
+/// the one `Bounds::centered` call it replaced.
+///
+/// - **No window yet** — centered. That is boot.
+///
+/// - **⌘N pressed from a FULLSCREEN window** — the new window opens
+///   fullscreen too. macOS gives a fullscreen window its own Space, and a
+///   *windowed* window cannot appear over one: it opens on the desktop
+///   Space, where it is not merely behind the window you are looking at
+///   but on another screen entirely, invisible until you swipe out. ⌘N
+///   from fullscreen therefore looked like it had done nothing — and
+///   worse, because what you were left looking at was the strip of the
+///   window that did open, it read as ⌘T. Both symptoms, one cause.
+///   The new window is opened WINDOWED and put into fullscreen a frame
+///   later — see [`source_is_fullscreen`]. Handing `open_window` a
+///   `WindowBounds::Fullscreen` is the obvious thing and it does not
+///   work: gpui answers it by calling `toggleFullScreen:` from inside
+///   `Window::new`, before the window is on screen and before anything
+///   has ordered it front, and AppKit drops it on the floor. So the
+///   bounds here are the RESTORE size — what the window becomes when it
+///   leaves fullscreen — and the toggle happens where it can land.
+///
+/// - **Otherwise** — stepped down and right from the frontmost window,
+///   which is what Chrome, Safari, Firefox and Arc all do. Two windows at
+///   identical bounds are pixel-aligned, and a new window you cannot tell
+///   apart from the old one is a new window nobody believes in.
+fn new_window_placement(cx: &mut App) -> WindowBounds {
+    let centered = Bounds::centered(None, size(px(theme::WINDOW_W), px(theme::WINDOW_H)), cx);
+    let Some(front) = frontmost_shell(cx) else {
+        return WindowBounds::Windowed(centered);
+    };
+    let Ok((fullscreen, bounds, screen)) = front.update(cx, |_, window, cx| {
+        (
+            window.is_fullscreen(),
+            window.bounds(),
+            window.display(cx).map(|d| d.visible_bounds()),
+        )
+    }) else {
+        return WindowBounds::Windowed(centered);
+    };
+    if fullscreen {
+        // The restore size. The fullscreen toggle itself is a frame away.
+        return WindowBounds::Windowed(centered);
+    }
+    let step = px(theme::WINDOW_CASCADE);
+    let mut next = bounds;
+    next.origin.x += step;
+    next.origin.y += step;
+    // Past the usable area — the visible bounds, so the Dock and the menu
+    // bar count. Start the cascade over rather than open a window whose
+    // titlebar is off the screen, which is a window nobody can move.
+    if let Some(screen) = screen {
+        let past_right = next.origin.x + next.size.width > screen.origin.x + screen.size.width;
+        let past_bottom = next.origin.y + next.size.height > screen.origin.y + screen.size.height;
+        if past_right || past_bottom {
+            return WindowBounds::Windowed(centered);
+        }
+    }
+    WindowBounds::Windowed(next)
+}
+
+/// A window id nobody else will mint. See [`eave_wire::WindowId`] — the
+/// client names its own windows.
+fn new_window_id() -> eave_wire::WindowId {
+    // Unique across every eave that has ever run against this data dir,
+    // which is what the id has to be: window ids are journaled with the
+    // tabs that name them, so one reused after a restart would adopt the
+    // previous run's strip. The boot instant separates runs and the
+    // counter separates windows within one — `uuid` is not a dependency
+    // of this crate and adding one for a name is not worth it.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let boot = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("w-{boot:x}-{n}")
+}
+
+/// Open a shell window for every strip in `want` that has none (Slice W1).
+///
+/// This is how a restart puts a second window back: the engine restores
+/// its tabs into the window they were opened in, and a window id in the
+/// snapshot with no surface drawing it is tabs the operator cannot reach.
+///
+/// **It never closes one.** A window whose last tab closed is a window
+/// the operator emptied, and emptying a window is not the same act as
+/// closing it — Chrome's ⌘W closes the window on the last tab because the
+/// keystroke asked to, not because the strip went empty. The close path
+/// is the traffic light and ⌘W, both of which say so.
+///
+/// ...and it never REopens one either, which is what [`CLOSED_WINDOWS`]
+/// is for. See there: a snapshot in flight across a close still names the
+/// window that is going away.
+fn adopt_windows(cx: &mut App, want: &[eave_wire::WindowId]) {
+    let open: Vec<eave_wire::WindowId> = cx
+        .windows()
+        .into_iter()
+        .filter_map(|w| w.downcast::<Shell>())
+        .filter_map(|h| h.read(cx).ok().map(|s| s.window_key.clone()))
+        .collect();
+    for id in want {
+        // The primary window is opened by `bootstrap` and is never
+        // adopted: it exists before any snapshot arrives, whether or not
+        // it has a single tab in it.
+        if id == eave_wire::PRIMARY_WINDOW || open.contains(id) || window_was_closed(id) {
+            continue;
+        }
+        open_shell_window(cx, id.clone());
+    }
+}
+
+/// Open one shell window onto `window_key`'s strip.
+///
+/// **Slice W1 extracted this from `bootstrap` unchanged.** Everything
+/// above it there is process-wide and runs once: bindings, actions, the
+/// menu bar, the settings store, the feed pump. Everything from here down
+/// was already per-window and merely had no second caller — which is why
+/// the extraction is a move rather than a rewrite, and why the diff is
+/// worth reading as one.
+fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHandle<Shell> {
+    let ShellDeps {
+        conn,
+        sessions,
+        files,
+        transcript,
+        web_tabs,
+        bookmarks,
+        typeahead,
+        cmd_tx,
+        perf_10k,
+    } = cx.global::<ShellDeps>().clone();
+    let placement = new_window_placement(cx);
     let handle = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(placement),
                 window_min_size: Some(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H))),
                 // Glass is the only look (ruled 2026-08-17, opaque path deleted
                 // 2026-08-19). theme.rs owns the tints this blur sits under.
@@ -20951,7 +21857,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                             TextField::new(cx)
                                 .with_shape(crate::text_field::Shape::Grow { min: 1, max: 12 })
                                 .with_key_context(COMPOSER_KEY_CONTEXT)
-                                .with_placeholder("Message eave…")
+                                .with_placeholder(composer::PLACEHOLDER_DOCKED)
                                 .with_debug_name("composer-text")
                         }),
                         key: String::new(),
@@ -20959,6 +21865,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         attachments: Vec::new(),
                         parked_files: HashMap::new(),
                         overflow: 0,
+                        runtime_mode: RuntimeMode::default(),
+                        parked_modes: HashMap::new(),
                     });
                     // Slice K: the approval card's buttons are built by a
                     // static row fn with no `Context`, so give the transcript
@@ -20989,6 +21897,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         &composer.read(cx).field.clone(),
                         |shell: &mut Shell, _, cx| {
                             shell.sync_slash_palette(cx);
+                            shell.sync_mention_palette(cx);
                         },
                     )
                     .detach();
@@ -21006,22 +21915,62 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                         cx.notify();
                     })
                     .detach();
+                    // ── Slice W1: which window the keyboard is in ─────
+                    //
+                    // Two things ride this edge, and both are facts that
+                    // only exist once there can be two windows.
+                    //
+                    // `KEY_WINDOW` is read by the one tab-opening path
+                    // that cannot name its own window — see the static.
+                    //
+                    // The transcript's composer back-pointer is the other,
+                    // and it is the sharper of the two. `TranscriptState`
+                    // holds ONE composer handle (the approval card reads
+                    // the deny reason out of it) and one weak shell, and
+                    // every window has its own composer. Wiring them at
+                    // window-open would make the LAST window opened own
+                    // them forever, so a deny typed in the window you are
+                    // looking at would be read out of a composer in a
+                    // window behind it. They follow the keyboard instead.
+                    cx.observe_window_activation(window, |shell: &mut Shell, window, cx| {
+                        if !window.is_window_active() {
+                            return;
+                        }
+                        set_key_window(&shell.window_key);
+                        let composer = shell.composer.clone();
+                        let weak = cx.weak_entity();
+                        shell.transcript.update(cx, |t, _| {
+                            t.composer = Some(composer);
+                            t.shell = Some(weak);
+                        });
+                    })
+                    .detach();
                     cx.observe(&conn, |_, _, cx| cx.notify()).detach();
                     cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&transcript, |shell, _, cx| {
+                        shell.maybe_auto_approve(cx);
+                        cx.notify();
+                    })
+                    .detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                     cx.observe(&web_tabs, |_, _, cx| cx.notify()).detach();
                     cx.observe(&bookmarks, |_, _, cx| cx.notify()).detach();
                     cx.observe(&typeahead, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
+                        window_key: window_key.clone(),
                         demo: DemoOverlay::default(),
                         rename: None,
                         caret: Cell::new(None),
                         launcher: LauncherUi::default(),
                         files_wait_since: Cell::new(None),
                         slash: SlashPalette::default(),
+                        mention: MentionPalette::default(),
+                        access: Popup::default(),
+                        mention_files: HashMap::new(),
+                        mention_loading: false,
+                        branch_by_cwd: HashMap::new(),
                         omni: Omnibox::default(),
                         dialog_text: None,
                         dialog_secret: None,
@@ -21090,6 +22039,31 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                 });
                 let handle = shell.read(cx).focus.clone();
                 window.focus(&handle, cx);
+                // ── Slice W1: a window's tabs go with it ──────────────
+                //
+                // Closing the surface has to close the strip, or the tabs
+                // stay in the engine's fold with nothing drawing them —
+                // reachable by no chord, no click and no menu, and back
+                // on screen at the next restart when `adopt_windows`
+                // opens a window for them. Invisible-but-alive is the one
+                // state a tab must never be in.
+                //
+                // The primary window is exempt. It is the shell — rail,
+                // composer, sessions — and it is a surface with or
+                // without a page in it, so closing it is not a statement
+                // about tabs. That is also why ⌘W's fallback can close it
+                // safely on an empty strip.
+                // The traffic light. The OTHER close path — ⌘W's
+                // fallback and the Window menu — is
+                // `close_active_shell_window` below; both call the one
+                // implementation on `Shell`.
+                {
+                    let shell = shell.clone();
+                    window.on_window_should_close(cx, move |_, cx| {
+                        shell.update(cx, |s, cx| s.release_tabs_on_close(cx));
+                        true
+                    });
+                }
                 // Slice P1: `EAVE_OVERLAY_DEMO=open` opens the menu on the
                 // first frame, so the surface can be looked at rather than
                 // only asserted. A fixed anchor rather than the pointer's,
@@ -21140,10 +22114,6 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
             },
         )
         .expect("open window");
-    // The bar, last: a `setMainMenu_` issued before the window exists and
-    // before activation does not stick (see `app_menus::install`).
-    crate::app_menus::install(cx);
-    cx.activate(true);
     handle
 }
 
@@ -22067,5 +23037,26 @@ mod tests {
                  would queue (draft={drafting}): {warned:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_composer_ships_monocode_chrome_and_mention_stop_access() {
+        let src = include_str!("ui.rs");
+        for needle in [
+            "composer-project",
+            "composer-access",
+            "composer-stop",
+            "mention-palette",
+            "Command::Stop",
+            "RuntimeMode",
+        ] {
+            assert!(src.contains(needle), "{needle} is gone from the composer");
+        }
+        assert!(include_str!("mentions.rs").contains("fn mention_token_at"));
+        assert!(include_str!("access.rs").contains("fn auto_allows"));
+        assert!(
+            crate::composer::PLACEHOLDER_DOCKED.contains("@ for references"),
+            "docked placeholder must name @ mentions"
+        );
     }
 }

@@ -680,6 +680,10 @@ impl AgentSession for PiSession {
         Ok(true)
     }
 
+    async fn interrupt(&mut self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     /// Identical to Claude's, and deliberately so — this is spec 01 §Kill,
     /// which is about process groups and has nothing to do with the wire
     /// format.

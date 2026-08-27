@@ -38,6 +38,18 @@ mod launcher;
 /// cap, the mention form and the compose rule without a window.
 pub mod attach;
 
+/// `@file` mentions in the composer (MonoCode's picker). Public: token
+/// parse, ranking and the file walk are pure, so they are tested without
+/// a window.
+pub mod mentions;
+
+/// Composer access / runtime modes (MonoCode's AccessPicker). Public
+/// because auto-approve policy is the part worth asserting without gpui.
+pub mod access;
+
+/// Composer chrome helpers (placeholders, send/stop, context meter).
+mod composer;
+
 /// The overlay layer (Slice P1): the anchored popover surface, the
 /// `Popup` state machine and the menu-row primitive. Private for the same
 /// reason as `loaders` and `motion` — it renders, and it has no product

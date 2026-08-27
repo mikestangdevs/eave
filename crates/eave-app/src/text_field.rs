@@ -567,6 +567,10 @@ impl TextField {
         cx.notify();
     }
 
+    pub fn placeholder(&self) -> &str {
+        self.placeholder.as_ref()
+    }
+
     /// Where the caret is, as a byte offset into [`Self::content`].
     ///
     /// What a caller needs to read the text *behind* the caret: the `#` an

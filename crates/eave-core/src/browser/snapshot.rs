@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 
 use super::bookmarks::{Bookmark, BookmarkTree};
 use super::permissions::{Grant, Permissions};
-use super::tabs::{GroupId, LoadState, PendingNav, Slot, TabContent, TabGroup, TabId, TabsState};
+use super::tabs::{
+    GroupId, LoadState, PendingNav, Slot, TabContent, TabGroup, TabId, TabsState, WindowId,
+    PRIMARY_WINDOW,
+};
 
 /// One tab, as the strip sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +88,13 @@ pub struct TabInfo {
     /// A private tab. Skipped when false so an older client still parses.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub incognito: bool,
+    /// Which window's strip holds it (Slice W1).
+    ///
+    /// `None` means the primary window, so a client that has never heard
+    /// of windows reads every tab as its own — which is what it was
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowId>,
     pub created_ts_ms: u64,
 }
 
@@ -105,11 +115,38 @@ pub struct TabsSnapshot {
     pub group_tabs: Vec<(GroupId, Vec<TabId>)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<TabId>,
+    /// Every window's strip, in the order the windows were opened
+    /// (Slice W1).
+    ///
+    /// **The snapshot carries every window and a client picks out its
+    /// own.** One `watch_tabs` subscription serves a whole client, and an
+    /// app with two windows on screen is still one client — so filtering
+    /// at the engine would mean either a subscription per window or a
+    /// window id on a channel that has never had one. Filtering at the
+    /// surface costs a retain over a list the client is about to draw
+    /// anyway.
+    ///
+    /// `tabs` above is every window's tabs; `order` and `active` are the
+    /// FIRST window's, which is what a client that reads neither this
+    /// field nor [`TabInfo::window`] sees — the single strip it had
+    /// before windows existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<WindowStrip>,
     /// A log on disk is from a newer format and nothing will be written.
     /// A stated fact so a surface can say so instead of quietly losing
     /// every change the operator makes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+}
+
+/// One window's share of a [`TabsSnapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowStrip {
+    pub id: WindowId,
+    /// Top-level ordering for this window: groups and ungrouped tabs.
+    pub order: Vec<Slot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<TabId>,
 }
 
 /// One bookmark in display order, with the shape a tree view needs.
@@ -185,12 +222,16 @@ impl TabsState {
                 history_len: t.nav.entries.len(),
                 opener: t.opener.clone(),
                 incognito: t.incognito,
+                // Elided for the primary window so the wire shape of a
+                // one-window client is byte-for-byte what it was.
+                window: (t.window != PRIMARY_WINDOW).then(|| t.window.clone()),
                 created_ts_ms: t.created_ts_ms,
             })
             .collect();
         let groups: Vec<TabGroup> = self
-            .order
+            .windows
             .iter()
+            .flat_map(|w| w.order.iter())
             .filter_map(|s| match s {
                 Slot::Group { id } => self.groups.get(id).cloned(),
                 Slot::Tab { .. } => None,
@@ -205,12 +246,29 @@ impl TabsState {
                 )
             })
             .collect();
+        let windows: Vec<WindowStrip> = self
+            .windows
+            .iter()
+            .map(|w| WindowStrip {
+                id: w.id.clone(),
+                order: w.order.clone(),
+                active: w.active.clone(),
+            })
+            .collect();
+        // The first window's, for a client that reads neither `windows`
+        // nor `TabInfo::window` — see the field docs. `first`, not the
+        // primary by name: after the primary's last tab closes it is gone
+        // from the fold, and answering an old client with an empty strip
+        // while other windows hold tabs would be worse than answering it
+        // with whichever strip exists.
+        let first = self.windows.first();
         TabsSnapshot {
             tabs,
             groups,
-            order: self.order.clone(),
+            order: first.map(|w| w.order.clone()).unwrap_or_default(),
             group_tabs,
-            active: self.active.clone(),
+            active: first.and_then(|w| w.active.clone()),
+            windows,
             read_only,
         }
     }

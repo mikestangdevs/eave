@@ -14,10 +14,11 @@
 //! for without thinking and which nothing in eave answered.
 //!
 //! Structure ported from comet's `app_menus.rs` (MIT), which ports zed's.
-//! Narrower than either: eave has no appearance-mode picker and no
-//! document-style New Window. It does have two second windows opened from
-//! this bar: Settings (⌘,, Slice S1) and the Theme Editor (bezel's Create
-//! page, ⌘⇧,).
+//! Narrower than either: eave has no appearance-mode picker. It does have
+//! New Window (⌘N, Slice W1) — a second SHELL window with its own tab
+//! strip, not zed's document-style one — and two second windows of
+//! another kind opened from this bar: Settings (⌘,, Slice S1) and the
+//! Theme Editor (bezel's Create page, ⌘⇧,).
 
 use gpui::{actions, App, Menu, MenuItem, Window};
 
@@ -47,7 +48,18 @@ pub fn init(cx: &mut App) {
     // the bug waiting for the day it opens two.
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |w| w.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |w| w.zoom_window()));
-    cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |w| w.remove_window()));
+    // Slice W1: a shell window closed from HERE takes its tabs with it,
+    // exactly as one closed from its traffic light does. The two paths
+    // do not meet on their own — `remove_window` does not raise
+    // `windowShouldClose:` — so both call the one implementation on
+    // `Shell`. A non-shell key window (Settings, the theme popup) falls
+    // through to the plain close, which is all it needs.
+    cx.on_action(|_: &CloseWindow, cx| {
+        if crate::ui::close_active_shell_window(cx) {
+            return;
+        }
+        with_active_window(cx, |w| w.remove_window())
+    });
 }
 
 /// Hand the platform the bar. **Call this immediately before
@@ -116,6 +128,7 @@ fn menus() -> Vec<Menu> {
             name: "File".into(),
             disabled: false,
             items: vec![
+                MenuItem::action("New Window", crate::ui::NewWindow),
                 MenuItem::action("New Tab", crate::ui::NewTab),
                 MenuItem::action("New Incognito Tab", crate::ui::NewIncognitoTab),
             ],
@@ -193,6 +206,13 @@ mod tests {
             file_names.iter().any(|n| n == "New Incognito Tab"),
             "the File menu lost New Incognito Tab: {file_names:?}"
         );
+        // Slice W1. Present because ⌘N now opens a real second window
+        // with its own strip; the negative list below forbade this exact
+        // word until it did.
+        assert!(
+            file_names.iter().any(|n| n == "New Window"),
+            "the File menu lost New Window: {file_names:?}"
+        );
         // Present since S1 built the window; before that, this very test
         // forbade the word. The row and the surface must arrive together,
         // and this assertion plus the negative list below is that contract
@@ -205,13 +225,16 @@ mod tests {
         // Nothing in either menu may claim a surface eave does not have.
         // This is a NEGATIVE test on purpose: the failure it prevents is
         // someone porting another row out of comet's menu, which has three
-        // appearance modes and a document-style New Window. "settings" and
-        // "preferences" left this list when S1 built the real window.
+        // appearance modes. "settings" and "preferences" left this list
+        // when S1 built the real window; "new window" left it when W1
+        // built the real second window — the row and the surface arrive
+        // together in both directions, which is what the positive
+        // assertion below holds up from the other side.
         for menu in &m {
             for item in &menu.items {
                 if let MenuItem::Action { name, .. } = item {
                     let n = name.to_lowercase();
-                    for absent in ["appearance", "new window"] {
+                    for absent in ["appearance"] {
                         assert!(
                             !n.contains(absent),
                             "the menu offers {name:?}, and eave has no such surface"

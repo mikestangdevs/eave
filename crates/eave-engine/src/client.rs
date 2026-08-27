@@ -23,9 +23,9 @@ use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use eave_core::proc::ProcIdentity;
 use eave_core::session::AgentConfig;
 use eave_wire::{
-    socket_path, BusyReport, Cursor, HelloOk, KillOk, ListOk, OpenOk, Request, RequestEnvelope,
-    ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem, ENGINE_BUSY_EXIT,
-    PROTO_VERSION,
+    socket_path, BusyReport, Cursor, HelloOk, InterruptOk, KillOk, ListOk, OpenOk, Request,
+    RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem,
+    ENGINE_BUSY_EXIT, PROTO_VERSION,
 };
 
 const SPAWN_CONNECT_WINDOW: Duration = Duration::from_secs(10);
@@ -317,6 +317,13 @@ impl Client {
         .await
     }
 
+    pub async fn interrupt(&self, session_id: &str) -> Result<InterruptOk, ClientError> {
+        self.request::<InterruptOk>(Request::Interrupt {
+            session_id: session_id.into(),
+        })
+        .await
+    }
+
     /// Answer one open permission question (Slice K). `Ok(false)` = the
     /// question was no longer open — already answered, or withdrawn by the
     /// provider under the operator's click. A race, not an error.
@@ -565,9 +572,18 @@ impl Client {
     }
 
     /// Open a tab; returns the id the engine minted.
-    pub async fn tab_open(&self, url: Option<&str>, activate: bool) -> Result<String, ClientError> {
+    ///
+    /// `window` names the strip it lands in; `None` is the primary window
+    /// (Slice W1).
+    pub async fn tab_open(
+        &self,
+        window: Option<&str>,
+        url: Option<&str>,
+        activate: bool,
+    ) -> Result<String, ClientError> {
         Ok(self
             .request::<eave_wire::CreatedOk>(Request::TabOpen {
+                window: window.map(str::to_string),
                 url: url.map(str::to_string),
                 group: None,
                 index: None,
@@ -586,9 +602,11 @@ impl Client {
         &self,
         session_id: &str,
         group: Option<&str>,
+        window: Option<&str>,
     ) -> Result<String, ClientError> {
         Ok(self
             .request::<eave_wire::CreatedOk>(Request::TabOpen {
+                window: window.map(str::to_string),
                 url: None,
                 group: group.map(str::to_string),
                 index: None,

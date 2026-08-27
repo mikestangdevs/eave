@@ -1404,6 +1404,17 @@ impl Engine {
         })
     }
 
+    async fn interrupt(self: &Arc<Self>, id: &str) -> Result<eave_wire::InterruptOk, String> {
+        let handle = self.session(id)?;
+        let mut live = handle.live.lock().await;
+        let l = live.as_mut().ok_or("session is not live")?;
+        l.session
+            .interrupt()
+            .await
+            .map_err(|e| format!("interrupt failed: {e}"))?;
+        Ok(eave_wire::InterruptOk {})
+    }
+
     /// Slice I2: move a never-started session into its own worktree.
     /// Isolation is the operator's opt-in (decision 1) and is only legal
     /// while nothing has ever spawned — the provider CLI keys its resume
@@ -2127,6 +2138,10 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Ok(ok) => ok_value(&ok),
                 Err(message) => ResponseBody::Err { message },
             },
+            Request::Interrupt { session_id } => match engine.interrupt(&session_id).await {
+                Ok(ok) => ok_value(&ok),
+                Err(message) => ResponseBody::Err { message },
+            },
             Request::Subscribe { session_id, cursor } => match engine.session(&session_id) {
                 Ok(handle) => {
                     let w = Arc::clone(&w);
@@ -2243,6 +2258,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 ok_value(&engine.browser.history_query(&typed, limit))
             }
             Request::TabOpen {
+                window,
                 url,
                 group,
                 index,
@@ -2251,7 +2267,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 activate,
                 incognito,
             } => match engine.browser.tab_open(
-                url, group, index, content, opener, activate, incognito,
+                window, url, group, index, content, opener, activate, incognito,
             ) {
                 Ok(id) => ok_value(&CreatedOk { id }),
                 Err(message) => ResponseBody::Err { message },
@@ -2270,11 +2286,15 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
             }
             Request::TabStated { tab_id, fact } => changed(engine.browser.tab_stated(tab_id, fact)),
             Request::GroupCreate {
+                window,
                 title,
                 color,
                 workspace,
                 index,
-            } => match engine.browser.group_create(title, color, workspace, index) {
+            } => match engine
+                .browser
+                .group_create(window, title, color, workspace, index)
+            {
                 Ok(id) => ok_value(&CreatedOk { id }),
                 Err(message) => ResponseBody::Err { message },
             },

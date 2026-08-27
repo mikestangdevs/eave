@@ -928,6 +928,7 @@ fn describe(action: &str) -> Option<(&'static str, &'static str)> {
         "eave_settings::OpenSettings" => ("Application", "Settings"),
         "eave_theme::OpenThemeEditor" => ("Application", "Customize Theme"),
         "eave_import::OpenImportDialog" => ("Application", "Import from another browser"),
+        "eave::NewWindow" => ("Application", "New window"),
         "eave::NewTab" => ("Tabs", "New tab"),
         "eave::NewIncognitoTab" => ("Tabs", "New incognito tab"),
         "eave::CloseTab" => ("Tabs", "Close the tab — the window when none is open"),
@@ -1290,6 +1291,7 @@ mod tests {
         cx.update(|cx| {
             cx.bind_keys([
                 gpui::KeyBinding::new("cmd-t", crate::ui::NewTab, None),
+                gpui::KeyBinding::new("cmd-n", crate::ui::NewWindow, None),
                 gpui::KeyBinding::new("cmd-,", OpenSettings, None),
             ]);
             let groups = shortcut_groups(cx, "");
@@ -1304,6 +1306,17 @@ mod tests {
                 .rows
                 .iter()
                 .any(|r| r.label == "Settings" && r.chords == vec!["⌘,".to_string()]));
+            // Slice W1. ⌘N reads as words rather than as the decamelled
+            // "New window" the fallback would give it — which is the
+            // difference between a chord this pane KNOWS and one it
+            // merely failed to hide.
+            assert!(
+                app.rows
+                    .iter()
+                    .any(|r| r.label == "New window" && r.chords == vec!["⌘N".to_string()]),
+                "the shortcuts pane lost ⌘N: {:?}",
+                app.rows.iter().map(|r| &r.label).collect::<Vec<_>>()
+            );
 
             // Search narrows to matching rows and drops empty groups.
             let hits = shortcut_groups(cx, "new tab");

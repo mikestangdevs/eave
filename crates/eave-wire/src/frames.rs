@@ -44,10 +44,11 @@ pub use eave_core::browser::permissions::{
     normalize_origin, Decision as PermissionDecision, Grant, PermissionKind, Permissions, Verdict,
 };
 pub use eave_core::browser::snapshot::{
-    BookmarkNode, BookmarksSnapshot, PermissionsSnapshot, TabInfo, TabsSnapshot,
+    BookmarkNode, BookmarksSnapshot, PermissionsSnapshot, TabInfo, TabsSnapshot, WindowStrip,
 };
 pub use eave_core::browser::tabs::{
     GroupId, LoadState, NavEntry, NavStack, PendingNav, Setting, Slot, TabContent, TabGroup, TabId,
+    WindowId, PRIMARY_WINDOW,
 };
 
 pub const PROTO_VERSION: u32 = 1;
@@ -123,6 +124,11 @@ pub enum Request {
     },
     /// Kill the session's live process (verified kill ladder, spec 01).
     Kill {
+        session_id: String,
+    },
+    /// Stop the in-flight turn without killing the process (composer Stop).
+    /// Claude writes a `control_request` interrupt; other adapters no-op.
+    Interrupt {
         session_id: String,
     },
     /// Observe the session SET (spec 05 §Watch): items flow on this
@@ -310,6 +316,16 @@ pub enum Request {
 
     /// Open a tab. The engine mints the id and returns it.
     TabOpen {
+        /// Which window's strip it lands in (Slice W1). `None` is the
+        /// primary window, so a client that has never heard of windows
+        /// sends no key and gets the one strip it has always had.
+        ///
+        /// **The client names this, not the engine.** A window is the
+        /// client's surface — see [`eave_wire::WindowId`] — and ⌘N has
+        /// to be able to put a tab in a window that exists on screen
+        /// before any reply has come back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<WindowId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,6 +400,10 @@ pub enum Request {
     },
 
     GroupCreate {
+        /// Which window's strip the group sits in (Slice W1). `None` is
+        /// the primary window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<WindowId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1134,6 +1154,12 @@ pub struct KillOk {
     pub already_exited: bool,
 }
 
+/// Reply to [`Request::Interrupt`]. Empty on purpose: the interrupt is
+/// fire-and-forget on the CLI's stdin; there is no "it stopped" ack on
+/// the wire besides the turn settling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct InterruptOk {}
+
 /// Reply to [`Request::Unsubscribe`] (Slice I1). `stopped` is a fact, not
 /// a success bit: `false` means the id named no live stream on this
 /// connection (already ended, never existed, or a raced disconnect) —
@@ -1747,6 +1773,7 @@ mod tests {
                 limit: Some(8),
             },
             Request::TabOpen {
+                window: None,
                 url: Some("https://x/".into()),
                 group: Some("g1".into()),
                 index: Some(2),
@@ -1847,6 +1874,7 @@ mod tests {
     #[test]
     fn an_ordinary_browser_frame_carries_no_optional_keys() {
         let line = serde_json::to_string(&Request::TabOpen {
+            window: None,
             url: Some("https://x/".into()),
             group: None,
             index: None,
@@ -1936,6 +1964,7 @@ mod tests {
         assert_eq!(
             env.request,
             Request::TabOpen {
+                window: None,
                 url: Some("https://x/".into()),
                 group: None,
                 index: None,

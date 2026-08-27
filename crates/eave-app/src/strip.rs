@@ -33,7 +33,68 @@
 
 use std::collections::HashMap;
 
-use eave_wire::{LoadState, Slot, TabContent, TabInfo, TabsSnapshot};
+use eave_wire::{LoadState, Slot, TabContent, TabInfo, TabsSnapshot, PRIMARY_WINDOW};
+
+/// Narrow an engine-wide snapshot to one window's strip (Slice W1).
+///
+/// **This is the whole of what a second window costs the surfaces.** The
+/// engine broadcasts every window's tabs on one subscription, because an
+/// app with two windows open is still one client; each shell then reads
+/// the snapshot through here and gets back exactly the shape a
+/// single-window eave always had — its own tabs, its own `order`, its own
+/// `active`. Everything downstream of `Shell::strip_snapshot` was written
+/// against that shape and none of it had to learn what a window is.
+///
+/// A snapshot from an engine that predates windows carries no `windows`
+/// entry at all. That is not an empty strip: it is one window's worth of
+/// tabs with no name on it, so it answers for the primary window and for
+/// nothing else — which is what it was.
+pub fn strip_for_window(snapshot: &TabsSnapshot, window: &str) -> TabsSnapshot {
+    let strip = snapshot.windows.iter().find(|w| w.id == window);
+    let (order, active) = match strip {
+        Some(w) => (w.order.clone(), w.active.clone()),
+        // No entry, and this is the primary window: either the engine is
+        // older than windows, or the primary has no tabs and the flat
+        // fields answer for whichever window is first. `windows` empty
+        // distinguishes the two — a populated `windows` without ours
+        // means ours is genuinely empty.
+        None if window == PRIMARY_WINDOW && snapshot.windows.is_empty() => {
+            (snapshot.order.clone(), snapshot.active.clone())
+        }
+        None => (Vec::new(), None),
+    };
+    let mine = |t: &TabInfo| match &t.window {
+        Some(w) => w == window,
+        None => window == PRIMARY_WINDOW,
+    };
+    let groups: Vec<_> = snapshot
+        .groups
+        .iter()
+        .filter(|g| {
+            order
+                .iter()
+                .any(|s| matches!(s, Slot::Group { id } if id == &g.id))
+        })
+        .cloned()
+        .collect();
+    TabsSnapshot {
+        tabs: snapshot.tabs.iter().filter(|t| mine(t)).cloned().collect(),
+        group_tabs: snapshot
+            .group_tabs
+            .iter()
+            .filter(|(id, _)| groups.iter().any(|g| &g.id == id))
+            .cloned()
+            .collect(),
+        groups,
+        order,
+        active,
+        // Deliberately dropped: a narrowed snapshot is one window's strip,
+        // and leaving every window's list inside it would give a caller a
+        // second, wider answer to the question it just narrowed.
+        windows: Vec::new(),
+        read_only: snapshot.read_only,
+    }
+}
 
 /// What a session tab needs from the session rail in order to draw.
 ///
@@ -625,6 +686,7 @@ mod tests {
             history_len: 0,
             opener: None,
             incognito: false,
+            window: None,
             created_ts_ms: 0,
         }
     }
@@ -648,6 +710,7 @@ mod tests {
             groups: Vec::new(),
             group_tabs: Vec::new(),
             active: active.map(str::to_string),
+            windows: Vec::new(),
             read_only: false,
         }
     }
@@ -828,6 +891,7 @@ mod tests {
             ],
             group_tabs: vec![("grp".into(), vec!["g1".into(), "g2".into(), "g3".into()])],
             active: Some("g2".into()),
+            windows: Vec::new(),
             read_only: false,
         }
     }
@@ -1129,5 +1193,130 @@ mod tests {
                 ("sess-1".to_string(), true),
             ]
         );
+    }
+
+    // ── Slice W1: narrowing a whole-app snapshot to one window ────────
+
+    fn windowed(tab: &str, window: &str) -> TabInfo {
+        TabInfo {
+            window: Some(window.into()),
+            ..page(tab, None, None)
+        }
+    }
+
+    /// A shell sees its own strip and nothing else — the whole of what a
+    /// second window costs the surfaces downstream.
+    #[test]
+    fn a_window_reads_its_own_tabs_and_no_others() {
+        let snapshot = TabsSnapshot {
+            tabs: vec![page("a", None, None), windowed("b", "w-2")],
+            groups: Vec::new(),
+            group_tabs: Vec::new(),
+            order: vec![Slot::Tab { id: "a".into() }],
+            active: Some("a".into()),
+            windows: vec![
+                eave_wire::WindowStrip {
+                    id: eave_wire::PRIMARY_WINDOW.into(),
+                    order: vec![Slot::Tab { id: "a".into() }],
+                    active: Some("a".into()),
+                },
+                eave_wire::WindowStrip {
+                    id: "w-2".into(),
+                    order: vec![Slot::Tab { id: "b".into() }],
+                    active: Some("b".into()),
+                },
+            ],
+            read_only: false,
+        };
+
+        let primary = strip_for_window(&snapshot, eave_wire::PRIMARY_WINDOW);
+        assert_eq!(
+            primary
+                .tabs
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(primary.active.as_deref(), Some("a"));
+
+        let second = strip_for_window(&snapshot, "w-2");
+        assert_eq!(
+            second
+                .tabs
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+        assert_eq!(second.active.as_deref(), Some("b"));
+
+        // A narrowed strip carries no window list: one answer to "which
+        // tabs", not two of different widths.
+        assert!(primary.windows.is_empty() && second.windows.is_empty());
+    }
+
+    /// An engine that predates windows sends no `windows` list. That is
+    /// not an empty strip — it is one window's tabs with no name on them,
+    /// and it has to answer for the primary window or the app boots
+    /// showing nothing.
+    #[test]
+    fn a_snapshot_from_before_windows_is_the_primary_windows_strip() {
+        let snapshot = snap(vec![page("a", None, None)], Some("a"));
+        assert!(snapshot.windows.is_empty(), "the fixture named a window");
+
+        let primary = strip_for_window(&snapshot, eave_wire::PRIMARY_WINDOW);
+        assert_eq!(
+            primary
+                .tabs
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(primary.active.as_deref(), Some("a"));
+
+        // ...and only for the primary. A second window reading the same
+        // nameless snapshot must get nothing, or every window would draw
+        // the same tabs.
+        let second = strip_for_window(&snapshot, "w-2");
+        assert!(second.tabs.is_empty() && second.active.is_none());
+    }
+
+    /// A group is drawn by the window whose strip holds its slot, and its
+    /// tab list travels with it — narrowing must not leave a group in one
+    /// window quoting tab ids that another window owns.
+    #[test]
+    fn a_group_narrows_with_the_window_that_holds_it() {
+        let mut snapshot = grouped();
+        snapshot.windows = vec![
+            eave_wire::WindowStrip {
+                id: eave_wire::PRIMARY_WINDOW.into(),
+                order: vec![Slot::Tab { id: "loose".into() }],
+                active: Some("loose".into()),
+            },
+            eave_wire::WindowStrip {
+                id: "w-2".into(),
+                order: vec![Slot::Group { id: "grp".into() }],
+                active: Some("g2".into()),
+            },
+        ];
+        for t in &mut snapshot.tabs {
+            if t.id != "loose" {
+                t.window = Some("w-2".into());
+            }
+        }
+
+        let primary = strip_for_window(&snapshot, eave_wire::PRIMARY_WINDOW);
+        assert!(
+            primary.groups.is_empty(),
+            "the group leaked into the primary window"
+        );
+        assert!(primary.group_tabs.is_empty());
+
+        let second = strip_for_window(&snapshot, "w-2");
+        assert_eq!(second.groups.len(), 1);
+        assert_eq!(second.group_tabs.len(), 1);
+        assert_eq!(second.tabs.len(), 3);
     }
 }

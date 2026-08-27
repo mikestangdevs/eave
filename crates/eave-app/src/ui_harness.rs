@@ -5996,6 +5996,11 @@ fn strip_tabs(h: &Harness, vcx: &mut VisualTestContext, tabs: Vec<TabInfo>, acti
         groups: Vec::new(),
         group_tabs: Vec::new(),
         active: active.map(str::to_string),
+        // The harness drives ONE window, so a snapshot with no `windows`
+        // entry is exactly right: `strip_for_window` reads it as the
+        // primary window's strip, which is the shape every assertion in
+        // this file was written against (Slice W1).
+        windows: Vec::new(),
         read_only: false,
     });
     vcx.run_until_parked();
@@ -6021,6 +6026,7 @@ fn session_tab(session_id: &str) -> TabInfo {
         history_len: 0,
         opener: None,
         incognito: false,
+        window: None,
         created_ts_ms: 0,
     }
 }
@@ -10468,6 +10474,80 @@ fn the_gauge_names_the_quietest_rank_rather_than_a_number() {
     );
 }
 
+/// MonoCode's composer chrome is on the empty session: project, access,
+/// attach, model, send. The card is the same entity as the docked one.
+#[gpui::test]
+fn the_composer_carries_monocode_chrome(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    for part in [
+        "composer-card",
+        "composer-project",
+        "composer-access",
+        "composer-attach",
+        "composer-model",
+        "composer-hint",
+        "send",
+    ] {
+        assert!(shown(vcx, part), "{part} missing from the composer");
+    }
+    assert!(
+        !shown(vcx, "composer-stop"),
+        "stop is a busy-turn control; an idle session must not show it"
+    );
+}
+
+/// Stop is the composer's interrupt, and it does not kill the session.
+#[gpui::test]
+fn the_composer_stop_interrupts_a_running_turn(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut s = session("aaaa1111");
+    s.state = "running".into();
+    s.live = true;
+    s.last_seq = 1;
+    h.plumbing.push_rail(vec![s]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-stop"), "a running turn has no Stop");
+    click(vcx, "composer-stop");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(c, Command::Stop)),
+        "Stop must emit Command::Stop, not Kill: {cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|c| matches!(c, Command::Kill)),
+        "composer Stop must not kill the session: {cmds:?}"
+    );
+}
+
+/// Access picker lists MonoCode's four modes and choosing one is a click,
+/// not a spawn-flag rewrite.
+#[gpui::test]
+fn the_access_picker_offers_the_four_modes(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    click(vcx, "composer-access");
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(200));
+    assert!(shown(vcx, "overlay-menu") || shown(vcx, "menu-row-0"));
+    for sel in ["menu-row-0", "menu-row-1", "menu-row-2", "menu-row-3"] {
+        assert!(shown(vcx, sel), "{sel} is missing from the access picker");
+    }
+    click(vcx, "menu-row-3");
+    vcx.run_until_parked();
+    vcx.read_window(&h.window, |shell, cx| {
+        assert_eq!(
+            shell.read(cx).composer.read(cx).runtime_mode,
+            crate::access::RuntimeMode::FullAccess
+        );
+    })
+    .unwrap();
+}
+
 // ── Slice C5 — the tab strip and the omnibox ──────────────────────────────
 
 /// **One strip, two kinds of tab.** The shape B1 argued for, C1 could not
@@ -12290,7 +12370,7 @@ fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
     let cmds = h.drain();
     assert!(
         cmds.iter()
-            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
         "⌘T opened nothing: {cmds:?}"
     );
     assert!(
@@ -12307,7 +12387,7 @@ fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
     let cmds = h.drain();
     assert!(
         cmds.iter()
-            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
         "the strip's + is not ⌘T: {cmds:?}"
     );
 }
@@ -12327,13 +12407,13 @@ fn cmd_shift_n_opens_an_incognito_tab(cx: &mut TestAppContext) {
     let cmds = h.drain();
     assert!(
         cmds.iter()
-            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewIncognitoTab))),
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewIncognitoTab { .. }))),
         "⌘⇧N opened nothing private: {cmds:?}"
     );
     assert!(
         !cmds
             .iter()
-            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
         "⌘⇧N issued an ordinary NewTab: {cmds:?}"
     );
     assert!(
@@ -12376,7 +12456,7 @@ fn the_footer_panel_is_a_door_to_library_theme_and_new(cx: &mut TestAppContext) 
     let cmds = h.drain();
     assert!(
         cmds.iter()
-            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab))),
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
         "the + menu's New Tab is not ⌘T's act: {cmds:?}"
     );
     assert!(
@@ -12596,6 +12676,7 @@ fn strip_with_project(
         }],
         group_tabs: vec![("grp".into(), group_ids)],
         active: active.map(str::to_string),
+        windows: Vec::new(),
         read_only: false,
     });
     vcx.run_until_parked();
@@ -16451,4 +16532,236 @@ fn menu_row_count(vcx: &mut VisualTestContext) -> usize {
     ROWS.iter()
         .take_while(|s| vcx.debug_bounds(*s).is_some())
         .count()
+}
+
+// ---------------------------------------------------------------------------
+// Slice W1 — ⌘N, a second window
+
+/// **⌘N opens a second shell window, and the two strips do not see each
+/// other.**
+///
+/// Driven through the real chord rather than by calling
+/// `open_shell_window`, because the thing worth asserting is the one a
+/// wrong binding would break: that ⌘N reaches `NewWindow` at all. The two
+/// windows then read ONE engine snapshot carrying both strips and each
+/// draws only its own — which is the whole mechanism, and the only defect
+/// this slice can produce is a window drawing the other's tabs.
+///
+/// Every window read goes through `TestAppContext`, never through the
+/// `VisualTestContext`: the latter is *inside* window one's update, and a
+/// `WindowHandle::read` of the window you are already updating answers
+/// `Err`. That cost a debugging round and is worth the sentence.
+#[gpui::test]
+fn cmd_n_opens_a_second_window_that_draws_its_own_strip(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    fn shells(cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|w| w.downcast::<Shell>())
+                .filter_map(|handle| handle.read(cx).ok().map(|s| s.window_key.clone()))
+                .collect()
+        })
+    }
+    assert_eq!(
+        shells(cx),
+        vec![eave_wire::PRIMARY_WINDOW.to_string()],
+        "eave booted with something other than one primary window"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-n");
+    vcx.run_until_parked();
+
+    let open = shells(cx);
+    assert_eq!(open.len(), 2, "⌘N did not open a second window: {open:?}");
+    let second = open
+        .iter()
+        .find(|k| k.as_str() != eave_wire::PRIMARY_WINDOW)
+        .expect("the second window took the primary's id")
+        .clone();
+
+    // A window opened by a chord opens a tab in ITSELF. A `NewTab` naming
+    // the primary window here would be the bug that makes ⌘N look like a
+    // very slow ⌘T.
+    let opened: Vec<_> = h
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::NewTab { window }) => Some(window),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        opened,
+        vec![Some(second.clone())],
+        "⌘N asked for a tab in the wrong window"
+    );
+
+    // Now answer with one engine snapshot holding both strips, the way
+    // the engine really does, and check each window draws only its own.
+    h.plumbing.push_tabs(eave_wire::TabsSnapshot {
+        tabs: vec![
+            page_tab("pppp1111", Some("https://one.test/"), Some("One")),
+            eave_wire::TabInfo {
+                window: Some(second.clone()),
+                ..page_tab("pppp2222", Some("https://two.test/"), Some("Two"))
+            },
+        ],
+        groups: Vec::new(),
+        group_tabs: Vec::new(),
+        order: vec![eave_wire::Slot::Tab {
+            id: "pppp1111".into(),
+        }],
+        active: Some("pppp1111".into()),
+        windows: vec![
+            eave_wire::WindowStrip {
+                id: eave_wire::PRIMARY_WINDOW.into(),
+                order: vec![eave_wire::Slot::Tab {
+                    id: "pppp1111".into(),
+                }],
+                active: Some("pppp1111".into()),
+            },
+            eave_wire::WindowStrip {
+                id: second.clone(),
+                order: vec![eave_wire::Slot::Tab {
+                    id: "pppp2222".into(),
+                }],
+                active: Some("pppp2222".into()),
+            },
+        ],
+        read_only: false,
+    });
+    vcx.run_until_parked();
+
+    fn drawn(cx: &mut TestAppContext, key: &str) -> (Vec<String>, Option<String>) {
+        let key = key.to_string();
+        cx.update(move |cx| {
+            let handle = cx
+                .windows()
+                .into_iter()
+                .filter_map(|w| w.downcast::<Shell>())
+                .find(|h| h.read(cx).map(|s| s.window_key == key).unwrap_or(false))
+                .expect("no such shell window");
+            let shell = handle.read(cx).expect("shell");
+            let snap = shell.strip_snapshot(cx);
+            (
+                snap.tabs.iter().map(|t| t.id.clone()).collect(),
+                snap.active.clone(),
+            )
+        })
+    }
+    assert_eq!(
+        drawn(cx, eave_wire::PRIMARY_WINDOW),
+        (vec!["pppp1111".to_string()], Some("pppp1111".to_string())),
+        "the primary window drew the second window's tab"
+    );
+    assert_eq!(
+        drawn(cx, &second),
+        (vec!["pppp2222".to_string()], Some("pppp2222".to_string())),
+        "the second window drew the primary window's tab"
+    );
+}
+
+/// **Closing a window closes its tabs, and a snapshot in flight across
+/// that close does not bring the window back.**
+///
+/// The race is real and cheap to lose: the close sends a `TabClose` per
+/// tab and removes the surface, and any snapshot already queued still
+/// names the window. Adopting it would answer a gesture that asked for
+/// one fewer window by producing an empty extra one. Driven here by
+/// feeding exactly that stale snapshot after the close.
+#[gpui::test]
+fn closing_a_window_takes_its_tabs_and_a_stale_snapshot_does_not_revive_it(
+    cx: &mut TestAppContext,
+) {
+    let (mut h, vcx) = boot(cx);
+    fn shells(cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|w| w.downcast::<Shell>())
+                .filter_map(|handle| handle.read(cx).ok().map(|s| s.window_key.clone()))
+                .collect()
+        })
+    }
+    vcx.simulate_keystrokes("cmd-n");
+    vcx.run_until_parked();
+    let second = shells(cx)
+        .into_iter()
+        .find(|k| k != eave_wire::PRIMARY_WINDOW)
+        .expect("⌘N opened no second window");
+
+    let stale = eave_wire::TabsSnapshot {
+        tabs: vec![eave_wire::TabInfo {
+            window: Some(second.clone()),
+            ..page_tab("pppp2222", Some("https://two.test/"), Some("Two"))
+        }],
+        groups: Vec::new(),
+        group_tabs: Vec::new(),
+        order: Vec::new(),
+        active: None,
+        windows: vec![eave_wire::WindowStrip {
+            id: second.clone(),
+            order: vec![eave_wire::Slot::Tab {
+                id: "pppp2222".into(),
+            }],
+            active: Some("pppp2222".into()),
+        }],
+        read_only: false,
+    };
+    h.plumbing.push_tabs(stale.clone());
+    vcx.run_until_parked();
+
+    // Close it the way the traffic light does.
+    let _ = h.drain();
+    cx.update(|cx| {
+        let handle = cx
+            .windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<Shell>())
+            .find(|hd| {
+                hd.read(cx)
+                    .map(|s| s.window_key == second)
+                    .unwrap_or(false)
+            })
+            .expect("no second window");
+        // The `remove_window` path — ⌘W's no-tabs fallback and the
+        // Window menu's Close row — NOT the traffic light's. It is the
+        // one that does not raise `windowShouldClose:`, so it is the one
+        // that silently orphaned a strip until both paths were routed
+        // through `Shell::release_tabs_on_close`.
+        handle
+            .update(cx, |shell, window, cx| {
+                shell.release_tabs_on_close(cx);
+                window.remove_window();
+            })
+            .expect("close the second window");
+    });
+    cx.run_until_parked();
+
+    // Its tab was asked to close...
+    let closed: Vec<_> = h
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::Close(id)) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        closed,
+        vec!["pppp2222".to_string()],
+        "closing a window left its tabs alive in the engine"
+    );
+
+    // ...and the snapshot that was in flight when it closed must not
+    // bring it back.
+    h.plumbing.push_tabs(stale);
+    vcx.run_until_parked();
+    assert_eq!(
+        shells(cx),
+        vec![eave_wire::PRIMARY_WINDOW.to_string()],
+        "a stale snapshot reopened a window the operator had closed"
+    );
 }

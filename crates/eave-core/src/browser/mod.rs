@@ -342,6 +342,7 @@ mod tests {
     fn open_tab(store: &mut BrowserStore, id: &str, url: &str) {
         store
             .tab_event(TabEvent::Opened {
+                window: tabs::PRIMARY_WINDOW.to_string(),
                 id: id.into(),
                 group: None,
                 index: usize::MAX,
@@ -534,6 +535,7 @@ mod tests {
         let (mut store, _) = BrowserStore::open(&dir).unwrap();
         assert!(store
             .tab_event(TabEvent::Opened {
+                window: tabs::PRIMARY_WINDOW.to_string(),
                 id: "secret".into(),
                 group: None,
                 index: usize::MAX,

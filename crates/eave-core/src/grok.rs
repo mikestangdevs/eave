@@ -430,6 +430,10 @@ impl AgentSession for GrokSession {
         Ok(true)
     }
 
+    async fn interrupt(&mut self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     async fn kill(&mut self) -> Result<KillReport, SessionError> {
         self.child.kill().await
     }

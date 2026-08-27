@@ -72,6 +72,31 @@ pub const URL_MAX_CHARS: usize = 8192;
 pub type TabId = String;
 /// Opaque group identity.
 pub type GroupId = String;
+/// Opaque window identity — which strip a tab is in (Slice W1, ⌘N).
+///
+/// **Minted by the client, not by the engine**, which is the one place
+/// this differs from a tab id. A window is a surface the client owns: it
+/// exists the instant ⌘N opens one, before any request has been answered,
+/// and a client that had to wait for a minted id would either open a
+/// window it could not yet put a tab into or block the keystroke on a
+/// round trip. Collision is a non-issue for the same reason it is for a
+/// tab id — both are uuids.
+///
+/// A window has no event of its own and no record apart from its tabs.
+/// It exists in this fold exactly while it holds at least one tab, which
+/// is also what a browser window is: closing the last tab closes the
+/// window, and there is no such thing as a window with nothing in it.
+/// The one exception is the client's FIRST window, which is a surface
+/// with a rail and a composer in it whether or not any page is open —
+/// but that is a fact about the client's shell, not about this store.
+pub type WindowId = String;
+
+/// The window a tab lands in when nothing names one.
+///
+/// Every tab written before Slice W1 folds into this, which is what makes
+/// an existing `tabs.jsonl` open as one window rather than as one window
+/// per tab or as none at all.
+pub const PRIMARY_WINDOW: &str = "w-primary";
 
 /// What a tab is showing.
 ///
@@ -268,8 +293,17 @@ impl NavStack {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tab {
     pub id: TabId,
+    /// Which window's strip holds it (Slice W1).
+    ///
+    /// Held on the tab as well as implied by the ordering, because
+    /// [`TabsState::detach`] has to know which strip to take a tab out of
+    /// *before* it can look at that strip — and for a grouped tab the
+    /// ordering does not say: its slot is inside a group, not inside a
+    /// window. One field answers both cases with no search.
+    #[serde(default = "primary_window")]
+    pub window: WindowId,
     /// `None` = ungrouped. Ungrouped tabs and groups share one ordering
-    /// (see [`TabsState::order`]).
+    /// (see [`WindowTabs::order`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<GroupId>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -388,6 +422,14 @@ pub enum Slot {
 pub enum TabEvent {
     Opened {
         id: TabId,
+        /// Which window's strip it lands in (Slice W1).
+        ///
+        /// `#[serde(default)]` to [`PRIMARY_WINDOW`], which is the whole
+        /// of the migration: every `Opened` written before this field
+        /// existed folds into one window, so an existing `tabs.jsonl`
+        /// opens as the single window it was.
+        #[serde(default = "primary_window")]
+        window: WindowId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<GroupId>,
         /// Where in its container the tab lands. Past the end appends.
@@ -455,6 +497,11 @@ pub enum TabEvent {
     },
     GroupCreated {
         id: GroupId,
+        /// Which window's strip the group sits in (Slice W1). Defaults to
+        /// [`PRIMARY_WINDOW`] for the same migration reason
+        /// [`TabEvent::Opened`]'s does.
+        #[serde(default = "primary_window")]
+        window: WindowId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -542,19 +589,117 @@ pub fn normalize_url(raw: &str) -> Option<String> {
 pub struct TabsState {
     pub tabs: HashMap<TabId, Tab>,
     pub groups: HashMap<GroupId, TabGroup>,
+    /// Tab ordering inside each group. Flat across windows because a
+    /// group belongs to exactly one window, so its id is enough.
+    pub group_order: HashMap<GroupId, Vec<TabId>>,
+    /// One strip per window, in the order the windows were first opened
+    /// (Slice W1).
+    ///
+    /// **A `Vec`, not a map.** The order matters — it is the order a
+    /// client restores windows in after a restart — and a `HashMap` would
+    /// make that order the hash's, while a `BTreeMap` would make it the
+    /// uuids'. Neither is the order anybody opened them in. The count is
+    /// how many windows a person has on screen, so a linear lookup is
+    /// cheaper than the map that would avoid it.
+    ///
+    /// An entry appears when the first tab lands in a window and is
+    /// removed when the last one leaves, because that is exactly the life
+    /// of a browser window (see [`WindowId`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<WindowTabs>,
+}
+
+/// One window's strip.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowTabs {
+    pub id: WindowId,
     /// Top-level ordering: groups and ungrouped tabs, interleaved.
     pub order: Vec<Slot>,
-    /// Tab ordering inside each group.
-    pub group_order: HashMap<GroupId, Vec<TabId>>,
-    /// The window's active tab. `None` when there are no tabs — never a
-    /// dangling id, which the fold guarantees by clearing it on close.
+    /// This window's active tab. `None` when the window has no tabs —
+    /// never a dangling id, which the fold guarantees by clearing it on
+    /// close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<TabId>,
+}
+
+fn primary_window() -> WindowId {
+    PRIMARY_WINDOW.to_string()
 }
 
 impl TabsState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The window a tab is in, or `None` if there is no such tab.
+    pub fn window_of(&self, id: &TabId) -> Option<&WindowId> {
+        self.tabs.get(id).map(|t| &t.window)
+    }
+
+    /// The window a group is in — the one whose strip holds its slot.
+    ///
+    /// Derived rather than stored, unlike a tab's. A group's slot IS in a
+    /// window's ordering (only tabs can hide inside a group), so the
+    /// ordering already answers, and a second copy of the answer is a
+    /// second thing that can be wrong.
+    pub fn window_of_group(&self, id: &GroupId) -> Option<&WindowId> {
+        self.windows
+            .iter()
+            .find(|w| {
+                w.order
+                    .iter()
+                    .any(|s| matches!(s, Slot::Group { id: g } if g == id))
+            })
+            .map(|w| &w.id)
+    }
+
+    pub fn window(&self, id: &str) -> Option<&WindowTabs> {
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    /// One window's top-level ordering. Empty for a window that holds
+    /// nothing, which is the same as one that does not exist.
+    pub fn order_in(&self, window: &str) -> &[Slot] {
+        self.window(window)
+            .map(|w| w.order.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// One window's active tab.
+    pub fn active_in(&self, window: &str) -> Option<&str> {
+        self.window(window).and_then(|w| w.active.as_deref())
+    }
+
+    /// The window's strip, creating it if this is its first tab.
+    fn window_mut(&mut self, id: &str) -> &mut WindowTabs {
+        if let Some(ix) = self.windows.iter().position(|w| w.id == id) {
+            return &mut self.windows[ix];
+        }
+        self.windows.push(WindowTabs {
+            id: id.to_string(),
+            order: Vec::new(),
+            active: None,
+        });
+        self.windows.last_mut().expect("just pushed")
+    }
+
+    /// Forget a window that has nothing left in it.
+    ///
+    /// Called after every removal, because a window is its tabs (see
+    /// [`WindowId`]) and an entry that outlived them would be a strip a
+    /// client keeps a surface open for with nothing to draw in it.
+    fn prune_window(&mut self, id: &str) {
+        self.windows
+            .retain(|w| w.id != id || !w.order.is_empty() || w.active.is_some());
+    }
+
+    /// Clear a tab id wherever a window still points at it as active.
+    fn clear_active(&mut self, id: &TabId) {
+        for w in &mut self.windows {
+            if w.active.as_deref() == Some(id.as_str()) {
+                w.active = None;
+            }
+        }
     }
 
     /// Fold one event in. Returns whether anything changed, so a caller can
@@ -564,6 +709,7 @@ impl TabsState {
         match event {
             TabEvent::Opened {
                 id,
+                window,
                 group,
                 index,
                 content,
@@ -577,6 +723,7 @@ impl TabsState {
                 }
                 let mut tab = Tab {
                     id: id.clone(),
+                    window: window.clone(),
                     group: None,
                     pinned: false,
                     content: content.clone(),
@@ -604,7 +751,7 @@ impl TabsState {
                 // instead — the same rule `Moved` keeps, and for the same
                 // reason: a tab somebody opened must be reachable.
                 let group = group.as_ref().filter(|g| self.groups.contains_key(*g));
-                self.place(id, group.cloned(), *index);
+                self.place(id, window, group.cloned(), *index);
                 true
             }
             TabEvent::Navigated {
@@ -707,8 +854,14 @@ impl TabsState {
                 // A move into a group that does not exist would put the tab
                 // somewhere nothing draws. Refuse the group, keep the tab.
                 let group = group.as_ref().filter(|g| self.groups.contains_key(*g));
+                // A move that names no group keeps the tab in the window
+                // it is already in: `Moved` is a reorder within a strip,
+                // and there is no wire verb for "the same place in another
+                // window" — moving between windows is a close and an open,
+                // because the page has to be re-parented anyway.
+                let window = self.tabs[id].window.clone();
                 self.detach(id);
-                self.place(id, group.cloned(), *index);
+                self.place(id, &window, group.cloned(), *index);
                 true
             }
             TabEvent::Closed { id } => {
@@ -719,11 +872,11 @@ impl TabsState {
                 // in, so removing the tab first makes it look ungrouped
                 // and leaves a dead id in `group_order` — which the strip
                 // snapshot then puts on the wire.
+                let window = self.tabs[id].window.clone();
                 self.detach(id);
                 self.tabs.remove(id);
-                if self.active.as_deref() == Some(id.as_str()) {
-                    self.active = None;
-                }
+                self.clear_active(id);
+                self.prune_window(&window);
                 for g in self.groups.values_mut() {
                     if g.last_active.as_deref() == Some(id.as_str()) {
                         g.last_active = None;
@@ -736,8 +889,15 @@ impl TabsState {
                     return false;
                 };
                 let group = tab.group.clone();
-                let already = self.active.as_deref() == Some(id.as_str());
-                self.active = Some(id.clone());
+                // Activation names a tab, never a window: the window is
+                // the one the tab is already in. That is what keeps ⌘N
+                // from needing a second verb, and what makes activating a
+                // tab in a background window leave the foreground
+                // window's own active tab alone.
+                let window = tab.window.clone();
+                let w = self.window_mut(&window);
+                let already = w.active.as_deref() == Some(id.as_str());
+                w.active = Some(id.clone());
                 let mut changed = !already;
                 if let Some(g) = group.and_then(|g| self.groups.get_mut(&g)) {
                     if g.last_active.as_deref() != Some(id.as_str()) {
@@ -749,6 +909,7 @@ impl TabsState {
             }
             TabEvent::GroupCreated {
                 id,
+                window,
                 title,
                 color,
                 workspace,
@@ -771,8 +932,9 @@ impl TabsState {
                     },
                 );
                 self.group_order.insert(id.clone(), Vec::new());
-                let at = (*index).min(self.order.len());
-                self.order.insert(at, Slot::Group { id: id.clone() });
+                let w = self.window_mut(window);
+                let at = (*index).min(w.order.len());
+                w.order.insert(at, Slot::Group { id: id.clone() });
                 true
             }
             TabEvent::GroupUpdated {
@@ -804,56 +966,95 @@ impl TabsState {
                 if !self.groups.contains_key(id) {
                     return false;
                 }
-                let Some(at) = self
+                let Some(window) = self.window_of_group(id).cloned() else {
+                    return false;
+                };
+                let w = self.window_mut(&window);
+                let Some(at) = w
                     .order
                     .iter()
                     .position(|s| matches!(s, Slot::Group { id: g } if g == id))
                 else {
                     return false;
                 };
-                let slot = self.order.remove(at);
-                let to = (*index).min(self.order.len());
+                let slot = w.order.remove(at);
+                let to = (*index).min(w.order.len());
                 if to == at {
-                    self.order.insert(at, slot);
+                    w.order.insert(at, slot);
                     return false;
                 }
-                self.order.insert(to, slot);
+                w.order.insert(to, slot);
                 true
             }
             TabEvent::GroupClosed { id } => {
+                let window = self.window_of_group(id).cloned();
                 if self.groups.remove(id).is_none() {
                     return false;
                 }
                 for tab_id in self.group_order.remove(id).unwrap_or_default() {
                     self.tabs.remove(&tab_id);
-                    if self.active.as_deref() == Some(tab_id.as_str()) {
-                        self.active = None;
-                    }
+                    self.clear_active(&tab_id);
                 }
-                self.order
-                    .retain(|s| !matches!(s, Slot::Group { id: g } if g == id));
+                if let Some(window) = window {
+                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == window) {
+                        w.order
+                            .retain(|s| !matches!(s, Slot::Group { id: g } if g == id));
+                    }
+                    self.prune_window(&window);
+                }
                 true
             }
         }
     }
 
     /// Remove a tab from whatever ordering currently holds it.
+    ///
+    /// Deliberately does NOT prune an emptied window: every caller either
+    /// puts the tab straight back ([`TabEvent::Moved`]) or prunes for
+    /// itself once the tab is really gone. Pruning here would drop a
+    /// window between a move's two halves and re-add it at the end of
+    /// `windows`, silently reordering the operator's windows on a drag.
     fn detach(&mut self, id: &TabId) {
-        let old_group = self.tabs.get(id).and_then(|t| t.group.clone());
+        let Some(tab) = self.tabs.get(id) else {
+            return;
+        };
+        let old_group = tab.group.clone();
+        let window = tab.window.clone();
         match old_group {
             Some(g) => {
                 if let Some(list) = self.group_order.get_mut(&g) {
                     list.retain(|t| t != id);
                 }
             }
-            None => self
-                .order
-                .retain(|s| !matches!(s, Slot::Tab { id: t } if t == id)),
+            None => {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == window) {
+                    w.order
+                        .retain(|s| !matches!(s, Slot::Tab { id: t } if t == id));
+                }
+            }
         }
     }
 
     /// Put a tab into a container at an index, past-the-end meaning append.
-    fn place(&mut self, id: &TabId, group: Option<GroupId>, index: usize) {
+    ///
+    /// `window` is where it lands when it is ungrouped. A GROUPED tab gets
+    /// no say: it lands in its group's window, because a group sits in
+    /// exactly one strip and a tab drawn inside that group cannot be in a
+    /// different one. That is also what keeps a drag honest — dropping a
+    /// tab into a group that belongs to another window moves the tab to
+    /// that window, which is what the gesture looks like.
+    fn place(&mut self, id: &TabId, window: &WindowId, group: Option<GroupId>, index: usize) {
+        let window = match &group {
+            Some(g) => self
+                .window_of_group(g)
+                .cloned()
+                .unwrap_or_else(|| window.clone()),
+            None => window.clone(),
+        };
+        // Unconditionally, so the strip exists even for the grouped arm
+        // below — which does not touch `order` and so would otherwise
+        // leave a first-tab-in-a-new-window with no window entry at all.
+        self.window_mut(&window);
         match &group {
             Some(g) => {
                 let list = self.group_order.entry(g.clone()).or_default();
@@ -861,20 +1062,45 @@ impl TabsState {
                 list.insert(at, id.clone());
             }
             None => {
-                let at = index.min(self.order.len());
-                self.order.insert(at, Slot::Tab { id: id.clone() });
+                let w = self.window_mut(&window);
+                let at = index.min(w.order.len());
+                w.order.insert(at, Slot::Tab { id: id.clone() });
             }
         }
         if let Some(tab) = self.tabs.get_mut(id) {
             tab.group = group;
+            tab.window = window;
         }
     }
 
     /// Every tab in strip order: groups expanded in place, ungrouped tabs
     /// where they sit. The one ordering any surface should read.
+    ///
+    /// Across every window, windows in the order they were opened. A
+    /// surface that draws ONE strip wants [`Self::ordered_tabs_in`]; this
+    /// is for the snapshot, which carries every window's tabs in one list
+    /// and lets each client pick out its own.
     pub fn ordered_tabs(&self) -> Vec<&Tab> {
         let mut out = Vec::with_capacity(self.tabs.len());
-        for slot in &self.order {
+        for w in &self.windows {
+            self.extend_ordered(&w.order, &mut out);
+        }
+        out
+    }
+
+    /// One window's tabs in strip order. Empty for a window that does not
+    /// exist, which is the same answer as a window with nothing in it —
+    /// and correctly so, because those are the same thing here.
+    pub fn ordered_tabs_in<'a>(&'a self, window: &str) -> Vec<&'a Tab> {
+        let mut out = Vec::new();
+        if let Some(w) = self.window(window) {
+            self.extend_ordered(&w.order, &mut out);
+        }
+        out
+    }
+
+    fn extend_ordered<'a>(&'a self, order: &[Slot], out: &mut Vec<&'a Tab>) {
+        for slot in order {
             match slot {
                 Slot::Tab { id } => {
                     if let Some(t) = self.tabs.get(id) {
@@ -890,7 +1116,6 @@ impl TabsState {
                 }
             }
         }
-        out
     }
 
     /// Whether this event is about a private tab — one that must not be
@@ -938,7 +1163,12 @@ mod tests {
     use super::*;
 
     fn open(state: &mut TabsState, id: &str, url: Option<&str>) {
+        open_in(state, PRIMARY_WINDOW, id, url)
+    }
+
+    fn open_in(state: &mut TabsState, window: &str, id: &str, url: Option<&str>) {
         state.apply(&TabEvent::Opened {
+            window: window.to_string(),
             id: id.into(),
             group: None,
             index: usize::MAX,
@@ -1231,6 +1461,7 @@ mod tests {
     fn a_tab_moved_out_of_a_group_is_in_exactly_one_ordering() {
         let mut s = TabsState::new();
         s.apply(&TabEvent::GroupCreated {
+            window: PRIMARY_WINDOW.to_string(),
             id: "g".into(),
             title: None,
             color: None,
@@ -1246,7 +1477,7 @@ mod tests {
         });
         assert_eq!(s.group_order["g"], vec!["loose".to_string()]);
         assert!(
-            !s.order
+            !s.order_in(PRIMARY_WINDOW)
                 .iter()
                 .any(|x| matches!(x, Slot::Tab { id } if id == "loose")),
             "the tab is in the group AND at the top level"
@@ -1258,7 +1489,7 @@ mod tests {
             index: 0,
         });
         assert!(s.group_order["g"].is_empty());
-        assert!(matches!(&s.order[0], Slot::Tab { id } if id == "loose"));
+        assert!(matches!(&s.order_in(PRIMARY_WINDOW)[0], Slot::Tab { id } if id == "loose"));
         assert_eq!(s.tabs["loose"].group, None);
     }
 
@@ -1284,6 +1515,7 @@ mod tests {
     fn closing_a_group_removes_its_tabs_and_clears_the_active_id() {
         let mut s = TabsState::new();
         s.apply(&TabEvent::GroupCreated {
+            window: PRIMARY_WINDOW.to_string(),
             id: "g".into(),
             title: None,
             color: None,
@@ -1292,6 +1524,7 @@ mod tests {
             ts_ms: 0,
         });
         s.apply(&TabEvent::Opened {
+            window: PRIMARY_WINDOW.to_string(),
             id: "t".into(),
             group: Some("g".into()),
             index: usize::MAX,
@@ -1302,14 +1535,15 @@ mod tests {
             ts_ms: 0,
         });
         s.apply(&TabEvent::Activated { id: "t".into() });
-        assert_eq!(s.active.as_deref(), Some("t"));
+        assert_eq!(s.active_in(PRIMARY_WINDOW), Some("t"));
 
         s.apply(&TabEvent::GroupClosed { id: "g".into() });
         assert!(s.tabs.is_empty());
         assert!(s.groups.is_empty());
-        assert!(s.order.is_empty());
+        assert!(s.order_in(PRIMARY_WINDOW).is_empty());
         assert_eq!(
-            s.active, None,
+            s.active_in(PRIMARY_WINDOW),
+            None,
             "active pointed at a tab that no longer exists"
         );
         assert!(s.ordered_tabs().is_empty());
@@ -1327,6 +1561,7 @@ mod tests {
     fn closing_a_grouped_tab_leaves_nothing_behind_in_the_group() {
         let mut s = TabsState::new();
         s.apply(&TabEvent::GroupCreated {
+            window: PRIMARY_WINDOW.to_string(),
             id: "g".into(),
             title: None,
             color: None,
@@ -1336,6 +1571,7 @@ mod tests {
         });
         for id in ["a", "b"] {
             s.apply(&TabEvent::Opened {
+                window: PRIMARY_WINDOW.to_string(),
                 id: id.into(),
                 group: Some("g".into()),
                 index: usize::MAX,
@@ -1367,6 +1603,7 @@ mod tests {
     fn a_tab_opened_into_a_missing_group_is_still_reachable() {
         let mut s = TabsState::new();
         s.apply(&TabEvent::Opened {
+            window: PRIMARY_WINDOW.to_string(),
             id: "t".into(),
             group: Some("nope".into()),
             index: usize::MAX,
@@ -1391,6 +1628,7 @@ mod tests {
     fn activating_a_tab_also_remembers_it_for_its_group() {
         let mut s = TabsState::new();
         s.apply(&TabEvent::GroupCreated {
+            window: PRIMARY_WINDOW.to_string(),
             id: "g".into(),
             title: None,
             color: None,
@@ -1400,6 +1638,7 @@ mod tests {
         });
         for id in ["a", "b"] {
             s.apply(&TabEvent::Opened {
+                window: PRIMARY_WINDOW.to_string(),
                 id: id.into(),
                 group: Some("g".into()),
                 index: usize::MAX,
@@ -1411,7 +1650,7 @@ mod tests {
             });
         }
         s.apply(&TabEvent::Activated { id: "b".into() });
-        assert_eq!(s.active.as_deref(), Some("b"));
+        assert_eq!(s.active_in(PRIMARY_WINDOW), Some("b"));
         assert_eq!(s.groups["g"].last_active.as_deref(), Some("b"));
         // Leaving the group and coming back must not lose that memory.
         open(&mut s, "elsewhere", None);
@@ -1431,6 +1670,7 @@ mod tests {
     fn a_session_tab_names_its_session_and_nothing_more() {
         let mut s = TabsState::new();
         s.apply(&TabEvent::Opened {
+            window: PRIMARY_WINDOW.to_string(),
             id: "t".into(),
             group: None,
             index: usize::MAX,
@@ -1489,6 +1729,7 @@ mod tests {
     fn a_group_update_distinguishes_absent_from_clear() {
         let mut s = TabsState::new();
         s.apply(&TabEvent::GroupCreated {
+            window: PRIMARY_WINDOW.to_string(),
             id: "g".into(),
             title: Some("one".into()),
             color: Some("blue".into()),
@@ -1537,6 +1778,7 @@ mod tests {
         assert_eq!(
             e,
             TabEvent::Opened {
+                window: PRIMARY_WINDOW.to_string(),
                 id: "t".into(),
                 group: None,
                 index: 0,
@@ -1562,5 +1804,164 @@ mod tests {
         for key in ["pinned", "content", "load", "favicon_url", "opener", "incognito"] {
             assert!(!back.contains(key), "a plain tab wrote a {key} key: {back}");
         }
+    }
+
+    // ── Slice W1: the window dimension ────────────────────────────────
+
+    /// The whole of what a second window is: two strips, and neither can
+    /// see the other's tabs.
+    #[test]
+    fn a_second_window_holds_its_own_strip() {
+        let mut s = TabsState::new();
+        open(&mut s, "a", Some("https://a.test/"));
+        open_in(&mut s, "w-2", "b", Some("https://b.test/"));
+
+        let primary: Vec<&str> = s
+            .ordered_tabs_in(PRIMARY_WINDOW)
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        let second: Vec<&str> = s
+            .ordered_tabs_in("w-2")
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(primary, vec!["a"], "the primary window sees w-2's tab");
+        assert_eq!(second, vec!["b"], "w-2 does not see its own tab");
+        // Both, in window order, is what the snapshot carries.
+        let all: Vec<&str> = s.ordered_tabs().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(all, vec!["a", "b"]);
+    }
+
+    /// Activation names a TAB and lands in that tab's window, which is
+    /// what lets a background window keep its own active tab while you
+    /// work in the front one. Two `active`s, and neither moves the other.
+    #[test]
+    fn activating_a_tab_leaves_the_other_windows_active_tab_alone() {
+        let mut s = TabsState::new();
+        open(&mut s, "a", None);
+        open_in(&mut s, "w-2", "b", None);
+        s.apply(&TabEvent::Activated { id: "a".into() });
+        s.apply(&TabEvent::Activated { id: "b".into() });
+
+        assert_eq!(s.active_in(PRIMARY_WINDOW), Some("a"));
+        assert_eq!(s.active_in("w-2"), Some("b"));
+    }
+
+    /// A window IS its tabs (see [`WindowId`]): the last one out takes the
+    /// window with it, so nothing downstream has to distinguish "a window
+    /// with an empty strip" from "no such window".
+    #[test]
+    fn a_window_lives_exactly_as_long_as_its_tabs() {
+        let mut s = TabsState::new();
+        open_in(&mut s, "w-2", "b", None);
+        assert!(s.window("w-2").is_some());
+
+        s.apply(&TabEvent::Closed { id: "b".into() });
+        assert!(
+            s.window("w-2").is_none(),
+            "a window outlived the last tab in it: {:?}",
+            s.windows
+        );
+        assert!(s.ordered_tabs_in("w-2").is_empty());
+    }
+
+    /// **The migration, and the only thing that makes an existing
+    /// `tabs.jsonl` openable.** Every `Opened` written before Slice W1 has
+    /// no `window` key; each one must fold into the primary window, not
+    /// into a window of its own and not into none.
+    #[test]
+    fn a_log_written_before_windows_folds_into_the_primary_window() {
+        let raw = r#"{"kind":"opened","id":"t1","index":0,"ts_ms":1}"#;
+        let e: TabEvent = serde_json::from_str(raw).expect("an old opened event still parses");
+        let mut s = TabsState::new();
+        assert!(s.apply(&e));
+        s.apply(&TabEvent::Activated { id: "t1".into() });
+
+        assert_eq!(
+            s.window_of(&"t1".to_string()).map(String::as_str),
+            Some(PRIMARY_WINDOW)
+        );
+        assert_eq!(s.active_in(PRIMARY_WINDOW), Some("t1"));
+        assert_eq!(
+            s.windows.len(),
+            1,
+            "one old log became {} windows",
+            s.windows.len()
+        );
+    }
+
+    /// A group belongs to a window, and a tab drawn inside that group is
+    /// in that window whatever the event asked for — because a group sits
+    /// in exactly one strip and a tab cannot be drawn in two places.
+    #[test]
+    fn a_grouped_tab_follows_its_group_into_that_groups_window() {
+        let mut s = TabsState::new();
+        s.apply(&TabEvent::GroupCreated {
+            id: "g".into(),
+            window: "w-2".into(),
+            title: None,
+            color: None,
+            workspace: None,
+            index: 0,
+            ts_ms: 1,
+        });
+        s.apply(&TabEvent::Opened {
+            // Asks for the primary window; the group overrules it.
+            window: PRIMARY_WINDOW.to_string(),
+            id: "t".into(),
+            group: Some("g".into()),
+            index: 0,
+            content: TabContent::Page,
+            opener: None,
+            url: None,
+            incognito: false,
+            ts_ms: 2,
+        });
+
+        assert_eq!(
+            s.window_of_group(&"g".to_string()).map(String::as_str),
+            Some("w-2")
+        );
+        assert_eq!(
+            s.window_of(&"t".to_string()).map(String::as_str),
+            Some("w-2")
+        );
+        assert!(
+            s.ordered_tabs_in(PRIMARY_WINDOW).is_empty(),
+            "the primary window drew a tab that lives in w-2's group"
+        );
+    }
+
+    /// A snapshot narrows per window, and the flat `order`/`active` still
+    /// answer for a client that has never heard of windows — which is
+    /// what keeps an older client reading one strip instead of none.
+    #[test]
+    fn the_snapshot_carries_every_window_and_answers_an_older_client_too() {
+        let mut s = TabsState::new();
+        open(&mut s, "a", None);
+        open_in(&mut s, "w-2", "b", None);
+        s.apply(&TabEvent::Activated { id: "a".into() });
+        s.apply(&TabEvent::Activated { id: "b".into() });
+
+        let snap = s.snapshot(false);
+        assert_eq!(snap.tabs.len(), 2, "the snapshot dropped a window's tabs");
+        assert_eq!(snap.windows.len(), 2);
+        assert_eq!(
+            snap.active.as_deref(),
+            Some("a"),
+            "the flat active is not the first window's"
+        );
+        assert_eq!(
+            snap.order.len(),
+            1,
+            "the flat order carried more than one window"
+        );
+        // The primary window's tabs carry no window key at all, so the
+        // wire shape of a one-window eave is what it always was.
+        let a = snap.tabs.iter().find(|t| t.id == "a").unwrap();
+        let b = snap.tabs.iter().find(|t| t.id == "b").unwrap();
+        assert_eq!(a.window, None);
+        assert_eq!(b.window.as_deref(), Some("w-2"));
     }
 }

@@ -35,6 +35,7 @@ use eave_core::browser::permissions::{Decision, PermissionEvent, PermissionKind}
 use eave_core::browser::snapshot::{BookmarksSnapshot, PermissionsSnapshot, TabsSnapshot};
 use eave_core::browser::tabs::{
     normalize_url, GroupId, LoadState, NavStack, PendingNav, Setting, TabContent, TabEvent, TabId,
+    PRIMARY_WINDOW,
 };
 use eave_core::browser::{BrowserStore, OpenReport};
 use eave_core::journal::now_ms;
@@ -213,6 +214,7 @@ impl Browser {
     #[allow(clippy::too_many_arguments)]
     pub fn tab_open(
         &self,
+        window: Option<String>,
         url: Option<String>,
         group: Option<GroupId>,
         index: Option<usize>,
@@ -223,8 +225,28 @@ impl Browser {
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let ts_ms = now_ms();
+        // Slice W1 — where an unnamed tab lands, in the order the answer
+        // is least likely to be wrong:
+        //
+        // 1. The window the client named.
+        // 2. **The opener's window.** A page calling `window.open` or a
+        //    `target=_blank` click has one true answer — beside the page
+        //    that opened it — and it is a fact the request already
+        //    carries. Resolving it here rather than making the client
+        //    send a window id keeps the client from holding a second,
+        //    staler copy of something the fold already knows.
+        // 3. The primary window, which is what every tab meant before
+        //    windows existed.
+        let window = window
+            .or_else(|| {
+                opener
+                    .as_ref()
+                    .and_then(|o| self.store.lock().unwrap().tabs.window_of(o).cloned())
+            })
+            .unwrap_or_else(|| PRIMARY_WINDOW.to_string());
         self.tab(TabEvent::Opened {
             id: id.clone(),
+            window,
             group,
             index: index.unwrap_or(usize::MAX),
             content,
@@ -550,6 +572,7 @@ impl Browser {
 
     pub fn group_create(
         &self,
+        window: Option<String>,
         title: Option<String>,
         color: Option<String>,
         workspace: Option<String>,
@@ -558,6 +581,7 @@ impl Browser {
         let id = uuid::Uuid::new_v4().to_string();
         self.tab(TabEvent::GroupCreated {
             id: id.clone(),
+            window: window.unwrap_or_else(|| PRIMARY_WINDOW.to_string()),
             title,
             color,
             workspace,
