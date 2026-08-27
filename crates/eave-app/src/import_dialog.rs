@@ -4,13 +4,15 @@
 //! `overlay::panel_layer`, same as Customize Theme. Second windows eat
 //! synthetic clicks; this one has to be walkable.
 
+use std::sync::Arc;
+
 use eave_core::browser::import::{
     self, Browser, ImportedPayload, SourceStatus,
 };
 
 use gpui::{
-    div, prelude::*, px, rgb, App, ClickEvent, Context, Div, EventEmitter, IntoElement, Render,
-    SharedString, Window,
+    div, img, prelude::*, px, App, ClickEvent, Context, Div, EventEmitter, Image, ImageFormat,
+    IntoElement, ObjectFit, Render, SharedString, Window,
 };
 
 use crate::icons;
@@ -76,6 +78,7 @@ impl Render for ImportDialog {
             .id("import-dialog")
             .debug_selector(|| "import-dialog".into())
             .w(px(560.0))
+            .flex_none()
             .p(px(28.0))
             .flex()
             .flex_col()
@@ -137,17 +140,20 @@ impl ImportDialog {
                 .any(|(src, st)| *src == b && *st == SourceStatus::Ready)
         });
         div()
+            .w_full()
             .flex()
             .flex_col()
             .gap(px(24.0))
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .flex_row()
                     .gap(px(28.0))
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.))
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
@@ -160,16 +166,19 @@ impl ImportDialog {
                             )
                             .child(
                                 div()
+                                    .w_full()
+                                    .min_w(px(0.))
                                     .text_size(px(14.0))
                                     .text_color(theme::text_secondary())
                                     .child(
-                                        "Import everything you need from your old browser to hit the ground running with eave.",
+                                        "Import everything you need from your old browser to hit the ground running with Eave.",
                                     ),
                             ),
                     )
                     .child(
                         div()
-                            .w(px(228.0))
+                            .w(px(PILL_W))
+                            .flex_none()
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
@@ -410,6 +419,10 @@ impl ImportDialog {
     }
 }
 
+/// Shared width for every source pill so Chrome (the longest name) and
+/// Arc (the shortest) occupy the same slot, icons on one vertical edge.
+const PILL_W: f32 = 168.0;
+
 fn to_wire_node(n: import::ImportedNode) -> eave_wire::ImportedBookmark {
     eave_wire::ImportedBookmark {
         title: n.title,
@@ -425,17 +438,18 @@ fn source_pill(
     cx: &mut Context<ImportDialog>,
 ) -> impl IntoElement {
     let ready = status == SourceStatus::Ready;
-    let label = browser.label().to_ascii_uppercase();
-    let (tile, letter) = brand_tile(browser);
     div()
         .id(SharedString::from(format!("import-source-{}", browser.label())))
         .debug_selector(move || format!("import-source-{}", browser.label()))
+        .w(px(PILL_W))
         .h(px(44.0))
         .rounded(px(12.0))
         .overflow_hidden()
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
+        .pl(px(12.0))
         .bg(if selected {
             theme::overlay_strong()
         } else {
@@ -449,44 +463,45 @@ fn source_pill(
                 cx.notify();
             }))
         })
+        .child(radio(selected && ready))
         .child(
             div()
-                .pl(px(14.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.0))
+                .ml(px(8.0))
                 .flex_1()
-                .child(radio(selected && ready))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(label),
-                ),
+                .min_w(px(0.))
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(browser.label()),
         )
         .child(
             div()
-                .w(px(44.0))
-                .h_full()
-                .bg(tile)
+                .size(px(44.0))
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(18.0))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(gpui::white())
-                .child(letter),
+                .overflow_hidden()
+                .child(source_logo(browser, 44.0)),
         )
 }
 
-fn brand_tile(browser: Browser) -> (gpui::Rgba, &'static str) {
-    match browser {
-        Browser::Brave => (rgb(0xFB542B), "B"),
-        Browser::Chrome => (rgb(0x1A73E8), "C"),
-        Browser::Safari => (rgb(0x0B84FF), "S"),
-        Browser::Arc => (rgb(0xF0997B), "A"),
-    }
+/// The vendor's own macOS app icon. PNG, not an SVG reconstruction:
+/// `svg().path()` is an alpha mask and would grey them out, and a
+/// drawn-from-memory Chrome circle is not Chrome.
+fn source_logo(browser: Browser, size: f32) -> impl IntoElement {
+    let bytes: &'static [u8] = match browser {
+        Browser::Brave => include_bytes!("../assets/logos/brave.png"),
+        Browser::Chrome => include_bytes!("../assets/logos/chrome.png"),
+        Browser::Safari => include_bytes!("../assets/logos/safari.png"),
+        Browser::Arc => include_bytes!("../assets/logos/arc.png"),
+    };
+    img(Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        bytes.to_vec(),
+    )))
+    .size(px(size))
+    .flex_none()
+    .object_fit(ObjectFit::Contain)
 }
 
 fn radio(on: bool) -> Div {

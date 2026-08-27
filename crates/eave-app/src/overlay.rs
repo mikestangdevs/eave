@@ -786,10 +786,69 @@ pub fn panel_layer<T>(
                                 .shadow(theme::shadow_modal())
                                 .bg(theme::menu_glass())
                                 .occlude()
+                                // The catcher behind us is a full-window flex
+                                // row; without this the panel stretches to
+                                // the window height (align-items: stretch
+                                // on the cross axis).
+                                .flex_none()
                                 .flex()
                                 .flex_col()
                                 .child(content),
                         ),
+                ),
+        )
+        .into_any_element(),
+    )
+}
+
+/// [`panel_layer`]'s sibling for a card that sits in the middle of the
+/// window, sized to its content. Import is this, not a second window and
+/// not a strip that fills the well: the catcher is still full-window so
+/// a click off the card dismisses; the card itself is `flex_none`.
+pub fn centered_panel_layer<T>(
+    popup: &Popup<T>,
+    now: Instant,
+    reduced: bool,
+    content: AnyElement,
+    on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Option<AnyElement> {
+    let (opacity, dy) = popup.motion_at(now, reduced)?;
+    if popup.in_flight(now, reduced) {
+        motion::mark_active();
+    }
+    let live = popup.is_open();
+    Some(
+        deferred(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .occlude()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .when(live, |d| d.on_mouse_down(MouseButton::Left, on_dismiss))
+                .child(
+                    div()
+                        .id("overlay-panel")
+                        .debug_selector(|| "overlay-panel".into())
+                        .opacity(opacity)
+                        .relative()
+                        .top(px(dy))
+                        .rounded(px(theme::RADIUS_MENU))
+                        .border_1()
+                        .border_color(theme::edge_modal())
+                        .shadow(theme::shadow_modal())
+                        .bg(theme::menu_glass())
+                        .occlude()
+                        .w(px(560.0))
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .child(content),
                 ),
         )
         .into_any_element(),

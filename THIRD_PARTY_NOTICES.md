@@ -35,6 +35,14 @@ Each vendor's trademark policy governs its own mark. If a vendor objects to a
 particular use, the fix is to drop that mark, not to redraw it: a "close
 enough" imitation of someone's logo is a worse position than not using one.
 
+## Browser marks
+
+`assets/logos/{chrome,safari,brave,arc}.png` are the vendors' own macOS
+app icons, taken from the apps on this machine (`Google Chrome.app`,
+`Safari.app`, `Brave Browser.app`, `Arc.app`). Same nominative use as the
+provider marks: they name a source, they are not eave's, and they do not
+imply endorsement. If a vendor objects, drop that file — do not redraw it.
+
 ## Fonts
 
 None embedded. eave asks the platform for `theme::SANS` / `theme::MONO` by

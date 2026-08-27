@@ -16697,16 +16697,13 @@ impl Shell {
     }
 
     fn import_popup_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let _ = window;
         let _ = self.import_popup.data()?;
         let view = self.import_view.clone()?;
         let now = cx.background_executor().now();
         let reduced = cx.reduce_motion();
-        let size = window.viewport_size();
-        let anchor = point(size.width / 2.0, size.height * 0.18);
-        overlay::panel_layer(
+        overlay::centered_panel_layer(
             &self.import_popup,
-            anchor,
-            gpui::Anchor::TopCenter,
             now,
             reduced,
             view.into_any_element(),
