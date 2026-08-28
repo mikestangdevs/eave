@@ -13,8 +13,8 @@
 //! starts the download after the pump returns. Dark-on-transparent glyphs
 //! are inverted in [`store`] so they read on the rail's dark tiles. Each
 //! slot gets its own device-size PNG: the tab plate is 16 logical (32
-//! device on 2×), the bookmark mark is 24 (48 device). Sharing one 48×48
-//! bitmap made the plate bilinear-filter 48→32.
+//! device on 2×), and the bookmark mark is the same 16 (32 device).
+//! Sharing one 48×48 bitmap used to bilinear-filter the plate 48→32.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,8 +30,8 @@ use super::tabs::{with_any_browser, with_browser};
 /// cannot share a bitmap.
 ///
 /// `source_px` is the native side before slot resize. GitHub's tab PNG
-/// is 32 — 1:1 on the plate, 1.5× and pixelated on the 48 px tile. A
-/// later apple-touch (120) must be allowed to replace it.
+/// is 32 — 1:1 on the plate and the tile at 32 device. A later
+/// apple-touch (120) must be allowed to replace it.
 #[derive(Clone)]
 struct CachedIcon {
     tab: Arc<gpui::Image>,
@@ -113,9 +113,10 @@ fn host_source_px(host: &str) -> u32 {
     BY_HOST.with(|m| m.borrow().get(host).map(|c| c.source_px).unwrap_or(0))
 }
 
-/// A source at least this large Lanczos-down to the 48 px tile without
+/// A source at least this large Lanczos-down to the tile without
 /// inventing pixels. 32 (GitHub's tab PNG / ICO) is below it — that is
-/// the pixelated bookmark.
+/// the pixelated bookmark when the tile was 48 device; apple-touch
+/// still upgrades it.
 const TILE_SOURCE_MIN: u32 = 96;
 
 /// Forget a tab that has actually closed. An eviction keeps the pixels:
@@ -155,9 +156,9 @@ pub fn fetch(tab_id: &str, url: &str, page_url: &str) {
                 m.borrow_mut().entry(page_host.clone()).or_insert(icon);
             });
         }
-        // Tab PNG is often 32 (GitHub). That is 1:1 on the plate and
-        // pixelated on the tile — ask apple-touch so the tile can
-        // Lanczos down from 120+.
+        // Tab PNG is often 32 (GitHub). Fine 1:1 on today's 32-device
+        // tile; apple-touch still upgrades it, and Calendar's origin
+        // 404s so that host goes through known_icon_url instead.
         maybe_enqueue_upgrade(&page_host);
     }
     let skip = ASKED.with(|m| m.borrow().get(tab_id).map(|u| u == url).unwrap_or(false))
@@ -303,12 +304,24 @@ fn store(tab_id: &str, host: &str, icon: CachedIcon) {
 
 /// `{origin}/apple-touch-icon.png` is the size Arc uses for a pin.
 /// GitHub's is 120×120; `/favicon.ico` is 16+32 and looks like Lego on
-/// the 24 px tile. Skip when we already have ≥ [`TILE_SOURCE_MIN`].
+/// a small tile. Skip when we already have ≥ [`TILE_SOURCE_MIN`].
+/// Hosts whose origin 404s both guesses (Calendar) go through
+/// [`known_icon_url`] instead of burning two downloads on 404s.
 fn maybe_enqueue_upgrade(host: &str) {
     if host.is_empty() || host_source_px(host) >= TILE_SOURCE_MIN {
         return;
     }
-    let url = format!("https://{host}/apple-touch-icon.png");
+    if let Some(url) = known_icon_url(host) {
+        enqueue_host_url(host, url);
+        return;
+    }
+    enqueue_host_url(host, format!("https://{host}/apple-touch-icon.png"));
+}
+
+fn enqueue_host_url(host: &str, url: String) {
+    if host.is_empty() || host_source_px(host) >= TILE_SOURCE_MIN {
+        return;
+    }
     let gen = LOAD_GEN.with(|g| g.get());
     let asked = ASKED_HOST_URL.with(|m| {
         m.borrow()
@@ -321,12 +334,51 @@ fn maybe_enqueue_upgrade(host: &str) {
     enqueue(String::new(), url, host.to_string());
 }
 
+/// A mark Chromium will not find at `{origin}/favicon.ico`.
+///
+/// Measured 2026-08-28: `calendar.google.com/favicon.ico` and
+/// `…/apple-touch-icon.png` both 302 to `/calendar/…` and 404. The
+/// icon the Calendar page itself paints is the dated gstatic PNG
+/// (`calendar_{mday}_2x.png`, no leading zero — `calendar_01_2x.png`
+/// 404s). Fetch still goes through Chromium (`download_image`), never
+/// a second HTTP client.
+fn known_icon_url(host: &str) -> Option<String> {
+    known_icon_url_on(host, local_mday())
+}
+
+fn known_icon_url_on(host: &str, day: u32) -> Option<String> {
+    match host {
+        "calendar.google.com" => {
+            let day = day.clamp(1, 31);
+            Some(format!(
+                "https://ssl.gstatic.com/calendar/images/dynamiclogo_2020q4/calendar_{day}_2x.png"
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn local_mday() -> u32 {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        if t < 0 {
+            return 1;
+        }
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 1;
+        }
+        tm.tm_mday.clamp(1, 31) as u32
+    }
+}
+
 /// Ask for a BOOKMARK's icon — no tab, no browser of its own.
 ///
 /// Routed through whatever browser happens to be live, per spec 06-browser
-/// D13 (never a second HTTP client). Guesses apple-touch first (the
-/// tile is 48 device; a 32 px ICO is what made GitHub look pixelated),
-/// then `/favicon.ico` so a site with no touch icon still gets a mark.
+/// D13 (never a second HTTP client). Guesses apple-touch first (a 32 px
+/// ICO is what made GitHub look pixelated), then `/favicon.ico` so a
+/// site with no touch icon still gets a mark. Hosts in [`known_icon_url`]
+/// skip the origin guesses — those 404.
 ///
 /// Queues rather than starting on this stack — same reason as [`fetch`].
 pub fn fetch_for_url(url: &str) {
@@ -335,20 +387,10 @@ pub fn fetch_for_url(url: &str) {
         return;
     }
     maybe_enqueue_upgrade(&host);
-    if host_source_px(&host) > 0 {
+    if host_source_px(&host) > 0 || known_icon_url(&host).is_some() {
         return;
     }
-    let ico = format!("https://{host}/favicon.ico");
-    let gen = LOAD_GEN.with(|g| g.get());
-    let asked = ASKED_HOST_URL.with(|m| {
-        m.borrow()
-            .get(&(host.clone(), ico.clone()))
-            .is_some_and(|asked| *asked == gen)
-    });
-    if asked {
-        return;
-    }
-    enqueue(String::new(), ico, host);
+    enqueue_host_url(&host, format!("https://{host}/favicon.ico"));
 }
 
 fn png_from_cef(image: &mut Image) -> Option<Vec<u8>> {
@@ -467,7 +509,7 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
-    use super::fallback_url;
+    use super::{fallback_url, known_icon_url_on, local_mday};
 
     #[test]
     fn fallback_url_is_origin_favicon() {
@@ -481,5 +523,31 @@ mod tests {
         );
         assert_eq!(fallback_url("about:blank"), None);
         assert_eq!(fallback_url("https://user:pass@evil.test/"), None);
+    }
+
+    #[test]
+    fn calendar_uses_the_dated_gstatic_mark() {
+        assert_eq!(
+            known_icon_url_on("calendar.google.com", 27).as_deref(),
+            Some(
+                "https://ssl.gstatic.com/calendar/images/dynamiclogo_2020q4/calendar_27_2x.png"
+            )
+        );
+        // `calendar_01_2x.png` 404s; the CDN path has no leading zero.
+        assert_eq!(
+            known_icon_url_on("calendar.google.com", 1).as_deref(),
+            Some(
+                "https://ssl.gstatic.com/calendar/images/dynamiclogo_2020q4/calendar_1_2x.png"
+            )
+        );
+        assert!(
+            known_icon_url_on("github.com", 27).is_none(),
+            "a host that serves /favicon.ico must not take a special URL"
+        );
+        let day = local_mday();
+        assert!(
+            (1..=31).contains(&day),
+            "local day of month was {day}"
+        );
     }
 }

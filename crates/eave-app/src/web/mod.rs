@@ -617,7 +617,7 @@ pub fn favicon_image(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
 
 /// The favicon for any url, by host — for surfaces that have an address
 /// but no tab. The rail's pinned bookmark grid (Slice T1b) is the caller.
-/// Sized for the 24 logical bookmark mark (48 device on 2×).
+/// Sized for the 16 logical bookmark mark (32 device on 2×).
 pub fn favicon_for_url(url: &str) -> Option<std::sync::Arc<gpui::Image>> {
     #[cfg(test)]
     {

@@ -12375,8 +12375,8 @@ impl Shell {
                 let Some(bounds) = at else {
                     return d;
                 };
-                // A hair inside the corner. The radii (tile 8, card 8)
-                // curve a few px of daylight between the visible corners
+                // A hair inside the corner. The radii (tile 12, card 8)
+                // curve ~6 px of daylight between the visible corners
                 // when the boxes exactly touch, so the value is walked
                 // in, not derived: -6 read as touching, 0 as a gulf,
                 // and -4 is where the operator said "perfect".

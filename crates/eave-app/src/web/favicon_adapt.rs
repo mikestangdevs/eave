@@ -14,9 +14,10 @@
 //!
 //! gpui's `img` treats PNG pixels as 1× logical, and Metal bilinear-
 //! filters any size miss. A 16 logical tab plate is 32 device on a 2×
-//! Mac; a 24 logical bookmark mark is 48. One 48×48 bitmap is 1:1 on
-//! the tile and 1.5× down on the plate — that 1.5× is the blur. Each
-//! slot gets its own exact-size PNG.
+//! Mac; the bookmark mark is the same 16 logical / 32 device. Each
+//! slot still gets its own exact-size PNG so a later size split does
+//! not share a bitmap — one 48×48 on both slots is why the plate
+//! used to bilinear-filter 48→32.
 
 use image::{
     codecs::png::PngEncoder, imageops, ExtendedColorType, ImageEncoder, ImageFormat, RgbaImage,
@@ -25,9 +26,9 @@ use image::{
 /// Device pixels for [`crate::theme::RAIL_MARK`] (16 logical) on a 2×
 /// display. Must stay `RAIL_MARK * 2`.
 pub const TAB_DEVICE_PX: u32 = 32;
-/// Device pixels for [`crate::theme::BOOKMARK_TILE_MARK`] (24 logical)
+/// Device pixels for [`crate::theme::BOOKMARK_TILE_MARK`] (16 logical)
 /// on a 2× display. Must stay `BOOKMARK_TILE_MARK * 2`.
-pub const TILE_DEVICE_PX: u32 = 48;
+pub const TILE_DEVICE_PX: u32 = 32;
 
 /// Opaque enough to count as "the mark" rather than an anti-aliased
 /// fringe. 32/255 is ~12.5%.
@@ -122,9 +123,9 @@ fn resize_to(img: &RgbaImage, dest: u32) -> RgbaImage {
         return img.clone();
     }
     // Downscale: Lanczos3 keeps edges. Integer 2× upscale of a 16 px
-    // ICO (the tab plate) is nearest so each source pixel is a 2×2
-    // block and the 32 px texture is 1:1. Any other upscale (32→48
-    // on the tile) is cubic — 1.5× nearest is the jagged "blurry
+    // ICO (the tab plate and the tile, both 32 device) is nearest so
+    // each source pixel is a 2×2 block and the texture is 1:1. Any
+    // other upscale is cubic — 1.5× nearest is the jagged "blurry
     // pixels" the 48-everywhere pass produced.
     let filter = if side > dest {
         imageops::FilterType::Lanczos3
@@ -265,8 +266,8 @@ mod tests {
         assert_eq!(out, src, "a red mark was inverted as if it were a glyph");
     }
 
-    /// A 32×32 source (the usual 2× ICO frame) must not be stretched to
-    /// 48 for the tab plate — that 1.5× is what Metal then filters.
+    /// A 32×32 source (the usual 2× ICO frame) must land 1:1 on both
+    /// slots at 32 device — stretching it is what Metal then filters.
     #[test]
     fn each_slot_is_its_device_size() {
         let mut img = RgbaImage::new(32, 32);

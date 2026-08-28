@@ -2553,11 +2553,13 @@ pub const RAIL_MARK: f32 = 16.0;
 
 /// The site mark inside a tile.
 ///
-/// 24 logical × 2 = 48 device on a retina Mac. Favicon bytes are
-/// rasterized to **this** size for the tile and to [`RAIL_MARK`]×2 (32)
-/// for the tab plate — one 48×48 bitmap in both slots is why the plate
-/// looked muddy (Metal bilinear 48→32). See `web/favicon_adapt.rs`.
-pub const BOOKMARK_TILE_MARK: f32 = 24.0;
+/// Smaller than the square on purpose: the cell stays [`BOOKMARK_TILE`]
+/// and the mark sits in air. 16 logical × 2 = 32 device on a retina Mac,
+/// same raster as [`RAIL_MARK`]. Favicon bytes are still written to two
+/// slots (`web/favicon_adapt.rs`) so a later size split does not share a
+/// bitmap — the 48-device mark used to bilinear-filter onto the 32-device
+/// plate.
+pub const BOOKMARK_TILE_MARK: f32 = 16.0;
 
 /// A tile's corner. Roughly a quarter of the tile, matching the reference
 /// frame's squircle.
@@ -2640,7 +2642,7 @@ pub const BOOKMARK_TILE: f32 = 44.0;
 pub const BOOKMARK_EMPTY_TILE: f32 = BOOKMARK_TILE - SPACE_2;
 
 /// Horizontal step between overlapping empty tiles. [`SPACE_4`] so they
-/// overlap by half a tile (`40 − 16` = 24 of shared width).
+/// overlap by half a tile (`36 − 16` = 20 of shared width).
 pub const BOOKMARK_EMPTY_STEP_X: f32 = SPACE_4;
 
 /// Vertical step between overlapping empty tiles.
