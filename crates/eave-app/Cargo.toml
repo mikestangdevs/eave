@@ -1,0 +1,206 @@
+[package]
+name = "eave-app"
+version.workspace = true
+edition.workspace = true
+
+# One binary, two roles: `eave` (GPUI shell) / `eave --engine` (spec 01
+# §Topology, comet-style).
+[[bin]]
+name = "eave"
+path = "src/main.rs"
+
+# The CEF helper process. CEF's macOS layout requires a SEPARATE executable
+# for the renderer/GPU/plugin children — the main binary cannot be reused,
+# because those children must not be a gpui app. It is tiny (`execute_process`
+# and nothing else) and only built with the `web` feature.
+[[bin]]
+name = "eave-web-helper"
+path = "src/bin/web_helper.rs"
+required-features = ["web"]
+
+[features]
+default = []
+# Slice C1: Chromium/CEF off-screen rendering, so a page is a scene
+# primitive. OFF by default, and the reason is not timidity:
+#
+#   - `cargo build` alone stops producing a runnable artifact. CEF needs a
+#     323 MB framework inside an assembled `.app` and five helper bundles
+#     beside it, so the binary only runs from inside one.
+#   - the first build downloads ~343 MB.
+#
+# Neither belongs in the path of `cargo test`. The suite must be runnable
+# on a machine that has never fetched Chromium, so nothing under `web`
+# is reachable from a test — see `src/web/mod.rs`, which compiles to a set
+# of honest no-ops when the feature is off.
+web = [
+    "dep:cef",
+    "dep:core-video",
+    "dep:core-foundation",
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-io-surface",
+]
+
+[dependencies]
+eave-core = { path = "../eave-core" }
+eave-wire = { path = "../eave-wire" }
+eave-engine = { path = "../eave-engine" }
+
+# --- the `web` feature's graph ------------------------------------------
+cef = { version = "151", features = ["build-util"], optional = true }
+core-video = { version = "0.5.2", features = ["metal"], optional = true }
+core-foundation = { version = "0.10", optional = true }
+# Deliberately NOT cef's own `accelerated_osr`: that feature imports the
+# shared texture into **wgpu**, dragging wgpu + ash + windows into the graph
+# to reach one `newTextureWithDescriptor:iosurface:plane:` call. gpui renders
+# through raw metal-rs. We write that call ourselves; it is 20 lines.
+#
+# objc2 0.6 here, while gpui carries 0.5. Both majors coexist in the graph
+# without complaint — but objc2's typed `ClassBuilder` cannot bridge them
+# (`MethodImplementation` will not resolve across two majors), so anything
+# at a gpui/CEF type seam uses the raw C runtime instead. See `web/host.rs`.
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"], optional = true }
+objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef"], optional = true }
+
+# gpui — the wingleeio/zed fork (comet's), pinned to the FIXED rev comet
+# ships: upstream base f14fea9 (our previous no-fork pin) + a 17-commit
+# rebased stack, plus ONE commit of our own (Slice C1). Decision
+# 2026-08-17 reversing the no-fork rule (spec 03
+# §No-fork consequences, 04 ledger): window vibrancy blurs only what is
+# behind the WINDOW; in-app translucent depth needs the BackdropBlur
+# scene primitive, which upstream does not have. NEVER pin a branch —
+# `cargo update` silently moving the renderer is waku's failure mode.
+# Frozen pin, not chasing upstream; rebase-classify before any bump.
+#
+# ---------------------------------------------------------------------
+# THE REMOTE. Commit 18 is OURS, not comet's, and we have no push access
+# to wingleeio/zed (`gh api` reports `push: false`). Slice C1 therefore
+# parked it in a bare repo on one machine and said so; that was a real
+# defect — the manifest resolved nowhere else. Slice C3 closed it:
+#
+#     https://github.com/mikestangdevs/zed   branch `eave-line`
+#
+# Note it is a STANDALONE PUBLIC REPO, not a GitHub fork of zed
+# (`"fork": false`) — it was pushed from the local bare repo rather than
+# created through the fork button. That distinction costs nothing here
+# (cargo fetches a git url and a sha; it does not care about GitHub's
+# fork graph) but it does mean there is no upstream link in the web UI
+# and no automatic way to compare against zed. Do not delete this repo:
+# every build of eave fetches gpui from it, so removing it or making it
+# private breaks the build for everyone, everywhere, permanently.
+#
+# `eave-line` is the branch to push to; its tip and this rev must stay
+# equal, and `main` there is 5d1f83d (comet's stack tip, no commit 18).
+# ---------------------------------------------------------------------
+#
+# All 18 commits over f14fea9 (verified `git log f14fea9..8521fc1`):
+#   [permanent product primitives — survive any upstream bump]
+#   14baea0 EdgeFade — scoped per-primitive vertical fade for scroll edges
+#   a6c1ad5 BackdropBlur primitive, horizontal EdgeFade, macOS glass fixes
+#   9199c39 per-edge EdgeFade bands (band_top/band_bottom)
+#   81f3684 quadratic ease-in on EdgeFade ramps
+#   a0d3f09 delayed-knee quad fade — solid fills never outlive glyphs
+#   ef2f35c per-pixel EdgeFade for quads and images (metal + wgpu)
+#   5d1f83d horizontal per-pixel EdgeFade for quads/images (pin tip)
+#   a5b59b5 object-fit crops via atlas-tile UVs (also Porter-Duff, below)
+#   b687328 ImageSource::evict + App::peek_asset (frees atlas tiles)
+#   ac135eb MTLDevice.currentAllocatedSize in COMET_GPU_STATS
+#   [upstream-fixable — drop each if upstream lands its own fix]
+#   a5d7d36 don't wrap before closing punctuation (LineWrapper)
+#   a6bf17c same wrap rule applied to shaped text (line_layout copy)
+#   9b672fa bound renderer GPU memory (region-sized backdrop-blur scratch,
+#           idle release of intermediates, instance-pool shrink)
+#   f596cde destination alpha on transparent windows (Porter-Duff OVER)
+#   8a8954c macOS 26 blur — UnderWindowBackground material (macOS 26
+#           stopped vending CABackdropLayer for Selection)
+#   [stack bookkeeping]
+#   53518c0 merge: edge-fade line into comet-line
+#   236f664 merge: danperks transparent-window alpha-blend PR
+#   [ours — Slice C1, the page-as-scene-primitive commit]
+#   8521fc1 single-plane BGRA surfaces (PaintSurface beyond video).
+#           `PaintSurface` was livekit's: the fragment shader converts
+#           YCbCr and the renderer ASSERTED NV12, so a browser frame
+#           aborted the process. Adds a second fragment function and
+#           pipeline; the pixel format picks between them. Vertex stage,
+#           content mask and z-order untouched — which is the whole
+#           point, because it means BackdropBlur sees the page.
+#           (Was spike/gpui-bgra-surface.patch; the patch file retired.)
+#   7910388 clip PaintSurface to corner_radii (SDF). Local `eave-line`
+#           on `spike/zed-fork`; the 8521fc1 checkout carries it until
+#           the pin is bumped. Without it the page's square corners
+#           overpaint the card radius.
+# `runtime_shaders` avoids a build-time Metal toolchain dependency;
+# `font-kit` is the macOS text system.
+gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27" }
+gpui_platform = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
+
+# bezel — a SwiftUI-flavored component library for gpui
+# (github.com/crabtalk/bezel, MIT, © 2026 clearloop; portions extracted from
+# zeronsh/comet © Wing). Slice BZ adopts its presentation for the tool-call,
+# activity, composer, transcript and diff surfaces. Attribution also sits in
+# the module doc of `src/bezel_theme.rs`, which is where the code touches it.
+#
+# REV-PINNED, never a branch — the same rule the gpui pin above states, for
+# the same reason: `cargo update` must not be able to move what eave paints.
+# f86dbbf is `main` at adoption (2026-08-23), the tip of five commits.
+#
+# `default-features = false` drops the bundled Geist faces (~700 KB of TTF).
+# Type is a token, `theme.rs` owns the tokens, and Slice BZ stage 1 builds
+# bezel's Theme global FROM ours — so the families eave paints with are
+# eave's and the embedded fonts would be dead weight in the binary.
+#
+# The facade, not the leaf crates: bezel's members are named `ui`, `theme`
+# and `motion`, and eave already has a `theme` of its own that is the single
+# source of truth. Reached as `bezel::ui` / `bezel::theme`, there is no
+# ambiguity about which theme a line means. It builds against OUR gpui via
+# the `[patch]` in the workspace root — see that comment for why.
+bezel = { git = "https://github.com/crabtalk/bezel", rev = "f86dbbfc84569cc69f3cba6ebb3d99d858dcb259", default-features = false }
+# Slice CM. The one dependency `text_field.rs` carries out of bezel — already
+# in the tree three times over (gpui, cosmic-text and bezel itself all pull it),
+# so this resolves to the same 1.13.3 and adds nothing to the build.
+unicode-segmentation = "1.13"
+
+# Favicon adapt-for-dark: decode a PNG, decide if it is a dark glyph on
+# transparent, invert. Same crate gpui already compiles (png only).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+futures = "0.3"
+# Slice S1: `settings.json` is a typed struct (serde-defaulted so old files
+# parse forever), unlike `frame.json`'s untyped merged read-modify-write.
+# Same serde the other crates already compile.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+# Stage J UI harness: gpui's own test scaffolding (TestAppContext /
+# VisualTestContext, the deterministic seeded scheduler, synthetic
+# input, `debug_bounds`). Same git+rev as the runtime dependency, so
+# cargo unifies them — `cargo test` builds gpui once WITH the feature,
+# `cargo build` once without. `.debug_selector()` calls compile to a
+# no-op in production builds (gpui elements/div.rs cfg gate).
+[dev-dependencies]
+gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
+    "test-support",
+] }
+# Slice P3: the icon-parse test uses the SAME parser gpui uses at runtime,
+# pinned to the version the fork's workspace pins (see the fork's root
+# Cargo.toml). A substring check for `viewBox=` would pass on a file whose
+# path data is malformed; this will not. Same version => cargo unifies it
+# with gpui's copy, so it costs no extra compile.
+usvg = { version = "0.46.0", default-features = false }
+
+# CEF's macOS bundle layout: which executable becomes the five nested
+# helper `.app`s, and where the .icns/.strings live.
+#
+# KNOWN DEFECT, carried from the spike and not fixed here: the bundler gives
+# all five helpers the SAME CFBundleIdentifier as the main app. Helpers need
+# distinct ones, and this must be fixed before anything is signed or
+# notarized. See docs/reports/stage-c1-osr.md.
+[package.metadata.cef.bundle]
+helper_name = "eave-web-helper"
+resources_path = "resources"
