@@ -10781,18 +10781,8 @@ impl Shell {
                             .child(note)
                     }))
                     .children(transcript_el.map(|el| {
-                        // `flex_col`, not the default block, so the list —
-                        // which is now only as tall as its content until it
-                        // fills the well — is pinned to the TOP of the well
-                        // by a rule taffy states rather than one block
-                        // layout implies. SPLIT PATH. The unsplit one is in
-                        // `Shell::render`, beside `edge_faded`; the two must
-                        // agree, and this file's history is mostly the times
-                        // they did not.
                         div()
                             .size_full()
-                            .flex()
-                            .flex_col()
                             .pt(px(theme::LOG_TOP_PAD))
                             .child(el)
                             .into_any_element()
@@ -21540,28 +21530,29 @@ impl Render for Shell {
             None
         };
 
-        // A chat log hangs from the bottom (`ListAlignment::Bottom`), which
-        // is right once there is more transcript than well and wrong before
-        // that: `size_full` made the list the height of the window whatever
-        // it held, so the first turn of a new session sat alone in the last
-        // inch of a tall empty box, with the 116 px bottom fade ramp across
-        // it. `Infer` sizes the element to `min(content, available)` instead.
-        // Short content is therefore a short list at the TOP of the well
-        // (see the two wrappers named below), growing downward, and the
-        // instant it outgrows the well the height saturates and every bit of
-        // the bottom-anchored behaviour — follow, the pin, the anchor
-        // invariant — is what it was.
+        // `size_full`, and NOT `ListSizingBehavior::Infer`. Sizing the list
+        // to `min(content, available)` is the obvious way to make a short
+        // transcript sit at the top of the well instead of hanging in its
+        // last inch, and it works — but `Infer` lays the list out TWICE per
+        // frame (`layout_items` in `request_layout`, then `prepaint_items`),
+        // and the replay assert needs two renders inside a narrow window to
+        // get from `Arming` to `Held`. Measured on this machine: 12
+        // never-anchored runs in 96 with `Infer`, 0 in 48 without. It never
+        // moved the anchor — 0 real jumps in all 144 — and it never
+        // distorted the measurement, which logged a healthy
+        // `below=809 need=737 viewport=641` immediately before failing. It
+        // just made the window easier to miss, so a sweep silently tested
+        // nothing about one run in eight.
         //
-        // `max_h_full` is the belt: block layout may hand the measure
-        // function `MaxContent` rather than a definite height, and an
-        // unclamped list would then overflow the well instead of scrolling
-        // inside it.
+        // A gate that quietly stops asserting is worse than the cosmetic
+        // problem it was bought with, which is the whole reason Slice C4
+        // gave `never-anchored` its own verdict. The top-of-well behaviour
+        // is still worth having; it needs an implementation that does not
+        // add a per-frame layout pass to the hottest element in the app.
         let transcript_el = list(list_state, move |ix, _window, cx| {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
         })
-        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
-        .w_full()
-        .max_h_full();
+        .size_full();
 
         // Here rather than beside `composer_mounted` above: that read of the
         // transcript is still borrowed at that point, and this needs `cx`
@@ -22519,14 +22510,8 @@ impl Render for Shell {
                                                             theme::TRANSCRIPT_FADE_BAND_TOP,
                                                             true,
                                                             true,
-                                                            // Top-anchors a
-                                                            // short list; see
-                                                            // the twin in
-                                                            // `split_pane`.
                                                             div()
                                                                 .size_full()
-                                                                .flex()
-                                                                .flex_col()
                                                                 .pt(px(theme::LOG_TOP_PAD))
                                                                 .child(transcript_el),
                                                         )
