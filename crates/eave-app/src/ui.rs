@@ -2783,107 +2783,6 @@ fn coarse_age(ms: u64) -> Option<String> {
     Some(format!("{}y", days / 365))
 }
 
-/// What the row's CORNER says — one slot, one fact (Slice RS1, AG2 gap #1).
-///
-/// **THE PRIORITY ORDER, and it is load-bearing.** Every reference that
-/// puts two facts in a rail corner ranks them by urgency and shows one:
-/// comet's corner is a status word *or*, for idle only, a relative time;
-/// waku's is `Working 2m` *or* `5m ago`. eave's corner already held a fact
-/// — the attention badge — so this is that same rule with eave's own
-/// vocabulary occupying the top of it:
-///
-/// 1. `waiting on you (3)` — the operator is the blocker (Slice K).
-/// 2. `unresponsive` — the engine has stopped hearing from a live process.
-/// 3. `failed`.
-/// 4. `quiet` — settled past the attention monitor's own threshold.
-/// 5. `2m`, in the live tier — running, and for how long.
-/// 6. `5m`, in the quiet tier — how long since the state last moved.
-///
-/// 1–4 are [`state_badge`]'s existing set, unchanged, still in the state's
-/// own pigment; this function only decides which of the six gets the slot.
-/// **Slice RS2's group header must mirror this list exactly** — that is the
-/// binding rule that makes a collapsed group honest, and a header ranking
-/// its children differently from the rows inside it would be a second
-/// opinion rather than a summary.
-///
-/// # Why the words are gone, measured
-///
-/// The brief asked for `Working 2m` and `5m ago`, which is waku's copy.
-/// eave has no room for it and the numbers are not close. Line one gives
-/// the name and the corner **152 px** between them at `RAIL_W`; a name
-/// somebody actually types — `chase the rail flake`, 20 characters — shapes
-/// to **114.7 px**, and `a_realistically_named_session_shows_its_whole_name`
-/// exists because the operator photographed a rail reading `clau…`,
-/// `claude c…`, `chase the rai…` and ruled that the name comes first. That
-/// leaves the corner **29.3 px**, against `Working 2m` at 62.6, `just now`
-/// at 43.7 and `5m ago` at 39.1. There is no arrangement of those words
-/// that fits, and there is no room on line two either: it owes its folder
-/// an 80 px floor against a 70 px marks group and has 20 px spare.
-///
-/// So the row is **factored** instead. The dot says which state — and for
-/// `running` it says so in motion, because Slice N3's `work_dot` pulses —
-/// and the corner says how long the row has been in it. `2m` beside a
-/// pulsing live dot is "working for two minutes"; `2m` beside a settled
-/// grey one is "two minutes since it stopped". That is one fact in one
-/// slot rather than a sentence in a slot that cannot hold one, and the ink
-/// tier moves with it — the live tier for a running row, the quiet tier for
-/// a settled one — so the two readings differ on three channels before a
-/// single glyph is read. `the_corner_never_costs_the_name_its_slot` is what
-/// holds this, and it fails the day either fact outgrows the other.
-///
-/// **What the precedence costs, stated:** a `quiet` row shows the word and
-/// not its age, and `quiet` is the state whose age an operator most wants
-/// — "quiet for 2m" and "quiet for 3h" are different situations. Same 29 px:
-/// it is the word or the number. The word is the one that says whether
-/// anything is owed, so the word keeps the slot. Merging them (`quiet 3h`)
-/// is one line here and is deliberately not taken — it would edit a
-/// shipped, tested fact on this slice's own authority.
-#[derive(Debug, Clone, PartialEq)]
-enum Corner {
-    /// [`state_badge`]'s word, in the state's own pigment.
-    Badge(String),
-    /// Running, and for how long — the live tier.
-    Elapsed(String),
-    /// How long since the state last moved — the quiet tier.
-    Since(String),
-}
-
-/// The word for a span too short to have a unit. Shared by both time
-/// readings, because at this granularity "started moments ago" and
-/// "stopped moments ago" are the same statement and the dot beside them is
-/// what makes them different.
-const CORNER_NOW: &str = "now";
-
-/// Resolve [`Corner`] for a row. `now` is passed in rather than read here
-/// so one rail paint dates every row from the same instant — fifteen rows
-/// disagreeing by the microseconds between their own `now()` calls is how a
-/// list ends up showing two sessions that started together a minute apart.
-fn row_corner(info: &SessionInfo, now: u64) -> Corner {
-    if let Some(word) = state_badge(&info.state) {
-        // Slice K: the badge counts the open questions when there is more
-        // than one — "waiting on you (3)" is a different fact from
-        // "waiting on you".
-        return Corner::Badge(if info.state == "awaiting_approval" && info.pending_approvals > 1 {
-            format!("{word} ({})", info.pending_approvals)
-        } else {
-            word.to_string()
-        });
-    }
-    // The SAME key the rail sorts by, and that is the whole point of gap
-    // #1: once a row states its age, the recency order the rail has always
-    // had stops looking arbitrary. `last_activity_ms` is stamped only where
-    // `state`/`live` move (see its wire doc), which makes it exactly two
-    // facts depending on which side of the move you are on — for a running
-    // session it is when the work STARTED, for a settled one when it
-    // stopped. No new wire field: one field, read twice.
-    let span = coarse_age(now.saturating_sub(activity_key(info)))
-        .unwrap_or_else(|| CORNER_NOW.to_string());
-    if info.state == "running" {
-        return Corner::Elapsed(span);
-    }
-    Corner::Since(span)
-}
-
 /// Take the operator's deny reason out of the composer and clear it
 /// (Slice K). eave has exactly one text field, so the composer IS the
 /// reason field — the card says so in as many words. Clearing it is the
@@ -14068,23 +13967,25 @@ impl Shell {
         // It buys 26 px, which is what makes a 220 px rail state its facts
         // whole instead of at 237.
         let meta_indent = theme::RAIL_STRIP_W;
-        // Slice RS1: ONE instant for the whole paint — see [`row_corner`].
-        //
-        // It is read here, per render, and nothing wakes the window to
-        // refresh it. That is a deliberate trade against N4's idle floor:
-        // a rail that ticked once a minute to age fifteen labels would be
-        // the only thing in eave scheduling frames on an untouched window,
-        // and the floor exists to say that nothing does. Every watch frame,
-        // every hover, every click re-renders and re-dates the ages — which
-        // covers every moment somebody is actually reading them — but an
-        // untouched window left overnight shows the ages it had when it was
-        // last drawn. Stated here rather than discovered later.
-        let now = eave_core::journal::now_ms();
         let sess_count = sessions.len();
         let files_stat = match (self.files.read(cx).snapshot.clone(), selected.as_deref()) {
             (Some((sid, Some(snap))), Some(sel)) if sid == sel => files_diffstat(&snap),
             _ => None,
         };
+        // ONE instant for the whole paint: fifteen rows disagreeing by
+        // the microseconds between their own `now()` calls is how a list
+        // ends up showing two sessions that started together a minute
+        // apart.
+        //
+        // Slice RS1 note, since it is the question this line invites:
+        // nothing wakes the window to refresh it, deliberately. A rail
+        // that ticked once a minute to age fifteen labels would be the
+        // only thing in eave scheduling frames on an untouched window,
+        // and N4's idle floor exists to say that nothing is. Every watch
+        // frame, every hover and every click re-renders and re-dates the
+        // ages — which covers every moment somebody is reading them — but
+        // an untouched window left overnight shows the ages it had when it
+        // was last drawn.
         let now_ms = eave_core::journal::now_ms();
         let rows: Vec<AnyElement> = sessions
             .into_iter()
@@ -14094,12 +13995,25 @@ impl Shell {
                 let label = row_label(&info, &provider_label);
                 let kicker = provider_kicker(&info, &provider_label);
                 let repo_line = row_repo_line(&info, home.as_deref());
-                let age = session_age_ms(&info, now_ms).map(fmt_elapsed);
+                // Slice RS1: `coarse_age`, not `fmt_elapsed`. The row's
+                // corner had been rendering the transcript's turn clock —
+                // `2m 05s`, `1h 03m` — which is right where an operator
+                // WATCHES it tick and wrong where fifteen of them are
+                // glanced down: the second unit is noise and the seconds
+                // change under the eye. One unit, at most four characters.
+                let age = session_age_ms(&info, now_ms).and_then(coarse_age);
                 let stat = is_sel.then_some(files_stat).flatten();
                 let dot = state_color(&info.state);
-                // Slice RS1: the corner is one slot and one fact, and
-                // `row_corner` is where the six candidates are ranked.
-                let corner = row_corner(&info, now);
+                // Slice K: the badge counts the open questions when there
+                // is more than one — "waiting on you (3)" is a different
+                // fact from "waiting on you".
+                let badge = state_badge(&info.state).map(|word| {
+                    if info.state == "awaiting_approval" && info.pending_approvals > 1 {
+                        format!("{word} ({})", info.pending_approvals)
+                    } else {
+                        word.to_string()
+                    }
+                });
                 // Slice AO: the posture line states the DANGEROUS posture
                 // only. `asks before it writes · default` is the safe
                 // default, and a line on every row restating the default
@@ -14511,71 +14425,16 @@ impl Shell {
                                     .child(SharedString::from(label))
                                     .into_any_element(),
                             })
-                            // Slice RS1 — THE CORNER. One box, one string,
-                            // whichever of the six facts `row_corner`
-                            // ranked first.
-                            //
-                            // Every branch draws the SAME metrics —
-                            // `SMALL_SIZE` in `SMALL_LINE`, `WEIGHT_LABEL`
-                            // — and only the ink and the selector change.
-                            // That is not tidiness: line one's height is
-                            // the tallest thing on it, so a corner that
-                            // changed line box between states would change
-                            // the ROW's height when a session started
-                            // working, and a rail whose rows resize
-                            // underneath the pointer is the failure both
-                            // `a_session_row_is_two_lines` and the replay
-                            // anchor exist to catch.
-                            //
-                            // The badge keeps `badge-{sid}` because that is
-                            // the selector every existing assertion
-                            // measures; the time takes its own `age-{sid}`,
-                            // so a test can tell "this row has no badge"
-                            // from "this row is showing its age" — which
-                            // are now different states and used to be one.
-                            .child(match &corner {
-                                Corner::Badge(word) => div()
+                            .children(badge.map(|word| {
+                                div()
                                     .debug_selector(|| format!("badge-{}", info.session_id))
                                     .flex_none()
                                     .text_size(px(theme::SMALL_SIZE))
                                     .line_height(px(theme::SMALL_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
                                     .text_color(dot)
-                                    .child(SharedString::from(word.clone())),
-                                // Two tiers below the badge, not a third
-                                // pigment. `live()` beside the pulsing dot
-                                // was the obvious choice and is wrong: the
-                                // dot already carries "running" in colour
-                                // and motion, and a second saturated mark
-                                // on the same line makes an ordinary
-                                // working session shout as loud as one
-                                // that is blocked on you. The step from
-                                // secondary to tertiary is what separates
-                                // "still going" from "long finished".
-                                //
-                                // Neither is a new contrast question: this
-                                // row already carries both inks at these
-                                // ranks — `text_secondary` on the folder,
-                                // `text_tertiary` on the marks — over the
-                                // same washes, so the floors they clear are
-                                // the ones already measured for line two.
-                                Corner::Elapsed(word) => div()
-                                    .debug_selector(|| format!("age-{}", info.session_id))
-                                    .flex_none()
-                                    .text_size(px(theme::SMALL_SIZE))
-                                    .line_height(px(theme::SMALL_LINE))
-                                    .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(theme::text_secondary())
-                                    .child(SharedString::from(word.clone())),
-                                Corner::Since(word) => div()
-                                    .debug_selector(|| format!("age-{}", info.session_id))
-                                    .flex_none()
-                                    .text_size(px(theme::SMALL_SIZE))
-                                    .line_height(px(theme::SMALL_LINE))
-                                    .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(theme::text_tertiary())
-                                    .child(SharedString::from(word.clone())),
-                            }),
+                                    .child(SharedString::from(word))
+                            })),
                     )
                     // LINE THREE — branch / cwd, and the selected session's
                     // diffstat. Files no longer sit under this list; the
@@ -24342,75 +24201,6 @@ mod tests {
                 assert!(span.len() <= 4, "{span:?} is wider than the slot");
             }
         }
-    }
-
-    /// Slice RS1 — **the corner's priority order**, all six rungs, in one
-    /// test, because the order is the product and any two of these
-    /// swapping is a silent regression.
-    ///
-    /// Slice RS2's group rollup must mirror this exactly. When that lands,
-    /// this test is the thing it is mirrored against.
-    #[test]
-    fn the_corner_shows_the_most_urgent_fact_and_only_one() {
-        // Far enough from zero that the oldest span below still
-        // subtracts.
-        let now = 100_000_000;
-        let at = |state: &str, ago_ms: u64| {
-            let mut s = info("aaaa1111", 1, Some(now - ago_ms));
-            s.state = state.into();
-            s
-        };
-
-        // 1–4: a badge outranks any age, however old or fresh.
-        let mut asking = at("awaiting_approval", 3 * 3_600_000);
-        asking.pending_approvals = 3;
-        assert_eq!(
-            row_corner(&asking, now),
-            Corner::Badge("waiting on you (3)".into())
-        );
-        let mut one = at("awaiting_approval", 0);
-        one.pending_approvals = 1;
-        assert_eq!(
-            row_corner(&one, now),
-            Corner::Badge("waiting on you".into()),
-            "a single question is not counted — Slice K"
-        );
-        for state in ["unresponsive", "failed", "quiet"] {
-            assert_eq!(
-                row_corner(&at(state, 5 * 60_000), now),
-                Corner::Badge(state.to_string()),
-                "{state} lost its slot to a number"
-            );
-        }
-
-        // 5: running reads as elapsed — the live tier.
-        assert_eq!(
-            row_corner(&at("running", 2 * 60_000), now),
-            Corner::Elapsed("2m".into())
-        );
-        assert_eq!(
-            row_corner(&at("running", 1_000), now),
-            Corner::Elapsed("now".into()),
-            "a turn under a minute old still has to say something"
-        );
-
-        // 6: everything else reads as age — the quiet tier.
-        assert_eq!(
-            row_corner(&at("idle", 5 * 60_000), now),
-            Corner::Since("5m".into())
-        );
-        assert_eq!(
-            row_corner(&at("new", 0), now),
-            Corner::Since("now".into())
-        );
-
-        // The fallback the wire asks for: no `last_activity_ms` means the
-        // state has not moved since the engine loaded the session, so the
-        // age is measured from creation — never from a fabricated zero,
-        // which would date every never-started session to 1970.
-        let mut never = info("bbbb2222", now - 7 * 60_000, None);
-        never.state = "new".into();
-        assert_eq!(row_corner(&never, now), Corner::Since("7m".into()));
     }
 
     #[test]

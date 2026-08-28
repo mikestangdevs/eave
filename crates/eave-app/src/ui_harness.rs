@@ -8437,106 +8437,42 @@ fn a_realistically_named_session_shows_its_whole_name(cx: &mut TestAppContext) {
     );
 }
 
-/// **Slice RS1 — the corner is never allowed to cost the name its slot.**
+/// **Slice RS1 — the rail corner states an age, in ONE unit.**
 ///
-/// This is the measurement that decided the corner's copy, kept as the
-/// thing that fails if either side of it moves. The brief asked for
-/// `Working 2m` / `5m ago`; line one has 152 px for the name and the
-/// corner together, a name somebody types needs 114.7 of it, and what is
-/// left will not hold those words. See [`crate::ui::Corner`] for the whole
-/// argument.
+/// The age itself is not this slice's — the rail has rendered
+/// `session_age_ms` since the row was rebuilt, and RS1 arrived believing it
+/// did not, because RS1 was written against a tree that had been rolled
+/// back 15 commits. What RS1 changed is the FORMAT: the corner had been
+/// drawing `fmt_elapsed`, which is the transcript's turn clock (`2m 05s`,
+/// `1h 03m`) and is right where somebody watches it tick — not where
+/// fifteen of them are glanced down a 228 px rail.
 ///
-/// Asserted on the row carrying the WIDEST corner the resolver can produce
-/// — a four-character span — beside the same 20-character name
-/// `a_realistically_named_session_shows_its_whole_name` pins, and with the
-/// row's other freight on it too. Both facts are measured, in the same
-/// frame, from the rendered layout: the corner is not allowed to be
-/// squeezed to nothing either, because a truncated age is a wrong age.
+/// Both halves are asserted, because the seconds are the actual defect: a
+/// corner whose last character changes every second, on every row, is
+/// motion nobody asked for on a list people read at rest.
 #[gpui::test]
-fn the_corner_never_costs_the_name_its_slot(cx: &mut TestAppContext) {
+fn the_rail_corner_states_an_age_in_one_unit(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    let name = "chase the rail flake";
-    let mut named = session("aaaa1111");
-    named.title = Some(name.into());
-    named.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
-    // 364 days: the widest span `coarse_age` can render before it rolls to
-    // years, which is what makes this the worst case rather than a case.
-    // Written as an arithmetic literal rather than through the formatter,
-    // so a change to the ladder shows up here as a failure instead of
-    // sliding this test along with it.
-    named.last_activity_ms =
-        Some(eave_core::journal::now_ms().saturating_sub(364 * 24 * 60 * 60 * 1_000));
-    rail_with_selected(&h, vcx, vec![named], "aaaa1111");
-
-    let label = vcx.debug_bounds("label-aaaa1111").expect("the row's name");
-    let age = vcx.debug_bounds("age-aaaa1111").expect("the row's corner");
-    let ink = real_name_width(name);
-    assert!(
-        label.size.width >= ink,
-        "{name:?} shapes to {ink:?} and the corner left it {:?} — the age \
-         is not worth a name nobody can read",
-        label.size.width
+    let mut s = session("aaaa1111");
+    s.last_activity_ms = Some(
+        eave_core::journal::now_ms().saturating_sub(2 * 60 * 60 * 1_000 + 5 * 60 * 1_000),
     );
-    assert!(
-        age.size.width > px(0.),
-        "the corner rendered an empty box — a row with no age is the gap \
-         this slice exists to close"
-    );
-
-    // And the other side of the same budget, measured rather than
-    // rendered: EVERY span the resolver can reach has to fit what the name
-    // leaves. 29 px is a literal on purpose — it is `152 − 114.7 − 8`
-    // today, and reading it from those constants would let a future slice
-    // widen the corner and move this test along with it.
-    //
-    // The list is the ladder's own boundaries, which is why `coarse_age`
-    // rolls days into years: without that rollover `20700d` is on this
-    // list, at 40 px, and there is no rail width at which it passes.
-    for span in ["1m", "59m", "1h", "23h", "1d", "364d", "1y", "999y"] {
-        let ink = real_text_width_at(span, theme::SANS, theme::SMALL_SIZE, theme::WEIGHT_LABEL);
-        assert!(
-            ink <= px(29.),
-            "the corner {span:?} shapes to {ink:?}; past 29 px it starts \
-             taking characters off the session's name"
-        );
-    }
-}
-
-/// Slice RS1 — one slot, and the row says which fact is in it.
-///
-/// The badge and the age share the corner under one precedence, so the two
-/// selectors are mutually exclusive by construction. Asserting the absence
-/// is the half that matters: a row rendering both would be a row whose
-/// name has lost another 40 px to a fact it was already stating.
-#[gpui::test]
-fn the_corner_holds_one_fact_and_the_row_says_which(cx: &mut TestAppContext) {
-    let (h, vcx) = boot(cx);
-    let mut working = session("aaaa1111");
-    working.state = "running".into();
-    working.live = true;
-    let mut asking = session("bbbb2222");
-    asking.state = "awaiting_approval".into();
-    asking.pending_approvals = 2;
-    let idle = session("cccc3333");
-    h.plumbing.push_rail(vec![working, asking, idle]);
+    h.plumbing.push_rail(vec![s]);
     vcx.run_until_parked();
 
-    assert!(shown(vcx, "age-aaaa1111"), "a running row states its elapsed");
+    let age = vcx.debug_bounds("age-aaaa1111").expect("the row states no age");
+    // Two hours and five minutes. `fmt_elapsed` renders that as `2h 05m`;
+    // `coarse_age` renders `2h`. The widths are what a layout can see, so
+    // that is what this measures — at real metrics, against the two
+    // strings the two formatters actually produce.
+    let one_unit = real_text_width(&"2h", theme::SANS, theme::MICRO_SIZE);
+    let two_units = real_text_width(&"2h 05m", theme::SANS, theme::MICRO_SIZE);
     assert!(
-        !shown(vcx, "badge-aaaa1111"),
-        "running has never had a badge and must not grow one"
+        age.size.width < two_units,
+        "the corner is {:?} wide — `2h 05m` needs {two_units:?} and `2h` \
+         needs {one_unit:?}, so it is still drawing the turn clock",
+        age.size.width
     );
-    assert!(
-        shown(vcx, "badge-bbbb2222"),
-        "the operator is the blocker and the corner has to say so"
-    );
-    assert!(
-        !shown(vcx, "age-bbbb2222"),
-        "the age took the slot from `waiting on you` — the precedence is \
-         inverted"
-    );
-    assert!(shown(vcx, "age-cccc3333"), "a settled row states its age");
-    assert!(!shown(vcx, "badge-cccc3333"));
 }
 
 /// **Slice RS1 — a row that moves is painted where it was, and the list
