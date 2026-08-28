@@ -110,6 +110,30 @@ const FRAME_RATE: i32 = 60;
 /// as real.
 const PEEK_FRAME_RATE: i32 = 2;
 
+/// The base background a page paints onto, ARGB — **opaque white**.
+///
+/// `set_as_windowless` documents this in one line and it is easy to read
+/// past: *"Transparent painting is enabled by default but can be disabled
+/// by setting CefBrowserSettings.background_color to an opaque value."*
+/// Default is `0`, whose alpha byte is `0x00`, so every browser eave made
+/// was painting **transparent**, and the theme showed through the page.
+///
+/// The failure is invisible until the app is not grey. A page only paints
+/// the boxes it was told to paint: Gmail's header has `background: white`
+/// and drew white, its buttons drew blue, its text drew black — and the
+/// body, which declares no background at all, drew NOTHING and handed the
+/// well's colour to the viewer. Themed orange, that reads as a tinted
+/// page; on the greys the theme shipped with, it read as correct. **The
+/// theme did not cause this bug, it revealed it.**
+///
+/// White rather than a theme colour, because the page is not ours to
+/// colour — this is the base Chromium itself uses, and it is what the
+/// reference browsers show. It is not a floor over dark pages either:
+/// blink's `StyleEngine::UpdateColorSchemeBackground` recomputes the base
+/// for a document that declares `color-scheme: dark`, so a dark page stays
+/// dark. Alpha must be `0x00` or `0xFF`; CEF documents nothing between.
+const PAGE_BACKGROUND: u32 = 0xFFFF_FFFF;
+
 #[cfg(test)]
 mod favicon_pick {
     use super::pick_favicon_url;
@@ -1194,6 +1218,7 @@ fn create(tab_id: &str, url: Option<&str>, incognito: bool) {
         } else {
             FRAME_RATE
         },
+        background_color: PAGE_BACKGROUND,
         ..Default::default()
     };
 
