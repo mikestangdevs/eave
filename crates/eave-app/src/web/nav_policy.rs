@@ -51,12 +51,13 @@ pub enum Decision {
     Upgrade { to: String, fallback: String },
     /// A scheme eave will neither render nor hand to the OS.
     ///
-    /// This is the same posture `ui::open_url` already takes for markdown
-    /// links, for the same reason: `open(1)` launches whatever has
-    /// registered for a scheme, and the string arrives from a web page.
-    /// An allow-list is the security boundary; a deny-list would be a
-    /// guess about every app installed on the machine.
+    /// `javascript:` and `chrome-extension:` (other than the PDF viewer)
+    /// land here. They are not prompted: one is a script, the other is
+    /// Chromium-internal and not an app.
     Block,
+    /// An unknown scheme. Chrome asks; we now ask too. The syscall is
+    /// still refused until a person answers Ok — see `Ask::OpenScheme`.
+    AskExternal(String),
 }
 
 /// One navigation, and everything a decision needs to know about it.
@@ -82,12 +83,8 @@ pub struct Nav<'a> {
 ///
 /// **An allow-list on purpose, and a short one.** These are the schemes a
 /// person unambiguously means to leave the browser with, and every one of
-/// them lands in a first-party Apple app. Chrome's behaviour for an
-/// *unknown* scheme is to ask first; eave has nowhere to ask from inside
-/// `on_before_browse` yet, so it refuses instead — which is what already
-/// happens today, only now it is deliberate and traced. A confirm prompt
-/// (reusing `web::dialogs`) is what turns those refusals into Chrome's
-/// behaviour, and is the next step rather than this one.
+/// them lands in a first-party Apple app. Unknown schemes raise
+/// [`Decision::AskExternal`] instead of opening, which is Chrome's prompt.
 const EXTERNAL_SCHEMES: &[&str] = &[
     "mailto",
     "tel",
@@ -107,7 +104,58 @@ pub fn is_external_scheme(scheme: &str) -> bool {
 }
 
 /// Schemes that are pages, and stay in the tab.
-const WEB_SCHEMES: &[&str] = &["http", "https", "file", "about", "data", "blob", "chrome"];
+///
+/// `eave` is the internal PDF viewer (and anything else we host). It is
+/// not on the OS allow-list and it is not prompted.
+const WEB_SCHEMES: &[&str] = &[
+    "http", "https", "file", "about", "data", "blob", "chrome", "eave",
+];
+
+/// Chrome's PDF Viewer extension id. Alloy does not ship the extension;
+/// a navigation here is a blank tab unless we rewrite it to pdf.js.
+pub const CHROME_PDF_VIEWER_HOST: &str = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
+
+/// Internal viewer URL for a PDF the tab was trying to show.
+pub fn pdf_viewer_url(source: &str) -> String {
+    format!("eave://pdf/view?u={}", urlencoding_minimal(source))
+}
+
+fn urlencoding_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+pub fn looks_like_pdf_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.to_ascii_lowercase().ends_with(".pdf")
+}
+
+pub fn is_chrome_pdf_viewer(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("chrome-extension://")
+        .or_else(|| url.strip_prefix("CHROME-EXTENSION://"))
+    else {
+        return false;
+    };
+    rest.starts_with(CHROME_PDF_VIEWER_HOST)
+}
+
+/// Schemes a person can confirm opening. Not `javascript:`, not Chromium
+/// internals, not pages.
+pub fn is_promptable_scheme(scheme: &str) -> bool {
+    if EXTERNAL_SCHEMES.contains(&scheme) || WEB_SCHEMES.contains(&scheme) {
+        return false;
+    }
+    !matches!(scheme, "javascript" | "chrome-extension" | "about" | "blob")
+}
 
 /// Tracking parameters stripped on every host.
 ///
@@ -495,7 +543,21 @@ pub fn decide(nav: Nav<'_>) -> Decision {
     if EXTERNAL_SCHEMES.contains(&scheme.as_str()) {
         return Decision::External(nav.url.to_string());
     }
+    if scheme == "http" || scheme == "https" || scheme == "file" {
+        if looks_like_pdf_url(nav.url) {
+            return Decision::Rewrite(pdf_viewer_url(nav.url));
+        }
+    }
+    if is_chrome_pdf_viewer(nav.url) {
+        if let Some(from) = nav.from.filter(|u| looks_like_pdf_url(u) || u.starts_with("http")) {
+            return Decision::Rewrite(pdf_viewer_url(from));
+        }
+        return Decision::Block;
+    }
     if !WEB_SCHEMES.contains(&scheme.as_str()) {
+        if is_promptable_scheme(&scheme) {
+            return Decision::AskExternal(nav.url.to_string());
+        }
         return Decision::Block;
     }
 
@@ -826,9 +888,48 @@ mod tests {
     /// The refusal is the half that matters for safety: `open(1)` launches
     /// whatever registered for a scheme, and this string came from a page.
     #[test]
-    fn an_unknown_scheme_is_refused_rather_than_handed_to_the_os() {
-        assert_eq!(decide(nav("zoommtg://zoom.us/join")), Decision::Block);
-        assert_eq!(decide(nav("javascript:alert(1)")), Decision::Block);
+    fn an_unknown_scheme_is_asked_not_opened() {
+        assert_eq!(
+            decide(nav("zoommtg://zoom.us/join")),
+            Decision::AskExternal("zoommtg://zoom.us/join".into())
+        );
+        assert_eq!(
+            decide(nav("slack://open")),
+            Decision::AskExternal("slack://open".into())
+        );
+        assert_eq!(
+            decide(nav("javascript:alert(1)")),
+            Decision::Block,
+            "javascript: is a script, not an app"
+        );
+    }
+
+    #[test]
+    fn a_pdf_url_is_rewritten_to_the_internal_viewer() {
+        let d = decide(nav("https://x.test/report.pdf"));
+        match d {
+            Decision::Rewrite(u) => {
+                assert!(u.starts_with("eave://pdf/view?u="), "{u}");
+                assert!(u.contains("report.pdf") || u.contains("report%2Epdf") || u.contains("%2Epdf"), "{u}");
+            }
+            other => panic!("expected rewrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chrome_pdf_viewer_rewrites_to_the_page_we_came_from() {
+        let d = decide(Nav {
+            url: "chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html",
+            from: Some("https://x.test/a.pdf"),
+            method: "GET",
+            is_redirect: false,
+            is_main_frame: true,
+            allow_upgrade: true,
+        });
+        match d {
+            Decision::Rewrite(u) => assert!(u.starts_with("eave://pdf/view?"), "{u}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

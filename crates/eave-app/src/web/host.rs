@@ -633,6 +633,14 @@ wrap_app! {
             Some(EaveBrowserProcessHandler::new())
         }
 
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            let Some(registrar) = registrar else { return };
+            registrar.add_custom_scheme(
+                Some(&CefString::from("eave")),
+                super::pdf::scheme_options(),
+            );
+        }
+
         /// One switch, and the docked DevTools does not connect without it.
         ///
         /// Chromium refuses a websocket to the debugging port that arrives
@@ -839,6 +847,9 @@ pub fn initialize(data_dir: &std::path::Path) -> bool {
     ) == 1;
     if !ok {
         eprintln!("eave: CefInitialize failed — continuing without a page engine");
+    } else {
+        super::pdf::register();
+        super::tabs::restore_downloads(data_dir);
     }
     // **The app object must outlive `initialize`.** It is what vends the
     // browser-process handler, and that handler is the only thing CEF calls

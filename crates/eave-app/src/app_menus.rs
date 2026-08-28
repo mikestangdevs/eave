@@ -131,6 +131,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("New Window", crate::ui::NewWindow),
                 MenuItem::action("New Tab", crate::ui::NewTab),
                 MenuItem::action("New Incognito Tab", crate::ui::NewIncognitoTab),
+                MenuItem::separator(),
+                MenuItem::action("Save as PDF…", crate::ui::PrintPage),
             ],
         },
         Menu {
@@ -212,6 +214,10 @@ mod tests {
         assert!(
             file_names.iter().any(|n| n == "New Window"),
             "the File menu lost New Window: {file_names:?}"
+        );
+        assert!(
+            file_names.iter().any(|n| n == "Save as PDF…"),
+            "the File menu lost Save as PDF: {file_names:?}"
         );
         // Present since S1 built the window; before that, this very test
         // forbade the word. The row and the surface must arrive together,

@@ -41,7 +41,7 @@ use cef::{
     ImplBrowser, ImplBrowserHost, ImplDragData, KeyEvent, KeyEventType, MouseButtonType,
     MouseEvent, Range as CefRange,
 };
-use gpui::{Keystroke, Modifiers, Pixels, Point, ScrollDelta, ScrollWheelEvent};
+use gpui::{Keystroke, Modifiers, Pixels, Point, ScrollDelta, ScrollWheelEvent, TouchPhase};
 
 /// CEF's modifier bitfield from gpui's modifiers.
 pub fn flags(m: &Modifiers) -> u32 {
@@ -146,6 +146,52 @@ pub fn wheel_delta(ev: &ScrollWheelEvent) -> (i32, i32, bool) {
         ScrollDelta::Lines(l) => {
             let (dx, dy) = take_pixels(l.x * COCOA_TICK_PX, l.y * COCOA_TICK_PX);
             (dx, dy, false)
+        }
+    }
+}
+
+/// Two-finger swipe history. Chrome's overscroll-navigation, for OSR:
+/// we never hear whether the page can scroll, so we only fire at the
+/// **end** of a predominantly-horizontal trackpad gesture.
+const SWIPE_PX: f32 = 80.0;
+
+thread_local! {
+    static SWIPE: Cell<(f32, f32, bool)> = const { Cell::new((0.0, 0.0, false)) };
+}
+
+/// `Some(-1)` back, `Some(1)` forward, `None` not a navigation.
+pub fn swipe_nav(ev: &ScrollWheelEvent) -> Option<i32> {
+    let ScrollDelta::Pixels(p) = ev.delta else {
+        return None;
+    };
+    let dx = f32::from(p.x);
+    let dy = f32::from(p.y);
+    match ev.touch_phase {
+        TouchPhase::Started => {
+            SWIPE.with(|c| c.set((0.0, 0.0, true)));
+            None
+        }
+        TouchPhase::Moved => {
+            SWIPE.with(|c| {
+                let (ax, ay, _) = c.get();
+                c.set((ax + dx, ay + dy, true));
+            });
+            None
+        }
+        TouchPhase::Ended => {
+            let (ax, ay, on) = SWIPE.with(|c| c.replace((0.0, 0.0, false)));
+            if !on {
+                return None;
+            }
+            if ax.abs() < SWIPE_PX || ax.abs() < ay.abs() * 2.0 {
+                return None;
+            }
+            // macOS: finger right (positive dx) is back.
+            Some(if ax > 0.0 { -1 } else { 1 })
+        }
+        TouchPhase::Cancelled => {
+            SWIPE.with(|c| c.set((0.0, 0.0, false)));
+            None
         }
     }
 }

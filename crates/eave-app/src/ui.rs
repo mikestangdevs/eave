@@ -106,6 +106,8 @@ actions!(
         /// of record, and this one is a browser command about the entry
         /// already loaded. See `web::reload_hard`.
         HardReloadTab,
+        /// ⌘P — save the page as a PDF. Alloy has no print preview.
+        PrintPage,
         /// Slice E2 — ⌘1–⌘8 jump to strip index N; ⌘9 is the last tab.
         ActivateTab1,
         ActivateTab2,
@@ -1217,6 +1219,14 @@ async fn feed_loop(
                             // inside the CEF callback that decided it.
                             Some(crate::web::PageRequest::External { url }) => {
                                 open_external(&url);
+                            }
+                            Some(crate::web::PageRequest::Go { tab_id, delta }) => {
+                                let _ = client
+                                    .browser_do(eave_wire::Request::TabGo { tab_id, delta })
+                                    .await;
+                            }
+                            Some(crate::web::PageRequest::ConfirmedScheme { url }) => {
+                                open_confirmed_scheme(&url);
                             }
                             // G1: what a person answered about an origin.
                             // It has already been applied to the app's
@@ -3476,6 +3486,23 @@ fn open_external(raw: &str) {
     if !crate::web::nav_policy::is_external_scheme(&scheme) {
         return;
     }
+    spawn_open(raw);
+}
+
+/// After a person confirmed an unknown scheme. Still refuses `javascript:`.
+fn open_confirmed_scheme(raw: &str) {
+    let Some(scheme) = crate::web::nav_policy::scheme(raw) else {
+        return;
+    };
+    if !crate::web::nav_policy::is_promptable_scheme(&scheme)
+        && !crate::web::nav_policy::is_external_scheme(&scheme)
+    {
+        return;
+    }
+    spawn_open(raw);
+}
+
+fn spawn_open(raw: &str) {
     #[cfg(test)]
     {
         OPENED_URLS.with(|o| o.borrow_mut().push(raw.to_string()));
@@ -7939,6 +7966,12 @@ impl Shell {
                 "Back to safety",
                 "Proceed anyway",
             ),
+            crate::web::Ask::OpenScheme { scheme, url } => (
+                Some(format!("Open {scheme}?")),
+                format!("This page wants to open {url}"),
+                "Open",
+                "Cancel",
+            ),
         };
 
         let is_prompt = matches!(pending.ask, crate::web::Ask::Prompt { .. });
@@ -11278,6 +11311,21 @@ impl Shell {
             return;
         };
         self.reload_tab(&id, cx);
+    }
+
+    fn print_page(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let Some(id) = snapshot
+            .tabs
+            .iter()
+            .find(|t| snapshot.active.as_deref() == Some(t.id.as_str()))
+            .filter(|t| t.content == eave_wire::TabContent::Page)
+            .map(|t| t.id.clone())
+        else {
+            return;
+        };
+        crate::web::print_to_pdf(&id);
+        cx.notify();
     }
 
     fn reload_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
@@ -22228,6 +22276,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
             .on_action(cx.listener(|this, _: &ReloadTab, _, cx| this.reload(cx)))
             .on_action(cx.listener(|this, _: &HardReloadTab, _, cx| this.hard_reload(cx)))
+            .on_action(cx.listener(|this, _: &PrintPage, _, cx| this.print_page(cx)))
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_nth(0, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| this.activate_nth(1, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| this.activate_nth(2, cx)))
@@ -23262,6 +23311,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // last-wins, and `cmd-shift-r` is a strictly more specific chord —
         // it does not shadow the binding above and is not shadowed by it.
         KeyBinding::new("cmd-shift-r", HardReloadTab, None),
+        KeyBinding::new("cmd-p", PrintPage, None),
         KeyBinding::new("cmd-1", ActivateTab1, None),
         KeyBinding::new("cmd-2", ActivateTab2, None),
         KeyBinding::new("cmd-3", ActivateTab3, None),

@@ -144,6 +144,11 @@ pub fn answer(tab_id: &str, answer: Answer) {
                 remember(&pending.origin, kinds, allowed);
             }
         }
+        if let Ask::OpenScheme { url, .. } = &pending.ask {
+            if matches!(answer, Answer::Ok) {
+                super::tabs::request(super::PageRequest::ConfirmedScheme { url: url.clone() });
+            }
+        }
         if super::tabs::trace() {
             eprintln!("[web] answered {:?} with {answer:?} — eave's own ask", pending.ask);
         }
