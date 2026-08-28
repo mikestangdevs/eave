@@ -2750,6 +2750,140 @@ fn state_badge(state: &str) -> Option<&'static str> {
     }
 }
 
+/// A span as the single coarsest unit that is still true, in **at most
+/// four characters** (Slice RS1).
+///
+/// `None` under a minute; `now` is the caller's word for that case, not
+/// this one's. Minutes roll to hours at 60, hours to days at 24, and days
+/// to YEARS at 365 — the last of those is not tidiness, it is the width
+/// budget: a session whose timestamp is the epoch (every fixture in this
+/// repo carries `created_ts_ms: 1`) renders `20700d` at 40 px and blows a
+/// slot that has 29 px, while `56y` renders at 22 px and is the same fact.
+///
+/// One unit, never two. `1h 03m` is [`fmt_elapsed`]'s job and it is right
+/// there — the transcript's turn clock is a thing an operator watches tick.
+/// This one is glanced at down fifteen rows, where the second unit is noise
+/// and every pixel it takes comes out of a session's name.
+fn coarse_age(ms: u64) -> Option<String> {
+    let mins = ms / 60_000;
+    if mins == 0 {
+        return None;
+    }
+    if mins < 60 {
+        return Some(format!("{mins}m"));
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return Some(format!("{hours}h"));
+    }
+    let days = hours / 24;
+    if days < 365 {
+        return Some(format!("{days}d"));
+    }
+    Some(format!("{}y", days / 365))
+}
+
+/// What the row's CORNER says — one slot, one fact (Slice RS1, AG2 gap #1).
+///
+/// **THE PRIORITY ORDER, and it is load-bearing.** Every reference that
+/// puts two facts in a rail corner ranks them by urgency and shows one:
+/// comet's corner is a status word *or*, for idle only, a relative time;
+/// waku's is `Working 2m` *or* `5m ago`. eave's corner already held a fact
+/// — the attention badge — so this is that same rule with eave's own
+/// vocabulary occupying the top of it:
+///
+/// 1. `waiting on you (3)` — the operator is the blocker (Slice K).
+/// 2. `unresponsive` — the engine has stopped hearing from a live process.
+/// 3. `failed`.
+/// 4. `quiet` — settled past the attention monitor's own threshold.
+/// 5. `2m`, in the live tier — running, and for how long.
+/// 6. `5m`, in the quiet tier — how long since the state last moved.
+///
+/// 1–4 are [`state_badge`]'s existing set, unchanged, still in the state's
+/// own pigment; this function only decides which of the six gets the slot.
+/// **Slice RS2's group header must mirror this list exactly** — that is the
+/// binding rule that makes a collapsed group honest, and a header ranking
+/// its children differently from the rows inside it would be a second
+/// opinion rather than a summary.
+///
+/// # Why the words are gone, measured
+///
+/// The brief asked for `Working 2m` and `5m ago`, which is waku's copy.
+/// eave has no room for it and the numbers are not close. Line one gives
+/// the name and the corner **152 px** between them at `RAIL_W`; a name
+/// somebody actually types — `chase the rail flake`, 20 characters — shapes
+/// to **114.7 px**, and `a_realistically_named_session_shows_its_whole_name`
+/// exists because the operator photographed a rail reading `clau…`,
+/// `claude c…`, `chase the rai…` and ruled that the name comes first. That
+/// leaves the corner **29.3 px**, against `Working 2m` at 62.6, `just now`
+/// at 43.7 and `5m ago` at 39.1. There is no arrangement of those words
+/// that fits, and there is no room on line two either: it owes its folder
+/// an 80 px floor against a 70 px marks group and has 20 px spare.
+///
+/// So the row is **factored** instead. The dot says which state — and for
+/// `running` it says so in motion, because Slice N3's `work_dot` pulses —
+/// and the corner says how long the row has been in it. `2m` beside a
+/// pulsing live dot is "working for two minutes"; `2m` beside a settled
+/// grey one is "two minutes since it stopped". That is one fact in one
+/// slot rather than a sentence in a slot that cannot hold one, and the ink
+/// tier moves with it — the live tier for a running row, the quiet tier for
+/// a settled one — so the two readings differ on three channels before a
+/// single glyph is read. `the_corner_never_costs_the_name_its_slot` is what
+/// holds this, and it fails the day either fact outgrows the other.
+///
+/// **What the precedence costs, stated:** a `quiet` row shows the word and
+/// not its age, and `quiet` is the state whose age an operator most wants
+/// — "quiet for 2m" and "quiet for 3h" are different situations. Same 29 px:
+/// it is the word or the number. The word is the one that says whether
+/// anything is owed, so the word keeps the slot. Merging them (`quiet 3h`)
+/// is one line here and is deliberately not taken — it would edit a
+/// shipped, tested fact on this slice's own authority.
+#[derive(Debug, Clone, PartialEq)]
+enum Corner {
+    /// [`state_badge`]'s word, in the state's own pigment.
+    Badge(String),
+    /// Running, and for how long — the live tier.
+    Elapsed(String),
+    /// How long since the state last moved — the quiet tier.
+    Since(String),
+}
+
+/// The word for a span too short to have a unit. Shared by both time
+/// readings, because at this granularity "started moments ago" and
+/// "stopped moments ago" are the same statement and the dot beside them is
+/// what makes them different.
+const CORNER_NOW: &str = "now";
+
+/// Resolve [`Corner`] for a row. `now` is passed in rather than read here
+/// so one rail paint dates every row from the same instant — fifteen rows
+/// disagreeing by the microseconds between their own `now()` calls is how a
+/// list ends up showing two sessions that started together a minute apart.
+fn row_corner(info: &SessionInfo, now: u64) -> Corner {
+    if let Some(word) = state_badge(&info.state) {
+        // Slice K: the badge counts the open questions when there is more
+        // than one — "waiting on you (3)" is a different fact from
+        // "waiting on you".
+        return Corner::Badge(if info.state == "awaiting_approval" && info.pending_approvals > 1 {
+            format!("{word} ({})", info.pending_approvals)
+        } else {
+            word.to_string()
+        });
+    }
+    // The SAME key the rail sorts by, and that is the whole point of gap
+    // #1: once a row states its age, the recency order the rail has always
+    // had stops looking arbitrary. `last_activity_ms` is stamped only where
+    // `state`/`live` move (see its wire doc), which makes it exactly two
+    // facts depending on which side of the move you are on — for a running
+    // session it is when the work STARTED, for a settled one when it
+    // stopped. No new wire field: one field, read twice.
+    let span = coarse_age(now.saturating_sub(activity_key(info)))
+        .unwrap_or_else(|| CORNER_NOW.to_string());
+    if info.state == "running" {
+        return Corner::Elapsed(span);
+    }
+    Corner::Since(span)
+}
+
 /// Take the operator's deny reason out of the composer and clear it
 /// (Slice K). eave has exactly one text field, so the composer IS the
 /// reason field — the card says so in as many words. Clearing it is the
@@ -3158,6 +3292,21 @@ const ROW_ACTION_HIT: f32 = 24.0;
 /// that a fact arriving longer than any of these degrades on its own line
 /// instead of taking the path with it.
 const ROW_MARKS_MAX: f32 = 70.0;
+
+/// The rail's reorder glide (Slice RS1 — AG2 gap #6).
+///
+/// 260 ms over [`motion::EASE_RESORT`], and neither number is a taste:
+/// both are what N1's motion inventory §1.17 already specified for a FLIP
+/// reorder, written down long before there was a list to reorder. The
+/// curve spends most of its distance early and lands slowly, which is what
+/// makes a row that has moved read as *having moved* — a linear slide of
+/// the same duration reads as the list being dragged.
+///
+/// Long enough to be seen and short enough that a row cannot be caught
+/// mid-flight by an operator reaching for it: at 260 ms a pointer already
+/// travelling toward a row lands after it has settled, and a pointer
+/// starting from rest has not begun.
+const RAIL_RESORT: motion::MotionSpec = motion::MotionSpec::new(260, motion::EASE_RESORT);
 
 /// The glyph inside that target. Smaller than `ICON_SM`, and the gap
 /// between the two numbers is the point: these sit in the row's corner
@@ -12327,8 +12476,8 @@ impl Shell {
                 let Some(bounds) = at else {
                     return d;
                 };
-                // A hair inside the corner. The radii (tile 12, card 8)
-                // curve ~6 px of daylight between the visible corners
+                // A hair inside the corner. The radii (tile 8, card 8)
+                // curve a few px of daylight between the visible corners
                 // when the boxes exactly touch, so the value is walked
                 // in, not derived: -6 read as touching, 0 as a gulf,
                 // and -4 is where the operator said "perfect".
@@ -13919,6 +14068,18 @@ impl Shell {
         // It buys 26 px, which is what makes a 220 px rail state its facts
         // whole instead of at 237.
         let meta_indent = theme::RAIL_STRIP_W;
+        // Slice RS1: ONE instant for the whole paint — see [`row_corner`].
+        //
+        // It is read here, per render, and nothing wakes the window to
+        // refresh it. That is a deliberate trade against N4's idle floor:
+        // a rail that ticked once a minute to age fifteen labels would be
+        // the only thing in eave scheduling frames on an untouched window,
+        // and the floor exists to say that nothing does. Every watch frame,
+        // every hover, every click re-renders and re-dates the ages — which
+        // covers every moment somebody is actually reading them — but an
+        // untouched window left overnight shows the ages it had when it was
+        // last drawn. Stated here rather than discovered later.
+        let now = eave_core::journal::now_ms();
         let sess_count = sessions.len();
         let files_stat = match (self.files.read(cx).snapshot.clone(), selected.as_deref()) {
             (Some((sid, Some(snap))), Some(sel)) if sid == sel => files_diffstat(&snap),
@@ -13936,16 +14097,9 @@ impl Shell {
                 let age = session_age_ms(&info, now_ms).map(fmt_elapsed);
                 let stat = is_sel.then_some(files_stat).flatten();
                 let dot = state_color(&info.state);
-                // Slice K: the badge counts the open questions when there
-                // is more than one — "waiting on you (3)" is a different
-                // fact from "waiting on you".
-                let badge = state_badge(&info.state).map(|word| {
-                    if info.state == "awaiting_approval" && info.pending_approvals > 1 {
-                        format!("{word} ({})", info.pending_approvals)
-                    } else {
-                        word.to_string()
-                    }
-                });
+                // Slice RS1: the corner is one slot and one fact, and
+                // `row_corner` is where the six candidates are ranked.
+                let corner = row_corner(&info, now);
                 // Slice AO: the posture line states the DANGEROUS posture
                 // only. `asks before it writes · default` is the safe
                 // default, and a line on every row restating the default
@@ -14019,6 +14173,32 @@ impl Shell {
                     .as_ref()
                     .filter(|(id, _)| id == &info.session_id)
                     .map(|(_, text)| text.clone());
+                // Slice RS1 — THE RESORT GLIDE (AG2 gap #6).
+                //
+                // Keyed by session id, because the id is the one thing a
+                // reorder does not change; an index would key the glide to
+                // the SLOT and so measure zero movement every time.
+                //
+                // What actually moves rows here is worth writing down,
+                // because the gap table's phrasing ("rows surviving a
+                // recency resort") describes a resort eave does not do:
+                // `fold_rail` sorts arrivals once, prepends them, and then
+                // deliberately never re-decides position again — its own
+                // comment names the comet bug that rule exists to refuse,
+                // and the same bug is on this slice's do-not-adopt list.
+                // So the movement this glides is real but narrower: a new
+                // session arriving pushes every existing row down, a
+                // session ending pulls them up, and the archive filter
+                // does both. Those used to jump. The mechanism is
+                // position-change, not sort-change, so it is also already
+                // correct for the day a resort is added.
+                //
+                // Paint-only, and enforced by construction rather than by
+                // care — see `crate::glide`.
+                crate::glide::glide(
+                    format!("rail-y-{}", info.session_id),
+                    &self.rail_scroll,
+                    RAIL_RESORT,
                 rail_inset().child(
                 div()
                     .id(SharedString::from(format!("rail-{}", info.session_id)))
@@ -14331,16 +14511,71 @@ impl Shell {
                                     .child(SharedString::from(label))
                                     .into_any_element(),
                             })
-                            .children(badge.map(|word| {
-                                div()
+                            // Slice RS1 — THE CORNER. One box, one string,
+                            // whichever of the six facts `row_corner`
+                            // ranked first.
+                            //
+                            // Every branch draws the SAME metrics —
+                            // `SMALL_SIZE` in `SMALL_LINE`, `WEIGHT_LABEL`
+                            // — and only the ink and the selector change.
+                            // That is not tidiness: line one's height is
+                            // the tallest thing on it, so a corner that
+                            // changed line box between states would change
+                            // the ROW's height when a session started
+                            // working, and a rail whose rows resize
+                            // underneath the pointer is the failure both
+                            // `a_session_row_is_two_lines` and the replay
+                            // anchor exist to catch.
+                            //
+                            // The badge keeps `badge-{sid}` because that is
+                            // the selector every existing assertion
+                            // measures; the time takes its own `age-{sid}`,
+                            // so a test can tell "this row has no badge"
+                            // from "this row is showing its age" — which
+                            // are now different states and used to be one.
+                            .child(match &corner {
+                                Corner::Badge(word) => div()
                                     .debug_selector(|| format!("badge-{}", info.session_id))
                                     .flex_none()
                                     .text_size(px(theme::SMALL_SIZE))
                                     .line_height(px(theme::SMALL_LINE))
                                     .font_weight(theme::WEIGHT_LABEL)
                                     .text_color(dot)
-                                    .child(SharedString::from(word))
-                            })),
+                                    .child(SharedString::from(word.clone())),
+                                // Two tiers below the badge, not a third
+                                // pigment. `live()` beside the pulsing dot
+                                // was the obvious choice and is wrong: the
+                                // dot already carries "running" in colour
+                                // and motion, and a second saturated mark
+                                // on the same line makes an ordinary
+                                // working session shout as loud as one
+                                // that is blocked on you. The step from
+                                // secondary to tertiary is what separates
+                                // "still going" from "long finished".
+                                //
+                                // Neither is a new contrast question: this
+                                // row already carries both inks at these
+                                // ranks — `text_secondary` on the folder,
+                                // `text_tertiary` on the marks — over the
+                                // same washes, so the floors they clear are
+                                // the ones already measured for line two.
+                                Corner::Elapsed(word) => div()
+                                    .debug_selector(|| format!("age-{}", info.session_id))
+                                    .flex_none()
+                                    .text_size(px(theme::SMALL_SIZE))
+                                    .line_height(px(theme::SMALL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(theme::text_secondary())
+                                    .child(SharedString::from(word.clone())),
+                                Corner::Since(word) => div()
+                                    .debug_selector(|| format!("age-{}", info.session_id))
+                                    .flex_none()
+                                    .text_size(px(theme::SMALL_SIZE))
+                                    .line_height(px(theme::SMALL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(word.clone())),
+                            }),
                     )
                     // LINE THREE — branch / cwd, and the selected session's
                     // diffstat. Files no longer sit under this list; the
@@ -14643,6 +14878,7 @@ impl Shell {
                             .text_color(color)
                             .child(SharedString::from(line))
                     })),
+                ),
                 )
                 .into_any_element()
             })
@@ -20285,7 +20521,12 @@ const PAGE_NO_ENGINE: &str = "this build has no page engine (`--features web`)";
 ///    replaced. The hint still appears the moment a draft exists.
 fn composer_hint(pending: usize, has_draft: bool, overflow: usize) -> String {
     if pending > 0 {
-        "return to send — queued behind the approval above until you answer".into()
+        // Ordered fact-first. It used to read `return to send — queued
+        // behind the approval above until you answer`, which put the
+        // keystroke everybody knows in front of the condition nobody does
+        // — so the words a narrow composer clipped were the only ones that
+        // said anything.
+        "queued behind the approval until you answer — return to send".into()
     } else if overflow > 0 {
         format!("{} files per send — {overflow} not attached", attach::MAX)
     } else if has_draft {
@@ -21132,6 +21373,36 @@ impl Render for Shell {
                         .child(
                             div()
                                 .debug_selector(|| "composer-hint".into())
+                                // **The hint is the element that YIELDS.**
+                                // Reported from the running app: with a
+                                // question open, the warning below is 60
+                                // characters of `DETAIL_SIZE` in a row that
+                                // also holds attach, the model chip, the
+                                // posture chip and the send group — and a
+                                // text div's default minimum width is its
+                                // own content, so it refused to shrink and
+                                // pushed the send and stop buttons out
+                                // through the card's `overflow_hidden`.
+                                // Measured at `WINDOW_MIN_W`: 258 px past
+                                // the card's right edge.
+                                //
+                                // A composer whose send button is off the
+                                // edge is not a cosmetic defect — the one
+                                // affordance the row exists for stops being
+                                // clickable, and it stops being clickable
+                                // exactly when a question is open, which is
+                                // the moment the operator most needs it.
+                                //
+                                // Both buttons were already `flex_none`, so
+                                // they were not the ones giving way; the row
+                                // simply had no element willing to. `min_w(0)`
+                                // is what makes `truncate` bite in a flex row
+                                // (the same note as the rail's session name),
+                                // and the sentence below is ordered so that
+                                // what survives a clip is the load-bearing
+                                // half.
+                                .min_w(px(0.))
+                                .truncate()
                                 // **Slice AQ: `MICRO_SIZE` → `DETAIL_SIZE`.**
                                 // This slot was the SMALLEST type in the
                                 // application, and on its loud branch it
@@ -24033,6 +24304,113 @@ mod tests {
         for s in ["new", "running", "done", "killed", "interrupted"] {
             assert_eq!(state_badge(s), None, "{s} must not badge");
         }
+    }
+
+    /// Slice RS1 — the ladder, and the rollover that exists for the width
+    /// budget rather than for the calendar.
+    #[test]
+    fn a_span_is_one_unit_and_at_most_four_characters() {
+        const MIN: u64 = 60_000;
+        // Under a minute has no unit. The caller supplies the word.
+        assert_eq!(coarse_age(0), None);
+        assert_eq!(coarse_age(MIN - 1), None);
+        assert_eq!(coarse_age(MIN).as_deref(), Some("1m"));
+        assert_eq!(coarse_age(59 * MIN).as_deref(), Some("59m"));
+        assert_eq!(coarse_age(60 * MIN).as_deref(), Some("1h"));
+        assert_eq!(coarse_age(23 * 60 * MIN).as_deref(), Some("23h"));
+        assert_eq!(coarse_age(24 * 60 * MIN).as_deref(), Some("1d"));
+        assert_eq!(coarse_age(364 * 24 * 60 * MIN).as_deref(), Some("364d"));
+        assert_eq!(coarse_age(365 * 24 * 60 * MIN).as_deref(), Some("1y"));
+
+        // **The reason years exist here.** Every fixture in this repo
+        // carries `created_ts_ms: 1`, so an un-rolled day count is not a
+        // hypothetical — it is what the harness renders. `20700d` shapes
+        // past the slot; `56y` does not.
+        let epoch_session = eave_core::journal::now_ms();
+        let span = coarse_age(epoch_session).expect("a session dated 1970 has an age");
+        assert!(
+            span.ends_with('y') && span.len() <= 4,
+            "a session dated to the epoch renders {span:?}, which is wider \
+             than the corner it has to fit"
+        );
+
+        // No shape this function can produce is longer than four
+        // characters until the year 3000, which is the invariant the
+        // width test below is allowed to assume.
+        for ms in [0, 1, MIN, 90 * MIN, 47 * 60 * MIN, 400 * 24 * 60 * MIN] {
+            if let Some(span) = coarse_age(ms) {
+                assert!(span.len() <= 4, "{span:?} is wider than the slot");
+            }
+        }
+    }
+
+    /// Slice RS1 — **the corner's priority order**, all six rungs, in one
+    /// test, because the order is the product and any two of these
+    /// swapping is a silent regression.
+    ///
+    /// Slice RS2's group rollup must mirror this exactly. When that lands,
+    /// this test is the thing it is mirrored against.
+    #[test]
+    fn the_corner_shows_the_most_urgent_fact_and_only_one() {
+        // Far enough from zero that the oldest span below still
+        // subtracts.
+        let now = 100_000_000;
+        let at = |state: &str, ago_ms: u64| {
+            let mut s = info("aaaa1111", 1, Some(now - ago_ms));
+            s.state = state.into();
+            s
+        };
+
+        // 1–4: a badge outranks any age, however old or fresh.
+        let mut asking = at("awaiting_approval", 3 * 3_600_000);
+        asking.pending_approvals = 3;
+        assert_eq!(
+            row_corner(&asking, now),
+            Corner::Badge("waiting on you (3)".into())
+        );
+        let mut one = at("awaiting_approval", 0);
+        one.pending_approvals = 1;
+        assert_eq!(
+            row_corner(&one, now),
+            Corner::Badge("waiting on you".into()),
+            "a single question is not counted — Slice K"
+        );
+        for state in ["unresponsive", "failed", "quiet"] {
+            assert_eq!(
+                row_corner(&at(state, 5 * 60_000), now),
+                Corner::Badge(state.to_string()),
+                "{state} lost its slot to a number"
+            );
+        }
+
+        // 5: running reads as elapsed — the live tier.
+        assert_eq!(
+            row_corner(&at("running", 2 * 60_000), now),
+            Corner::Elapsed("2m".into())
+        );
+        assert_eq!(
+            row_corner(&at("running", 1_000), now),
+            Corner::Elapsed("now".into()),
+            "a turn under a minute old still has to say something"
+        );
+
+        // 6: everything else reads as age — the quiet tier.
+        assert_eq!(
+            row_corner(&at("idle", 5 * 60_000), now),
+            Corner::Since("5m".into())
+        );
+        assert_eq!(
+            row_corner(&at("new", 0), now),
+            Corner::Since("now".into())
+        );
+
+        // The fallback the wire asks for: no `last_activity_ms` means the
+        // state has not moved since the engine loaded the session, so the
+        // age is measured from creation — never from a fabricated zero,
+        // which would date every never-started session to 1970.
+        let mut never = info("bbbb2222", now - 7 * 60_000, None);
+        never.state = "new".into();
+        assert_eq!(row_corner(&never, now), Corner::Since("7m".into()));
     }
 
     #[test]

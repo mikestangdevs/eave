@@ -2844,6 +2844,61 @@ fn the_composer_states_that_a_send_will_queue_behind_the_question(cx: &mut TestA
     );
 }
 
+/// **The send button is never pushed out of the composer.** Reported from
+/// the running app, on the exact state that produced it: a question open,
+/// so the composer's trailing slot is carrying Slice K's warning rather
+/// than nothing.
+///
+/// The slot is a text div in a flex row, and a text div's default minimum
+/// width is its own content — so it declined to shrink, the row
+/// overflowed, and the card's `overflow_hidden` clipped the send and stop
+/// buttons off the right edge. The affordance the row exists for stopped
+/// being clickable at exactly the moment the operator needed it.
+///
+/// Asserted as CONTAINMENT rather than as "the hint truncates": what
+/// matters is not how the words degrade, it is that the button is still
+/// inside the card with its whole hit target. A future slice may reword
+/// the warning freely; it may not put it in front of the button.
+#[gpui::test]
+fn the_warning_never_pushes_the_send_button_out_of_the_card(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    ask(
+        &h,
+        vcx,
+        vec![
+            user_record(1, "go"),
+            approval_record(2, "req-1", "Write", "/repo/a.txt"),
+        ],
+    );
+    // **At the narrowest window eave will open.** The defect is a width
+    // defect, and a test that only ever asks it at the harness's default
+    // size passes without asking anything — this one did, until it was
+    // pointed at the size where the row actually runs out of room.
+    vcx.simulate_resize(size(px(theme::WINDOW_MIN_W), px(theme::WINDOW_MIN_H)));
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(10));
+
+    let card = vcx.debug_bounds("composer-card").expect("the composer card");
+    let send = vcx.debug_bounds("send").expect("the send button");
+    assert!(
+        send.origin.x >= card.origin.x
+            && send.origin.x + send.size.width <= card.origin.x + card.size.width,
+        "the send button sits at {:?}..{:?} and the card ends at {:?} — the \
+         warning pushed it through `overflow_hidden` and out of the app",
+        send.origin.x,
+        send.origin.x + send.size.width,
+        card.origin.x + card.size.width
+    );
+    assert_eq!(
+        send.size.width,
+        px(composer::TOOL),
+        "the send button was squeezed to {:?} instead of the row yielding \
+         somewhere else — a shrunken hit target is the same defect wearing \
+         a smaller hat",
+        send.size.width
+    );
+}
+
 /// The floating notice is chrome above the composer; the question is a
 /// card in the log with the buttons on it. Rendering both put the notice
 /// ON TOP of the approve/deny it was pointing at (reported from the real
@@ -8380,6 +8435,195 @@ fn a_realistically_named_session_shows_its_whole_name(cx: &mut TestAppContext) {
         "the folder is {:?} wide on a named, shared row",
         folder.size.width
     );
+}
+
+/// **Slice RS1 — the corner is never allowed to cost the name its slot.**
+///
+/// This is the measurement that decided the corner's copy, kept as the
+/// thing that fails if either side of it moves. The brief asked for
+/// `Working 2m` / `5m ago`; line one has 152 px for the name and the
+/// corner together, a name somebody types needs 114.7 of it, and what is
+/// left will not hold those words. See [`crate::ui::Corner`] for the whole
+/// argument.
+///
+/// Asserted on the row carrying the WIDEST corner the resolver can produce
+/// — a four-character span — beside the same 20-character name
+/// `a_realistically_named_session_shows_its_whole_name` pins, and with the
+/// row's other freight on it too. Both facts are measured, in the same
+/// frame, from the rendered layout: the corner is not allowed to be
+/// squeezed to nothing either, because a truncated age is a wrong age.
+#[gpui::test]
+fn the_corner_never_costs_the_name_its_slot(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let name = "chase the rail flake";
+    let mut named = session("aaaa1111");
+    named.title = Some(name.into());
+    named.shared_with = vec!["bbbb2222".into(), "cccc3333".into()];
+    // 364 days: the widest span `coarse_age` can render before it rolls to
+    // years, which is what makes this the worst case rather than a case.
+    // Written as an arithmetic literal rather than through the formatter,
+    // so a change to the ladder shows up here as a failure instead of
+    // sliding this test along with it.
+    named.last_activity_ms =
+        Some(eave_core::journal::now_ms().saturating_sub(364 * 24 * 60 * 60 * 1_000));
+    rail_with_selected(&h, vcx, vec![named], "aaaa1111");
+
+    let label = vcx.debug_bounds("label-aaaa1111").expect("the row's name");
+    let age = vcx.debug_bounds("age-aaaa1111").expect("the row's corner");
+    let ink = real_name_width(name);
+    assert!(
+        label.size.width >= ink,
+        "{name:?} shapes to {ink:?} and the corner left it {:?} — the age \
+         is not worth a name nobody can read",
+        label.size.width
+    );
+    assert!(
+        age.size.width > px(0.),
+        "the corner rendered an empty box — a row with no age is the gap \
+         this slice exists to close"
+    );
+
+    // And the other side of the same budget, measured rather than
+    // rendered: EVERY span the resolver can reach has to fit what the name
+    // leaves. 29 px is a literal on purpose — it is `152 − 114.7 − 8`
+    // today, and reading it from those constants would let a future slice
+    // widen the corner and move this test along with it.
+    //
+    // The list is the ladder's own boundaries, which is why `coarse_age`
+    // rolls days into years: without that rollover `20700d` is on this
+    // list, at 40 px, and there is no rail width at which it passes.
+    for span in ["1m", "59m", "1h", "23h", "1d", "364d", "1y", "999y"] {
+        let ink = real_text_width_at(span, theme::SANS, theme::SMALL_SIZE, theme::WEIGHT_LABEL);
+        assert!(
+            ink <= px(29.),
+            "the corner {span:?} shapes to {ink:?}; past 29 px it starts \
+             taking characters off the session's name"
+        );
+    }
+}
+
+/// Slice RS1 — one slot, and the row says which fact is in it.
+///
+/// The badge and the age share the corner under one precedence, so the two
+/// selectors are mutually exclusive by construction. Asserting the absence
+/// is the half that matters: a row rendering both would be a row whose
+/// name has lost another 40 px to a fact it was already stating.
+#[gpui::test]
+fn the_corner_holds_one_fact_and_the_row_says_which(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut working = session("aaaa1111");
+    working.state = "running".into();
+    working.live = true;
+    let mut asking = session("bbbb2222");
+    asking.state = "awaiting_approval".into();
+    asking.pending_approvals = 2;
+    let idle = session("cccc3333");
+    h.plumbing.push_rail(vec![working, asking, idle]);
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "age-aaaa1111"), "a running row states its elapsed");
+    assert!(
+        !shown(vcx, "badge-aaaa1111"),
+        "running has never had a badge and must not grow one"
+    );
+    assert!(
+        shown(vcx, "badge-bbbb2222"),
+        "the operator is the blocker and the corner has to say so"
+    );
+    assert!(
+        !shown(vcx, "age-bbbb2222"),
+        "the age took the slot from `waiting on you` — the precedence is \
+         inverted"
+    );
+    assert!(shown(vcx, "age-cccc3333"), "a settled row states its age");
+    assert!(!shown(vcx, "badge-cccc3333"));
+}
+
+/// **Slice RS1 — a row that moves is painted where it was, and the list
+/// underneath it does not move at all.**
+///
+/// Both halves are the test. The first is the feature: rows used to jump
+/// when a session arrived above them. The second is the constraint the
+/// brief put on it and the reason the replay sweep is this stage's gate —
+/// the glide is a PAINT offset, so no row's height, no row's box and no
+/// distance between two rows may change while it runs. A glide implemented
+/// with margins or with a spacer would pass the first assertion and fail
+/// the third.
+#[gpui::test]
+fn a_reordered_row_glides_and_the_list_underneath_it_does_not_move(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+
+    let at = |sel: &'static str, vcx: &mut VisualTestContext| {
+        vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} did not render"))
+    };
+    let a_before = at("rail-aaaa1111", vcx);
+    let b_before = at("rail-bbbb2222", vcx);
+    let pitch_before = b_before.origin.y - a_before.origin.y;
+
+    // A third session arrives. `fold_rail` puts an arrival at the TOP and
+    // leaves every surviving row in the order it already had, so both
+    // existing rows are pushed down by exactly one row.
+    h.plumbing.push_rail(vec![
+        session("cccc3333"),
+        session("aaaa1111"),
+        session("bbbb2222"),
+    ]);
+    vcx.run_until_parked();
+
+    let a_mid = at("rail-aaaa1111", vcx);
+    let b_mid = at("rail-bbbb2222", vcx);
+    assert!(
+        (a_mid.origin.y - a_before.origin.y).abs() <= px(1.),
+        "the row jumped from {:?} to {:?} the frame the arrival landed — \
+         that IS the jump this slice exists to remove",
+        a_before.origin.y,
+        a_mid.origin.y
+    );
+    assert!(
+        (b_mid.origin.y - b_before.origin.y).abs() <= px(1.),
+        "the second surviving row jumped to {:?}",
+        b_mid.origin.y
+    );
+    // ...and the list is rigid while it does it.
+    assert_eq!(
+        b_mid.origin.y - a_mid.origin.y,
+        pitch_before,
+        "the two rows are {:?} apart mid-glide and were {:?} apart before \
+         — the glide is moving layout, not paint",
+        b_mid.origin.y - a_mid.origin.y,
+        pitch_before
+    );
+    assert_eq!(
+        (a_mid.size, b_mid.size),
+        (a_before.size, b_before.size),
+        "a row changed size while gliding"
+    );
+
+    // It is an animation, not a hold: the window asks for frames, and when
+    // it stops asking the rows are where the layout always had them.
+    let frames = drive(&h, vcx, Duration::from_millis(16));
+    assert!(
+        frames > 1,
+        "the reorder settled in {frames} frame(s) — nothing glided"
+    );
+    let a_after = at("rail-aaaa1111", vcx);
+    let b_after = at("rail-bbbb2222", vcx);
+    assert!(
+        a_after.origin.y > a_before.origin.y,
+        "the arrival above it never actually pushed the row down: {:?} then \
+         {:?}",
+        a_before.origin.y,
+        a_after.origin.y
+    );
+    assert_eq!(
+        b_after.origin.y - a_after.origin.y,
+        pitch_before,
+        "the rows landed at a different pitch than they set off at"
+    );
+    assert_eq!((a_after.size, b_after.size), (a_before.size, b_before.size));
 }
 
 /// Selection reads as a FILL and a RIM — `launcher.rs`\'s treatment for its
@@ -14351,8 +14595,15 @@ fn the_page_menu_says_what_was_clicked(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 }
 
-/// A menu over a link gains the two link rows; a menu over a selection
+/// A menu over a link gains the THREE link rows; a menu over a selection
 /// gains the search row.
+///
+/// **This test was red on `main` and the product was right.** A commit
+/// added `Open Link in Incognito Tab` beside `Copy Link` / `Open Link in
+/// New Tab` and did not move the arithmetic here, so the row count below
+/// was one short and the last assertion fired on a row somebody had in
+/// fact asked for. Corrected rather than deleted: the assertion is the
+/// only thing standing between this menu and rows nobody ordered.
 #[gpui::test]
 fn a_link_and_a_selection_each_add_their_own_rows(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -14372,11 +14623,13 @@ fn a_link_and_a_selection_each_add_their_own_rows(cx: &mut TestAppContext) {
             editable: false,
         },
     );
-    // Back, Forward, Reload, Mute Tab, Copy, Copy Link, Open Link in New
-    // Tab, Search, View Page Source, Inspect.
-    assert!(shown(vcx, "menu-row-7"), "the search row is missing");
+    // 0 Back, 1 Forward, 2 Reload, 3 Mute Tab, 4 Copy, 5 Copy Link,
+    // 6 Open Link in New Tab, 7 Open Link in Incognito Tab, 8 Search,
+    // 9 View Page Source, 10 Inspect. Eleven rows, so the first index
+    // that must NOT exist is 11.
+    assert!(shown(vcx, "menu-row-8"), "the search row is missing");
     assert!(
-        !shown(vcx, "menu-row-10"),
+        !shown(vcx, "menu-row-11"),
         "the menu grew a row nothing asked for"
     );
 }

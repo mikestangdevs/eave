@@ -184,8 +184,9 @@ pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
 /// below ride it.
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 /// CSS `cubic-bezier(0.22, 1, 0.36, 1)` — reorder glides.
-#[allow(dead_code)] // inventory §1.17 (260 ms FLIP reorder) is its caller,
-                    // §1.9 (drag-reorder glide) the second; both unbuilt.
+// Inventory §1.17 (the FLIP reorder) is BUILT — Slice RS1's rail glide,
+// which reads this through [`glide_t`]. §1.9 (drag-reorder) is still
+// unbuilt and is the second caller when it lands.
 pub const EASE_RESORT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
 /// CSS `ease-in-out` — scroll glides (the browser smooth-scroll shape:
 /// gentle start, cruise, gentle landing).
@@ -746,12 +747,69 @@ impl FadeEntry {
     }
 }
 
+/// One key's place in a list, and whatever displacement it still owes
+/// (Slice RS1 — inventory §1.17, the FLIP reorder).
+///
+/// A FLIP glide is not a tween between two *values*; it is a tween whose
+/// only job is to be **wrong on purpose** for a moment. The row is already
+/// laid out at its new position — layout never waits — and this carries the
+/// paint back to where the row used to be, then pays that displacement down
+/// to zero. Nothing here is ever asked what the row's position *is*; the
+/// answer to that is the layout's, every frame.
+///
+/// `y` is the key's position in the LIST's own coordinates, not the
+/// window's, and that is what the caller has to supply — see [`glide_t`].
+/// Without it a scroll would read as every row moving at once.
+#[derive(Debug, Clone, Copy)]
+struct GlideEntry {
+    /// Where the key sat in list coordinates at its last read.
+    y: f32,
+    /// The displacement owed at `started`, in px, paid down to zero. Sign
+    /// is the paint's: a row whose layout moved DOWN owes a NEGATIVE
+    /// offset, because it has to be painted back up where it was.
+    origin: f32,
+    started: Instant,
+    spec: MotionSpec,
+    /// Frame counter at the last read — [`FadeEntry::seen`]'s job exactly,
+    /// and the only signal that a row has left the list.
+    seen: u64,
+}
+
+impl GlideEntry {
+    fn value(&self, now: Instant) -> f32 {
+        let span = self.spec.scaled_total();
+        let elapsed = now.saturating_duration_since(self.started);
+        if span.is_zero() || elapsed >= span {
+            return 0.0;
+        }
+        lerp(
+            self.origin,
+            0.0,
+            self.spec
+                .progress(elapsed.as_secs_f32() / span.as_secs_f32()),
+        )
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        self.origin == 0.0
+            || now.saturating_duration_since(self.started) >= self.spec.scaled_total()
+    }
+}
+
 /// Per-key fade progress. The pure core: every method takes `now`
 /// explicitly, so the whole thing is unit-testable with no window and no
 /// clock. The thread-local wrappers below are what the shell calls.
 #[derive(Default)]
 struct Fades {
     entries: HashMap<String, FadeEntry>,
+    /// Where each glide key sat last frame, and what it still owes. A
+    /// SECOND map rather than a variant of [`FadeEntry`]: a fade is a
+    /// value that animates and a glide is a position that does not, and
+    /// the pruning rules differ — a settled fade at 0 is indistinguishable
+    /// from an absent one and goes, while a settled glide still has to
+    /// remember `y` or the next reorder would measure from nothing and
+    /// refuse to animate.
+    glides: HashMap<String, GlideEntry>,
     /// Renders of the root view, not display frames — see [`begin_frame`].
     frame: u64,
     /// The instant every read in this frame answers at. `None` before the
@@ -795,6 +853,13 @@ impl Fades {
             }
             !(e.target == 0.0 && e.settled(now))
         });
+        // Glides prune on STALENESS only. A settled glide is a row sitting
+        // still, and its `y` is the memory the next reorder measures
+        // against — dropping it the moment it stops moving would make
+        // every second reorder a first fill, which by rule does not
+        // animate. Rows that leave the list stop being read and go on the
+        // same one-frame grace as a fade.
+        self.glides.retain(|_, g| g.seen + 1 >= frame);
     }
 
     /// The instant this frame answers at.
@@ -877,6 +942,56 @@ impl Fades {
         value
     }
 
+    /// Record where `key` sits this frame and hand back the paint offset
+    /// that hides the move — see [`glide_t`] for the contract.
+    fn glide(&mut self, key: &str, y: f32, spec: MotionSpec, now: Instant) -> f32 {
+        let frame = self.frame;
+        let reduced = self.reduced;
+        let Some(e) = self.glides.get_mut(key) else {
+            // FIRST FILL NEVER ANIMATES. A key with no recorded position
+            // has not moved — it has arrived — and a list drawing itself
+            // for the first time must not play every row's arrival as a
+            // slide from y=0. Record where it is and paint it there.
+            self.glides.insert(
+                key.to_string(),
+                GlideEntry {
+                    y,
+                    origin: 0.0,
+                    started: now,
+                    spec,
+                    seen: frame,
+                },
+            );
+            return 0.0;
+        };
+        e.seen = frame;
+        // What the row is painting at right now, relative to its own
+        // layout box. Read BEFORE `y` is overwritten: a row displaced
+        // again mid-flight has to continue from where the eye last saw it,
+        // not restart from the full new distance.
+        let carried = e.value(now);
+        let moved = y - e.y;
+        e.y = y;
+        if reduced {
+            // The preference is honoured here, once, rather than at every
+            // call site — the same place [`lease`] honours it. Nothing is
+            // recorded as owed, so nothing is mid-flight and the tail asks
+            // for no frames.
+            e.origin = 0.0;
+            return 0.0;
+        }
+        if moved != 0.0 {
+            // The row was painting at `e.y + carried` and is now laid out
+            // at `y`. Staying visually still means an offset of
+            // `(e.y + carried) - y` — which is `carried - moved`, and
+            // which composes: a second move mid-glide adds its own
+            // distance to whatever was left of the first.
+            e.origin = carried - moved;
+            e.started = now;
+        }
+        e.value(now)
+    }
+
     /// Is anything still mid-flight? The root render's tail asks once and
     /// turns a `true` into a claim on the next frame.
     fn active(&self, now: Instant) -> bool {
@@ -885,7 +1000,14 @@ impl Fades {
         // a store full of half-run tweens still asks for nothing the moment
         // it is set. (The tail checks the flag too — this is the store
         // holding its own end, not a duplicate of that check.)
-        !self.reduced && self.entries.values().any(|e| !e.settled(now))
+        !self.reduced
+            && (self.entries.values().any(|e| !e.settled(now))
+                // A glide is driven by the same tail. Without this the
+                // first frame of a reorder would paint the offset and
+                // then nothing would ask for a second frame, so the rows
+                // would sit displaced until something else redrew them —
+                // which is worse than not animating at all.
+                || self.glides.values().any(|g| !g.settled(now)))
     }
 }
 
@@ -923,6 +1045,36 @@ pub fn entrance_t(key: &str, spec: MotionSpec) -> f32 {
         match fades.now() {
             Some(now) => fades.entrance(key, spec, now),
             None => 1.0,
+        }
+    })
+}
+
+/// **The FLIP glide** (Slice RS1, inventory §1.17): tell the store where
+/// `key` sits in its list this frame; get back the vertical paint offset
+/// that makes it look like it has not moved yet. 0 before the first
+/// [`begin_frame`], 0 under reduced motion, and 0 for a key the store has
+/// never seen.
+///
+/// **`y` must be the key's position in the LIST's own coordinates**, not
+/// the window's. A row inside a scroller changes window-y every time
+/// anybody scrolls, and a glide fed window-y would read a scroll as every
+/// row reordering at once — a whole list smearing under a trackpad. The
+/// caller subtracts the scroller's origin and its offset; see
+/// [`crate::glide::Glide`], which is the only correct way to call this and
+/// exists so no future caller has to rediscover that subtraction.
+///
+/// It is **paint-only, by construction**: the caller has already been
+/// handed its layout bounds by the time it can ask, so the value can only
+/// ever be spent on `with_element_offset`. Nothing here can change a row's
+/// height, the list's height, or where the next row starts — which is the
+/// property the replay assert measures and the reason a glide is safe to
+/// add to a rail that holds a scroll anchor.
+pub fn glide_t(key: &str, y: f32, spec: MotionSpec) -> f32 {
+    FADES.with(|f| {
+        let mut fades = f.borrow_mut();
+        match fades.now() {
+            Some(now) => fades.glide(key, y, spec, now),
+            None => 0.0,
         }
     })
 }
@@ -1439,6 +1591,153 @@ mod tests {
     }
 
     const KEY: &str = "some-button";
+
+    // -----------------------------------------------------------------
+    // The glide store (Slice RS1 — inventory §1.17)
+
+    const ROW: &str = "rail-y-aaaa1111";
+    const GLIDE: MotionSpec = MotionSpec::new(260, EASE_RESORT);
+
+    /// The four rules a FLIP glide is made of, in the order they bite.
+    ///
+    /// comet states all four (`shell.rs:3820-3870`) and the first is the
+    /// one that is easy to lose: a **first fill never animates**. Without
+    /// it every row of a list drawing itself for the first time slides in
+    /// from wherever the store thought it was, which on an empty store is
+    /// y=0 — a rail that unfurls on every launch.
+    #[test]
+    fn a_first_fill_never_animates_and_a_move_pays_itself_down() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+
+        // 1. First fill: recorded, not animated.
+        assert_eq!(f.glide(ROW, 100.0, GLIDE, t0), 0.0);
+        assert!(!f.active(t0), "a first fill asked the window for frames");
+
+        // 2. Sitting still costs nothing, however many frames pass.
+        let t1 = t0 + Duration::from_millis(16);
+        frame(&mut f, t1, false);
+        assert_eq!(f.glide(ROW, 100.0, GLIDE, t1), 0.0);
+
+        // 3. A move: the row is laid out 40 px lower and paints 40 px
+        //    HIGHER, so that the first frame after the reorder looks
+        //    exactly like the last frame before it.
+        let t2 = t1 + Duration::from_millis(16);
+        frame(&mut f, t2, false);
+        assert_eq!(f.glide(ROW, 140.0, GLIDE, t2), -40.0);
+        assert!(f.active(t2), "a glide has to keep asking for frames");
+
+        // 4. And it pays down to nothing, monotonically, inside the spec.
+        let mid = t2 + Duration::from_millis(130);
+        frame(&mut f, mid, false);
+        let half = f.glide(ROW, 140.0, GLIDE, mid);
+        assert!(
+            (-40.0..0.0).contains(&half),
+            "half a glide in, the offset was {half} — outside the distance \
+             it is supposed to be covering"
+        );
+        let end = t2 + Duration::from_millis(261);
+        frame(&mut f, end, false);
+        assert_eq!(f.glide(ROW, 140.0, GLIDE, end), 0.0);
+        assert!(!f.active(end), "a settled glide is still asking for frames");
+    }
+
+    /// A row displaced again while it is still moving continues from where
+    /// the eye last saw it. The mutation this guards is the easy one —
+    /// re-anchoring at the full new distance — which reads as the row
+    /// jumping backwards before setting off again, and which is exactly
+    /// the bug `a_hover_that_reverses_mid_flight_re_anchors_at_its_current_value`
+    /// guards for washes.
+    #[test]
+    fn a_second_move_mid_glide_composes_instead_of_restarting() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        f.glide(ROW, 0.0, GLIDE, t0);
+
+        let t1 = t0 + Duration::from_millis(16);
+        frame(&mut f, t1, false);
+        assert_eq!(f.glide(ROW, 40.0, GLIDE, t1), -40.0);
+
+        // Halfway down: still owed something, and less than the whole.
+        let mid = t1 + Duration::from_millis(130);
+        frame(&mut f, mid, false);
+        let carried = f.glide(ROW, 40.0, GLIDE, mid);
+
+        // A second push of 40 px, from that position. The offset the next
+        // frame paints must be the carried one plus the new distance —
+        // not −40, which would be a restart, and not −80, which would be
+        // the two distances summed as if nothing had been paid off.
+        frame(&mut f, mid, false);
+        let composed = f.glide(ROW, 80.0, GLIDE, mid);
+        assert!(
+            (composed - (carried - 40.0)).abs() < 0.01,
+            "carried {carried}, pushed 40 more, and painted {composed}"
+        );
+        assert!(
+            composed > -80.0 && composed < -40.0,
+            "the composed offset {composed} is either a restart or a sum"
+        );
+    }
+
+    /// Reduced motion snaps, and takes nothing with it: no offset, and
+    /// nothing left mid-flight for the tail to keep waking the window for.
+    #[test]
+    fn reduced_motion_moves_the_row_and_never_glides_it() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, true);
+        assert_eq!(f.glide(ROW, 0.0, GLIDE, t0), 0.0);
+        let t1 = t0 + Duration::from_millis(16);
+        frame(&mut f, t1, true);
+        assert_eq!(
+            f.glide(ROW, 400.0, GLIDE, t1),
+            0.0,
+            "a 400 px reorder under reduced motion has to be a cut"
+        );
+        assert!(!f.active(t1));
+    }
+
+    /// A row that leaves the list is forgotten, and a row that stays is
+    /// not. The distinction is the whole reason glides prune on staleness
+    /// rather than on settling: a settled glide still owns the `y` the
+    /// NEXT reorder measures against, so dropping it would make every
+    /// second reorder a first fill — which, by the rule above, does not
+    /// animate.
+    #[test]
+    fn a_settled_row_keeps_its_place_and_a_departed_one_is_forgotten() {
+        let mut f = Fades::default();
+        let t0 = Instant::now();
+        frame(&mut f, t0, false);
+        f.glide(ROW, 100.0, GLIDE, t0);
+
+        // Two frames of sitting still — long enough that a settle-prune
+        // would have dropped it.
+        let mut t = t0;
+        for _ in 0..2 {
+            t += Duration::from_millis(300);
+            frame(&mut f, t, false);
+            f.glide(ROW, 100.0, GLIDE, t);
+        }
+        t += Duration::from_millis(16);
+        frame(&mut f, t, false);
+        assert_eq!(
+            f.glide(ROW, 60.0, GLIDE, t),
+            40.0,
+            "a row that had been sitting still glided from nowhere — its \
+             place was pruned out from under it"
+        );
+
+        // Now stop reading it: the row is gone from the list. One frame of
+        // grace, then forgotten — and a key the store has never heard of
+        // is a first fill, which does not animate.
+        for _ in 0..3 {
+            t += Duration::from_millis(16);
+            frame(&mut f, t, false);
+        }
+        assert_eq!(f.glide(ROW, 500.0, GLIDE, t), 0.0);
+    }
 
     /// The property that makes a fade feel like a fade rather than a
     /// toggle: flick the pointer off an element halfway through its wash

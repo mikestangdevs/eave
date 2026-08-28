@@ -8,6 +8,12 @@
 /// the acceptance runs use.
 mod edge_fade;
 
+/// The resort glide (Slice RS1): the FLIP wrapper that paints a reordered
+/// row where it used to be and slides it to where it now is. Private for
+/// the same reason `edge_fade` is — it is render-path machinery, and the
+/// headless acceptance runs never lay a row out.
+mod glide;
+
 /// The frame drive (Slice N1): the shared pulse clock, the motion catalog
 /// and the render tail. Private for the same reason `edge_fade` is — it is
 /// render-path machinery, not part of the headless surface the acceptance
