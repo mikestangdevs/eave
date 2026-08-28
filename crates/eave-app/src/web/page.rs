@@ -396,6 +396,16 @@ pub fn page_element(tab_id: &str, cx: &mut App) -> Option<gpui::AnyElement> {
                 super::host::request_pump();
             })
             .on_scroll_wheel(move |ev, _window, cx| {
+                if let Some(delta) = input::swipe_nav(ev) {
+                    super::tabs::request(super::PageRequest::Go {
+                        tab_id: wheel_id.clone(),
+                        delta,
+                    });
+                    super::host::note_activity();
+                    super::host::request_pump();
+                    cx.stop_propagation();
+                    return;
+                }
                 super::tabs::with_browser(&wheel_id, |b| {
                     let (dx, dy, precise) = input::wheel_delta(ev);
                     input::wheel(

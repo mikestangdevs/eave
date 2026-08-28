@@ -193,6 +193,8 @@ mod osr;
 #[cfg(feature = "web")]
 mod page;
 #[cfg(feature = "web")]
+mod pdf;
+#[cfg(feature = "web")]
 mod tabs;
 #[cfg(feature = "web")]
 mod zoom;
@@ -207,7 +209,7 @@ pub use page::{page_element, page_focus_handle, set_keyboard_page, set_live_divi
 #[cfg(feature = "web")]
 pub use tabs::{
     chrome, downloads, drive, install_fact_sink, install_request_sink, is_on_screen,
-    set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
+    print_to_pdf, set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
 };
 
 /// Clear Chromium's own copy of an origin's permission answers (G1).
@@ -1608,6 +1610,8 @@ pub enum PageRequest {
         kinds: Vec<permissions::PermissionKind>,
         decision: permissions::PermissionDecision,
     },
+    Go { tab_id: String, delta: i32 },
+    ConfirmedScheme { url: String },
 }
 
 /// Give the page engine somewhere to ask. Nothing asks here.
@@ -1654,6 +1658,10 @@ pub struct Download {
 pub fn downloads() -> Vec<Download> {
     Vec::new()
 }
+
+/// No Chromium, no PDF.
+#[cfg(not(feature = "web"))]
+pub fn print_to_pdf(_tab_id: &str) {}
 
 // ---------------------------------------------------------------------------
 // D11 — the link under the pointer

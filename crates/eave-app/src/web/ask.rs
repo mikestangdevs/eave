@@ -71,6 +71,9 @@ pub enum Ask {
     /// `reason` is Chromium's own error code, named. Carried rather than
     /// phrased for the same reason `Ask::Permission` carries kinds.
     Certificate { url: String, reason: String },
+    /// An unknown URL scheme. Chrome asks; we ask. `javascript:` never
+    /// lands here.
+    OpenScheme { scheme: String, url: String },
 }
 
 impl Ask {
@@ -514,6 +517,11 @@ mod tests {
             reason: "ERR_CERT_AUTHORITY_INVALID".into(),
         }
         .is_a_standing_decision());
+        assert!(!Ask::OpenScheme {
+            scheme: "zoommtg".into(),
+            url: "zoommtg://zoom.us/join".into(),
+        }
+        .is_a_standing_decision());
     }
 
     /// Two of the sixteen deliberately share the generic sentence
@@ -641,6 +649,11 @@ mod tests {
         .is_refusable());
         assert!(Ask::Confirm {
             message: "x".into()
+        }
+        .is_refusable());
+        assert!(Ask::OpenScheme {
+            scheme: "zoommtg".into(),
+            url: "zoommtg://x".into(),
         }
         .is_refusable());
         assert!(Ask::Leave {

@@ -45,6 +45,7 @@
 //! `docs/reports/stage-b1-browser-state.md`.
 
 pub mod bookmarks;
+pub mod downloads;
 pub mod history;
 pub mod import;
 pub mod log;

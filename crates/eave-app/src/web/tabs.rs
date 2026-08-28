@@ -473,6 +473,12 @@ pub enum PageRequest {
         kinds: Vec<super::permissions::PermissionKind>,
         decision: super::permissions::PermissionDecision,
     },
+    /// Trackpad swipe (or anything else that wants the engine stack, not
+    /// Chromium's). Same verb the arrows use.
+    Go { tab_id: String, delta: i32 },
+    /// A person confirmed an unknown scheme. `open_external` still
+    /// refuses those; this path is the one that may call `open(1)`.
+    ConfirmedScheme { url: String },
 }
 
 static REQUESTS: OnceLock<tokio::sync::mpsc::UnboundedSender<PageRequest>> = OnceLock::new();
@@ -2360,6 +2366,124 @@ pub fn cancel_download(id: u32) {
     super::host::request_pump();
 }
 
+thread_local! {
+    static DOWNLOAD_LOG: std::cell::RefCell<Option<eave_core::browser::log::EventLog<eave_core::browser::downloads::DownloadEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Load finished downloads from `<data_dir>/browser/downloads.jsonl`.
+pub fn restore_downloads(data_dir: &std::path::Path) {
+    use eave_core::browser::downloads::Downloads;
+    use eave_core::browser::log::EventLog;
+    let path = data_dir.join("browser").join("downloads.jsonl");
+    let (log, events, report) = match EventLog::open(&path, "downloads") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("eave: downloads log: {e}");
+            return;
+        }
+    };
+    if let Some(line) = report.stated() {
+        eprintln!("eave: downloads: {line}");
+    }
+    let mut fold = Downloads::new();
+    for e in &events {
+        fold.apply(e);
+    }
+    DOWNLOADS.with(|d| {
+        let mut map = d.borrow_mut();
+        for (i, item) in fold.items().iter().enumerate() {
+            let id = 1_000_000 + i as u32;
+            map.entry(id).or_insert(Download {
+                id,
+                url: item.url.clone(),
+                file_name: item.file_name.clone(),
+                path: item.path.clone(),
+                received: item.bytes,
+                total: item.bytes,
+                percent: 100,
+                done: true,
+                cancelled: false,
+            });
+        }
+    });
+    DOWNLOAD_LOG.with(|l| *l.borrow_mut() = Some(log));
+}
+
+fn persist_finished(d: &Download) {
+    use eave_core::browser::downloads::DownloadEvent;
+    if d.path.is_empty() {
+        return;
+    }
+    DOWNLOAD_LOG.with(|l| {
+        if let Some(log) = l.borrow_mut().as_mut() {
+            let _ = log.append(&DownloadEvent::Finished {
+                url: d.url.clone(),
+                file_name: d.file_name.clone(),
+                path: d.path.clone(),
+                bytes: d.received,
+                ts_ms: 0,
+            });
+            let _ = log.flush();
+        }
+    });
+}
+
+wrap_pdf_print_callback! {
+    struct SavePdfCallback {
+        path: String,
+    }
+
+    impl PdfPrintCallback {
+        fn on_pdf_print_finished(&self, path: Option<&CefString>, ok: ::std::os::raw::c_int) {
+            if super::host::traced() {
+                let p = path.map(|p| p.to_string()).unwrap_or_else(|| self.path.clone());
+                eprintln!("[web] print_to_pdf ok={ok} path={p}");
+            }
+        }
+    }
+}
+
+/// Save the current page as a PDF in `~/Downloads`. No preview: Alloy
+/// does not have print preview.
+pub fn print_to_pdf(tab_id: &str) {
+    let path = with_browser(tab_id, |b| {
+        let Some(host) = b.host() else { return None };
+        let url = last_url(tab_id);
+        let name = url
+            .as_deref()
+            .and_then(|u| u.split(['?', '#']).next())
+            .and_then(|u| u.rsplit('/').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("page");
+        let stem = name.trim_end_matches(".pdf");
+        let dest = download_dir().join(format!("{stem}.pdf"));
+        let dest_s = dest.to_string_lossy().into_owned();
+        let settings = PdfPrintSettings {
+            print_background: 1,
+            scale: 1.0,
+            paper_width: 8.5,
+            paper_height: 11.0,
+            ..PdfPrintSettings::default()
+        };
+        let mut cb = SavePdfCallback::new(dest_s.clone());
+        host.print_to_pdf(
+            Some(&CefString::from(dest_s.as_str())),
+            Some(&settings),
+            Some(&mut cb),
+        );
+        Some(dest_s)
+    })
+    .flatten();
+    if trace() {
+        match path {
+            Some(p) => eprintln!("[web] print_to_pdf asked -> {p}"),
+            None => eprintln!("[web] print_to_pdf: no browser"),
+        }
+    }
+    super::host::request_pump();
+}
+
 /// Where downloads go.
 ///
 /// `~/Downloads` when it exists, the home directory when it does not, and
@@ -2529,6 +2653,9 @@ wrap_download_handler! {
                 CANCELS.with(|c| {
                     c.borrow_mut().remove(&id);
                 });
+            }
+            if next.done && !next.cancelled {
+                persist_finished(&next);
             }
             // A download is chrome, not page pixels: it changes something
             // eave draws with no page frame to carry the change, which is
@@ -2781,6 +2908,19 @@ wrap_request_handler! {
                     if trace() {
                         eprintln!("[web] policy: blocked {url}");
                     }
+                    1
+                }
+                super::nav_policy::Decision::AskExternal(url) => {
+                    if trace() {
+                        eprintln!("[web] policy: ask to open {url}");
+                    }
+                    let scheme = super::nav_policy::scheme(&url).unwrap_or_default();
+                    super::ask::note_raised(super::ask::Pending {
+                        tab_id: self.tab_id.clone(),
+                        origin: from.clone().unwrap_or_else(|| url.clone()),
+                        ask: super::ask::Ask::OpenScheme { scheme, url },
+                    });
+                    bump_chrome_revision();
                     1
                 }
             }
