@@ -1,0 +1,56 @@
+name: cef-codecs
+
+# Self-hosted Chromium build of pin 151.3.18 with proprietary codecs.
+# Deliberately NOT on github-hosted macos-latest: those runners do not
+# have 200 GB free, and a checkout that wedges the runner is not a check.
+#
+# workflow_dispatch only. A push of scripts/cef-with-codecs must not
+# start a 6-hour compile. The existing .github/workflows/cef.yml still
+# gates the *public* Spotify artefact (pin + bundle identifiers).
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_dir:
+        description: 'Absolute path on the self-hosted runner with ≥200 GiB free'
+        required: true
+        type: string
+
+concurrency:
+  group: cef-codecs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: disk gate
+        run: |
+          set -euo pipefail
+          DIR="${{ inputs.download_dir }}"
+          mkdir -p "$DIR"
+          AVAIL_GIB=$(( $(df -k "$DIR" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
+          echo "free: ${AVAIL_GIB} GiB on $DIR"
+          if [ "$AVAIL_GIB" -lt 200 ]; then
+            echo "disk gate: $AVAIL_GIB GiB < 200. Refusing to start Chromium." >&2
+            exit 1
+          fi
+
+      - name: pin equality (lockfile, no framework required)
+        run: scripts/check-cef-pin.sh
+
+      - name: build CEF 151.3.18 with proprietary codecs
+        run: |
+          scripts/cef-with-codecs/build-cef-with-codecs.sh \
+            --download-dir "${{ inputs.download_dir }}"
+
+      - name: upload minimal tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: cef-151.3.18-macosarm64-minimal-codecs
+          path: ${{ inputs.download_dir }}/**/cef_binary_*_macosarm64_minimal.tar.bz2
+          if-no-files-found: error
+          retention-days: 14

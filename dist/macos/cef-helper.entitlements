@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the five helper bundles under a hardened runtime.
+
+  Deliberately NARROWER than the app's: a renderer holds a web page's code
+  and is the process an attacker reaches first, so it gets the JIT permissions
+  V8 cannot run without and nothing else. No camera, no microphone — the
+  browser process owns those and brokers them.
+
+  This is also the second reason the shared CFBundleIdentifier had to go.
+  Entitlements are attached per signing target, and a signing target is a
+  bundle; five helpers wearing the app's identifier could not be given
+  different permissions from the app even in principle.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.security.cs.allow-dyld-environment-variables</key>
+	<true/>
+	<key>com.apple.security.cs.inherit</key>
+	<false/>
+</dict>
+</plist>

@@ -1,0 +1,45 @@
+name: ci
+
+# The merge gate: the workspace suite on every push and pull request.
+#
+# This exists so a change can be reviewed without the reviewer building it,
+# which is the precondition for taking outside contributions at all.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # Costs milliseconds, downloads nothing, and catches the one drift
+      # cargo cannot: the CEF framework's version lives in a crate's BUILD
+      # METADATA, which cargo ignores in version requirements, and
+      # cef-dll-sys's own check accepts any framework older than the crate.
+      # The full CEF bundle gate is .github/workflows/cef.yml.
+      - name: cef pin consistency
+        run: scripts/check-cef-pin.sh
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Must be the whole workspace, not `-p eave-engine`: the wire tests look
+      # for `fake-agent` next to their own binary, and it only exists once
+      # eave-core's bins are built (docs/progress.md).
+      - name: test
+        run: cargo test --workspace

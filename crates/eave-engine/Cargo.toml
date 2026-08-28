@@ -1,0 +1,22 @@
+[package]
+name = "eave-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eave-core = { path = "../eave-core" }
+eave-wire = { path = "../eave-wire" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "net", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+notify = "8"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+# The engine role's process entry. The shipped app embeds the same role in
+# the `eave` binary (`eave --engine`); this standalone bin exists so wire
+# tests can spawn and kill a real engine process without building GPUI.
+[[bin]]
+name = "eave-engined"
+path = "src/bin/eave_engined.rs"

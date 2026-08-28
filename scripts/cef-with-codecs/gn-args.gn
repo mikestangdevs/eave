@@ -1,0 +1,25 @@
+# Extra GN args for a drop-in CEF that can play H.264/AAC.
+#
+# These are merged by CEF's tools/gn_args.py with:
+#   - Chromium defaults
+#   - CEF recommended defaults (is_component_build=false, …)
+#   - CEF REQUIRED args (enable_widevine=true, and on mac/win
+#     enable_cdm_host_verification / enable_cdm_storage_id / enable_rlz)
+#
+# Do not put required args here. gn_args.py asserts equality and the
+# build dies if you try to override them. proprietary_codecs and
+# ffmpeg_branding are NOT required — they default off / "Chromium" —
+# which is why the Spotify public builds omit H.264.
+#
+# Pass as one line (this file is documentation; the build script exports
+# GN_DEFINES). automate-git.py will not accept --args; see
+# cef/tools/gclient_hook.py.
+
+is_official_build = true
+is_component_build = false
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+
+# enable_widevine is required-true by CEF already. The CDM is still not
+# in the tarball: Google does not allow distributing it. Runtime fetch
+# is a separate problem (see inspect-widevine.sh and the BR1 report).

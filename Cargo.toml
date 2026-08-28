@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eave-core",
+    "crates/eave-wire",
+    "crates/eave-engine",
+    "crates/eave-app",
+]
+
+[workspace.package]
+# The single source of truth for the shipped version. `scripts/package-macos.sh`
+# reads it, and `.github/workflows/release.yml` refuses to publish when the
+# pushed tag disagrees — a build that lies about its own version is worse than
+# no build, because every bug report after it points at the wrong commit.
+version = "0.1.0"
+edition = "2021"
+
+# gpui is unusably slow unoptimized; optimize deps even in dev (zed's own
+# approach, mirrored in comet's workspace manifest).
+[profile.dev.package."*"]
+opt-level = 2
+
+# The render-path crates must hold the 16 ms frame budget in dev builds
+# too (spec 04 §Acceptance: 10k-message scroll) — the O(rows) display fold
+# is ~20× slower at opt-0. debug_assertions stay on.
+[profile.dev.package.eave-wire]
+opt-level = 2
+
+[profile.dev.package.eave-app]
+opt-level = 2
+
+# ---------------------------------------------------------------------------
+# bezel builds against ITS gpui fork; eave builds against OURS. One graph.
+#
+# bezel (github.com/crabtalk/bezel, MIT) pins gpui to `crabtalk/zed`
+# cf1b90e. eave pins `mikestangdevs/zed` 8521fc1 (`eave-line`) — the fork
+# carrying BackdropBlur, EdgeFade and the BGRA `PaintSurface` a page is drawn
+# through. Those are two different git sources for one package name, and
+# cargo will happily build BOTH: the failure is not a link error, it is two
+# incompatible type universes, so `bezel::ui`'s `Div` is not `gpui::Div` and
+# no bezel component can be a child of an eave element.
+#
+# This redirects the source. Every `gpui` that bezel's crates ask
+# `crabtalk/zed` for is served by our fork instead, so there is exactly one
+# gpui in the tree and bezel's components paint through our renderer —
+# BackdropBlur included, which is the point of adopting them at all.
+#
+# It reconciles because both forks declare `gpui` version 0.2.2 and bezel's
+# component crates (`ui`, `theme`, `motion`) depend on `gpui` alone — not on
+# `gpui_platform` or `gpui_web`, which is what keeps this to one line.
+# `cargo tree -p gpui` is the check, and Slice BZ's report records the count.
+[patch."https://github.com/crabtalk/zed"]
+gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27" }
