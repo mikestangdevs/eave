@@ -3058,7 +3058,53 @@ fn provider_kicker(info: &SessionInfo, provider_label: &str) -> String {
 
 /// Branch when the session has a worktree (`repo/branch`); otherwise the
 /// home-relative cwd. Replaces stacking a files list under the sessions.
-fn row_repo_line(info: &SessionInfo, home: Option<&str>) -> String {
+///
+/// **`group_root` is the project header standing directly above this row**
+/// (Slice AG2 #9), or `None` when the row has no header — because the rail
+/// holds one project, or because this session's checkout is not known.
+///
+/// When a header is there, the home-relative cwd is the one thing on the row
+/// that the header just said. Grouping made this line redundant, and the
+/// redundancy is not free: line three is the row's most constrained, sharing
+/// its width with the diffstat and the sharing count, so a repeated path
+/// truncates to `~/Desktop/eave…` — spending the space to say the header
+/// again AND losing the segment that would tell two rows apart. Observed in
+/// the running rail, not deduced.
+///
+/// So, under a header: the cwd that IS the root renders nothing, and a cwd
+/// beneath it renders the part the header does not cover. A worktree keeps
+/// `repo/branch` either way — a branch is never what a header says.
+fn row_repo_line(
+    info: &SessionInfo,
+    home: Option<&str>,
+    group_root: Option<&str>,
+) -> Option<String> {
+    // Not `else`-chained onto the worktree arm below: a worktree'd session
+    // is grouped by its own root like any other, and its branch is still
+    // the useful fact. Only the PATH arm is what a header can duplicate.
+    if info.worktree.is_none() {
+        if let Some(root) = group_root {
+            let cwd = info.cwd.trim_end_matches('/');
+            let root = root.trim_end_matches('/');
+            if cwd == root {
+                return None;
+            }
+            if let Some(rest) = cwd.strip_prefix(root).and_then(|r| r.strip_prefix('/')) {
+                // A non-empty remainder only. `strip_prefix` on a root that
+                // is a string prefix of a DIFFERENT directory (`/w/eave`
+                // against `/w/eave-old`) is caught by requiring the
+                // separator, which is why the `/` is stripped separately.
+                if !rest.is_empty() {
+                    return Some(rest.to_string());
+                }
+            }
+        }
+    }
+    Some(row_repo_line_full(info, home))
+}
+
+/// The un-grouped form: what line three said before there were headers.
+fn row_repo_line_full(info: &SessionInfo, home: Option<&str>) -> String {
     if let Some(wt) = info.worktree.as_ref() {
         let repo = Path::new(&wt.base)
             .file_name()
@@ -3146,6 +3192,110 @@ fn rail_shows(info: &SessionInfo, selected: Option<&str>, show_archived: bool) -
         || info.state == "awaiting_approval"
 }
 
+/// The sentence a filtered rail owes the operator (Slice AG2 #5).
+///
+/// `archived_line` is the precedent, and its reasoning transfers exactly: a
+/// list that hides rows and does not account for them reads as broken
+/// rather than as filtered, and the operator's next move is to distrust the
+/// rail instead of to clear the field.
+///
+/// **The asker clause is the part that is not decoration.** A text filter
+/// can hide a session parked on a permission question, and unlike the
+/// archive filter it may not simply let that row through — `rail_shows`
+/// can, because "archived" is not a claim about relevance, but a filter
+/// that returned unrelated rows because they happened to be asking would
+/// stop being a filter. Stating the count is the honest third option, and
+/// it is the same bargain the project header strikes when it collapses.
+fn filter_note_text(shown: usize, total: usize, hidden_askers: usize) -> String {
+    let base = format!("showing {shown} of {total}");
+    if hidden_askers > 0 {
+        format!("{base} · {hidden_askers} waiting on you hidden")
+    } else {
+        base
+    }
+}
+
+fn rail_filter_note(shown: usize, total: usize, hidden_askers: usize) -> AnyElement {
+    let asking = hidden_askers > 0;
+    rail_inset()
+        .child(
+            div()
+                .debug_selector(|| "rail-filter-note".into())
+                .w_full()
+                .px(px(theme::RAIL_HOVER_PAD))
+                .text_size(px(theme::MICRO_SIZE))
+                .line_height(px(theme::MICRO_LINE))
+                // The warning ink only when something is actually being
+                // withheld. A permanent amber count would train the eye to
+                // stop reading it, which is the one thing this line cannot
+                // afford.
+                .text_color(if asking {
+                    theme::warning()
+                } else {
+                    theme::text_tertiary()
+                })
+                .child(SharedString::from(filter_note_text(
+                    shown,
+                    total,
+                    hidden_askers,
+                ))),
+        )
+        .into_any_element()
+}
+
+/// Does this row survive the rail's text filter (Slice AG2 #5)?
+///
+/// **Matched against what the row SAYS**, not against everything the engine
+/// knows. A filter that hits a field the operator cannot see returns rows
+/// they cannot account for, which reads as the filter being broken — the
+/// same failure `archived_line` exists to prevent at the other end. So: the
+/// title, the provider, the model kicker and the path/project — every one
+/// of them is on the card.
+///
+/// Case-insensitive substring, not fuzzy. monocode fuzzy-matches; that
+/// earns its keep over hundreds of threads and costs predictability at
+/// fifteen, where a substring the operator can see is the whole point.
+///
+/// An all-whitespace needle matches everything: a field holding a stray
+/// space must not empty the rail.
+fn session_matches(info: &SessionInfo, needle: &str, home: Option<&str>) -> bool {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    let hay = [
+        info.title.clone().unwrap_or_default(),
+        info.provider.clone(),
+        info.model.clone().unwrap_or_default(),
+        short_cwd(&info.cwd, home),
+        info.checkout_root
+            .as_deref()
+            .map(strip::project_title)
+            .unwrap_or_default(),
+        info.worktree
+            .as_ref()
+            .map(|w| w.branch.clone())
+            .unwrap_or_default(),
+    ];
+    hay.iter().any(|h| h.to_lowercase().contains(&needle))
+}
+
+/// How many of the rows a filter removed were parked on the operator.
+///
+/// **The filter is allowed to hide an asking session; it is not allowed to
+/// do it silently.** `rail_shows` lets an asking row through the ARCHIVE
+/// filter, but a text filter cannot use that escape without breaking
+/// itself — type `eave` and an unrelated session would appear because it
+/// happened to be asking. So this states the number instead, and the rail
+/// says it, which is the same resolution `archived_line` reached: a
+/// filtered list must account for what it is not showing.
+fn hidden_askers(all: &[SessionInfo], needle: &str, home: Option<&str>) -> usize {
+    all.iter()
+        .filter(|s| !session_matches(s, needle, home))
+        .filter(|s| s.state == "awaiting_approval" || s.pending_approvals > 0)
+        .count()
+}
+
 /// The word an archived row wears (Stage AC), or `None` for a row that is
 /// not archived.
 ///
@@ -3167,6 +3317,187 @@ fn archived_line(info: &SessionInfo, show_archived: bool) -> Option<String> {
     } else {
         "archived".to_string()
     })
+}
+
+/// Where a state sorts when several sessions have to be spoken for by one
+/// header (Slice AG2 #3).
+///
+/// **This is a ranking, not a second vocabulary.** The rollup uses it to
+/// pick a CHILD, and the header then renders that child's own
+/// [`state_color`] and [`state_badge`] — so the word and the ink on a
+/// group can never drift from the word and the ink on the row it came
+/// from. t3code carries the same rollup as an explicit priority table
+/// beside its per-thread resolver and calls the duplication a maintenance
+/// obligation; picking a row instead of a word is how that obligation is
+/// avoided rather than accepted.
+///
+/// `awaiting_approval` outranks everything because it is the one state
+/// where the thing being waited on is the operator. Between `failed` and
+/// `unresponsive` the order decides only which word a group holding both
+/// shows; both ink `danger` either way, so nothing is hidden by the choice.
+///
+/// 0 means "no claim on attention". A group whose every child is 0 gets a
+/// header with a count and no word — see [`group_rail`].
+fn attention_rank(state: &str) -> u8 {
+    match state {
+        "awaiting_approval" => 5,
+        "failed" => 4,
+        "unresponsive" => 3,
+        "quiet" => 2,
+        "running" => 1,
+        _ => 0,
+    }
+}
+
+/// A project header in the rail: the checkout its rows share, and the one
+/// fact that must survive collapsing them.
+struct RailGroup {
+    /// The checkout root. The group's IDENTITY — collapse is keyed on it,
+    /// and it is what `TabGroup::workspace` binds to — never its label.
+    root: String,
+    /// [`strip::project_title`] of the root. What a person reads.
+    title: String,
+    count: usize,
+    /// The state of the child with the highest [`attention_rank`], when any
+    /// child has a claim at all. The header renders THIS through the same
+    /// two functions a row uses.
+    lead_state: Option<String>,
+    /// How many children are parked on the operator. Only ever rendered
+    /// when it is more than one — `waiting on you` already means "at least
+    /// one" and a `(1)` after it is noise, exactly as the row's own badge
+    /// decided (Slice K).
+    asking: usize,
+}
+
+/// The word a project header wears, if it has one to wear (Slice AG2 #3).
+///
+/// The word itself is [`state_badge`] applied to the leading child's own
+/// state — never a vocabulary of this slice's own, so a header and the row
+/// it speaks for cannot drift apart.
+///
+/// The count follows the row's rule from Slice K: it appears only when it
+/// says something the bare word does not, so one asker renders `waiting on
+/// you` and not `waiting on you (1)`.
+///
+/// **And it is gated on the WORD, not merely on the count.** `asking`
+/// counts every child with an open question, including one whose state is
+/// something else — `pending_approvals > 0` under a `running` or `failed`
+/// state is a real combination the engine can report. Ungated, a group
+/// holding two of those would render `failed (2)`, which reads as two
+/// failures and is not what the number counts. The count belongs to
+/// `waiting on you` and to nothing else.
+fn group_badge(lead_state: Option<&str>, asking: usize) -> Option<String> {
+    let word = lead_state.and_then(state_badge)?;
+    Some(if asking > 1 && lead_state == Some("awaiting_approval") {
+        format!("{word} ({asking})")
+    } else {
+        word.to_string()
+    })
+}
+
+/// One line in the rail's session list.
+enum RailEntry {
+    Header(RailGroup),
+    Row(SessionInfo),
+}
+
+/// Fold the rail's rows into projects, **without moving a single one**
+/// (Slice AG2 #2).
+///
+/// The grouping key is `checkout_root`, which the engine already stamps and
+/// already documents as the thing that makes two sessions share files. The
+/// derivation is not new either: `ui.rs` folds the same field into a
+/// `HashMap` to mint a project TAB, and `strip::project_title` /
+/// `strip::group_for_workspace` have named and looked up projects since T1.
+/// The rail is the last surface that had the key and did not use it.
+///
+/// **Order is preserved, absolutely.** Groups appear in the order of their
+/// first member and rows keep their order inside a group, so every row is
+/// still where the operator last saw it. `fold_rail` decides position once
+/// when a row arrives and then refuses to re-decide it, for a reason with a
+/// user report attached: comet ordered its rail by attention, so opening a
+/// session changed that session's state, which re-sorted the rail, which
+/// slid the row out from under the pointer that had just clicked it.
+/// Grouping is a second chance to make exactly that mistake and does not
+/// take it — a group cannot bubble because its child started running.
+///
+/// **A session with no `checkout_root` is ungrouped and keeps the top of
+/// the list, headerless.** The field is `None` when the probe has not run
+/// yet or the engine predates it, which is "we do not know", not "no
+/// project" — and a header is a stated fact. Filing an unknown under an
+/// invented name is the one thing this rail does not do.
+///
+/// **Headers appear only when they divide something.** One header over
+/// every row is a line that states what the absence of any other header
+/// already said. So: no headers unless the sessions actually fall into two
+/// or more parts, counting the ungrouped ones as a part.
+fn group_rail(sessions: Vec<SessionInfo>) -> Vec<RailEntry> {
+    // First pass: the order roots appear in, and the members of each.
+    // `Vec` of pairs rather than a map because the ORDER is the output —
+    // a `HashMap` here is how the row-shuffling bug gets in.
+    let mut order: Vec<String> = Vec::new();
+    let mut loose: Vec<SessionInfo> = Vec::new();
+    let mut members: std::collections::HashMap<String, Vec<SessionInfo>> =
+        std::collections::HashMap::new();
+    for info in sessions {
+        match info.checkout_root.clone().filter(|r| !r.is_empty()) {
+            Some(root) => {
+                if !members.contains_key(&root) {
+                    order.push(root.clone());
+                }
+                members.entry(root).or_default().push(info);
+            }
+            None => loose.push(info),
+        }
+    }
+
+    // The parts test, before any header is built: distinct roots, plus one
+    // if anything is ungrouped.
+    let parts = order.len() + usize::from(!loose.is_empty());
+    if parts < 2 {
+        let mut flat: Vec<RailEntry> = loose.into_iter().map(RailEntry::Row).collect();
+        for root in order {
+            flat.extend(
+                members
+                    .remove(&root)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(RailEntry::Row),
+            );
+        }
+        return flat;
+    }
+
+    let mut out: Vec<RailEntry> = Vec::new();
+    // Ungrouped first and unlabelled. They were at the top because
+    // `fold_rail` put them there; a header would be a claim, and there is
+    // nothing to claim.
+    out.extend(loose.into_iter().map(RailEntry::Row));
+    for root in order {
+        let children = members.remove(&root).unwrap_or_default();
+        // The lead is a CHILD, not a computed word. `max_by_key` keeps the
+        // FIRST maximum on ties, which is the child already highest in the
+        // list — so a tie is broken by the order on screen and the header
+        // never disagrees with the first row under it.
+        let lead_state = children
+            .iter()
+            .max_by_key(|s| attention_rank(&s.state))
+            .filter(|s| attention_rank(&s.state) > 0)
+            .map(|s| s.state.clone());
+        let asking = children
+            .iter()
+            .filter(|s| s.state == "awaiting_approval" || s.pending_approvals > 0)
+            .count();
+        out.push(RailEntry::Header(RailGroup {
+            title: strip::project_title(&root),
+            root,
+            count: children.len(),
+            lead_state,
+            asking,
+        }));
+        out.extend(children.into_iter().map(RailEntry::Row));
+    }
+    out
 }
 
 /// One affordance on a rail row: a hit target, an icon, and nothing else.
@@ -5729,6 +6060,10 @@ struct Shell {
     /// and no scroll POSITION is authoritative here (spec 03: the UI
     /// holds no authoritative state).
     rail_scroll: ScrollHandle,
+    /// The Projects zone's own scroller (the rail-sections split). Its own
+    /// handle because it is its own list: sharing `tabs_scroll` would mean
+    /// scrolling projects moved the tabs under them.
+    projects_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
     /// **The rail's live width (Slice D3).** `theme::RAIL_W` is only the
     /// value a data dir with no saved width starts at; this is the one the
@@ -5782,6 +6117,16 @@ struct Shell {
     /// a session, so it must survive the feed events that rebuild the
     /// rail underneath it.
     rename: Option<RenameEdit>,
+    /// The rail's text filter (Slice AG2 #5). `None` = closed; `Some("")` =
+    /// open and empty, which still shows every row — an open field is not
+    /// yet a filter.
+    ///
+    /// Deliberately NOT persisted. A collapsed group is a standing opinion
+    /// about a project; a filter is a thing you are doing right now, and a
+    /// rail that came back tomorrow still showing three of fifteen sessions
+    /// — with the field's own explanation scrolled out of mind — is the
+    /// shape of bug where the operator concludes their sessions are gone.
+    rail_filter: Option<String>,
     /// Which field the caret is blinking in, and when it last went solid.
     ///
     /// **One anchor for the whole window, carrying the field it belongs
@@ -5972,6 +6317,16 @@ struct Shell {
     zone_projects_collapsed: std::cell::Cell<bool>,
     zone_folders_collapsed: std::cell::Cell<bool>,
     zone_sessions_collapsed: std::cell::Cell<bool>,
+    /// Which PROJECT groups in the sessions zone are collapsed, by
+    /// checkout root (Slice AG2 #2). Keyed on the root and not on the
+    /// title, because two checkouts can share a last segment — `wt-c5`
+    /// under two different parents is two projects, and collapsing one
+    /// must not collapse the other.
+    ///
+    /// A set of the CLOSED ones, so a project that appears for the first
+    /// time is open: the default for a fact the operator has never had an
+    /// opinion about is to state it.
+    rail_groups_collapsed: RefCell<std::collections::HashSet<String>>,
     /// Checkout roots a project has already been asked for (Slice T1),
     /// keyed on the root rather than the session.
     ///
@@ -6148,6 +6503,8 @@ enum Field {
     Find,
     /// The rail's inline rename box.
     Rename,
+    /// The rail's session filter (Slice AG2 #5).
+    RailFilter,
 }
 
 /// One caret, for every field whose text does not wrap.
@@ -6439,6 +6796,66 @@ fn save_zone_collapsed(key: &str, collapsed: bool) {
             }
         }
         Err(e) => eprintln!("eave: cannot serialise {key}: {e}"),
+    }
+}
+
+/// The `frame.json` key holding the collapsed PROJECT groups (Slice AG2).
+///
+/// One key with a list under it, not a key per project: the roots are
+/// absolute paths the operator's machine chooses, and minting a top-level
+/// preference key per checkout would let a scratch directory leave a
+/// permanent entry in a file three other things also write.
+const GROUPS_COLLAPSED_KEY: &str = "rail_groups_collapsed";
+
+/// Which project groups were collapsed when eave last ran.
+///
+/// Unreadable, missing or malformed all mean the empty set — every group
+/// open. Same default as [`load_zone_collapsed`] and for the same reason:
+/// a broken preferences file may not hide sessions from the operator.
+fn load_groups_collapsed() -> std::collections::HashSet<String> {
+    let Some(path) = frame_prefs_path() else {
+        return Default::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Default::default();
+    };
+    v.get(GROUPS_COLLAPSED_KEY)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the collapsed set back, keeping every other key.
+///
+/// Sorted, so the file does not churn on every write purely because a
+/// `HashSet` iterates in a different order than it did last time — this
+/// file is small, human-readable and read by people diagnosing the rail.
+fn save_groups_collapsed(shut: &std::collections::HashSet<String>) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    let mut list: Vec<&String> = shut.iter().collect();
+    list.sort();
+    doc[GROUPS_COLLAPSED_KEY] = serde_json::json!(list);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!("eave: cannot save collapsed groups to {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise collapsed groups: {e}"),
     }
 }
 
@@ -8652,6 +9069,51 @@ impl Shell {
         //
         // Ahead of the caret-anchor reset for the same reason as the
         // overlay gates: nobody is typing in the composer.
+        // Slice AG2 #5: the rail's filter field, on the same terms as the
+        // rename field below it — a field you can type past is not a field.
+        // BELOW rename in priority is impossible here because the two
+        // cannot both be open: opening rename closes the filter and vice
+        // versa (`open_rail_filter` / `begin_rename`).
+        if self.rail_filter.is_some() {
+            match ks.key.as_str() {
+                "escape" => {
+                    self.rail_filter = None;
+                    cx.notify();
+                }
+                // Enter does NOT commit anything — the list is already
+                // narrowed as you type. It closes the field and KEEPS the
+                // needle, which is the shape every narrowing field has:
+                // you type, you look, you reach for the row.
+                "enter" => {
+                    cx.notify();
+                }
+                "backspace" => {
+                    if let Some(text) = self.rail_filter.as_mut() {
+                        text.pop();
+                    }
+                    cx.notify();
+                }
+                "v" if ks.modifiers.platform => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(f) = self.rail_filter.as_mut() {
+                            f.push_str(&text);
+                        }
+                        cx.notify();
+                    }
+                }
+                _ => {
+                    if let Some(ch) = ks.key_char.clone() {
+                        if !ks.modifiers.platform && !ks.modifiers.control {
+                            if let Some(f) = self.rail_filter.as_mut() {
+                                f.push_str(&ch);
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if self.rename.is_some() {
             match ks.key.as_str() {
                 "escape" => self.cancel_rename(cx),
@@ -8932,6 +9394,10 @@ impl Shell {
             || self.launcher.models.is_open()
             || self.demo.menu.is_open()
             || self.rename.is_some()
+            // Slice AG2 #5: an open filter field owns the keys exactly as
+            // rename does, and this list is what keeps the composer and
+            // the page from disagreeing about that.
+            || self.rail_filter.is_some()
     }
 
     /// A document is on screen and nothing of ours is sitting in front of
@@ -9092,6 +9558,10 @@ impl Shell {
             .find(|s| s.session_id == id)
             .and_then(|s| s.title.clone())
             .unwrap_or_default();
+        // Slice AG2 #5: the two rail fields are exclusive — both claim the
+        // keyboard in `chrome_holds_keyboard`, and two open at once gives
+        // `on_key` two live branches and the caret two owners.
+        self.rail_filter = None;
         self.rename = Some(RenameEdit {
             session_id: id,
             text,
@@ -9110,6 +9580,10 @@ impl Shell {
             .find(|n| n.bookmark.id == id)
             .and_then(|n| n.bookmark.title.clone())
             .unwrap_or_default();
+        // Slice AG2 #5: the two rail fields are exclusive — both claim the
+        // keyboard in `chrome_holds_keyboard`, and two open at once gives
+        // `on_key` two live branches and the caret two owners.
+        self.rail_filter = None;
         self.rename = Some(RenameEdit {
             session_id: id,
             text,
@@ -11403,6 +11877,9 @@ impl Shell {
         if self.find_here(cx).is_some() {
             return Some(Field::Find);
         }
+        if self.rail_filter.is_some() {
+            return Some(Field::RailFilter);
+        }
         if self.rename.is_some() {
             return Some(Field::Rename);
         }
@@ -11848,6 +12325,12 @@ impl Shell {
         // `theme::rail_rows_h`.
         let mut extra = 0usize;
         let mut active_row: Option<usize> = None;
+        // Where the Projects zone stops and Folders/Tabs begins. The rail's
+        // sections are separate scrollers (the operator's report: "each
+        // section needs to be its own scrollable section"), and this index
+        // is the cut — recorded where the folders head is emitted rather
+        // than recomputed, so the two cannot drift.
+        let mut seam_ix: Option<usize> = None;
         rows.push(self.zone_toggle(
             "zone-projects",
             ZONE_PROJECTS,
@@ -11863,6 +12346,7 @@ impl Shell {
         let mut emitted_tabs_seam = false;
         for (ix, item) in items.iter().enumerate() {
             if ix == projects && !emitted_tabs_seam {
+                seam_ix = Some(rows.len());
                 extra += self.emit_folders_and_tabs_head(
                     &mut rows,
                     folders_shut,
@@ -11934,6 +12418,7 @@ impl Shell {
             }
         }
         if !emitted_tabs_seam {
+            seam_ix = Some(rows.len());
             extra += self.emit_folders_and_tabs_head(
                 &mut rows,
                 folders_shut,
@@ -11948,12 +12433,31 @@ impl Shell {
         // consumes, so re-arming it every pass would pin the list and the
         // operator could never scroll to anything else. Index is the ROW,
         // not the strip item: a split draws two tabs as one child.
+        // The cut. Everything before the folders head is the Projects
+        // zone; everything from it on is Folders/Tabs.
+        let seam = seam_ix.unwrap_or(rows.len()).min(rows.len());
+        let tab_rows: Vec<AnyElement> = rows.split_off(seam);
+        let project_rows: Vec<AnyElement> = rows;
+        // `extra` counted the whole list. Split it the same way, so each
+        // section's height is computed from its OWN rows: the Projects zone
+        // keeps its header, Folders/Tabs keeps everything the head emitted.
+        let project_extra = 1usize.min(project_rows.len());
+        let tab_extra = extra.saturating_sub(project_extra);
+
         {
             let mut been = self.tab_scrolled_to.borrow_mut();
             match snapshot.active.as_deref() {
                 Some(active) if been.as_deref() != Some(active) => {
                     if let Some(ix) = active_row {
-                        self.tabs_scroll.scroll_to_item(ix);
+                        // The index was taken against the WHOLE list, so it
+                        // has to be re-based onto whichever section now owns
+                        // that row — scrolling the tabs list to a project's
+                        // index would jump to an unrelated tab.
+                        if ix >= seam {
+                            self.tabs_scroll.scroll_to_item(ix - seam);
+                        } else {
+                            self.projects_scroll.scroll_to_item(ix);
+                        }
                         *been = Some(active.to_string());
                     }
                 }
@@ -11962,12 +12466,49 @@ impl Shell {
             }
         }
 
+        // A SECTION each, and neither may starve the one below it.
+        //
+        // This used to be one scroll box holding Projects, Folders and Tabs
+        // together, at a definite height computed from a row count, marked
+        // `flex_none`. Measured on a rail 520 px tall it took 277 of them
+        // and left the SESSIONS list 27 px — a header and three pixels —
+        // and no amount of window height fixed it, because `flex_none` is a
+        // refusal to yield rather than a size.
+        //
+        // So: `min_h` + `max_h` + shrink instead of an exact `h`. The
+        // minimum is what keeps a scroll container from collapsing (its
+        // automatic minimum size is zero, which is the Slice D1 bug the
+        // definite height was introduced to fix — `min_h` fixes it without
+        // also making the box unable to yield). The maximum is the old
+        // computed height, so nothing GREW. And because the box can now
+        // scroll rather than clip, a row whose height the formula does not
+        // know about costs a scroll instead of an unreachable row.
         div()
             .debug_selector(|| "rail-tabs".into())
-            .flex_none()
+            .flex_shrink(1.)
+            .min_h(px(0.))
             .w_full()
             .flex()
             .flex_col()
+            .children((!project_rows.is_empty()).then(|| {
+                div()
+                    .id("projects-strip")
+                    .debug_selector(|| "projects-strip".into())
+                    .w_full()
+                    .flex_shrink(1.)
+                    .min_h(px(theme::RAIL_TAB_H))
+                    .max_h(px(theme::rail_section_h(
+                        project_rows.len().min(theme::RAIL_TABS_VISIBLE + 1),
+                    )))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.projects_scroll)
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::RAIL_ROW_GAP))
+                    .children(project_rows)
+            }))
             .child(
                 div()
                     .id("tab-strip")
@@ -11988,7 +12529,9 @@ impl Shell {
                     // twelve tabs in the journal and an empty OPEN section on
                     // screen to see it — the render-vs-measure gap the
                     // webview spike named, arriving from the other side.
-                    .h(px(theme::rail_rows_h(rows.len(), extra)))
+                    .flex_shrink(1.)
+                    .min_h(px(theme::RAIL_TAB_H))
+                    .max_h(px(theme::rail_rows_h(tab_rows.len(), tab_extra)))
                     .overflow_y_scroll()
                     .track_scroll(&self.tabs_scroll)
                     // Same reason the horizontal strip stopped propagation:
@@ -12000,7 +12543,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(theme::RAIL_ROW_GAP))
-                    .children(rows),
+                    .children(tab_rows),
             )
             .into_any_element()
     }
@@ -12546,6 +13089,247 @@ impl Shell {
             .drag_over::<TabDrag>(|style, drag, _, _| {
                 bookmark_drop_slot(style, drag.files_as_bookmark())
             })
+            .into_any_element()
+    }
+
+    /// The rail's session filter (Slice AG2 #5): a one-line control until it
+    /// is opened, the field itself after.
+    ///
+    /// Closed it costs a row and states a capability; open it costs the same
+    /// row and holds the needle. It never changes height between the two, so
+    /// opening the filter does not move the list under the pointer that just
+    /// opened it — the same rule the rename field follows for the same
+    /// reason.
+    ///
+    /// **Opening closes rename.** Both are rail text fields and both claim
+    /// the keyboard in `chrome_holds_keyboard`; two open at once would give
+    /// `on_key` two live branches and the caret two owners.
+    fn rail_filter_row(&self, caret_lit: bool, cx: &Context<Self>) -> AnyElement {
+        let open = self.rail_filter.clone();
+        rail_inset()
+            .child(
+                div()
+                    .id("rail-filter")
+                    .debug_selector(|| "rail-filter".into())
+                    .w_full()
+                    .h(px(theme::RAIL_GHOST_H))
+                    .px(px(theme::RAIL_HOVER_PAD))
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .when(open.is_none(), |d| {
+                        d.cursor_pointer()
+                            .hover_fade("rail-filter", theme::wash_rest(), theme::overlay())
+                    })
+                    // Open, the box is a box: the border is what says the
+                    // next keystroke lands here and not in the composer.
+                    // The I-beam lives on the field itself below, which is
+                    // the element that is actually typed into.
+                    .when(open.is_some(), |d| {
+                        d.border_1().border_color(theme::border_strong())
+                    })
+                    .child(icons::tagged_icon(
+                        icons::MAGNIFER,
+                        theme::ICON_STATUS,
+                        theme::text_tertiary(),
+                        "rail-filter-glyph",
+                    ))
+                    .child(match open.clone() {
+                        Some(text) => div()
+                            .id("rail-filter-box")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            // An I-beam, not a hand — this is the one part
+                            // of the control that is typed into rather than
+                            // pressed, exactly as the rename field is.
+                            .cursor_text()
+                            // And a click inside the field is not a click on
+                            // the control: without this, a pointer landing
+                            // in the box you are typing in runs the opener
+                            // again. The rename field carries the same guard
+                            // for the same reason.
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text())
+                            .child(
+                                div()
+                                    .debug_selector(|| "rail-filter-field".into())
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .child(SharedString::from(text)),
+                            )
+                            .child(caret_glyph(
+                                "rail-filter",
+                                caret_lit,
+                                theme::SMALL_LINE,
+                                theme::text(),
+                            )),
+                        // Closed: the placeholder is the label. Tertiary,
+                        // because a control nobody has used is not a fact
+                        // about any session.
+                        None => div()
+                            .id("rail-filter-box")
+                            .debug_selector(|| "rail-filter-placeholder".into())
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(theme::SMALL_SIZE))
+                            .line_height(px(theme::SMALL_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child("Filter sessions"),
+                    })
+                    // The way out, and it must be a CLICK target as well as
+                    // ⎋: the field is opened with the mouse and an operator
+                    // who opened it that way should not have to find a key
+                    // to undo it.
+                    .children(open.is_some().then(|| {
+                        div()
+                            .id("rail-filter-clear")
+                            .debug_selector(|| "rail-filter-clear".into())
+                            .size(px(theme::TAB_CLOSE))
+                            .flex_none()
+                            .rounded(px(theme::RADIUS_CHIP))
+                            .cursor_pointer()
+                            .hover_fade(
+                                "rail-filter-clear",
+                                gpui::transparent_black(),
+                                theme::overlay_strong(),
+                            )
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.rail_filter = None;
+                                cx.notify();
+                            }))
+                            .child(icons::tagged_icon(
+                                icons::CLOSE,
+                                theme::ICON_SM,
+                                theme::text_secondary(),
+                                "rail-filter-clear-glyph",
+                            ))
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.rail_filter.is_none() {
+                            // Rename and the filter are the same kind of
+                            // thing and cannot both hold the keyboard.
+                            this.rename = None;
+                            this.rail_filter = Some(String::new());
+                            cx.notify();
+                        }
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// A project header inside the Sessions zone (Slice AG2 #2/#3).
+    ///
+    /// `▸ title  n            ● waiting on you (2)`
+    ///
+    /// **The header's word and ink come from the same two functions a row
+    /// uses**, applied to a real child — `group_rail` picks the session with
+    /// the highest `attention_rank` and this renders `state_badge` and
+    /// `state_color` on that session's own state. There is deliberately no
+    /// rollup vocabulary of its own: t3code keeps one as a priority table
+    /// beside its per-thread resolver and documents that the two must be
+    /// maintained in step, which is a promise a second table cannot keep.
+    ///
+    /// The dot does not animate, even when the leading child is `running`.
+    /// A row's running dot works because a person is watching that session;
+    /// a header's would put a moving element on every project in a rail
+    /// nobody is looking at, which is what N4's idle floor exists to
+    /// prevent.
+    ///
+    /// The selector carries the ROOT, not the title: two checkouts can end
+    /// in the same segment, and `debug_bounds` resolves a selector to the
+    /// last-painted element — so title-keyed selectors would hand the
+    /// harness one project's header while it believed it had the other's.
+    fn rail_group_header(&self, g: RailGroup, collapsed: bool, cx: &Context<Self>) -> AnyElement {
+        let sel = format!("rail-group-{}", g.root);
+        let sel_id = SharedString::from(sel.clone());
+        let root = g.root.clone();
+        let badge = group_badge(g.lead_state.as_deref(), g.asking);
+        let dot = g.lead_state.as_deref().map(state_color);
+        let sel_label = sel.clone();
+        let sel_count = sel.clone();
+        let sel_badge = sel.clone();
+        let sel_chev = sel.clone();
+        rail_inset()
+            .child(
+                div()
+                    .id(sel_id)
+                    .debug_selector(move || sel.clone().into())
+                    .w_full()
+                    .h(px(theme::RAIL_GHOST_H))
+                    .px(px(theme::RAIL_HOVER_PAD))
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .cursor_pointer()
+                    .hover_fade(sel_chev.clone(), theme::wash_rest(), theme::overlay())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
+                    .child(icons::tagged_icon(
+                        if collapsed {
+                            icons::ALT_ARROW_RIGHT
+                        } else {
+                            icons::ALT_ARROW_DOWN
+                        },
+                        theme::ICON_STATUS,
+                        theme::text_tertiary(),
+                        format!("{sel_chev}-chevron"),
+                    ))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("{sel_label}-label"))
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_BODY)
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(g.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("{sel_count}-count"))
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_BODY)
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(format!("{}", g.count))),
+                    )
+                    .child(div().flex_1())
+                    .children(dot.map(|c| div().size(px(theme::STATE_DOT)).rounded_full().bg(c)))
+                    .children(badge.map(|word| {
+                        div()
+                            .debug_selector(move || format!("{sel_badge}-badge"))
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .text_color(
+                                g.lead_state
+                                    .as_deref()
+                                    .map(state_color)
+                                    .unwrap_or_else(theme::text_tertiary),
+                            )
+                            .child(SharedString::from(word))
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        {
+                            let mut shut = this.rail_groups_collapsed.borrow_mut();
+                            if !shut.remove(&root) {
+                                shut.insert(root.clone());
+                            }
+                            save_groups_collapsed(&shut);
+                        }
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -14028,7 +14812,13 @@ impl Shell {
     /// `caret_lit` is asked for in the root render pass and passed down,
     /// because this one takes `&Context` and a lease needs `&mut`. It is
     /// the rename field's, and it is false unless that field is open.
-    fn rail(&self, cx: &Context<Self>, phase: Option<f32>, caret_lit: bool) -> AnyElement {
+    fn rail(
+        &self,
+        cx: &Context<Self>,
+        phase: Option<f32>,
+        caret_lit: bool,
+        filter_caret_lit: bool,
+    ) -> AnyElement {
         // Already in draw order: `fold_rail` decided it when each row
         // arrived, and deliberately does not re-decide it here (Stage AB).
         let all = self.sessions.read(cx).sessions.clone();
@@ -14051,6 +14841,28 @@ impl Shell {
             .into_iter()
             .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
             .collect();
+        // Slice AG2 #5 — the text filter, and WHERE it runs is the design.
+        //
+        // After the archive filter, so the two compose rather than
+        // compete; and BEFORE `group_rail`, so a project header counts and
+        // speaks for what is actually under it. A header reading `wt-c5 3`
+        // over one visible row would be the collapse problem again — a
+        // stated number that does not match what the operator can see.
+        //
+        // The needle is read once. `None` (closed) and `Some("")` (open,
+        // empty) both mean "no filter", which is why `session_matches`
+        // returns true on an empty needle rather than this branching.
+        let needle = self.rail_filter.clone().unwrap_or_default();
+        let before_filter = sessions.len();
+        // Counted BEFORE the rows are dropped, because after that the
+        // information is gone — this is the number the rail owes the
+        // operator for hiding a session that is waiting on them.
+        let filtered_askers = hidden_askers(&sessions, &needle, home.as_deref());
+        let sessions: Vec<SessionInfo> = sessions
+            .into_iter()
+            .filter(|s| session_matches(s, &needle, home.as_deref()))
+            .collect();
+        let filtered_out = before_filter - sessions.len();
         // The second line aligns under the session name: dot + gap +
         // chip + gap.
         // **Slice D3: the row's lower lines indent past the STATE DOT, not
@@ -14098,14 +14910,16 @@ impl Shell {
         // an untouched window left overnight shows the ages it had when it
         // was last drawn.
         let now_ms = eave_core::journal::now_ms();
-        let rows: Vec<AnyElement> = sessions
-            .into_iter()
-            .map(|info| {
+        // Slice AG2 #2/#3. The row body is a named closure now rather than
+        // the argument to a `map`, because the loop below has to decide
+        // whether to call it at all: a row under a collapsed project header
+        // is not built. Nothing inside it changed.
+        let build_row = |info: SessionInfo, group_root: Option<&str>| -> AnyElement {
                 let is_sel = selected.as_deref() == Some(info.session_id.as_str());
                 let (glyph, provider_label) = provider_identity(&info.provider);
                 let label = row_label(&info, &provider_label);
                 let kicker = provider_kicker(&info, &provider_label);
-                let repo_line = row_repo_line(&info, home.as_deref());
+                let repo_line = row_repo_line(&info, home.as_deref(), group_root);
                 // Slice RS1: `coarse_age`, not `fmt_elapsed`. The row's
                 // corner had been rendering the transcript's turn clock —
                 // `2m 05s`, `1h 03m` — which is right where an operator
@@ -14550,30 +15364,54 @@ impl Shell {
                     // LINE THREE — branch / cwd, and the selected session's
                     // diffstat. Files no longer sit under this list; the
                     // +/− is the summary, the footer is the door.
-                    .child(
+                    //
+                    // Slice AG2 #9: the whole line is conditional now. Under
+                    // a project header the path can be redundant and
+                    // `row_repo_line` returns `None` for it — but the
+                    // diffstat and the sharing count live here too, so the
+                    // PATH going quiet may not take them with it. The line
+                    // is dropped only when it would carry nothing at all.
+                    .when(
+                        repo_line.is_some() || stat.is_some() || marks.is_some(),
+                        |row| {
+                            row.child(
                         div()
                             .pl(px(meta_indent))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(theme::SPACE_2))
-                            .child(icons::tagged_icon(
-                                icons::GIT_BRANCH,
-                                theme::ICON_STATUS,
-                                theme::text_tertiary(),
-                                format!("git-{}", info.session_id),
-                            ))
-                            .child(
+                            // The icon belongs to the PATH, not to the line:
+                            // a branch glyph with no branch beside it reads
+                            // as a fact that failed to load.
+                            .children(repo_line.map(|line| {
                                 div()
-                                    .debug_selector(|| format!("cwd-{}", info.session_id))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_2))
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .truncate()
-                                    .text_size(px(theme::DETAIL_SIZE))
-                                    .line_height(px(theme::DETAIL_LINE))
-                                    .text_color(theme::text_secondary())
-                                    .child(SharedString::from(repo_line)),
-                            )
+                                    .child(icons::tagged_icon(
+                                        icons::GIT_BRANCH,
+                                        theme::ICON_STATUS,
+                                        theme::text_tertiary(),
+                                        format!("git-{}", info.session_id),
+                                    ))
+                                    .child(
+                                        div()
+                                            .debug_selector(|| {
+                                                format!("cwd-{}", info.session_id)
+                                            })
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_size(px(theme::DETAIL_SIZE))
+                                            .line_height(px(theme::DETAIL_LINE))
+                                            .text_color(theme::text_secondary())
+                                            .child(SharedString::from(line)),
+                                    )
+                            }))
                             .children(stat.map(|(adds, dels)| {
                                 div()
                                     .id(SharedString::from(format!(
@@ -14616,6 +15454,8 @@ impl Shell {
                                     .text_color(theme::text_tertiary())
                                     .child(SharedString::from(line))
                             })),
+                            )
+                        },
                     )
                     // Stage AC: an archived row that is on screen says so,
                     // and when it is on screen because it is BLOCKED on
@@ -14851,8 +15691,40 @@ impl Shell {
                 ),
                 )
                 .into_any_element()
-            })
-            .collect();
+        };
+        // Slice AG2 #2: fold the rows into projects and walk them. The fold
+        // moves nothing — `group_rail` preserves the order `fold_rail`
+        // decided, and refuses to emit a header at all unless the sessions
+        // genuinely fall into more than one part.
+        //
+        // **A collapsed group hides rows, and that is only allowed because
+        // its header carries their worst state (#3).** The two ship
+        // together or neither ships: waku collapses project groups with no
+        // rollup, so a collapsed group there can silently swallow a session
+        // parked on a permission question. eave's own `rail_shows` already
+        // refuses to let the ARCHIVE filter do that; a collapse that did it
+        // would be the same regression through a different door.
+        let shut_groups = self.rail_groups_collapsed.borrow().clone();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut group_shut = false;
+        // The header a row sits under, for #9's subline. `None` until the
+        // first header, which is exactly right: the ungrouped rows come
+        // first and have no header to repeat.
+        let mut group_root: Option<String> = None;
+        for entry in group_rail(sessions) {
+            match entry {
+                RailEntry::Header(g) => {
+                    group_shut = shut_groups.contains(&g.root);
+                    group_root = Some(g.root.clone());
+                    rows.push(self.rail_group_header(g, group_shut, cx));
+                }
+                RailEntry::Row(info) => {
+                    if !group_shut {
+                        rows.push(build_row(info, group_root.as_deref()));
+                    }
+                }
+            }
+        }
         // No empty-state copy under Sessions. Add is the header `+`.
         // If every session is archived, the archived toggle below is the
         // reason the list is empty — restating it is noise.
@@ -14874,6 +15746,23 @@ impl Shell {
             cx,
         )];
         if !sess_shut {
+            // Slice AG2 #5. The field sits between the header and the rows,
+            // which is where a narrowing control belongs: above what it
+            // narrows, below the thing it belongs to.
+            //
+            // Shown from two sessions up. One session is not a list and a
+            // permanent control for narrowing it would be the rail's own
+            // version of the `+0 −0` this codebase refuses elsewhere — an
+            // affordance stating a capability there is no occasion to use.
+            if before_filter > 1 {
+                rows.push(self.rail_filter_row(filter_caret_lit, cx));
+            }
+            // What the filter is not showing, stated. `archived_line` is
+            // the precedent and the reason: a list that hides rows and does
+            // not account for them reads as broken rather than as filtered.
+            if filtered_out > 0 {
+                rows.push(rail_filter_note(sess_count, before_filter, filtered_askers));
+            }
             rows.extend(body);
             if archived_count > 0 {
                 let label = archived_toggle_label(archived_count, show_archived);
@@ -21429,6 +22318,7 @@ impl Render for Shell {
         // field owns the keyboard, so at most one of these is ever true.
         let caret_lit = self.caret_lit(Field::Composer, cx);
         let rename_caret_lit = self.caret_lit(Field::Rename, cx);
+        let filter_caret_lit = self.caret_lit(Field::RailFilter, cx);
         // Slice CM: the blink is decided once for the window (see `caret_lit`)
         // and handed down. The field does not ask, because asking would mean a
         // second lease on the pulse clock and a second reason for an idle
@@ -22384,7 +23274,7 @@ impl Render for Shell {
                     // agent chrome down the side of a fullscreen film is
                     // the thing every browser removes.
                     .when(!rail_collapsed && !fullscreen, |d| {
-                        d.child(self.rail(cx, pulse, rename_caret_lit))
+                        d.child(self.rail(cx, pulse, rename_caret_lit, filter_caret_lit))
                     })
                     .child(
                         // Content is a floating card on the window surface:
@@ -24208,6 +25098,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         window_key: window_key.clone(),
                         demo: DemoOverlay::default(),
                         rename: None,
+                        rail_filter: None,
                         caret: Cell::new(None),
                         launcher: LauncherUi::default(),
                         files_wait_since: Cell::new(None),
@@ -24248,6 +25139,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         zone_sessions_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_SESSIONS,
                         )),
+                        rail_groups_collapsed: RefCell::new(load_groups_collapsed()),
                         asked_to_select: RefCell::new(None),
                         closed_pages: VecDeque::new(),
                         conn: conn.clone(),
@@ -24274,6 +25166,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         zoom_hud: None,
                         zoom_hud_gen: 0,
                         rail_scroll: ScrollHandle::new(),
+                        projects_scroll: ScrollHandle::new(),
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from
                         // then on. A per-frame read would also make an
@@ -24967,6 +25860,364 @@ mod tests {
             permission_mode: None,
             rss_bytes: None,
         }
+    }
+
+    /// Slice AG2 #5. The filter matches what the ROW SAYS.
+    ///
+    /// A filter that hits a field the operator cannot see returns rows they
+    /// cannot account for, which reads as the filter being broken — the same
+    /// failure `archived_line` exists to prevent at the other end.
+    #[test]
+    fn the_filter_matches_the_facts_the_card_shows() {
+        let mut s = info("a", 100, None);
+        s.title = Some("nightly sweep".into());
+        s.model = Some("opus".into());
+        s.cwd = "/w/eave".into();
+        s.checkout_root = Some("/w/eave".into());
+
+        assert!(session_matches(&s, "sweep", None), "the title");
+        assert!(session_matches(&s, "claude", None), "the provider");
+        assert!(session_matches(&s, "opus", None), "the model kicker");
+        assert!(session_matches(&s, "eave", None), "the project");
+        assert!(session_matches(&s, "SWEEP", None), "case-insensitive");
+        assert!(!session_matches(&s, "codex", None), "matched nothing shown");
+
+        // The session id is NOT matched: it is not on the card. A row that
+        // appeared for a hex string nobody can see is the exact defect this
+        // rule prevents — so the needle here is the id and nothing else.
+        let mut hidden_id = info("zzz99999", 100, None);
+        hidden_id.title = Some("nightly sweep".into());
+        hidden_id.cwd = "/w/eave".into();
+        assert!(
+            !session_matches(&hidden_id, "zzz99999", None),
+            "the filter matched a session id, which is not on the card"
+        );
+    }
+
+    /// An empty or all-whitespace needle shows everything. A field holding a
+    /// stray space must not empty the rail — the operator would read that as
+    /// their sessions being gone, not as a filter matching nothing.
+    #[test]
+    fn a_blank_needle_hides_nothing() {
+        let s = info("a", 100, None);
+        assert!(session_matches(&s, "", None));
+        assert!(session_matches(&s, "   ", None));
+    }
+
+    /// **The clause that keeps the filter honest.** A text filter may hide a
+    /// session parked on a permission question — it has to, or typing `eave`
+    /// would surface unrelated rows because they happened to be asking. What
+    /// it may not do is hide one silently.
+    #[test]
+    fn the_rail_counts_the_askers_its_filter_hid() {
+        let mut a = info("a", 100, None);
+        a.title = Some("eave".into());
+        let mut asking = info("b", 100, None);
+        asking.title = Some("waku".into());
+        asking.state = "awaiting_approval".into();
+        asking.pending_approvals = 1;
+        let mut asking2 = info("c", 100, None);
+        asking2.title = Some("waku two".into());
+        asking2.pending_approvals = 2;
+        let all = vec![a, asking, asking2];
+
+        assert_eq!(hidden_askers(&all, "eave", None), 2, "both are hidden");
+        assert_eq!(
+            hidden_askers(&all, "waku", None),
+            0,
+            "an asker the filter KEPT is not hidden"
+        );
+        assert_eq!(hidden_askers(&all, "", None), 0, "no filter hides nothing");
+    }
+
+    /// The sentence itself. The asker clause appears only when there is one
+    /// — a permanent amber count trains the eye to stop reading it.
+    #[test]
+    fn the_filter_note_states_the_count_and_only_warns_when_it_must() {
+        assert_eq!(filter_note_text(3, 15, 0), "showing 3 of 15");
+        assert_eq!(
+            filter_note_text(3, 15, 1),
+            "showing 3 of 15 · 1 waiting on you hidden"
+        );
+    }
+
+    /// Slice AG2 #9. Line three under a project header.
+    ///
+    /// Before grouping, the home-relative cwd was the row's own fact. After
+    /// it, a header may have just said the same thing — and line three is
+    /// the row's most constrained, sharing its width with the diffstat and
+    /// the sharing count, so the repeat truncates to `~/Desktop/eave…` and
+    /// costs the segment that would tell two rows apart.
+    #[test]
+    fn a_row_does_not_repeat_the_project_its_header_just_named() {
+        let mut s = info("a", 100, None);
+        s.cwd = "/w/eave".into();
+
+        // Ungrouped: exactly what it always said.
+        assert_eq!(
+            row_repo_line(&s, None, None).as_deref(),
+            Some("/w/eave"),
+            "the un-grouped form must not change"
+        );
+        // Under its own header: the header IS the path.
+        assert_eq!(row_repo_line(&s, None, Some("/w/eave")), None);
+
+        // Beneath the root: the part the header does not cover, which is
+        // also the part that was being truncated away.
+        s.cwd = "/w/eave/crates/eave-app".into();
+        assert_eq!(
+            row_repo_line(&s, None, Some("/w/eave")).as_deref(),
+            Some("crates/eave-app")
+        );
+    }
+
+    /// **The prefix trap.** `/w/eave` is a string prefix of `/w/eave-old`,
+    /// so a bare `strip_prefix` would render that row as `-old` — a path
+    /// that does not exist, under a header it does not belong to. The
+    /// separator is required separately for exactly this reason.
+    #[test]
+    fn a_sibling_that_merely_starts_with_the_root_keeps_its_whole_path() {
+        let mut s = info("a", 100, None);
+        s.cwd = "/w/eave-old".into();
+        assert_eq!(
+            row_repo_line(&s, None, Some("/w/eave")).as_deref(),
+            Some("/w/eave-old")
+        );
+    }
+
+    /// A worktree keeps `repo/branch` under a header. A branch is never
+    /// what a header says, so there is nothing redundant to drop — and the
+    /// branch is the fact that row exists to state.
+    #[test]
+    fn a_worktree_row_still_states_its_branch_under_a_header() {
+        let mut s = info("a", 100, None);
+        s.cwd = "/w/eave".into();
+        s.worktree = Some(eave_wire::WorktreeInfo {
+            base: "/w/eave".into(),
+            branch: "eave/abcd1234".into(),
+            present: true,
+            dirty_files: Some(0),
+        });
+        assert_eq!(
+            row_repo_line(&s, None, Some("/w/eave")).as_deref(),
+            Some("eave/eave/abcd1234")
+        );
+    }
+
+    /// Slice AG2 #2/#3. A session in a named checkout, in a stated state.
+    fn in_root(id: &str, root: Option<&str>, state: &str) -> SessionInfo {
+        let mut s = info(id, 100, None);
+        s.checkout_root = root.map(str::to_string);
+        s.state = state.into();
+        if state == "awaiting_approval" {
+            s.pending_approvals = 1;
+        }
+        s
+    }
+
+    fn shape(entries: &[RailEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| match e {
+                RailEntry::Header(g) => format!("[{}]", g.title),
+                RailEntry::Row(s) => s.session_id.clone(),
+            })
+            .collect()
+    }
+
+    /// A header has to DIVIDE something. One project holding every session
+    /// means the header states exactly what the absence of any other header
+    /// already said, and spends a rail line saying it — so the rail keeps
+    /// the flat list it had before this slice.
+    #[test]
+    fn one_project_gets_no_header_at_all() {
+        let rows = vec![
+            in_root("a", Some("/w/eave"), "idle"),
+            in_root("b", Some("/w/eave"), "idle"),
+        ];
+        assert_eq!(shape(&group_rail(rows)), vec!["a", "b"]);
+    }
+
+    /// The same is true when NOTHING has a root: `checkout_root` is `None`
+    /// while the probe has not run, and a rail that sprouted headers as
+    /// those answers arrived would rearrange itself under the operator for
+    /// reasons they cannot see.
+    #[test]
+    fn no_roots_at_all_is_also_one_part() {
+        let rows = vec![in_root("a", None, "idle"), in_root("b", None, "idle")];
+        assert_eq!(shape(&group_rail(rows)), vec!["a", "b"]);
+    }
+
+    /// **The row that this slice could most easily have broken.** comet
+    /// ordered its rail by attention and had to revert it with a user
+    /// report attached: opening a session changed its state, which
+    /// re-sorted the rail, which slid the row out from under the pointer
+    /// that had just clicked it. Grouping is a second chance to make that
+    /// mistake — a group could bubble because a child started running, or
+    /// rows could come back in `HashMap` order.
+    ///
+    /// So: groups appear in the order of their FIRST member, rows keep
+    /// their order inside a group, and neither depends on state. `zed`
+    /// leads `eave` here purely because `c` was above `a`.
+    #[test]
+    fn grouping_never_moves_a_row() {
+        let rows = vec![
+            in_root("c", Some("/w/zed"), "idle"),
+            in_root("a", Some("/w/eave"), "running"),
+            in_root("d", Some("/w/zed"), "awaiting_approval"),
+            in_root("b", Some("/w/eave"), "idle"),
+        ];
+        assert_eq!(
+            shape(&group_rail(rows)),
+            vec!["[zed]", "c", "d", "[eave]", "a", "b"],
+            "groups in first-member order, rows untouched inside them"
+        );
+    }
+
+    /// `None` is "we do not know yet", not "no project". A header is a
+    /// stated fact, so an unknown gets none — and keeps the top of the
+    /// list, where `fold_rail` put it.
+    #[test]
+    fn a_rootless_session_keeps_the_top_and_gets_no_header() {
+        let rows = vec![
+            in_root("a", Some("/w/eave"), "idle"),
+            in_root("loose", None, "idle"),
+        ];
+        assert_eq!(shape(&group_rail(rows)), vec!["loose", "[eave]", "a"]);
+    }
+
+    /// #3, and the reason #2 is allowed to hide rows at all. The header
+    /// speaks with the worst child's OWN state — not a word of its own —
+    /// so a collapsed project cannot swallow a session parked on a
+    /// permission question. `running` sorts under `awaiting_approval`
+    /// even though it is the first row in the group.
+    #[test]
+    fn a_group_speaks_with_its_worst_childs_own_state() {
+        let rows = vec![
+            in_root("a", Some("/w/eave"), "running"),
+            in_root("b", Some("/w/eave"), "awaiting_approval"),
+            in_root("z", Some("/w/other"), "idle"),
+        ];
+        let entries = group_rail(rows);
+        let g = entries
+            .iter()
+            .find_map(|e| match e {
+                RailEntry::Header(g) if g.title == "eave" => Some(g),
+                _ => None,
+            })
+            .expect("a header for eave");
+        assert_eq!(g.lead_state.as_deref(), Some("awaiting_approval"));
+        // The WORD is not this slice's to invent — it is whatever the row
+        // itself would have shown.
+        assert_eq!(
+            g.lead_state.as_deref().and_then(state_badge),
+            Some("waiting on you"),
+        );
+        assert_eq!(g.count, 2);
+        assert_eq!(
+            g.asking, 1,
+            "one of the two is asking, so no count is drawn"
+        );
+    }
+
+    /// Two asking sessions is a different fact from one, and it is the fact
+    /// a COLLAPSED project has to carry — otherwise the operator opens it
+    /// expecting one question and finds two. Mirrors the row's own rule
+    /// (Slice K): the count appears only when it says something the bare
+    /// word does not.
+    #[test]
+    fn a_group_counts_its_askers_when_there_is_more_than_one() {
+        let rows = vec![
+            in_root("a", Some("/w/eave"), "awaiting_approval"),
+            in_root("b", Some("/w/eave"), "awaiting_approval"),
+            in_root("z", Some("/w/other"), "idle"),
+        ];
+        let entries = group_rail(rows);
+        let g = entries
+            .iter()
+            .find_map(|e| match e {
+                RailEntry::Header(g) if g.title == "eave" => Some(g),
+                _ => None,
+            })
+            .expect("a header for eave");
+        assert_eq!(g.asking, 2);
+    }
+
+    /// The count belongs to one word. `asking` counts children with an open
+    /// question, and a child can carry `pending_approvals > 0` under a state
+    /// that is not `awaiting_approval` — so an ungated count would render
+    /// `failed (2)`, which reads as two failures and counts something else
+    /// entirely.
+    #[test]
+    fn the_asker_count_rides_only_on_waiting_on_you() {
+        assert_eq!(
+            group_badge(Some("awaiting_approval"), 2).as_deref(),
+            Some("waiting on you (2)")
+        );
+        assert_eq!(
+            group_badge(Some("awaiting_approval"), 1).as_deref(),
+            Some("waiting on you"),
+            "a bare word already means at least one"
+        );
+        assert_eq!(
+            group_badge(Some("failed"), 2).as_deref(),
+            Some("failed"),
+            "the count leaked onto a word that does not count askers"
+        );
+        assert_eq!(group_badge(Some("idle"), 0), None, "no badge, no word");
+        assert_eq!(group_badge(None, 0), None);
+    }
+
+    /// A group with no claim on attention says nothing. `attention_rank`
+    /// returns 0 for every state that has no badge, and a header wearing a
+    /// dot for `idle` would put fifteen meaningless marks down a rail whose
+    /// whole argument is that it only speaks when it has something to say.
+    #[test]
+    fn a_quiet_group_wears_no_dot_and_no_word() {
+        let rows = vec![
+            in_root("a", Some("/w/eave"), "idle"),
+            in_root("z", Some("/w/other"), "new"),
+        ];
+        let entries = group_rail(rows);
+        // The guard, and it is not ceremony: the assertion below lives
+        // inside a `if let`, so a `group_rail` that emitted NO headers
+        // would satisfy it without executing it once. Two absence
+        // assertions passed for free in this repo on 2026-08-28 for
+        // exactly this reason.
+        let headers = entries
+            .iter()
+            .filter(|e| matches!(e, RailEntry::Header(_)))
+            .count();
+        assert_eq!(
+            headers, 2,
+            "there must be headers for the check to mean anything"
+        );
+        for e in entries {
+            if let RailEntry::Header(g) = e {
+                assert_eq!(g.lead_state, None, "{} claimed attention", g.title);
+            }
+        }
+    }
+
+    /// Two checkouts can end in the same segment. The group is bound to the
+    /// ROOT — collapse is keyed on it and so is the selector — while the
+    /// title is only what a person reads, so two `wt-c5`s are two groups.
+    #[test]
+    fn two_checkouts_sharing_a_last_segment_are_two_groups() {
+        let rows = vec![
+            in_root("a", Some("/one/wt-c5"), "idle"),
+            in_root("b", Some("/two/wt-c5"), "idle"),
+        ];
+        let entries = group_rail(rows);
+        let roots: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                RailEntry::Header(g) => Some(g.root.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roots, vec!["/one/wt-c5", "/two/wt-c5"]);
+        assert_eq!(shape(&entries), vec!["[wt-c5]", "a", "[wt-c5]", "b"]);
     }
 
     /// Stage AB. Activity decides where a row LANDS; it never decides

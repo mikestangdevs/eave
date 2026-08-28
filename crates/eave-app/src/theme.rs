@@ -2320,6 +2320,29 @@ pub fn rail_tabs_max_h() -> f32 {
     rail_tabs_h(RAIL_TABS_VISIBLE)
 }
 
+/// A plain rail section's height: `n` rows of [`RAIL_TAB_H`] and the gaps
+/// BETWEEN them, which is one fewer gap than rows.
+///
+/// [`rail_rows_h`] is not this. That one is bespoke to the combined
+/// Projects+Folders+Tabs list it was written for: it discounts a tab budget,
+/// splits rows into "tabs" and "extra", and unconditionally adds a
+/// [`rail_rule_h`] for the folders seam. Applied to the Projects section
+/// after the sections were split, it charged for a rule that section does
+/// not have and counted one row fewer than it holds — 7 px short on three
+/// projects, which is a row sliced through the middle.
+///
+/// Uniform rows, stated as such. Every row in the Projects section is
+/// `RAIL_TAB_H`: the zone header ([`RAIL_GHOST_H`]), a group head
+/// ([`GROUP_HEAD_H`]) and a tab are all that height, and two of those three
+/// are defined as `RAIL_TAB_H` precisely so this stays true.
+pub fn rail_section_h(rows: usize) -> f32 {
+    if rows == 0 {
+        return 0.0;
+    }
+    RAIL_TAB_H * rows as f32 + RAIL_ROW_GAP * (rows - 1) as f32
+}
+
+
 /// The OPEN section's height for `n` tabs — the exact height, capped at
 /// [`RAIL_TABS_VISIBLE`].
 ///
@@ -3179,13 +3202,26 @@ pub const TAB_CLOSE: f32 = PROVIDER_CHIP;
 /// fallback ellipsis.
 pub const TAB_CLOSE_W: f32 = TAB_CLOSE + SPACE_1;
 
-/// A group's head chip on the strip.
+/// A group's head row in the RAIL.
 ///
 /// Not a tab: it carries a colour and a name, has no close of its own, and
 /// is `flex_none` at its content width rather than at [`TAB_W`]. Groups are
 /// few and named short; a fixed-width group head would either clip `eave`
 /// or reserve a tab's worth of room for four characters.
-pub const GROUP_HEAD_H: f32 = TAB_H;
+///
+/// **It was [`TAB_H`] — the HORIZONTAL strip's height — and that was a
+/// leftover.** The strip moved into the rail in Slice C5/D1 and this
+/// constant did not follow, leaving the project row as the rail's only row
+/// that is not [`RAIL_TAB_H`]. That matters because [`rail_rows_h`] computes
+/// the open section's height from a row COUNT, assuming every row is
+/// `RAIL_TAB_H`: each project therefore under-counted by 3 px, so three
+/// projects made the box 9 px shorter than what was in it and hard-clipped
+/// the last tab — with no way to scroll to it, because the box was already
+/// showing everything it believed it had.
+///
+/// Measured, not deduced: `each_rail_section_scrolls_on_its_own_and_none_is_cut_off`
+/// reported the row at 27 px inside a box sized for 24 px rows.
+pub const GROUP_HEAD_H: f32 = RAIL_TAB_H;
 /// The colour swatch on a group head.
 pub const GROUP_DOT: f32 = STATE_DOT;
 

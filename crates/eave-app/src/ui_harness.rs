@@ -7183,6 +7183,128 @@ fn an_archived_row_leaves_the_rail_and_the_shelf_brings_it_back(cx: &mut TestApp
     assert!(!shown(vcx, "rail-aaaa1111"), "the shelf would not close");
 }
 
+/// **Slice AG2 #2 + #3, and the reason they are one test.**
+///
+/// Grouping earns its place by hiding rows; it is allowed to hide them only
+/// because the header keeps their worst state. So the walk collapses a
+/// project that is parked on a permission question and asserts the rows are
+/// gone AND the question is still stated. waku ships the first half without
+/// the second — a collapsed group there silently swallows a waiting session
+/// — and eave's own `rail_shows` already refuses to let the archive filter
+/// do that.
+#[gpui::test]
+fn a_collapsed_project_still_says_a_session_is_waiting_on_you(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/w/eave".into());
+    a.state = "awaiting_approval".into();
+    a.pending_approvals = 1;
+    let mut b = session("bbbb2222");
+    b.checkout_root = Some("/w/eave".into());
+    let mut z = session("cccc3333");
+    z.checkout_root = Some("/w/zed".into());
+    h.plumbing.push_rail(vec![a, b, z]);
+    vcx.run_until_parked();
+
+    // Two checkouts, so the rail divides. (One would not — see
+    // `one_project_gets_no_header_at_all`.)
+    assert!(
+        shown(vcx, "rail-group-/w/eave-label"),
+        "the rail held two checkouts and drew no project header"
+    );
+    assert!(shown(vcx, "rail-group-/w/zed-label"));
+    assert!(shown(vcx, "rail-aaaa1111"), "the asking row");
+    assert!(shown(vcx, "rail-bbbb2222"), "its neighbour");
+    assert!(
+        shown(vcx, "rail-group-/w/eave-badge"),
+        "the header said nothing about a child waiting on the operator"
+    );
+    assert!(
+        !shown(vcx, "rail-group-/w/zed-badge"),
+        "a group with nothing to say wore a word anyway"
+    );
+
+    // Collapse the project that is asking — the dangerous direction.
+    click(vcx, "rail-group-/w/eave");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "rail-aaaa1111"), "the group would not collapse");
+    assert!(!shown(vcx, "rail-bbbb2222"));
+    assert!(
+        shown(vcx, "rail-group-/w/eave-badge"),
+        "COLLAPSING SWALLOWED A SESSION PARKED ON A QUESTION — this is the \
+         whole reason #3 ships with #2"
+    );
+    // The other project is untouched: collapse is keyed on the root, so one
+    // header cannot fold another's rows.
+    assert!(
+        shown(vcx, "rail-cccc3333"),
+        "collapsing eave folded zed too"
+    );
+
+    click(vcx, "rail-group-/w/eave");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-aaaa1111"), "the group would not reopen");
+}
+
+/// **Slice AG2 #5, and the clause that keeps it honest.**
+///
+/// A text filter is allowed to hide a session parked on a permission
+/// question — it has to be, or typing a project name would surface
+/// unrelated rows because they happened to be asking. What it may not do is
+/// hide one silently, so the rail states the count. This walks both halves:
+/// the narrowing, and the sentence that accounts for it.
+#[gpui::test]
+fn the_rail_filter_narrows_and_says_what_it_hid(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut keep = session("aaaa1111");
+    keep.title = Some("eave sweep".into());
+    let mut drop = session("bbbb2222");
+    drop.title = Some("waku poll".into());
+    let mut asking = session("cccc3333");
+    asking.title = Some("waku approvals".into());
+    asking.state = "awaiting_approval".into();
+    asking.pending_approvals = 1;
+    h.plumbing.push_rail(vec![keep, drop, asking]);
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "rail-filter"), "no filter control on a real list");
+    assert!(
+        shown(vcx, "rail-filter-placeholder"),
+        "the control should read as closed before it is opened"
+    );
+    assert!(!shown(vcx, "rail-filter-note"), "nothing is filtered yet");
+    assert!(shown(vcx, "rail-aaaa1111") && shown(vcx, "rail-cccc3333"));
+
+    click(vcx, "rail-filter");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-filter-field"), "the field would not open");
+
+    // NOT "eave": the harness fixture's cwd is `/tmp/eave-harness`, so every
+    // row matches that needle — correctly, since the path is on the card.
+    // The needle has to be one only the intended row carries.
+    vcx.simulate_input("sweep");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-aaaa1111"), "the matching row went missing");
+    assert!(!shown(vcx, "rail-bbbb2222"), "a non-matching row survived");
+    assert!(
+        !shown(vcx, "rail-cccc3333"),
+        "an ASKING row survived a filter it does not match — the filter \
+         would stop being a filter"
+    );
+    assert!(
+        shown(vcx, "rail-filter-note"),
+        "THE RAIL HID A SESSION WAITING ON THE OPERATOR AND SAID NOTHING"
+    );
+
+    // ⎋ closes the field and the whole list comes back — the filter is not
+    // persisted, so there is no state left to strand the rows in.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-cccc3333"), "the rows did not come back");
+    assert!(!shown(vcx, "rail-filter-note"));
+    assert!(shown(vcx, "rail-filter-placeholder"), "the field would not close");
+}
+
 /// The shelf appears only when there is something on it, so a rail nobody
 /// has archived from looks exactly as it always did.
 #[gpui::test]
@@ -13389,6 +13511,191 @@ fn strip_with_project(
         read_only: false,
     });
     vcx.run_until_parked();
+}
+
+/// **The rail's sections are separate scrollers, and none may starve the
+/// others.**
+///
+/// The operator's report was "each section needs to be its own scrollable
+/// section and have no cut offs", against a rail showing a tab row sliced
+/// through the middle. Both halves were real and they were different bugs.
+///
+/// Measured on a 520 px rail before the fix: ONE box held Projects, Folders
+/// and Tabs at a definite height, `flex_none`, taking 277 px — and the
+/// SESSIONS list got 27 px, a header and three pixels. Being `flex_none`,
+/// no amount of window height helped, which is why the operator still saw
+/// it in fullscreen.
+///
+/// The cut-off row was a second, independent defect: `GROUP_HEAD_H` was
+/// `TAB_H` (27 px, the horizontal strip's) while `rail_rows_h` sizes the box
+/// assuming every row is `RAIL_TAB_H` (24 px), so each project under-counted
+/// by 3 px and the last tab was clipped — unreachable, because the box
+/// believed it was already showing everything.
+#[gpui::test]
+fn each_rail_section_scrolls_on_its_own_and_none_is_cut_off(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+
+    let tab = |id: &str, title: &str| page_tab(id, Some("https://example.com"), Some(title));
+    let group = |id: &str, title: &str| eave_wire::TabGroup {
+        id: id.into(),
+        title: Some(title.into()),
+        color: None,
+        collapsed: false,
+        workspace: Some(format!("/w/{title}")),
+        last_active: None,
+        created_ts_ms: 0,
+    };
+    h.plumbing.push_tabs(TabsSnapshot {
+        order: vec![
+            eave_wire::Slot::Group { id: "g1".into() },
+            eave_wire::Slot::Group { id: "g2".into() },
+            eave_wire::Slot::Group { id: "g3".into() },
+            eave_wire::Slot::Tab { id: "loose".into() },
+        ],
+        tabs: vec![
+            tab("t1", "waku tab"),
+            tab("t2", "wt-c5 tab"),
+            tab("t3", "t3code tab"),
+            tab("loose", "you - Google Search"),
+        ],
+        groups: vec![
+            group("g1", "waku"),
+            group("g2", "wt-c5"),
+            group("g3", "t3code"),
+        ],
+        group_tabs: vec![
+            ("g1".into(), vec!["t1".into()]),
+            ("g2".into(), vec!["t2".into()]),
+            ("g3".into(), vec!["t3".into()]),
+        ],
+        active: Some("loose".into()),
+        windows: Vec::new(),
+        read_only: false,
+    });
+    vcx.run_until_parked();
+
+    // Two boxes, not one. A project row and a tab row are in DIFFERENT
+    // scrollers now, which is what lets either scroll without moving the
+    // other.
+    let projects = vcx
+        .debug_bounds("projects-strip")
+        .expect("Projects has no scroller of its own");
+    let tabs = vcx.debug_bounds("tab-strip").expect("the tabs strip");
+    assert!(
+        projects.origin.y + projects.size.height <= tabs.origin.y,
+        "the two sections overlap — they are still one box"
+    );
+
+    // No row cut off by the box that holds it. This is the assertion the
+    // 27-vs-24 px mismatch failed.
+    let inside = |vcx: &mut VisualTestContext, sel: &'static str, box_: gpui::Bounds<Pixels>| {
+        let b = vcx
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} never drew"));
+        assert!(
+            b.origin.y >= box_.origin.y
+                && b.origin.y + b.size.height <= box_.origin.y + box_.size.height,
+            "{sel} sits at {:?}..{:?} inside a box running {:?}..{:?} — the \
+             row is CUT OFF by the section that is supposed to hold it",
+            b.origin.y,
+            b.origin.y + b.size.height,
+            box_.origin.y,
+            box_.origin.y + box_.size.height
+        );
+    };
+    for sel in ["group-g1", "group-g2", "group-g3", "tab-t3"] {
+        inside(vcx, sel, projects);
+    }
+    inside(vcx, "tab-loose", tabs);
+
+    // **The assertion the original defect actually fails, and it is not
+    // containment.** `debug_bounds` reports a row's position inside the
+    // scroll CONTENT, so a clipped row still measures "inside" its box —
+    // which is why the first version of this test passed against the bug it
+    // was written for. The property that broke is arithmetic: `rail_rows_h`
+    // sizes a section from a row COUNT, so the box has to be at least as
+    // tall as the rows it was sized for.
+    let reaches = |vcx: &mut VisualTestContext, last: &'static str, box_: gpui::Bounds<Pixels>| {
+        let b = vcx.debug_bounds(last).unwrap();
+        let needed = b.origin.y + b.size.height - box_.origin.y;
+        assert!(
+            box_.size.height >= needed,
+            "the section is {:?} tall but its rows run {:?} past its top — \
+             {last} is CUT OFF, by exactly the amount the height formula \
+             under-counted",
+            box_.size.height,
+            needed
+        );
+    };
+    reaches(vcx, "tab-t3", projects);
+    reaches(vcx, "tab-loose", tabs);
+}
+
+/// A section with more rows than fit stops growing and scrolls, rather than
+/// taking the height from whatever is below it.
+///
+/// This is the other half of "its own scrollable section". The cut-off half
+/// is arithmetic (see the test above); this half is the cap — without it a
+/// rail with fifteen projects would push the session list off the bottom of
+/// the window entirely, which is the failure mode the old single box had in
+/// the other direction.
+#[gpui::test]
+fn a_section_with_more_rows_than_fit_caps_and_scrolls(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+
+    let n = 15;
+    let ids: Vec<String> = (0..n).map(|i| format!("g{i}")).collect();
+    h.plumbing.push_tabs(TabsSnapshot {
+        order: ids
+            .iter()
+            .map(|id| eave_wire::Slot::Group { id: id.clone() })
+            .collect(),
+        tabs: ids
+            .iter()
+            .map(|id| page_tab(&format!("t{id}"), Some("https://example.com"), Some(id)))
+            .collect(),
+        groups: ids
+            .iter()
+            .map(|id| eave_wire::TabGroup {
+                id: id.clone(),
+                title: Some(id.clone()),
+                color: None,
+                collapsed: true,
+                workspace: Some(format!("/w/{id}")),
+                last_active: None,
+                created_ts_ms: 0,
+            })
+            .collect(),
+        group_tabs: ids
+            .iter()
+            .map(|id| (id.clone(), vec![format!("t{id}")]))
+            .collect(),
+        active: None,
+        windows: Vec::new(),
+        read_only: false,
+    });
+    vcx.run_until_parked();
+
+    let projects = vcx.debug_bounds("projects-strip").expect("projects");
+    let rail = vcx.debug_bounds("rail").expect("the rail");
+    // Fifteen collapsed projects plus the zone header is sixteen rows. The
+    // cap is what keeps that off the session list.
+    let uncapped = px(theme::rail_section_h(n + 1));
+    assert!(
+        uncapped > projects.size.height,
+        "the fixture does not overflow the cap ({uncapped:?} vs {:?}), so \
+         this test measures nothing",
+        projects.size.height
+    );
+    assert!(
+        projects.size.height < rail.size.height / 2.,
+        "the Projects section is {:?} of a {:?} rail — one zone is taking \
+         the space every other zone needs",
+        projects.size.height,
+        rail.size.height
+    );
 }
 
 /// A project is drawn ABOVE the loose tabs, whatever order the engine keeps
