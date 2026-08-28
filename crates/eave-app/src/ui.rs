@@ -3801,6 +3801,14 @@ struct TranscriptState {
     /// on a real session switch, with everything else that belongs to the
     /// session that left.
     open_tools: std::collections::HashSet<String>,
+    /// Turns the reader has expanded by hand, by the transcript row index
+    /// that opened each (Slice AT1).
+    ///
+    /// View state, exactly like `open_tools`, and kept for the same
+    /// reason: a resubscribe replays the same conversation, and a turn the
+    /// reader opened to read should not slam shut because the engine
+    /// reconnected. Dropped with everything else on a real session switch.
+    expanded_turns: Vec<usize>,
     /// Activity box: opens with the run until the header is pressed
     /// (bezel's `Takeover`). Scroll/follow pin the reasoning to its
     /// newest line.
@@ -3849,6 +3857,7 @@ impl TranscriptState {
             composer: None,
             shell: None,
             open_tools: std::collections::HashSet::new(),
+            expanded_turns: Vec::new(),
             thought: bezel::ui::widgets::Takeover::default(),
             thought_scroll: ScrollHandle::new(),
             thought_follow: bezel::ui::scroll::FollowState::new(),
@@ -3914,21 +3923,22 @@ impl TranscriptState {
         for rec in records {
             self.turn.on_record(rec, rec.ts_ms);
         }
-        let ops = self.display.update(&self.transcript);
+        // Slice AT1: the fold is decided here, inside the same fold that
+        // already rebuilds the row list — so a turn settling produces ONE
+        // splice, carried by the machinery that was already carrying the
+        // settle. No second pass, and nothing per-frame.
+        let ops = self.display.update_with(
+            &self.transcript,
+            &crate::display::FoldInput {
+                turns: &self.transcript.turns,
+                expanded: &self.expanded_turns,
+            },
+        );
         // List item count is always display rows + 1: the trailing
         // under-glass spacer (Stage H). Content splices carry indices
         // < len, so an append at old_len inserts BEFORE the spacer and
         // the spacer stays terminal without bookkeeping.
-        if ops.reset {
-            self.list.reset(self.display.len() + 1);
-        } else {
-            if let Some(range) = &ops.remeasure {
-                self.list.remeasure_items(range.clone());
-            }
-            if let Some((range, count)) = &ops.splice {
-                self.list.splice(range.clone(), *count);
-            }
-        }
+        self.apply_display_ops(&ops);
 
         // Veil bookkeeping: how much did the live message grow?
         let after_live = self.live_len();
@@ -4245,6 +4255,54 @@ items={count} rows={} frames={} ops={}",
     /// the toggle re-measures the one row it changed, which is the same
     /// remeasure-never-splice rule the fold follows (`display::diff`),
     /// applied from the other side.
+    /// Mirror one display diff onto the `ListState`.
+    ///
+    /// List item count is always display rows + 1: the trailing
+    /// under-glass spacer (Stage H). Content splices carry indices < len,
+    /// so an append at old_len inserts BEFORE the spacer and the spacer
+    /// stays terminal without bookkeeping.
+    ///
+    /// Extracted by Slice AT1 because the fold gave this a SECOND caller.
+    /// Expanding a turn is the same kind of event as a burst arriving —
+    /// the row list changed and the list must be told in minimal ops — and
+    /// two hand-written copies of that mapping is the shape where one gets
+    /// a `reset` where the other splices.
+    fn apply_display_ops(&mut self, ops: &crate::display::DiffOps) {
+        if ops.reset {
+            self.list.reset(self.display.len() + 1);
+        } else {
+            if let Some(range) = &ops.remeasure {
+                self.list.remeasure_items(range.clone());
+            }
+            if let Some((range, count)) = &ops.splice {
+                self.list.splice(range.clone(), *count);
+            }
+        }
+    }
+
+    /// Open or shut one settled turn (Slice AT1).
+    ///
+    /// A structural splice, deliberately: expanding re-splices the turn's
+    /// real rows back, and every one of them is the row it always was —
+    /// same id, same fingerprint, same cached measure. Nothing about the
+    /// fold rewrites content, so a turn that has been folded and expanded
+    /// renders bit-identically to one that never folded.
+    fn toggle_turn(&mut self, start_row: usize) {
+        if let Some(at) = self.expanded_turns.iter().position(|r| *r == start_row) {
+            self.expanded_turns.remove(at);
+        } else {
+            self.expanded_turns.push(start_row);
+        }
+        let ops = self.display.update_with(
+            &self.transcript,
+            &crate::display::FoldInput {
+                turns: &self.transcript.turns,
+                expanded: &self.expanded_turns,
+            },
+        );
+        self.apply_display_ops(&ops);
+    }
+
     fn remeasure_tool(&mut self, tool_id: &str) {
         let msg = self
             .transcript
@@ -15857,6 +15915,24 @@ impl Shell {
         if state.transcript.pending_approvals().next().is_some() {
             return None;
         }
+        // **Slice AT1, carrying waku's rule verbatim** (`waku
+        // transcript.rs:950`): a session that FAILED with its turn still
+        // marked running must not be captioned "working".
+        //
+        // The two facts are independent and both are true at once here.
+        // `closed` is set by the terminal record; the turn ledger is not
+        // closed by it, because a crashed CLI sends no `turn_completed` —
+        // so `in_turn()` stays true forever over a session that is gone.
+        // Before this guard that composed into the worst sentence the
+        // trailer can make: a live work bar and a running clock over a
+        // session that had already died, which reads as "still going" at
+        // precisely the moment the operator needs to know it stopped.
+        //
+        // The notice owns this slot when a session ends, and it says what
+        // actually happened. This arm simply gets out of its way.
+        if state.transcript.closed.is_some() {
+            return None;
+        }
         // No start seen means no honest clock to report; the indicator
         // alone still states that something is running. Never invent a
         // start time from when this process attached.
@@ -16178,6 +16254,74 @@ impl Shell {
             return div().h(px(theme::COMPOSER_CLEARANCE)).into_any_element();
         };
         let id = row.id;
+        // **Slice AT1 — the fold row, intercepted before the transcript
+        // lookup below.** A fold row's `msg` is its turn's OPENING row, so
+        // `trow` would hand back that turn's user prompt and this function
+        // would render the prompt twice. The block index is what tells the
+        // two apart (see `display::FOLD_BLOCK`).
+        if id.block == crate::display::FOLD_BLOCK {
+            let Some(summary) = state.display.fold_summary(id.msg) else {
+                return div().into_any_element();
+            };
+            let start_row = id.msg as usize;
+            let shell = state.shell.clone();
+            let sentence = summary.sentence();
+            // "Worked for 12s" when a clock covered the turn, plain
+            // "Worked" when none did. The elapsed is the SPAN's, measured
+            // between the record that opened the turn and the one that
+            // closed it — never a wall clock, so a transcript replayed
+            // tomorrow still reports what it took today.
+            let head = match summary.elapsed_ms {
+                Some(ms) => format!("Worked for {}", fmt_elapsed(ms)),
+                None => "Worked".to_string(),
+            };
+            // The failure lift (gap #6): a fold must never hide red. If
+            // anything inside failed, the row wears the danger ink and
+            // says so, whether or not the reader ever opens it.
+            let ink = if summary.has_failure {
+                theme::danger()
+            } else {
+                theme::text_tertiary()
+            };
+            let detail = if sentence.is_empty() {
+                format!("{} rows", summary.hidden)
+            } else {
+                sentence
+            };
+            let words = if summary.has_failure {
+                format!("{head} · {detail} · something failed")
+            } else {
+                format!("{head} · {detail}")
+            };
+            return Self::column(
+                div()
+                    .id(SharedString::from(format!("turn-fold-{start_row}")))
+                    .debug_selector(|| "turn-fold".into())
+                    .py(px(theme::SPACE_2))
+                    .ml(px(theme::TOOL_INDENT))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(ink)
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                            shell.update(cx, |shell, cx| {
+                                shell.transcript.update(cx, |t, cx| {
+                                    t.toggle_turn(start_row);
+                                    cx.notify();
+                                });
+                            });
+                        }
+                    })
+                    .child(SharedString::from(words)),
+            )
+            .into_any_element();
+        }
         let Some(trow) = state.transcript.rows.get(id.msg as usize) else {
             return div().into_any_element();
         };
@@ -16248,12 +16392,25 @@ impl Shell {
                 // The colour that went with each word tinted the animated
                 // dot; bezel's row takes `failed` and colours its own icon,
                 // so only the word is still eave's to choose.
-                let label = match status {
-                    ToolStatus::Running => "running…",
-                    ToolStatus::Finished if *is_error => "failed",
-                    ToolStatus::Finished => "done",
-                    ToolStatus::Interrupted => "interrupted",
-                };
+                // **Slice AT1 — the D9 deletion.** The word is gone. It
+                // used to read `running… / done / failed / interrupted`
+                // beside the tool's name, and both reference apps that
+                // removed it did so from user reports of the same thing:
+                // in a long turn the word repaints on every delta, so a
+                // column of chips flickers while nothing meaningful about
+                // any of them changed. comet cites the report by name.
+                //
+                // Nothing is lost, because nothing here was the only
+                // carrier of the fact. `tool_status_icon` already spins
+                // while running and settles when done, `is_error` already
+                // tints the row, and a FAILED tool still states its reason
+                // without being opened (Slice Z, below). What the word
+                // added on top of those was repetition — and motion.
+                //
+                // The one case the word did carry alone is a failure
+                // hidden inside a folded turn, and that is exactly what
+                // `TurnSummary::has_failure` lifts onto the collapsed row
+                // (gap #6), so the fold cannot hide red either.
                 // What the tool was ASKED to do. Until Slice V a row was
                 // the tool's name and a status word, so an agent running
                 // `cargo test --workspace` rendered "Bash  done" — the one
@@ -16309,7 +16466,7 @@ impl Shell {
                         tool_status_icon(status, *is_error),
                         SharedString::from(name.clone()),
                         detail.map(SharedString::from),
-                        Some(SharedString::from(label)),
+                        None,
                         *is_error,
                         has_body.then_some(open),
                     )
@@ -21021,9 +21178,41 @@ impl Render for Shell {
                 .flatten()
                 .or_else(|| s.worktree.as_ref().map(|w| w.branch.clone()))
         });
+        // **Slice AT1 (gap #2).** The stop affordance itself already
+        // existed; what it watched was wrong. `s.state == "running"` is
+        // the engine's SessionInfo state, and this file's own Slice N3
+        // note records why that cannot answer "is a turn live": the real
+        // CLI lingers after `turn_completed` waiting for more stdin, so it
+        // still reads `running` between turns. The button was therefore on
+        // screen over an idle session, offering to interrupt nothing.
+        //
+        // The turn ledger is the predicate that was built for this
+        // question, and it is the same one the working trailer reads — so
+        // the stop control and the "working" sentence now appear and
+        // vanish together, which is the pairing an operator reads as one
+        // state rather than two.
+        // Either witness will do, and that is the point: the button's
+        // availability is a SUPERSET of what it was, never a narrowing.
+        //
+        // `s.state == "running"` was the whole condition, and it is not
+        // quite the question being asked — this file's own Slice N3 note
+        // records that the real CLI lingers after `turn_completed` waiting
+        // for more stdin, so the engine's session state still reads
+        // `running` between turns. The turn ledger is the predicate built
+        // for "is a turn live", and it is the one the working trailer
+        // reads, so adding it pairs the stop control with the "working"
+        // sentence.
+        //
+        // It is an OR rather than a replacement on purpose. Stop is an
+        // interrupt: offering it a moment too long costs a no-op, and
+        // withholding it while an agent runs costs the operator the one
+        // control they are reaching for. `the_composer_stop_interrupts_a_
+        // running_turn` pins the engine-state half as a contract, and this
+        // slice had no business quietly retiring it.
         let session_busy = composer_session
             .as_ref()
-            .is_some_and(|s| s.state == "running");
+            .is_some_and(|s| s.state == "running")
+            || (composer_session.is_some() && self.transcript.read(cx).in_turn());
 
         // MonoCode's composer card: project + branch + meter on top, the
         // field, then + / model / access / send-or-stop. Frosted like the

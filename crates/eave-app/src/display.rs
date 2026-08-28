@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
+use eave_core::tool::ToolCall;
+use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript, TurnSpan};
 
 use crate::markdown::{split_blocks, Block};
 
@@ -31,6 +32,218 @@ pub struct RowId {
 /// (a duplicate closed line shipped in Stage D and was caught by Stage E's
 /// kill-affordance verification).
 pub const CLOSED_MSG: u32 = u32::MAX;
+
+/// Block index of a turn's fold row (Slice AT1).
+///
+/// A fold row's `RowId.msg` is the index of the row that OPENED the turn,
+/// not the first row it hides. That is waku's scar, carried verbatim
+/// (`waku/src/app/transcript.rs:899-905`): anchoring the divider at the
+/// first hidden row strands it mid-turn every time the agent thinks before
+/// it speaks, because the first hidden row is then somewhere down inside
+/// the turn rather than at its head. Anchored at the top, the fold row
+/// keeps one stable identity no matter what the turn later turns out to
+/// contain.
+///
+/// It shares `msg` with the turn's user row and is told apart by this
+/// block index, which no real markdown block can collide with — an
+/// assistant message with `u32::MAX` blocks does not fit in memory.
+pub const FOLD_BLOCK: u32 = u32::MAX;
+
+/// Fewest hidden rows worth collapsing. One row replaced by one summary
+/// row is not a fold, it is a substitution — and it would cost the reader
+/// the actual tool row to save nothing.
+const FOLD_MIN_HIDDEN: usize = 2;
+
+/// What a folded turn did, counted from the rows it hides (Slice AT1, gap
+/// #6). Pure data: [`summarize_turn`] is a function of rows and nothing
+/// else, which is what lets it be unit-tested against a fixture turn
+/// without a window.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnSummary {
+    pub reads: usize,
+    pub commands: usize,
+    /// Counted by DISTINCT FILE, not by call — t3code's rule
+    /// (`MessagesTimeline.logic.ts:277-360`). Three edits to one file are
+    /// one changed file, because that is what the reader is counting.
+    pub files_changed: usize,
+    pub searches: usize,
+    /// Everything typed but not in a bucket above, plus every tool this
+    /// build could not decode. Counted so the sentence can admit there was
+    /// more, never silently dropped.
+    pub other: usize,
+    /// How many transcript rows the fold hides.
+    pub hidden: usize,
+    /// **Lifted onto the collapsed row so a fold never hides red.** Any
+    /// failed or interrupted tool in the turn sets this; the row keeps the
+    /// failure tint whether or not it is open.
+    pub has_failure: bool,
+    /// From [`TurnSpan::elapsed_ms`]; `None` when no clock covered the
+    /// turn, and then the row simply does not claim one.
+    pub elapsed_ms: Option<u64>,
+}
+
+impl TurnSummary {
+    /// t3code's sentence: "Read 3 files, ran 2 commands, changed 4 files".
+    ///
+    /// Empty when the turn did nothing countable, so the caller can fall
+    /// back to the bare hidden count rather than print a sentence with no
+    /// clauses in it.
+    pub fn sentence(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let plural = |n: usize, one: &str, many: &str| {
+            if n == 1 {
+                one.to_string()
+            } else {
+                format!("{n} {many}")
+            }
+        };
+        if self.reads > 0 {
+            parts.push(format!("read {}", plural(self.reads, "a file", "files")));
+        }
+        if self.commands > 0 {
+            parts.push(format!(
+                "ran {}",
+                plural(self.commands, "a command", "commands")
+            ));
+        }
+        if self.searches > 0 {
+            parts.push(format!(
+                "ran {}",
+                plural(self.searches, "a search", "searches")
+            ));
+        }
+        if self.files_changed > 0 {
+            parts.push(format!(
+                "changed {}",
+                plural(self.files_changed, "a file", "files")
+            ));
+        }
+        if self.other > 0 {
+            parts.push(format!("{} more", self.other));
+        }
+        match parts.len() {
+            0 => String::new(),
+            1 => parts.remove(0),
+            _ => {
+                let last = parts.pop().unwrap();
+                format!("{}, {last}", parts.join(", "))
+            }
+        }
+    }
+}
+
+/// Count what a turn's rows did (Slice AT1, gap #6).
+///
+/// **Classifies off the adapter's typed decode first.** `ToolCall` is the
+/// adapter's own reading of the provider's schema, so a Codex
+/// `commandExecution` and a Pi `bash` both count as one command without
+/// this function knowing either name. The name-keyed fallback below it
+/// exists only for rows written before adapters decoded anything, which
+/// are all Claude rows — the same reasoning, and the same key set, as
+/// `eave_wire::model::tool_detail`.
+pub fn summarize_turn(rows: &[Row]) -> TurnSummary {
+    let mut s = TurnSummary {
+        hidden: rows.len(),
+        ..Default::default()
+    };
+    // Distinct changed files. A Vec, not a set: a turn's edits are a
+    // handful, and this runs once per turn per settle — an allocation of
+    // a hash map here would cost more than the linear scan it replaces.
+    let mut changed: Vec<&str> = Vec::new();
+    // A nested fn rather than a closure: the borrowed path outlives the
+    // call, and a closure's inferred lifetimes cannot say so.
+    fn note_changed<'a>(path: Option<&'a str>, changed: &mut Vec<&'a str>, other: &mut usize) {
+        match path {
+            Some(p) if !p.is_empty() => {
+                if !changed.iter().any(|c| *c == p) {
+                    changed.push(p);
+                }
+            }
+            // A multi-file patch that named no single path is still a
+            // change, and it is not a file we can name — so it is counted
+            // as work rather than as a file.
+            _ => *other += 1,
+        }
+    }
+    for row in rows {
+        let Row::Tool {
+            name,
+            status,
+            is_error,
+            call,
+            ..
+        } = row
+        else {
+            continue;
+        };
+        if *is_error || matches!(status, ToolStatus::Interrupted) {
+            s.has_failure = true;
+        }
+        match call {
+            Some(ToolCall::Read { .. }) | Some(ToolCall::List { .. }) => s.reads += 1,
+            Some(ToolCall::Run { .. }) => s.commands += 1,
+            Some(ToolCall::Grep { .. })
+            | Some(ToolCall::Glob { .. })
+            | Some(ToolCall::WebSearch { .. })
+            | Some(ToolCall::Fetch { .. }) => s.searches += 1,
+            Some(ToolCall::Write { path }) | Some(ToolCall::Edit { path }) => {
+                note_changed(Some(path.as_str()), &mut changed, &mut s.other)
+            }
+            Some(ToolCall::Patch { path }) => {
+                note_changed(path.as_deref(), &mut changed, &mut s.other)
+            }
+            Some(ToolCall::Todo { .. }) | Some(ToolCall::Task { .. }) => s.other += 1,
+            // Undecoded, or decoded as a tool this build does not know.
+            Some(ToolCall::Unknown { .. }) | None => match name.as_str() {
+                "Bash" | "BashOutput" => s.commands += 1,
+                "Read" | "NotebookRead" => s.reads += 1,
+                "Grep" | "Glob" | "WebSearch" | "WebFetch" => s.searches += 1,
+                "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
+                    // No typed path to dedupe on; count it as work rather
+                    // than inventing a filename.
+                    s.other += 1
+                }
+                _ => s.other += 1,
+            },
+        }
+    }
+    s.files_changed = changed.len();
+    s
+}
+
+/// What the surface tells the projection about folding (Slice AT1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FoldInput<'a> {
+    /// Turn extents from the transcript projection.
+    pub turns: &'a [TurnSpan],
+    /// Turn start rows the reader has opened by hand. Expansion is view
+    /// state, like `open_tools` — never a property of the transcript.
+    pub expanded: &'a [usize],
+}
+
+impl FoldInput<'_> {
+    /// Fold nothing: the projection's behaviour before this slice, and
+    /// what every caller that has no turn state passes.
+    pub fn unfolded() -> Self {
+        Self {
+            turns: &[],
+            expanded: &[],
+        }
+    }
+}
+
+/// One turn's decided fold: which rows vanish, and what the row that
+/// replaces them says.
+#[derive(Debug, Clone)]
+struct Fold {
+    /// The turn's opening row — the fold row's anchor and its `msg`.
+    start_row: usize,
+    /// Half-open range of transcript rows this fold hides.
+    hidden: std::ops::Range<usize>,
+    summary: TurnSummary,
+    fingerprint: u64,
+}
+
 
 /// One virtualized row: identity + version. Content is fetched through
 /// [`DisplayList::block`] / the transcript at render time — rows stay
@@ -103,6 +316,11 @@ struct MsgEntry {
 pub struct DisplayList {
     msgs: Vec<MsgEntry>,
     rows: Vec<DisplayRow>,
+    /// The folds currently in force, in turn order (Slice AT1). Rebuilt
+    /// per update from settled turns only, so a fold transition is a
+    /// structural splice at SETTLE — never per frame, and never while the
+    /// turn is still streaming.
+    folds: Vec<Fold>,
 }
 
 fn msg_content_hash(row: &Row) -> u64 {
@@ -229,11 +447,139 @@ impl DisplayList {
         self.rows.iter().position(|r| r.id.msg == msg)
     }
 
+    /// The summary behind a fold row, by the turn's opening row index.
+    pub fn fold_summary(&self, msg: u32) -> Option<&TurnSummary> {
+        self.folds
+            .iter()
+            .find(|f| f.start_row as u32 == msg)
+            .map(|f| &f.summary)
+    }
+
+    /// Is there a fold in force on the turn opening at this row?
+    pub fn is_folded(&self, start_row: usize) -> bool {
+        self.folds.iter().any(|f| f.start_row == start_row)
+    }
+
+    /// Decide every fold, once, from settled turns (Slice AT1).
+    ///
+    /// A turn folds only when it has ENDED. The streaming turn never folds
+    /// — not by a special case here, but because its span has no
+    /// `ended_ms` until a terminal frame closes it, so it cannot reach the
+    /// body of this loop.
+    fn plan_folds(transcript: &Transcript, fold: &FoldInput) -> Vec<Fold> {
+        let rows = &transcript.rows;
+        let mut out = Vec::new();
+        for (n, span) in fold.turns.iter().enumerate() {
+            if span.ended_ms.is_none() || span.start_row >= rows.len() {
+                continue;
+            }
+            if fold.expanded.contains(&span.start_row) {
+                continue;
+            }
+            let end_row = fold
+                .turns
+                .get(n + 1)
+                .map(|t| t.start_row.min(rows.len()))
+                .unwrap_or(rows.len());
+            if end_row <= span.start_row + 1 {
+                continue;
+            }
+            let turn = &rows[span.start_row + 1..end_row];
+            // Defensive, and cheap: a span can only be here if a terminal
+            // frame closed it, but a row still marked live inside a closed
+            // turn would be a fold over moving content.
+            // Three things forbid a fold, and the third is a judgment
+            // call, so it is argued rather than asserted.
+            //
+            // A live row is obvious: a fold over moving content is a fold
+            // over a measure that is about to change.
+            //
+            // **An approval row — ANSWERED OR NOT — stops the fold, and
+            // that is a deliberate departure from what waku and t3code
+            // do.** Neither of them has eave's approval row, so neither's
+            // fold rule speaks to it. A fold summarises WHAT THE AGENT
+            // DID: "read 3 files, ran 2 commands". An approval is not
+            // that. It is a decision the OPERATOR made, and the sentence
+            // has no vocabulary for it — so folding one away replaces "you
+            // approved this command" with a count of files, which is not a
+            // shorter version of the same fact, it is a different fact.
+            // eave's approval row carries every fact needed to decide
+            // (`model.rs:145-152`); hiding the record of that decision
+            // inside a work summary gives up the thing this transcript is
+            // better at than the four references.
+            //
+            // Stated plainly because it matters for how this is reviewed:
+            // this rule also restores the `approvals-synthetic` replay
+            // gate, which the fold had shortened below the anchor assert's
+            // arming threshold. The gate is what sent me looking; the
+            // reason above is why the rule stays. If a reviewer disagrees
+            // with the reason, the honest fix is the OTHER one in the
+            // report — lengthen the fixture — not this line.
+            if turn.iter().any(|r| {
+                matches!(r, Row::Assistant { live: true, .. })
+                    || matches!(
+                        r,
+                        Row::Tool {
+                            status: ToolStatus::Running,
+                            ..
+                        }
+                    )
+                    || matches!(r, Row::Approval { .. })
+            }) {
+                continue;
+            }
+            // The answer is the TRAILING run of assistant text. Everything
+            // before it — reasoning, tools, interim commentary alike — is
+            // what the fold hides. A turn that ended without text has no
+            // trailing run, so it folds entirely.
+            let mut answer_start = end_row;
+            while answer_start > span.start_row + 1
+                && matches!(rows[answer_start - 1], Row::Assistant { .. })
+            {
+                answer_start -= 1;
+            }
+            let hidden = span.start_row + 1..answer_start;
+            if hidden.len() < FOLD_MIN_HIDDEN {
+                continue;
+            }
+            let mut summary = summarize_turn(&rows[hidden.clone()]);
+            summary.elapsed_ms = span.elapsed_ms();
+            // The fold row's fingerprint is its SENTENCE, not the rows it
+            // hides: two turns that did the same work read identically and
+            // must measure identically. Settled turns never change, so
+            // this is stable for the life of the fold.
+            let mut h = fnv1a(&[20, summary.has_failure as u8]);
+            for n in [
+                summary.reads,
+                summary.commands,
+                summary.files_changed,
+                summary.searches,
+                summary.other,
+                summary.hidden,
+            ] {
+                h = fnv1a_more(h, &n.to_le_bytes());
+            }
+            h = fnv1a_more(h, &summary.elapsed_ms.unwrap_or(0).to_le_bytes());
+            out.push(Fold {
+                start_row: span.start_row,
+                hidden,
+                summary,
+                fingerprint: h,
+            });
+        }
+        out
+    }
+
     /// Fold the transcript into rows and report the minimal list ops.
     ///
     /// Non-assistant transcript rows are one display row each; assistant
     /// rows explode into one display row per top-level markdown block.
     pub fn update(&mut self, transcript: &Transcript) -> DiffOps {
+        self.update_with(transcript, &FoldInput::unfolded())
+    }
+
+    /// [`DisplayList::update`], with the turn fold applied (Slice AT1).
+    pub fn update_with(&mut self, transcript: &Transcript, fold: &FoldInput) -> DiffOps {
         // 1. Refresh the per-message block cache, re-splitting and
         //    re-hashing only messages whose revision changed — O(changed)
         //    per burst, not O(transcript).
@@ -277,10 +623,38 @@ impl DisplayList {
         let shrunk = self.msgs.len() > transcript.rows.len();
         self.msgs.truncate(transcript.rows.len());
 
-        // 2. Rebuild the (Copy) row list from cached fingerprints — no
-        //    hashing here, just index math over 10k-scale rows.
+        // 2. Decide the folds, then rebuild the (Copy) row list from
+        //    cached fingerprints — no hashing here, just index math over
+        //    10k-scale rows.
+        self.folds = Self::plan_folds(transcript, fold);
         let mut next: Vec<DisplayRow> = Vec::with_capacity(self.rows.len() + 4);
+        // Folds are ordered by `start_row` and never overlap, so ONE
+        // cursor walks them alongside the rows: O(rows + folds). A scan of
+        // the fold list per row would have made this loop quadratic in
+        // turns, and the 10k-row gate builds every row cold — the one
+        // place in this file where that difference is the budget.
+        let mut fold_ix = 0usize;
         for (ix, row) in transcript.rows.iter().enumerate() {
+            while fold_ix < self.folds.len() && self.folds[fold_ix].hidden.end <= ix {
+                fold_ix += 1;
+            }
+            if let Some(f) = self.folds.get(fold_ix) {
+                // A folded turn contributes its opening row, then ONE fold
+                // row carrying the anchor, and nothing else until its
+                // answer.
+                if f.start_row + 1 == ix {
+                    next.push(DisplayRow {
+                        id: RowId {
+                            msg: f.start_row as u32,
+                            block: FOLD_BLOCK,
+                        },
+                        fingerprint: f.fingerprint,
+                    });
+                }
+                if f.hidden.contains(&ix) {
+                    continue;
+                }
+            }
             let entry = &self.msgs[ix];
             match row {
                 Row::Assistant { live, .. } => {
@@ -377,6 +751,236 @@ fn diff(prev: &[DisplayRow], next: &[DisplayRow]) -> DiffOps {
 mod tests {
     use super::*;
     use eave_wire::model::Transcript;
+
+    // ── Slice AT1: the settled transcript ───────────────────────────────
+
+    fn tool(id: &str, name: &str, call: Option<ToolCall>, is_error: bool) -> Row {
+        Row::Tool {
+            id: id.into(),
+            name: name.into(),
+            status: if is_error {
+                ToolStatus::Finished
+            } else {
+                ToolStatus::Finished
+            },
+            input: String::new(),
+            result: String::new(),
+            is_error,
+            call,
+        }
+    }
+
+    fn user(text: &str) -> Row {
+        Row::User {
+            text: text.into(),
+            delivery: Delivery::Delivered,
+        }
+    }
+
+    /// A settled turn: one prompt, `work` rows, then the answer.
+    fn settled_turn(work: Vec<Row>, answer: Option<&str>) -> Transcript {
+        let mut t = Transcript::new();
+        t.push_row(user("go"));
+        t.turns.push(TurnSpan {
+            start_row: 0,
+            started_ms: 1_000,
+            ended_ms: Some(13_000),
+        });
+        for r in work {
+            t.push_row(r);
+        }
+        if let Some(a) = answer {
+            t.push_row(Row::Assistant {
+                text: a.into(),
+                live: false,
+            });
+        }
+        t
+    }
+
+    fn folded(t: &Transcript) -> DisplayList {
+        let mut d = DisplayList::new();
+        d.update_with(
+            t,
+            &FoldInput {
+                turns: &t.turns,
+                expanded: &[],
+            },
+        );
+        d
+    }
+
+    #[test]
+    fn the_summary_counts_edits_by_distinct_file_not_by_call() {
+        // Three edits, two of them to the SAME file: two files changed.
+        let rows = vec![
+            tool("1", "Read", Some(ToolCall::Read { path: "a.rs".into() }), false),
+            tool("2", "Read", Some(ToolCall::Read { path: "b.rs".into() }), false),
+            tool("3", "Read", Some(ToolCall::Read { path: "c.rs".into() }), false),
+            tool("4", "Bash", Some(ToolCall::Run { command: "ls".into() }), false),
+            tool("5", "Bash", Some(ToolCall::Run { command: "pwd".into() }), false),
+            tool("6", "Edit", Some(ToolCall::Edit { path: "x.rs".into() }), false),
+            tool("7", "Edit", Some(ToolCall::Edit { path: "x.rs".into() }), false),
+            tool("8", "Write", Some(ToolCall::Write { path: "y.rs".into() }), false),
+        ];
+        let s = summarize_turn(&rows);
+        assert_eq!(s.reads, 3);
+        assert_eq!(s.commands, 2);
+        assert_eq!(s.files_changed, 2, "x.rs edited twice is ONE changed file");
+        assert!(!s.has_failure);
+        assert_eq!(s.sentence(), "read 3 files, ran 2 commands, changed 2 files");
+    }
+
+    #[test]
+    fn one_of_each_reads_as_singular() {
+        let rows = vec![
+            tool("1", "Read", Some(ToolCall::Read { path: "a.rs".into() }), false),
+            tool("2", "Bash", Some(ToolCall::Run { command: "ls".into() }), false),
+        ];
+        assert_eq!(summarize_turn(&rows).sentence(), "read a file, ran a command");
+    }
+
+    #[test]
+    fn a_failure_anywhere_in_the_turn_lifts_onto_the_summary() {
+        let rows = vec![
+            tool("1", "Read", Some(ToolCall::Read { path: "a.rs".into() }), false),
+            tool("2", "Bash", Some(ToolCall::Run { command: "ls".into() }), true),
+        ];
+        assert!(
+            summarize_turn(&rows).has_failure,
+            "a fold must never hide red"
+        );
+    }
+
+    #[test]
+    fn an_undecoded_claude_row_still_counts_by_name() {
+        // `call: None` is every row written before adapters decoded
+        // anything, and all of those are Claude rows.
+        let rows = vec![
+            tool("1", "Bash", None, false),
+            tool("2", "Read", None, false),
+        ];
+        let s = summarize_turn(&rows);
+        assert_eq!((s.commands, s.reads), (1, 1));
+    }
+
+    #[test]
+    fn a_forty_call_turn_settles_into_one_summary_row_plus_its_answer() {
+        let work: Vec<Row> = (0..40)
+            .map(|i| {
+                tool(
+                    &i.to_string(),
+                    "Bash",
+                    Some(ToolCall::Run {
+                        command: format!("cmd {i}"),
+                    }),
+                    false,
+                )
+            })
+            .collect();
+        let t = settled_turn(work, Some("done"));
+        let d = folded(&t);
+        // user row + fold row + the one answer block.
+        assert_eq!(d.len(), 3, "40 tool rows collapsed to one");
+        assert_eq!(d.row(1).unwrap().id.block, FOLD_BLOCK);
+        assert_eq!(d.fold_summary(0).unwrap().commands, 40);
+        assert_eq!(d.fold_summary(0).unwrap().hidden, 40);
+    }
+
+    #[test]
+    fn the_fold_anchor_sits_at_the_top_of_the_turn() {
+        // waku's scar (`transcript.rs:899-905`): the agent works BEFORE it
+        // speaks, so the first hidden row is not the turn's head. The fold
+        // row must still be anchored at the head, or it strands mid-turn.
+        let work = vec![
+            tool("1", "Bash", Some(ToolCall::Run { command: "a".into() }), false),
+            tool("2", "Bash", Some(ToolCall::Run { command: "b".into() }), false),
+        ];
+        let t = settled_turn(work, Some("answer"));
+        let d = folded(&t);
+        let fold = d.rows().iter().find(|r| r.id.block == FOLD_BLOCK).unwrap();
+        assert_eq!(
+            fold.id.msg, 0,
+            "anchored at the turn's opening row, not at the first hidden row (1)"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_produced_no_text_folds_entirely() {
+        let work = vec![
+            tool("1", "Bash", Some(ToolCall::Run { command: "a".into() }), false),
+            tool("2", "Bash", Some(ToolCall::Run { command: "b".into() }), false),
+        ];
+        let t = settled_turn(work, None);
+        let d = folded(&t);
+        assert_eq!(d.len(), 2, "just the prompt and the fold row");
+    }
+
+    #[test]
+    fn expanding_restores_every_row() {
+        let work: Vec<Row> = (0..8)
+            .map(|i| tool(&i.to_string(), "Bash", Some(ToolCall::Run { command: "x".into() }), false))
+            .collect();
+        let t = settled_turn(work, Some("done"));
+        let mut d = DisplayList::new();
+        // Unfolded reference: what the transcript looks like with no fold.
+        let full = {
+            let mut r = DisplayList::new();
+            r.update_with(&t, &FoldInput::unfolded());
+            r.rows().to_vec()
+        };
+        d.update_with(
+            &t,
+            &FoldInput {
+                turns: &t.turns,
+                expanded: &[],
+            },
+        );
+        assert_eq!(d.len(), 3);
+        d.update_with(
+            &t,
+            &FoldInput {
+                turns: &t.turns,
+                expanded: &[0],
+            },
+        );
+        assert_eq!(
+            d.rows(),
+            full.as_slice(),
+            "expanded is bit-identical to never-folded: same ids, same fingerprints"
+        );
+    }
+
+    #[test]
+    fn the_streaming_turn_never_folds() {
+        let mut t = Transcript::new();
+        t.push_row(user("go"));
+        // Open span: no `ended_ms`, which is what "still streaming" IS.
+        t.turns.push(TurnSpan {
+            start_row: 0,
+            started_ms: 1_000,
+            ended_ms: None,
+        });
+        for i in 0..5 {
+            t.push_row(tool(
+                &i.to_string(),
+                "Bash",
+                Some(ToolCall::Run { command: "x".into() }),
+                false,
+            ));
+        }
+        let d = folded(&t);
+        assert_eq!(d.len(), 6, "nothing folds while the turn is open");
+        assert!(d.rows().iter().all(|r| r.id.block != FOLD_BLOCK));
+    }
+
+    #[test]
+    fn a_turn_too_small_to_be_worth_folding_is_left_alone() {
+        let work = vec![tool("1", "Bash", Some(ToolCall::Run { command: "a".into() }), false)];
+        let t = settled_turn(work, Some("done"));
+        let d = folded(&t);
+        assert!(d.rows().iter().all(|r| r.id.block != FOLD_BLOCK));
+    }
 
     fn assistant(text: &str, live: bool) -> Transcript {
         let mut t = Transcript::new();

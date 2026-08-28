@@ -157,6 +157,44 @@ pub enum Row {
     },
 }
 
+/// One turn's extent in [`Transcript::rows`], with the only clock a fold
+/// can honestly read.
+///
+/// **Why this lives here and not in the app.** A settled turn's duration
+/// is not reconstructible from `rows` alone — a `Row` carries no time —
+/// and the records that *do* carry `ts_ms` are consumed here, in `apply`,
+/// which is the one place that knows both the timestamp and the row index
+/// it just produced. Deriving it a second time in the surface would mean a
+/// second copy of "what opens a turn", and this codebase has already paid
+/// for that once: see the note on [`crate::model::Transcript`]'s sibling
+/// in `eave_core::turn`, written after `attention.rs` and `ui.rs` kept two
+/// turn counters that disagreed.
+///
+/// No protocol change: nothing new is journalled, sent, or asked of any
+/// adapter. This is the existing projection recording, for itself, a fact
+/// it was already being handed and throwing away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnSpan {
+    /// Index in `rows` of the row that opened this turn — always the
+    /// `Row::User` the prompt produced.
+    pub start_row: usize,
+    /// The opening record's `ts_ms`, not a wall clock: a reader replaying
+    /// history must report the turn's real age, not the age of its own
+    /// subscription.
+    pub started_ms: u64,
+    /// `None` while the turn is still open. An UNANNOUNCED turn is closed
+    /// by nothing on the wire, so it stays `None` forever and never folds
+    /// — the conservative half of that trade, taken deliberately.
+    pub ended_ms: Option<u64>,
+}
+
+impl TurnSpan {
+    /// How long the turn ran, once it has ended.
+    pub fn elapsed_ms(&self) -> Option<u64> {
+        self.ended_ms.map(|e| e.saturating_sub(self.started_ms))
+    }
+}
+
 /// One session's projected transcript plus its resume cursor.
 #[derive(Debug, Default)]
 pub struct Transcript {
@@ -221,6 +259,13 @@ pub struct Transcript {
     /// When the first thought chunk of this turn arrived, so the activity
     /// header can say how long it thought without inventing a clock.
     pub thought_started_ms: Option<u64>,
+    /// Turn extents, in order, maintained by `apply` (Slice AT1).
+    ///
+    /// Only turns eave itself opened with a prompt appear here. A turn the
+    /// agent started on its own has no `UserSent` to anchor it, so it gets
+    /// no span and is never folded — stating less rather than guessing a
+    /// boundary that is not on the wire.
+    pub turns: Vec<TurnSpan>,
     rev_counter: u64,
 }
 
@@ -255,7 +300,9 @@ impl Transcript {
                     });
                 }
             }
+            let rows_before = self.rows.len();
             self.apply_event(&rec.event);
+            self.note_turn(rec, rows_before);
             self.cursor = Some(Cursor {
                 epoch,
                 seq: rec.seq,
@@ -281,6 +328,46 @@ impl Transcript {
         self.rev_counter += 1;
         self.rows.push(row);
         self.revs.push(self.rev_counter);
+    }
+
+    /// Maintain [`Transcript::turns`] alongside the row fold (Slice AT1).
+    ///
+    /// Called with the row count from *before* the event was applied, so
+    /// the row a `UserSent` just pushed is identified by index rather than
+    /// by re-deciding what a prompt row looks like.
+    fn note_turn(&mut self, rec: &Record, rows_before: usize) {
+        match &rec.event {
+            JournalEvent::UserSent { .. } => {
+                // Guarded on the row actually appearing: the span must
+                // point at a row that exists, or the fold would bound a
+                // turn by an index into nothing.
+                if self.rows.len() > rows_before {
+                    self.turns.push(TurnSpan {
+                        start_row: rows_before,
+                        started_ms: rec.ts_ms,
+                        ended_ms: None,
+                    });
+                }
+            }
+            JournalEvent::TurnInterrupted { .. } | JournalEvent::Closed { .. } => {
+                self.close_turn(rec.ts_ms)
+            }
+            JournalEvent::Provider {
+                event: SessionEvent::TurnCompleted { .. },
+            } => self.close_turn(rec.ts_ms),
+            _ => {}
+        }
+    }
+
+    /// End the open turn, if one is open. First closer wins: a turn
+    /// interrupted and then reported complete ended when it was
+    /// interrupted, which is when the work stopped.
+    fn close_turn(&mut self, ts_ms: u64) {
+        if let Some(t) = self.turns.last_mut() {
+            if t.ended_ms.is_none() {
+                t.ended_ms = Some(ts_ms);
+            }
+        }
     }
 
     fn apply_event(&mut self, event: &JournalEvent) {
