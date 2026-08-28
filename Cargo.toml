@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eave-core",
+    "crates/eave-wire",
+    "crates/eave-engine",
+    "crates/eave-app",
+]
+
+[workspace.package]
+# The single source of truth for the shipped version. `scripts/package-macos.sh`
+# reads it, and `.github/workflows/release.yml` refuses to publish when the
+# pushed tag disagrees — a build that lies about its own version is worse than
+# no build, because every bug report after it points at the wrong commit.
+version = "0.1.0"
+edition = "2021"
+
+# gpui is unusably slow unoptimized; optimize deps even in dev (zed's own
+# approach, mirrored in comet's workspace manifest).
+[profile.dev.package."*"]
+opt-level = 2
+
+# The render-path crates must hold the 16 ms frame budget in dev builds
+# too (spec 04 §Acceptance: 10k-message scroll) — the O(rows) display fold
+# is ~20× slower at opt-0. debug_assertions stay on.
+[profile.dev.package.eave-wire]
+opt-level = 2
+
+[profile.dev.package.eave-app]
+opt-level = 2

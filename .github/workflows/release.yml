@@ -1,0 +1,98 @@
+name: release
+
+# Build a macOS release artifact and publish it:
+#   - eave-<version>-macos-<arch>.dmg        the user download
+#   - eave-<version>-macos-<arch>-app.tar.gz the bare bundle, for a future
+#                                            in-place updater
+#
+# Trigger: push a tag `v<version>` that MATCHES [workspace.package].version in
+# Cargo.toml (bump it in the same commit). The version guard below is the
+# whole point of the tag form — a build that reports a version it was not cut
+# from sends every later bug report to the wrong commit.
+#
+# macOS-only for now. eave is a native macOS app (gpui + Metal, CoreFoundation
+# FFI for the reduce-motion preference); there is no Linux target to package.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest # Apple silicon
+    env:
+      CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          ws="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
+                sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          if [[ "$tag" != "$ws" ]]; then
+            echo "tag v$tag does not match [workspace.package].version $ws" >&2
+            exit 1
+          fi
+          echo "version $ws"
+
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # gpui builds from a git pin and takes minutes cold; without this every
+      # release pays that cost again.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: import Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pw="$(uuidgen)"
+          security create-keychain -p "$pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$pw" "$keychain"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$pw" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: notary key
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          printf '%s' "$AC_API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          echo "NOTARY_KEY_ID=$AC_API_KEY_ID" >> "$GITHUB_ENV"
+          echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID" >> "$GITHUB_ENV"
+
+      - name: package
+        run: scripts/package-macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ runner.arch }}
+          path: |
+            target/package/*.dmg
+            target/package/*-app.tar.gz
+          if-no-files-found: error
+
+      - name: publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/package/*.dmg
+            target/package/*-app.tar.gz
+          generate_release_notes: true

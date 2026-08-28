@@ -1,0 +1,6 @@
+/target
+.DS_Store
+/docs-shots
+
+# Agent scratch: worktrees and session state, never part of the tree.
+.claude/

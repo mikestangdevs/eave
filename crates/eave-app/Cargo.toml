@@ -1,0 +1,76 @@
+[package]
+name = "eave-app"
+version.workspace = true
+edition.workspace = true
+
+# One binary, two roles: `eave` (GPUI shell) / `eave --engine` (spec 01
+# §Topology, comet-style).
+[[bin]]
+name = "eave"
+path = "src/main.rs"
+
+[dependencies]
+eave-core = { path = "../eave-core" }
+eave-wire = { path = "../eave-wire" }
+eave-engine = { path = "../eave-engine" }
+
+# gpui — the wingleeio/zed fork (comet's), pinned to the FIXED rev comet
+# ships: upstream base f14fea9 (our previous no-fork pin) + a 17-commit
+# rebased stack. Decision 2026-08-17 reversing the no-fork rule (spec 03
+# §No-fork consequences, 04 ledger): window vibrancy blurs only what is
+# behind the WINDOW; in-app translucent depth needs the BackdropBlur
+# scene primitive, which upstream does not have. NEVER pin a branch —
+# `cargo update` silently moving the renderer is waku's failure mode.
+# Frozen pin, not chasing upstream; rebase-classify before any bump.
+# All 17 commits over f14fea9 (verified `git log f14fea9..5d1f83d`):
+#   [permanent product primitives — survive any upstream bump]
+#   14baea0 EdgeFade — scoped per-primitive vertical fade for scroll edges
+#   a6c1ad5 BackdropBlur primitive, horizontal EdgeFade, macOS glass fixes
+#   9199c39 per-edge EdgeFade bands (band_top/band_bottom)
+#   81f3684 quadratic ease-in on EdgeFade ramps
+#   a0d3f09 delayed-knee quad fade — solid fills never outlive glyphs
+#   ef2f35c per-pixel EdgeFade for quads and images (metal + wgpu)
+#   5d1f83d horizontal per-pixel EdgeFade for quads/images (pin tip)
+#   a5b59b5 object-fit crops via atlas-tile UVs (also Porter-Duff, below)
+#   b687328 ImageSource::evict + App::peek_asset (frees atlas tiles)
+#   ac135eb MTLDevice.currentAllocatedSize in COMET_GPU_STATS
+#   [upstream-fixable — drop each if upstream lands its own fix]
+#   a5d7d36 don't wrap before closing punctuation (LineWrapper)
+#   a6bf17c same wrap rule applied to shaped text (line_layout copy)
+#   9b672fa bound renderer GPU memory (region-sized backdrop-blur scratch,
+#           idle release of intermediates, instance-pool shrink)
+#   f596cde destination alpha on transparent windows (Porter-Duff OVER)
+#   8a8954c macOS 26 blur — UnderWindowBackground material (macOS 26
+#           stopped vending CABackdropLayer for Selection)
+#   [stack bookkeeping]
+#   53518c0 merge: edge-fade line into comet-line
+#   236f664 merge: danperks transparent-window alpha-blend PR
+# `runtime_shaders` avoids a build-time Metal toolchain dependency;
+# `font-kit` is the macOS text system.
+gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
+
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+futures = "0.3"
+serde_json = "1"
+libc = "0.2"
+
+# Stage J UI harness: gpui's own test scaffolding (TestAppContext /
+# VisualTestContext, the deterministic seeded scheduler, synthetic
+# input, `debug_bounds`). Same git+rev as the runtime dependency, so
+# cargo unifies them — `cargo test` builds gpui once WITH the feature,
+# `cargo build` once without. `.debug_selector()` calls compile to a
+# no-op in production builds (gpui elements/div.rs cfg gate).
+[dev-dependencies]
+gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
+    "test-support",
+] }
+# Slice P3: the icon-parse test uses the SAME parser gpui uses at runtime,
+# pinned to the version the fork's workspace pins (see the fork's root
+# Cargo.toml). A substring check for `viewBox=` would pass on a file whose
+# path data is malformed; this will not. Same version => cargo unifies it
+# with gpui's copy, so it costs no extra compile.
+usvg = { version = "0.46.0", default-features = false }
