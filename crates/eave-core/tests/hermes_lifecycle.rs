@@ -342,7 +342,9 @@ async fn a_tool_call_round_trip_reports_both_ends() {
     assert!(
         matches!(
             done.last().unwrap(),
-            SessionEvent::ToolUseFinished { id, result, is_error: false }
+            SessionEvent::ToolUseFinished { id, result, is_error: false,
+                diff: None,
+            }
                 if id == "call-1" && result.contains("42 passed")
         ),
         "{:?}",
@@ -366,7 +368,9 @@ async fn a_tool_left_open_at_turn_end_is_closed_with_the_reason() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            SessionEvent::ToolUseFinished { id, result, is_error: true }
+            SessionEvent::ToolUseFinished { id, result, is_error: true,
+                diff: None,
+            }
                 if id == "call-orphan" && result.contains("turn ended")
         )),
         "an unresolved tool must be closed with a stated reason: {events:?}"

@@ -234,11 +234,18 @@ impl AcpStream {
                     }
                 };
                 self.outstanding.retain(|o| o != &id);
+                let content = update.get("content");
                 vec![SessionEvent::ToolUseFinished {
                     id,
-                    result: cap_payload(&flatten_content(update.get("content"))),
+                    result: cap_payload(&flatten_content(content)),
                     // The agent's own verdict, not an inference from text.
                     is_error,
+                    // Slice AG1 #4: keep the OTHER half of the diff block.
+                    // `flatten_content` above takes `newText` as the result
+                    // and is right to — what the file became is what the
+                    // tool returned. This keeps the before-text beside it
+                    // so a row can draw the change rather than the outcome.
+                    diff: first_diff(content),
                 }]
             }
             // Slice CC: ACP's own context gauge. `used` is "Tokens
@@ -329,6 +336,38 @@ fn tool_input(input: ToolInput, update: &Value) -> String {
 /// (terminal refs, block types added later) is kept as its own JSON, so
 /// the record still says what happened instead of silently becoming an
 /// empty string.
+/// The FIRST `{type:"diff", path, oldText, newText}` block in a tool call's
+/// content, as a [`ToolDiff`] (Slice AG1 #4).
+///
+/// **First, not merged.** An agent may report several diffs in one call.
+/// Concatenating them would invent a change nobody made — two hunks in
+/// different files are not one diff — and picking the largest would make
+/// the row's meaning depend on content size. The first is the one the
+/// agent led with, and a row that shows one honest change beats a row that
+/// shows a synthesised one. A multi-file edit still says what it did
+/// through its result text.
+///
+/// `oldText` absent is NOT the same as absent-diff: ACP omits it when the
+/// tool created the file, so it reads as empty and the row draws a pure
+/// addition, which is what happened.
+pub fn first_diff(content: Option<&Value>) -> Option<crate::events::ToolDiff> {
+    let items = content.and_then(Value::as_array)?;
+    items.iter().find_map(|item| {
+        if item.get("type").and_then(Value::as_str) != Some("diff") {
+            return None;
+        }
+        Some(crate::events::ToolDiff {
+            path: item.get("path").and_then(Value::as_str)?.to_string(),
+            old_text: cap_payload(
+                item.get("oldText").and_then(Value::as_str).unwrap_or(""),
+            ),
+            new_text: cap_payload(
+                item.get("newText").and_then(Value::as_str).unwrap_or(""),
+            ),
+        })
+    })
+}
+
 pub fn flatten_content(content: Option<&Value>) -> String {
     let Some(items) = content.and_then(Value::as_array) else {
         return String::new();

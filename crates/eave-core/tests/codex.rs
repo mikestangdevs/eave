@@ -498,7 +498,9 @@ async fn tool_calls_count_in_and_back_out_and_reasoning_does_not() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            SessionEvent::ToolUseFinished { id, result, is_error: false }
+            SessionEvent::ToolUseFinished { id, result, is_error: false,
+                diff: None,
+            }
                 if id == "c1" && result.contains("exit 0") && result.contains("hello")
         )),
         "{events:?}"

@@ -1212,6 +1212,52 @@ mod tests {
         assert_eq!(h.proto.in_flight(), 0);
     }
 
+    /// Slice AG1 #4 — the before-text survives instead of being discarded.
+    ///
+    /// `flatten_content` keeps `newText` as the result, which is right:
+    /// what the file became is what the tool returned. But an inline diff
+    /// needs the other side, and until this slice `oldText` was read past
+    /// and dropped. This is the real Grok capture, so the shape is the
+    /// agent's and not one eave invented.
+    #[test]
+    fn a_grok_edit_keeps_the_text_the_file_had_before() {
+        let mut h = Harness::new();
+        h.feed(TOOL_CALL);
+        let (events, _) = h.feed(TOOL_DONE);
+        match events.as_slice() {
+            [SessionEvent::ToolUseFinished { result, diff, .. }] => {
+                // The result is unchanged by this slice.
+                assert_eq!(result, "hi\n", "the result stopped being newText");
+                let d = diff.as_ref().expect("the diff block was discarded");
+                assert_eq!(d.path, "/tmp/probe1/hello.txt");
+                assert_eq!(d.new_text, "hi\n");
+                // This capture CREATES the file, so the old side is
+                // genuinely empty — a pure addition, not a missing fact.
+                assert_eq!(d.old_text, "", "a creation has no before-text");
+            }
+            other => panic!("expected ToolUseFinished, got {other:?}"),
+        }
+    }
+
+    /// ...and a real modification carries a real before-text, which is the
+    /// case a creation cannot prove.
+    #[test]
+    fn a_grok_edit_over_existing_content_carries_both_sides() {
+        let mut h = Harness::new();
+        h.feed(TOOL_CALL);
+        let done = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-adbc8e1b-54ac-438e-b439-1b75e3de6766-0","status":"completed","content":[{"type":"diff","path":"a.txt","oldText":"one\ntwo\n","newText":"one\nTWO\n"}]}}}"#;
+        let (events, _) = h.feed(done);
+        match events.as_slice() {
+            [SessionEvent::ToolUseFinished { diff, .. }] => {
+                let d = diff.as_ref().expect("no diff");
+                assert_eq!(d.old_text, "one\ntwo\n");
+                assert_eq!(d.new_text, "one\nTWO\n");
+                assert_ne!(d.old_text, d.new_text, "both sides are the same");
+            }
+            other => panic!("expected ToolUseFinished, got {other:?}"),
+        }
+    }
+
     /// Grok sends several `tool_call_update`s per call; only a terminal
     /// status closes one. Treating a title refinement as a completion would
     /// settle the row while the tool was still running.

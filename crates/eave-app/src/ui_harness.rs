@@ -990,6 +990,7 @@ fn tool_finished(seq: u64, id: &str, result: &str, is_error: bool) -> eave_core:
                 id: id.into(),
                 result: result.into(),
                 is_error,
+                diff: None,
             },
         },
     }
@@ -1015,6 +1016,285 @@ fn assistant_record(seq: u64, text: &str) -> eave_core::journal::Record {
 /// WHOLE fence when the view is capped is a property of `fence_view` and is
 /// asserted there, purely — a fence tall enough to be capped puts its own
 /// copy button ~3000 px above the viewport, where a simulated click hits
+/// Slice AG1 #4, end to end — an opened tool row draws the change, and
+/// does NOT also draw the whole new file beneath it.
+///
+/// The duplication is the failure worth pinning: for ACP the result string
+/// IS `newText`, so a row that drew both would show the change and then
+/// repeat the entire file under it.
+#[gpui::test]
+fn an_opened_edit_row_draws_its_diff_instead_of_the_whole_new_file(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let finished = eave_core::journal::Record {
+        seq: 2,
+        ts_ms: 20,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseFinished {
+                id: "t1".into(),
+                result: "one\nTWO\n".into(),
+                is_error: false,
+                diff: Some(eave_core::events::ToolDiff {
+                    path: "a.txt".into(),
+                    old_text: "one\ntwo\n".into(),
+                    new_text: "one\nTWO\n".into(),
+                }),
+            },
+        },
+    };
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started_typed(
+                1,
+                "t1",
+                "Write",
+                r#"{"file_path":"a.txt"}"#,
+                Some(eave_core::tool::ToolCall::Write {
+                    path: "a.txt".into(),
+                }),
+            ),
+            finished,
+        ],
+    });
+    vcx.run_until_parked();
+
+    // Collapsed rows stay cheap: no diff until it is opened.
+    assert!(!shown(vcx, "tool-diff"), "a collapsed row drew a diff");
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "tool-diff"), "an opened edit row drew no diff");
+    assert!(
+        vcx.debug_bounds("tool-part-t1-input").is_some(),
+        "the opened row lost its input, so this test is not measuring a real row"
+    );
+    assert!(
+        vcx.debug_bounds("tool-part-t1-result").is_none(),
+        "the row drew the diff AND repeated the whole new file under it"
+    );
+}
+
+/// A FAILED edit keeps its error text and draws no diff — a picture of a
+/// change that never landed would be a lie about the worktree.
+#[gpui::test]
+fn a_failed_edit_row_draws_its_error_not_a_diff(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let finished = eave_core::journal::Record {
+        seq: 2,
+        ts_ms: 20,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseFinished {
+                id: "t1".into(),
+                result: "permission denied".into(),
+                is_error: true,
+                diff: Some(eave_core::events::ToolDiff {
+                    path: "a.txt".into(),
+                    old_text: "one\n".into(),
+                    new_text: "two\n".into(),
+                }),
+            },
+        },
+    };
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started_typed(1, "t1", "Write", r#"{"file_path":"a.txt"}"#, None),
+            finished,
+        ],
+    });
+    vcx.run_until_parked();
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+
+    assert!(
+        !shown(vcx, "tool-diff"),
+        "a failed edit drew a diff of a change that never landed"
+    );
+    assert!(
+        vcx.debug_bounds("tool-part-t1-error").is_some(),
+        "a failed edit lost its error text"
+    );
+}
+
+/// Slice AG1 #4 — the diff logic itself, at the boundaries that matter.
+#[test]
+fn a_trimmed_hunk_shows_only_what_changed() {
+    use eave_wire::frames::DiffOp;
+    let old = "a\nb\nc\nd\ne\n";
+    let new = "a\nb\nX\nd\ne\n";
+    let (lines, more) = Shell::diff_lines(old, new, 1, 40);
+    assert_eq!(more, 0);
+    let ops: Vec<DiffOp> = lines.iter().map(|l| l.op).collect();
+    // one context, the removal, the addition, one context — the shared
+    // head and tail are dropped, which is the whole point.
+    assert_eq!(
+        ops,
+        vec![DiffOp::Ctx, DiffOp::Del, DiffOp::Add, DiffOp::Ctx],
+        "{lines:?}"
+    );
+    assert_eq!(lines[1].text, "c");
+    assert_eq!(lines[2].text, "X");
+}
+
+/// An identical before and after is NO diff, not an empty one — the row
+/// must fall back to its result rather than draw a hunk with no lines.
+#[test]
+fn an_unchanged_file_produces_no_hunk() {
+    let (lines, _) = Shell::diff_lines("same\n", "same\n", 2, 40);
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// A creation has no before-text, and that must read as a pure addition
+/// rather than as "no diff" — this is the shape the real Grok capture has.
+#[test]
+fn a_creation_is_all_additions() {
+    use eave_wire::frames::DiffOp;
+    let (lines, _) = Shell::diff_lines("", "hi\nthere\n", 2, 40);
+    assert!(!lines.is_empty(), "a creation produced no diff at all");
+    assert!(
+        lines.iter().all(|l| l.op == DiffOp::Add),
+        "a creation drew something other than additions: {lines:?}"
+    );
+}
+
+/// The cap states its remainder rather than trailing off.
+#[test]
+fn a_long_diff_states_how_much_it_did_not_draw() {
+    let new: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    let (lines, more) = Shell::diff_lines("", &new, 2, 10);
+    assert_eq!(lines.len(), 10);
+    assert_eq!(more, 90, "the remainder was miscounted");
+}
+
+/// Slice AG1 #16 — a tool row that CHANGED a file offers a jump to it,
+/// and the jump opens the files face rather than acting behind a shut rail.
+#[gpui::test]
+fn a_tool_row_that_changed_a_file_jumps_to_its_diff(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started_typed(
+            1,
+            "t1",
+            "Write",
+            r#"{"file_path":"src/lib.rs"}"#,
+            Some(eave_core::tool::ToolCall::Write {
+                path: "src/lib.rs".into(),
+            }),
+        )],
+    });
+    vcx.run_until_parked();
+
+    // The files face starts shut, which is the state that made the naive
+    // version of this feature look dead.
+    assert!(!shown(vcx, "files-section"), "the files face started open");
+    assert!(shown(vcx, "tool-jump-t1"), "a Write row offers no jump");
+
+    click(vcx, "tool-jump-t1");
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "files-section"),
+        "the jump left the files face shut, so the click did nothing visible"
+    );
+}
+
+/// ...and a tool that only READ a file does not, because a jump lands on a
+/// diff pane and an unchanged file has no diff to land on.
+#[gpui::test]
+fn a_read_only_tool_row_offers_no_jump(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![tool_started_typed(
+            1,
+            "t1",
+            "Read",
+            r#"{"file_path":"src/lib.rs"}"#,
+            Some(eave_core::tool::ToolCall::Read {
+                path: "src/lib.rs".into(),
+            }),
+        )],
+    });
+    vcx.run_until_parked();
+    assert!(shown(vcx, "tool-row"), "no tool row at all");
+    assert!(
+        !shown(vcx, "tool-jump-t1"),
+        "a Read row offered a jump to a diff that cannot exist"
+    );
+}
+
+/// Slice AG1 #5 — the per-message copy takes the WHOLE message.
+///
+/// The distinction that matters: an assistant message renders as several
+/// BLOCKS, and the control is mounted on block 0. A copy that handed back
+/// only the block under the pointer would be the quiet failure the fence
+/// copy already refuses, so this message is deliberately multi-paragraph
+/// AND carries a fence, which is its own block.
+#[gpui::test]
+fn per_message_copy_takes_the_whole_message_not_one_block(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let whole = "first paragraph\n\n```rust\nlet x = 1;\n```\n\nlast paragraph";
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![assistant_record(1, whole)],
+    });
+    vcx.run_until_parked();
+
+    // The selector is per-message, so it names the ROW the message opens
+    // at — row 0 here, because a reset session's first record is this
+    // message. (`assistant_record(1, ..)`'s 1 is a seq, not a row index.)
+    let sel = "msg-copy-0";
+    assert!(shown(vcx, sel), "an assistant message has no copy control");
+    click(vcx, sel);
+    vcx.run_until_parked();
+
+    let got = vcx
+        .read_from_clipboard()
+        .and_then(|i| i.text())
+        .expect("the clipboard holds the message");
+    assert_eq!(got, whole, "copy must be the whole message, blocks and all");
+    assert!(
+        got.contains("first paragraph") && got.contains("last paragraph"),
+        "a block-scoped copy would have dropped one end: {got:?}"
+    );
+}
+
 /// nothing (see the note in `click_with`).
 #[gpui::test]
 fn a_fence_leaves_the_app_when_you_click_copy(cx: &mut TestAppContext) {
@@ -2009,6 +2289,93 @@ fn a_session_switch_restores_follow(cx: &mut TestAppContext) {
         mode(vcx, &h),
         ScrollMode::Follow,
         "a pin outlived its session"
+    );
+}
+
+/// **The ↓-bottom pill needs a bottom to return to.**
+///
+/// Sending flips the scroll mode to `PinOnNextUserRow` and then to
+/// `Pinned { msg }`, which asks the list to put the sent row at the top of
+/// the viewport so the answer streams below it. On the first turn of a new
+/// session there is nothing below to scroll into view: the list walks its
+/// scroll top back to the first row and the pin does nothing. The mode is
+/// still Pinned, though, and `scroll != Follow` used to be the whole test
+/// for the affordance — so a two-row log wore a control offering to return
+/// the reader to a bottom they had never left.
+///
+/// The state is set here rather than typed into the composer on purpose:
+/// what is under test is the affordance's condition, not the send path. A
+/// test that sent a message would pass through four other slices to reach
+/// the same field, and would name one of them when it broke.
+#[gpui::test]
+fn the_bottom_pill_waits_for_a_log_taller_than_the_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "heyyy")],
+    });
+    vcx.run_until_parked();
+
+    // The pill enters on `motion::DIALOG_IN`, so it paints at opacity 0 on
+    // the frame it mounts. `run_until_parked` alone would therefore find no
+    // pill in EITHER half of this test, and the absence assertion below
+    // would pass without testing anything. Driving the clock is what makes
+    // the negative honest.
+    let pin = |vcx: &mut VisualTestContext, h: &Harness| {
+        h.window
+            .update(vcx, |shell, _, cx| {
+                shell
+                    .transcript
+                    .update(cx, |t, _| t.scroll = ScrollMode::Pinned { msg: 0 });
+            })
+            .unwrap();
+        vcx.run_until_parked();
+        // TWO frames, and the second is the point. `render` reads the
+        // scroll extent the LAST layout measured, so the frame that first
+        // lays out taller content still asks the previous frame whether
+        // there is anything to scroll. `refresh` forces the frame that
+        // sees it. The pill also enters on `motion::DIALOG_IN`, so it
+        // paints at opacity 0 on the frame it mounts and `drive` is what
+        // brings it up — without both of these the absence assertion below
+        // would pass while testing nothing.
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        drive(h, vcx, Duration::from_millis(16));
+    };
+
+    pin(vcx, &h);
+    assert!(
+        !shown(vcx, "to-bottom"),
+        "one row in an empty well, and the transcript is already offering \
+         to scroll the reader back to a bottom they are sitting on"
+    );
+
+    // Now give it more transcript than well. The turn is deliberately left
+    // OPEN — no `TurnCompleted` — because a settled turn folds (Slice AT1)
+    // and a fold would take the height back out from under this assertion.
+    let tall = (0..400)
+        .map(|i| format!("line {i} of an answer that does not fit"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![assistant_record(2, &tall)],
+    });
+    vcx.run_until_parked();
+
+    pin(vcx, &h);
+    assert!(
+        shown(vcx, "to-bottom"),
+        "the log is taller than the well and the pin has moved the view off \
+         the bottom, and there is no way back"
     );
 }
 

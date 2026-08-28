@@ -602,7 +602,8 @@ mod tests {
                     id: "t1".into(),
                     result: String::new(),
                     is_error: false,
-                }),
+                        diff: None,
+                    }),
                 700_000
             ),
             Some(AttentionSnapshot::Running)

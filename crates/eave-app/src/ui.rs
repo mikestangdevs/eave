@@ -6583,6 +6583,11 @@ const FRICTION_NOTE_TTL: Duration = Duration::from_secs(4);
 /// percent, short enough that 90% does not become chrome.
 const ZOOM_HUD_TTL: Duration = Duration::from_millis(1000);
 
+/// Context lines either side of a transcript diff hunk (Slice AG1 #4).
+/// Two: enough to place the change, few enough that an opened tool row
+/// stays a row and not a file listing.
+const DIFF_CONTEXT: usize = 2;
+
 impl Shell {
     /// Send the composer draft (enter key and send button share this).
     fn send_current(&mut self, cx: &mut Context<Self>) {
@@ -10776,8 +10781,18 @@ impl Shell {
                             .child(note)
                     }))
                     .children(transcript_el.map(|el| {
+                        // `flex_col`, not the default block, so the list —
+                        // which is now only as tall as its content until it
+                        // fills the well — is pinned to the TOP of the well
+                        // by a rule taffy states rather than one block
+                        // layout implies. SPLIT PATH. The unsplit one is in
+                        // `Shell::render`, beside `edge_faded`; the two must
+                        // agree, and this file's history is mostly the times
+                        // they did not.
                         div()
                             .size_full()
+                            .flex()
+                            .flex_col()
                             .pt(px(theme::LOG_TOP_PAD))
                             .child(el)
                             .into_any_element()
@@ -15516,6 +15531,40 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Slice AG1 #16 — jump from a tool row to that file's diff.
+    ///
+    /// **Reveals the files face first, and that ordering is the whole
+    /// bug this avoids.** The rail's files face is `!files.collapsed`;
+    /// open a diff behind a collapsed rail and the click does nothing
+    /// visible, which reads as a dead affordance rather than as a rail
+    /// that is shut. The reveal is unconditional — if it is already open
+    /// this costs a redundant notify, which is cheaper than a click that
+    /// silently succeeds somewhere the reader cannot see.
+    ///
+    /// **Opens, never toggles.** `toggle_diff` closes when asked for the
+    /// pane it is already showing, which is right for the files rail —
+    /// the row IS the control. From the transcript it would mean the same
+    /// click did opposite things depending on rail state the reader may
+    /// not be looking at, so a jump that lands on the open pane is a
+    /// no-op, not a close.
+    fn jump_to_file(&self, path: String, cx: &mut Context<Self>) {
+        self.files.update(cx, |f, cx| {
+            f.collapsed = false;
+            cx.notify();
+        });
+        let Some(sid) = self.transcript.read(cx).session_id.clone() else {
+            return;
+        };
+        let already = matches!(
+            self.files.read(cx).diff.as_ref(),
+            Some(slot) if slot.session == sid && slot.path == path
+        );
+        if !already {
+            self.toggle_diff(path, cx);
+        }
+        cx.notify();
+    }
+
     /// Toggle one file's inline diff (B2). Opening requests the content
     /// (unary; the reply folds in via the diffs queue); the request is
     /// re-issued by the pump on every fresh snapshot while the row stays
@@ -16240,6 +16289,225 @@ impl Shell {
             )
     }
 
+    /// Slice AG1 #5 — copy one whole MESSAGE, not one block.
+    ///
+    /// **Absolutely positioned, and that is the whole design.** The rule
+    /// four screens down is that a row's height must depend only on its
+    /// identity and content, never its position — a stale cached measure
+    /// moves the scroll anchor and the replay assert catches it as a jump.
+    /// A hover-revealed *footer*, which is the shape all three references
+    /// use, would break that twice over: it occupies space only while the
+    /// pointer is inside the row, so height would depend on the pointer.
+    /// Taken out of flow instead, it cannot move a measure at all, and the
+    /// hover changes opacity only. **This is the presentation-only extract
+    /// of the references' footer** — same affordance, none of their
+    /// layout.
+    ///
+    /// The text is the whole message because `msg_text` IS the whole
+    /// message: an assistant row is one BLOCK of it, and a copy that gave
+    /// you the paragraph you happened to be pointing at would be the quiet
+    /// failure the fence copy above already refuses. Mounted on block 0 so
+    /// a message carries exactly one, however many blocks it renders as.
+    ///
+    /// **Hover-revealed by COLOUR, never by opacity — and the difference is
+    /// the whole of why this works.** The obvious spelling is zero opacity
+    /// at rest raised by a hover style. In this fork that ships a dead
+    /// control: an element at zero opacity is not painted at all, so it has
+    /// no hit area, and the hover meant to reveal it can never fire. Proven
+    /// by controlled comparison — identical code resolves `msg-copy-0` at
+    /// full opacity and does not exist at zero.
+    ///
+    /// So the element is ALWAYS painted and only its ink moves, from
+    /// `wash_rest` (transparent black) to `text_tertiary`, through
+    /// `motion::hover_blend`. `mix` premultiplies, so the zero-alpha end
+    /// contributes nothing but transparency and the icon does not flash
+    /// dark on its way in — the reason `wash_rest` is a named colour.
+    ///
+    /// The listener sits on the MESSAGE, not on the icon, so the whole
+    /// message is the hover target: an icon that only appears once you are
+    /// already on top of it cannot be found. The key is per-message, which
+    /// is also why every block of one message shares it — hovering any
+    /// block reveals the one control on block 0.
+    ///
+    /// **The guard for the height rule is the replay sweep, not a unit
+    /// test.** Being out of flow is structural — an absolute child is
+    /// removed from layout — so a test asserting "the row did not grow"
+    /// can only restate the layout engine. The regression that would
+    /// actually matter is a stale cached measure moving the anchor, and
+    /// the sweep already measures exactly that. A first draft of this
+    /// slice shipped a unit test for it that compared the control's bounds
+    /// against a row selector which does not exist; it fell through to
+    /// comparing the control with itself and passed unconditionally.
+    ///
+    /// The selector is per-message, deliberately unlike `fence-copy`'s
+    /// constant one: `debug_bounds` keeps ONE entry per selector and the
+    /// last painted wins, so a shared string across simultaneously visible
+    /// rows would let a test measure a different row than it clicked.
+    fn message_copy(state: &TranscriptState, msg: u32, text: String) -> AnyElement {
+        let lines = text.lines().count();
+        let shell = state.shell.clone();
+        let sel = format!("msg-copy-{msg}");
+        let ink = motion::hover_blend(&sel, theme::wash_rest(), theme::text_tertiary());
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel)
+            .absolute()
+            .top(px(0.))
+            .right(px(0.))
+            .flex_none()
+            .px(px(theme::SPACE_1))
+            .cursor_pointer()
+            .child(icons::icon(icons::COPY, theme::ICON_SM, ink))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                    shell.update(cx, |shell, cx| {
+                        shell.transient_note(
+                            format!("copied {lines} line{}", if lines == 1 { "" } else { "s" }),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .into_any_element()
+    }
+
+    /// Slice AG1 #4 — turn a provider's before/after into renderable lines.
+    ///
+    /// **A trimmed single hunk, NOT a diff algorithm, and the difference is
+    /// deliberate.** The workspace has no in-process differ — `DiffHunk`
+    /// and `DiffLine` exist only as the parse of git's unified output
+    /// (`git.rs::parse_diff`) — so drawing this either adds a dependency
+    /// or writes one. This writes the smallest honest thing: drop the
+    /// lines both sides share at the top and at the bottom, and show what
+    /// is left as a removal followed by an addition, with a little context
+    /// either side.
+    ///
+    /// For an `Edit` — one contiguous replacement, which is what the tool
+    /// does — that IS the diff, exactly. For a change with two separate
+    /// edited regions it is coarser than an LCS diff would be: everything
+    /// between the first and last difference is shown as changed, context
+    /// in the middle included. That is *coarse, never wrong* — it never
+    /// claims a line changed in the wrong direction, and it never hides a
+    /// change. An LCS pass would be finer and is the upgrade path if a
+    /// provider starts sending multi-region edits; it is not worth a
+    /// dependency or a subtle algorithm on the evidence we have.
+    ///
+    /// Capped, because element count scales with lines. The pane's own cap
+    /// is the reason `diff_pane` is affordable there and says so; a
+    /// transcript row inside a virtualized list has strictly less budget,
+    /// so this cap is smaller and states its remainder rather than
+    /// trailing off.
+    fn diff_lines(
+        old: &str,
+        new: &str,
+        context: usize,
+        cap: usize,
+    ) -> (Vec<eave_wire::frames::DiffLine>, usize) {
+        use eave_wire::frames::{DiffLine, DiffOp};
+        let o: Vec<&str> = old.lines().collect();
+        let n: Vec<&str> = new.lines().collect();
+        let mut pre = 0usize;
+        while pre < o.len() && pre < n.len() && o[pre] == n[pre] {
+            pre += 1;
+        }
+        let mut suf = 0usize;
+        while suf < o.len() - pre && suf < n.len() - pre && o[o.len() - 1 - suf] == n[n.len() - 1 - suf]
+        {
+            suf += 1;
+        }
+        if pre == o.len() && pre == n.len() {
+            return (Vec::new(), 0);
+        }
+        let mut out: Vec<DiffLine> = Vec::new();
+        let ctx_start = pre.saturating_sub(context);
+        for line in &o[ctx_start..pre] {
+            out.push(DiffLine {
+                op: DiffOp::Ctx,
+                text: (*line).to_string(),
+            });
+        }
+        for line in &o[pre..o.len() - suf] {
+            out.push(DiffLine {
+                op: DiffOp::Del,
+                text: (*line).to_string(),
+            });
+        }
+        for line in &n[pre..n.len() - suf] {
+            out.push(DiffLine {
+                op: DiffOp::Add,
+                text: (*line).to_string(),
+            });
+        }
+        let tail_end = (o.len() - suf + context).min(o.len());
+        for line in &o[o.len() - suf..tail_end] {
+            out.push(DiffLine {
+                op: DiffOp::Ctx,
+                text: (*line).to_string(),
+            });
+        }
+        let total = out.len();
+        out.truncate(cap);
+        (out, total.saturating_sub(cap))
+    }
+
+    /// Which file a tool row CHANGED, if any — the target for #16.
+    ///
+    /// Deliberately not `Read` or `List`. A jump lands on the files rail's
+    /// diff pane, and a file that was only read has no diff to show: the
+    /// pane would open on "no changes" and the affordance would have lied
+    /// about what it does. `Patch` answers only when the provider named a
+    /// single path — a multi-file patch has no one destination, which is
+    /// exactly why `ToolCall::Patch` carries an `Option`.
+    fn changed_path(call: Option<&eave_core::tool::ToolCall>) -> Option<String> {
+        match call? {
+            eave_core::tool::ToolCall::Edit { path }
+            | eave_core::tool::ToolCall::Write { path } => Some(path.clone()),
+            eave_core::tool::ToolCall::Patch { path } => path.clone(),
+            _ => None,
+        }
+    }
+
+    /// Slice AG1 #16 — jump from a tool row to the file it changed.
+    ///
+    /// Out of flow and revealed by ink, for both of the reasons
+    /// [`Self::message_copy`] spells out: a row's height may not depend on
+    /// the pointer, and an element at zero opacity is not painted and so
+    /// cannot be hovered.
+    ///
+    /// **It is a separate control rather than the path text itself**, which
+    /// is the compromise this row makes. The reference apps make the path
+    /// clickable; here the tool head's interior belongs to bezel
+    /// (`bz.step_row` renders name and detail itself) and the head's own
+    /// click already toggles the row open. Overloading that click would
+    /// make one target do two things; reaching into bezel's interior would
+    /// mean moving a pinned dependency. So the jump gets its own hit area
+    /// in the row's corner.
+    fn jump_button(state: &TranscriptState, tool_id: &str, path: String) -> AnyElement {
+        let shell = state.shell.clone();
+        let sel = format!("tool-jump-{tool_id}");
+        let ink = motion::hover_blend(&sel, theme::wash_rest(), theme::text_tertiary());
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel)
+            .absolute()
+            .top(px(0.))
+            .right(px(0.))
+            .flex_none()
+            .px(px(theme::SPACE_1))
+            .cursor_pointer()
+            .child(icons::icon(icons::ARROW_RIGHT, theme::ICON_SM, ink))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                    let path = path.clone();
+                    shell.update(cx, |shell, cx| shell.jump_to_file(path, cx));
+                }
+            })
+            .into_any_element()
+    }
+
     /// Build one virtualized row. Called only for visible + overdraw rows.
     /// Every row wraps its content in the shared reading column; vertical
     /// rhythm lives on the row (turn gap before a directive, block gap
@@ -16353,12 +16621,19 @@ impl Shell {
                     .when(matches!(delivery, Delivery::Pending), |d| d.opacity(0.65))
                     .child(SharedString::from(text.clone()));
                 let wrap = div()
+                    .id(SharedString::from(format!("msg-hover-{}", id.msg)))
+                    .on_hover(motion::hover_listener(format!("msg-copy-{}", id.msg)))
                     .when(!first, |d| d.pt(px(theme::TURN_GAP)))
                     .flex()
                     .flex_col()
                     .items_start()
                     .gap_1()
-                    .child(block);
+                    .relative()
+                    .child(block)
+                    // Slice AG1 #5. A directive is one row, so no block
+                    // gate is needed here — but it is still out of flow,
+                    // for the same height reason.
+                    .child(Self::message_copy(state, id.msg, text.clone()));
                 match delivery {
                     // The acceptance-critical distinction: journaled but
                     // never reached the agent (spec 02 §Delivery state).
@@ -16383,6 +16658,7 @@ impl Shell {
                 result,
                 is_error,
                 call,
+                diff: tool_diff,
             } => {
                 // Slice Z: a tool with anything to show can be opened, and
                 // a FAILED one shows its reason without being opened —
@@ -16493,15 +16769,23 @@ impl Shell {
                             }
                         })
                 });
+                let jump = Self::changed_path(call.as_ref());
                 crate::bezel_tools::box_(run.first, run.last)
                     .debug_selector(|| "tool-row".into())
+                    // Slice AG1 #16: the whole row is the hover target, so
+                    // the corner control is findable without already being
+                    // on top of it. One key per tool id.
+                    .id(SharedString::from(format!("tool-hover-{tool_id}")))
+                    .on_hover(motion::hover_listener(format!("tool-jump-{tool_id}")))
                     .when(run.first, |d| d.mt(px(theme::SPACE_2)))
                     .when(run.last, |d| d.mb(px(theme::SPACE_1)))
                     .ml(px(theme::TOOL_INDENT))
                     .flex()
                     .flex_col()
+                    .relative()
                     .gap(px(theme::SPACE_1))
                     .child(head)
+                    .children(jump.map(|p| Self::jump_button(state, tool_id, p)))
                     .children(open.then(|| {
                         // Opened: what it was asked, and what came back.
                         // Both verbatim, both bounded, each labelled — an
@@ -16514,7 +16798,30 @@ impl Shell {
                             parts
                                 .push(("input", tool_body_view(input, theme::TOOL_BODY_MAX_LINES)));
                         }
-                        if !result.trim().is_empty() {
+                        // Slice AG1 #4. The provider's `newText` IS the
+                        // result string, so when a diff is drawn the
+                        // result plate would repeat it — the whole new
+                        // file under the change it already shows. The
+                        // diff replaces it rather than joining it. A
+                        // FAILED tool keeps its error text: the diff of a
+                        // change that did not land would be a picture of
+                        // something that never happened.
+                        let drawn = (!*is_error)
+                            .then_some(tool_diff.as_ref())
+                            .flatten()
+                            .map(|d| {
+                                (
+                                    d.path.clone(),
+                                    Self::diff_lines(
+                                        &d.old_text,
+                                        &d.new_text,
+                                        DIFF_CONTEXT,
+                                        theme::TOOL_BODY_MAX_LINES,
+                                    ),
+                                )
+                            })
+                            .filter(|(_, (lines, _))| !lines.is_empty());
+                        if drawn.is_none() && !result.trim().is_empty() {
                             parts.push((
                                 if *is_error { "error" } else { "result" },
                                 tool_body_view(result, theme::TOOL_BODY_MAX_LINES),
@@ -16526,9 +16833,57 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .gap(px(theme::SPACE_1))
+                            .children(drawn.map(|(path, (lines, more))| {
+                                let (mut o, mut n) = (1u32, 1u32);
+                                div()
+                                    .debug_selector(|| "tool-diff".into())
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .font_weight(theme::WEIGHT_LABEL)
+                                            .text_color(theme::text_tertiary())
+                                            .child(SharedString::from(path)),
+                                    )
+                                    .children(lines.iter().map(|l| {
+                                        let (a, b) = crate::bezel_diff::numbers(
+                                            l.op, &mut o, &mut n,
+                                        );
+                                        // Numbers are RELATIVE to the hunk,
+                                        // not the file: the provider sends
+                                        // text, not offsets, so a file-
+                                        // absolute number would be invented.
+                                        crate::bezel_diff::line(l, a, b)
+                                    }))
+                                    .when(more > 0, |d| {
+                                        // State the remainder, the way the
+                                        // pane and the error strip do.
+                                        d.child(
+                                            div()
+                                                .text_size(px(theme::MICRO_SIZE))
+                                                .line_height(px(theme::MICRO_LINE))
+                                                .text_color(theme::text_tertiary())
+                                                .child(SharedString::from(format!(
+                                                    "… {more} more lines"
+                                                ))),
+                                        )
+                                    })
+                            }))
                             .children(parts.into_iter().map(|(label, body)| {
                                 use bezel::ui::widgets::Status as _;
+                                // A REAL handle for this part. bezel's
+                                // `step_output` takes an `ElementId`, not a
+                                // debug selector, so `tool-out-…` never
+                                // entered the selector map — a test that
+                                // asserted a part was ABSENT by that name
+                                // passed whether or not it was there. This
+                                // wrapper is eave's, so this is eave's to
+                                // label.
+                                let part_sel = format!("tool-part-{tool_id}-{label}");
                                 div()
+                                    .debug_selector(move || part_sel)
                                     .flex()
                                     .flex_col()
                                     .child(
@@ -16616,9 +16971,21 @@ impl Shell {
                 };
                 let el = Self::render_block(state, id, block, msg_text, *live);
                 div()
+                    // Every block of the message carries the listener, all
+                    // on the message's one key, so hovering any block
+                    // reveals the single control mounted on block 0.
+                    .id(SharedString::from(format!("msg-hover-{}-{}", id.msg, id.block)))
+                    .on_hover(motion::hover_listener(format!("msg-copy-{}", id.msg)))
                     .when(id.block == 0, |d| d.pt(px(theme::MSG_TOP_GAP)))
                     .pb(px(theme::BLOCK_GAP))
+                    .relative()
                     .child(el)
+                    // Slice AG1 #5. Block 0 only, so one message carries
+                    // one control however many blocks it renders as, and
+                    // out of flow, so this cannot move a cached height.
+                    .when(id.block == 0, |d| {
+                        d.child(Self::message_copy(state, id.msg, msg_text.clone()))
+                    })
                     .into_any_element()
             }
         };
@@ -21051,8 +21418,41 @@ impl Render for Shell {
         // `replay_watch_set`, which only the assert calls.
         replay_watch_frame(&list_state, state.display.len());
         // The ↓-bottom affordance needs something to return to: never on an
-        // empty log (the Stage E cosmetic bug), only when follow is broken.
-        let show_affordance = state.scroll != ScrollMode::Follow && !state.display.is_empty();
+        // empty log (the Stage E cosmetic bug), only when follow is broken,
+        // and only when the log is actually taller than the well.
+        //
+        // The third clause is a defect that showed on the FIRST turn of every
+        // new session. Sending flips the mode to `PinOnNextUserRow` and then
+        // to `Pinned { msg }`, which asks the list to put that row at the
+        // viewport top so the answer streams beneath it. On a transcript
+        // shorter than the well there is nothing below to scroll into view,
+        // so `prepaint_items` walks the scroll top back to the first row and
+        // the pin is a no-op — but the MODE still reads Pinned, and
+        // `!= Follow` was the whole test. The affordance therefore appeared
+        // over a two-row log, offering to return the operator to a bottom
+        // they had never left: the feature failed silently and then
+        // advertised its own failure.
+        //
+        // `max_offset_for_scrollbar` is `max(0, content - viewport)`, so it
+        // is zero exactly when there is no scrolling to undo. It does not
+        // under-report on a long log even though unmeasured rows count as
+        // zero height: prepaint always measures the visible window plus the
+        // 512 px overdraw, so a transcript that overflows the well has a
+        // measured height that overflows it too.
+        //
+        // ONE FRAME STALE, deliberately. `render` builds the tree before
+        // this frame is laid out, so the offset it reads is the one the
+        // LAST frame measured — the same trap `edge_fade`'s
+        // `fade_overflow_y` documents, where comet shipped render-time
+        // gating and got a user report for a ramp that stuck on after a
+        // content shrink. The direction of the error is what makes it
+        // tolerable here rather than there: a log that has just outgrown
+        // the well is a log that is being written to, and every chunk
+        // draws a frame, so the affordance is late by one frame and never
+        // by more. The failure it replaces was permanent.
+        let show_affordance = state.scroll != ScrollMode::Follow
+            && !state.display.is_empty()
+            && state.list.max_offset_for_scrollbar().y > px(0.);
         let rail_collapsed = self.sessions.read(cx).collapsed;
         let composer_text = self.composer.read(cx).field.read(cx).content().to_string();
         let attachments = self.composer.read(cx).attachments.clone();
@@ -21140,10 +21540,28 @@ impl Render for Shell {
             None
         };
 
+        // A chat log hangs from the bottom (`ListAlignment::Bottom`), which
+        // is right once there is more transcript than well and wrong before
+        // that: `size_full` made the list the height of the window whatever
+        // it held, so the first turn of a new session sat alone in the last
+        // inch of a tall empty box, with the 116 px bottom fade ramp across
+        // it. `Infer` sizes the element to `min(content, available)` instead.
+        // Short content is therefore a short list at the TOP of the well
+        // (see the two wrappers named below), growing downward, and the
+        // instant it outgrows the well the height saturates and every bit of
+        // the bottom-anchored behaviour — follow, the pin, the anchor
+        // invariant — is what it was.
+        //
+        // `max_h_full` is the belt: block layout may hand the measure
+        // function `MaxContent` rather than a definite height, and an
+        // unclamped list would then overflow the well instead of scrolling
+        // inside it.
         let transcript_el = list(list_state, move |ix, _window, cx| {
             transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
         })
-        .size_full();
+        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+        .w_full()
+        .max_h_full();
 
         // Here rather than beside `composer_mounted` above: that read of the
         // transcript is still borrowed at that point, and this needs `cx`
@@ -22101,8 +22519,14 @@ impl Render for Shell {
                                                             theme::TRANSCRIPT_FADE_BAND_TOP,
                                                             true,
                                                             true,
+                                                            // Top-anchors a
+                                                            // short list; see
+                                                            // the twin in
+                                                            // `split_pane`.
                                                             div()
                                                                 .size_full()
+                                                                .flex()
+                                                                .flex_col()
                                                                 .pt(px(theme::LOG_TOP_PAD))
                                                                 .child(transcript_el),
                                                         )

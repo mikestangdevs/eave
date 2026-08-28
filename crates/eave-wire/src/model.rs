@@ -137,6 +137,15 @@ pub enum Row {
         result: String,
         is_error: bool,
         call: Option<ToolCall>,
+        /// The before/after for an edit, when the provider reported one
+        /// (Slice AG1 #4). `None` for every provider that does not, and
+        /// for journals written before the field existed — both of which
+        /// are honestly "no recorded before-text", not "no change".
+        ///
+        /// Arrives on the FINISH, not the start: an edit's old text is
+        /// part of what came back, so a running tool row carries `None`
+        /// and gains it when the tool settles.
+        diff: Option<eave_core::events::ToolDiff>,
     },
     /// The agent is asking to run one tool (Slice K). Every fact an
     /// operator needs to decide is on the row: an approval given without
@@ -504,14 +513,16 @@ impl Transcript {
                     result: String::new(),
                     is_error: false,
                     call: call.clone(),
+                    diff: None,
                 }),
             },
             SessionEvent::ToolUseFinished {
                 id,
                 result,
                 is_error,
+                diff,
             } => {
-                self.finish_tool(id, result, *is_error);
+                self.finish_tool(id, result, *is_error, diff.clone());
             }
             // The CLI's echo of our own message — the `UserSent` row already
             // renders it; a duplicate row would be merge-by-accident.
@@ -687,13 +698,20 @@ impl Transcript {
     /// flag land together, because they are one fact arriving at one moment
     /// and a row that took them separately could render "done" with the
     /// previous call's output.
-    fn finish_tool(&mut self, id: &str, result: &str, is_error: bool) {
+    fn finish_tool(
+        &mut self,
+        id: &str,
+        result: &str,
+        is_error: bool,
+        diff: Option<eave_core::events::ToolDiff>,
+    ) {
         for ix in 0..self.rows.len() {
             if let Row::Tool {
                 id: rid,
                 status,
                 result: r,
                 is_error: e,
+                diff: d,
                 ..
             } = &mut self.rows[ix]
             {
@@ -701,6 +719,7 @@ impl Transcript {
                     *status = ToolStatus::Finished;
                     *r = result.to_string();
                     *e = is_error;
+                    *d = diff;
                     self.touch(ix);
                     return;
                 }

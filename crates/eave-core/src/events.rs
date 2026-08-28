@@ -148,6 +148,22 @@ impl ContextWindow {
     }
 }
 
+/// One edit's before and after, as the provider reported it (Slice AG1 #4).
+///
+/// Bounded by the same [`crate::events::TOOL_PAYLOAD_CAP`] as every other
+/// tool payload, and for the same reason: a row must never be the thing
+/// that has to defend the render budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDiff {
+    pub path: String,
+    /// What the file was. Empty when the tool created the file — something
+    /// that did not exist has no old text, and that is a fact, not a gap.
+    #[serde(default)]
+    pub old_text: String,
+    #[serde(default)]
+    pub new_text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -227,6 +243,29 @@ pub enum SessionEvent {
         result: String,
         #[serde(default)]
         is_error: bool,
+        /// The before/after the provider handed us for an edit, when it
+        /// handed us one (Slice AG1 #4).
+        ///
+        /// **This is a fact eave was already being given and throwing
+        /// away.** ACP agents send `{type:"diff", path, oldText, newText}`
+        /// in a tool call's content; `flatten_content` keeps `newText` —
+        /// correct for a RESULT string, since what the file became is what
+        /// the tool returned — and dropped `oldText` on the floor. Without
+        /// the old side there is no diff to draw, so the transcript could
+        /// only ever show the finished text.
+        ///
+        /// **Not reconstructible later, which is why it is journalled.**
+        /// The engine's own diff (`git.rs::diff`) is against HEAD — the
+        /// file's CURRENT state — so it answers a different question the
+        /// moment a later call touches the same file. A row is a
+        /// historical fact and needs the diff as it was.
+        ///
+        /// `serde(default)` for the same reason as its siblings: journals
+        /// written before this field existed must still load, and they
+        /// will read `None`, which is honest — those turns really do have
+        /// no recorded before-text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<ToolDiff>,
     },
     /// The CLI echoed a user message back (`--replay-user-messages`).
     UserEcho { text: String },
@@ -454,7 +493,8 @@ mod tests {
                 id: "toolu_1".into(),
                 result: String::new(),
                 is_error: false,
-            }
+                    diff: None,
+                }
         );
     }
     /// A record with no typed call must not grow one on disk.

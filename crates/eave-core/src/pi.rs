@@ -945,6 +945,7 @@ impl PiStream {
                     result: cap_payload(&flatten_content(v.pointer("/result/content"))),
                     // Pi's own flag, never inferred from the text.
                     is_error: v.get("isError").and_then(Value::as_bool).unwrap_or(false),
+                    diff: None,
                 }]
             }
             "message_update" => match v.pointer("/assistantMessageEvent") {
@@ -1565,7 +1566,8 @@ mod tests {
                 id,
                 result,
                 is_error,
-            }] => {
+                    diff: None,
+                }] => {
                 assert_eq!(id, "call_stub_1");
                 assert_eq!(result, "hi\n");
                 assert!(!is_error);

@@ -389,7 +389,8 @@ impl ClaudeStream {
                                             .get("is_error")
                                             .and_then(Value::as_bool)
                                             .unwrap_or(false),
-                                    });
+                    diff: None,
+                });
                                 }
                             }
                         }

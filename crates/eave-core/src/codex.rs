@@ -1378,7 +1378,8 @@ fn decode_item_completed(params: &Value, line: &str) -> (SessionEvent, Bookkeepi
             // operator said no and the tool did not run.
             is_error: matches!(status, "failed" | "declined")
                 || item.get("error").is_some_and(|e| !e.is_null()),
-        },
+                    diff: None,
+                },
         Bookkeeping::ToolFinished { id: id.to_string() },
     )
 }

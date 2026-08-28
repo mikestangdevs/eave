@@ -350,6 +350,13 @@ fn msg_content_hash(row: &Row) -> u64 {
             // allocation per row inside the fold, and the 10k-row gate
             // builds every row cold.
             call: _,
+            // Not hashed either, on the FIRST ground above and only that
+            // one: the diff is written by `finish_tool` in the same breath
+            // as `result`, which IS hashed, so a row can never gain a diff
+            // without this fingerprint moving anyway. (Slice AG1 #4 added
+            // it; if it ever arrives independently of `result`, this must
+            // be revisited.)
+            diff: _,
         } => {
             let tag: u8 = match status {
                 ToolStatus::Running => 1,
@@ -764,6 +771,7 @@ mod tests {
                 ToolStatus::Finished
             },
             input: String::new(),
+            diff: None,
             result: String::new(),
             is_error,
             call,

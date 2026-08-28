@@ -819,7 +819,8 @@ mod tests {
                         id: "t1".into(),
                         result: String::new(),
                         is_error: false,
-                    },
+                            diff: None,
+                        },
                 ),
             ),
             (
@@ -933,7 +934,8 @@ mod tests {
                 id: "orphan".into(),
                 result: String::new(),
                 is_error: false,
-            },
+                    diff: None,
+                },
         ];
         for event in noise {
             let mut l = TurnLedger::new(0);
@@ -987,7 +989,8 @@ mod tests {
                         id: "t1".into(),
                         result: "ok".into(),
                         is_error: false,
-                    },
+                            diff: None,
+                        },
                 ),
                 true,
             ),

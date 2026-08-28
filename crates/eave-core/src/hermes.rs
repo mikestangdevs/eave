@@ -826,7 +826,8 @@ impl Reader {
                         result: "the turn ended before Hermes reported a result for this tool"
                             .into(),
                         is_error: true,
-                    })
+                    diff: None,
+                })
                     .await;
                 }
                 // A turn that failed at the protocol level. The error
