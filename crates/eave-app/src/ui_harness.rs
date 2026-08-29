@@ -14747,6 +14747,217 @@ fn a_pinned_bookmark_wears_its_site_mark_when_the_bytes_are_in(cx: &mut TestAppC
     crate::web::set_host_favicon_for_test("github.com", None);
 }
 
+/// A link inside a folder wears the same host mark the grid does.
+///
+/// Filing a tab into a folder used to swap the favicon for a globe
+/// because the child row always painted `GLOBAL`. The bytes are keyed
+/// by host, so a page you just had open still has them.
+#[gpui::test]
+fn a_bookmark_inside_a_folder_wears_its_site_mark_when_the_bytes_are_in(
+    cx: &mut TestAppContext,
+) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("dev"), None),
+            ("gh", 1, None, Some("https://github.com/")),
+        ],
+    );
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "bookmark-child-gh"),
+        "the folder did not open its child"
+    );
+    assert!(
+        !shown(vcx, "bookmark-child-mark-gh"),
+        "a folder child drew a mark before any bytes arrived"
+    );
+    assert!(
+        shown(vcx, "bookmark-child-glyph"),
+        "the globe fallback is missing, so an iconless child is invisible"
+    );
+
+    crate::web::set_host_favicon_for_test(
+        "github.com",
+        Some(std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            TINY_PNG.to_vec(),
+        ))),
+    );
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("dev"), None),
+            ("gh", 1, None, Some("https://github.com/")),
+        ],
+    );
+
+    assert!(
+        shown(vcx, "bookmark-child-mark-gh"),
+        "the folder child kept its globe with bytes in hand"
+    );
+    crate::web::set_host_favicon_for_test("github.com", None);
+}
+
+/// Hover the folder, wait out the 0.8s dwell, and force a Shell
+/// redraw so the inventory mounts. `point_at_row` only drives the
+/// hover wash; the dwell clock is Instant (executor in tests).
+fn dwell_folder_popup(h: &Harness, vcx: &mut VisualTestContext, row: &'static str) {
+    point_at_row(h, vcx, row);
+    vcx.executor().advance_clock(Duration::from_millis(800));
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    drive(h, vcx, Duration::from_millis(20));
+}
+
+/// Hovering a folder opens a searchable, scrollable inventory of
+/// everything in it — not an inline expand, and not a globe-only list.
+#[gpui::test]
+fn hovering_a_folder_opens_a_searchable_scrollable_popup(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("OpenModel"), None),
+            ("rs", 1, Some("docs.rs"), Some("https://docs.rs/")),
+            ("deep", 1, Some("deep"), Some("https://deep.test/")),
+        ],
+    );
+
+    assert!(
+        !shown(vcx, "folder-popup-dev"),
+        "the popup was up before the pointer settled"
+    );
+
+    dwell_folder_popup(&h, vcx, "bookmark-folder-dev");
+
+    assert!(
+        shown(vcx, "folder-popup-dev"),
+        "hovering the folder never opened its popup"
+    );
+    let folder = vcx
+        .debug_bounds("bookmark-folder-dev")
+        .expect("folder row");
+    let pop = vcx
+        .debug_bounds("folder-popup-dev")
+        .expect("folder popup bounds");
+    assert!(
+        pop.size.width > px(40.0) && pop.size.height > px(20.0),
+        "the popup mounted at zero size: {pop:?}"
+    );
+    assert!(
+        pop.origin.x >= folder.origin.x + folder.size.width - px(8.0),
+        "the popup is not on the outside of the sidebar: folder {folder:?} popup {pop:?}"
+    );
+    let folder_cy = folder.origin.y + folder.size.height / 2.0;
+    let pop_cy = pop.origin.y + pop.size.height / 2.0;
+    assert!(
+        (pop_cy - folder_cy).abs() <= px(12.0),
+        "the popup is not vertically centered on the folder: folder {folder:?} popup {pop:?}"
+    );
+    assert!(
+        shown(vcx, "folder-popup-search-dev"),
+        "the popup has no search field"
+    );
+    assert!(
+        shown(vcx, "folder-popup-list"),
+        "the popup has no scrolling list"
+    );
+    assert!(
+        shown(vcx, "folder-popup-row-rs") && shown(vcx, "folder-popup-row-deep"),
+        "the popup did not list the folder's pages"
+    );
+    assert!(
+        shown(vcx, "folder-popup-search-placeholder"),
+        "search was focused on hover, stealing keys from the page"
+    );
+}
+
+/// Moving onto the inventory must not dismiss it — search and scroll
+/// live on the popup, not on the folder row.
+#[gpui::test]
+fn the_folder_popup_survives_moving_onto_search(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("OpenModel"), None),
+            ("rs", 1, Some("docs.rs"), Some("https://docs.rs/")),
+        ],
+    );
+
+    dwell_folder_popup(&h, vcx, "bookmark-folder-dev");
+    assert!(
+        shown(vcx, "folder-popup-dev"),
+        "the closed folder never offered its inventory"
+    );
+
+    let at = vcx
+        .debug_bounds("folder-popup-search-dev")
+        .expect("search field");
+    vcx.simulate_mouse_move(at.center(), None, Modifiers::none());
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(20));
+    assert!(
+        shown(vcx, "folder-popup-dev"),
+        "moving onto search dismissed the inventory"
+    );
+    assert!(
+        shown(vcx, "folder-popup-list"),
+        "the scrolling list went with it"
+    );
+}
+
+/// The inventory is closed-folder hover only. An open folder already
+/// lists its pages in the rail.
+#[gpui::test]
+fn an_open_folder_does_not_show_the_hover_popup(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("dev", 0, Some("OpenModel"), None),
+            ("rs", 1, Some("docs.rs"), Some("https://docs.rs/")),
+        ],
+    );
+
+    dwell_folder_popup(&h, vcx, "bookmark-folder-dev");
+    assert!(
+        shown(vcx, "folder-popup-dev"),
+        "the closed folder never offered its inventory"
+    );
+
+    click(vcx, "bookmark-folder-dev");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "bookmark-child-rs"),
+        "the click did not expand the folder"
+    );
+    assert!(
+        !shown(vcx, "folder-popup-dev"),
+        "opening the folder left the popup standing"
+    );
+
+    point_at_row(&h, vcx, "bookmark-folder-dev");
+    drive(&h, vcx, Duration::from_millis(20));
+    assert!(
+        !shown(vcx, "folder-popup-dev"),
+        "hovering an open folder raised the inventory again"
+    );
+}
+
 /// Slice T1b — the page well holds no bookmarks surface at all.
 ///
 /// The companion to the test above, and the one that would catch the bar
@@ -15117,16 +15328,14 @@ fn moving_a_bookmark_reparents_or_reorders(cx: &mut TestAppContext) {
     );
 }
 
-/// Slice T1 — the Folders header makes folders, and names them so two
-/// are told apart.
+/// New folder is Untitled, selected, ready to type over. A second
+/// folder is also Untitled — numbering was a stand-in for the rename
+/// field this now opens.
 ///
-/// New folder is on the Folders dropdown (double-click / right-click),
-/// not on the bookmark grid's `+`. A folder created unnamed would draw
-/// as an empty chip: eave has no inline rename for a bookmark yet
-/// (`BookmarkRename` is on the wire and nothing calls it), so the
-/// operator could open it and fill it but never identify it.
+/// New folder is on the Folders dropdown (right-click),
+/// not on the bookmark grid's `+`.
 #[gpui::test]
-fn the_folders_header_makes_folders_and_names_them_apart(cx: &mut TestAppContext) {
+fn a_new_folder_is_untitled_and_ready_to_type(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     push_bookmarks(&h, vcx, &[]);
@@ -15148,21 +15357,51 @@ fn the_folders_header_makes_folders_and_names_them_apart(cx: &mut TestAppContext
         cmds.iter().any(|c| matches!(
             c,
             Command::Browser(BrowserCmd::BookmarkAdd { url: None, title: Some(t), .. })
-                if t == "new folder"
+                if t == crate::bookmarks::UNTITLED
         )),
-        "the Folders header made no folder: {cmds:?}"
+        "the Folders header made no Untitled folder: {cmds:?}"
+    );
+
+    // The id is minted by the engine. The harness injects the snapshot
+    // the watch would have delivered; that is what opens the field.
+    push_bookmarks(
+        &h,
+        vcx,
+        &[("f1", 0, Some(crate::bookmarks::UNTITLED), None)],
+    );
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("rename-bookmark-f1").is_some(),
+        "the new folder did not open for naming"
+    );
+    assert!(
+        shown(vcx, "rename-selection"),
+        "Untitled was not selected, so the next key would append"
+    );
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some(crate::bookmarks::UNTITLED),
+        "the field opened on something other than Untitled"
+    );
+
+    vcx.simulate_input("work");
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some("work"),
+        "typing appended to Untitled instead of replacing it: {:?}",
+        rename_buffer(vcx, &h)
+    );
+    assert!(
+        !shown(vcx, "rename-selection"),
+        "the selection wash stayed after the first key"
     );
 
     // The menu OCCLUDES for its whole mounted life, exit included
     // (`overlay::menu_layer`), and `run_until_parked` does not advance the
     // motion clock — so without this the first menu is still on screen,
-    // still painting its rows, and taking no clicks. The second right-click
-    // then lands on a dead overlay and the assertion below reads as "the
-    // product forgot how to name a folder".
+    // still painting its rows, and taking no clicks.
     drive(&h, vcx, Duration::from_millis(16));
 
-    // With one already there, the next is distinguishable from it.
-    push_bookmarks(&h, vcx, &[("f1", 0, Some("new folder"), None)]);
     let _ = h.drain();
     let at = vcx.debug_bounds("zone-folders").expect("zone-folders");
     vcx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
@@ -15174,9 +15413,9 @@ fn the_folders_header_makes_folders_and_names_them_apart(cx: &mut TestAppContext
         cmds.iter().any(|c| matches!(
             c,
             Command::Browser(BrowserCmd::BookmarkAdd { url: None, title: Some(t), .. })
-                if t == "new folder 2"
+                if t == crate::bookmarks::UNTITLED
         )),
-        "a second folder was made indistinguishable from the first: {cmds:?}"
+        "a second folder was numbered rather than Untitled: {cmds:?}"
     );
 }
 

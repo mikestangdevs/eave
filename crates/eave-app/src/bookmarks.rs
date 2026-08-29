@@ -27,6 +27,10 @@ pub struct BarItem {
     /// How many children a folder holds. Zero on a folder is a fact — an
     /// empty folder — and the renderer must not draw it as a link.
     pub children: usize,
+    /// When the bookmark was filed. The folder popup's "2 months ago"
+    /// line reads this; `0` means the fixture never set one and the
+    /// popup draws no age.
+    pub created_ts_ms: u64,
 }
 
 impl BarItem {
@@ -34,6 +38,14 @@ impl BarItem {
         self.url.is_none()
     }
 }
+
+/// What a folder with no name of its own is called.
+///
+/// Not a numbered stand-in ("new folder 2") and not an empty chip. The
+/// blank state is one word, the same on every unnamed folder, and the
+/// create path seeds the rename field with it selected so the next key
+/// is the name.
+pub const UNTITLED: &str = "Untitled";
 
 /// What a bookmark with no name of its own is called.
 ///
@@ -67,17 +79,17 @@ fn item(node: &eave_wire::BookmarkNode) -> BarItem {
     let label = match (&node.bookmark.title, &url) {
         (Some(t), _) if !t.trim().is_empty() => t.clone(),
         (_, Some(url)) => fallback_label(url),
-        // A folder the operator never named. Not "folder" — that is the
-        // same class of stand-in as the hex session id the operator ruled
-        // against twice, and unlike a link there is no address to fall back
-        // on. An empty name is at least visibly unfinished.
-        _ => String::new(),
+        // A folder the operator never named. Not "folder" and not a
+        // number — those read as identities. Untitled is the blank
+        // state, same as the field a new folder opens with.
+        _ => UNTITLED.to_string(),
     };
     BarItem {
         id: node.bookmark.id.clone(),
         label,
         url,
         children: node.children,
+        created_ts_ms: node.bookmark.created_ts_ms,
     }
 }
 
@@ -175,6 +187,47 @@ pub fn links_in(snapshot: &BookmarksSnapshot, folder_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every link in a folder's subtree, as bar items, in tree order.
+///
+/// Nested folders are skipped — the popup is a searchable inventory of
+/// pages, not a second tree. A folder of folders still lists every
+/// page underneath, which is the same walk [`links_in`] does.
+pub fn links_under(snapshot: &BookmarksSnapshot, folder_id: &str) -> Vec<BarItem> {
+    let Some(start) = snapshot
+        .nodes
+        .iter()
+        .position(|n| n.bookmark.id == folder_id)
+    else {
+        return Vec::new();
+    };
+    let depth = snapshot.nodes[start].depth;
+    snapshot.nodes[start + 1..]
+        .iter()
+        .take_while(|n| n.depth > depth)
+        .filter_map(|n| match &n.bookmark.kind {
+            BookmarkKind::Link { url } if !url.is_empty() => Some(item(n)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a folder-popup row matches the search needle.
+///
+/// Empty needle matches everything. Label and url both count, so
+/// typing a host finds an untitled pin.
+pub fn folder_search_hit(item: &BarItem, needle: &str) -> bool {
+    let n = needle.trim();
+    if n.is_empty() {
+        return true;
+    }
+    let n = n.to_ascii_lowercase();
+    item.label.to_ascii_lowercase().contains(&n)
+        || item
+            .url
+            .as_deref()
+            .is_some_and(|u| u.to_ascii_lowercase().contains(&n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +306,29 @@ mod tests {
         assert!(links_in(&s, "nobody").is_empty());
     }
 
+    /// The popup lists every page under a folder, nested ones included,
+    /// and does not list the nested folders themselves.
+    #[test]
+    fn links_under_a_folder_are_the_pages_not_the_nested_folders() {
+        let s = tree();
+        let ids: Vec<String> = links_under(&s, "dev").into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["rs", "deep"]);
+        assert!(links_under(&s, "nobody").is_empty());
+    }
+
+    #[test]
+    fn folder_search_matches_label_or_url() {
+        let s = tree();
+        let rs = links_under(&s, "dev")
+            .into_iter()
+            .find(|i| i.id == "rs")
+            .unwrap();
+        assert!(folder_search_hit(&rs, ""));
+        assert!(folder_search_hit(&rs, "docs"));
+        assert!(folder_search_hit(&rs, "DOCS.RS"));
+        assert!(!folder_search_hit(&rs, "github"));
+    }
+
     /// Nested pins are still pins. The omnibox would miss a folder's
     /// contents if this only returned the grid.
     #[test]
@@ -284,6 +360,19 @@ mod tests {
         // Nothing to name it after: keep the url rather than draw a chip
         // with no label at all.
         assert_eq!(fallback_label("https:///"), "https:///");
+    }
+
+    /// An unnamed folder is still a folder, and it reads as Untitled
+    /// rather than as an empty chip.
+    #[test]
+    fn an_unnamed_folder_reads_as_untitled() {
+        let unnamed = BookmarksSnapshot {
+            nodes: vec![node("f", 0, None, None)],
+            ..Default::default()
+        };
+        let items = bar(&unnamed);
+        assert!(items[0].is_folder());
+        assert_eq!(items[0].label, UNTITLED);
     }
 
     /// A folder is told from a link by having no url, and an EMPTY folder

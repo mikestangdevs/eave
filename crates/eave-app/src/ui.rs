@@ -2842,6 +2842,45 @@ fn coarse_age(ms: u64) -> Option<String> {
     Some(format!("{}y", days / 365))
 }
 
+/// Age on a folder-popup row. Fixture timestamps (`created_ts_ms == 1`
+/// or 0) are not ages. Wording follows the screenshot: "2 months ago",
+/// not the rail's `60d`.
+fn folder_item_age(created_ts_ms: u64, now_ms: u64) -> Option<String> {
+    if created_ts_ms <= 1_000 {
+        return None;
+    }
+    let ms = now_ms.saturating_sub(created_ts_ms);
+    let mins = ms / 60_000;
+    if mins < 1 {
+        return Some("just now".into());
+    }
+    if mins < 60 {
+        return Some(format!("{mins}m ago"));
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return Some(format!("{hours}h ago"));
+    }
+    let days = hours / 24;
+    if days < 30 {
+        return Some(format!("{days}d ago"));
+    }
+    let months = days / 30;
+    if months < 12 {
+        return Some(if months == 1 {
+            "1 month ago".into()
+        } else {
+            format!("{months} months ago")
+        });
+    }
+    let years = days / 365;
+    Some(if years <= 1 {
+        "1 year ago".into()
+    } else {
+        format!("{years} years ago")
+    })
+}
+
 /// Take the operator's deny reason out of the composer and clear it
 /// (Slice K). eave has exactly one text field, so the composer IS the
 /// reason field — the card says so in as many words. Clearing it is the
@@ -5759,6 +5798,51 @@ const TOOLTIP_MAX_W: f32 = 320.0;
 /// still narrower than the menu cap so it never crowds the well.
 const BOOKMARK_PEEK_W: f32 = 300.0;
 
+/// The folder hover popup: same width as the peek, eight rows before
+/// it scrolls. 0.8s dwell, operator ruling. The wash ends at 150 ms
+/// and stops asking for frames, so the dwell clock has to pump its
+/// own (see the `on_next_frame` next to the tile peek's).
+const FOLDER_POPUP_W: f32 = BOOKMARK_PEEK_W;
+const FOLDER_POPUP_MAX_ROWS: usize = 8;
+const FOLDER_POPUP_ROW_H: f32 = 40.0;
+const FOLDER_POPUP_DWELL: Duration = Duration::from_millis(800);
+/// A little past the dwell so the frame that raises the popup is
+/// actually painted, not merely due.
+const FOLDER_POPUP_PUMP: Duration = Duration::from_millis(1000);
+/// How long the inventory stays up after the pointer has left both
+/// the folder row and the popup. Crossing into search/scroll has to
+/// survive the gap; 150 ms of hover fade is not enough once the
+/// surface is mounted at the root, off the row.
+const FOLDER_POPUP_LEAVE: Duration = Duration::from_millis(400);
+
+/// Dwell clock for the folder inventory. Tests use the executor so
+/// `drive` can move it; production uses the wall clock the same way
+/// the tile peek does (`Instant::elapsed`), because a frozen executor
+/// now is how the 0.8s never came due on hover.
+fn folder_hover_now(cx: &App) -> Instant {
+    #[cfg(test)]
+    {
+        cx.background_executor().now()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cx;
+        Instant::now()
+    }
+}
+
+fn folder_hover_elapsed(at: Instant, cx: &App) -> Duration {
+    #[cfg(test)]
+    {
+        cx.background_executor().now().saturating_duration_since(at)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cx;
+        at.elapsed()
+    }
+}
+
 thread_local! {
     /// Where each bookmark tile actually PAINTED this frame, recorded by
     /// a zero-cost canvas child of the tile. The peek card is anchored
@@ -5769,6 +5853,14 @@ thread_local! {
     /// first bookmark").
     static TILE_BOUNDS: RefCell<std::collections::HashMap<String, gpui::Bounds<Pixels>>> =
         RefCell::new(std::collections::HashMap::new());
+    /// Folder rows, same instrument as [`TILE_BOUNDS`]: the inventory is
+    /// hung from the row's vertical centre and the rail's right edge.
+    static FOLDER_BOUNDS: RefCell<std::collections::HashMap<String, gpui::Bounds<Pixels>>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// The rail's painted box. The folder inventory hangs off this right
+    /// edge, vertically centred on the folder — the same pin as a
+    /// bookmark peek, not the pointer.
+    static RAIL_BOUNDS: RefCell<Option<gpui::Bounds<Pixels>>> = RefCell::new(None);
 }
 
 /// A bookmark open in flight — see `Shell::bookmark_tab_pending`.
@@ -6135,8 +6227,7 @@ enum TabMenuTarget {
     /// opens for exactly that reason.
     Bookmark(String),
     /// The Folders zone header. New folder lives on this header's `+`
-    /// (and still on double-click / right-click), not on the bookmark
-    /// grid's `+`.
+    /// (and still on right-click), not on the bookmark grid's `+`.
     Folders,
     /// The downloads panel — 06-browser D4.
     ///
@@ -6379,6 +6470,10 @@ struct Shell {
     /// a session, so it must survive the feed events that rebuild the
     /// rail underneath it.
     rename: Option<RenameEdit>,
+    /// Folder ids that existed when New Folder was asked. The next
+    /// snapshot that contains a folder not in this set is the one we
+    /// open for naming. `None` = not waiting.
+    pending_folder_rename: Option<Vec<String>>,
     /// The rail's text filter (Slice AG2 #5). `None` = closed; `Some("")` =
     /// open and empty, which still shows every row — an open field is not
     /// yet a filter.
@@ -6573,6 +6668,24 @@ struct Shell {
     /// clock. The hover FADE saturates in 150 ms and the walk asked for
     /// half a second, so the fade cannot be the timer.
     bookmark_peek_hover_since: RefCell<Option<(String, std::time::Instant)>>,
+    /// Which folder's hover popup is up. One at a time. Opens after
+    /// [`FOLDER_POPUP_DWELL`] on a closed row; stays while the row or
+    /// the card is hovered, or while its search field owns the keyboard.
+    folder_popup_shown: RefCell<Option<String>>,
+    /// When the pointer settled on the closed folder — the inventory's
+    /// dwell clock. Wall time in production; test executor in the harness.
+    folder_popup_hover_since: RefCell<Option<(String, Instant)>>,
+    /// When the pointer left both the folder row and the popup. Hide
+    /// after [`FOLDER_POPUP_LEAVE`] if it has not come back. `None` =
+    /// still over one of them.
+    folder_popup_leave_since: RefCell<Option<(String, Instant)>>,
+    /// A click on this folder suppresses the inventory until the
+    /// pointer leaves. Without it, mouse-down paints the popup and
+    /// mouse-up expands the row and hides it — a flash, not a hover.
+    folder_popup_suppress: RefCell<Option<String>>,
+    /// The folder popup's search buffer. `None` = not typing (hover is
+    /// a preview); `Some` = the field owns the keyboard.
+    folder_search: Option<String>,
     /// Which rail zones are collapsed (Slice D4.2 stage 2). Loaded from
     /// `frame.json` at construction and written back on the click, so the
     /// rail comes back the way it was left.
@@ -6767,6 +6880,8 @@ enum Field {
     Rename,
     /// The rail's session filter (Slice AG2 #5).
     RailFilter,
+    /// Search inside a folder hover popup.
+    FolderSearch,
 }
 
 /// One caret, for every field whose text does not wrap.
@@ -6824,6 +6939,11 @@ struct RenameEdit {
     text: String,
     /// A bookmark folder, not a session. Same field, different verb.
     bookmark: bool,
+    /// True until the first keystroke. The seeded name is drawn as a
+    /// selection, and the next printable character replaces it — the
+    /// same stand-in for a selection the omnibox uses. New folders
+    /// open this way so "Untitled" is ready to type over.
+    seeded: bool,
 }
 
 /// Slice Q2. The provider strip's selection and the model menu.
@@ -9610,6 +9730,55 @@ impl Shell {
             }
             return;
         }
+        if self.folder_popup_shown.borrow().is_some() && self.folder_search.is_none() {
+            if ks.key.as_str() == "escape" {
+                self.close_folder_popup(cx);
+            }
+            return;
+        }
+        if self.folder_search.is_some() {
+            match ks.key.as_str() {
+                "escape" => {
+                    if self
+                        .folder_search
+                        .as_ref()
+                        .is_some_and(|q| !q.is_empty())
+                    {
+                        self.folder_search = Some(String::new());
+                    } else {
+                        self.folder_search = None;
+                        *self.folder_popup_shown.borrow_mut() = None;
+                    }
+                    cx.notify();
+                }
+                "enter" => self.open_folder_search_hit(cx),
+                "backspace" => {
+                    if let Some(text) = self.folder_search.as_mut() {
+                        text.pop();
+                    }
+                    cx.notify();
+                }
+                "v" if ks.modifiers.platform => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(f) = self.folder_search.as_mut() {
+                            f.push_str(&text);
+                        }
+                        cx.notify();
+                    }
+                }
+                _ => {
+                    if let Some(ch) = ks.key_char.clone() {
+                        if !ks.modifiers.platform && !ks.modifiers.control {
+                            if let Some(f) = self.folder_search.as_mut() {
+                                f.push_str(&ch);
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+            return;
+        }
         // Stage AC: an open rename field owns the keyboard, exactly the
         // way P1's menus above do, and for the same reason — a field you
         // can type past is not a field, and every key that fell through
@@ -9674,7 +9843,11 @@ impl Shell {
                 "enter" => self.commit_rename(cx),
                 "backspace" => {
                     if let Some(edit) = self.rename.as_mut() {
-                        edit.text.pop();
+                        if std::mem::take(&mut edit.seeded) {
+                            edit.text.clear();
+                        } else {
+                            edit.text.pop();
+                        }
                     }
                     cx.notify();
                 }
@@ -9684,6 +9857,9 @@ impl Shell {
                 "v" if ks.modifiers.platform => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                         if let Some(edit) = self.rename.as_mut() {
+                            if std::mem::take(&mut edit.seeded) {
+                                edit.text.clear();
+                            }
                             edit.text.push_str(&text);
                         }
                         cx.notify();
@@ -9693,6 +9869,9 @@ impl Shell {
                     if let Some(ch) = ks.key_char.clone() {
                         if !ks.modifiers.platform && !ks.modifiers.control {
                             if let Some(edit) = self.rename.as_mut() {
+                                if std::mem::take(&mut edit.seeded) {
+                                    edit.text.clear();
+                                }
                                 edit.text.push_str(&ch);
                             }
                             cx.notify();
@@ -9952,6 +10131,7 @@ impl Shell {
             // rename does, and this list is what keeps the composer and
             // the page from disagreeing about that.
             || self.rail_filter.is_some()
+            || self.folder_search.is_some()
     }
 
     /// A document is on screen and nothing of ours is sitting in front of
@@ -10116,10 +10296,12 @@ impl Shell {
         // keyboard in `chrome_holds_keyboard`, and two open at once gives
         // `on_key` two live branches and the caret two owners.
         self.rail_filter = None;
+        self.folder_search = None;
         self.rename = Some(RenameEdit {
             session_id: id,
             text,
             bookmark: false,
+            seeded: false,
         });
         cx.notify();
     }
@@ -10132,16 +10314,18 @@ impl Shell {
             .nodes
             .iter()
             .find(|n| n.bookmark.id == id)
-            .and_then(|n| n.bookmark.title.clone())
-            .unwrap_or_default();
+            .and_then(|n| n.bookmark.title.clone().filter(|t| !t.trim().is_empty()))
+            .unwrap_or_else(|| bookmarks::UNTITLED.to_string());
         // Slice AG2 #5: the two rail fields are exclusive — both claim the
         // keyboard in `chrome_holds_keyboard`, and two open at once gives
         // `on_key` two live branches and the caret two owners.
         self.rail_filter = None;
+        self.folder_search = None;
         self.rename = Some(RenameEdit {
             session_id: id,
             text,
             bookmark: true,
+            seeded: true,
         });
         cx.notify();
     }
@@ -10677,6 +10861,7 @@ impl Shell {
     /// every browser does, and a thing a person only discovers after
     /// pressing Return.
     fn open_omnibox(&mut self, cx: &mut Context<Self>) {
+        self.folder_search = None;
         let snapshot = self.strip_snapshot(cx);
         let text = snapshot
             .active
@@ -12497,6 +12682,9 @@ impl Shell {
         if self.rail_filter.is_some() {
             return Some(Field::RailFilter);
         }
+        if self.folder_search.is_some() {
+            return Some(Field::FolderSearch);
+        }
         if self.rename.is_some() {
             return Some(Field::Rename);
         }
@@ -12882,7 +13070,13 @@ impl Shell {
     /// Radius carries a Projects tree and a Tabs list in one column. A
     /// session with a tab open appears in both, and that is correct: one
     /// section is what is open, the other is what exists.
-    fn rail_tabs(&self, cx: &Context<Self>, phase: Option<f32>, caret_lit: bool) -> AnyElement {
+    fn rail_tabs(
+        &self,
+        cx: &Context<Self>,
+        phase: Option<f32>,
+        caret_lit: bool,
+        folder_caret_lit: bool,
+    ) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
         let chips: HashMap<String, strip::SessionChip> = self
             .sessions
@@ -12941,6 +13135,7 @@ impl Shell {
         // Counted so they do not spend the tab budget — see
         // `theme::rail_rows_h`.
         let mut extra = 0usize;
+        let mut folder_block: Vec<AnyElement> = Vec::new();
         let mut active_row: Option<usize> = None;
         // Where the Projects zone stops and Folders/Tabs begins. The rail's
         // sections are separate scrollers (the operator's report: "each
@@ -12965,10 +13160,12 @@ impl Shell {
             if ix == projects && !emitted_tabs_seam {
                 seam_ix = Some(rows.len());
                 extra += self.emit_folders_and_tabs_head(
+                    &mut folder_block,
                     &mut rows,
                     folders_shut,
                     folder_count,
                     caret_lit,
+                    folder_caret_lit,
                     cx,
                 );
                 emitted_tabs_seam = true;
@@ -13037,10 +13234,12 @@ impl Shell {
         if !emitted_tabs_seam {
             seam_ix = Some(rows.len());
             extra += self.emit_folders_and_tabs_head(
+                &mut folder_block,
                 &mut rows,
                 folders_shut,
                 folder_count,
                 caret_lit,
+                folder_caret_lit,
                 cx,
             );
         }
@@ -13126,6 +13325,18 @@ impl Shell {
                     .gap(px(theme::RAIL_ROW_GAP))
                     .children(project_rows)
             }))
+            .child(
+                div()
+                    .id("folders-strip")
+                    .debug_selector(|| "folders-strip".into())
+                    .w_full()
+                    .flex_none()
+                    .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::RAIL_ROW_GAP))
+                    .children(folder_block),
+            )
             .child(
                 div()
                     .id("tab-strip")
@@ -13838,6 +14049,7 @@ impl Shell {
                             // Rename and the filter are the same kind of
                             // thing and cannot both hold the keyboard.
                             this.rename = None;
+                            this.folder_search = None;
                             this.rail_filter = Some(String::new());
                             cx.notify();
                         }
@@ -14062,20 +14274,7 @@ impl Shell {
                             format!("{selector}-chevron"),
                         ))
                     })
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                        if key == ZONE_FOLDERS && ev.click_count() >= 2 {
-                            if nested {
-                                // First click of the pair already toggled
-                                // collapse; put it back so a double-click
-                                // is the menu.
-                                let cell = this.zone_cell(key);
-                                let next = !cell.get();
-                                cell.set(next);
-                                save_zone_collapsed(key, next);
-                            }
-                            this.open_folders_menu(ev.position(), cx);
-                            return;
-                        }
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         if !nested {
                             return;
                         }
@@ -14107,20 +14306,23 @@ impl Shell {
         }
     }
 
-    /// Folders zone + the tabs seam + the standing New Tab pill. Pushed
-    /// as a block so the two call sites (the seam inside the item loop,
-    /// and the no-loose-tabs tail) cannot drift. Tabs themselves are not
-    /// a collapsing zone — they just exist under the pill.
+    /// Folders zone, then the tabs seam + the standing New Tab pill.
+    ///
+    /// Folders are written into `folder_block` so they can sit OUTSIDE
+    /// the tabs scroller — bookmark peeks work because tiles are not
+    /// inside `overflow_y_scroll`; the inventory is the same shape.
+    /// The divider and New Tab pill stay in `rows` (the tabs strip).
     fn emit_folders_and_tabs_head(
         &self,
+        folder_block: &mut Vec<AnyElement>,
         rows: &mut Vec<AnyElement>,
         folders_shut: bool,
         folder_count: usize,
         caret_lit: bool,
+        folder_caret_lit: bool,
         cx: &Context<Self>,
     ) -> usize {
-        let mut extra = 0usize;
-        rows.push(self.zone_toggle(
+        folder_block.push(self.zone_toggle(
             "zone-folders",
             ZONE_FOLDERS,
             "Folders",
@@ -14130,15 +14332,13 @@ impl Shell {
             |this, cx| this.new_bookmark_folder(cx),
             cx,
         ));
-        extra += 1;
         if !folders_shut {
             // No empty-state row: add is the header `+` (and still the
-            // double-click / right-click menu). An empty zone has nothing
+            // right-click menu). An empty zone has nothing
             // nested, so it is just the header.
-            let folders = self.bookmark_folder_rows(caret_lit, cx);
-            extra += folders.len();
-            rows.extend(folders);
+            folder_block.extend(self.bookmark_folder_rows(caret_lit, folder_caret_lit, cx));
         }
+        let mut extra = 0usize;
         rows.push(self.zone_rule("tabs-divider"));
         extra += 1;
         rows.push(self.new_tab_row(cx));
@@ -14189,24 +14389,368 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The bookmark FOLDERS, as titled rows in their own zone between
-    /// projects and tabs — and, when one is open, its children as rows
-    /// directly beneath it.
-    ///
-    /// **Expansion is inline, not a popup.** T1 opened a folder into a
-    /// `deferred` overlay hanging off the bar; the operator ruled against
-    /// it. A disclosure that pushes its neighbours down is a list, and this
-    /// rail is already a scrolling list — the container these rows land in
-    /// is `overflow_y_scroll` with a definite height capped at
-    /// `RAIL_TABS_VISIBLE`, so an expanded folder scrolls with everything
-    /// else and needs no machinery of its own.
-    ///
-    /// Returns a flat `Vec` rather than a nested element for exactly that
-    /// reason: the children have to be siblings of the tab rows to share
-    /// their scroll, not children of the folder row.
-    fn bookmark_folder_rows(&self, caret_lit: bool, cx: &Context<Self>) -> Vec<AnyElement> {
+    /// Open the first link the folder popup's search is showing.
+    fn open_folder_search_hit(&mut self, cx: &mut Context<Self>) {
+        let Some(folder_id) = self.folder_popup_shown.borrow().clone() else {
+            return;
+        };
+        let needle = self.folder_search.clone().unwrap_or_default();
+        let url = bookmarks::links_under(&self.bookmarks.read(cx).snapshot, &folder_id)
+            .into_iter()
+            .find(|i| bookmarks::folder_search_hit(i, &needle))
+            .and_then(|i| i.url);
+        if let Some(url) = url {
+            self.folder_search = None;
+            *self.folder_popup_shown.borrow_mut() = None;
+            self.open_bookmark(url, cx);
+        }
+        cx.notify();
+    }
+
+    /// Hover inventory of a folder: search field, then a scrolling list
+    /// of every page underneath.
+    fn folder_popup(
+        &self,
+        folder: &bookmarks::BarItem,
+        caret_lit: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let snapshot = &self.bookmarks.read(cx).snapshot;
-        let folders = bookmarks::folders(snapshot);
+        let needle = self.folder_search.clone().unwrap_or_default();
+        let typing = self.folder_search.is_some();
+        let items: Vec<bookmarks::BarItem> = bookmarks::links_under(snapshot, &folder.id)
+            .into_iter()
+            .filter(|i| bookmarks::folder_search_hit(i, &needle))
+            .collect();
+        let now_ms = eave_core::journal::now_ms();
+        let list_h = FOLDER_POPUP_ROW_H * FOLDER_POPUP_MAX_ROWS as f32;
+        let placeholder = format!("Search {}...", folder.label);
+        let folder_id = folder.id.clone();
+        let search_id = folder.id.clone();
+        // Same hover key on every hit target inside the popup so moving
+        // from the chrome onto search/rows does not drop `pop_t` and
+        // start the leave clock.
+        let hover_key = format!("folder-popup-{}", folder.id);
+
+        let search = div()
+            .id(SharedString::from(format!("folder-popup-search-{folder_id}")))
+            .debug_selector({
+                let id = folder.id.clone();
+                move || format!("folder-popup-search-{id}")
+            })
+            .w_full()
+            .h(px(theme::RAIL_GHOST_H))
+            .px(px(theme::SPACE_3))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_2))
+            .cursor_text()
+            .on_hover(crate::motion::hover_listener(hover_key.clone()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.rename = None;
+                this.rail_filter = None;
+                if this.folder_search.is_none() {
+                    this.folder_search = Some(String::new());
+                }
+                *this.folder_popup_shown.borrow_mut() = Some(search_id.clone());
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(icons::tagged_icon(
+                icons::MAGNIFER,
+                theme::ICON_SM,
+                theme::text_tertiary(),
+                "folder-popup-search-glyph",
+            ))
+            .child(if typing {
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .text_color(theme::text())
+                    .child(
+                        div()
+                            .debug_selector(|| "folder-popup-search-field".into())
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(SharedString::from(if needle.is_empty() {
+                                String::new()
+                            } else {
+                                needle.clone()
+                            })),
+                    )
+                    .child(caret_glyph(
+                        "folder-search",
+                        caret_lit,
+                        theme::SMALL_SIZE,
+                        theme::text(),
+                    ))
+                    .into_any_element()
+            } else {
+                div()
+                    .debug_selector(|| "folder-popup-search-placeholder".into())
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(placeholder))
+                    .into_any_element()
+            });
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if items.is_empty() {
+            rows.push(
+                div()
+                    .debug_selector(|| "folder-popup-empty".into())
+                    .w_full()
+                    .h(px(FOLDER_POPUP_ROW_H))
+                    .px(px(theme::SPACE_3))
+                    .flex()
+                    .items_center()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .text_color(theme::text_tertiary())
+                    .child(if needle.trim().is_empty() {
+                        SharedString::from("empty")
+                    } else {
+                        SharedString::from("no matches")
+                    })
+                    .into_any_element(),
+            );
+        } else {
+            for (i, child) in items.iter().enumerate() {
+                let open_url = child.url.clone().unwrap_or_default();
+                let age = folder_item_age(child.created_ts_ms, now_ms);
+                let row_sel = format!("folder-popup-row-{}", child.id);
+                rows.push(
+                    div()
+                        .id(SharedString::from(row_sel.clone()))
+                        .debug_selector({
+                            let s = row_sel.clone();
+                            move || s
+                        })
+                        .w_full()
+                        .h(px(FOLDER_POPUP_ROW_H))
+                        .px(px(theme::SPACE_3))
+                        .rounded(px(theme::RADIUS_MENU_ROW))
+                        .cursor_pointer()
+                        .hover_fade(
+                            hover_key.clone(),
+                            if i == 0 {
+                                theme::overlay()
+                            } else {
+                                theme::wash_rest()
+                            },
+                            theme::overlay_strong(),
+                        )
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACE_2))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.folder_search = None;
+                            *this.folder_popup_shown.borrow_mut() = None;
+                            this.open_bookmark(open_url.clone(), cx);
+                            cx.notify();
+                        }))
+                        .child(self.bookmark_child_mark(child))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_size(px(theme::SMALL_SIZE))
+                                        .font_weight(theme::WEIGHT_BODY)
+                                        .text_color(theme::text())
+                                        .child(SharedString::from(child.label.clone())),
+                                )
+                                .children(age.map(|a| {
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_size(px(theme::MICRO_SIZE))
+                                        .text_color(theme::text_tertiary())
+                                        .child(SharedString::from(a))
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        div()
+            .id(SharedString::from(format!("folder-popup-{folder_id}")))
+            .debug_selector({
+                let id = folder.id.clone();
+                move || format!("folder-popup-{id}")
+            })
+            .relative()
+            .occlude()
+            .on_hover(crate::motion::hover_listener(hover_key.clone()))
+            .w(px(FOLDER_POPUP_W))
+            .rounded(px(theme::RADIUS_MENU))
+            .bg(theme::menu_glass())
+            .border_1()
+            .border_color(theme::edge_modal())
+            .shadow(theme::shadow_modal())
+            .flex()
+            .flex_col()
+            .py(px(theme::SPACE_1))
+            .child(search)
+            .child(
+                div()
+                    .id("folder-popup-list")
+                    .debug_selector(|| "folder-popup-list".into())
+                    .w_full()
+                    .max_h(px(list_h))
+                    .overflow_y_scroll()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .on_hover(crate::motion::hover_listener(hover_key.clone()))
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn close_folder_popup(&mut self, cx: &mut Context<Self>) {
+        self.folder_search = None;
+        *self.folder_popup_shown.borrow_mut() = None;
+        *self.folder_popup_hover_since.borrow_mut() = None;
+        *self.folder_popup_leave_since.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// Dwell / leave clock for a closed folder's inventory. Same shape
+    /// as the bookmark-tile peek: `hover_t` starts the clock, wall time
+    /// (executor in tests) decides when it is due, and the card stays
+    /// while the row or the card is hovered — plus a short leave grace
+    /// so the pointer can cross the gutter onto search.
+    fn folder_inventory_tick(&self, id: &str, is_open: bool, cx: &App) -> bool {
+        let folder_t = crate::motion::hover_t(&format!("bookmark-folder-{id}"));
+        let popup_t = crate::motion::hover_t(&format!("folder-popup-{id}"));
+        if is_open {
+            if self.folder_popup_shown.borrow().as_deref() == Some(id) {
+                *self.folder_popup_shown.borrow_mut() = None;
+                *self.folder_popup_hover_since.borrow_mut() = None;
+                *self.folder_popup_leave_since.borrow_mut() = None;
+            }
+            return false;
+        }
+
+        let suppressed = self
+            .folder_popup_suppress
+            .borrow()
+            .as_deref()
+            .is_some_and(|fid| fid == id);
+        if folder_t <= 0.001 {
+            if self
+                .folder_popup_hover_since
+                .borrow()
+                .as_ref()
+                .is_some_and(|(fid, _)| fid == id)
+            {
+                *self.folder_popup_hover_since.borrow_mut() = None;
+            }
+            if suppressed {
+                *self.folder_popup_suppress.borrow_mut() = None;
+            }
+        } else if folder_t > 0.9 && !suppressed {
+            let mut since = self.folder_popup_hover_since.borrow_mut();
+            if !since.as_ref().is_some_and(|(fid, _)| fid == id) {
+                *since = Some((id.to_string(), folder_hover_now(cx)));
+            }
+        }
+
+        let dwelled = !suppressed
+            && self
+                .folder_popup_hover_since
+                .borrow()
+                .as_ref()
+                .is_some_and(|(fid, at)| {
+                    fid == id && folder_hover_elapsed(*at, cx) >= FOLDER_POPUP_DWELL
+                });
+        let over = folder_t > 0.001
+            || popup_t > 0.001
+            || (self.folder_search.is_some()
+                && self.folder_popup_shown.borrow().as_deref() == Some(id));
+
+        let mut shown = self.folder_popup_shown.borrow_mut();
+        let is_shown = shown.as_deref() == Some(id);
+        if !is_shown && dwelled {
+            *shown = Some(id.to_string());
+            *self.folder_popup_leave_since.borrow_mut() = None;
+            true
+        } else if is_shown && !over {
+            let mut leave = self.folder_popup_leave_since.borrow_mut();
+            if !leave.as_ref().is_some_and(|(fid, _)| fid == id) {
+                *leave = Some((id.to_string(), folder_hover_now(cx)));
+            }
+            if leave.as_ref().is_some_and(|(fid, at)| {
+                fid == id && folder_hover_elapsed(*at, cx) >= FOLDER_POPUP_LEAVE
+            }) {
+                *shown = None;
+                *leave = None;
+                false
+            } else {
+                true
+            }
+        } else if is_shown {
+            *self.folder_popup_leave_since.borrow_mut() = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Hung off the rail's right edge, vertically centred on the folder.
+    /// `deferred` + `anchored` is the bookmark-peek path: the card is
+    /// its own hit target, so search and scroll stay reachable.
+    fn folder_inventory_layer(
+        &self,
+        folder: &bookmarks::BarItem,
+        caret_lit: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let bounds = FOLDER_BOUNDS.with(|m| m.borrow().get(&folder.id).copied())?;
+        let rail_b = RAIL_BOUNDS.with(|b| *b.borrow());
+        let x = rail_b
+            .map(|r| r.origin.x + r.size.width)
+            .unwrap_or(bounds.origin.x + bounds.size.width)
+            + px(theme::SPACE_1);
+        let y = bounds.origin.y + bounds.size.height / 2.0;
+        Some(
+            deferred(
+                gpui::anchored()
+                    .anchor(gpui::Anchor::LeftCenter)
+                    .position(point(x, y))
+                    .snap_to_window_with_margin(px(theme::MENU_SCREEN_MARGIN))
+                    .child(self.folder_popup(folder, caret_lit, cx)),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Click still expands inline (T1). Hover on a *closed* folder
+    /// opens a searchable, scrollable inventory of every page in it.
+    /// An open folder already lists those pages in the rail, so the
+    /// popup stays off.
+    fn bookmark_folder_rows(
+        &self,
+        caret_lit: bool,
+        _folder_caret_lit: bool,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let folders = bookmarks::folders(&self.bookmarks.read(cx).snapshot);
         let open = self.bookmark_folder_open.borrow().clone();
         let mut out: Vec<AnyElement> = Vec::new();
 
@@ -14214,14 +14758,14 @@ impl Shell {
             let id = item.id.clone();
             let sel = item.id.clone();
             let is_open = open.as_deref() == Some(item.id.as_str());
-            let (click_id, menu_dbl, menu_right, drop_id, add_id, add_tab) = (
-                id.clone(),
+            let (click_id, menu_right, drop_id, add_id, add_tab) = (
                 id.clone(),
                 id.clone(),
                 id.clone(),
                 id.clone(),
                 id.clone(),
             );
+            let show_popup = self.folder_inventory_tick(&id, is_open, cx);
 
             out.push(
                 rail_inset()
@@ -14229,6 +14773,7 @@ impl Shell {
                         div()
                             .id(SharedString::from(format!("bookmark-folder-{id}")))
                             .debug_selector(move || format!("bookmark-folder-{sel}"))
+                            .relative()
                             .w_full()
                             .h(px(theme::RAIL_TAB_H))
                             .px(px(theme::RAIL_HOVER_PAD))
@@ -14244,6 +14789,25 @@ impl Shell {
                             .flex_row()
                             .items_center()
                             .gap(px(theme::SPACE_2))
+                            .child({
+                                let bid = item.id.clone();
+                                gpui::canvas(
+                                    move |bounds, _, _| {
+                                        FOLDER_BOUNDS.with(|m| {
+                                            m.borrow_mut().insert(bid, bounds);
+                                        });
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full()
+                            })
+                            .when(show_popup, |d| {
+                                match self.folder_inventory_layer(item, caret_lit, cx) {
+                                    Some(layer) => d.child(layer),
+                                    None => d,
+                                }
+                            })
                             .child(icons::tagged_icon(
                                 if is_open {
                                     icons::FOLDER_OPEN
@@ -14255,16 +14819,13 @@ impl Shell {
                                 "bookmark-folder-glyph",
                             ))
                             .child(self.bookmark_folder_label(&id, item.label.clone(), caret_lit, cx))
-                            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                if ev.click_count() >= 2 {
-                                    // The first click of the pair already
-                                    // toggled; put it back so a double-click is
-                                    // the menu, not expand-then-menu.
-                                    this.toggle_bookmark_folder(&click_id, cx);
-                                    this.open_bookmark_menu(&menu_dbl, ev.position(), cx);
-                                    return;
-                                }
+                                this.folder_search = None;
+                                *this.folder_popup_shown.borrow_mut() = None;
+                                *this.folder_popup_hover_since.borrow_mut() = None;
+                                *this.folder_popup_leave_since.borrow_mut() = None;
+                                *this.folder_popup_suppress.borrow_mut() = Some(click_id.clone());
                                 this.toggle_bookmark_folder(&click_id, cx);
                                 cx.notify();
                             }))
@@ -14304,7 +14865,7 @@ impl Shell {
             if !is_open {
                 continue;
             }
-            let children = bookmarks::children_of(snapshot, &item.id);
+            let children = bookmarks::children_of(&self.bookmarks.read(cx).snapshot, &item.id);
             if children.is_empty() {
                 // An empty folder is a fact, and saying so beats a folder
                 // that opens into nothing the operator cannot tell from a
@@ -14332,7 +14893,6 @@ impl Shell {
                 let cid = child.id.clone();
                 let csel = child.id.clone();
                 let curl = child.url.clone();
-                let cmenu_dbl = child.id.clone();
                 let cmenu_right = child.id.clone();
                 let nested = child.is_folder();
                 let mut row = div()
@@ -14357,12 +14917,7 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(theme::SPACE_2))
-                    .child(icons::tagged_icon(
-                        if nested { icons::FOLDER } else { icons::GLOBAL },
-                        theme::RAIL_MARK,
-                        theme::text_tertiary(),
-                        "bookmark-child-glyph",
-                    ))
+                    .child(self.bookmark_child_mark(child))
                     .child(if nested {
                         self.bookmark_folder_label(&cid, child.label.clone(), caret_lit, cx)
                     } else {
@@ -14386,12 +14941,9 @@ impl Shell {
                 // rather than an exemption: the right-click wiring was
                 // identical in both arms and is now written once.
                 row = row
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         if nested {
                             cx.stop_propagation();
-                            if ev.click_count() >= 2 {
-                                this.open_bookmark_menu(&cmenu_dbl, ev.position(), cx);
-                            }
                             return;
                         }
                         if let Some(url) = curl.clone() {
@@ -14658,6 +15210,48 @@ impl Shell {
         }
     }
 
+    /// The leading mark on a row inside an open folder.
+    ///
+    /// A nested folder stays a folder glyph. A link wears the same host
+    /// favicon the pinned grid does — dropping a tab into a folder is
+    /// filing the page, not swapping its mark for a globe. The globe is
+    /// only the "no bytes yet" fallback, same contract as a tile.
+    fn bookmark_child_mark(&self, item: &bookmarks::BarItem) -> AnyElement {
+        if item.is_folder() {
+            return icons::tagged_icon(
+                icons::FOLDER,
+                theme::RAIL_MARK,
+                theme::text_tertiary(),
+                "bookmark-child-glyph",
+            )
+            .into_any_element();
+        }
+        if let Some(url) = item.url.as_deref() {
+            crate::web::request_favicon(url);
+            if let Some(image) = crate::web::favicon_for_url(url) {
+                let id = item.id.clone();
+                return div()
+                    .debug_selector(move || format!("bookmark-child-mark-{id}"))
+                    .flex_none()
+                    .size(px(theme::RAIL_MARK))
+                    .overflow_hidden()
+                    .child(
+                        img(image)
+                            .size(px(theme::RAIL_MARK))
+                            .object_fit(ObjectFit::Fill),
+                    )
+                    .into_any_element();
+            }
+        }
+        icons::tagged_icon(
+            icons::GLOBAL,
+            theme::RAIL_MARK,
+            theme::text_tertiary(),
+            "bookmark-child-glyph",
+        )
+        .into_any_element()
+    }
+
     fn bookmark_folder_label(
         &self,
         id: &str,
@@ -14668,41 +15262,51 @@ impl Shell {
         let editing = self
             .rename
             .as_ref()
-            .and_then(|e| (e.bookmark && e.session_id == id).then_some(e.text.clone()));
+            .filter(|e| e.bookmark && e.session_id == id);
         match editing {
-            Some(text) => div()
-                .id(SharedString::from(format!("rename-bookmark-{id}")))
-                .debug_selector({
-                    let id = id.to_string();
-                    move || format!("rename-bookmark-{id}")
-                })
-                .flex_1()
-                .min_w(px(0.))
-                .flex()
-                .flex_row()
-                .items_center()
-                .border_1()
-                .border_color(theme::border_strong())
-                .rounded(px(theme::RADIUS_SELECT))
-                .text_size(px(theme::SMALL_SIZE))
-                .font_weight(theme::WEIGHT_BODY)
-                .text_color(theme::text())
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .cursor_text()
-                .child(
-                    div()
-                        .min_w(px(0.))
-                        .truncate()
-                        .child(SharedString::from(text)),
-                )
-                .child(caret_glyph(
-                    "rename",
-                    caret_lit,
-                    theme::SMALL_SIZE,
-                    theme::text(),
-                ))
-                .into_any_element(),
+            Some(edit) => {
+                let selected = edit.seeded && !edit.text.is_empty();
+                let text = edit.text.clone();
+                div()
+                    .id(SharedString::from(format!("rename-bookmark-{id}")))
+                    .debug_selector({
+                        let id = id.to_string();
+                        move || format!("rename-bookmark-{id}")
+                    })
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .border_1()
+                    .border_color(theme::border_strong())
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .font_weight(theme::WEIGHT_BODY)
+                    .text_color(theme::text())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .cursor_text()
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .when(selected, |d| {
+                                d.debug_selector(|| "rename-selection".into())
+                                    .bg(theme::overlay_strong())
+                            })
+                            .child(SharedString::from(text)),
+                    )
+                    .when(!selected, |d| {
+                        d.child(caret_glyph(
+                            "rename",
+                            caret_lit,
+                            theme::SMALL_SIZE,
+                            theme::text(),
+                        ))
+                    })
+                    .into_any_element()
+            }
             None => div()
                 .min_w(px(0.))
                 .flex_1()
@@ -14716,25 +15320,7 @@ impl Shell {
     }
 
     fn new_nested_folder(&mut self, parent: String, cx: &mut Context<Self>) {
-        let existing = bookmarks::children_of(&self.bookmarks.read(cx).snapshot, &parent)
-            .iter()
-            .filter(|i| i.is_folder())
-            .count();
-        let title = if existing == 0 {
-            "new folder".to_string()
-        } else {
-            format!("new folder {}", existing + 1)
-        };
-        let _ = self
-            .commands
-            .send(Command::Browser(BrowserCmd::BookmarkAdd {
-                parent: Some(parent.clone()),
-                index: None,
-                title: Some(title),
-                url: None,
-            }));
-        *self.bookmark_folder_open.borrow_mut() = Some(parent);
-        cx.notify();
+        self.request_new_folder(Some(parent), cx);
     }
 
     fn copy_folder_links(&self, folder_id: &str, cx: &mut Context<Self>) {
@@ -14825,34 +15411,73 @@ impl Shell {
     }
 
     /// A top-level folder, from the Folders header `+` or its menu.
-    ///
-    /// Named on creation rather than left blank and renamed after. eave has
-    /// no inline rename for a bookmark yet (`BookmarkRename` is on the wire
-    /// and nothing calls it), so a folder created unnamed would draw as an
-    /// empty chip the operator could open and fill but never identify. The
-    /// count makes the second one distinguishable from the first, which is
-    /// the whole job until a rename exists.
     fn new_bookmark_folder(&mut self, cx: &mut Context<Self>) {
-        let existing = bookmarks::bar(&self.bookmarks.read(cx).snapshot)
-            .iter()
-            .filter(|i| i.is_folder())
-            .count();
-        let title = if existing == 0 {
-            "new folder".to_string()
-        } else {
-            format!("new folder {}", existing + 1)
-        };
+        self.request_new_folder(None, cx);
+    }
+
+    /// Ask the engine for a folder named Untitled, then open its rename
+    /// field selected once the snapshot carries the new id.
+    ///
+    /// The id is minted on the other side of the command channel, so this
+    /// cannot start the field itself. [`Shell::arm_pending_folder_rename`]
+    /// is the other half: it watches the next tree for a folder that was
+    /// not here when we asked.
+    fn request_new_folder(&mut self, parent: Option<String>, cx: &mut Context<Self>) {
+        self.pending_folder_rename = Some(
+            self.bookmarks
+                .read(cx)
+                .snapshot
+                .nodes
+                .iter()
+                .filter(|n| n.bookmark.is_folder())
+                .map(|n| n.bookmark.id.clone())
+                .collect(),
+        );
         let _ = self
             .commands
             .send(Command::Browser(BrowserCmd::BookmarkAdd {
-                parent: None,
+                parent: parent.clone(),
                 index: None,
-                title: Some(title),
+                title: Some(bookmarks::UNTITLED.to_string()),
                 url: None,
             }));
+        if let Some(parent) = parent {
+            *self.bookmark_folder_open.borrow_mut() = Some(parent);
+        }
         self.zone_folders_collapsed.set(false);
         save_zone_collapsed(ZONE_FOLDERS, false);
         cx.notify();
+    }
+
+    /// Open rename on the folder New Folder just made, once it exists.
+    ///
+    /// Only an Untitled (or unnamed) folder that was not in the set we
+    /// recorded counts — an import or a named pin landing in the same
+    /// snapshot must not steal the field.
+    fn arm_pending_folder_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(known) = self.pending_folder_rename.clone() else {
+            return;
+        };
+        let new_id = self
+            .bookmarks
+            .read(cx)
+            .snapshot
+            .nodes
+            .iter()
+            .find(|n| {
+                n.bookmark.is_folder()
+                    && !known.iter().any(|k| k == &n.bookmark.id)
+                    && n.bookmark
+                        .title
+                        .as_deref()
+                        .map(|t| t.trim().is_empty() || t == bookmarks::UNTITLED)
+                        .unwrap_or(true)
+            })
+            .map(|n| n.bookmark.id.clone());
+        if let Some(id) = new_id {
+            self.pending_folder_rename = None;
+            self.begin_bookmark_rename(id, cx);
+        }
     }
 
     fn move_bookmark(
@@ -15435,6 +16060,7 @@ impl Shell {
         phase: Option<f32>,
         caret_lit: bool,
         filter_caret_lit: bool,
+        folder_caret_lit: bool,
     ) -> AnyElement {
         // Already in draw order: `fold_rail` decided it when each row
         // arrived, and deliberately does not re-decide it here (Stage AB).
@@ -16514,6 +17140,16 @@ impl Shell {
             // overhangs the seam by half its width — so this has to establish
             // the containing block or the handle would anchor to the window.
             .relative()
+            .child({
+                gpui::canvas(
+                    |bounds, _, _| {
+                        RAIL_BOUNDS.with(|b| *b.borrow_mut() = Some(bounds));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
             .bg(theme::rail_plate())
             // **No right border.** The rail meets the content card across a
             // CARD_GUTTER of window surface, and the card draws its own
@@ -16541,7 +17177,7 @@ impl Shell {
             // Slice T1b — the pinned marks head the rail, above the
             // projects, as the reference frame has them.
             .children(self.bookmarks_grid(cx))
-            .child(self.rail_tabs(cx, phase, caret_lit))
+            .child(self.rail_tabs(cx, phase, caret_lit, folder_caret_lit))
             .child(self.rail_handle(cx))
             // Tabs/sessions seam. Same painter as folders/tabs, sitting
             // BETWEEN the two containers so scrolling either list does
@@ -20415,8 +21051,8 @@ impl Shell {
         self.open_tab_menu_at(TabMenu { target, at }, cx);
     }
 
-    /// Folder/bookmark options. Right-click or double-click on a folder
-    /// lands here. A single left-click expands the row.
+    /// Folder/bookmark options. Right-click (two-finger click) on a
+    /// folder lands here. A single left-click expands the row.
     ///
     /// Goes through `open_tab_menu_at` rather than opening a popup of its
     /// own, so the bar inherits the strip's whole menu discipline for
@@ -22933,6 +23569,12 @@ impl Render for Shell {
             .borrow()
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_millis(700))
+            || self.folder_popup_hover_since.borrow().as_ref().is_some_and(
+                |(_, at)| folder_hover_elapsed(*at, cx) < FOLDER_POPUP_PUMP,
+            )
+            || self.folder_popup_leave_since.borrow().as_ref().is_some_and(
+                |(_, at)| folder_hover_elapsed(*at, cx) < FOLDER_POPUP_LEAVE + Duration::from_millis(50),
+            )
         {
             let entity = self.transcript.clone();
             window.on_next_frame(move |_, cx| {
@@ -23051,6 +23693,7 @@ impl Render for Shell {
         let caret_lit = self.caret_lit(Field::Composer, cx);
         let rename_caret_lit = self.caret_lit(Field::Rename, cx);
         let filter_caret_lit = self.caret_lit(Field::RailFilter, cx);
+        let folder_caret_lit = self.caret_lit(Field::FolderSearch, cx);
         // Slice CM: the blink is decided once for the window (see `caret_lit`)
         // and handed down. The field does not ask, because asking would mean a
         // second lease on the pulse clock and a second reason for an idle
@@ -24013,7 +24656,13 @@ impl Render for Shell {
                     // agent chrome down the side of a fullscreen film is
                     // the thing every browser removes.
                     .when(!rail_collapsed && !fullscreen, |d| {
-                        d.child(self.rail(cx, pulse, rename_caret_lit, filter_caret_lit))
+                        d.child(self.rail(
+                            cx,
+                            pulse,
+                            rename_caret_lit,
+                            filter_caret_lit,
+                            folder_caret_lit,
+                        ))
                     })
                     .child(
                         // Content is a floating card on the window surface:
@@ -25858,13 +26507,18 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     .detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                     cx.observe(&web_tabs, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&bookmarks, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&bookmarks, |shell, _, cx| {
+                        shell.arm_pending_folder_rename(cx);
+                        cx.notify();
+                    })
+                    .detach();
                     cx.observe(&typeahead, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
                         window_key: window_key.clone(),
                         demo: DemoOverlay::default(),
                         rename: None,
+                        pending_folder_rename: None,
                         rail_filter: None,
                         caret: Cell::new(None),
                         launcher: LauncherUi::default(),
@@ -25897,6 +26551,11 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         born: std::time::Instant::now(),
                         bookmark_peek_shown: RefCell::new(None),
                         bookmark_peek_hover_since: RefCell::new(None),
+                        folder_popup_shown: RefCell::new(None),
+                        folder_popup_hover_since: RefCell::new(None),
+                        folder_popup_leave_since: RefCell::new(None),
+                        folder_popup_suppress: RefCell::new(None),
+                        folder_search: None,
                         zone_projects_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_PROJECTS,
                         )),
