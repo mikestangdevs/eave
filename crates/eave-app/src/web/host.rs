@@ -486,6 +486,10 @@ fn pump_cef() {
 /// **after** `CefDoMessageLoopWork` has returned. Do not fold it back into the
 /// pump: that shape is what Slice C6 removed.
 fn refresh_if_painted(cx: &mut gpui::AsyncApp) {
+    // D11's dwell completes here, not on vsync: a pointer sitting on a
+    // link delivers no frame, and promoting first means the bubble
+    // appearing is a chrome revision this same check can see.
+    super::tabs::promote_status();
     // Two reasons to redraw, one gate. A frame arriving is the obvious
     // one; the chrome changing is the one added with the display handler,
     // because a cursor crossing a link boundary or a status bubble

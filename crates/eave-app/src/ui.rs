@@ -11122,7 +11122,7 @@ impl Shell {
         wrapper.into_any_element()
     }
 
-    /// D11 — the link under the pointer, bottom-right of the page.
+    /// D11 — the link under the pointer, bottom-left of the page.
     ///
     /// **Deliberately not interactive**: no `.id()`, no listeners, so
     /// hit-testing falls straight through to the page beneath it. A bubble
@@ -11132,7 +11132,11 @@ impl Shell {
     ///
     /// The plate is opaque rather than a wash: it sits over arbitrary page
     /// pixels, and secondary ink on a 34% overlay is legible against eave's
-    /// canvas and nothing else.
+    /// canvas and nothing else. The inner (top-right) corner is square —
+    /// a radius there read as a second, smaller round on a pane that
+    /// already clips the flush corner. What it paints has already waited
+    /// [`crate::web::STATUS_SHOW_DELAY`]; this helper does not re-decide
+    /// the clock.
     ///
     /// # One helper, because there are TWO page render paths
     /// A page is mounted from `split_pane` when the well is split and from
@@ -11151,14 +11155,13 @@ impl Shell {
                 .debug_selector(|| "page-status".into())
                 .absolute()
                 .bottom_0()
-                .right_0()
+                .left_0()
                 .max_w(relative(0.6))
                 .px(px(theme::SPACE_2))
                 .py(px(theme::SPACE_1))
-                .rounded_tl(px(theme::RADIUS_BUTTON))
                 .bg(theme::menu_glass())
                 .border_t_1()
-                .border_l_1()
+                .border_r_1()
                 .border_color(theme::border())
                 .text_size(px(theme::DETAIL_SIZE))
                 .line_height(px(theme::DETAIL_LINE))

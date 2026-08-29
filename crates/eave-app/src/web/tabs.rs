@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use cef::*;
 use eave_wire::{LoadState, PageFact, TabContent, TabsSnapshot};
@@ -525,7 +526,8 @@ pub(super) fn trace() -> bool {
 pub struct PageChrome {
     /// 0.0 to 1.0 across a load.
     pub progress: f32,
-    /// The link under the pointer.
+    /// The link under the pointer, once the dwell has elapsed.
+    /// Chromium's raw report is held until [`super::STATUS_SHOW_DELAY`].
     pub status: Option<String>,
     /// The `title=` of whatever is under the pointer.
     pub tooltip: Option<String>,
@@ -558,6 +560,19 @@ thread_local! {
     /// `on_address_change` for why the dedup is not left to the engine.
     static LAST_URL: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// D11's dwell: Chromium's latest link-under-pointer, and whether the
+    /// bubble has already popped. `PageChrome.status` is the SHOWN value,
+    /// so a hover that has not yet waited is not a chrome change.
+    static STATUS_HOVER: std::cell::RefCell<HashMap<String, StatusHover>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// One tab's pending (or shown) link hover. See [`note_status_at`].
+struct StatusHover {
+    text: Option<String>,
+    since: Instant,
+    shown: bool,
 }
 
 /// Bumped whenever [`PageChrome`] actually CHANGES for any tab.
@@ -619,10 +634,76 @@ pub fn chrome(tab_id: &str) -> Option<PageChrome> {
 fn forget_chrome(tab_id: &str) {
     CHROME.with(|c| c.borrow_mut().remove(tab_id));
     LAST_URL.with(|u| u.borrow_mut().remove(tab_id));
+    STATUS_HOVER.with(|h| {
+        h.borrow_mut().remove(tab_id);
+    });
     // Or a rebuilt browser for a reused tab id would inherit a visibility
     // that was never sent to it, and a restored background tab would paint
     // at full rate because this said it had already been hidden.
     VISIBLE.with(|v| v.borrow_mut().remove(tab_id));
+}
+
+/// Chromium just said what is under the pointer. Hide is immediate;
+/// show waits [`super::STATUS_SHOW_DELAY`].
+fn note_status(tab_id: &str, text: Option<String>) {
+    note_status_at(tab_id, text, Instant::now());
+}
+
+fn note_status_at(tab_id: &str, text: Option<String>, now: Instant) {
+    let mut apply: Option<Option<String>> = None;
+    STATUS_HOVER.with(|h| {
+        let mut map = h.borrow_mut();
+        match &text {
+            None => {
+                map.remove(tab_id);
+                apply = Some(None);
+            }
+            Some(next) => {
+                let hover = map.entry(tab_id.to_string()).or_insert(StatusHover {
+                    text: None,
+                    since: now,
+                    shown: false,
+                });
+                if hover.text.as_ref() == Some(next) {
+                    return;
+                }
+                hover.text = Some(next.clone());
+                if hover.shown {
+                    apply = Some(Some(next.clone()));
+                } else {
+                    hover.since = now;
+                }
+            }
+        }
+    });
+    if let Some(status) = apply {
+        set_chrome(tab_id, |c| c.status = status);
+    }
+}
+
+/// Commit any hover that has now waited its delay. The pump calls this
+/// so the bubble appearing is a chrome revision on that same refresh —
+/// a pointer sitting on a link delivers no frame, and without this the
+/// dwell would only be noticed on the next incidental paint.
+pub(super) fn promote_status() {
+    promote_status_at(Instant::now());
+}
+
+fn promote_status_at(now: Instant) {
+    STATUS_HOVER.with(|h| {
+        for (id, hover) in h.borrow_mut().iter_mut() {
+            if hover.shown {
+                continue;
+            }
+            let Some(text) = hover.text.clone() else {
+                continue;
+            };
+            if super::status_bubble_due(hover.since, now) {
+                hover.shown = true;
+                set_chrome(id, |c| c.status = Some(text));
+            }
+        }
+    });
 }
 
 /// Record `url` as this tab's address, and say whether it CHANGED.
@@ -3058,13 +3139,13 @@ wrap_request_handler! {
             super::osr::forget(&self.tab_id);
             set_chrome(&self.tab_id, |c| {
                 c.progress = 0.;
-                c.status = None;
                 // The renderer that would have sent the clearing empty
                 // string is the one that just died, so nothing else will
                 // take this down.
                 c.tooltip = None;
                 c.fullscreen = false;
             });
+            note_status(&self.tab_id, None);
             report(
                 &self.tab_id,
                 PageFact::Load {
@@ -3241,9 +3322,14 @@ wrap_display_handler! {
         }
 
         /// The link under the pointer — the bubble in the corner.
+        ///
+        /// Show waits [`super::STATUS_SHOW_DELAY`]; an empty string (the
+        /// pointer left the link) clears immediately. The delay lives in
+        /// [`note_status`], not here, so a test can drive the clock
+        /// without a CEF callback.
         fn on_status_message(&self, _browser: Option<&mut Browser>, value: Option<&CefString>) {
             let text = value.map(|v| v.to_string()).filter(|v| !v.is_empty());
-            set_chrome(&self.tab_id, |c| c.status = text.clone());
+            note_status(&self.tab_id, text);
         }
 
         /// D12 — the `title=` under the pointer.
@@ -3660,6 +3746,72 @@ mod tests {
             note_url("t5", "https://a.test/"),
             "a reused tab id must not inherit the old tab's address"
         );
+    }
+
+    #[test]
+    fn a_link_hover_does_not_draw_until_it_has_dwelled() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = Instant::now();
+        note_status_at("status-a", Some("https://a.test/".into()), t0);
+        assert_eq!(chrome("status-a").and_then(|c| c.status), None);
+        promote_status_at(t0 + super::super::STATUS_SHOW_DELAY - std::time::Duration::from_millis(1));
+        assert_eq!(chrome("status-a").and_then(|c| c.status), None);
+        promote_status_at(t0 + super::super::STATUS_SHOW_DELAY);
+        assert_eq!(
+            chrome("status-a").and_then(|c| c.status).as_deref(),
+            Some("https://a.test/")
+        );
+        forget_chrome("status-a");
+    }
+
+    #[test]
+    fn leaving_a_link_hides_the_bubble_immediately() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = Instant::now();
+        note_status_at("status-b", Some("https://a.test/".into()), t0);
+        promote_status_at(t0 + super::super::STATUS_SHOW_DELAY);
+        note_status_at("status-b", None, t0 + super::super::STATUS_SHOW_DELAY);
+        assert_eq!(chrome("status-b").and_then(|c| c.status), None);
+        forget_chrome("status-b");
+    }
+
+    #[test]
+    fn a_shown_bubble_updates_without_waiting_again() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = Instant::now();
+        note_status_at("status-c", Some("https://a.test/".into()), t0);
+        promote_status_at(t0 + super::super::STATUS_SHOW_DELAY);
+        note_status_at(
+            "status-c",
+            Some("https://b.test/".into()),
+            t0 + super::super::STATUS_SHOW_DELAY,
+        );
+        assert_eq!(
+            chrome("status-c").and_then(|c| c.status).as_deref(),
+            Some("https://b.test/")
+        );
+        forget_chrome("status-c");
+    }
+
+    #[test]
+    fn moving_to_another_link_before_the_delay_restarts_it() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = Instant::now();
+        let half = super::super::STATUS_SHOW_DELAY / 2;
+        note_status_at("status-d", Some("https://a.test/".into()), t0);
+        note_status_at("status-d", Some("https://b.test/".into()), t0 + half);
+        promote_status_at(t0 + super::super::STATUS_SHOW_DELAY);
+        assert_eq!(
+            chrome("status-d").and_then(|c| c.status),
+            None,
+            "still only half a dwell on the second link"
+        );
+        promote_status_at(t0 + half + super::super::STATUS_SHOW_DELAY);
+        assert_eq!(
+            chrome("status-d").and_then(|c| c.status).as_deref(),
+            Some("https://b.test/")
+        );
+        forget_chrome("status-d");
     }
 
     #[test]

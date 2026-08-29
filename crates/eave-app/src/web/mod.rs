@@ -1674,6 +1674,23 @@ pub fn print_to_pdf(_tab_id: &str) {}
 /// megabyte of `href` sixty times a second while the pointer moves.
 const STATUS_MAX: usize = 512;
 
+/// How long the pointer must rest on a link before the status bubble
+/// draws. Chromium reports the URL the instant the cursor crosses into
+/// an `<a>`, and drawing then makes the corner flash on the way past.
+/// Hide is still immediate — a bubble that outlives the link it describes
+/// is describing the wrong thing.
+pub(crate) const STATUS_SHOW_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Whether a hover that started at `since` may draw at `now`.
+///
+/// Ungated and pure, same bargain as [`status_text`]: the delay is a
+/// decision about two instants, and none of it needs Chromium. The pane
+/// paints `chrome().status` only after this has gone true; it does not
+/// decide the clock.
+pub(crate) fn status_bubble_due(since: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(since) >= STATUS_SHOW_DELAY
+}
+
 /// What the status bubble says, or `None` for no bubble.
 ///
 /// Ungated and pure, the [`download_rows`] shape: what the bubble SAYS is a
@@ -2188,6 +2205,20 @@ mod tests {
         // an off-by-one here would ellipsise a url that fits.
         let exact: String = std::iter::repeat('a').take(STATUS_MAX).collect();
         assert_eq!(status_text(&exact), Some(exact));
+    }
+
+    /// D11's delay is the popup, not the hide. The 799/800 pair is the
+    /// boundary: an off-by-one here would either flash a brush-past or
+    /// make the operator wait a frame longer than they asked.
+    #[test]
+    fn a_status_bubble_waits_eight_tenths_before_it_pops() {
+        use std::time::{Duration, Instant};
+        assert_eq!(STATUS_SHOW_DELAY, Duration::from_millis(800));
+        let t0 = Instant::now();
+        assert!(!status_bubble_due(t0, t0));
+        assert!(!status_bubble_due(t0, t0 + Duration::from_millis(799)));
+        assert!(status_bubble_due(t0, t0 + Duration::from_millis(800)));
+        assert!(status_bubble_due(t0, t0 + Duration::from_millis(801)));
     }
 
     /// D12 gets D11's treatment, and this pins that rather than trusting
