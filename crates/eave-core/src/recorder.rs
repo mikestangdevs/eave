@@ -120,6 +120,30 @@ pub async fn record_session(
 
     loop {
         tokio::select! {
+            // **Biased, and `extra` goes first.** These two channels carry
+            // one causal order — eave sends, then the CLI answers — and an
+            // unbiased `select!` picks a ready branch at RANDOM, so a fast
+            // CLI's whole reply could be journalled ahead of the
+            // `UserSent` that caused it. Measured 2026-08-29: a journal
+            // reading init / text_delta / assistant_text / turn_completed
+            // / user_sent / user_delivered, about one run in four.
+            //
+            // `UserSent` is enqueued here before the prompt is written to
+            // the child's stdin, so draining `extra` first makes that
+            // ordering hold rather than leaving it to chance.
+            // `UserDelivered` is enqueued after the write and may still
+            // land behind the reply — that case is fine and is what the
+            // `prompted` balance in `turn.rs` was built for.
+            biased;
+            ev = extra.recv(), if extra_open => {
+                match ev {
+                    Some(ev) => {
+                        let rec = writer.append(ev)?;
+                        tap_send(rec);
+                    }
+                    None => extra_open = false,
+                }
+            }
             ev = events.recv() => {
                 let Some(ev) = ev else {
                     // `Exited` is contractually the final event; a bare
@@ -160,18 +184,140 @@ pub async fn record_session(
                     }
                 }
             }
-            ev = extra.recv(), if extra_open => {
-                match ev {
-                    Some(ev) => {
-                        let rec = writer.append(ev)?;
-                        tap_send(rec);
-                    }
-                    None => extra_open = false,
-                }
-            }
             _ = tick.tick() => {
                 writer.flush()?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::Header;
+    use crate::store::{Meta, META_FORMAT_VERSION};
+
+    /// **The two channels carry one causal order, and `select!` must not
+    /// pick between them at random.**
+    ///
+    /// eave enqueues `UserSent` on `extra` BEFORE the prompt is written to
+    /// the child's stdin, so a reply can only exist because that record
+    /// already exists. An unbiased `tokio::select!` polls a ready branch at
+    /// random, and measured on 2026-08-29 that produced journals reading
+    /// `init / text_delta / assistant_text / turn_completed / user_sent /
+    /// user_delivered` — the whole reply ahead of the prompt that caused
+    /// it — in about one run in four.
+    ///
+    /// That ordering is not cosmetic. `TurnLedger::agent_opener` uses
+    /// `sent_unconfirmed` to refuse to mint an agent turn out of an
+    /// ordinary reply; with `UserSent` not yet folded the guard reads 0,
+    /// the reply mints a phantom `Unannounced` turn, and its
+    /// `TurnCompleted` then closes THAT instead of pre-cancelling the
+    /// prompted balance. The late `UserDelivered` opens a turn nothing will
+    /// ever close, and the session reports `quiet` and then `unresponsive`
+    /// while it sits perfectly healthy. The acceptance test that caught it
+    /// is `eave-engine/tests/attention.rs::
+    /// idle_between_turns_after_turn_completed_is_no_state`, which its own
+    /// docstring calls "THE regression that matters most".
+    ///
+    /// **Not deterministic in the failing direction, and saying so
+    /// matters.** Both channels are filled before the recorder runs, so
+    /// both branches are ready on the first poll — the case `biased;`
+    /// decides and an unbiased `select!` decides by coin flip. Measured
+    /// with `biased;` removed: 5 failures in 12 runs. That is a better
+    /// detector than the acceptance test's one-in-four AND it names the
+    /// cause, but a single green run of this is not proof the bias is
+    /// still there. Read the `biased;` if you need to know.
+    #[tokio::test]
+    async fn the_journal_keeps_eaves_own_record_ahead_of_the_reply_it_caused() {
+        let dir = std::env::temp_dir().join(format!("eave-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("journal.jsonl");
+        let writer = JournalWriter::create(
+            &path,
+            &Header {
+                format_version: 1,
+                session_id: "s1".into(),
+                provider: "claude-code".into(),
+                cwd: "/tmp".into(),
+                created_ts_ms: 1,
+                agent: Default::default(),
+            },
+        )
+        .expect("writer");
+        let meta = Meta {
+            format_version: META_FORMAT_VERSION,
+            provider: "claude-code".into(),
+            cwd: "/tmp".into(),
+            session_id: "s1".into(),
+            state: "new".into(),
+            child: None,
+            title: None,
+            archived: false,
+        };
+        meta.save(&dir).expect("meta");
+
+        let (ev_tx, ev_rx) = mpsc::channel(16);
+        let (extra_tx, extra_rx) = mpsc::channel(16);
+        let (tap_tx, mut tap_rx) = mpsc::unbounded_channel();
+
+        // Both ready before the loop runs: eave's own record, and a reply
+        // that could only have been provoked by it.
+        extra_tx
+            .send(JournalEvent::UserSent { text: "go".into() })
+            .await
+            .expect("user_sent");
+        ev_tx
+            .send(SessionEvent::AssistantText {
+                text: "done".into(),
+            })
+            .await
+            .expect("reply");
+        ev_tx
+            .send(SessionEvent::TurnCompleted {
+                subtype: "success".into(),
+                is_error: false,
+            })
+            .await
+            .expect("result");
+        ev_tx
+            .send(SessionEvent::Exited {
+                code: Some(0),
+                signal: None,
+                stderr_tail: String::new(),
+            })
+            .await
+            .expect("exit");
+
+        let task = tokio::spawn(record_session(
+            ev_rx,
+            extra_rx,
+            writer,
+            dir.clone(),
+            meta,
+            Some(tap_tx),
+        ));
+        let _ = task.await.expect("join");
+
+        let mut order: Vec<String> = Vec::new();
+        while let Ok(rec) = tap_rx.try_recv() {
+            order.push(match rec.event {
+                JournalEvent::UserSent { .. } => "user_sent".into(),
+                JournalEvent::Provider { event } => format!("{event:?}")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("provider")
+                    .to_string(),
+                other => format!("{other:?}"),
+            });
+        }
+        let first = order.first().map(String::as_str);
+        assert_eq!(
+            first,
+            Some("user_sent"),
+            "THE REPLY WAS JOURNALLED AHEAD OF THE PROMPT THAT CAUSED IT: \
+             {order:?}"
+        );
     }
 }

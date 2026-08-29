@@ -3368,6 +3368,77 @@ fn attention_rank(state: &str) -> u8 {
 
 /// A project header in the rail: the checkout its rows share, and the one
 /// fact that must survive collapsing them.
+/// The one word a rail row wears, if it has one (Slice K, then AG2 #4).
+///
+/// **One word, and the strongest one.** The badge slot holds a single
+/// thing, so this is a priority and not a concatenation — the same rule
+/// [`group_badge`] keeps for a header.
+///
+/// The state's own word wins whenever there is one: a failed session the
+/// operator has not seen says `failed`, because the failure is the
+/// stronger fact and `finished` would be a weaker way of saying a session
+/// stopped. `finished` speaks only into the silence `state_badge`
+/// deliberately leaves for `done` — which is exactly the gap #4 names,
+/// since "done" is not attention-worthy but "done and you have not looked"
+/// is.
+///
+/// **`unseen` is a fact handed in, never re-derived here.**
+/// [`unseen_finish`] is the one place that decides what counts, and a
+/// second copy of that rule in this function is the two-places drift the
+/// rest of this rail is built to avoid.
+fn row_badge(info: &SessionInfo, unseen: bool) -> Option<String> {
+    if let Some(word) = state_badge(&info.state) {
+        // Slice K: the badge counts the open questions when there is more
+        // than one — "waiting on you (3)" is a different fact from
+        // "waiting on you".
+        return Some(
+            if info.state == "awaiting_approval" && info.pending_approvals > 1 {
+                format!("{word} ({})", info.pending_approvals)
+            } else {
+                word.to_string()
+            },
+        );
+    }
+    unseen.then(|| "finished".to_string())
+}
+
+/// Has this session SETTLED since the operator last looked at it?
+/// (Slice AG2 #4 — unseen completion.)
+///
+/// The gap in one sentence: *a session that ended an hour ago and one that
+/// ended while you were reading it look identical.* comet syncs a seen
+/// marker across devices; t3code compares `completedAt > lastVisitedAt`.
+///
+/// **This needed no wire change, and the gap table said it did.**
+/// `SessionInfo::last_activity_ms` already exists and is stamped, in its
+/// own words, "only where `state`/`live` change, and nowhere else" — which
+/// is exactly the set of transitions a finish is made of. The other half,
+/// when the operator last looked, is a fact about this CLIENT and belongs
+/// nowhere near the engine.
+///
+/// **Three states are refused, each for its own reason:**
+///
+/// - `running` and `new` have not finished. There is no finish to have
+///   missed.
+/// - `awaiting_approval` is louder and lands on the same row. The rail
+///   says the stronger fact and never two at once — the rule the group
+///   rollup already follows.
+///
+/// `last_activity_ms: None` means the state has not moved since the engine
+/// loaded the session, so there is nothing to have missed either.
+fn unseen_finish(info: &SessionInfo, seen: Option<u64>) -> bool {
+    if matches!(info.state.as_str(), "running" | "new" | "awaiting_approval") {
+        return false;
+    }
+    match (info.last_activity_ms, seen) {
+        (Some(now), Some(then)) => now > then,
+        // No record of a visit is "we do not know", not "you have not
+        // looked" — the same distinction `checkout_root: None` keeps. The
+        // rail baselines it instead and the row says nothing.
+        _ => false,
+    }
+}
+
 struct RailGroup {
     /// The checkout root. The group's IDENTITY — collapse is keyed on it,
     /// and it is what `TabGroup::workspace` binds to — never its label.
@@ -3384,6 +3455,13 @@ struct RailGroup {
     /// one" and a `(1)` after it is noise, exactly as the row's own badge
     /// decided (Slice K).
     asking: usize,
+    /// How many children settled since the operator last looked (#4).
+    ///
+    /// Rendered ONLY when the group has no attention lead — a project
+    /// holding a session parked on a question does not also mention that
+    /// another one finished. One word per header, the strongest fact,
+    /// which is the rule the badge has kept since #3.
+    unseen: usize,
 }
 
 /// The word a project header wears, if it has one to wear (Slice AG2 #3).
@@ -3403,8 +3481,25 @@ struct RailGroup {
 /// holding two of those would render `failed (2)`, which reads as two
 /// failures and is not what the number counts. The count belongs to
 /// `waiting on you` and to nothing else.
-fn group_badge(lead_state: Option<&str>, asking: usize) -> Option<String> {
-    let word = lead_state.and_then(state_badge)?;
+fn group_badge(lead_state: Option<&str>, asking: usize, unseen: usize) -> Option<String> {
+    let Some(word) = lead_state.and_then(state_badge) else {
+        // Slice AG2 #4. Reached only when no child has an attention claim
+        // at all — a collapsed project may not swallow the fact that
+        // something under it finished while the operator was elsewhere,
+        // which is #3's bargain applied to a quieter fact.
+        //
+        // **No dot beside it**, unlike every other header word: the dot is
+        // the STATE's mark and there is no state here. This says something
+        // about the operator's attention, not about the session's
+        // condition.
+        return (unseen > 0).then(|| {
+            if unseen > 1 {
+                format!("finished ({unseen})")
+            } else {
+                "finished".to_string()
+            }
+        });
+    };
     Some(if asking > 1 && lead_state == Some("awaiting_approval") {
         format!("{word} ({asking})")
     } else {
@@ -3448,7 +3543,7 @@ enum RailEntry {
 /// every row is a line that states what the absence of any other header
 /// already said. So: no headers unless the sessions actually fall into two
 /// or more parts, counting the ungrouped ones as a part.
-fn group_rail(sessions: Vec<SessionInfo>) -> Vec<RailEntry> {
+fn group_rail(sessions: Vec<SessionInfo>, unseen: &HashSet<String>) -> Vec<RailEntry> {
     // First pass: the order roots appear in, and the members of each.
     // `Vec` of pairs rather than a map because the ORDER is the output —
     // a `HashMap` here is how the row-shuffling bug gets in.
@@ -3505,12 +3600,17 @@ fn group_rail(sessions: Vec<SessionInfo>) -> Vec<RailEntry> {
             .iter()
             .filter(|s| s.state == "awaiting_approval" || s.pending_approvals > 0)
             .count();
+        let unseen_here = children
+            .iter()
+            .filter(|s| unseen.contains(&s.session_id))
+            .count();
         out.push(RailEntry::Header(RailGroup {
             title: strip::project_title(&root),
             root,
             count: children.len(),
             lead_state,
             asking,
+            unseen: unseen_here,
         }));
         out.extend(children.into_iter().map(RailEntry::Row));
     }
@@ -6155,6 +6255,23 @@ struct Shell {
     /// opened from the launcher or confirmed by the engine could land
     /// off the end of a fifteen-row list with nothing to say so.
     rail_scrolled_to: RefCell<Option<String>>,
+    /// Slice AG2 #4 — when the operator last LOOKED at each session, as
+    /// the `last_activity_ms` that session carried at that moment.
+    ///
+    /// The other half of unseen-completion, and the half that is a fact
+    /// about this client rather than about any session — which is why it
+    /// is here and not on the wire. See [`unseen_finish`].
+    ///
+    /// **In memory only, deliberately.** Persisting it would mean a file
+    /// write from inside the render pass, which is what N4's idle floor
+    /// exists to forbid. The cost is stated rather than hidden: restarting
+    /// eave baselines every session and the rail starts silent again.
+    ///
+    /// A session is baselined the FIRST time the rail sees it, so the
+    /// feature never opens with fifteen rows shouting about work the
+    /// operator already knows about — the same reason the filter note is
+    /// inked amber only when something is really being withheld.
+    rail_seen: RefCell<HashMap<String, u64>>,
     /// Slice P1 — see [`DemoOverlay`]. No product consumer.
     demo: DemoOverlay,
     /// The rail's inline rename field (Stage AC), when one is open.
@@ -13364,7 +13481,7 @@ impl Shell {
         let sel = format!("rail-group-{}", g.root);
         let sel_id = SharedString::from(sel.clone());
         let root = g.root.clone();
-        let badge = group_badge(g.lead_state.as_deref(), g.asking);
+        let badge = group_badge(g.lead_state.as_deref(), g.asking, g.unseen);
         let dot = g.lead_state.as_deref().map(state_color);
         let sel_label = sel.clone();
         let sel_count = sel.clone();
@@ -14946,6 +15063,44 @@ impl Shell {
         // Stage L's aggregate ceiling moved into the library menu
         // (`library_menu`) when the footer took this slot — computed there,
         // still over EVERY session and not the filtered list.
+        // Slice AG2 #4 — the seen bookkeeping, over EVERY session the
+        // engine reports and before any filter. A session hidden by the
+        // archive toggle or the text field must keep its baseline, or
+        // clearing the filter would light up rows that changed nothing.
+        let unseen: HashSet<String> = {
+            let mut seen = self.rail_seen.borrow_mut();
+            // A session the engine no longer reports cannot be looked at
+            // again, so its mark is dead weight. Pruned here rather than
+            // on delete because this is the one place that knows the whole
+            // list.
+            let live: HashSet<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+            seen.retain(|id, _| live.contains(id.as_str()));
+            let mut out = HashSet::new();
+            for info in &all {
+                let mark = info.last_activity_ms.unwrap_or(0);
+                let looking = selected.as_deref() == Some(info.session_id.as_str());
+                match seen.get(&info.session_id) {
+                    // First sight: baseline and say nothing.
+                    None => {
+                        seen.insert(info.session_id.clone(), mark);
+                    }
+                    // **The selected session is being looked at right
+                    // now**, so its mark stays current — a session you are
+                    // watching finish is a session you saw finish. This is
+                    // also what makes walking away mid-turn produce the
+                    // mark on your return.
+                    Some(_) if looking => {
+                        seen.insert(info.session_id.clone(), mark);
+                    }
+                    Some(&then) => {
+                        if unseen_finish(info, Some(then)) {
+                            out.insert(info.session_id.clone());
+                        }
+                    }
+                }
+            }
+            out
+        };
         let sessions: Vec<SessionInfo> = all
             .into_iter()
             .filter(|s| rail_shows(s, selected.as_deref(), show_archived))
@@ -15041,13 +15196,7 @@ impl Shell {
                 // Slice K: the badge counts the open questions when there
                 // is more than one — "waiting on you (3)" is a different
                 // fact from "waiting on you".
-                let badge = state_badge(&info.state).map(|word| {
-                    if info.state == "awaiting_approval" && info.pending_approvals > 1 {
-                        format!("{word} ({})", info.pending_approvals)
-                    } else {
-                        word.to_string()
-                    }
-                });
+                let badge = row_badge(&info, unseen.contains(&info.session_id));
                 // Slice AO: the posture line states the DANGEROUS posture
                 // only. `asks before it writes · default` is the safe
                 // default, and a line on every row restating the default
@@ -15827,7 +15976,7 @@ impl Shell {
         // gone.
         let mut walk: Vec<String> = Vec::new();
         let mut sel_at: Option<usize> = None;
-        for entry in group_rail(sessions) {
+        for entry in group_rail(sessions, &unseen) {
             match entry {
                 RailEntry::Header(g) => {
                     group_shut = shut_groups.contains(&g.root);
@@ -25338,6 +25487,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_scroll: ScrollHandle::new(),
                         rail_walk: RefCell::new(Vec::new()),
                         rail_scrolled_to: RefCell::new(None),
+                        rail_seen: RefCell::new(HashMap::new()),
                         projects_scroll: ScrollHandle::new(),
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from
@@ -26207,7 +26357,7 @@ mod tests {
             in_root("a", Some("/w/eave"), "idle"),
             in_root("b", Some("/w/eave"), "idle"),
         ];
-        assert_eq!(shape(&group_rail(rows)), vec!["a", "b"]);
+        assert_eq!(shape(&group_rail(rows, &HashSet::new())), vec!["a", "b"]);
     }
 
     /// The same is true when NOTHING has a root: `checkout_root` is `None`
@@ -26217,7 +26367,7 @@ mod tests {
     #[test]
     fn no_roots_at_all_is_also_one_part() {
         let rows = vec![in_root("a", None, "idle"), in_root("b", None, "idle")];
-        assert_eq!(shape(&group_rail(rows)), vec!["a", "b"]);
+        assert_eq!(shape(&group_rail(rows, &HashSet::new())), vec!["a", "b"]);
     }
 
     /// **The row that this slice could most easily have broken.** comet
@@ -26240,7 +26390,7 @@ mod tests {
             in_root("b", Some("/w/eave"), "idle"),
         ];
         assert_eq!(
-            shape(&group_rail(rows)),
+            shape(&group_rail(rows, &HashSet::new())),
             vec!["[zed]", "c", "d", "[eave]", "a", "b"],
             "groups in first-member order, rows untouched inside them"
         );
@@ -26255,7 +26405,10 @@ mod tests {
             in_root("a", Some("/w/eave"), "idle"),
             in_root("loose", None, "idle"),
         ];
-        assert_eq!(shape(&group_rail(rows)), vec!["loose", "[eave]", "a"]);
+        assert_eq!(
+            shape(&group_rail(rows, &HashSet::new())),
+            vec!["loose", "[eave]", "a"]
+        );
     }
 
     /// #3, and the reason #2 is allowed to hide rows at all. The header
@@ -26270,7 +26423,7 @@ mod tests {
             in_root("b", Some("/w/eave"), "awaiting_approval"),
             in_root("z", Some("/w/other"), "idle"),
         ];
-        let entries = group_rail(rows);
+        let entries = group_rail(rows, &HashSet::new());
         let g = entries
             .iter()
             .find_map(|e| match e {
@@ -26304,7 +26457,7 @@ mod tests {
             in_root("b", Some("/w/eave"), "awaiting_approval"),
             in_root("z", Some("/w/other"), "idle"),
         ];
-        let entries = group_rail(rows);
+        let entries = group_rail(rows, &HashSet::new());
         let g = entries
             .iter()
             .find_map(|e| match e {
@@ -26321,23 +26474,163 @@ mod tests {
     /// `failed (2)`, which reads as two failures and counts something else
     /// entirely.
     #[test]
+    fn a_row_wears_one_word_and_it_is_the_strongest_one() {
+        let mut s = super::SessionInfo {
+            session_id: "a".into(),
+            title: None,
+            archived: false,
+            provider: "claude-code".into(),
+            model: None,
+            cwd: "/w".into(),
+            created_ts_ms: 1,
+            last_activity_ms: Some(2),
+            state: "done".into(),
+            live: false,
+            epoch: 1,
+            last_seq: 0,
+            checkout_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            pending_approvals: 0,
+            permission_mode: None,
+            rss_bytes: None,
+        };
+        // `done` is the silence #4 speaks into: no word seen, a word unseen.
+        assert_eq!(row_badge(&s, false), None);
+        assert_eq!(row_badge(&s, true).as_deref(), Some("finished"));
+
+        // A state with its own word keeps it. `finished` would be a weaker
+        // way of saying a session stopped.
+        s.state = "failed".into();
+        assert_eq!(
+            row_badge(&s, true).as_deref(),
+            Some("failed"),
+            "an unseen failure lost its own word to the finish mark"
+        );
+        s.state = "quiet".into();
+        assert_eq!(row_badge(&s, true).as_deref(), Some("quiet"));
+
+        // Slice K's count survives, and does not pick up the finish mark.
+        s.state = "awaiting_approval".into();
+        s.pending_approvals = 3;
+        assert_eq!(
+            row_badge(&s, true).as_deref(),
+            Some("waiting on you (3)"),
+            "the finish mark displaced the louder fact"
+        );
+
+        // **This function takes the fact; it does not re-derive it.**
+        // Told a running session is unseen, it says so — because
+        // `unseen_finish` is the ONE place that decides, and a second copy
+        // of the state rule here is exactly the two-places drift the rail
+        // has been avoiding all slice. The lock is upstream and is tested
+        // upstream.
+        s.state = "running".into();
+        s.pending_approvals = 0;
+        assert_eq!(row_badge(&s, true).as_deref(), Some("finished"));
+        assert!(
+            !unseen_finish(&s, Some(1)),
+            "…and the one place that decides refuses it, which is what \
+             makes the line above unreachable in the product"
+        );
+    }
+
+    /// Slice AG2 #4's rule, as a function: what counts as a finish the
+    /// operator missed.
+    #[test]
+    fn only_a_settled_session_with_movement_since_your_visit_is_unseen() {
+        let mut s = super::SessionInfo {
+            session_id: "a".into(),
+            title: None,
+            archived: false,
+            provider: "claude-code".into(),
+            model: None,
+            cwd: "/w".into(),
+            created_ts_ms: 1,
+            last_activity_ms: Some(200),
+            state: "done".into(),
+            live: false,
+            epoch: 1,
+            last_seq: 0,
+            checkout_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            pending_approvals: 0,
+            permission_mode: None,
+            rss_bytes: None,
+        };
+        assert!(unseen_finish(&s, Some(100)), "it moved since the visit");
+        assert!(!unseen_finish(&s, Some(200)), "the visit is current");
+        assert!(!unseen_finish(&s, Some(300)), "the visit is newer");
+        assert!(
+            !unseen_finish(&s, None),
+            "no record of a visit is 'we do not know', never 'you have not \
+             looked' — the rail baselines it instead"
+        );
+
+        // Nothing to have missed: still going, or never started.
+        for state in ["running", "new"] {
+            s.state = state.into();
+            assert!(!unseen_finish(&s, Some(100)), "{state} is not a finish");
+        }
+        // The louder fact owns the row.
+        s.state = "awaiting_approval".into();
+        assert!(!unseen_finish(&s, Some(100)));
+
+        // A state that never moved has nothing to report either.
+        s.state = "done".into();
+        s.last_activity_ms = None;
+        assert!(!unseen_finish(&s, Some(100)));
+    }
+
+    #[test]
     fn the_asker_count_rides_only_on_waiting_on_you() {
         assert_eq!(
-            group_badge(Some("awaiting_approval"), 2).as_deref(),
+            group_badge(Some("awaiting_approval"), 2, 0).as_deref(),
             Some("waiting on you (2)")
         );
         assert_eq!(
-            group_badge(Some("awaiting_approval"), 1).as_deref(),
+            group_badge(Some("awaiting_approval"), 1, 0).as_deref(),
             Some("waiting on you"),
             "a bare word already means at least one"
         );
         assert_eq!(
-            group_badge(Some("failed"), 2).as_deref(),
+            group_badge(Some("failed"), 2, 0).as_deref(),
             Some("failed"),
             "the count leaked onto a word that does not count askers"
         );
-        assert_eq!(group_badge(Some("idle"), 0), None, "no badge, no word");
-        assert_eq!(group_badge(None, 0), None);
+        assert_eq!(group_badge(Some("idle"), 0, 0), None, "no badge, no word");
+        assert_eq!(group_badge(None, 0, 0), None);
+
+        // Slice AG2 #4 — one word per header, and the strongest one.
+        assert_eq!(
+            group_badge(None, 0, 1).as_deref(),
+            Some("finished"),
+            "a project holding an unseen finish said nothing"
+        );
+        assert_eq!(
+            group_badge(None, 0, 3).as_deref(),
+            Some("finished (3)"),
+            "the count is the difference between one and several"
+        );
+        assert_eq!(
+            group_badge(Some("awaiting_approval"), 1, 2).as_deref(),
+            Some("waiting on you"),
+            "a project with a question ALSO mentioned a finish — the \
+             header holds one word and it is the strongest"
+        );
+        assert_eq!(
+            group_badge(Some("failed"), 0, 2).as_deref(),
+            Some("failed"),
+            "the finish word displaced a failure"
+        );
+        assert_eq!(
+            group_badge(Some("idle"), 0, 2).as_deref(),
+            Some("finished (2)"),
+            "a lead state with no word of its own is not a claim on the \
+             slot — `attention_rank` returns 0 for it and the header is \
+             free to say the quieter fact"
+        );
     }
 
     /// A group with no claim on attention says nothing. `attention_rank`
@@ -26350,7 +26643,7 @@ mod tests {
             in_root("a", Some("/w/eave"), "idle"),
             in_root("z", Some("/w/other"), "new"),
         ];
-        let entries = group_rail(rows);
+        let entries = group_rail(rows, &HashSet::new());
         // The guard, and it is not ceremony: the assertion below lives
         // inside a `if let`, so a `group_rail` that emitted NO headers
         // would satisfy it without executing it once. Two absence
@@ -26380,7 +26673,7 @@ mod tests {
             in_root("a", Some("/one/wt-c5"), "idle"),
             in_root("b", Some("/two/wt-c5"), "idle"),
         ];
-        let entries = group_rail(rows);
+        let entries = group_rail(rows, &HashSet::new());
         let roots: Vec<&str> = entries
             .iter()
             .filter_map(|e| match e {

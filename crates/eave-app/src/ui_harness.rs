@@ -7257,6 +7257,122 @@ fn an_archived_row_leaves_the_rail_and_the_shelf_brings_it_back(cx: &mut TestApp
 /// the second — a collapsed group there silently swallows a waiting session
 /// — and eave's own `rail_shows` already refuses to let the archive filter
 /// do that.
+/// Slice AG2 #4 — a session that settled while the operator was elsewhere
+/// says `finished` in the badge slot `state_badge` deliberately leaves
+/// empty for `done`.
+///
+/// The gap in one sentence: *a session that ended an hour ago and one that
+/// ended while you were reading it look identical.*
+#[gpui::test]
+fn a_session_that_settled_while_you_were_away_says_finished(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.state = "running".into();
+    a.last_activity_ms = Some(100);
+    h.plumbing.push_rail(vec![a.clone()]);
+    vcx.run_until_parked();
+    // First sight baselined it, and a running session has nothing to say.
+    assert!(
+        !shown(vcx, "badge-aaaa1111"),
+        "a running session wore a word"
+    );
+
+    // It finishes, and nobody is looking: no session is selected.
+    let mut done = a;
+    done.state = "done".into();
+    done.last_activity_ms = Some(200);
+    h.plumbing.push_rail(vec![done]);
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "badge-aaaa1111"),
+        "A SESSION FINISHED UNWATCHED AND THE RAIL SAID NOTHING — the gap"
+    );
+}
+
+/// **A session you are looking at never says it finished**, because you
+/// watched it finish. This is the half that keeps the mark from being noise.
+#[gpui::test]
+fn a_session_you_are_looking_at_never_says_finished(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.state = "running".into();
+    a.last_activity_ms = Some(100);
+    rail_with_selected(&h, vcx, vec![a.clone()], "aaaa1111");
+
+    let mut done = a;
+    done.state = "done".into();
+    done.last_activity_ms = Some(200);
+    h.plumbing.push_rail(vec![done]);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "badge-aaaa1111"),
+        "the session open on screen claimed the operator had missed it"
+    );
+}
+
+/// A session the rail has never seen says NOTHING, however long ago it
+/// settled.
+///
+/// Without this the feature opens with fifteen rows shouting about work the
+/// operator already knows about, and the eye learns to stop reading the
+/// slot — the failure `filter_note_text`'s own doc names.
+#[gpui::test]
+fn a_session_seen_for_the_first_time_says_nothing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.state = "done".into();
+    // Settled long ago, and this client has no record of ever looking.
+    a.last_activity_ms = Some(9_999);
+    h.plumbing.push_rail(vec![a]);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "badge-aaaa1111"),
+        "a session the rail had never seen before claimed to be news"
+    );
+}
+
+/// **A collapsed project may not swallow a finish either** — #3's bargain
+/// applied to the quieter fact: a header speaks for the children it hides.
+#[gpui::test]
+fn a_collapsed_project_still_says_a_child_finished(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/w/eave".into());
+    a.state = "running".into();
+    a.last_activity_ms = Some(100);
+    let mut z = session("cccc3333");
+    z.checkout_root = Some("/w/zed".into());
+    h.plumbing.push_rail(vec![a.clone(), z.clone()]);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-group-/w/eave-badge"),
+        "the header spoke before anything had happened"
+    );
+
+    let mut done = a;
+    done.state = "done".into();
+    done.last_activity_ms = Some(200);
+    h.plumbing.push_rail(vec![done, z]);
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "rail-group-/w/eave-badge"),
+        "the project said nothing about a child that finished"
+    );
+
+    click(vcx, "rail-group-/w/eave");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "rail-aaaa1111"), "the group would not collapse");
+    assert!(
+        shown(vcx, "rail-group-/w/eave-badge"),
+        "COLLAPSING SWALLOWED THE FINISH"
+    );
+    // The other project is untouched — nothing under it moved.
+    assert!(
+        !shown(vcx, "rail-group-/w/zed-badge"),
+        "a group with nothing to say wore a word anyway"
+    );
+}
+
 /// Slice AG2 #7 — ⌘⇧↓ and ⌘⇧↑ move the selection one row along the rail.
 ///
 /// The rail is the screen an operator lives in and it had no keyboard
