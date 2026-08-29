@@ -3808,6 +3808,22 @@ fn group_rail(sessions: Vec<SessionInfo>, unseen: &HashSet<String>) -> Vec<RailE
 /// outcomes are not close enough for a tight target to be acceptable.
 const ROW_ACTION_HIT: f32 = 24.0;
 
+/// The leading rule a marked row wears (Slice AG2 #12).
+///
+/// **A rule, and on the accent.** The rail's colour vocabulary is
+/// attention (`state_color`) and, since #8, identity (`project_color`), and
+/// a mark is neither — it is where the next action is going, which is
+/// exactly what the accent means everywhere else in this app. The shape
+/// keeps it apart too: attention is a dot, identity is a dot, this is a
+/// line down the row's leading edge.
+///
+/// Drawn ABSOLUTELY, inside the card's own positioning context (the one
+/// Stage AK's action strip already established), so it costs no layout and
+/// every rail width test measures the room it measured before. Inset from
+/// the pill's corners rather than run to them, or `RADIUS_SELECT` would
+/// clip it into two stubs.
+const ROW_MARK_W: f32 = 2.0;
+
 /// Slice AO — the ceiling on the marks group at the end of line two.
 ///
 /// Line two has `RAIL_W 248 − PLATE_MARGIN 12 − RAIL_CARD_BLEED 12 (the
@@ -3947,6 +3963,34 @@ fn window_rail(
         }
     }
     (out, held)
+}
+
+/// How many staged rows are not on screen (Slice AG2 #12).
+///
+/// A marked row can be out of sight for three unrelated reasons — a
+/// collapsed project, the text filter, the window — and [`Shell::rail_walk`]
+/// is the ONE record of what was actually drawn, so it answers all three at
+/// once without knowing about any of them. The same argument the keyboard
+/// walk makes (AG2 #7), applied to a count instead of an order.
+fn marked_out_of_sight(marked: &HashSet<String>, walk: &[String]) -> usize {
+    marked.iter().filter(|id| !walk.contains(id)).count()
+}
+
+/// What the mark bar says (Slice AG2 #12).
+///
+/// **It states the count that is true and does not quantify the action** —
+/// `archived_toggle_label`'s documented trap, and this control is more
+/// exposed to it than that one was: a marked row can be out of sight for
+/// three separate reasons (a collapsed project, the text filter, the
+/// window), and a bar reading `3 marked` above a list showing one of them
+/// would look like a bug in the count rather than a fact about the list.
+/// So the rows it is holding that you cannot see are named as such.
+fn marked_bar_label(marked: usize, hidden: usize) -> String {
+    if hidden > 0 {
+        format!("{marked} marked · {hidden} not shown")
+    } else {
+        format!("{marked} marked")
+    }
 }
 
 /// What the rail says about the rows the window is holding back.
@@ -6627,6 +6671,24 @@ struct Shell {
     /// it back because they typed in a box would be the rail deciding it
     /// knew better.
     rail_window: Cell<usize>,
+    /// Slice AG2 #12 — the sessions the operator has COLLECTED.
+    ///
+    /// **This is not the selection, and keeping the two apart is the whole
+    /// design.** eave's rail selection *navigates*: clicking a row swaps the
+    /// transcript, the composer, the files list and the page well over to
+    /// that session. A mark *collects*: it changes nothing on screen except
+    /// the row's own leading rule and the bar that counts it. So a plain
+    /// click still goes somewhere and leaves the marks standing — you are
+    /// meant to be able to look at one of the rows you have staged before
+    /// acting on all of them.
+    ///
+    /// In memory, and pruned against the snapshot in the sessions observer
+    /// rather than in the paint: a count that included a session the engine
+    /// has forgotten would be a number that cannot be acted on.
+    rail_marked: std::collections::HashSet<String>,
+    /// Where the last mark was made, so a shift-click has something to
+    /// extend from. `None` when nothing is marked.
+    rail_mark_anchor: Option<String>,
     /// Which session the rail has already scrolled into view — the same
     /// EDGE [`Shell::tab_scrolled_to`] keeps, for the same reason, and
     /// the rail needed one the moment the selection could move without a
@@ -7828,6 +7890,101 @@ impl Shell {
         self.rail_window
             .set(self.rail_window.get() + RAIL_WINDOW_STEP);
         cx.notify();
+    }
+
+    /// Slice AG2 #12 — ⌘-click toggles one row, ⇧-click extends the range.
+    ///
+    /// **The range walks [`Shell::rail_walk`], not the session list.** That
+    /// field is the paint's own record of the rows actually on screen, so a
+    /// range cannot reach into a collapsed project, past the window, or
+    /// through a row the text filter dropped — the same reason the keyboard
+    /// walk reads it (AG2 #7). Deriving the span from the unfiltered list
+    /// would let one shift-click stage rows the operator cannot see.
+    ///
+    /// **A range only ever ADDS.** A shift-click that unmarked a span would
+    /// be the one gesture in this rail that destroys work invisibly — the
+    /// marks are cleared by a button that says so.
+    fn mark_row(&mut self, sid: &str, extend: bool, cx: &mut Context<Self>) {
+        let span = extend
+            .then(|| self.rail_mark_anchor.clone())
+            .flatten()
+            .and_then(|anchor| {
+                let walk = self.rail_walk.borrow();
+                let from = walk.iter().position(|s| s == &anchor)?;
+                let to = walk.iter().position(|s| s == sid)?;
+                let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+                Some(walk[lo..=hi].to_vec())
+            });
+        match span {
+            Some(rows) => self.rail_marked.extend(rows),
+            None => {
+                if !self.rail_marked.remove(sid) {
+                    self.rail_marked.insert(sid.to_string());
+                    self.rail_mark_anchor = Some(sid.to_string());
+                } else if self.rail_mark_anchor.as_deref() == Some(sid) {
+                    self.rail_mark_anchor = None;
+                }
+            }
+        }
+        if self.rail_marked.is_empty() {
+            self.rail_mark_anchor = None;
+        }
+        cx.notify();
+    }
+
+    fn clear_marks(&mut self, cx: &mut Context<Self>) {
+        self.rail_marked.clear();
+        self.rail_mark_anchor = None;
+        cx.notify();
+    }
+
+    /// File every marked session away in one act — **or bring them all
+    /// back, when every one of them is already filed.**
+    ///
+    /// The direction mirrors the row button's own rule rather than
+    /// inventing a second one, and archiving stays the ONE bulk verb for
+    /// the reason that button's comment already gives: nothing is
+    /// destroyed, so a confirmation would be ceremony with no fact behind
+    /// it. Delete is deliberately absent — `RemoveWorktree` arms on a
+    /// per-row count of uncommitted files and unmerged commits, and a bulk
+    /// version would either drop that count or state ten of them in one
+    /// line.
+    ///
+    /// The marks are cleared afterwards. A staged set that survived its own
+    /// action would leave the bar counting rows the operator has already
+    /// dealt with.
+    fn archive_marked(&mut self, archived: bool, cx: &mut Context<Self>) {
+        for id in std::mem::take(&mut self.rail_marked) {
+            let _ = self.commands.send(Command::SetArchived { id, archived });
+        }
+        self.rail_mark_anchor = None;
+        cx.notify();
+    }
+
+    /// Drop marks for sessions the engine no longer reports.
+    ///
+    /// From the sessions observer and never the paint — the precedent is
+    /// `release_queued`, and the reason is the same: this writes, and a
+    /// write from the render pass is what N4's idle floor forbids.
+    fn prune_marks(&mut self, cx: &App) {
+        if self.rail_marked.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<&str> = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        self.rail_marked.retain(|id| live.contains(id.as_str()));
+        if self
+            .rail_mark_anchor
+            .as_deref()
+            .is_some_and(|a| !self.rail_marked.contains(a))
+        {
+            self.rail_mark_anchor = None;
+        }
     }
 
     /// Drop a queued follow-up. The words are gone — this is the take-back
@@ -14264,6 +14421,103 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Slice AG2 #12 — what the operator has staged, and the one act they
+    /// can perform on all of it.
+    ///
+    /// **Archive is the only bulk verb, and that is a decision rather than
+    /// a first instalment.** The row's own archive button carries the
+    /// reason: *"Nothing is destroyed — the same button, one click, brings
+    /// it back — so a confirmation here would be ceremony with no fact
+    /// behind it."* That property is what makes it safe to apply to ten
+    /// rows at once. `RemoveWorktree` has the opposite property — it arms
+    /// on a per-row count of uncommitted files and unmerged commits — so a
+    /// bulk delete would either drop that count or try to state ten of
+    /// them in one line, and neither is a thing this rail should do.
+    ///
+    /// The direction mirrors the row button rather than inventing a second
+    /// rule: it files them away, unless every marked row is already filed,
+    /// in which case the same control brings them back.
+    fn rail_marked_bar(&self, cx: &Context<Self>) -> AnyElement {
+        let marked = self.rail_marked.len();
+        // A marked row can be off screen for three unrelated reasons — a
+        // collapsed project, the text filter, the window — and `rail_walk`
+        // is the ONE record of what was actually drawn, so it answers all
+        // three at once without knowing about any of them.
+        let hidden = marked_out_of_sight(&self.rail_marked, &self.rail_walk.borrow());
+        // Every marked row already filed away? Then the verb is the other
+        // one. `all` over an empty set is vacuously true, which is why this
+        // is only ever reached with at least one mark.
+        let all_filed = {
+            let state = self.sessions.read(cx);
+            self.rail_marked.iter().all(|id| {
+                state
+                    .sessions
+                    .iter()
+                    .find(|s| &s.session_id == id)
+                    .is_some_and(|s| s.archived)
+            })
+        };
+        let archive_to = !all_filed;
+        let verb = if archive_to { "Archive" } else { "Unarchive" };
+        // The selector carries the direction, the way `downloads-glyph`
+        // does. It is a different control depending on which way it goes,
+        // and a harness that could not tell them apart would pass a test
+        // for "it archives" while the button said Unarchive.
+        let act_sel = if archive_to {
+            "rail-marked-archive"
+        } else {
+            "rail-marked-unarchive"
+        };
+        rail_inset()
+            .child(
+                div()
+                    .debug_selector(|| "rail-marked".into())
+                    .w_full()
+                    .h(px(theme::RAIL_GHOST_H))
+                    .px(px(theme::RAIL_HOVER_PAD))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .child(
+                        div()
+                            .debug_selector(|| "rail-marked-count".into())
+                            .flex_1()
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(marked_bar_label(marked, hidden))),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(act_sel))
+                            .debug_selector(move || act_sel.into())
+                            .px(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_SELECT))
+                            .cursor_pointer()
+                            .hover_fade(act_sel, theme::wash_rest(), theme::overlay())
+                            .text_color(theme::accent())
+                            .child(SharedString::from(verb))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.archive_marked(archive_to, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("rail-marked-clear")
+                            .debug_selector(|| "rail-marked-clear".into())
+                            .px(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_SELECT))
+                            .cursor_pointer()
+                            .hover_fade("rail-marked-clear", theme::wash_rest(), theme::overlay())
+                            .text_color(theme::text_tertiary())
+                            .child("Clear")
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_marks(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// A project header inside the Sessions zone (Slice AG2 #2/#3).
     ///
     /// `▸ title  n            ● waiting on you (2)`
@@ -16452,6 +16706,9 @@ impl Shell {
         // is not built. Nothing inside it changed.
         let build_row = |info: SessionInfo, group_root: Option<&str>| -> AnyElement {
                 let is_sel = selected.as_deref() == Some(info.session_id.as_str());
+                // Slice AG2 #12 — staged for a bulk act, which is a
+                // different fact from being the row you are looking at.
+                let is_marked = self.rail_marked.contains(&info.session_id);
                 let (glyph, provider_label) = provider_identity(&info.provider);
                 let label = row_label(&info, &provider_label);
                 let kicker = provider_kicker(&info, &provider_label);
@@ -16614,14 +16871,50 @@ impl Shell {
                         if is_sel { theme::overlay_strong() } else { theme::overlay() },
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                        // Slice AG2 #12 — ⌘ toggles a mark, ⇧ extends the
+                        // range, and neither navigates. The chords are the
+                        // list convention every platform uses, and in the
+                        // SESSIONS face neither is spoken for.
+                        //
+                        // ⌘-click does mean something else twice in this
+                        // app — "reveal in Finder" on a file row, "open in
+                        // a background tab" on a transcript link — and both
+                        // are the browser's *open elsewhere*. The files rail
+                        // is the other FACE of this same rail and the two
+                        // cannot be on screen together, so the collision is
+                        // between a list that has multi-select and one that
+                        // does not, which is where the convention already
+                        // says the toggle wins.
+                        let m = ev.modifiers();
+                        if m.platform || m.shift {
+                            this.mark_row(&sid, m.shift, cx);
+                            return;
+                        }
                         // Stage AC: selecting anything closes an open
                         // rename field, discarding it. The field lives in
                         // one row's label slot; leaving it open while the
                         // selection moves would strand a keyboard grab on
                         // a row the operator has walked away from.
+                        //
+                        // It does NOT clear the marks. Navigating is not
+                        // unstaging — looking at one of the rows you have
+                        // collected before acting on all of them is the
+                        // whole reason the two are separate.
                         this.cancel_rename(cx);
                         let _ = this.commands.send(Command::Select(sid.clone()));
+                    }))
+                    .children(is_marked.then(|| {
+                        let sel_mark = format!("mark-{}", info.session_id);
+                        div()
+                            .debug_selector(move || sel_mark.clone().into())
+                            .absolute()
+                            .left(px(theme::SPACE_HALF))
+                            .top(px(theme::SPACE_2))
+                            .bottom(px(theme::SPACE_2))
+                            .w(px(ROW_MARK_W))
+                            .rounded_full()
+                            .bg(theme::accent())
                     }))
                     .flex()
                     .flex_col()
@@ -17337,6 +17630,30 @@ impl Shell {
             // not account for them reads as broken rather than as filtered.
             if filtered_out > 0 {
                 rows.push(rail_filter_note(sess_count, before_filter, filtered_askers));
+            }
+            // Slice AG2 #12 — the mark bar, ABOVE the rows it acts on and
+            // below the field that narrows them. The reveal and the
+            // archived toggle sit at the other end because they ACCOUNT for
+            // rows; this one is a verb, and a verb belongs where the eye
+            // lands before it reaches the list.
+            //
+            // **It costs one glide, and the cost is stated rather than
+            // hidden.** Appearing here pushes every row down by its own
+            // height, and `RAIL_RESORT` animates that over 260 ms — during
+            // which a row is PAINTED where it used to be and takes clicks
+            // there. So a ⌘-click inside that window can land on the row
+            // above the one under the pointer. It happens exactly twice per
+            // marking session (the bar arrives on the first mark and leaves
+            // on the last), never on the marks in between, and the
+            // alternatives are worse: below the list it is off the fold in
+            // a long rail, which is precisely when bulk archiving is what
+            // you came for, and a permanently reserved slot is an
+            // affordance stating a capability there is no occasion to use.
+            // The harness meets it head-on — see `settle` in
+            // `ui_harness.rs`, which exists because this was found by a
+            // test clicking Clear and selecting a session instead.
+            if !self.rail_marked.is_empty() {
+                rows.push(self.rail_marked_bar(cx));
             }
             // Where `body` starts inside the scroller, so `sel_at` — an
             // index within `body` — can be re-based onto the container
@@ -26795,6 +27112,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     // chords changes this and nothing on the transcript.
                     cx.observe(&sessions, |shell: &mut Shell, _, cx| {
                         shell.release_queued(cx);
+                        shell.prune_marks(cx);
                         cx.notify();
                     })
                     .detach();
@@ -26898,6 +27216,8 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         zoom_hud_gen: 0,
                         rail_scroll: ScrollHandle::new(),
                         rail_window: Cell::new(RAIL_WINDOW_FIRST),
+                        rail_marked: std::collections::HashSet::new(),
+                        rail_mark_anchor: None,
                         rail_walk: RefCell::new(Vec::new()),
                         rail_scrolled_to: RefCell::new(None),
                         rail_seen: RefCell::new(HashMap::new()),
@@ -27883,6 +28203,43 @@ mod tests {
         assert_eq!(project_color(Some(""), None), theme::accent());
     }
 
+    // ── Slice AG2 #12 — bulk operations ───────────────────────────────
+
+    /// `archived_toggle_label`'s trap, in a control more exposed to it: a
+    /// bar reading `3 marked` above a list showing one of them looks like
+    /// a broken count rather than a filtered list. It states the number
+    /// that is true and names what it is holding out of sight — and it
+    /// does not quantify the action, because "archive 3" over a list of
+    /// one would promise the wrong thing twice.
+    #[test]
+    fn the_mark_bar_states_the_count_and_names_what_it_is_hiding() {
+        assert_eq!(marked_bar_label(1, 0), "1 marked");
+        assert_eq!(marked_bar_label(3, 0), "3 marked");
+        assert_eq!(marked_bar_label(3, 2), "3 marked · 2 not shown");
+        // Never the other way round: the count is of what is STAGED, and
+        // the second clause is a subset of it.
+        assert_eq!(marked_bar_label(2, 2), "2 marked · 2 not shown");
+    }
+
+    /// A staged row can be off screen for three unrelated reasons — a
+    /// collapsed project, the text filter, the window — and `rail_walk`
+    /// answers all three at once because it is the record of what was
+    /// actually drawn rather than a second opinion about any of them.
+    #[test]
+    fn a_staged_row_off_screen_is_counted_as_off_screen() {
+        let marked: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let drawn = |ids: &[&str]| -> Vec<String> { ids.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(marked_out_of_sight(&marked, &drawn(&["a", "b", "c"])), 0);
+        assert_eq!(marked_out_of_sight(&marked, &drawn(&["a"])), 2);
+        // The rail drew nothing — the files face, or a collapsed zone.
+        // Every mark is out of sight, and that is a fact, not an error.
+        assert_eq!(marked_out_of_sight(&marked, &[]), 3);
+        // Rows drawn that are not staged do not count against anything.
+        assert_eq!(
+            marked_out_of_sight(&marked, &drawn(&["a", "b", "c", "d", "e"])),
+            0
+        );
+    }
     /// Slice AG2 #2/#3. A session in a named checkout, in a stated state.
     fn in_root(id: &str, root: Option<&str>, state: &str) -> SessionInfo {
         let mut s = info(id, 100, None);

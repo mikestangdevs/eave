@@ -7833,6 +7833,306 @@ fn a_project_has_one_colour_and_one_place_that_decides_it(_cx: &mut TestAppConte
     }
 }
 
+// ── Slice AG2 #12 — bulk operations ───────────────────────────────────
+
+fn cmd() -> Modifiers {
+    Modifiers {
+        platform: true,
+        ..Modifiers::none()
+    }
+}
+
+fn shift() -> Modifiers {
+    Modifiers {
+        shift: true,
+        ..Modifiers::none()
+    }
+}
+
+/// **Let the resort glide finish before clicking the bar.**
+///
+/// The first mark makes the bar appear, which pushes every row down by its
+/// height, and `RAIL_RESORT` animates that over 260 ms — during which a row
+/// is PAINTED where it used to be and takes clicks there. Without this the
+/// click on `rail-marked-clear` landed on the session row underneath and
+/// the test failed with a `Select` it never asked for, which is how the
+/// cost was found. `run_until_parked` does not help: the glide is a clock,
+/// not a task.
+fn settle(vcx: &mut VisualTestContext) {
+    vcx.executor().advance_clock(Duration::from_millis(400));
+    vcx.run_until_parked();
+}
+
+/// **A mark collects; the selection navigates. The point of #12 is that
+/// they are not the same act.**
+///
+/// Today archiving a row you are not looking at is impossible — the
+/// archive button is gated on `is_sel` — so tidying ten finished sessions
+/// costs ten context switches, each of which swaps the transcript, the
+/// composer, the files list and the page well. ⌘-click has to stage a row
+/// without going anywhere near it, or the bulk act has not fixed anything.
+#[gpui::test]
+fn a_marked_row_is_staged_without_going_there(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    let _ = h.drain();
+
+    click_with(vcx, "rail-bbbb2222", cmd());
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "⌘-click navigated — staging a row moved the whole workspace onto it"
+    );
+    assert!(
+        shown(vcx, "mark-bbbb2222"),
+        "the row does not say it is staged"
+    );
+    assert!(
+        !shown(vcx, "mark-aaaa1111"),
+        "an unmarked row wore the rule"
+    );
+    assert!(shown(vcx, "rail-marked"), "nothing counted the staged rows");
+    assert!(shown(vcx, "rail-marked-archive"));
+
+    // And again unstages it — a toggle, so the gesture that made a mistake
+    // is the gesture that undoes it.
+    click_with(vcx, "rail-bbbb2222", cmd());
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "mark-bbbb2222"));
+    assert!(!shown(vcx, "rail-marked"), "the bar outlived the last mark");
+}
+
+/// Navigating is not unstaging. Looking at one of the rows you have
+/// collected before acting on all of them is the whole reason the two
+/// concepts are separate.
+#[gpui::test]
+fn a_plain_click_still_navigates_and_leaves_the_marks_standing(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    let _ = h.drain();
+
+    click_with(vcx, "rail-bbbb2222", cmd());
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    click(vcx, "rail-bbbb2222");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "a plain click stopped navigating"
+    );
+    assert!(
+        shown(vcx, "mark-bbbb2222"),
+        "going to look at a staged row threw the staging away"
+    );
+}
+
+/// **A range walks what the rail DREW, not what it holds.**
+///
+/// The span comes from `rail_walk`, so it cannot reach into a collapsed
+/// project, past the window, or through a row the text filter dropped —
+/// the same argument AG2 #7 makes about the keyboard. Deriving it from the
+/// session list instead would let one shift-click stage rows the operator
+/// cannot see and is about to archive.
+#[gpui::test]
+fn a_range_cannot_reach_into_a_collapsed_project(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let loose = session("aaaa1111");
+    let mut e = session("bbbb2222");
+    e.checkout_root = Some("/w/eave".into());
+    let mut z = session("cccc3333");
+    z.checkout_root = Some("/w/zed".into());
+    h.plumbing.push_rail(vec![loose, e, z]);
+    vcx.run_until_parked();
+
+    // Fold the middle project away. The rail now draws the loose row and
+    // the zed row, with eave's between them in the list and on screen
+    // nowhere.
+    click(vcx, "rail-group-/w/eave");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-bbbb2222"),
+        "the project would not collapse"
+    );
+
+    click_with(vcx, "rail-aaaa1111", cmd());
+    vcx.run_until_parked();
+    click_with(vcx, "rail-cccc3333", shift());
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "mark-aaaa1111"), "the anchor lost its mark");
+    assert!(
+        shown(vcx, "mark-cccc3333"),
+        "the range did not reach the far end"
+    );
+
+    // Re-open the project and look at what the range swept up.
+    click(vcx, "rail-group-/w/eave");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-bbbb2222"), "the project would not reopen");
+    assert!(
+        !shown(vcx, "mark-bbbb2222"),
+        "A SHIFT-CLICK STAGED A ROW THAT WAS NOT ON SCREEN — this is the \
+         whole reason the range reads `rail_walk`"
+    );
+}
+
+/// A range only ever adds. A shift-click that unmarked a span would be the
+/// one gesture in this rail that destroys work invisibly.
+#[gpui::test]
+fn a_range_only_ever_adds(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![
+        session("aaaa1111"),
+        session("bbbb2222"),
+        session("cccc3333"),
+    ]);
+    vcx.run_until_parked();
+
+    click_with(vcx, "rail-aaaa1111", cmd());
+    vcx.run_until_parked();
+    click_with(vcx, "rail-cccc3333", shift());
+    vcx.run_until_parked();
+    for sel in ["mark-aaaa1111", "mark-bbbb2222", "mark-cccc3333"] {
+        assert!(shown(vcx, sel), "{sel} was not swept up by the range");
+    }
+
+    // The same range again finds them all marked and leaves them that way.
+    click_with(vcx, "rail-cccc3333", shift());
+    vcx.run_until_parked();
+    for sel in ["mark-aaaa1111", "mark-bbbb2222", "mark-cccc3333"] {
+        assert!(shown(vcx, sel), "a second shift-click unstaged {sel}");
+    }
+}
+
+/// The bar files them all away in one act and then stops counting them —
+/// a staged set that survived its own action would leave the bar naming
+/// rows the operator has already dealt with.
+#[gpui::test]
+fn archiving_the_marked_files_them_all_and_clears_the_staging(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    vcx.run_until_parked();
+
+    click_with(vcx, "rail-aaaa1111", cmd());
+    vcx.run_until_parked();
+    click_with(vcx, "rail-bbbb2222", cmd());
+    settle(vcx);
+    let _ = h.drain();
+
+    click(vcx, "rail-marked-archive");
+    vcx.run_until_parked();
+    let mut filed: Vec<String> = h
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::SetArchived { id, archived: true } => Some(id),
+            _ => None,
+        })
+        .collect();
+    filed.sort();
+    assert_eq!(filed, vec!["aaaa1111".to_string(), "bbbb2222".to_string()]);
+    assert!(
+        !shown(vcx, "rail-marked"),
+        "the staging outlived its own act"
+    );
+}
+
+/// The direction mirrors the row button rather than inventing a second
+/// rule: when every staged row is already filed, the same control brings
+/// them back.
+#[gpui::test]
+fn a_set_that_is_already_filed_offers_to_bring_it_back(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+
+    click_with(vcx, "rail-aaaa1111", cmd());
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "rail-marked-archive"),
+        "a live row offered no filing"
+    );
+
+    // The engine reports it filed. The row leaves the list; the mark does
+    // not, because the session still exists.
+    let mut filed = session("aaaa1111");
+    filed.archived = true;
+    h.plumbing.push_rail(vec![filed]);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-aaaa1111"),
+        "an archived row stayed on screen"
+    );
+    assert!(
+        shown(vcx, "rail-marked-unarchive"),
+        "the bar still offered to file away a set that is already filed"
+    );
+}
+
+/// Clear unstages and does nothing else — the take-back for a range that
+/// swept up more than was meant.
+#[gpui::test]
+fn clear_unstages_without_acting(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // Seeded WITH a selection: an unselected rail emits its own
+    // `Select` on a later frame, and this test's whole assertion is that
+    // nothing was emitted.
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "bbbb2222",
+    );
+
+    click_with(vcx, "rail-aaaa1111", cmd());
+    settle(vcx);
+    let _ = h.drain();
+
+    click(vcx, "rail-marked-clear");
+    vcx.run_until_parked();
+    let after = h.drain();
+    assert!(
+        after.is_empty(),
+        "clearing the staging acted on it: {after:?}"
+    );
+    assert!(!shown(vcx, "mark-aaaa1111"));
+    assert!(!shown(vcx, "rail-marked"));
+}
+
+/// A mark on a session the engine has forgotten is a number that cannot be
+/// acted on. Pruned in the sessions observer, never the paint — the
+/// precedent is `release_queued` and the reason is the same.
+#[gpui::test]
+fn a_mark_dies_with_the_session_it_was_on(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    vcx.run_until_parked();
+
+    click_with(vcx, "rail-bbbb2222", cmd());
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-marked"));
+
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-marked"),
+        "the bar went on counting a session that is gone"
+    );
+}
+
 /// **Slice AG2 #5, and the clause that keeps it honest.**
 ///
 /// A text filter is allowed to hide a session parked on a permission
