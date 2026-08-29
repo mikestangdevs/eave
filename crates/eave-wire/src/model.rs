@@ -109,6 +109,75 @@ pub fn tool_detail(call: Option<&ToolCall>, name: &str, input: &str) -> Option<S
     })
 }
 
+/// The before/after an EDIT already carries in its own input, for the
+/// providers that never send a diff block (Slice AG1 #4, the second half).
+///
+/// **The first half of #4 shipped ACP-only.** ACP agents report an edit as
+/// `{type:"diff", path, oldText, newText}` in the tool result, which
+/// `eave_core::acp::update::first_diff` lifts onto `ToolUseFinished`. Claude
+/// Code sends no such block — but it never had to, because an `Edit`'s
+/// before-text is the tool's own **argument**, and `input` has held it
+/// verbatim all along (`eave_core::tool` documents in as many words that the
+/// old/new strings are "deliberately absent" from `ToolCall` because "they
+/// are already on `input`"). So this reads a fact eave already stores; it
+/// adds nothing to the journal and needs no adapter change, and every
+/// transcript already on disk gains its diffs on the next cold start.
+///
+/// **Keyed on the shape, never on the tool's name.** `old_string` +
+/// `new_string` + `file_path` together mean one thing and cannot be
+/// mistaken for another tool's arguments, whereas a name table would have
+/// to be kept per provider and would quietly render nothing the day a CLI
+/// renamed its editor. A shape that does not match yields `None`, which is
+/// the row exactly as it renders today — a wrong guess here costs a missing
+/// diff, never a false one.
+///
+/// **`Write` is deliberately excluded.** Its input carries `content` and no
+/// before-text, so the only diff derivable from it is "every line added" —
+/// true when the file was created and a lie when it was overwritten, and
+/// the input does not say which. ACP's absent `oldText` is a different
+/// fact: there the AGENT said it created the file.
+///
+/// **MultiEdit shows its first edit only**, for `first_diff`'s reason —
+/// concatenating edits would invent a change nobody made, and picking the
+/// largest would make the row's meaning depend on content size.
+///
+/// No cap is applied: `input` was bounded by
+/// `eave_core::events::TOOL_PAYLOAD_CAP` before it was stored, and these
+/// are slices of it.
+///
+/// **The key names are the CLI's documented schema, NOT read off a
+/// capture.** `tool_detail` above cites
+/// `docs/research/approvals-capture-2026-08-18/` for its verified keys and
+/// that directory is no longer in the tree, so there was nothing here to
+/// check these against. The shape gate is what makes that safe: three keys
+/// that must all be present and all be strings, so a schema that turns out
+/// to differ yields `None` and the row renders exactly as it does today.
+pub fn diff_from_input(input: &str) -> Option<eave_core::events::ToolDiff> {
+    if input.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let path = v.get("file_path")?.as_str()?;
+    // MultiEdit nests the same pair inside `edits`; a bare Edit carries it
+    // at the top level.
+    let edit = match v.get("edits").and_then(|e| e.as_array()) {
+        Some(edits) => edits.first()?,
+        None => &v,
+    };
+    let old = edit.get("old_string")?.as_str()?;
+    let new = edit.get("new_string")?.as_str()?;
+    // An edit that changed nothing is not a change. Drawing it would give
+    // the row a diff pane stating that a file stayed as it was.
+    if old == new {
+        return None;
+    }
+    Some(eave_core::events::ToolDiff {
+        path: path.to_string(),
+        old_text: old.to_string(),
+        new_text: new.to_string(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
     User {
@@ -709,6 +778,7 @@ impl Transcript {
             if let Row::Tool {
                 id: rid,
                 status,
+                input: i,
                 result: r,
                 is_error: e,
                 diff: d,
@@ -719,7 +789,12 @@ impl Transcript {
                     *status = ToolStatus::Finished;
                     *r = result.to_string();
                     *e = is_error;
-                    *d = diff;
+                    // Slice AG1 #4, second half. The provider's own diff
+                    // wins whenever it sent one: it reports what the edit
+                    // DID, while the input only says what was asked. They
+                    // agree on a successful edit and the renderer already
+                    // refuses to draw either on a failed one.
+                    *d = diff.or_else(|| diff_from_input(i));
                     self.touch(ix);
                     return;
                 }
@@ -1242,5 +1317,207 @@ mod tests {
             t.rows
         );
         assert_eq!(t.turn_tokens, None);
+    }
+
+    /// Slice AG1 #4, second half: a Claude `Edit` gains a diff from the
+    /// argument it always carried, with no diff block from the provider.
+    ///
+    /// This is the case the ACP half could not reach, and it is the one
+    /// that matters most here: Claude Code is the provider eave was built
+    /// on, and until now every one of its edits rendered as a wall of
+    /// result text.
+    #[test]
+    fn a_claude_edit_gains_its_diff_from_the_input_it_already_carried() {
+        let t = edited(
+            "Edit",
+            r#"{"file_path":"src/a.rs","old_string":"one\ntwo\n","new_string":"one\nTWO\n"}"#,
+            None,
+        );
+        assert_eq!(
+            tool_diff(&t),
+            Some(eave_core::events::ToolDiff {
+                path: "src/a.rs".into(),
+                old_text: "one\ntwo\n".into(),
+                new_text: "one\nTWO\n".into(),
+            })
+        );
+    }
+
+    /// The provider's own diff always wins. It reports what the edit DID;
+    /// the input only says what was asked for.
+    #[test]
+    fn a_reported_diff_is_never_replaced_by_the_derived_one() {
+        let reported = eave_core::events::ToolDiff {
+            path: "reported.rs".into(),
+            old_text: "a\n".into(),
+            new_text: "b\n".into(),
+        };
+        let t = edited(
+            "Edit",
+            r#"{"file_path":"asked.rs","old_string":"x\n","new_string":"y\n"}"#,
+            Some(reported.clone()),
+        );
+        assert_eq!(tool_diff(&t), Some(reported));
+    }
+
+    /// `Write` gets nothing. Its input has `content` and no before-text, so
+    /// the only diff derivable from it draws every line as an addition —
+    /// true if the file was created, a lie if it was overwritten, and the
+    /// input does not say which.
+    #[test]
+    fn a_write_gets_no_derived_diff_because_it_states_no_before_text() {
+        let t = edited(
+            "Write",
+            r#"{"file_path":"src/a.rs","content":"one\ntwo\n"}"#,
+            None,
+        );
+        assert_eq!(tool_diff(&t), None);
+    }
+
+    /// MultiEdit shows the first edit only — `first_diff`'s rule, for
+    /// `first_diff`'s reason: merging them would invent a change nobody
+    /// made, and taking the largest would make the row depend on size.
+    #[test]
+    fn a_multi_edit_draws_its_first_edit_and_does_not_merge_them() {
+        let t = edited(
+            "MultiEdit",
+            r#"{"file_path":"src/a.rs","edits":[
+                {"old_string":"one\n","new_string":"ONE\n"},
+                {"old_string":"two\n","new_string":"TWO\n"}]}"#,
+            None,
+        );
+        let d = tool_diff(&t).expect("a multi-edit drew nothing");
+        assert_eq!(d.old_text, "one\n");
+        assert_eq!(d.new_text, "ONE\n", "the second edit was merged in");
+    }
+
+    /// An edit whose strings match changed nothing, and a diff pane stating
+    /// that a file stayed as it was is noise, not a fact worth a pane.
+    #[test]
+    fn an_edit_that_changed_nothing_draws_no_diff() {
+        let t = edited(
+            "Edit",
+            r#"{"file_path":"src/a.rs","old_string":"same\n","new_string":"same\n"}"#,
+            None,
+        );
+        assert_eq!(tool_diff(&t), None);
+    }
+
+    /// The restated start is what carries the arguments (Claude announces
+    /// the tool with `{}` and fills it a line later), so the derivation
+    /// must read the row's CURRENT input, not the one it was born with.
+    /// Without the in-place update this row would finish holding `{}`.
+    #[test]
+    fn the_derived_diff_reads_the_restated_input_not_the_empty_first_one() {
+        let started = |input: &str| SessionEvent::ToolUseStarted {
+            id: "t1".into(),
+            name: "Edit".into(),
+            input: input.into(),
+            call: None,
+        };
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    JournalEvent::Provider {
+                        event: started("{}"),
+                    },
+                ),
+                rec(
+                    2,
+                    JournalEvent::Provider {
+                        event: started(
+                            r#"{"file_path":"src/a.rs","old_string":"one\n","new_string":"ONE\n"}"#,
+                        ),
+                    },
+                ),
+                rec(
+                    3,
+                    JournalEvent::Provider {
+                        event: SessionEvent::ToolUseFinished {
+                            id: "t1".into(),
+                            result: "ok".into(),
+                            is_error: false,
+                            diff: None,
+                        },
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(
+            tool_diff(&t).is_some(),
+            "the finish read the placeholder input, not the restated one"
+        );
+    }
+
+    /// A tool that never finished holds no diff: an edit's row gains it
+    /// when the tool settles, the same moment the ACP half does.
+    #[test]
+    fn a_running_edit_holds_no_diff_yet() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[rec(
+                1,
+                JournalEvent::Provider {
+                    event: SessionEvent::ToolUseStarted {
+                        id: "t1".into(),
+                        name: "Edit".into(),
+                        input: r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#.into(),
+                        call: None,
+                    },
+                },
+            )],
+        )
+        .unwrap();
+        assert_eq!(tool_diff(&t), None);
+    }
+
+    /// One `Edit` start, one finish, and the diff the finish ended up with.
+    fn edited(
+        name: &str,
+        input: &str,
+        reported: Option<eave_core::events::ToolDiff>,
+    ) -> Transcript {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    JournalEvent::Provider {
+                        event: SessionEvent::ToolUseStarted {
+                            id: "t1".into(),
+                            name: name.into(),
+                            input: input.into(),
+                            call: None,
+                        },
+                    },
+                ),
+                rec(
+                    2,
+                    JournalEvent::Provider {
+                        event: SessionEvent::ToolUseFinished {
+                            id: "t1".into(),
+                            result: "ok".into(),
+                            is_error: false,
+                            diff: reported,
+                        },
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        t
+    }
+
+    fn tool_diff(t: &Transcript) -> Option<eave_core::events::ToolDiff> {
+        t.rows.iter().find_map(|r| match r {
+            Row::Tool { diff, .. } => diff.clone(),
+            _ => None,
+        })
     }
 }

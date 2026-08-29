@@ -461,6 +461,15 @@ mod tests {
 
     #[test]
     fn claude_tab_lists_native_ids() {
+        // The lock its siblings take, and `capabilities::probe_test_lock`
+        // requires by name: "every test that reads or writes the cache
+        // must hold this for its whole body". This one read the cache
+        // without it and asserted `names[0]`, which is the exact failure
+        // that doc describes — a concurrent `record("claude-code", ..)`
+        // replacing the static list underneath it. Seen once as a one-off
+        // failure on 2026-08-28 and diagnosed from that comment.
+        let _turn = eave_core::capabilities::probe_test_lock();
+        eave_core::capabilities::forget();
         let rows = entries_for_provider(claude());
         let names: Vec<&str> = rows.iter().map(|e| e.model).collect();
         assert_eq!(names[0], "claude-sonnet-5", "{names:?}");

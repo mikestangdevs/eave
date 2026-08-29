@@ -72,6 +72,23 @@ actions!(
         Quit,
         ApproveOldest,
         DenyOldest,
+        /// Slice AG2 #7 — ⌘⇧↑ / ⌘⇧↓, the rail's selection walk.
+        ///
+        /// The ⌘⇧ family is where eave's SESSION chords live (⌘⇧A / ⌘⇧D
+        /// above), and the arrows are the rail's own axis. **Not ⌘⇧[ /
+        /// ⌘⇧]**, which Safari and Chrome both spend on tab switching:
+        /// eave is a browser with a tab strip, so taking a tab chord for
+        /// the session list would be Slice C5's ⌘L collision run in
+        /// reverse.
+        ///
+        /// Actions rather than `on_key` arms, deliberately and with the
+        /// same consequence ⌘⇧A/⌘⇧D already carry: gpui dispatches a
+        /// matched action ahead of the bubble-phase listeners, so these
+        /// fire from anywhere — including with the rail's filter field
+        /// open, which is the point. You narrow the list, then walk what
+        /// is left without reaching for the mouse to close the field.
+        SelectPrevSession,
+        SelectNextSession,
         /// Slice C5 — ⌘T.
         NewTab,
         /// **Slice W1 — ⌘N, a second window.**
@@ -6109,6 +6126,35 @@ struct Shell {
     /// and a notify per frame is the defect N4's idle floor exists to
     /// prevent.
     tab_scrolled_to: RefCell<Option<String>>,
+    /// Slice AG2 #7 — the session ids the rail is SHOWING, top to bottom.
+    ///
+    /// **Written by the paint, read by the walk, and that is the whole
+    /// design.** The alternative was to re-derive the order in the key
+    /// handler by re-running the archive filter, the text filter,
+    /// `group_rail` and the collapsed-group skip. Four steps, in two
+    /// places, drifting apart the first time one of them grows a rule —
+    /// which is the shape of the two-favicon-cache defect this codebase
+    /// has already paid for once. Recording what was painted means the
+    /// walk cannot disagree with the rail, because it is not a second
+    /// opinion about it.
+    ///
+    /// Empty while the rail is showing its FILES face: there are no
+    /// session rows on screen then, and a chord that moved the selection
+    /// behind a list of files would be an invisible act. The footer
+    /// toggle brings the sessions back.
+    ///
+    /// A `RefCell` for the reason [`Shell::tab_scrolled_to`] gives: it is
+    /// this window's record of what it drew, written under `&self` inside
+    /// the render pass, where an entity write would notify and a notify
+    /// per frame is what N4's idle floor forbids.
+    rail_walk: RefCell<Vec<String>>,
+    /// Which session the rail has already scrolled into view — the same
+    /// EDGE [`Shell::tab_scrolled_to`] keeps, for the same reason, and
+    /// the rail needed one the moment the selection could move without a
+    /// pointer. It also closes a hole that predates the walk: a session
+    /// opened from the launcher or confirmed by the engine could land
+    /// off the end of a fifteen-row list with nothing to say so.
+    rail_scrolled_to: RefCell<Option<String>>,
     /// Slice P1 — see [`DemoOverlay`]. No product consumer.
     demo: DemoOverlay,
     /// The rail's inline rename field (Stage AC), when one is open.
@@ -9831,6 +9877,65 @@ impl Shell {
         if let Some(next) = strip::cycle(&snapshot, forward) {
             self.activate_tab(&next, cx);
         }
+    }
+
+    /// ⌘⇧↑ / ⌘⇧↓ — move the selection one row along the rail (AG2 #7).
+    ///
+    /// eave already had ⌘⇧A / ⌘⇧D to ACT on the oldest asking session,
+    /// which is ahead of all four reference apps; what it had no way to do
+    /// was *select* one without the pointer. This is that.
+    ///
+    /// **The walk goes where the eye goes.** The order is
+    /// [`Shell::rail_walk`], recorded by the paint, so a row hidden by a
+    /// collapsed project or dropped by the text filter is not somewhere
+    /// this can land. That is the same bargain #3 struck for the collapse:
+    /// a header speaks for the children it hides, and nothing reaches past
+    /// it in silence.
+    ///
+    /// **It clamps; it does not wrap** — and that is a deliberate
+    /// divergence from [`crate::strip::cycle`], which wraps and documents
+    /// why ("with two tabs open, ctrl-tab has to come back or the second
+    /// press does nothing"). The difference is that ctrl-tab is a CYCLER,
+    /// pressed repeatedly to toggle, while these chords are DIRECTIONAL:
+    /// the glyph says ↓. A ↓ that jumped from the last row to the first
+    /// would move the selection up the screen, and in a rail that is now a
+    /// map of four checkouts it would land you in a different project than
+    /// the one you were reading.
+    ///
+    /// With nothing selected, or with the selection hidden behind a
+    /// collapsed header, the walk enters the list from the end it is
+    /// travelling from — ↓ takes the first row, ↑ the last. Refusing
+    /// instead would make the chord dead at the launcher, which is exactly
+    /// where a keyboard-first operator starts.
+    fn walk_rail(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let order = self.rail_walk.borrow().clone();
+        if order.is_empty() {
+            return;
+        }
+        let at = self
+            .transcript
+            .read(cx)
+            .session_id
+            .as_deref()
+            .and_then(|sel| order.iter().position(|id| id == sel));
+        let next = match at {
+            Some(ix) if forward => match order.get(ix + 1) {
+                Some(id) => id,
+                None => return,
+            },
+            Some(ix) => match ix.checked_sub(1).and_then(|p| order.get(p)) {
+                Some(id) => id,
+                None => return,
+            },
+            None if forward => &order[0],
+            None => &order[order.len() - 1],
+        };
+        // Everything a click on the row does, and for the reasons the
+        // click site gives: an open rename field is a keyboard grab on a
+        // row the operator is walking away from.
+        let next = next.clone();
+        self.cancel_rename(cx);
+        let _ = self.commands.send(Command::Select(next));
     }
 
     /// ⌘1–⌘8. Strip order, 0-based. Past the end is a silent no-op.
@@ -15715,6 +15820,13 @@ impl Shell {
         // first header, which is exactly right: the ungrouped rows come
         // first and have no header to repeat.
         let mut group_root: Option<String> = None;
+        // Slice AG2 #7. The walk's order, recorded from the ONE loop that
+        // decides what is on screen — see [`Shell::rail_walk`]. `sel_at`
+        // is the same row's index within `body`, kept here because after
+        // this loop the rows are opaque elements and their identity is
+        // gone.
+        let mut walk: Vec<String> = Vec::new();
+        let mut sel_at: Option<usize> = None;
         for entry in group_rail(sessions) {
             match entry {
                 RailEntry::Header(g) => {
@@ -15724,6 +15836,10 @@ impl Shell {
                 }
                 RailEntry::Row(info) => {
                     if !group_shut {
+                        if selected.as_deref() == Some(info.session_id.as_str()) {
+                            sel_at = Some(rows.len());
+                        }
+                        walk.push(info.session_id.clone());
                         rows.push(build_row(info, group_root.as_deref()));
                     }
                 }
@@ -15738,6 +15854,21 @@ impl Shell {
         // action — it stays at the end because it is a filter over what
         // the zone already shows.
         let sess_shut = self.zone_sessions_collapsed.get();
+        // Slice AG2 #7 — the walk's order, and it is written on EVERY
+        // pass, including the passes that paint no rows.
+        //
+        // The first cut only wrote it when there were rows, which left
+        // the previous list standing: opening the files face or
+        // collapsing the Sessions zone made the rows vanish while the
+        // chord went on walking the list that used to be there — the
+        // invisible selection change this field exists to refuse. An
+        // empty list is a fact about the rail and has to be recorded like
+        // any other.
+        *self.rail_walk.borrow_mut() = if sess_shut || self.files_face(cx) {
+            Vec::new()
+        } else {
+            walk
+        };
         let body = rows;
         let mut rows = vec![self.zone_toggle(
             "zone-sessions",
@@ -15767,7 +15898,32 @@ impl Shell {
             if filtered_out > 0 {
                 rows.push(rail_filter_note(sess_count, before_filter, filtered_askers));
             }
+            // Where `body` starts inside the scroller, so `sel_at` — an
+            // index within `body` — can be re-based onto the container
+            // `rail_scroll` actually tracks. The zone header, the filter
+            // field and the filter note are all children of it too, and
+            // scrolling to the wrong index would land on an unrelated row.
+            // Exactly the re-basing `rail_tabs` does across its seam.
+            let body_at = rows.len();
             rows.extend(body);
+            // Slice AG2 #7 — scroll the selected row into view, on the
+            // EDGE of the selection changing and never every frame.
+            // `scroll_to_item` arms an active item that prepaint consumes,
+            // so re-arming it each pass would pin the list and the
+            // operator could never scroll away from the selected row —
+            // the defect `tab_scrolled_to` exists to prevent, in the
+            // other scroller.
+            let mut been = self.rail_scrolled_to.borrow_mut();
+            match selected.as_deref() {
+                Some(sel) if been.as_deref() != Some(sel) => {
+                    if let Some(ix) = sel_at {
+                        self.rail_scroll.scroll_to_item(body_at + ix);
+                        *been = Some(sel.to_string());
+                    }
+                }
+                None => *been = None,
+                _ => {}
+            }
             if archived_count > 0 {
                 let label = archived_toggle_label(archived_count, show_archived);
                 rows.push(
@@ -23181,6 +23337,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| this.activate_nth(7, cx)))
             .on_action(cx.listener(|this, _: &ActivateLastTab, _, cx| this.activate_last(cx)))
             .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| this.reopen_closed_tab(cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevSession, _, cx| this.walk_rail(false, cx)))
+            .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.walk_rail(true, cx)))
             .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| this.decide_oldest(true, cx)))
             .on_action(cx.listener(|this, _: &DenyOldest, _, cx| this.decide_oldest(false, cx)))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
@@ -24237,6 +24395,14 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // bindings rather than living only inside the key handler.
         KeyBinding::new("cmd-shift-a", ApproveOldest, None),
         KeyBinding::new("cmd-shift-d", DenyOldest, None),
+        // Slice AG2 #7 — the rail's selection walk, beside the two chords
+        // that already act on it. `text_field` binds `up`/`down` and
+        // `shift-up`/`shift-down` in the composer's context and
+        // `cmd-shift-left`/`cmd-shift-right` in its own, but NOT this
+        // pair, so nothing is being taken away from a field to pay for
+        // them.
+        KeyBinding::new("cmd-shift-up", SelectPrevSession, None),
+        KeyBinding::new("cmd-shift-down", SelectNextSession, None),
         // Slice Y: the three a macOS user reaches for without thinking.
         // Bound here rather than expressed as `OsAction`s because eave's
         // gpui pin has no Minimize/Close variants (see `app_menus`).
@@ -25170,6 +25336,8 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         zoom_hud: None,
                         zoom_hud_gen: 0,
                         rail_scroll: ScrollHandle::new(),
+                        rail_walk: RefCell::new(Vec::new()),
+                        rail_scrolled_to: RefCell::new(None),
                         projects_scroll: ScrollHandle::new(),
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from

@@ -945,6 +945,8 @@ fn describe(action: &str) -> Option<(&'static str, &'static str)> {
         "eave::ZoomOut" => ("Page", "Zoom out"),
         "eave::ZoomReset" => ("Page", "Reset zoom"),
         "eave::ToggleDevtools" => ("Page", "Toggle DevTools"),
+        "eave::SelectPrevSession" => ("Sessions", "Previous session in the rail"),
+        "eave::SelectNextSession" => ("Sessions", "Next session in the rail"),
         "eave::ApproveOldest" => ("Sessions", "Approve the oldest ask"),
         "eave::DenyOldest" => ("Sessions", "Deny the oldest ask"),
         "eave::SendMessage" => ("Composer", "Send"),

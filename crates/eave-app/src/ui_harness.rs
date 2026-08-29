@@ -1081,6 +1081,71 @@ fn an_opened_edit_row_draws_its_diff_instead_of_the_whole_new_file(cx: &mut Test
     );
 }
 
+/// Slice AG1 #4, second half: a Claude `Edit` draws a diff on the surface,
+/// from an event stream carrying NO provider diff block.
+///
+/// The ACP half shipped first and Claude Code — the provider eave was built
+/// on — was the one left out, because it reports an edit through the tool's
+/// arguments rather than through a diff block in the result. This is the
+/// whole slice measured end to end: nothing but `old_string` / `new_string`
+/// on the start, and a diff pane on the screen.
+#[gpui::test]
+fn a_claude_edit_row_draws_a_diff_with_no_provider_diff_block(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let finished = eave_core::journal::Record {
+        seq: 2,
+        ts_ms: 20,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::ToolUseFinished {
+                id: "t1".into(),
+                // Claude's own reply to an Edit: prose about the change,
+                // not the file. There is no diff block anywhere here.
+                result: "The file src/a.rs has been updated.".into(),
+                is_error: false,
+                diff: None,
+            },
+        },
+    };
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started_typed(
+                1,
+                "t1",
+                "Edit",
+                r#"{"file_path":"src/a.rs","old_string":"one\ntwo\n","new_string":"one\nTWO\n"}"#,
+                Some(eave_core::tool::ToolCall::Edit {
+                    path: "src/a.rs".into(),
+                }),
+            ),
+            finished,
+        ],
+    });
+    vcx.run_until_parked();
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "tool-diff"),
+        "a Claude edit drew no diff, so #4 is still ACP-only"
+    );
+    // The existing rule holds for a derived diff too: a drawn diff
+    // replaces the result plate. For ACP that avoids repeating the whole
+    // new file; here it drops a one-line confirmation that the diff
+    // already states more precisely.
+    assert!(
+        vcx.debug_bounds("tool-part-t1-result").is_none(),
+        "a derived diff left the result plate beside it"
+    );
+}
+
 /// A FAILED edit keeps its error text and draws no diff — a picture of a
 /// change that never landed would be a lie about the worktree.
 #[gpui::test]
@@ -7192,6 +7257,279 @@ fn an_archived_row_leaves_the_rail_and_the_shelf_brings_it_back(cx: &mut TestApp
 /// the second — a collapsed group there silently swallows a waiting session
 /// — and eave's own `rail_shows` already refuses to let the archive filter
 /// do that.
+/// Slice AG2 #7 — ⌘⇧↓ and ⌘⇧↑ move the selection one row along the rail.
+///
+/// The rail is the screen an operator lives in and it had no keyboard
+/// selection at all: ⌘⇧A / ⌘⇧D could ACT on the oldest asking session, but
+/// nothing could choose a row without the pointer.
+#[gpui::test]
+fn the_rail_walk_moves_the_selection_one_row_each_way(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![
+            session("aaaa1111"),
+            session("bbbb2222"),
+            session("cccc3333"),
+        ],
+        "bbbb2222",
+    );
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "cccc3333"),
+        "⌘⇧↓ did not walk to the next row"
+    );
+
+    // The selection only actually moves when the engine confirms it, so
+    // the harness plays that part — the same thing a click relies on.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "cccc3333".into(),
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-up");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "⌘⇧↑ did not walk back"
+    );
+}
+
+/// **The walk goes where the eye goes.** A row folded away under a
+/// collapsed project is not somewhere the keyboard may land.
+///
+/// This is #3's bargain enforced on a second surface: a header speaks for
+/// the children it hides, and nothing reaches past it in silence. A walk
+/// that stepped into a collapsed group would move the transcript to a
+/// session with no row on screen to say so.
+#[gpui::test]
+fn the_walk_will_not_step_into_a_collapsed_project(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/w/eave".into());
+    let mut b = session("bbbb2222");
+    b.checkout_root = Some("/w/zed".into());
+    let mut c = session("cccc3333");
+    c.checkout_root = Some("/w/zed".into());
+    rail_with_selected(&h, vcx, vec![a, b, c], "aaaa1111");
+
+    // Precondition: without the collapse, ⌘⇧↓ lands on the zed group's
+    // first row. Establishing it here is what stops the assert below from
+    // passing for the wrong reason.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "the walk did not reach the second project at all, so this test \
+         cannot show that collapsing is what stops it"
+    );
+
+    click(vcx, "rail-group-/w/zed");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "rail-bbbb2222"), "the group would not collapse");
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "THE WALK STEPPED INTO A COLLAPSED PROJECT — it selected a session \
+         with no row on screen"
+    );
+}
+
+/// The same rule through the filter's door: a row the text filter dropped
+/// is not somewhere the walk may land either.
+#[gpui::test]
+fn the_walk_will_not_step_onto_a_row_the_filter_hid(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.title = Some("sweep the floor".into());
+    // Sits BETWEEN the two matches, so a walk that ignored the filter
+    // would land here and a walk that respects it must step over.
+    let mut b = session("bbbb2222");
+    b.title = Some("something else".into());
+    let mut c = session("cccc3333");
+    c.title = Some("sweep the stairs".into());
+    rail_with_selected(&h, vcx, vec![a, b, c], "aaaa1111");
+
+    click(vcx, "rail-filter");
+    vcx.run_until_parked();
+    vcx.simulate_input("sweep");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "rail-aaaa1111"), "the first match should show");
+    assert!(shown(vcx, "rail-cccc3333"), "the second match should show");
+    assert!(!shown(vcx, "rail-bbbb2222"), "the filter did not narrow");
+    let _ = h.drain();
+
+    // The chord is an ACTION, so it fires ahead of the filter field's own
+    // key handling — which is deliberate, and is the interaction this
+    // pins: narrow the list, then walk what is left without closing the
+    // field.
+    //
+    // A POSITIVE landing, not an absence. Asserting only "nothing was
+    // selected" would pass just as well if the chord were dead.
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "cccc3333"),
+        "the walk landed on the row the filter had hidden, or nowhere at all"
+    );
+}
+
+/// It clamps; it does not wrap.
+///
+/// The deliberate divergence from `strip::cycle`, which wraps and says
+/// why. ctrl-tab is a CYCLER; these chords are DIRECTIONAL, and a ↓ that
+/// jumped to the top would move the selection up the screen — in a rail
+/// that is now a map of several checkouts, into a different project than
+/// the one being read.
+#[gpui::test]
+fn the_walk_clamps_at_both_ends_rather_than_wrapping(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "bbbb2222",
+    );
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "⌘⇧↓ on the last row wrapped to the top"
+    );
+
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-up");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "⌘⇧↑ on the first row wrapped to the bottom"
+    );
+
+    // The control. Both asserts above are absences, and an absence is
+    // also what a dead chord produces — so prove the chord is live in
+    // THIS fixture by walking the direction that has somewhere to go.
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "the chord did nothing at all here, so the two clamps above prove \
+         nothing"
+    );
+}
+
+/// With nothing selected the walk ENTERS the list, from the end it is
+/// travelling from. Refusing would make the chord dead at the launcher,
+/// which is exactly where a keyboard-first operator starts.
+#[gpui::test]
+fn the_walk_enters_the_list_when_nothing_is_selected(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "aaaa1111"),
+        "⌘⇧↓ with no session open did not take the first row"
+    );
+
+    vcx.simulate_keystrokes("cmd-shift-up");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "⌘⇧↑ with no session open did not take the last row"
+    );
+}
+
+/// A rail showing its FILES face has no session rows on screen, so the
+/// chord does nothing.
+///
+/// The refusal is the same one the collapsed-project test states: a chord
+/// that moved the selection behind a list of files would be an invisible
+/// act. It is also the test that found the defect — the first cut skipped
+/// WRITING the walk order here rather than clearing it, which left the
+/// previous list standing and the chord walking rows that were no longer
+/// drawn.
+#[gpui::test]
+fn the_walk_is_inert_while_the_rail_shows_its_files_face(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    // The control, taken BEFORE the face swaps: the chord works here.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "the chord was already dead, so this test cannot show the face is \
+         what stops it"
+    );
+
+    open_files_face(vcx);
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-bbbb2222"),
+        "the files face did not replace the session rows"
+    );
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "the walk moved the selection behind a list of files"
+    );
+}
+
+/// The walk's order is the PAINTED order, which is why it is recorded by
+/// the paint rather than re-derived. `fold_rail` decides position once and
+/// grouping preserves it, so the walk must follow the rail's own order and
+/// not, say, the order the rows arrived in.
+#[gpui::test]
+fn the_walk_follows_the_rails_order_across_a_group_boundary(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    // A rootless session sorts to the top ungrouped, then the two
+    // checkouts in first-member order.
+    let loose = session("aaaa1111");
+    let mut e = session("bbbb2222");
+    e.checkout_root = Some("/w/eave".into());
+    let mut z = session("cccc3333");
+    z.checkout_root = Some("/w/zed".into());
+    rail_with_selected(&h, vcx, vec![loose, e, z], "bbbb2222");
+    let _ = h.drain();
+
+    // From the eave group's only row, ⌘⇧↓ crosses INTO the zed group —
+    // over its header, which is not a stop.
+    vcx.simulate_keystrokes("cmd-shift-down");
+    vcx.run_until_parked();
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "cccc3333"),
+        "the walk did not cross the group boundary"
+    );
+}
+
 #[gpui::test]
 fn a_collapsed_project_still_says_a_session_is_waiting_on_you(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
