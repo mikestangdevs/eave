@@ -2753,11 +2753,7 @@ fn attach_button() -> gpui::Stateful<gpui::Div> {
         ))
 }
 
-/// State pigment per the stance: color only when state deserves attention.
-/// `running` is live activity; quiet/unresponsive/failed are the
-/// engine-classified notices; every settled or not-yet-started state is
-/// neutral.
-/// Slice C5 — the pigment a tab group's colour name maps to.
+/// The pigment one of the operator's own colour names maps to (Slice C5).
 ///
 /// B1 kept `TabGroup::color` a bare `String` on purpose: *"a colour name
 /// chosen by the operator, stored verbatim and interpreted by whatever
@@ -2767,21 +2763,132 @@ fn attach_button() -> gpui::Stateful<gpui::Div> {
 /// where design decisions belong.
 ///
 /// The names are Chrome's group palette, which is what an operator who has
-/// grouped tabs before will reach for. A name eave has no pigment for falls
-/// back to the **accent**, not to nothing: an uncoloured swatch on a strip
-/// of coloured ones reads as a rendering failure rather than as a group
-/// someone named `chartreuse`.
-fn group_color(name: Option<&str>) -> Hsla {
-    match name.map(str::to_ascii_lowercase).as_deref() {
-        Some("grey") | Some("gray") => theme::text_tertiary(),
-        Some("blue") => theme::accent(),
-        Some("red") => theme::danger(),
-        Some("yellow") | Some("orange") => theme::warning(),
-        Some("green") => theme::live(),
-        _ => theme::accent(),
+/// grouped tabs before will reach for. **`None` for a name eave has no
+/// pigment for** — [`project_color`] decides what to do about it, and since
+/// Slice AG2 #8 what it does is give the project its derived ink rather
+/// than a flat accent: a group someone called `chartreuse` still gets a
+/// colour of its own, which is what the operator was asking for.
+fn named_color(name: &str) -> Option<Hsla> {
+    match name.to_ascii_lowercase().as_str() {
+        "grey" | "gray" => Some(theme::text_tertiary()),
+        "blue" => Some(theme::accent()),
+        "red" => Some(theme::danger()),
+        "yellow" | "orange" => Some(theme::warning()),
+        "green" => Some(theme::live()),
+        _ => None,
     }
 }
 
+/// The hues a project's derived ink is drawn from (Slice AG2 #8).
+///
+/// **The gap table proposed hashing the checkout path into the tab-group
+/// palette. That is the one thing this rail must not do.** That palette
+/// maps onto [`theme::danger`], [`theme::warning`] and [`theme::live`] —
+/// the rail's *attention* inks — so a project hashed onto it would wear
+/// alarm red on its header a few pixels from a state dot where the same
+/// red means a session failed. The distinction that resolves it is who is
+/// speaking: **a colour the operator chose is their word and is rendered
+/// verbatim, including red; a colour eave derives is eave's, and eave may
+/// not derive alarm.**
+///
+/// So the ring skips the two alarm hues categorically — `danger` sits at
+/// oklch hue 22.2 (dark) / 27.3 (light), `warning` at 84.4 / 49.0, and
+/// nothing here comes within 8° of the band they span. It also keeps a
+/// guard band around `live` (276.9, *running*) and `success` (163.2,
+/// *done*), which are states rather than alarms but are still read off a
+/// mark. **The accent is deliberately NOT dodged**: it is operator-
+/// configurable through Customize Theme, so an exclusion that named it
+/// could not be maintained past the first person who set their accent to
+/// green — and it is a focus ink, not a state one, so a project sharing
+/// its hue states nothing false.
+///
+/// Eight, at ≥22° spacing, which is what a 6 px dot can still be told
+/// apart at. Beyond eight projects two share a hue; that is a collision,
+/// not a lie, and the header's title is the fact — the swatch is the
+/// glance.
+const PROJECT_HUES: [f32; 8] = [108.0, 134.0, 186.0, 212.0, 240.0, 308.0, 330.0, 352.0];
+
+/// FNV-1a, 64-bit, written out rather than reached for.
+///
+/// `DefaultHasher` would have done the arithmetic, and its documentation
+/// says in terms that the algorithm may change between releases — which
+/// for a colour means every project silently changes identity on a
+/// toolchain bump. A hash whose output is drawn on screen is part of the
+/// product, so it is pinned here and pinned by a test.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Which of [`PROJECT_HUES`] a checkout root lands on.
+fn project_hue_ix(workspace: &str) -> usize {
+    (fnv1a(workspace.as_bytes()) % PROJECT_HUES.len() as u64) as usize
+}
+
+/// The derived ink's oklch lightness and chroma, per appearance.
+///
+/// Named rather than inline because the chroma is the honesty claim and a
+/// test pins it: **below every pigment [`state_color`] can return** — the
+/// loudest are `live` at 0.182 (dark) and `danger` at 0.245 (light) — so a
+/// project mark can never out-shout a state mark sharing its header. The
+/// lightness follows the state inks' own register at each appearance.
+const PROJECT_INK_DARK: (f32, f32) = (0.72, 0.14);
+const PROJECT_INK_LIGHT: (f32, f32) = (0.58, 0.17);
+
+/// The ink eave gives a project nobody has coloured (Slice AG2 #8).
+///
+/// Quieter than a state mark on purpose — lower chroma than every pigment
+/// in [`state_color`] — because identity and attention share a header and
+/// only one of them is asking for anything. Lightness follows the
+/// appearance the same way the state inks do.
+fn derived_project_ink(workspace: &str) -> Hsla {
+    let (l, c) = if theme::is_light() {
+        PROJECT_INK_LIGHT
+    } else {
+        PROJECT_INK_DARK
+    };
+    theme::field_sample(l, c, PROJECT_HUES[project_hue_ix(workspace)])
+}
+
+/// The colour a project wears — **on the strip and in the rail, from this
+/// one function** (Slice AG2 #8).
+///
+/// Before this slice `TabGroup::color` had a pigment map, a wire field and
+/// a swatch on the strip, and **nothing in the app ever set it**: the only
+/// writer is a test fixture, so every project on the strip drew the same
+/// accent violet and the colour vocabulary distinguished nothing. Deriving
+/// from the checkout root is what makes the swatch mean something without
+/// asking the operator for anything.
+///
+/// **Derived, not stored, and that is the load-bearing choice.** A stored
+/// colour is written by one surface and read by another, which is how the
+/// two-favicon-cache defect happened; a colour that is a pure function of
+/// the checkout root cannot drift between the strip and the rail, because
+/// they are not exchanging it — they are each computing it from the key
+/// they already agree on (`TabGroup::workspace` *is*
+/// `SessionInfo::checkout_root`).
+///
+/// The operator's own word still wins, verbatim. A group bound to no
+/// workspace at all keeps the accent: there is no project for it to be the
+/// colour of, and inventing one would be a claim.
+fn project_color(workspace: Option<&str>, chosen: Option<&str>) -> Hsla {
+    if let Some(picked) = chosen.and_then(named_color) {
+        return picked;
+    }
+    match workspace.filter(|w| !w.is_empty()) {
+        Some(root) => derived_project_ink(root),
+        None => theme::accent(),
+    }
+}
+
+/// State pigment per the stance: color only when state deserves attention.
+/// `running` is live activity; quiet/unresponsive/failed are the
+/// engine-classified notices; every settled or not-yet-started state is
+/// neutral.
 fn state_color(state: &str) -> Hsla {
     match state {
         "running" => theme::live(),
@@ -13275,6 +13382,7 @@ impl Shell {
                     id,
                     title,
                     color,
+                    workspace,
                     collapsed,
                     count,
                     holds_active,
@@ -13286,6 +13394,7 @@ impl Shell {
                         id,
                         title,
                         color,
+                        workspace,
                         *collapsed,
                         *count,
                         *holds_active,
@@ -14177,7 +14286,13 @@ impl Shell {
     /// in the same segment, and `debug_bounds` resolves a selector to the
     /// last-painted element — so title-keyed selectors would hand the
     /// harness one project's header while it believed it had the other's.
-    fn rail_group_header(&self, g: RailGroup, collapsed: bool, cx: &Context<Self>) -> AnyElement {
+    fn rail_group_header(
+        &self,
+        g: RailGroup,
+        ink: Hsla,
+        collapsed: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let sel = format!("rail-group-{}", g.root);
         let sel_id = SharedString::from(sel.clone());
         let root = g.root.clone();
@@ -14187,6 +14302,7 @@ impl Shell {
         let sel_count = sel.clone();
         let sel_badge = sel.clone();
         let sel_chev = sel.clone();
+        let sel_swatch = sel.clone();
         rail_inset()
             .child(
                 div()
@@ -14212,6 +14328,26 @@ impl Shell {
                         theme::text_tertiary(),
                         format!("{sel_chev}-chevron"),
                     ))
+                    // Slice AG2 #8 — the project's identity, in the same
+                    // slot and the same 6 px dot the strip's project row
+                    // has drawn since C5, from the same function.
+                    //
+                    // **Identity left, attention right**, and the header
+                    // already split that way before this landed: chevron,
+                    // title and count on one side, the state dot and its
+                    // word on the other. That is what lets a coloured mark
+                    // sit on a row whose whole other colour vocabulary is
+                    // attention — the two never share a side, a size or a
+                    // shape, and the derived ink carries less chroma than
+                    // any pigment `state_color` can return.
+                    .child(
+                        div()
+                            .debug_selector(move || format!("{sel_swatch}-swatch"))
+                            .size(px(theme::GROUP_DOT))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(ink),
+                    )
                     .child(
                         div()
                             .debug_selector(move || format!("{sel_label}-label"))
@@ -15658,6 +15794,7 @@ impl Shell {
         id: &str,
         title: &Option<String>,
         color: &Option<String>,
+        workspace: &Option<String>,
         collapsed: bool,
         count: usize,
         holds_active: bool,
@@ -15720,13 +15857,19 @@ impl Shell {
                             .size(px(theme::GROUP_DOT))
                             .flex_none()
                             .rounded_full()
-                            // The palette is the OPERATOR's word, stored verbatim
-                            // (B1 kept `color` a `String` so this crate is not
-                            // where a palette gets frozen into a file format). A
-                            // name eave has no pigment for falls back to the
-                            // accent rather than to nothing: an uncoloured swatch
-                            // on a coloured strip reads as a rendering failure.
-                            .bg(group_color(color.as_deref())),
+                            // Slice AG2 #8 — the project's colour, and the SAME
+                            // one the rail's project header wears, because both
+                            // ask `project_color` about the same checkout root
+                            // rather than passing a colour between them.
+                            //
+                            // The operator's word still wins verbatim (B1 kept
+                            // `color` a `String` so this crate is not where a
+                            // palette gets frozen into a file format). What
+                            // changed is the other branch: nothing in the app has
+                            // ever SET that field, so every project on this strip
+                            // drew the same accent violet and the colour
+                            // vocabulary distinguished nothing at all.
+                            .bg(project_color(workspace.as_deref(), color.as_deref())),
                     )
                     .children(title.as_ref().map(|t| {
                         div()
@@ -17092,6 +17235,21 @@ impl Shell {
         // refuses to let the ARCHIVE filter do that; a collapse that did it
         // would be the same regression through a different door.
         let shut_groups = self.rail_groups_collapsed.borrow().clone();
+        // Slice AG2 #8 — the colours the operator has chosen, by checkout
+        // root. Read from the FULL snapshot rather than `strip_snapshot`:
+        // a project's identity is a fact about the project, and a session
+        // in this rail can belong to a checkout whose tabs are open in
+        // another window. Narrowing it here would give one project two
+        // colours across two windows, which is the exact failure deriving
+        // the ink exists to make impossible.
+        let chosen_colors: HashMap<String, String> = self
+            .web_tabs
+            .read(cx)
+            .snapshot
+            .groups
+            .iter()
+            .filter_map(|g| Some((g.workspace.clone()?, g.color.clone()?)))
+            .collect();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut group_shut = false;
         // The header a row sits under, for #9's subline. `None` until the
@@ -17109,8 +17267,12 @@ impl Shell {
             match entry {
                 RailEntry::Header(g) => {
                     group_shut = shut_groups.contains(&g.root);
+                    let ink = project_color(
+                        Some(&g.root),
+                        chosen_colors.get(&g.root).map(String::as_str),
+                    );
                     group_root = Some(g.root.clone());
-                    rows.push(self.rail_group_header(g, group_shut, cx));
+                    rows.push(self.rail_group_header(g, ink, group_shut, cx));
                 }
                 RailEntry::Row(info) => {
                     if !group_shut {
@@ -27575,6 +27737,150 @@ mod tests {
             row_repo_line(&s, None, Some("/w/eave")).as_deref(),
             Some("eave/eave/abcd1234")
         );
+    }
+
+    // ── Slice AG2 #8 — a project's colour ─────────────────────────────
+
+    /// **The hash is part of the product, so it is pinned.**
+    ///
+    /// A project's colour is a fact an operator learns by eye and then
+    /// relies on; a hash that quietly changed would re-colour every
+    /// project on a toolchain bump and look like a rendering bug. FNV-1a
+    /// is written out in this file for that reason and these are its
+    /// answers.
+    #[test]
+    fn a_projects_ink_is_pinned_to_its_path_and_nothing_else() {
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325, "the FNV-1a offset basis");
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c, "FNV-1a of \"a\"");
+        assert_eq!(project_hue_ix("/w/eave"), project_hue_ix("/w/eave"));
+        assert_ne!(
+            project_hue_ix("/w/eave"),
+            project_hue_ix("/w/eave/"),
+            "a trailing slash is a different string and the caller must \
+             normalise before it gets here — `checkout_root` already does"
+        );
+    }
+
+    /// The case the colour exists for: two checkouts of the same project,
+    /// whose titles differ by one character and whose rows are otherwise
+    /// identical. This is the workspace this app is built in.
+    #[test]
+    fn four_sibling_checkouts_wear_four_different_inks() {
+        let roots = [
+            "/Users/michaelstang/Desktop/eave/wt-c5",
+            "/Users/michaelstang/Desktop/eave/wt-c3",
+            "/Users/michaelstang/Desktop/eave/wt-main",
+            "/Users/michaelstang/Desktop/eave/eave-p1",
+        ];
+        let mut seen: Vec<usize> = roots.iter().map(|r| project_hue_ix(r)).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            roots.len(),
+            "two sibling checkouts share a hue: {:?}",
+            roots.map(project_hue_ix)
+        );
+    }
+
+    /// **eave may not derive alarm.**
+    ///
+    /// `danger` sits at oklch hue 22.216 (dark) / 27.325 (light) and
+    /// `warning` at 84.429 / 48.998, so the band an operator reads as
+    /// "act on this" spans 22.2..84.5. Nothing in the ring may enter it,
+    /// with room on both sides — a colour the operator CHOSE is their
+    /// word and is rendered verbatim, but a colour eave picked is eave's
+    /// and may not say a healthy project is on fire.
+    #[test]
+    fn the_derived_ring_never_lands_on_an_alarm_hue() {
+        const ALARM: std::ops::RangeInclusive<f32> = 7.0..=100.0;
+        for hue in PROJECT_HUES {
+            assert!(
+                !ALARM.contains(&hue),
+                "hue {hue} is inside the danger/warning band"
+            );
+            assert!(
+                (0.0..360.0).contains(&hue),
+                "hue {hue} is not on the circle"
+            );
+        }
+        // And far enough apart to be told apart at 6 px.
+        let mut sorted = PROJECT_HUES;
+        sorted.sort_by(f32::total_cmp);
+        for pair in sorted.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= 22.0,
+                "{:?} and {:?} are too close to distinguish",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// A mark that never out-shouts the mark beside it. See
+    /// [`PROJECT_INK_DARK`].
+    #[test]
+    fn a_derived_ink_is_quieter_than_every_state_pigment() {
+        assert!(
+            PROJECT_INK_DARK.1 < 0.182,
+            "dark identity chroma is not below live()'s"
+        );
+        assert!(
+            PROJECT_INK_LIGHT.1 < 0.245,
+            "light identity chroma is not below danger()'s"
+        );
+    }
+
+    /// The ring is used, not clumped into two corners of itself.
+    #[test]
+    fn eave_uses_every_hue_it_has() {
+        let mut hit = [0usize; PROJECT_HUES.len()];
+        for i in 0..200 {
+            hit[project_hue_ix(&format!("/w/proj-{i}"))] += 1;
+        }
+        assert!(
+            hit.iter().all(|n| *n > 0),
+            "a hue nothing can ever land on is a hue that is not in the \
+             palette: {hit:?}"
+        );
+    }
+
+    /// The operator's own word wins, verbatim — **including red**, which
+    /// the derived ring refuses. Who is speaking is the whole distinction.
+    #[test]
+    fn the_operators_own_word_wins_over_the_derived_ink() {
+        assert_eq!(project_color(Some("/w/eave"), Some("red")), theme::danger());
+        assert_eq!(project_color(Some("/w/eave"), Some("GREEN")), theme::live());
+        assert_ne!(
+            project_color(Some("/w/eave"), Some("red")),
+            project_color(Some("/w/eave"), None),
+            "the chosen colour was ignored"
+        );
+    }
+
+    /// A name eave has no pigment for used to fall back to a flat accent.
+    /// With a derived ink available that is strictly worse than giving the
+    /// project its own colour: the operator asked for A colour, and the
+    /// accent is the one thing on the strip that means something else.
+    #[test]
+    fn an_unrecognised_colour_name_falls_back_to_the_project_not_the_accent() {
+        assert_eq!(
+            project_color(Some("/w/eave"), Some("chartreuse")),
+            project_color(Some("/w/eave"), None),
+        );
+        assert_ne!(
+            project_color(Some("/w/eave"), Some("chartreuse")),
+            theme::accent(),
+        );
+    }
+
+    /// A group bound to no checkout has no project to be the colour of,
+    /// and inventing one from its id would be a claim about a binding that
+    /// does not exist. It keeps the accent, which is what it wore before.
+    #[test]
+    fn a_group_bound_to_no_checkout_keeps_the_accent() {
+        assert_eq!(project_color(None, None), theme::accent());
+        assert_eq!(project_color(Some(""), None), theme::accent());
     }
 
     /// Slice AG2 #2/#3. A session in a named checkout, in a stated state.

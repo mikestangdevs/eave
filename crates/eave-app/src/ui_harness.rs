@@ -7715,6 +7715,124 @@ fn a_collapsed_project_still_says_a_session_is_waiting_on_you(cx: &mut TestAppCo
     assert!(shown(vcx, "rail-aaaa1111"), "the group would not reopen");
 }
 
+/// **Slice AG2 #8 — a project's colour, in the slot the strip already
+/// keeps for it.**
+///
+/// The rail's project header and the tab strip's project row are two
+/// drawings of one thing, so the header takes the strip's own order —
+/// chevron, swatch, title — rather than inventing a place for the mark.
+/// The state dot stays on the far side of the header: identity left,
+/// attention right, which is how the header was already split.
+#[gpui::test]
+fn a_project_header_wears_its_colour_in_the_strips_own_slot(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/w/eave".into());
+    let mut z = session("bbbb2222");
+    z.checkout_root = Some("/w/zed".into());
+    h.plumbing.push_rail(vec![a, z]);
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "rail-group-/w/eave-swatch"),
+        "the project header drew no colour at all"
+    );
+    assert!(shown(vcx, "rail-group-/w/zed-swatch"));
+
+    let chevron = vcx.debug_bounds("rail-group-/w/eave-chevron").unwrap();
+    let swatch = vcx.debug_bounds("rail-group-/w/eave-swatch").unwrap();
+    let label = vcx.debug_bounds("rail-group-/w/eave-label").unwrap();
+    assert!(
+        chevron.origin.x < swatch.origin.x && swatch.origin.x < label.origin.x,
+        "the swatch is not between the disclosure and the title: \
+         chevron {:?} swatch {:?} label {:?}",
+        chevron.origin.x,
+        swatch.origin.x,
+        label.origin.x
+    );
+    // The mark is the strip's 6 px dot, not a bar or a rule — a shape the
+    // rail already uses for exactly one other thing, on the other side of
+    // this same row.
+    assert_eq!(swatch.size.width, px(theme::GROUP_DOT));
+    assert_eq!(swatch.size.height, px(theme::GROUP_DOT));
+}
+
+/// A mark that distinguishes nothing is noise, and the rail already says
+/// so about the header itself: `group_rail` emits no header unless the
+/// sessions genuinely fall into more than one part. The swatch inherits
+/// that rule by living on the header rather than on the row.
+#[gpui::test]
+fn one_project_gets_no_swatch_because_it_gets_no_header(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/w/eave".into());
+    let mut b = session("bbbb2222");
+    b.checkout_root = Some("/w/eave".into());
+    h.plumbing.push_rail(vec![a, b]);
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "rail-aaaa1111"), "the rows are there");
+    assert!(
+        !shown(vcx, "rail-group-/w/eave-swatch"),
+        "one project wore a colour telling it apart from nothing"
+    );
+}
+
+/// **One function decides a project's colour, and both surfaces ask it.**
+///
+/// This is the structural half of the claim the doc comment on
+/// `project_color` makes: the strip and the rail agree about a project
+/// because they each COMPUTE the colour from the checkout root, not
+/// because one of them stores it and the other reads it. A second
+/// producer would be the two-favicon-cache defect again — two caches, one
+/// fact, and a tab drawing a globe.
+///
+/// `group_color` is gone rather than left standing: the last slice deleted
+/// two callerless twins in `composer.rs` that were still carrying the live
+/// controls' selectors, and a pigment function nothing calls is the same
+/// shape of trap.
+#[gpui::test]
+fn a_project_has_one_colour_and_one_place_that_decides_it(_cx: &mut TestAppContext) {
+    let src = include_str!("ui.rs");
+    let prod = &src[..src.rfind("#[cfg(test)]").expect("the tests module")];
+    assert!(
+        !prod.contains("group_color"),
+        "the old pigment function is still here — with `project_color` \
+         beside it that is a second answer to one question"
+    );
+    assert_eq!(
+        prod.matches("fn project_color(").count(),
+        1,
+        "more than one decider"
+    );
+    assert_eq!(
+        prod.matches("project_color(").count(),
+        3,
+        "the definition and exactly two call sites — the strip's project \
+         row and the rail's project header. A third surface painting a \
+         project mark must come through here too."
+    );
+    // The strip's call site passes the group's OWN checkout root. Passing
+    // `None` there would compile, draw an accent dot, and give one project
+    // two identities across two surfaces — the failure this whole
+    // arrangement exists to make impossible, and the only one of these that
+    // is invisible on screen until you have both surfaces open at once.
+    assert_eq!(
+        prod.matches("workspace.as_deref()").count(),
+        1,
+        "the strip's project swatch stopped asking about its own checkout"
+    );
+    // `named_color` without its parenthesis: `project_color` reaches it as
+    // a function value (`chosen.and_then(named_color)`), not as a call.
+    for (helper, uses) in [("named_color", 2), ("derived_project_ink(", 2)] {
+        assert_eq!(
+            prod.matches(helper).count(),
+            uses,
+            "{helper} is reached from somewhere other than project_color"
+        );
+    }
+}
+
 /// **Slice AG2 #5, and the clause that keeps it honest.**
 ///
 /// A text filter is allowed to hide a session parked on a permission

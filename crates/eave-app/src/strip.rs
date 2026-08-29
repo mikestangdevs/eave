@@ -201,6 +201,12 @@ pub enum StripItem {
         id: String,
         title: Option<String>,
         color: Option<String>,
+        /// The checkout root this project is bound to, when it is bound to
+        /// one. Carried for Slice AG2 #8: it is the key the project's
+        /// derived colour comes from, and it is the SAME key the rail
+        /// groups its sessions on — so the two surfaces agree about a
+        /// project's identity by computing it, not by exchanging it.
+        workspace: Option<String>,
         collapsed: bool,
         /// How many tabs it holds — the number a collapsed group shows,
         /// and the reason a collapsed group is not simply absent.
@@ -362,6 +368,7 @@ pub fn items(
                     id: id.clone(),
                     title: group.and_then(|g| g.title.clone()),
                     color: group.and_then(|g| g.color.clone()),
+                    workspace: group.and_then(|g| g.workspace.clone()),
                     collapsed: group.is_some_and(|g| g.collapsed),
                     count: ids.len(),
                     holds_active,
@@ -1031,6 +1038,26 @@ mod tests {
             Some("grp")
         );
         assert_eq!(group_for_workspace(&s, "/Users/x/other"), None);
+    }
+
+    /// Slice AG2 #8 — the project row carries the checkout it is bound to,
+    /// because that is the key its colour comes from and the same key the
+    /// rail groups sessions on. Dropping it here would not break a layout;
+    /// it would quietly give the project one colour on the strip and a
+    /// different one in the rail.
+    #[test]
+    fn a_project_row_carries_the_checkout_it_is_bound_to() {
+        let mut s = grouped();
+        s.groups[0].workspace = Some("/w/eave".into());
+        let items = items(&s, &HashMap::new(), &|_| true);
+        match &items[0] {
+            StripItem::Group { workspace, .. } => assert_eq!(
+                workspace.as_deref(),
+                Some("/w/eave"),
+                "the strip forgot which checkout the project is about"
+            ),
+            other => panic!("expected a project row: {other:?}"),
+        }
     }
 
     /// A collapsed group hides its tabs from the strip but not from the
