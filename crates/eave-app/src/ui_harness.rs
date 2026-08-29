@@ -18969,3 +18969,238 @@ fn a_queue_held_by_the_rail_alone_drains_when_the_rail_says_so(cx: &mut TestAppC
         "the rail said the session had settled and the queue did not notice"
     );
 }
+
+// ── Slice AG2 #10 — scale windowing ───────────────────────────────────────
+//
+// The rail drew every session it had, forever. Fifteen is a column; sixty
+// is a scrollbar with a list behind it, and the rows an operator actually
+// works in are at the top of it.
+//
+// The probe for "which rows did the rail draw" is `Shell::rail_walk`, and
+// deliberately so: it is written BY THE PAINT (AG2 #7) from exactly the
+// rows that were rendered, so a test reading it cannot be told a different
+// story than the keyboard is.
+
+fn many_sessions(n: usize) -> Vec<SessionInfo> {
+    (0..n)
+        .map(|i| {
+            let mut s = session(&format!("s{i:04}"));
+            // Distinct roots, or `group_rail` folds them under one header
+            // and the collapse logic starts deciding what the window is
+            // being asked to decide.
+            s.cwd = format!("/tmp/eave-harness/p{i:04}");
+            s
+        })
+        .collect()
+}
+
+fn walk_now(h: &Harness, vcx: &mut VisualTestContext) -> Vec<String> {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell.read(cx).rail_walk.borrow().clone()
+    })
+    .unwrap()
+}
+
+/// Press the rail's reveal control.
+///
+/// **Not `click`, and the reason is a harness limit rather than a
+/// shortcut.** The control sits below thirty rows inside `rail_scroll`;
+/// `debug_bounds` reports a position inside the scroll CONTENT and cannot
+/// see clipping, so it answers `y = 2777` in a 760 px window (measured),
+/// `click` takes that at face value and lands outside the window, and the
+/// test goes green having exercised no handler. Scrolling first does not
+/// help, because the coordinate `debug_bounds` returns does not move.
+///
+/// So the button's BEHAVIOUR is driven here by name and its WIRING is
+/// pinned separately by
+/// `the_reveal_control_is_wired_to_the_method_that_grows_the_window`.
+/// Between them the two cover what one unreachable click would have.
+fn press_reveal(h: &Harness, vcx: &mut VisualTestContext) {
+    assert!(
+        shown(vcx, "rail-reveal"),
+        "nothing offered to reveal more sessions"
+    );
+    h.window
+        .update(vcx, |shell, _, cx| shell.reveal_more_sessions(cx))
+        .unwrap();
+    vcx.run_until_parked();
+}
+
+/// The rail stops, and says so. A list that simply ended at thirty with no
+/// account of the rest would read as a rail that had lost sessions — the
+/// failure `archived_line` and the filter note both exist to prevent.
+#[gpui::test]
+fn a_long_rail_draws_a_window_and_accounts_for_the_rest(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(many_sessions(42));
+    vcx.run_until_parked();
+
+    let walk = walk_now(&h, vcx);
+    assert_eq!(
+        walk.len(),
+        30,
+        "the rail drew {} rows, not a window",
+        walk.len()
+    );
+    assert_eq!(
+        walk[0], "s0000",
+        "the window took the wrong end of the list"
+    );
+    assert!(
+        shown(vcx, "rail-reveal"),
+        "twelve sessions vanished with nothing on screen to account for them"
+    );
+}
+
+/// One reveal is a step, not a floodgate — and the count on it is the
+/// number that is true.
+#[gpui::test]
+fn revealing_grows_the_window_by_one_step(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(many_sessions(80));
+    vcx.run_until_parked();
+    assert_eq!(walk_now(&h, vcx).len(), 30);
+
+    press_reveal(&h, vcx);
+    assert_eq!(
+        walk_now(&h, vcx).len(),
+        55,
+        "a reveal did not add exactly one step"
+    );
+    assert!(
+        shown(vcx, "rail-reveal"),
+        "twenty-five are still held back and the control left"
+    );
+
+    press_reveal(&h, vcx);
+    assert_eq!(
+        walk_now(&h, vcx).len(),
+        80,
+        "the last step did not finish the list"
+    );
+    assert!(
+        !shown(vcx, "rail-reveal"),
+        "nothing is held back and the rail still offers to show more"
+    );
+}
+
+/// **The binding rule.** A session parked on a permission question may not
+/// be hidden by anything — that is `rail_shows`'s contract for the archive
+/// filter, and the window is held to the same one because the harm is the
+/// same.
+#[gpui::test]
+fn a_session_waiting_on_you_is_never_windowed_away(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut infos = many_sessions(42);
+    infos[38].pending_approvals = 2;
+    infos[38].state = "awaiting_approval".into();
+    h.plumbing.push_rail(infos);
+    vcx.run_until_parked();
+
+    let walk = walk_now(&h, vcx);
+    assert!(
+        walk.contains(&"s0038".to_string()),
+        "an agent stranded on a question was cut off by the window: {walk:?}"
+    );
+    // ...and it kept its place rather than being lifted to the top. The
+    // rail's order is never re-decided — comet shipped attention bucketing
+    // and reverted it with a user report attached.
+    assert_eq!(walk[0], "s0000", "the window reordered the list");
+    assert_eq!(
+        walk.iter().position(|s| s == "s0038"),
+        Some(walk.len() - 1),
+        "the exempt row did not stay in recency order"
+    );
+}
+
+/// The selected session is on screen whatever else is true — every other
+/// filter in this rail already says so.
+#[gpui::test]
+fn the_selected_session_is_never_windowed_away(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, many_sessions(42), "s0040");
+    let walk = walk_now(&h, vcx);
+    assert!(
+        walk.contains(&"s0040".to_string()),
+        "the rail windowed away the session it is showing: {walk:?}"
+    );
+}
+
+/// A short list is not a windowed list, and must not grow a control that
+/// says otherwise. The composer's `+0 −0` rule: no affordance for an
+/// occasion that does not exist.
+#[gpui::test]
+fn a_rail_that_fits_offers_nothing_to_reveal(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(many_sessions(30));
+    vcx.run_until_parked();
+    assert_eq!(walk_now(&h, vcx).len(), 30);
+    assert!(
+        !shown(vcx, "rail-reveal"),
+        "a rail showing everything offered to show more"
+    );
+}
+
+/// The window composes with the keyboard walk for free, and this pins that
+/// it is free rather than accidental: `rail_walk` is written by the paint,
+/// so a row the window held back is not somewhere the chord can go.
+#[gpui::test]
+fn the_walk_cannot_reach_a_row_the_window_held_back(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(many_sessions(42));
+    vcx.run_until_parked();
+    let walk = walk_now(&h, vcx);
+    for held in ["s0030", "s0035", "s0041"] {
+        assert!(
+            !walk.contains(&held.to_string()),
+            "{held} is off screen and the chord would still walk onto it"
+        );
+    }
+}
+
+/// A search still reaches every session the operator has: the window runs
+/// AFTER the filter, so narrowing to an old row finds it.
+#[gpui::test]
+fn the_filter_still_reaches_past_the_window(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_rail(many_sessions(42));
+    vcx.run_until_parked();
+    assert!(!walk_now(&h, vcx).contains(&"s0038".to_string()));
+
+    click(vcx, "rail-filter");
+    vcx.run_until_parked();
+    vcx.simulate_input("p0038");
+    vcx.run_until_parked();
+    assert_eq!(
+        walk_now(&h, vcx),
+        vec!["s0038".to_string()],
+        "the filter could not see past the window"
+    );
+}
+
+/// The reveal control is connected to the thing the tests above drive.
+///
+/// A structural check, and the pair to `press_reveal`'s doc: that helper
+/// exercises the behaviour by name because the button cannot be clicked
+/// from this harness, which leaves exactly one gap — a control that draws,
+/// says the right number, and does nothing. This closes it.
+#[gpui::test]
+fn the_reveal_control_is_wired_to_the_method_that_grows_the_window(_cx: &mut TestAppContext) {
+    let src = include_str!("ui.rs");
+    let at = src
+        .find(r#".debug_selector(|| "rail-reveal".into())"#)
+        .expect("the rail's reveal control is gone");
+    let element = &src[at..];
+    let element = &element[..element
+        .find(".into_any_element()")
+        .expect("the reveal control has no end")];
+    assert!(
+        element.contains(".on_click("),
+        "the reveal control draws and takes no click"
+    );
+    assert!(
+        element.contains("reveal_more_sessions(cx)"),
+        "the reveal control is wired to something other than the method the \
+         tests drive, so both could be right and the button still dead"
+    );
+}

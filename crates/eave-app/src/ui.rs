@@ -3785,6 +3785,77 @@ fn row_action(key: String, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
         ))
 }
 
+/// How many session rows the rail draws before it stops (Slice AG2 #10).
+///
+/// waku shows three days plus thirty; comet shows ten then reveals
+/// twenty-five at a time. Thirty is waku's number because eave's rows are
+/// taller than comet's — three lines and a marks group — so ten would cut
+/// a working operator's list in half on any screen.
+///
+/// **Not a performance limit.** The rail is not virtualized and does not
+/// need to be at these counts; this is about a column a person can read.
+const RAIL_WINDOW_FIRST: usize = 30;
+
+/// What one reveal adds to the window. comet's twenty-five.
+const RAIL_WINDOW_STEP: usize = 25;
+
+/// May this row be held back by the window?
+///
+/// **Deliberately the same exceptions `rail_shows` names for the archive
+/// filter, and no others.** The two hide rows for unrelated reasons — one
+/// because the operator filed a session away, one because there are too
+/// many to read — but the HARM of hiding a given row is identical in both,
+/// so there is one rule for what may never be hidden and it is used twice.
+///
+/// That means `running`, `quiet`, `failed` and `unresponsive` are windowed
+/// like anything else. None of them is blocked on the operator, and
+/// exempting a live session would quietly reintroduce the attention
+/// ordering all four reference apps refuse — comet shipped it and reverted
+/// it with a user report attached.
+fn window_exempt(info: &SessionInfo, selected: Option<&str>) -> bool {
+    selected == Some(info.session_id.as_str())
+        || info.pending_approvals > 0
+        || info.state == "awaiting_approval"
+}
+
+/// Keep the first `limit` rows, plus anything beyond them that may not be
+/// hidden. Returns the list and how many rows were held back.
+///
+/// **A filter, never a sort.** The list arrives in `activity_key` order
+/// decided by `fold_rail`, and an exempt row past the cut keeps its own
+/// place rather than being lifted to the top — so the drawn count can
+/// exceed `limit`, and the rail's "order is never re-decided" rule holds.
+fn window_rail(
+    sessions: Vec<SessionInfo>,
+    limit: usize,
+    selected: Option<&str>,
+) -> (Vec<SessionInfo>, usize) {
+    let mut out = Vec::with_capacity(sessions.len().min(limit));
+    let mut held = 0usize;
+    for (ix, info) in sessions.into_iter().enumerate() {
+        if ix < limit || window_exempt(&info, selected) {
+            out.push(info);
+        } else {
+            held += 1;
+        }
+    }
+    (out, held)
+}
+
+/// What the rail says about the rows the window is holding back.
+///
+/// **`archived_toggle_label`'s trap, avoided the same way.** That doc
+/// records why it reads "3 archived · show" and not "show 3 archived": the
+/// second promises to reveal three rows and reveals two, because an
+/// exempt row is already on screen. The same is true here in the other
+/// direction — one reveal grows the WINDOW by `RAIL_WINDOW_STEP`, and how
+/// many rows that actually adds depends on how many past the cut were
+/// exempt. So this states the count that is true (`held`) and leaves the
+/// action unquantified.
+fn rail_reveal_label(held: usize) -> String {
+    format!("{held} older · show more")
+}
+
 /// The rail's archived toggle, stated as a fact plus the action (Stage AC).
 ///
 /// The count is of archived sessions, not of hidden rows, and the wording
@@ -6438,6 +6509,17 @@ struct Shell {
     /// the render pass, where an entity write would notify and a notify
     /// per frame is what N4's idle floor forbids.
     rail_walk: RefCell<Vec<String>>,
+    /// How many session rows the rail is currently willing to draw
+    /// (Slice AG2 #10).
+    ///
+    /// **In memory, and it only ever grows.** A restart returns to
+    /// `RAIL_WINDOW_FIRST`, which is the same bargain `rail_seen` makes and
+    /// for the same reason: persisting it means a write from the render
+    /// path. It is deliberately NOT reset when the filter changes —
+    /// revealing older rows is a thing the operator asked for, and taking
+    /// it back because they typed in a box would be the rail deciding it
+    /// knew better.
+    rail_window: Cell<usize>,
     /// Which session the rail has already scrolled into view — the same
     /// EDGE [`Shell::tab_scrolled_to`] keeps, for the same reason, and
     /// the rail needed one the moment the selection could move without a
@@ -7624,6 +7706,21 @@ impl Shell {
         });
         self.sync_slash_palette(cx);
         self.sync_mention_palette(cx);
+    }
+
+    /// Show one more page of older sessions (Slice AG2 #10).
+    ///
+    /// A named method rather than the click closure's body, because the
+    /// closure's body is not reachable from a test: the control sits below
+    /// thirty rows inside `rail_scroll`, `debug_bounds` reports a position
+    /// inside the scroll CONTENT and cannot see clipping, and a click at
+    /// that point lands outside the window and asserts nothing. So the
+    /// behaviour is exercised here and the wiring is pinned by name
+    /// (`the_reveal_control_is_wired_to_the_method_that_grows_the_window`).
+    fn reveal_more_sessions(&mut self, cx: &mut Context<Self>) {
+        self.rail_window
+            .set(self.rail_window.get() + RAIL_WINDOW_STEP);
+        cx.notify();
     }
 
     /// Drop a queued follow-up. The words are gone — this is the take-back
@@ -16144,6 +16241,15 @@ impl Shell {
             .filter(|s| session_matches(s, &needle, home.as_deref()))
             .collect();
         let filtered_out = before_filter - sessions.len();
+        // Slice AG2 #10 — the window, and WHERE it runs is the design
+        // again. After both filters, so a search still reaches every
+        // session the operator has; and BEFORE `group_rail`, for the
+        // reason the text filter gives four lines up — a project header
+        // must count and speak for what is actually under it, and a header
+        // reading `wt-c5 3` over one visible row is the collapse problem
+        // wearing a different hat.
+        let (sessions, windowed_out) =
+            window_rail(sessions, self.rail_window.get(), selected.as_deref());
         // The second line aligns under the session name: dot + gap +
         // chip + gap.
         // **Slice D3: the row's lower lines indent past the STATE DOT, not
@@ -16171,6 +16277,12 @@ impl Shell {
         // It buys 26 px, which is what makes a 220 px rail state its facts
         // whole instead of at 237.
         let meta_indent = theme::RAIL_STRIP_W;
+        // **What is on screen, not what survived the filter.** With the
+        // window in play those stopped being the same number, and this file
+        // already has a rule for which one a header carries: the archived
+        // toggle has always sat under a `Sessions` count that excluded the
+        // rows it accounts for. The header says what you can see; the lines
+        // under it say what you cannot, and why.
         let sess_count = sessions.len();
         let files_stat = match (self.files.read(cx).snapshot.clone(), selected.as_deref()) {
             (Some((sid, Some(snap))), Some(sel)) if sid == sel => files_diffstat(&snap),
@@ -17089,6 +17201,37 @@ impl Shell {
                 }
                 None => *been = None,
                 _ => {}
+            }
+            // Slice AG2 #10. Below the rows it is holding back and above
+            // the archived toggle, which is the order the two facts are
+            // read in: what is older, then what is filed away.
+            if windowed_out > 0 {
+                let label = rail_reveal_label(windowed_out);
+                rows.push(
+                    rail_inset()
+                        .child(
+                            div()
+                                .id("rail-reveal")
+                                .debug_selector(|| "rail-reveal".into())
+                                .w_full()
+                                .h(px(theme::RAIL_GHOST_H))
+                                .px(px(theme::RAIL_HOVER_PAD))
+                                .rounded(px(theme::RADIUS_SELECT))
+                                .cursor_pointer()
+                                .hover_fade("rail-reveal", theme::wash_rest(), theme::overlay())
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .text_size(px(theme::SMALL_SIZE))
+                                .line_height(px(theme::SMALL_LINE))
+                                .text_color(theme::text_tertiary())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reveal_more_sessions(cx);
+                                }))
+                                .child(SharedString::from(label)),
+                        )
+                        .into_any_element(),
+                );
             }
             if archived_count > 0 {
                 let label = archived_toggle_label(archived_count, show_archived);
@@ -26592,6 +26735,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         zoom_hud: None,
                         zoom_hud_gen: 0,
                         rail_scroll: ScrollHandle::new(),
+                        rail_window: Cell::new(RAIL_WINDOW_FIRST),
                         rail_walk: RefCell::new(Vec::new()),
                         rail_scrolled_to: RefCell::new(None),
                         rail_seen: RefCell::new(HashMap::new()),
@@ -28106,6 +28250,101 @@ mod tests {
             usage_line(TurnTokens::stated(None, None, None, None), None).is_empty(),
             "four silences are not a usage statement"
         );
+    }
+
+    /// The window keeps the recent end, keeps its order, and counts what
+    /// it held back.
+    #[test]
+    fn the_window_takes_the_first_page_and_counts_the_rest() {
+        let rows: Vec<SessionInfo> = (0..10)
+            .map(|i| {
+                let mut s = win_session(&format!("s{i}"));
+                s.cwd = format!("/w/p{i}");
+                s
+            })
+            .collect();
+        let (out, held) = window_rail(rows, 4, None);
+        assert_eq!(
+            out.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s0", "s1", "s2", "s3"],
+            "the window took the wrong end, or re-sorted"
+        );
+        assert_eq!(held, 6);
+    }
+
+    /// An exempt row past the cut is kept **in its own place**, not lifted.
+    /// Promoting it would be attention ordering, which all four reference
+    /// apps refuse and comet reverted with a user report attached.
+    #[test]
+    fn an_exempt_row_past_the_cut_keeps_its_position() {
+        let mut rows: Vec<SessionInfo> = (0..8).map(|i| win_session(&format!("s{i}"))).collect();
+        rows[6].pending_approvals = 1;
+        let (out, held) = window_rail(rows, 3, None);
+        assert_eq!(
+            out.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s0", "s1", "s2", "s6"],
+            "the asking row was promoted instead of kept where it was"
+        );
+        assert_eq!(held, 4, "the exempt row was counted as held back");
+    }
+
+    /// The selected row is never held back, and `awaiting_approval` counts
+    /// even when the count has not landed yet — the two facts come from
+    /// different engine structures and `rail_shows` already takes the
+    /// cheap error on that disjunction.
+    #[test]
+    fn the_window_never_hides_the_selection_or_an_asker() {
+        let rows: Vec<SessionInfo> = (0..6).map(|i| win_session(&format!("s{i}"))).collect();
+        let (out, _) = window_rail(rows.clone(), 1, Some("s5"));
+        assert!(out.iter().any(|s| s.session_id == "s5"));
+
+        let mut rows = rows;
+        rows[4].state = "awaiting_approval".into();
+        let (out, _) = window_rail(rows, 1, None);
+        assert!(
+            out.iter().any(|s| s.session_id == "s4"),
+            "a session parked on a question was hidden because its count \
+             had not arrived yet"
+        );
+    }
+
+    /// A window that holds nothing back says nothing, and the label states
+    /// the count that is TRUE rather than promising a number of rows —
+    /// `archived_toggle_label`'s trap, which it documents.
+    #[test]
+    fn the_reveal_label_states_what_is_held_not_what_it_will_show() {
+        assert_eq!(rail_reveal_label(12), "12 older · show more");
+        assert!(
+            !rail_reveal_label(12).contains(&RAIL_WINDOW_STEP.to_string()),
+            "the label promises a number of rows a reveal may not produce"
+        );
+    }
+
+    fn win_session(id: &str) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            title: None,
+            archived: false,
+            provider: "claude-code".into(),
+            model: None,
+            cwd: "/w/eave".into(),
+            created_ts_ms: 1,
+            last_activity_ms: None,
+            state: "idle".into(),
+            live: false,
+            epoch: 1,
+            last_seq: 0,
+            checkout_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            pending_approvals: 0,
+            permission_mode: None,
+            rss_bytes: None,
+        }
     }
 
     /// Small counts keep every digit; only large ones round, and the
