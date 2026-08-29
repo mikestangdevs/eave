@@ -2147,7 +2147,7 @@ fn the_composer_states_a_ninth_file_was_not_attached(cx: &mut TestAppContext) {
     assert_eq!(overflow, 1);
     let hint = vcx
         .read_window(&h.window, |shell, cx| {
-            composer_hint(0, true, shell.read(cx).composer.read(cx).overflow)
+            composer_hint(0, true, shell.read(cx).composer.read(cx).overflow, 0, false)
         })
         .unwrap();
     assert!(
@@ -3625,16 +3625,31 @@ fn every_clickable_element_says_it_is_clickable(_cx: &mut TestAppContext) {
     let cursors_in_attach_button = attach_button_body.matches(".cursor_pointer()").count()
         + attach_button_body.matches(".cursor_text()").count();
     let via_attach_button = src.matches("attach_button(").count() - 1;
+    // Slice AG1 #7: the follow-up queue's three per-row controls differ only
+    // by glyph and handler, so they share a constructor exactly the way the
+    // three above do, and are accounted for the same way.
+    let queue_control_body = {
+        let from = &src[src.find("fn queue_control(").unwrap()..];
+        &from[..from.find("\n}\n").unwrap()]
+    };
+    let cursors_in_queue_control = queue_control_body.matches(".cursor_pointer()").count()
+        + queue_control_body.matches(".cursor_text()").count();
+    let via_queue_control = src.matches("queue_control(").count() - 1;
     assert_eq!(
         clicks,
-        cursors - cursors_in_helper - cursors_in_model_chip - cursors_in_attach_button
+        cursors
+            - cursors_in_helper
+            - cursors_in_model_chip
+            - cursors_in_attach_button
+            - cursors_in_queue_control
             + via_helper
             + via_model_chip
-            + via_attach_button,
+            + via_attach_button
+            + via_queue_control,
         "every .on_click site needs a .cursor_pointer or .cursor_text, \
-         directly or through row_action / model_chip / attach_button — eave \
-         had 84 fewer cursor calls than comet and every one of them was the \
-         default arrow"
+         directly or through row_action / model_chip / attach_button / \
+         queue_control — eave had 84 fewer cursor calls than comet and every \
+         one of them was the default arrow"
     );
 
     // Hover coverage, all thirteen controls. Before Slice M five of them
@@ -18262,5 +18277,456 @@ fn closing_a_window_takes_its_tabs_and_a_stale_snapshot_does_not_revive_it(
         shells(cx),
         vec![eave_wire::PRIMARY_WINDOW.to_string()],
         "a stale snapshot reopened a window the operator had closed"
+    );
+}
+
+// ── Slice AG1 #7 — the follow-up queue ────────────────────────────────────
+//
+// Before this slice `send_current` wrote every message straight at the
+// CLI's stdin whatever the session was doing. Claude's CLI holds one sent
+// mid-turn and says nothing (Slice K, capture N), so the words were gone:
+// not on screen, not editable, not retrievable. eave holds them now.
+//
+// Every test here is written against the OBSERVABLE fact — a `Command::Send`
+// on the wire, or its absence — and not against the composer's private
+// vector, because "the message did not reach the agent" is the thing the
+// operator is promised.
+
+/// Put a turn in flight, with the session in the rail so the composer is
+/// looking at something. `state` stays `idle`: the turn ledger is what
+/// makes this busy, exactly as it is for the Stop control and the working
+/// trailer, and a rail row saying `running` would let a test pass over a
+/// predicate that had quietly narrowed to the engine's session state.
+fn in_flight(h: &Harness, vcx: &mut VisualTestContext) {
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    ask(h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+}
+
+fn draft_now(h: &Harness, vcx: &mut VisualTestContext) -> String {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .field
+            .read(cx)
+            .content()
+            .to_string()
+    })
+    .unwrap()
+}
+
+fn queued_texts(h: &Harness, vcx: &mut VisualTestContext) -> Vec<String> {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .queued
+            .iter()
+            .map(|q| q.text.clone())
+            .collect::<Vec<_>>()
+    })
+    .unwrap()
+}
+
+fn sends(cmds: &[Command]) -> Vec<String> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            Command::Send { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **The whole slice in one test.** A follow-up typed during a turn does
+/// not reach the agent, and it is on screen instead.
+#[gpui::test]
+fn a_follow_up_written_during_a_turn_is_held_and_shown(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    in_flight(&h, vcx);
+    let _ = h.drain();
+
+    vcx.simulate_input("also run the linter");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    assert!(
+        sends(&h.drain()).is_empty(),
+        "the follow-up went at the CLI mid-turn, which is the behaviour this slice replaces"
+    );
+    assert_eq!(draft_now(&h, vcx), "", "a queued draft is still spent");
+    assert_eq!(queued_texts(&h, vcx), vec!["also run the linter"]);
+    assert!(
+        shown(vcx, "composer-queued-0"),
+        "a held message with no row is the old invisible queue with extra steps"
+    );
+}
+
+/// ...and it goes out on its own when the turn settles, without being
+/// retyped.
+#[gpui::test]
+fn a_held_follow_up_goes_out_when_the_turn_ends(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    in_flight(&h, vcx);
+    vcx.simulate_input("also run the linter");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![turn_completed_record(3)],
+    });
+    vcx.run_until_parked();
+
+    assert_eq!(
+        sends(&h.drain()),
+        vec!["also run the linter"],
+        "the turn ended and the queue did not drain"
+    );
+    assert!(
+        queued_texts(&h, vcx).is_empty(),
+        "a released follow-up is still sitting in the queue and will go twice"
+    );
+    assert!(!shown(vcx, "composer-queued-0"));
+}
+
+/// **One at a time.** The queue exists so follow-ups become separate
+/// turns; emptying it into one settle would be the opposite.
+#[gpui::test]
+fn only_the_head_of_the_queue_goes_out_per_turn(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    in_flight(&h, vcx);
+    for text in ["first", "second", "third"] {
+        vcx.simulate_input(text);
+        vcx.simulate_keystrokes("enter");
+    }
+    vcx.run_until_parked();
+    assert_eq!(queued_texts(&h, vcx), vec!["first", "second", "third"]);
+    let _ = h.drain();
+
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![turn_completed_record(3)],
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        sends(&h.drain()),
+        vec!["first"],
+        "the settle released more than the head"
+    );
+    assert_eq!(queued_texts(&h, vcx), vec!["second", "third"]);
+
+    // The interlock, which is the part an edge-triggered release gets
+    // wrong: nothing more goes out until the turn we just asked for has
+    // actually opened and closed again. Every notify between now and then
+    // re-runs the release rule.
+    vcx.run_until_parked();
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    vcx.run_until_parked();
+    assert!(
+        sends(&h.drain()).is_empty(),
+        "the second follow-up went out on top of the first"
+    );
+
+    // The released message's own turn arrives and settles; now the next.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(4, "first"), delivered_record(5)],
+    });
+    vcx.run_until_parked();
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![turn_completed_record(6)],
+    });
+    vcx.run_until_parked();
+    assert_eq!(sends(&h.drain()), vec!["second"]);
+}
+
+/// The case the composer has been describing in words since Slice K: a
+/// message written while a permission question is open. The sentence was
+/// true and unbacked — now there is a row behind it.
+#[gpui::test]
+fn a_follow_up_written_under_an_open_question_is_held(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing.push_rail(vec![session("aaaa1111")]);
+    ask(
+        &h,
+        vcx,
+        vec![approval_record(1, "req-1", "Write", "/repo/src/main.rs")],
+    );
+    let _ = h.drain();
+
+    vcx.simulate_input("use the other path");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    assert!(
+        sends(&h.drain()).is_empty(),
+        "the CLI was handed a message it would swallow until the question was answered"
+    );
+    assert_eq!(queued_texts(&h, vcx), vec!["use the other path"]);
+}
+
+/// Return on an empty composer stays the no-op it has always been. A queue
+/// that mints an empty row is worse than the send it replaced.
+#[gpui::test]
+fn return_on_an_empty_composer_queues_nothing(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    in_flight(&h, vcx);
+    let _ = h.drain();
+
+    vcx.simulate_keystrokes("enter");
+    vcx.simulate_input("   ");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    assert!(queued_texts(&h, vcx).is_empty(), "whitespace became a row");
+    assert!(sends(&h.drain()).is_empty());
+    assert!(!shown(vcx, "composer-queue"));
+}
+
+/// The take-back. Once the words were in the pipe there was no way to
+/// offer this at all.
+#[gpui::test]
+fn removing_a_queued_follow_up_takes_the_words_back(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    in_flight(&h, vcx);
+    vcx.simulate_input("never mind this");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    click(vcx, "composer-queued-0-remove");
+    vcx.run_until_parked();
+    assert!(queued_texts(&h, vcx).is_empty());
+
+    // ...and the settle it was waiting for sends nothing.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![turn_completed_record(3)],
+    });
+    vcx.run_until_parked();
+    assert!(
+        sends(&h.drain()).is_empty(),
+        "a removed follow-up was sent anyway"
+    );
+}
+
+/// Edit is a **swap**, and the assertion is that nothing is lost in either
+/// direction: the queued words reach the field and the words that were in
+/// the field take the row's place, keeping its position.
+#[gpui::test]
+fn editing_a_queued_follow_up_trades_places_with_the_draft(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    in_flight(&h, vcx);
+    for text in ["first", "second"] {
+        vcx.simulate_input(text);
+        vcx.simulate_keystrokes("enter");
+    }
+    vcx.run_until_parked();
+    vcx.simulate_input("still typing");
+    let _ = h.drain();
+
+    click(vcx, "composer-queued-1-edit");
+    vcx.run_until_parked();
+    assert_eq!(
+        draft_now(&h, vcx),
+        "second",
+        "edit did not bring the queued words back to the field"
+    );
+    assert_eq!(
+        queued_texts(&h, vcx),
+        vec!["first", "still typing"],
+        "the draft was spent, or the row changed position"
+    );
+
+    // Exactly reversible: the same click puts everything back.
+    click(vcx, "composer-queued-1-edit");
+    vcx.run_until_parked();
+    assert_eq!(draft_now(&h, vcx), "still typing");
+    assert_eq!(queued_texts(&h, vcx), vec!["first", "second"]);
+}
+
+/// The override. eave still lets an operator hand a CLI a message mid-turn
+/// — what changed is that it is a button somebody pressed rather than what
+/// happens to every message by default.
+#[gpui::test]
+fn send_now_puts_one_through_while_the_turn_is_still_running(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    in_flight(&h, vcx);
+    for text in ["first", "second"] {
+        vcx.simulate_input(text);
+        vcx.simulate_keystrokes("enter");
+    }
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    click(vcx, "composer-queued-1-now");
+    vcx.run_until_parked();
+    assert_eq!(
+        sends(&h.drain()),
+        vec!["second"],
+        "send now did not send, or sent the wrong row"
+    );
+    assert_eq!(queued_texts(&h, vcx), vec!["first"]);
+}
+
+/// **A queue belongs to one session**, for the reason a draft does and one
+/// more: it is released by a turn ending, and the turn it is waiting for is
+/// not the one the session you switched to is running.
+#[gpui::test]
+fn a_queue_travels_with_the_session_it_was_written_for(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+    vcx.simulate_input("for aaaa");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    assert_eq!(queued_texts(&h, vcx), vec!["for aaaa"]);
+    let _ = h.drain();
+
+    // Switch to B and settle B's turn. A's follow-up is not B's to send.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    vcx.run_until_parked();
+    assert!(
+        queued_texts(&h, vcx).is_empty(),
+        "B is wearing A's unsent follow-up"
+    );
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "bbbb2222".into(),
+        epoch: 1,
+        records: vec![turn_completed_record(3)],
+    });
+    vcx.run_until_parked();
+    assert!(
+        sends(&h.drain()).is_empty(),
+        "A's follow-up was sent to B, which is the failure `switch_to` exists to prevent"
+    );
+
+    // Come back and it is where it was left.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    assert_eq!(queued_texts(&h, vcx), vec!["for aaaa"]);
+}
+
+/// With nothing in flight the composer is unchanged: Return still sends,
+/// immediately, and no row is drawn. The queue must not become a tax on
+/// the ordinary case.
+#[gpui::test]
+fn an_idle_session_still_sends_the_moment_you_press_return(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let _ = h.drain();
+
+    vcx.simulate_input("run the tests");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    assert_eq!(sends(&h.drain()), vec!["run the tests"]);
+    assert!(queued_texts(&h, vcx).is_empty());
+    assert!(
+        !shown(vcx, "composer-queue"),
+        "the queue drew itself over a session with nothing queued"
+    );
+}
+
+/// The guard on the release rule, tested against the window the pump does
+/// not currently open.
+///
+/// `release_queued` reads the turn from the TRANSCRIPT and the queue from
+/// the COMPOSER, and those are two entities that move at a session switch.
+/// In the running app they move in one pump pass and gpui flushes the
+/// observer after both, so the disagreement never lasts a frame — arming
+/// the guard away breaks no other test in this file, which is exactly why
+/// this one is written by hand rather than left to be discovered.
+///
+/// What it costs to be wrong is not a repaint: it is A's unsent follow-up
+/// delivered to B, the failure `ComposerState::switch_to` was written to
+/// prevent, arriving through a door that did not exist when it was written.
+#[gpui::test]
+fn a_release_is_refused_while_the_transcript_and_the_composer_disagree(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    h.plumbing
+        .push_rail(vec![session("aaaa1111"), session("bbbb2222")]);
+    ask(&h, vcx, vec![user_record(1, "go"), delivered_record(2)]);
+    vcx.simulate_input("for aaaa");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    assert_eq!(queued_texts(&h, vcx), vec!["for aaaa"]);
+    let _ = h.drain();
+
+    // Move the transcript to B and leave the composer on A — half a switch,
+    // which is the state the two-entity read is exposed to. Nothing is in
+    // flight for B, so every other condition for a release is met.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.transcript.update(cx, |t, cx| {
+                t.reset();
+                t.session_id = Some("bbbb2222".into());
+                cx.notify();
+            });
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    assert!(
+        sends(&h.drain()).is_empty(),
+        "A's follow-up was released against B's transcript"
+    );
+    assert_eq!(
+        queued_texts(&h, vcx),
+        vec!["for aaaa"],
+        "the queue was drained by a session it does not belong to"
+    );
+}
+
+/// The other half of the predicate, and the other observer.
+///
+/// `send_is_held` is an OR: a turn open in the transcript, or the engine's
+/// own session state saying `running`. A session that is busy by the second
+/// witness only never touches the transcript when it stops being busy —
+/// the fact arrives on the rail — so the release rule has to be reachable
+/// from there too, or a follow-up queued against a spawning session waits
+/// for an unrelated record to wake it.
+#[gpui::test]
+fn a_queue_held_by_the_rail_alone_drains_when_the_rail_says_so(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut running = session("aaaa1111");
+    running.state = "running".into();
+    running.live = true;
+    rail_with_selected(&h, vcx, vec![running], "aaaa1111");
+    let _ = h.drain();
+
+    vcx.simulate_input("queue me");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    assert_eq!(
+        queued_texts(&h, vcx),
+        vec!["queue me"],
+        "a session the rail calls running took the send anyway"
+    );
+    assert!(sends(&h.drain()).is_empty());
+
+    // No record moves; only the rail's word for what the session is doing.
+    let mut settled = session("aaaa1111");
+    settled.state = "done".into();
+    h.plumbing.push_rail(vec![settled]);
+    vcx.run_until_parked();
+    assert_eq!(
+        sends(&h.drain()),
+        vec!["queue me"],
+        "the rail said the session had settled and the queue did not notice"
     );
 }

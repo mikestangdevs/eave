@@ -53,70 +53,34 @@ pub fn tool_button(
         ))
 }
 
-/// Send: solid when armed, quiet when not. Square, not a stadium.
-#[allow(dead_code)]
-pub fn send_button(has_draft: bool) -> Stateful<gpui::Div> {
-    div()
-        .id("send")
-        .debug_selector(|| "send".into())
-        .flex_none()
-        .size(px(TOOL))
-        .rounded(px(TOOL_RADIUS))
-        .flex()
-        .items_center()
-        .justify_center()
-        .hover_fade(
-            "send",
-            if has_draft {
-                theme::solid()
-            } else {
-                theme::overlay_strong()
-            },
-            if has_draft {
-                theme::inverse_hover()
-            } else {
-                theme::overlay_strongest()
-            },
-        )
-        .cursor_pointer()
-        .child(icons::tagged_icon(
-            icons::ARROW_UP,
-            theme::ICON_SM,
-            if has_draft {
-                theme::on_solid()
-            } else {
-                theme::text_secondary()
-            },
-            "send-glyph",
-        ))
-}
+// **`send_button` and `stop_button` used to live here and are deleted.**
+//
+// Both were callerless, and both are the reason a dead constructor is not
+// merely untidy: each carried the LIVE control's `debug_selector`s — `send`
+// / `send-glyph` and `composer-stop` / `composer-stop-glyph`, the same
+// literals `ui.rs` paints — so calling either would have put two elements
+// on screen under one selector. `debug_bounds` resolves a selector to the
+// LAST-PAINTED element, so the harness would have found one, clicked one,
+// received the command it expected, and gone green over a composer with two
+// send buttons. AG1's gap table reported `stop_button`; `send_button` was
+// the same defect standing beside it and is deleted for the same reason.
+//
+// The live pair is inline in `ui.rs` (the stop control at its
+// `session_busy` gate, the send button beside it), which is also where
+// `attach_button` lives — so this file is not where composer controls are
+// constructed, and a copy here was never going to be the one that ships.
+// `every_clickable_element_says_it_is_clickable` counts cursors in `ui.rs`
+// alone, which is the mechanical reason the live constructors belong there.
 
-/// Stop: a filled square in the armed send plate. MonoCode's Square glyph.
-#[allow(dead_code)]
-pub fn stop_button() -> Stateful<gpui::Div> {
-    div()
-        .id("composer-stop")
-        .debug_selector(|| "composer-stop".into())
-        .flex_none()
-        .size(px(TOOL))
-        .rounded(px(TOOL_RADIUS))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(theme::solid())
-        .hover_fade("composer-stop", theme::solid(), theme::inverse_hover())
-        .cursor_pointer()
-        .child(
-            div()
-                .size(px(10.0))
-                .rounded(px(2.0))
-                .bg(theme::on_solid())
-                .debug_selector(|| "composer-stop-glyph".into()),
-        )
-}
-
-/// Two-line hover copy for the context meter. `None` when the provider
-/// stated nothing — the meter itself is omitted then.
+/// Two-line hover copy for the context meter.
+///
+/// **Wired 2026-08-29.** This was written, unit-tested, and never called
+/// from anything that paints — it showed up as a live `never used` warning
+/// in every build, which is where the evidence had been sitting. The
+/// question the gap table left open was whether it had been superseded by
+/// [`context_meter`]; it had not. The meter renders a ring and `69%` and
+/// says nothing about the two numbers that produced it, so the copy was not
+/// redundant — it was missing.
 pub fn meter_copy(context: ContextWindow) -> (String, String) {
     let used = compact(context.used_tokens);
     match (context.fraction(), context.limit_tokens) {
@@ -148,17 +112,73 @@ pub fn meter_ink(ratio: f32) -> Hsla {
     }
 }
 
+/// What the context meter says when the pointer rests on it.
+///
+/// A view because that is what `.tooltip()` takes — gpui owns the delay,
+/// the placement and the dismissal, which is most of what a tooltip is.
+/// Same plate as `PageTooltip` in `ui.rs`, two lines instead of one.
+struct MeterTip {
+    headline: SharedString,
+    detail: SharedString,
+}
+
+impl gpui::Render for MeterTip {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_SELECT))
+            .bg(theme::menu_glass())
+            .border_1()
+            .border_color(theme::border())
+            .shadow(theme::shadow_panel())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(theme::text())
+                    .child(self.headline.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(self.detail.clone()),
+            )
+    }
+}
+
 /// Context meter. Renders nothing without a stated ceiling — a number
 /// guessing at a window is worse than no meter (MonoCode's rule, and
 /// Slice CC's).
+///
+/// The ring and the percent are the glance; the exact pair is one hover
+/// away through [`meter_copy`]. `69%` is the right thing to read across a
+/// composer and the wrong thing to be told when you are deciding whether to
+/// compact, which wants `176k / 256k`.
 pub fn context_meter(context: Option<ContextWindow>) -> Option<AnyElement> {
     let context = context?;
     let ratio = context.fraction()?;
     let pct = (ratio * 100.0).round() as i32;
+    let (headline, detail) = meter_copy(context);
+    let headline = SharedString::from(headline);
+    let detail = SharedString::from(detail);
     Some(
         div()
             .id("composer-meter")
             .debug_selector(|| "composer-meter".into())
+            .tooltip(move |_, cx| {
+                let headline = headline.clone();
+                let detail = detail.clone();
+                cx.new(|_| MeterTip { headline, detail }).into()
+            })
             .flex_none()
             .flex()
             .flex_row()
@@ -207,6 +227,60 @@ mod tests {
         let (h, d) = meter_copy(no_ceiling);
         assert_eq!(h, "Context used");
         assert_eq!(d, "12 tokens");
+    }
+
+    /// **The copy above reaches a screen.**
+    ///
+    /// A structural check on the source, for the reason
+    /// `every_clickable_element_says_it_is_clickable` gives for being one:
+    /// gpui owns the tooltip's hover delay and shows it in its own
+    /// deferred pass, so there is no element in a painted frame to assert
+    /// against. What CAN be pinned is the property that actually decayed —
+    /// this function was written, tested, and called by nothing that
+    /// paints, and the suite above went green the whole time because a
+    /// unit test of a pure function cannot see that nobody calls it.
+    ///
+    /// The two halves are checked separately on purpose: `context_meter`
+    /// could keep its tooltip and stop building it from `meter_copy`, and
+    /// then this file would be back where it started with a second copy of
+    /// the words.
+    #[test]
+    fn the_meters_hover_copy_is_actually_hung_on_the_meter() {
+        let src = include_str!("composer.rs");
+        let body = {
+            let from = &src[src.find("pub fn context_meter(").unwrap()..];
+            &from[..from.find("\n}\n").unwrap()]
+        };
+        assert!(
+            body.contains(".tooltip("),
+            "the context meter lost its hover copy and `meter_copy` is dead again"
+        );
+        assert!(
+            body.contains("meter_copy(context)"),
+            "the meter grew a tooltip that does not read from `meter_copy`, \
+             so the words are written twice"
+        );
+    }
+
+    /// The dead twins are gone and must stay gone: each carried a LIVE
+    /// control's `debug_selector`, so calling one painted two elements
+    /// under one selector and `debug_bounds` — which resolves to the
+    /// last-painted — would have found one, clicked one, and passed.
+    #[test]
+    fn no_composer_control_here_claims_a_live_selector() {
+        let src = include_str!("composer.rs");
+        for stolen in [
+            "\"send\".into()",
+            "\"send-glyph\"",
+            "\"composer-stop\".into()",
+            "\"composer-stop-glyph\"",
+        ] {
+            assert!(
+                !src.contains(stolen),
+                "{stolen} is painted from two files again — the harness \
+                 cannot tell the copies apart"
+            );
+        }
     }
 
     #[test]

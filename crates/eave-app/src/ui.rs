@@ -2701,6 +2701,38 @@ fn model_chip(
         ))
 }
 
+/// One control on a queued follow-up's row (Slice AG1 #7).
+///
+/// A shared constructor for the same reason `row_action` is one: three
+/// buttons that differ only by glyph and handler, and ONE place that says
+/// what the pointer does over them. `every_clickable_element_says_it_is_clickable`
+/// credits the call sites through this fn, so the cursor is declared here
+/// exactly once and the accounting stays honest.
+///
+/// The handler is the caller's — this returns the button, not the action.
+fn queue_control(sel: String, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(sel.clone()))
+        .debug_selector({
+            let sel = sel.clone();
+            move || sel.clone()
+        })
+        .flex_none()
+        .size(px(theme::ICON_SM))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CHIP))
+        .hover_fade(sel.clone(), theme::wash_rest(), theme::overlay())
+        .cursor_pointer()
+        .child(icons::tagged_icon(
+            glyph,
+            theme::ICON_SM,
+            theme::text_secondary_on_wash(),
+            format!("{sel}-glyph"),
+        ))
+}
+
 fn attach_button() -> gpui::Stateful<gpui::Div> {
     div()
         .id("composer-attach")
@@ -4822,6 +4854,30 @@ items={count} rows={} frames={} ops={}",
     }
 }
 
+/// One follow-up the operator wrote while the agent could not take it.
+///
+/// **Slice AG1 #7.** Before this, `send_current` wrote every message
+/// straight at the CLI's stdin whatever the session was doing, and the
+/// composer said so in words: *"queued behind the approval until you
+/// answer"* (`composer_hint`). That sentence was true and it was the
+/// whole surface — the message was gone into a pipe, the CLI held it
+/// silently (Slice K, capture N, 2026-08-18), and there was no way to see
+/// it, change it or take it back. eave holds it here instead.
+///
+/// **The operator's own words, not the composed body.** `text` is what
+/// was typed and `files` are the chips that were staged; the `@mention`
+/// join happens at release through the same `attach::compose_send` an
+/// immediate send goes through. Storing the composed body would have made
+/// `edit` put a line the operator never wrote back in the field.
+#[derive(Clone, Debug, PartialEq)]
+struct QueuedSend {
+    /// Identity for a click, and an index is not one: removing row 0
+    /// renumbers row 1 under a pointer that is already over it.
+    id: u64,
+    text: String,
+    files: Vec<StagedFile>,
+}
+
 struct ComposerState {
     /// The live buffer: always the draft belonging to `key`.
     ///
@@ -4855,6 +4911,29 @@ struct ComposerState {
     /// Composer access mode for THIS session. Parked like the draft.
     runtime_mode: RuntimeMode,
     parked_modes: HashMap<String, RuntimeMode>,
+    /// THIS session's follow-ups, in the order they will be sent.
+    ///
+    /// Same one-home rule as the draft: the entry for `key` lives here and
+    /// nowhere else, and every other session's is parked below.
+    queued: Vec<QueuedSend>,
+    /// Every other session's follow-ups, parked with its draft.
+    parked_queues: HashMap<String, Vec<QueuedSend>>,
+    /// Ids are minted from here and never reused, so a row keeps its
+    /// identity across an edit, a removal above it, and a repaint.
+    next_queued_id: u64,
+    /// A follow-up has been released for THIS session and the turn it
+    /// starts has not opened yet.
+    ///
+    /// This is the whole of the release interlock. Without it the second
+    /// row would go out on the very next notify, because the session does
+    /// not read busy until the send has made a round trip — so the queue
+    /// would empty itself into one turn, which is the opposite of what it
+    /// is for. Cleared by seeing the session busy again, which is the
+    /// arrival of exactly the turn we asked for.
+    awaiting: bool,
+    /// The sessions whose released follow-up is still unaccounted for.
+    /// Absence is `false`, the same way an absent draft is an empty one.
+    parked_awaiting: HashSet<String>,
 }
 
 impl ComposerState {
@@ -4894,6 +4973,26 @@ impl ComposerState {
         self.overflow = 0;
         self.parked_modes.insert(self.key.clone(), self.runtime_mode);
         self.runtime_mode = self.parked_modes.remove(&key).unwrap_or_default();
+        // The follow-up queue travels with the session it was written for,
+        // for the reason the draft does and one more: a queued row is
+        // released by a rule that fires on a turn ending, and the turn it
+        // is waiting for belongs to one session. Left behind, A's follow-up
+        // would go out the moment B's turn settled.
+        let outgoing_queue = std::mem::take(&mut self.queued);
+        if outgoing_queue.is_empty() {
+            self.parked_queues.remove(&self.key);
+        } else {
+            self.parked_queues.insert(self.key.clone(), outgoing_queue);
+        }
+        self.queued = self.parked_queues.remove(&key).unwrap_or_default();
+        // ...and so does the interlock. Arriving at a session whose
+        // released follow-up has not landed yet must not look like a
+        // session with nothing in flight, or coming back to it sends a
+        // second one on top of the first.
+        if self.awaiting {
+            self.parked_awaiting.insert(self.key.clone());
+        }
+        self.awaiting = self.parked_awaiting.remove(&key);
         self.key = key;
     }
 }
@@ -7198,6 +7297,7 @@ const DIFF_CONTEXT: usize = 2;
 impl Shell {
     /// Send the composer draft (enter key and send button share this).
     fn send_current(&mut self, cx: &mut Context<Self>) {
+        let held = self.send_is_held(cx);
         let (text, files) = self.composer.update(cx, |c, cx| {
             let text = c.field.read(cx).content().to_string();
             c.field.update(cx, |f, cx| f.clear(cx));
@@ -7206,12 +7306,75 @@ impl Shell {
             cx.notify();
             (text, files)
         });
+        if held {
+            // Slice AG1 #7. The draft is spent either way — the field is
+            // already cleared above and the words have left the composer —
+            // so the only question is where they go. `compose_send` is
+            // asked first and for the same reason the immediate path asks
+            // it: it is what decides there is anything to send at all, and
+            // Return on an empty composer must stay the no-op it has always
+            // been rather than minting an empty row in the queue.
+            let mentions: Vec<String> = files.iter().map(|f| f.mention.clone()).collect();
+            if attach::compose_send(&text, &mentions).is_some() {
+                self.composer.update(cx, |c, cx| {
+                    let id = c.next_queued_id;
+                    c.next_queued_id += 1;
+                    c.queued.push(QueuedSend { id, text, files });
+                    cx.notify();
+                });
+            }
+        } else {
+            self.dispatch_send(&text, &files, cx);
+        }
+        // The composer is empty now, so the projection says closed. Said
+        // here as well as derived at the two read sites, so the popup does
+        // not sit mounted-but-invisible until the next keystroke.
+        self.sync_slash_palette(cx);
+        self.sync_mention_palette(cx);
+    }
+
+    /// Can the agent take a message right now?
+    ///
+    /// The union of the two conditions under which a send does not reach
+    /// the agent when it is written: a turn is in flight, or the session is
+    /// parked on a permission question. Both were already computed — the
+    /// first for the composer's Stop control, the second for its hint — and
+    /// this is the one place that says they are the same question, so the
+    /// rows the queue draws and the rule that drains it cannot disagree
+    /// about whether a message would have gone through.
+    ///
+    /// The busy half is deliberately the Stop button's OR and not just
+    /// `state == "running"`: this file's Slice N3 note records that the
+    /// real CLI lingers after `turn_completed` waiting for more stdin, so
+    /// the engine's session state alone would hold a queue shut forever
+    /// over an idle session.
+    fn send_is_held(&self, cx: &App) -> bool {
+        let session = self.selected_session(cx);
+        let busy = session.as_ref().is_some_and(|s| s.state == "running")
+            || (session.is_some() && self.transcript.read(cx).in_turn());
+        let asking = self
+            .transcript
+            .read(cx)
+            .transcript
+            .pending_approvals()
+            .next()
+            .is_some();
+        busy || asking
+    }
+
+    /// Put one message on the wire: the tail every send path shares.
+    ///
+    /// Immediate sends and released follow-ups compose identically — same
+    /// `@mention` join, same image extraction, same anchor flip — because
+    /// a queued message is not a different kind of message, only a later
+    /// one.
+    fn dispatch_send(&mut self, text: &str, files: &[StagedFile], cx: &mut Context<Self>) {
         let mentions: Vec<String> = files.iter().map(|f| f.mention.clone()).collect();
         let images: Vec<PathBuf> = files
             .iter()
             .filter_map(|f| f.image_send_path().map(Path::to_path_buf))
             .collect();
-        if let Some(body) = attach::compose_send(&text, &mentions) {
+        if let Some(body) = attach::compose_send(text, &mentions) {
             // Anchor flip on own send (spec 03 §Scroll): pin once the row
             // lands in the feed.
             self.transcript.update(cx, |t, _| {
@@ -7219,11 +7382,140 @@ impl Shell {
             });
             let _ = self.commands.send(Command::Send { text: body, images });
         }
-        // The composer is empty now, so the projection says closed. Said
-        // here as well as derived at the two read sites, so the popup does
-        // not sit mounted-but-invisible until the next keystroke.
+    }
+
+    /// Release the head of the follow-up queue, if the agent can take it.
+    ///
+    /// **Called from the transcript and sessions observers, never from the
+    /// paint.** Both facts it reads change through those two entities and
+    /// nothing else, and a send is not something a render pass should be
+    /// able to cause: `maybe_auto_approve` sits on the same observer for
+    /// the same reason.
+    ///
+    /// One at a time, and the interlock is `awaiting` rather than an edge
+    /// on "held". An edge would be wrong across a session switch — the
+    /// remembered value would belong to the session you left — where this
+    /// parks with the queue it guards.
+    ///
+    /// **Limit, stated rather than hidden: a queue drains for the session
+    /// the composer is on.** The transcript holds one session's records, so
+    /// a turn ending is only observable for the selected one; a follow-up
+    /// queued in A and left behind waits until A is selected again. The
+    /// rows stay on screen with `send now` on each, so the wait is visible
+    /// and has a manual out — which is the same bargain `rail_seen` makes
+    /// about surviving a restart.
+    fn release_queued(&mut self, cx: &mut Context<Self>) {
+        let held = self.send_is_held(cx);
+        let key = self
+            .transcript
+            .read(cx)
+            .session_id
+            .clone()
+            .unwrap_or_default();
+        let head = self.composer.update(cx, |c, cx| {
+            // Mid-switch the transcript has already moved and the composer
+            // has not. Releasing here would send A's follow-up into B —
+            // the exact failure `switch_to` exists to prevent. The switch
+            // notifies when it completes, and that notify brings us back.
+            if c.key != key {
+                return None;
+            }
+            if held {
+                // The turn we were waiting for. Anything queued behind it
+                // waits for this one to settle in its turn.
+                if c.awaiting {
+                    c.awaiting = false;
+                    cx.notify();
+                }
+                return None;
+            }
+            if c.awaiting || c.queued.is_empty() {
+                return None;
+            }
+            let head = c.queued.remove(0);
+            c.awaiting = true;
+            cx.notify();
+            Some(head)
+        });
+        if let Some(head) = head {
+            self.dispatch_send(&head.text, &head.files, cx);
+        }
+    }
+
+    /// Send one queued follow-up now, ahead of the rest and whatever the
+    /// session is doing.
+    ///
+    /// The operator's override, and the one place eave still hands a
+    /// message to a CLI that is mid-turn. That is a capability the product
+    /// had by accident before this slice and would otherwise have lost:
+    /// what changes is that it is now a button somebody pressed rather
+    /// than what happens to every message by default.
+    fn send_queued_now(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let row = self.composer.update(cx, |c, cx| {
+            if ix >= c.queued.len() {
+                return None;
+            }
+            let row = c.queued.remove(ix);
+            c.awaiting = true;
+            cx.notify();
+            Some(row)
+        });
+        if let Some(row) = row {
+            self.dispatch_send(&row.text, &row.files, cx);
+        }
+    }
+
+    /// Take a queued follow-up back into the composer to change it.
+    ///
+    /// **A swap, not a lift.** Whatever is in the field trades places with
+    /// the row, keeping the row's position in the queue. The alternative —
+    /// refusing while a draft exists, or overwriting it — either blocks the
+    /// common case for the rare one or spends words the operator typed.
+    /// The swap loses nothing and is exactly reversible: clicking edit on
+    /// the same position puts everything back.
+    fn edit_queued(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.composer.update(cx, |c, cx| {
+            if ix >= c.queued.len() {
+                return;
+            }
+            let draft = c.field.read(cx).content().to_string();
+            let staged = std::mem::take(&mut c.attachments);
+            let row = if draft.trim().is_empty() && staged.is_empty() {
+                c.queued.remove(ix)
+            } else {
+                let id = c.next_queued_id;
+                c.next_queued_id += 1;
+                std::mem::replace(
+                    &mut c.queued[ix],
+                    QueuedSend {
+                        id,
+                        text: draft,
+                        files: staged,
+                    },
+                )
+            };
+            // `set_content` and not an insert, for the reason `switch_to`
+            // gives: arriving text is not an edit somebody made, so there
+            // is no undo history for ⌘Z to walk back past into it.
+            c.field.update(cx, |f, cx| f.set_content(row.text, cx));
+            c.attachments = row.files;
+            c.overflow = 0;
+            cx.notify();
+        });
         self.sync_slash_palette(cx);
         self.sync_mention_palette(cx);
+    }
+
+    /// Drop a queued follow-up. The words are gone — this is the take-back
+    /// the old behaviour had no way to offer once the pipe had swallowed
+    /// them.
+    fn remove_queued(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.composer.update(cx, |c, cx| {
+            if ix < c.queued.len() {
+                c.queued.remove(ix);
+                cx.notify();
+            }
+        });
     }
 
     fn selected_session(&self, cx: &App) -> Option<SessionInfo> {
@@ -7469,6 +7761,105 @@ impl Shell {
                         .child(remove_el)
                         .into_any_element()
                 }
+            }))
+            .into_any_element()
+    }
+
+    /// The follow-up queue, drawn above the field (Slice AG1 #7).
+    ///
+    /// Above and not below, because the queue is EARLIER than the draft:
+    /// read top to bottom the column is what goes next, then what goes
+    /// after that, then what you are typing. Below the field the same rows
+    /// would read as a log of things already sent, which is the one thing
+    /// they are not.
+    ///
+    /// One line per row, truncated. A follow-up is usually a sentence and
+    /// the composer is not a second transcript — the full text is one click
+    /// away in the field, which is also the only place it can be changed.
+    ///
+    /// Three controls, and they are the three the reference apps converged
+    /// on: send it now, take it back to edit, throw it away. Each carries
+    /// its own `debug_selector` because the harness resolves clicks by
+    /// selector and never by position.
+    fn composer_queue_rows(&self, queued: &[QueuedSend], cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "composer-queue".into())
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_1))
+            .pb(px(theme::SPACE_2))
+            .children(queued.iter().enumerate().map(|(ix, row)| {
+                let base = format!("composer-queued-{ix}");
+                div()
+                    .id(SharedString::from(base.clone()))
+                    .debug_selector({
+                        let base = base.clone();
+                        move || base.clone()
+                    })
+                    .w_full()
+                    .h(px(theme::CONTROL_H))
+                    .px(px(theme::SPACE_2))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::wash_rest())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .child(icons::tagged_icon(
+                        icons::CHAT_ROUND_LINE,
+                        theme::ICON_STATUS,
+                        theme::text_secondary_on_wash(),
+                        format!("{base}-glyph"),
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(theme::LABEL_SIZE))
+                            .line_height(px(theme::LABEL_LINE))
+                            .text_color(theme::text())
+                            .child(SharedString::from(row.text.clone())),
+                    )
+                    // A follow-up can be files with no words at all
+                    // (`compose_send` turns those into a mentions-only
+                    // send), and a row that then drew an empty line would
+                    // look like a bug. The count is the fact that survives
+                    // truncation, so it is stated rather than implied.
+                    .children((!row.files.is_empty()).then(|| {
+                        div()
+                            .debug_selector({
+                                let sel = format!("{base}-files");
+                                move || sel.clone()
+                            })
+                            .flex_none()
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(if row.files.len() == 1 {
+                                "1 file".to_string()
+                            } else {
+                                format!("{} files", row.files.len())
+                            }))
+                    }))
+                    .child(
+                        queue_control(format!("{base}-now"), icons::ARROW_UP).on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.send_queued_now(ix, cx)
+                            }),
+                        ),
+                    )
+                    .child(queue_control(format!("{base}-edit"), icons::PEN).on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.edit_queued(ix, cx)),
+                    ))
+                    .child(
+                        queue_control(format!("{base}-remove"), icons::CLOSE).on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.remove_queued(ix, cx)
+                            }),
+                        ),
+                    )
+                    .into_any_element()
             }))
             .into_any_element()
     }
@@ -22138,16 +22529,48 @@ const PAGE_NO_ENGINE: &str = "this build has no page engine (`--features web`)";
 ///    keystroke is looking at an empty composer that already has focus;
 ///    teaching Return on a keycap next to it was the card this layout
 ///    replaced. The hint still appears the moment a draft exists.
-fn composer_hint(pending: usize, has_draft: bool, overflow: usize) -> String {
+///
+/// **Slice AG1 #7 added two cases in the middle**, both of which are the
+/// same kind of thing as case 1 — a live fact about what the next Return
+/// will do, not a hint about a keystroke. `held` is [`Shell::send_is_held`]:
+/// when it is true, Return does not send, and a line that still said
+/// "return to send" would be the only thing on screen contradicting the
+/// queue rows underneath it.
+///
+/// The draft case is checked BEFORE the standing queue count, following
+/// this doc's own rule that the line is spent on what the reader can act on
+/// right now: the count is already drawn as rows, the redirected keystroke
+/// is not drawn anywhere.
+fn composer_hint(
+    pending: usize,
+    has_draft: bool,
+    overflow: usize,
+    queued: usize,
+    held: bool,
+) -> String {
     if pending > 0 {
         // Ordered fact-first. It used to read `return to send — queued
         // behind the approval above until you answer`, which put the
         // keystroke everybody knows in front of the condition nobody does
         // — so the words a narrow composer clipped were the only ones that
         // said anything.
+        //
+        // Slice AG1 #7: this sentence was true and unbacked — the message
+        // had gone into the CLI's stdin and been swallowed there. It is
+        // now backed by a row the operator can see, edit and take back,
+        // and the words did not have to change to become honest.
         "queued behind the approval until you answer — return to send".into()
     } else if overflow > 0 {
         format!("{} files per send — {overflow} not attached", attach::MAX)
+    } else if has_draft && held {
+        "return to queue behind this turn · shift-return for a line".into()
+    } else if queued > 0 {
+        let n = queued;
+        if n == 1 {
+            "1 follow-up queued — it goes when this turn ends".into()
+        } else {
+            format!("{n} follow-ups queued — the first goes when this turn ends")
+        }
     } else if has_draft {
         // Slice CM: shift-return is named because it is the one affordance in
         // the composer with no other way to be found. A multi-line draft is
@@ -22694,6 +23117,8 @@ impl Render for Shell {
         let composer_text = self.composer.read(cx).field.read(cx).content().to_string();
         let attachments = self.composer.read(cx).attachments.clone();
         let overflow = self.composer.read(cx).overflow;
+        let queued = self.composer.read(cx).queued.clone();
+        let send_held = self.send_is_held(cx);
         let has_text = !composer_text.is_empty();
         let has_files = !attachments.is_empty();
         let has_draft = has_text || has_files;
@@ -22981,6 +23406,7 @@ impl Render for Shell {
                                 .child(SharedString::from(usage))
                         })),
                 )
+                .children((!queued.is_empty()).then(|| self.composer_queue_rows(&queued, cx)))
                 .children(has_files.then(|| self.composer_files_row(&attachments, cx)))
                 .child(
                     div()
@@ -23184,6 +23610,8 @@ impl Render for Shell {
                                     pending_here,
                                     has_draft,
                                     overflow,
+                                    queued.len(),
+                                    send_held,
                                 ))),
                         )
                         .child(div().flex_1())
@@ -25322,6 +25750,11 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         overflow: 0,
                         runtime_mode: RuntimeMode::default(),
                         parked_modes: HashMap::new(),
+                        queued: Vec::new(),
+                        parked_queues: HashMap::new(),
+                        next_queued_id: 1,
+                        awaiting: false,
+                        parked_awaiting: HashSet::new(),
                     });
                     // Slice K: the approval card's buttons are built by a
                     // static row fn with no `Context`, so give the transcript
@@ -25401,10 +25834,25 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     })
                     .detach();
                     cx.observe(&conn, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
+                    // Slice AG1 #7: the rail carries the session's state
+                    // and its pending-approval count, which are half of
+                    // what decides whether a follow-up can go out. An
+                    // approval answered from the rail's own keyboard
+                    // chords changes this and nothing on the transcript.
+                    cx.observe(&sessions, |shell: &mut Shell, _, cx| {
+                        shell.release_queued(cx);
+                        cx.notify();
+                    })
+                    .detach();
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();
                     cx.observe(&transcript, |shell, _, cx| {
                         shell.maybe_auto_approve(cx);
+                        // ...and the other half. A turn ending is a
+                        // transcript fact — `TurnCompleted` arriving in a
+                        // record batch, or the one-second heartbeat
+                        // settling an unannounced turn — so both settle
+                        // paths reach the queue through this one line.
+                        shell.release_queued(cx);
                         cx.notify();
                     })
                     .detach();
@@ -27023,24 +27471,79 @@ mod tests {
     #[test]
     fn the_composer_states_the_keystroke_only_when_it_is_true() {
         assert_eq!(
-            composer_hint(0, false, 0),
+            composer_hint(0, false, 0, 0, false),
             "",
             "the composer is still captioning an action nobody can take — \
              `send_current` emits nothing on an empty draft"
         );
         assert_eq!(
-            composer_hint(0, true, 0),
+            composer_hint(0, true, 0, 0, false),
             "return to send · shift-return for a line"
         );
 
         for drafting in [false, true] {
-            let warned = composer_hint(2, drafting, 0);
+            let warned = composer_hint(2, drafting, 0, 0, true);
             assert!(
                 warned.contains("queued behind the approval"),
                 "a question is open and the composer did not say the send \
                  would queue (draft={drafting}): {warned:?}"
             );
         }
+    }
+
+    /// **The keystroke stops claiming to send once it does not** (AG1 #7).
+    ///
+    /// The hint's whole justification is that it describes an action the
+    /// reader can take right now. With a turn in flight Return no longer
+    /// sends — it queues — so the line that says otherwise is not a stale
+    /// hint, it is the only thing on screen contradicting the rows the
+    /// queue draws underneath it.
+    #[test]
+    fn a_held_composer_says_return_will_queue_not_send() {
+        let held = composer_hint(0, true, 0, 0, true);
+        assert!(
+            held.contains("queue"),
+            "a draft that Return will queue is still captioned as a send: {held:?}"
+        );
+        assert!(
+            !held.contains("return to send"),
+            "the send caption survived into a state where Return does not send: {held:?}"
+        );
+        // ...and the moment the turn ends it is the ordinary hint again.
+        assert_eq!(
+            composer_hint(0, true, 0, 0, false),
+            "return to send · shift-return for a line"
+        );
+    }
+
+    /// A standing queue says WHEN, and it says it in the one case the rows
+    /// cannot: the composer is empty, so there is no draft hint competing
+    /// for the line and nothing else on screen states the release rule.
+    #[test]
+    fn a_standing_queue_says_when_the_first_one_goes() {
+        let one = composer_hint(0, false, 0, 1, true);
+        assert!(
+            one.contains("1 follow-up queued") && one.contains("when this turn ends"),
+            "a queued follow-up did not say when it goes: {one:?}"
+        );
+        let many = composer_hint(0, false, 0, 3, true);
+        assert!(
+            many.contains("3 follow-ups queued") && many.contains("the first"),
+            "three queued rows did not say which one goes next: {many:?}"
+        );
+        // The approval warning still outranks it: that string says WHY the
+        // queue exists, which is the fact the reader is missing.
+        assert!(
+            composer_hint(1, false, 0, 3, true).contains("queued behind the approval"),
+            "the count displaced the reason the send is being held"
+        );
+        // ...and a draft in hand outranks the count, because the count is
+        // already drawn as rows and the redirected keystroke is not drawn
+        // anywhere.
+        assert!(
+            composer_hint(0, true, 0, 3, true).contains("return to queue"),
+            "the standing count displaced the live keystroke"
+        );
     }
 
     #[test]
