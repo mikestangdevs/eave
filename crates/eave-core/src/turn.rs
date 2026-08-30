@@ -161,6 +161,11 @@ fn marks_agent_work(event: &SessionEvent) -> bool {
         | SessionEvent::UserEcho { .. }
         | SessionEvent::TurnCompleted { .. }
         | SessionEvent::System { .. }
+        // Reasoning is not a turn opener. It arrives inside a turn that
+        // something else opened, and a lone chunk that opened one would
+        // mint a phantom `Unannounced`. `System` above carries the ACP
+        // spelling of the same fact and is false for the same reason.
+        | SessionEvent::ThoughtDelta { .. }
         | SessionEvent::ApprovalWithdrawn { .. }
         | SessionEvent::DialogRefused { .. }
         | SessionEvent::PostureRefused { .. }

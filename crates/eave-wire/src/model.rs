@@ -498,6 +498,30 @@ impl Transcript {
         }
     }
 
+    /// Accumulate this turn's reasoning.
+    ///
+    /// **Two wire shapes reach here and this is the only place either of
+    /// them lands.** ACP agents send `agent_thought_chunk` as a `System`
+    /// frame; Claude sends a typed [`SessionEvent::ThoughtDelta`] decoded
+    /// from its `thinking_delta`. Keeping the accumulation in one function
+    /// is what stops two decoders becoming two behaviours — the clock in
+    /// particular, which starts at the FIRST chunk of the turn whichever
+    /// provider sent it, and is cleared with the thought on the next
+    /// `UserSent`.
+    fn push_thought(&mut self, text: &str) {
+        // An empty chunk is not a thought. The decoders drop these at the
+        // wire, but a journal written before they did still replays them,
+        // and starting the clock on one would report a session as having
+        // thought for an hour about nothing.
+        if text.is_empty() {
+            return;
+        }
+        if self.thought_started_ms.is_none() {
+            self.thought_started_ms = Some(eave_core::journal::now_ms());
+        }
+        self.thought.push_str(text);
+    }
+
     fn apply_provider(&mut self, event: &SessionEvent) {
         match event {
             SessionEvent::Init {
@@ -649,15 +673,14 @@ impl Transcript {
                 }
             }
             SessionEvent::System { subtype, raw } => {
+                // The ACP spelling. Claude's arrives typed, below.
                 if subtype == "agent_thought_chunk" {
                     if let Some(text) = thought_text(raw) {
-                        if self.thought_started_ms.is_none() {
-                            self.thought_started_ms = Some(eave_core::journal::now_ms());
-                        }
-                        self.thought.push_str(&text);
+                        self.push_thought(&text);
                     }
                 }
             }
+            SessionEvent::ThoughtDelta { text } => self.push_thought(text),
             // Slice CJ. A child thread's frame is recorded, never
             // rendered: eave has no subagent surface, and painting a
             // child's prose or tool row into the parent's transcript is
@@ -1161,6 +1184,70 @@ mod tests {
         // Gap: seq 4 after 2 errors.
         let r4 = rec(4, JournalEvent::UserDelivered {});
         assert!(t.apply(1, &[r4]).is_err());
+    }
+
+    /// Two providers spell reasoning differently and both land in one
+    /// place, with one clock.
+    ///
+    /// Claude sends a typed `ThoughtDelta` decoded from `thinking_delta`;
+    /// ACP agents send their own `session/update` frame as `System`. If
+    /// these accumulated separately the box would show one provider's
+    /// reasoning and not the other's — which is exactly the state eave was
+    /// in until 2026-08-30, when the Claude half was decoded to nothing.
+    #[test]
+    fn reasoning_from_either_wire_shape_lands_in_one_place() {
+        const ACP: &str = r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"content":{"text":"and then","type":"text"},"sessionUpdate":"agent_thought_chunk"}}}"#;
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    JournalEvent::Provider {
+                        event: SessionEvent::ThoughtDelta {
+                            text: "first ".into(),
+                        },
+                    },
+                ),
+                rec(
+                    2,
+                    JournalEvent::Provider {
+                        event: SessionEvent::System {
+                            subtype: "agent_thought_chunk".into(),
+                            raw: ACP.into(),
+                        },
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            t.thought, "first and then",
+            "one accumulator, two spellings"
+        );
+        assert!(
+            t.thought_started_ms.is_some(),
+            "the clock starts at the first chunk whoever sent it"
+        );
+        // Reasoning is not a message: it must not push a row.
+        assert!(t.rows.is_empty(), "reasoning drew a transcript row");
+
+        // The next prompt clears it — a thought belongs to its turn.
+        t.apply(
+            1,
+            &[rec(
+                3,
+                JournalEvent::UserSent {
+                    text: "next".into(),
+                },
+            )],
+        )
+        .unwrap();
+        assert_eq!(t.thought, "", "a turn's reasoning outlived its turn");
+        assert!(
+            t.thought_started_ms.is_none(),
+            "the clock outlived its turn"
+        );
     }
 
     #[test]

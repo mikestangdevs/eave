@@ -336,12 +336,54 @@ impl ClaudeStream {
                     Vec::new()
                 }
             }
-            Some("content_block_delta") => match ev["delta"].get("text").and_then(Value::as_str) {
-                Some(text) => vec![SessionEvent::TextDelta {
-                    text: text.to_string(),
-                }],
-                None => Vec::new(),
-            },
+            Some("content_block_delta") => {
+                // Three delta shapes share this frame and they are told
+                // apart by WHICH KEY carries the string, not by a type
+                // tag: answer text is `text`, reasoning is `thinking`,
+                // and `signature_delta` carries `signature`, which is a
+                // cryptographic receipt for the thinking block and not
+                // anything to render.
+                //
+                // **Reasoning was silently dropped until 2026-08-30**:
+                // this arm read `delta.text` and returned nothing for a
+                // `thinking_delta`, so the reasoning box could only ever
+                // be filled by an ACP agent.
+                //
+                // **And decoding it is currently a no-op, which is the
+                // CLI's doing and is measured, not assumed.** Claude Code
+                // 2.1.251 REDACTS the content: every `thinking_delta`
+                // carries `"thinking": ""` with an `estimated_tokens`
+                // count beside it, and the opening
+                // `content_block_start` carries `"thinking": ""` and
+                // `"signature": ""` too. eave is shown the SHAPE of the
+                // thinking and none of the text.
+                //
+                // So the empty filter below is load-bearing, not
+                // defensive: without it every turn writes a run of
+                // `thought_delta` records carrying nothing, and starts
+                // the reasoning clock for a trace that will never have a
+                // word in it. The decode stays because it is correct and
+                // costs nothing, and it starts working the day the CLI
+                // stops redacting — the `estimated_tokens` field is a
+                // real fact and a different feature, deliberately not
+                // built here.
+                let delta = &ev["delta"];
+                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                    vec![SessionEvent::TextDelta {
+                        text: text.to_string(),
+                    }]
+                } else if let Some(text) = delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                {
+                    vec![SessionEvent::ThoughtDelta {
+                        text: text.to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
         }
     }
@@ -979,6 +1021,59 @@ mod usage_tests {
     /// bill is 53,820 input tokens and the context holds 26,967. A build
     /// that read occupancy off the result line would report the window
     /// twice as full as it is, and would do so more the more tools ran.
+    /// Claude streams reasoning as `thinking_delta`, and eave dropped every
+    /// one of them until 2026-08-30.
+    ///
+    /// The frame is the same `content_block_delta` that carries answer
+    /// text; only the KEY differs. Reading `delta.text` and stopping meant
+    /// the reasoning box — which has shipped for slices — could only ever
+    /// be filled by an ACP agent. Shapes captured from eave's exact argv.
+    #[test]
+    fn claude_reasoning_is_decoded_and_not_confused_with_its_answer() {
+        let mut s = ClaudeStream::new();
+        let ev = |s: &mut ClaudeStream, line: &str| s.parse_line(line);
+
+        // The block opening carries no text of its own.
+        assert!(
+            ev(&mut s, r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}"#).is_empty(),
+            "a thinking block's start is not a chunk"
+        );
+        let got = ev(
+            &mut s,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"17 x 23. "}}}"#,
+        );
+        assert_eq!(
+            got,
+            vec![SessionEvent::ThoughtDelta {
+                text: "17 x 23. ".into()
+            }],
+            "a thinking_delta is reasoning"
+        );
+        // **What the CLI actually sends today**, captured 2026-08-30: the
+        // content is redacted and only a token estimate rides along. An
+        // empty chunk must produce NO event — otherwise every turn writes
+        // a run of empty records and starts the reasoning clock for a
+        // trace that will never have a word in it.
+        assert!(
+            ev(&mut s, r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}}}"#).is_empty(),
+            "a redacted thinking chunk journalled an empty thought"
+        );
+        // A signature is a cryptographic receipt for the block, not text.
+        assert!(
+            ev(&mut s, r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc123=="}}}"#).is_empty(),
+            "a signature_delta rendered as reasoning would put base64 in the box"
+        );
+        // And the answer still decodes as the answer.
+        assert_eq!(
+            ev(
+                &mut s,
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"391"}}}"#
+            ),
+            vec![SessionEvent::TextDelta { text: "391".into() }],
+            "answer text must not become reasoning"
+        );
+    }
+
     #[test]
     fn a_turn_with_a_tool_bills_the_prompt_twice_and_the_context_holds_it_once() {
         let mut s = ClaudeStream::new();

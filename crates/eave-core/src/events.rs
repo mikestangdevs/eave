@@ -202,6 +202,24 @@ pub enum SessionEvent {
     },
     /// Incremental assistant text (from partial-message stream events).
     TextDelta { text: String },
+    /// Incremental *reasoning* — the model thinking in public, before or
+    /// between its answer text.
+    ///
+    /// **Typed rather than a `System` frame, and that is the point.** ACP
+    /// agents send reasoning in their own wire form and it is decoded from
+    /// `System { subtype: "agent_thought_chunk", .. }`; Claude sends a
+    /// `thinking_delta` on the partial-message stream, which is not an ACP
+    /// frame and must not be dressed as one — a `raw` that claims to be a
+    /// `session/update` nobody sent is a journal line that lies. Two wire
+    /// shapes, two decoders, and **one place they land**
+    /// (`Projection::push_thought`), so they cannot become two behaviours.
+    ///
+    /// Deliberately NOT agent work for [`crate::turn`]: reasoning arrives
+    /// inside a turn something else already opened, and letting it open one
+    /// is how a lone chunk mints a phantom `Unannounced` turn. `System`
+    /// carrying the ACP spelling is `false` for the same reason, so the two
+    /// providers behave identically.
+    ThoughtDelta { text: String },
     /// A complete assistant text block (the post-stream snapshot message).
     AssistantText { text: String },
     /// A tool call became outstanding. Emitted once per tool id.
