@@ -101,6 +101,7 @@ fn session(id: &str) -> SessionInfo {
         checkout_root: None,
         shared_with: Vec::new(),
         worktree: None,
+        diff_stat: None,
         pending_approvals: 0,
         permission_mode: None,
         rss_bytes: None,
@@ -614,6 +615,15 @@ fn a_marked_row_still_shows_its_folder(cx: &mut TestAppContext) {
     crowded.cwd = "/Users/somebody/very/deeply/nested/checkout/of/a/project".into();
     crowded.shared_with = (0..9).map(|i| format!("share{i}00000")).collect();
     crowded.worktree = Some(worktree("eave/cccc3333", Some(999_999), true));
+    // Slice AG2 #11 gave every row a diffstat, and this row carries the
+    // widest one. It is set HERE, on the test that measures line three,
+    // precisely because the answer was to keep it OFF line three: a stat
+    // that ever drifted back onto this line would take the folder from a
+    // passing width to 25 px, and this assertion is what would say so.
+    crowded.diff_stat = Some(DiffStat {
+        adds: 999_999,
+        dels: 999_999,
+    });
     h.plumbing.push_rail(vec![crowded]);
     vcx.run_until_parked();
     let folder = vcx.debug_bounds("cwd-cccc3333").unwrap();
@@ -7831,6 +7841,233 @@ fn a_project_has_one_colour_and_one_place_that_decides_it(_cx: &mut TestAppConte
             "{helper} is reached from somewhere other than project_color"
         );
     }
+}
+
+// ── Slice AG2 #11 — the diffstat on every row ──────────────────
+
+/// The row this slice exists for is the one you are NOT looking at.
+///
+/// The `+N −N` used to be summed in the rail from the single `files`
+/// subscription the shell holds, which is the selected session's and
+/// nobody else's — fourteen other sessions could each be carrying a
+/// hundred uncommitted lines and the rail said nothing about any of them.
+/// It is a session fact now, so it arrives on the same watch frame as the
+/// state word, for every row at once.
+///
+/// The third session is the other half of the claim: `None` is an honest
+/// silence and must draw NOTHING, never a `+0 −0`.
+#[gpui::test]
+fn every_row_states_its_own_diffstat_not_only_the_selected_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.diff_stat = Some(DiffStat { adds: 12, dels: 3 });
+    let mut b = session("bbbb2222");
+    b.diff_stat = Some(DiffStat {
+        adds: 400,
+        dels: 91,
+    });
+    // Nothing to say: no scan yet, a failed scan, a truncated list, or a
+    // clean tree — `FilesSnapshot::diff_stat` decides which, and every one
+    // of them arrives here as the same `None`.
+    let c = session("cccc3333");
+    h.plumbing.push_rail(vec![a, b, c]);
+    // The shell is subscribed to A, and holds no files snapshot for B at
+    // all. Under the old rule that alone was enough to blank B's numbers.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "stat-aaaa1111"),
+        "the selected row lost its stat"
+    );
+    assert!(
+        shown(vcx, "stat-bbbb2222"),
+        "a row nobody is subscribed to still has no numbers"
+    );
+    assert!(
+        !shown(vcx, "stat-cccc3333"),
+        "a session with no honest number drew one anyway"
+    );
+}
+
+/// Which LINE the numbers are on, pinned — because the answer cost a
+/// measurement and nothing else in the file records it.
+///
+/// The stat shipped on line three for one release, beside the path, back
+/// when only the selected row had one. Once every row has one that line
+/// cannot hold it: `a_marked_row_still_shows_its_folder` measured the
+/// folder at 25 px of the 142 px line three shares, and `/Us…` is the exact
+/// failure that test exists to catch. Line one had the room and the better
+/// argument — the age is already there, and a magnitude and a span are the
+/// same kind of glance.
+///
+/// Asserted as geometry rather than as a comment: same row as the age,
+/// strictly above the path, and left of the age so the corner clock stays
+/// the corner clock.
+#[gpui::test]
+fn the_diffstat_sits_with_the_age_and_not_with_the_path(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut s = session("aaaa1111");
+    s.diff_stat = Some(DiffStat {
+        adds: 124,
+        dels: 18,
+    });
+    // An age the row will actually render: `coarse_age` says nothing under
+    // a minute, and a fixture stamp is not an age.
+    s.last_activity_ms = Some(eave_core::journal::now_ms().saturating_sub(2 * 60 * 60 * 1_000));
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+
+    let mut at = |sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+    };
+    let stat = at("stat-aaaa1111");
+    let age = at("age-aaaa1111");
+    let cwd = at("cwd-aaaa1111");
+
+    assert_eq!(
+        stat.origin.y, age.origin.y,
+        "the stat and the age should share line one"
+    );
+    assert!(
+        stat.origin.y < cwd.origin.y,
+        "the stat is back on line three with the path: stat {:?}, path {:?}",
+        stat.origin,
+        cwd.origin
+    );
+    assert!(
+        stat.origin.x + stat.size.width <= age.origin.x,
+        "the stat took the corner the age holds"
+    );
+}
+
+/// Every row STATES its numbers; only the row you are in is a DOOR.
+///
+/// `toggle_files_face` swaps the well's face for the session the well is
+/// showing. Fired from another row it would change a face you are not
+/// looking at, on a session you did not name, and leave the number you
+/// actually clicked unexplained — so off the selected row the stat carries
+/// no handler at all and the click belongs to the row, which is the
+/// ordinary thing a click on a row does.
+#[gpui::test]
+fn the_diffstat_is_a_door_only_on_the_row_you_are_in(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.diff_stat = Some(DiffStat { adds: 12, dels: 3 });
+    let mut b = session("bbbb2222");
+    b.diff_stat = Some(DiffStat {
+        adds: 400,
+        dels: 91,
+    });
+    h.plumbing.push_rail(vec![a, b]);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    click(vcx, "stat-bbbb2222");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "rail-rows"),
+        "another row's stat swapped the rail's face"
+    );
+    assert!(
+        matches!(h.drain().as_slice(), [Command::Select(id)] if id == "bbbb2222"),
+        "the click should have belonged to the row it landed on"
+    );
+
+    click(vcx, "stat-aaaa1111");
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "rail-rows"),
+        "the selected row's stat is still the door to the changes face"
+    );
+    assert!(
+        h.drain().is_empty(),
+        "the door stops the click; it must not also re-select the row"
+    );
+}
+
+/// The floor line one now needs, for the reason line three has one.
+///
+/// Slice AG2 #11 put a permanent third occupant on this line, so the same
+/// question applies to it: with everything at its widest, does the thing
+/// that yields yield to NOTHING? It does not, and the reason is structural
+/// rather than lucky — both of the flanking facts are hard-bounded to four
+/// characters (`coarse_lines`, `coarse_age`), so what is left for the
+/// kicker has a floor that no session's data can move.
+///
+/// A truncated provider name is the cheapest loss on the card: the chip
+/// beside it carries the identity, and its own docs call the text "a label
+/// for the name beside it". That is why this floor is 36 px where line
+/// three's is 80.
+///
+/// **This is the extreme, not the ordinary row.** `+124 −18` beside a `2h`
+/// leaves the kicker 71 px and `Claude Code` renders whole (67.4 px at
+/// `MICRO_SIZE`). Reaching 39 px takes a session with six figures of
+/// changed lines AND a span near the year rollover AND a model name — all
+/// three at once.
+#[gpui::test]
+fn line_one_never_squeezes_the_provider_to_nothing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut s = session("aaaa1111");
+    // Everything at its widest, at once: `+999k -999k` is the widest the
+    // coarse ladder can shape to, `364d` the widest span before the year
+    // rollover, and a long model name pushes the kicker past its box.
+    s.diff_stat = Some(DiffStat {
+        adds: 999_999,
+        dels: 999_999,
+    });
+    s.last_activity_ms =
+        Some(eave_core::journal::now_ms().saturating_sub(364 * 24 * 60 * 60 * 1_000));
+    s.model = Some("claude-sonnet-4-5-20250929".into());
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+
+    let _ = vcx
+        .debug_bounds("age-aaaa1111")
+        .expect("no age on the row — this is not the crowded line the test means");
+    let prov = vcx
+        .debug_bounds("prov-aaaa1111")
+        .expect("the kicker vanished");
+    assert!(
+        prov.size.width >= px(36.),
+        "the kicker was squeezed to {:?} by the numbers beside it",
+        prov.size.width
+    );
+}
+
+/// One source for the number, pinned in the source itself.
+///
+/// The defect this forecloses is the two-favicon-cache one: a rail summing
+/// its own total from the `files` subscription while the engine stamps
+/// another onto the row would show two different numbers for one tree
+/// depending on which one last arrived. `files_diffstat` was that second
+/// summer and is gone; `FilesSnapshot::diff_stat` in `eave-wire` is the one
+/// place that decides, and the rail only renders what it decided.
+#[gpui::test]
+fn the_rail_sums_nothing_and_renders_one_number(_cx: &mut TestAppContext) {
+    let src = include_str!("ui.rs");
+    let prod = &src[..src.rfind("#[cfg(test)]").expect("ui.rs has a test module")];
+    assert_eq!(
+        prod.matches("files_diffstat").count(),
+        0,
+        "the rail is summing a snapshot again"
+    );
+    assert_eq!(
+        prod.matches("files_stat").count(),
+        0,
+        "the selected-session-only stat is back"
+    );
+    assert_eq!(
+        prod.matches("let stat = info.diff_stat;").count(),
+        1,
+        "the row's number should come from the session fact, once"
+    );
 }
 
 // ── Slice AG2 #12 — bulk operations ───────────────────────────────────

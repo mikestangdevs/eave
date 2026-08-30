@@ -779,6 +779,29 @@ pub struct SessionInfo {
     /// them automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
+    /// Lines added and removed across everything uncommitted in this
+    /// session's cwd (AG2 #11). `None` is an honest unknown and never a
+    /// `+0 −0`; [`FilesSnapshot::diff_stat`] is the one place that
+    /// decides which it is, and its docs list every case.
+    ///
+    /// A quantity, like [`rss_bytes`](SessionInfo::rss_bytes) is a size
+    /// and [`pending_approvals`](SessionInfo::pending_approvals) is a
+    /// count, so the watch channel may carry it: the isolation invariant
+    /// (spec 05 §Watch) bars transcript CONTENT, and how many lines
+    /// stand uncommitted on disk is a fact about the checkout, not about
+    /// what the operator asked the agent to do. It is the fact
+    /// [`WorktreeInfo::dirty_files`] already crosses with, one unit
+    /// finer.
+    ///
+    /// It lives here rather than on [`WorktreeInfo`] because a session
+    /// that was never isolated has a diff too, and the point of the field
+    /// is that every row can state one.
+    ///
+    /// **As fresh as that session's last scan**, which for a session
+    /// nobody is subscribed to is its last turn boundary — exactly
+    /// `dirty_files`' staleness, so not a new class of stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_stat: Option<DiffStat>,
     /// Resident memory held by this session's agent process right now, in
     /// bytes (Stage L). `None` when nothing is live, when the probe
     /// failed, or from an engine predating this field — never a zero,
@@ -1028,6 +1051,53 @@ pub struct ChangedFile {
     /// is the file's own content — `git diff HEAD` cannot see it).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub untracked: bool,
+}
+
+/// Lines added and removed, summed over a change list (AG2 #11).
+///
+/// One field carrying two numbers rather than two `Option<u64>`s: adds
+/// and dels are one measurement, and either both are known or neither
+/// is. A pair of options could be half-present, which is a state that
+/// means nothing and that every reader would have to invent a rendering
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffStat {
+    pub adds: u64,
+    pub dels: u64,
+}
+
+impl FilesSnapshot {
+    /// The `+N −N` for this snapshot, or `None` when there is no honest
+    /// number to give. **The one place that decides**, so the engine's
+    /// per-session stamp and a client reading a snapshot directly cannot
+    /// disagree about the same tree.
+    ///
+    /// `None` in four cases, and each of them is a real one:
+    ///
+    /// - the scan did not answer (`state` is not `Ok`) — the same
+    ///   "honest unknown, never a fake zero" rule
+    ///   [`WorktreeInfo::dirty_files`] already follows;
+    /// - files were [`omitted`](FilesSnapshot::omitted) past the engine's
+    ///   cap. A sum over a truncated list is a WRONG number, not a
+    ///   partial one — it would render the largest change there is as
+    ///   a small one. How many files were dropped is known; how many
+    ///   lines they held is not;
+    /// - every file came without counts (binary, or too large to count),
+    ///   so the list says nothing about lines at all;
+    /// - nothing changed. A clean tree already states itself in words on
+    ///   the row, and `+0 −0` would be a second, quieter way to say the
+    ///   same thing.
+    pub fn diff_stat(&self) -> Option<DiffStat> {
+        if !matches!(self.state, GitState::Ok) || self.omitted > 0 {
+            return None;
+        }
+        let mut stat = DiffStat { adds: 0, dels: 0 };
+        for f in &self.files {
+            stat.adds += f.adds.unwrap_or(0);
+            stat.dels += f.dels.unwrap_or(0);
+        }
+        (stat.adds > 0 || stat.dels > 0).then_some(stat)
+    }
 }
 
 /// Worktree-level status, folded from git's two-letter XY codes: the
@@ -1434,6 +1504,7 @@ mod tests {
                         present: true,
                         dirty_files: Some(3),
                     }),
+                    diff_stat: Some(DiffStat { adds: 41, dels: 6 }),
                     pending_approvals: 2,
                     permission_mode: Some("default".into()),
                     rss_bytes: Some(268_435_456),
@@ -1444,6 +1515,84 @@ mod tests {
         assert!(line.contains("\"sessions\""), "{line}");
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back, resp);
+    }
+
+    /// AG2 #11: the four ways a snapshot has no honest `+N −N`, and the
+    /// one way it has one. This is the whole of the decision — the engine
+    /// stamps what this returns and the rail renders it, so a rule that is
+    /// not here is not anywhere.
+    #[test]
+    fn a_diffstat_is_a_sum_or_it_is_nothing() {
+        let file = |adds, dels| ChangedFile {
+            path: "a.rs".into(),
+            status: FileStatus::Modified,
+            adds,
+            dels,
+            orig_path: None,
+            untracked: false,
+        };
+        let snap = |state, omitted, files: Vec<ChangedFile>| FilesSnapshot {
+            state,
+            files,
+            omitted,
+            watching: false,
+            basis: DiffBasis::WorkingTree,
+        };
+
+        assert_eq!(
+            snap(
+                GitState::Ok,
+                0,
+                vec![file(Some(4), Some(1)), file(Some(2), None)]
+            )
+            .diff_stat(),
+            Some(DiffStat { adds: 6, dels: 1 }),
+            "counted files add up, and a missing half counts as zero within a list that has counts"
+        );
+
+        // A scan that did not answer is an unknown, never a fake zero —
+        // `WorktreeInfo::dirty_files`' rule, applied one unit finer.
+        assert_eq!(
+            snap(GitState::NotARepo, 0, vec![file(Some(9), Some(9))]).diff_stat(),
+            None,
+            "a non-Ok state has no number even if files somehow came with it"
+        );
+
+        // THE ONE THAT IS NOT OBVIOUS. Past the engine's list cap the
+        // omitted files' LINES are unknowable, so a sum over what
+        // survived would render the largest change there is as a small
+        // one. `dirty_files` can add `omitted` because it counts files;
+        // this cannot, so it declines.
+        assert_eq!(
+            snap(GitState::Ok, 150, vec![file(Some(4), Some(1))]).diff_stat(),
+            None,
+            "a truncated list yields a WRONG total, not a partial one"
+        );
+
+        assert_eq!(
+            snap(GitState::Ok, 0, vec![file(None, None)]).diff_stat(),
+            None,
+            "a list of uncountable files says nothing about lines"
+        );
+        assert_eq!(
+            snap(GitState::Ok, 0, Vec::new()).diff_stat(),
+            None,
+            "a clean tree states itself in words; +0 −0 would be a second, quieter claim"
+        );
+    }
+
+    /// Wire-compat both directions: an engine predating AG2 #11 puts no
+    /// key on the wire and a client reading it gets the honest unknown;
+    /// an unknown never travels as a key either, so a rail can tell
+    /// "nothing to say" from "zero" without a sentinel.
+    #[test]
+    fn a_session_without_a_diffstat_puts_no_key_on_the_wire() {
+        let line = r#"{"session_id":"s1","provider":"claude-code","cwd":"/tmp",
+            "created_ts_ms":7,"state":"new","live":false,"epoch":1,"last_seq":0}"#;
+        let info: SessionInfo = serde_json::from_str(line).unwrap();
+        assert_eq!(info.diff_stat, None);
+        let back = serde_json::to_string(&info).unwrap();
+        assert!(!back.contains("diff_stat"), "{back}");
     }
 
     /// Stage AC: one method, one bit, both directions — and a frame that

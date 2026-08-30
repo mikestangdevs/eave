@@ -42,8 +42,8 @@ use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
 use eave_wire::{
     AttentionSnapshot, ChangedFile, Cursor, DiffBasis, DiffHunk, DiffKind, DiffLine, DiffOp,
-    FileDiff, FileScope, FileStatus, FilesSnapshot, GitState, SessionInfo, SubscriptionItem,
-    WaitReason,
+    DiffStat, FileDiff, FileScope, FileStatus, FilesSnapshot, GitState, SessionInfo,
+    SubscriptionItem, WaitReason,
 };
 
 use crate::access::{self, RuntimeMode};
@@ -1801,6 +1801,11 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         checkout_root: None,
         shared_with: Vec::new(),
         worktree: None,
+        // Slice AG2 #11: from the SAME snapshot the files rail is handed
+        // three lines below, because that is where the engine's number
+        // comes from too — a rig that invented its own total would draw a
+        // row disagreeing with the pane it sits beside.
+        diff_stat: synthetic_files_snapshot().diff_stat(),
         pending_approvals: 0,
         permission_mode: Some("default".into()),
         // A real `claude` sits in this range; the replay rig is the only
@@ -2949,6 +2954,45 @@ fn coarse_age(ms: u64) -> Option<String> {
     Some(format!("{}y", days / 365))
 }
 
+/// One side of a row's diffstat, in **at most four characters** (AG2 #11).
+///
+/// [`coarse_age`]'s rule, on the same line and for the same reason. Exact
+/// under a thousand, then the coarsest unit that is still true, floored
+/// rather than rounded so the label never claims more than the tree holds.
+/// A rail is glanced at down fifteen rows, where the difference between
+/// `+1204` and `+1198` is not a fact anybody acts on and every pixel it
+/// costs comes out of the path beside it: measured, `+999999 −999999`
+/// shapes to 98 px of the 142 px line three shares, and leaves the folder
+/// nothing.
+///
+/// The exact number is one click away — the selected row's stat is the
+/// door to the changes pane, which counts per file.
+fn coarse_lines(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 10_000 {
+        return format!("{}.{}k", n / 1_000, (n % 1_000) / 100);
+    }
+    if n < 1_000_000 {
+        return format!("{}k", n / 1_000);
+    }
+    if n < 10_000_000 {
+        return format!("{}.{}M", n / 1_000_000, (n % 1_000_000) / 100_000);
+    }
+    if n < 1_000_000_000 {
+        return format!("{}M", n / 1_000_000);
+    }
+    // The ladder STOPS, rather than growing a unit per three digits. Past
+    // a billion the exact figure has no reader, and a label that kept
+    // climbing would eventually be wider than the slot it is pinned to fit
+    // — which is the failure this whole function exists to prevent. `>1G`
+    // is bounded, is four characters, and is true of every `u64` above the
+    // rung, so the width invariant holds for values git cannot produce as
+    // well as for the ones it can.
+    ">1G".to_string()
+}
+
 /// Age on a folder-popup row. Fixture timestamps (`created_ts_ms == 1`
 /// or 0) are not ages. Wording follows the screenshot: "2 months ago",
 /// not the rail's `60d`.
@@ -3261,10 +3305,14 @@ fn provider_kicker(info: &SessionInfo, provider_label: &str) -> String {
 /// When a header is there, the home-relative cwd is the one thing on the row
 /// that the header just said. Grouping made this line redundant, and the
 /// redundancy is not free: line three is the row's most constrained, sharing
-/// its width with the diffstat and the sharing count, so a repeated path
+/// its width with the sharing count and the worktree mark, so a repeated path
 /// truncates to `~/Desktop/eave…` — spending the space to say the header
 /// again AND losing the segment that would tell two rows apart. Observed in
 /// the running rail, not deduced.
+///
+/// (Slice AG2 #11 briefly put a diffstat on this line too and measured what
+/// it cost: 25 px of folder out of 142. The stat lives on line one for that
+/// reason, and this line's budget is the one it always had.)
 ///
 /// So, under a header: the cwd that IS the root renders nothing, and a cwd
 /// beneath it renders the part the header does not cover. A worktree keeps
@@ -3315,21 +3363,6 @@ fn row_repo_line_full(info: &SessionInfo, home: Option<&str>) -> String {
     } else {
         short_cwd(&info.cwd, home)
     }
-}
-
-/// Line +/− for a files snapshot. `None` when git did not answer, or when
-/// every file came without counts — never a fake `+0 −0`.
-fn files_diffstat(snap: &FilesSnapshot) -> Option<(u64, u64)> {
-    if !matches!(snap.state, GitState::Ok) {
-        return None;
-    }
-    let mut adds = 0u64;
-    let mut dels = 0u64;
-    for f in &snap.files {
-        adds += f.adds.unwrap_or(0);
-        dels += f.dels.unwrap_or(0);
-    }
-    (adds > 0 || dels > 0).then_some((adds, dels))
 }
 
 /// Age for the card's trailing clock. Fixture timestamps (`created_ts_ms
@@ -16681,10 +16714,6 @@ impl Shell {
         // rows it accounts for. The header says what you can see; the lines
         // under it say what you cannot, and why.
         let sess_count = sessions.len();
-        let files_stat = match (self.files.read(cx).snapshot.clone(), selected.as_deref()) {
-            (Some((sid, Some(snap))), Some(sel)) if sid == sel => files_diffstat(&snap),
-            _ => None,
-        };
         // ONE instant for the whole paint: fifteen rows disagreeing by
         // the microseconds between their own `now()` calls is how a list
         // ends up showing two sessions that started together a minute
@@ -16720,7 +16749,17 @@ impl Shell {
                 // glanced down: the second unit is noise and the seconds
                 // change under the eye. One unit, at most four characters.
                 let age = session_age_ms(&info, now_ms).and_then(coarse_age);
-                let stat = is_sel.then_some(files_stat).flatten();
+                // Slice AG2 #11. This used to be the SELECTED row's number
+                // and nothing else: the rail summed the one `files`
+                // subscription it holds, so fourteen other sessions could
+                // each be carrying a hundred uncommitted lines and the rail
+                // said nothing about any of them. The number is a session
+                // fact now (`SessionInfo::diff_stat`), summed engine-side
+                // from the scan every session already gets, so it arrives
+                // for every row on the same watch frame as the state word.
+                // `None` stays an honest silence — see the field's docs for
+                // the four ways it can be one.
+                let stat = info.diff_stat;
                 let dot = state_color(&info.state);
                 // Slice K: the badge counts the open questions when there
                 // is more than one — "waiting on you (3)" is a different
@@ -17021,6 +17060,71 @@ impl Shell {
                                     .text_color(theme::text_tertiary())
                                     .child(SharedString::from(kicker)),
                             )
+                            // Slice AG2 #11 — the diffstat, beside the age.
+                            //
+                            // It sat on line three for one release, next to
+                            // the path, because the selected row was the
+                            // only row that had one. Once EVERY row has one
+                            // that line does not fit: measured on the
+                            // rail's own floor test, path + `+N −N` + the
+                            // marks group leaves the folder 25 px of the
+                            // 142 px it shares, and `/Us…` is the exact
+                            // failure `a_marked_row_still_shows_its_folder`
+                            // was written to catch.
+                            //
+                            // Line one is where it belongs anyway: the age
+                            // is here, and these are the same KIND of fact
+                            // — a magnitude you glance at down fifteen
+                            // rows, never a thing you read. What yields for
+                            // it is the kicker, which is `flex_1` and
+                            // truncates, and which its own docs call the
+                            // row's quiet line. A truncated provider name
+                            // costs less than a truncated path, which is
+                            // "the one thing on that line a person
+                            // recognises".
+                            .children(stat.map(|DiffStat { adds, dels }| {
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "stat-{}",
+                                        info.session_id
+                                    )))
+                                    .debug_selector(|| format!("stat-{}", info.session_id))
+                                    .flex_none()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(theme::SPACE_1))
+                                    // Every row STATES its numbers; only the
+                                    // row you are in is a DOOR.
+                                    // `toggle_files_face` swaps the well's
+                                    // face for the session the well is
+                                    // showing — from another row it would
+                                    // change a face you are not looking at,
+                                    // on a session you did not name, and
+                                    // leave the number you actually clicked
+                                    // unexplained.
+                                    .when(is_sel, |stat| {
+                                        stat.cursor_pointer().on_click(cx.listener(
+                                            |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.toggle_files_face(cx);
+                                            },
+                                        ))
+                                    })
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .text_color(theme::success())
+                                            .child(format!("+{}", coarse_lines(adds))),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .line_height(px(theme::MICRO_LINE))
+                                            .text_color(theme::danger())
+                                            .child(format!("-{}", coarse_lines(dels))),
+                                    )
+                            }))
                             .children(age.map(|word| {
                                 div()
                                     .debug_selector(|| format!("age-{}", info.session_id))
@@ -17184,19 +17288,20 @@ impl Shell {
                                     .child(SharedString::from(word))
                             })),
                     )
-                    // LINE THREE — branch / cwd, and the selected session's
-                    // diffstat. Files no longer sit under this list; the
-                    // +/− is the summary, the footer is the door.
+                    // LINE THREE — branch / cwd, and the marks group.
                     //
-                    // Slice AG2 #9: the whole line is conditional now. Under
-                    // a project header the path can be redundant and
+                    // Slice AG2 #9: the whole line is conditional. Under a
+                    // project header the path can be redundant and
                     // `row_repo_line` returns `None` for it — but the
-                    // diffstat and the sharing count live here too, so the
-                    // PATH going quiet may not take them with it. The line
-                    // is dropped only when it would carry nothing at all.
-                    .when(
-                        repo_line.is_some() || stat.is_some() || marks.is_some(),
-                        |row| {
+                    // sharing count and the worktree mark live here too, so
+                    // the PATH going quiet may not take them with it. The
+                    // line is dropped only when it would carry nothing at
+                    // all.
+                    //
+                    // Slice AG2 #11 took the diffstat OFF this line rather
+                    // than adding fifteen of them to it; the reason is
+                    // written where it went, on line one.
+                    .when(repo_line.is_some() || marks.is_some(), |row| {
                             row.child(
                         div()
                             .pl(px(meta_indent))
@@ -17233,37 +17338,6 @@ impl Shell {
                                             .line_height(px(theme::DETAIL_LINE))
                                             .text_color(theme::text_secondary())
                                             .child(SharedString::from(line)),
-                                    )
-                            }))
-                            .children(stat.map(|(adds, dels)| {
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "stat-{}",
-                                        info.session_id
-                                    )))
-                                    .debug_selector(|| format!("stat-{}", info.session_id))
-                                    .flex_none()
-                                    .flex()
-                                    .flex_row()
-                                    .gap(px(theme::SPACE_1))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_files_face(cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::MICRO_SIZE))
-                                            .line_height(px(theme::MICRO_LINE))
-                                            .text_color(theme::success())
-                                            .child(format!("+{adds}")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::MICRO_SIZE))
-                                            .line_height(px(theme::MICRO_LINE))
-                                            .text_color(theme::danger())
-                                            .child(format!("-{dels}")),
                                     )
                             }))
                             .children(marks.map(|line| {
@@ -27799,6 +27873,43 @@ mod tests {
         }
     }
 
+    /// Slice AG2 #11 — the same ladder as [`coarse_age`], for the same
+    /// reason: a fixed slot on a glanced-at row.
+    ///
+    /// Floored, never rounded. `1999` is `1.9k`, not `2.0k` — a label that
+    /// rounds up claims lines the tree does not have, and this number sits
+    /// beside a `dirty` count that would then disagree with it.
+    #[test]
+    fn a_line_count_is_one_unit_and_at_most_four_characters() {
+        // Exact while exact fits. Nothing coarsens a number a person could
+        // have counted.
+        assert_eq!(coarse_lines(0), "0");
+        assert_eq!(coarse_lines(7), "7");
+        assert_eq!(coarse_lines(999), "999");
+
+        assert_eq!(coarse_lines(1_000), "1.0k");
+        assert_eq!(coarse_lines(1_999), "1.9k", "floored, not rounded");
+        assert_eq!(coarse_lines(9_999), "9.9k");
+        assert_eq!(coarse_lines(10_000), "10k");
+        assert_eq!(coarse_lines(999_999), "999k");
+        assert_eq!(coarse_lines(1_000_000), "1.0M");
+        assert_eq!(coarse_lines(9_999_999), "9.9M");
+        assert_eq!(coarse_lines(10_000_000), "10M");
+        assert_eq!(coarse_lines(999_999_999), "999M");
+        // The ladder stops rather than growing units for ever.
+        assert_eq!(coarse_lines(1_000_000_000), ">1G");
+        assert_eq!(coarse_lines(u64::MAX), ">1G");
+
+        // The invariant the row's width budget is allowed to assume. A
+        // generated file can put a seven-figure count on a rail row, and
+        // `+999999 −999999` measured 98 px of the 142 px line three had —
+        // which is what moved this fact to line one in the first place.
+        for n in [0, 1, 999, 1_000, 12_345, 999_999, 1_000_000, u64::MAX] {
+            let s = coarse_lines(n);
+            assert!(s.len() <= 4, "{n} renders {s:?}, wider than the slot");
+        }
+    }
+
     #[test]
     fn count_labels_never_fake_a_number() {
         assert_eq!(
@@ -27911,6 +28022,7 @@ mod tests {
             checkout_root: None,
             shared_with: Vec::new(),
             worktree: None,
+            diff_stat: None,
             pending_approvals: 0,
             permission_mode: None,
             rss_bytes: None,
@@ -28405,6 +28517,7 @@ mod tests {
             checkout_root: None,
             shared_with: Vec::new(),
             worktree: None,
+            diff_stat: None,
             pending_approvals: 0,
             permission_mode: None,
             rss_bytes: None,
@@ -28469,6 +28582,7 @@ mod tests {
             checkout_root: None,
             shared_with: Vec::new(),
             worktree: None,
+            diff_stat: None,
             pending_approvals: 0,
             permission_mode: None,
             rss_bytes: None,
@@ -29004,6 +29118,7 @@ mod tests {
             checkout_root: None,
             shared_with: Vec::new(),
             worktree: None,
+            diff_stat: None,
             pending_approvals: 0,
             permission_mode: None,
             rss_bytes: None,

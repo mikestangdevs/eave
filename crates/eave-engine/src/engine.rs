@@ -462,6 +462,28 @@ impl SessionHandle {
                     present: w.present,
                     dirty_files: w.dirty_files,
                 }),
+            // AG2 #11. Summed here rather than stamped into a slot of its
+            // own for the same reason `rss_bytes` is sampled here: `info()`
+            // is built only for `list` and `watch` snapshots — operator-paced,
+            // not record-paced — and a fold over at most `git::MAX_FILES`
+            // elements per live session per snapshot is not a cost anybody
+            // can see. The stronger reason is that `handle.files` stays the
+            // ONE store of these numbers: a second copy stamped beside
+            // `dirty_files` could drift from the list it was summed from,
+            // and the rail would state a total the changes pane disagrees
+            // with. `FilesSnapshot::diff_stat` decides what counts.
+            //
+            // Lock order: `files` is taken last and released here. Nothing
+            // anywhere holds `files` and then reaches for `shared`,
+            // `worktree`, `checkout` or `approvals` — the only other
+            // holders are `refresh_files`' store and `run_files`' read,
+            // both of which take it alone.
+            diff_stat: self
+                .files
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(FilesSnapshot::diff_stat),
         }
     }
 
@@ -2885,7 +2907,17 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
             None => false,
         }
     };
-    *handle.files.lock().unwrap() = Some(snapshot);
+    // AG2 #11: the same store, and the same place the comparison has to
+    // happen — `handle.files` is what `info()` sums, so "did the number
+    // the rail states change" is exactly "did this snapshot's stat differ
+    // from the one it replaces".
+    let stat_changed = {
+        let mut slot = handle.files.lock().unwrap();
+        let before = slot.as_ref().and_then(FilesSnapshot::diff_stat);
+        let after = snapshot.diff_stat();
+        *slot = Some(snapshot);
+        before != after
+    };
     // Slice AA: the turn-scoped list refreshes on the same triggers as
     // the working-tree one and under the same gate — but only while
     // somebody is subscribed at that scope, because it costs a second
@@ -2895,7 +2927,14 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
         *handle.files_turn.lock().unwrap() = Some(turn);
     }
     let _ = handle.files_tx.send(());
-    if wt_changed {
+    // AG2 #11 widened this gate, and the widening IS the feature. It used
+    // to read `if wt_changed`, which pokes the watch channel only when a
+    // WORKTREE fact moved — and `wt_changed` is flatly `false` for every
+    // session that was never isolated. A diffstat that moved on its own
+    // would have been computed correctly, stored correctly, and never
+    // pushed: the rail would hold the number it had at the last worktree
+    // event and look like a bug in the sum rather than a bug in delivery.
+    if wt_changed || stat_changed {
         handle.poke_watch();
     }
 }

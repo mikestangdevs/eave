@@ -22,8 +22,8 @@ use eave_core::proc::{self, ProcIdentity};
 use eave_core::store::Meta;
 use eave_engine::client::Client;
 use eave_wire::{
-    socket_path, DiffBasis, DiffKind, DiffOp, FileScope, FileStatus, FilesSnapshot, GitState,
-    ResponseBody, ResponseEnvelope, SubscriptionItem,
+    socket_path, DiffBasis, DiffKind, DiffOp, DiffStat, FileScope, FileStatus, FilesSnapshot,
+    GitState, ResponseBody, ResponseEnvelope, SessionInfo, SubscriptionItem,
 };
 
 fn engined_bin() -> PathBuf {
@@ -582,6 +582,87 @@ async fn fs_events_refresh_without_turn_boundaries() {
     assert_eq!(snap.files[0].status, FileStatus::Modified);
 
     drop(engine);
+}
+
+/// AG2 #11, and this is the trap the row was built around.
+///
+/// `refresh_files` used to poke the watch channel only `if wt_changed` —
+/// only when a WORKTREE fact moved. This session was never isolated, so
+/// that condition is flatly `false` for it forever: the diffstat would be
+/// computed correctly, stored correctly, and never pushed, and the rail
+/// would show whatever it had at open time while the tree moved under it.
+///
+/// So: no isolate, no send, no turn boundary anywhere. The `files`
+/// subscription is here only to start the FS watcher — nothing reads it.
+/// Every assertion is on `watch`, which is the channel the rail's rows
+/// actually arrive on.
+#[tokio::test]
+async fn a_plain_session_pushes_its_diffstat_on_watch_with_no_worktree_and_no_turn() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+
+    let mut files = c.files("s1").await.expect("files");
+    // Same reason `fs_events_refresh_without_turn_boundaries` waits on
+    // this flag: until the watcher is live, a write is only guaranteed to
+    // be picked up by a poll this test never triggers.
+    let _ = wait_for_snapshot(&mut files, "watcher live", |s| s.watching).await;
+    let mut watch = c.watch().await.expect("watch");
+
+    std::fs::write(repo.join("base.txt"), "one\nLIVE\nALSO\ntwo\n").unwrap();
+    let s1 = wait_for_watch(&mut watch, "the diffstat arrives", |s| {
+        s.session_id == "s1" && s.diff_stat.is_some()
+    })
+    .await;
+    assert_eq!(
+        s1.diff_stat,
+        Some(DiffStat { adds: 2, dels: 0 }),
+        "two lines inserted into a committed file, and nothing removed"
+    );
+    assert!(
+        s1.worktree.is_none(),
+        "the point of the test: this session has no worktree fact to move"
+    );
+
+    // Both directions. A gate that pushed the rise and not the fall would
+    // freeze every row at its last non-zero total, which reads as a stuck
+    // number rather than a missing one and is harder to notice.
+    std::fs::write(repo.join("base.txt"), "one\ntwo\n").unwrap();
+    let back = wait_for_watch(&mut watch, "the diffstat goes back to nothing", |s| {
+        s.session_id == "s1" && s.diff_stat.is_none()
+    })
+    .await;
+    assert_eq!(back.diff_stat, None, "clean again, and said so");
+
+    drop(engine);
+}
+
+async fn wait_for_watch<F>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SubscriptionItem>,
+    what: &str,
+    pred: F,
+) -> SessionInfo
+where
+    F: Fn(&SessionInfo) -> bool,
+{
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = end.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for {what}");
+        let item = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .unwrap_or_else(|| panic!("watch stream ended waiting for {what}"));
+        if let SubscriptionItem::Sessions { sessions } = item {
+            if let Some(found) = sessions.into_iter().find(&pred) {
+                return found;
+            }
+        }
+    }
 }
 
 /// Fixing a dogfood blocker (directive 2026-08-17): the real claude CLI
