@@ -8154,6 +8154,62 @@ impl Shell {
         self.sync_mention_palette(cx);
     }
 
+    /// Put `text` in the composer as a markdown blockquote, at the caret,
+    /// and take focus.
+    ///
+    /// `TextField::insert` and not `set_content`, for the reason the paste
+    /// handler above states: it is the same edit typing performs, so it
+    /// groups with typing for undo and lands where the caret is. A quote
+    /// that wiped the sentence you were already writing would be the
+    /// worst possible way to offer to help you write it.
+    ///
+    /// **A quote is a block, so it starts on its own line.** `cursor()` is
+    /// documented for exactly this — reading the text *behind* the caret —
+    /// so the leading break is added only when it is actually needed,
+    /// rather than always, which would leave a blank line at the top of an
+    /// empty composer.
+    ///
+    /// Blank lines inside the message become a bare `>` and not `"> "`:
+    /// trailing whitespace on every empty line is what a hand-written
+    /// quotation never has.
+    fn quote_into_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let quoted = text
+            .lines()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {l}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if quoted.is_empty() {
+            return;
+        }
+        self.composer.update(cx, |c, cx| {
+            c.field.update(cx, |f, cx| {
+                let at = f.cursor();
+                let on_own_line = at == 0
+                    || f.content()
+                        .get(..at)
+                        .is_some_and(|before| before.ends_with('\n'));
+                let body = if on_own_line {
+                    format!("{quoted}\n\n")
+                } else {
+                    format!("\n{quoted}\n\n")
+                };
+                f.insert(&body, cx);
+            });
+        });
+        // The point of quoting is to write a reply to it, so the caret
+        // belongs here now. No transient note: the composer visibly gains
+        // the text and the focus, and saying so as well would be the one
+        // fact rendered twice this file refuses elsewhere.
+        let handle = gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx);
+        window.focus(&handle, cx);
+    }
+
     fn composer_files_row(&self, files: &[StagedFile], cx: &mut Context<Self>) -> AnyElement {
         div()
             .debug_selector(|| "composer-files".into())
@@ -19302,11 +19358,73 @@ impl Shell {
     /// constant one: `debug_bounds` keeps ONE entry per selector and the
     /// last painted wins, so a shared string across simultaneously visible
     /// rows would let a test measure a different row than it clicked.
+    /// **Slice AG1 #15 — a message into the composer as a quotation.**
+    ///
+    /// The row asked for monocode's *select transcript text → append as a
+    /// blockquote*. **That half cannot be built yet and this is not it:**
+    /// monocode's `quoteDraft.ts` reads a *browser* selection, which is
+    /// free on the web, and eave's transcript has no text selection at
+    /// all. Per-character hit-testing exists (see `link_text`, written
+    /// because `InteractiveText` would not do it), so the hard part is
+    /// not point-to-character — it is selection state spanning rows that
+    /// UNMOUNT, in a virtualized list.
+    ///
+    /// So: the whole message, which is the unit [`Self::message_copy`]
+    /// already computes and already has a control for. Same corner, same
+    /// out-of-flow rule, one icon to its left.
+    fn message_quote(state: &TranscriptState, msg: u32, text: String) -> AnyElement {
+        let shell = state.shell.clone();
+        let sel = format!("msg-quote-{msg}");
+        // The cluster's key, for the reason spelled out in `message_copy`.
+        // **Walked 2026-08-30 and this was WRONG first:** blending on this
+        // control's OWN name — a key no listener registers — left the icon
+        // at `wash_rest` forever: laid out, hit-testable, clickable, and
+        // invisible. Every harness assertion passed.
+        let ink = motion::hover_blend(
+            &format!("msg-controls-{msg}"),
+            theme::wash_rest(),
+            theme::text_tertiary(),
+        );
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel)
+            .absolute()
+            .top(px(0.))
+            // Left of the copy icon, which is flush right: its own glyph
+            // plus the padding either side of it.
+            .right(px(theme::ICON_SM + theme::SPACE_1 * 2.))
+            .flex_none()
+            .px(px(theme::SPACE_1))
+            .cursor_pointer()
+            .child(icons::icon(icons::CHAT_ROUND_LINE, theme::ICON_SM, ink))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                    let text = text.clone();
+                    shell.update(cx, |shell, cx| {
+                        shell.quote_into_composer(&text, window, cx);
+                    });
+                }
+            })
+            .into_any_element()
+    }
+
     fn message_copy(state: &TranscriptState, msg: u32, text: String) -> AnyElement {
         let lines = text.lines().count();
         let shell = state.shell.clone();
         let sel = format!("msg-copy-{msg}");
-        let ink = motion::hover_blend(&sel, theme::wash_rest(), theme::text_tertiary());
+        // **The blend key is the CLUSTER's, not this control's.** The wrapper
+        // registers one `hover_listener` for the whole message, and
+        // `hover_blend` reads the key that listener writes — a blend whose key
+        // nothing registers never moves off `rest`, which here is `wash_rest`
+        // and is invisible. `HoverFade` exists so the pair cannot be split;
+        // these two controls predate it and are hand-split, so the key has to
+        // be shared deliberately. See `the_message_controls_share_one_hover_key`.
+        let ink = motion::hover_blend(
+            &format!("msg-controls-{msg}"),
+            theme::wash_rest(),
+            theme::text_tertiary(),
+        );
         div()
             .id(SharedString::from(sel.clone()))
             .debug_selector(move || sel)
@@ -19581,7 +19699,7 @@ impl Shell {
                     .child(SharedString::from(text.clone()));
                 let wrap = div()
                     .id(SharedString::from(format!("msg-hover-{}", id.msg)))
-                    .on_hover(motion::hover_listener(format!("msg-copy-{}", id.msg)))
+                    .on_hover(motion::hover_listener(format!("msg-controls-{}", id.msg)))
                     .when(!first, |d| d.pt(px(theme::TURN_GAP)))
                     .flex()
                     .flex_col()
@@ -19592,7 +19710,8 @@ impl Shell {
                     // Slice AG1 #5. A directive is one row, so no block
                     // gate is needed here — but it is still out of flow,
                     // for the same height reason.
-                    .child(Self::message_copy(state, id.msg, text.clone()));
+                    .child(Self::message_copy(state, id.msg, text.clone()))
+                    .child(Self::message_quote(state, id.msg, text.clone()));
                 match delivery {
                     // The acceptance-critical distinction: journaled but
                     // never reached the agent (spec 02 §Delivery state).
@@ -19752,8 +19871,37 @@ impl Shell {
                         // guess which is which. bezel's `step_output` is
                         // the plate; the label above it stays eave's,
                         // because bezel has no slot for one.
+                        // **Slice AG1 #14 — a plan renders as a plan.**
+                        // `TodoWrite`'s input IS the checklist, so the
+                        // input plate made the operator read
+                        // `{"content":…,"status":"completed"}` to learn
+                        // what the agent intends to do next — the one
+                        // tool row in a turn that is about intent rather
+                        // than an action already taken.
+                        //
+                        // The typed decode already holds the items
+                        // (`ToolCall::Todo`, `stream.rs`), so the card
+                        // REPLACES the input plate exactly the way a
+                        // drawn diff replaces the result plate below:
+                        // same rule, same reason — when eave has decoded
+                        // a blob into the thing it means, showing both is
+                        // showing one fact twice, and the blob is the
+                        // worse of the two.
+                        //
+                        // Closed by default like any other tool body,
+                        // which is what answers comet's objection to a
+                        // card: a turn with eight `TodoWrite` calls is
+                        // eight one-line rows, not eight checklists.
+                        let plan = match call.as_ref() {
+                            Some(eave_core::tool::ToolCall::Todo { items })
+                                if !items.is_empty() =>
+                            {
+                                Some(items.clone())
+                            }
+                            _ => None,
+                        };
                         let mut parts: Vec<(&str, String)> = Vec::new();
-                        if !input.trim().is_empty() {
+                        if plan.is_none() && !input.trim().is_empty() {
                             parts
                                 .push(("input", tool_body_view(input, theme::TOOL_BODY_MAX_LINES)));
                         }
@@ -19792,6 +19940,76 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .gap(px(theme::SPACE_1))
+                            .children(plan.map(|items| {
+                                let total = items.len();
+                                let shown = total.min(theme::TOOL_BODY_MAX_LINES);
+                                div()
+                                    .debug_selector(|| "tool-plan".into())
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_1))
+                                    .children(items.into_iter().take(shown).map(|item| {
+                                        // Done-ness is the only state
+                                        // the decode carries: it folds
+                                        // `in_progress` into "not
+                                        // done" on purpose (`stream.rs`
+                                        // — *"the CLI's own word"*),
+                                        // and a third mark here would
+                                        // be a state eave invented.
+                                        //
+                                        // A fixed mark column rather
+                                        // than a glyph: the filled
+                                        // disc is spent on session and
+                                        // tool state and the compact
+                                        // set is spent on file status,
+                                        // so a checkbox drawn from
+                                        // either would be the
+                                        // vocabulary collision
+                                        // `STATUS_MODIFIED` is written
+                                        // to avoid. Blank-for-pending
+                                        // is also simply what a
+                                        // checklist looks like.
+                                        let ink = if item.done {
+                                            theme::text_tertiary()
+                                        } else {
+                                            theme::text_secondary()
+                                        };
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .gap(px(theme::SPACE_1))
+                                            .text_size(px(theme::SMALL_SIZE))
+                                            .line_height(px(theme::SMALL_LINE))
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(10.))
+                                                    .text_color(theme::success())
+                                                    .child(if item.done { "\u{2713}" } else { "" }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_color(ink)
+                                                    .child(SharedString::from(item.text)),
+                                            )
+                                    }))
+                                    .when(total > shown, |d| {
+                                        // The remainder, stated the way
+                                        // the diff and the error strip
+                                        // state theirs.
+                                        d.child(
+                                            div()
+                                                .text_size(px(theme::MICRO_SIZE))
+                                                .line_height(px(theme::MICRO_LINE))
+                                                .text_color(theme::text_tertiary())
+                                                .child(SharedString::from(format!(
+                                                    "… {} more",
+                                                    total - shown
+                                                ))),
+                                        )
+                                    })
+                            }))
                             .children(drawn.map(|(path, (lines, more))| {
                                 let (mut o, mut n) = (1u32, 1u32);
                                 div()
@@ -19934,7 +20152,7 @@ impl Shell {
                     // on the message's one key, so hovering any block
                     // reveals the single control mounted on block 0.
                     .id(SharedString::from(format!("msg-hover-{}-{}", id.msg, id.block)))
-                    .on_hover(motion::hover_listener(format!("msg-copy-{}", id.msg)))
+                    .on_hover(motion::hover_listener(format!("msg-controls-{}", id.msg)))
                     .when(id.block == 0, |d| d.pt(px(theme::MSG_TOP_GAP)))
                     .pb(px(theme::BLOCK_GAP))
                     .relative()
@@ -19944,6 +20162,7 @@ impl Shell {
                     // out of flow, so this cannot move a cached height.
                     .when(id.block == 0, |d| {
                         d.child(Self::message_copy(state, id.msg, msg_text.clone()))
+                            .child(Self::message_quote(state, id.msg, msg_text.clone()))
                     })
                     .into_any_element()
             }

@@ -19859,3 +19859,178 @@ fn the_reveal_control_is_wired_to_the_method_that_grows_the_window(_cx: &mut Tes
          tests drive, so both could be right and the button still dead"
     );
 }
+
+// ── Slice AG1 #14 — plan rendering ────────────────────────────────────
+
+/// A `TodoWrite` row opens onto a checklist, and the JSON it was decoded
+/// from is GONE rather than shown beside it.
+///
+/// The replacement is the point. `TodoWrite`'s input *is* the checklist,
+/// so before this the one tool row in a turn that says what the agent
+/// intends to do next made the operator read
+/// `{"content":…,"status":"completed"}` to find out. Showing the card and
+/// the blob together would be the duplication the diff row already
+/// refuses two plates below.
+#[gpui::test]
+fn an_opened_plan_is_a_checklist_and_not_its_json(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let items = vec![
+        eave_core::tool::TodoItem {
+            text: "read the adapter".into(),
+            done: true,
+        },
+        eave_core::tool::TodoItem {
+            text: "fix the parser".into(),
+            done: false,
+        },
+    ];
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started_typed(
+                1,
+                "t1",
+                "TodoWrite",
+                r#"{"todos":[{"content":"read the adapter","status":"completed"},{"content":"fix the parser","status":"pending"}]}"#,
+                Some(eave_core::tool::ToolCall::Todo { items }),
+            ),
+            tool_finished(2, "t1", "ok", false),
+        ],
+    });
+    vcx.run_until_parked();
+
+    // A collapsed plan is one row, which is what answers comet's
+    // objection to cards: eight `TodoWrite` calls in a turn stay eight
+    // lines until you ask for one.
+    assert!(!shown(vcx, "tool-plan"), "a collapsed row drew its plan");
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "tool-plan"), "an opened plan drew no checklist");
+    assert!(
+        vcx.debug_bounds("tool-part-t1-input").is_none(),
+        "the card is drawn and the JSON it was decoded from is still \
+         under it — one fact rendered twice, and the worse one second"
+    );
+}
+
+// ── Slice AG1 #15 — quote into the composer ───────────────────────────
+
+/// Quoting a message puts it in the composer as a blockquote, at the
+/// caret, and a quote always starts on its own line.
+///
+/// The second half is the part with a wrong answer available: adding the
+/// leading break unconditionally leaves a blank line at the top of an
+/// empty composer, and never adding it welds the quote onto the end of
+/// the sentence you were already writing.
+#[gpui::test]
+fn quoting_a_message_puts_it_in_the_composer_as_a_blockquote(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![assistant_record(1, "first paragraph\n\nlast paragraph")],
+    });
+    vcx.run_until_parked();
+
+    let draft = |vcx: &mut VisualTestContext, h: &Harness| {
+        vcx.read_window(&h.window, |shell, cx| {
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
+        })
+        .unwrap()
+    };
+
+    // A blank line inside the message is a bare `>`: trailing whitespace
+    // on every empty line is what a hand-written quotation never has.
+    let quoted = "> first paragraph\n>\n> last paragraph";
+
+    assert!(shown(vcx, "msg-quote-0"), "a message has no quote control");
+    click(vcx, "msg-quote-0");
+    vcx.run_until_parked();
+    assert_eq!(
+        draft(vcx, &h),
+        format!("{quoted}\n\n"),
+        "an empty composer should take the quote with no leading blank line"
+    );
+
+    // Now the other branch: text behind the caret that is not a newline.
+    vcx.simulate_input("hi");
+    assert_eq!(draft(vcx, &h), format!("{quoted}\n\nhi"));
+    click(vcx, "msg-quote-0");
+    vcx.run_until_parked();
+    assert_eq!(
+        draft(vcx, &h),
+        format!("{quoted}\n\nhi\n{quoted}\n\n"),
+        "a quote welded onto the end of the sentence already being written"
+    );
+}
+
+/// A `hover_blend` key that no `hover_listener` writes never moves off
+/// `rest` — and for these controls `rest` is `wash_rest`, which is
+/// invisible against the plate.
+///
+/// **This is a source test because it is the only kind that can see this.**
+/// The bug it guards shipped through the whole suite once: the quote
+/// control laid out, hit-tested, took a click and filled the composer, and
+/// drew nothing at all. `debug_bounds` reports geometry, never colour, so
+/// every behavioural assertion passed on an invisible element. It was
+/// found by looking at the window.
+///
+/// `motion::HoverFade` exists precisely so the blend and the listener
+/// cannot be split — *"a blend with no listener never moves"*. These
+/// controls predate it and are hand-split, so the pairing is checked here
+/// instead. Adding a fourth `hover_blend` to `ui.rs` should fail this test
+/// until its key is paired too.
+#[gpui::test]
+fn every_hover_blend_key_has_a_listener_that_writes_it(_cx: &mut TestAppContext) {
+    let src = include_str!("ui.rs");
+    let prod = &src[..src.rfind("#[cfg(test)]").expect("ui.rs has a test module")];
+    assert_eq!(
+        prod.matches("hover_blend(").count(),
+        3,
+        "a hover_blend was added or removed — pair its key with a listener \
+         and account for it here"
+    );
+    // The message cluster: one listener per wrapper, one blend per control.
+    assert_eq!(
+        prod.matches("hover_listener(format!(\"msg-controls-{}\", id.msg))")
+            .count(),
+        2,
+        "both message wrappers must register the cluster's hover key"
+    );
+    assert_eq!(
+        prod.matches("msg-controls-{msg}").count(),
+        2,
+        "both message controls must BLEND on the cluster key the wrapper writes"
+    );
+    // Each control's own name is its id and debug_selector, and nothing
+    // else. Blending on it is the defect: nothing registers it.
+    for own in ["msg-copy-{msg}", "msg-quote-{msg}"] {
+        assert_eq!(
+            prod.matches(own).count(),
+            1,
+            "{own} is an identity, not a hover key — blending on it makes an \
+             invisible control that still takes clicks"
+        );
+    }
+}
