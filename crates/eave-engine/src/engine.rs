@@ -2019,6 +2019,31 @@ async fn serve_locked(
                 tokio::spawn(probe_checkout(Arc::clone(&handle)));
                 if handle.worktree.lock().unwrap().is_some() {
                     tokio::spawn(verify_worktree(handle));
+                } else {
+                    // AG2 #11, and this `else` is the whole of it.
+                    //
+                    // Slice I2 gave WORKTREE sessions an eager scan here for
+                    // a reason it wrote down: a dirty count has to reach the
+                    // rail "without anyone subscribing". `diff_stat` is the
+                    // same kind of fact and needs the same thing — but it is
+                    // on every session, not only isolated ones, and a plain
+                    // session reaching this arm has never been scanned in
+                    // this engine's life. `handle.files` is `None`, so
+                    // `info()` sums nothing and the row states nothing.
+                    //
+                    // WALKED, not deduced: on a cold start every idle row in
+                    // the rail was blank and only the session you clicked
+                    // grew numbers — which is exactly the behaviour #11
+                    // existed to remove. No test could see it, because every
+                    // one of them hands the surface a `SessionInfo` that
+                    // already has the field filled.
+                    //
+                    // The cost is one `git status` per session at boot, off
+                    // the loop, which is the cost I2 already accepted for
+                    // the sessions it covered. `verify_worktree` ends in the
+                    // same call, so this is an `else` rather than a second
+                    // spawn: no session is scanned twice.
+                    tokio::spawn(refresh_files(handle));
                 }
             }
             Err(e) => eprintln!("engine: skipping session {id}: {e}"),

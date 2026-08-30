@@ -824,6 +824,65 @@ async fn file_state_rebuilds_from_git_after_engine_restart() {
     drop(engine2);
 }
 
+/// AG2 #11 on a COLD engine — the half a harness cannot reach.
+///
+/// Every surface test hands the rail a `SessionInfo` with the field already
+/// filled, so none of them can see whether anything ever fills it. Walked
+/// with a real window, the answer was no: on a fresh engine every idle row
+/// was blank and only the session you clicked grew numbers, because the
+/// startup sweep scanned a session only if it claimed a WORKTREE (Slice I2)
+/// and a plain session was left with `handle.files == None`.
+///
+/// The assertion is deliberately made through `list`, with **no `files`
+/// subscription anywhere** — subscribing is what used to hide this, because
+/// `run_files` triggers a scan when the cache is empty. This is the rail's
+/// own vantage point: rows it never subscribed to.
+#[tokio::test]
+async fn a_cold_engine_states_the_diffstat_without_anyone_subscribing() {
+    let dir = scratch();
+    let repo = repo();
+    let engine1 = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    // Committed base plus two new lines: a diff that exists before the
+    // engine this test cares about has ever run.
+    std::fs::write(repo.join("base.txt"), "one\nLIVE\nALSO\ntwo\n").unwrap();
+    drop(c);
+    drop(engine1);
+
+    let engine2 = EngineProc::spawn(&dir, "linger");
+    let c2 = Client::connect(&dir).await.expect("reconnect");
+    let end = Instant::now() + Duration::from_secs(15);
+    let stat = loop {
+        assert!(
+            Instant::now() < end,
+            "a cold engine never stated the diffstat for an unsubscribed session"
+        );
+        let sessions = c2.list().await.expect("list");
+        let s1 = sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .expect("s1 listed");
+        if let Some(stat) = s1.diff_stat {
+            assert!(
+                s1.worktree.is_none(),
+                "the point of the test: a session I2's eager scan does not cover"
+            );
+            break stat;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        stat,
+        DiffStat { adds: 2, dels: 0 },
+        "the cold engine's own scan, not a subscriber's"
+    );
+
+    drop(engine2);
+}
+
 /// The stale-engine fix (2026-08-17 trap): a request this engine cannot
 /// parse — an unknown method from a newer client — errors on the REAL
 /// envelope id, so the caller's pending call resolves instead of hanging
