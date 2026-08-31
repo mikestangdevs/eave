@@ -251,6 +251,7 @@ mod tests {
         Row::User {
             text: text.into(),
             delivery: Delivery::Delivered,
+            provider_msg_id: None,
         }
     }
 

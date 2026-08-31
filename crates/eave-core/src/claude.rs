@@ -16,27 +16,38 @@
 //! from the CLI's own `init.permissionMode` rather than assumed, and a
 //! session that cannot prove it asks is refused (spec 04 §Permissions).
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::events::SessionEvent;
 use crate::media::{self, EncodedImage, ImageRef};
 use crate::proc::{self, ProcIdentity};
 use crate::process;
 use crate::session::{
-    AgentSession, ApprovalDecision, KillReport, SessionError, SessionWatch, SpawnConfig,
+    AgentSession, ApprovalDecision, KillReport, RewindOutcome, RewindTarget, SessionError,
+    SessionWatch, SpawnConfig,
 };
 use crate::stream::ClaudeStream;
 use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
+
+/// How long a control request that expects a REPLY may wait for one.
+///
+/// Only `rewind_conversation` does; `interrupt` is fire-and-forget. The
+/// bound exists because the reply is synchronous with the operator's
+/// click, and a CLI that never answers must not park the UI: on expiry
+/// eave reports the timeout as a refusal, which is true — the
+/// conversation was not rewound.
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 const STDERR_RING_CAP: usize = 4096;
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -54,6 +65,14 @@ struct Shared {
     /// on — descendants holding inherited pipes may emit stale lines after
     /// the leader dies (spec 01 §Kill; research: bb.md pain points).
     kill_initiated: AtomicBool,
+    /// Outbound control requests still waiting for their reply, by
+    /// `request_id` (Slice AG1 #10).
+    ///
+    /// Empty except for the few milliseconds one is in flight, which is
+    /// what makes the reader's check affordable: an uncontended
+    /// `is_empty()` per line, and no second parse of any frame in the
+    /// normal case.
+    pending_control: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>,
 }
 
 type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
@@ -168,6 +187,7 @@ impl ClaudeCodeSession {
 
         let shared = Arc::new(Shared {
             stream: Mutex::new(ClaudeStream::new()),
+            pending_control: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(Instant::now()),
             saw_init: AtomicBool::new(false),
             kill_initiated: AtomicBool::new(false),
@@ -187,6 +207,14 @@ impl ClaudeCodeSession {
             while let Ok(Some(line)) = lines.next_line().await {
                 *reader_shared.last_activity.lock().unwrap() = Instant::now();
                 if reader_shared.kill_initiated.load(Ordering::SeqCst) {
+                    continue;
+                }
+                // A reply to one of eave's OWN control requests, claimed
+                // before the parser sees it. `stream.rs` drops every
+                // `control_response` — correctly, since the echo of a
+                // decision eave already journalled carries nothing new —
+                // so a request that expects an ANSWER has to take it here.
+                if claim_control_reply(&reader_shared, &line) {
                     continue;
                 }
                 let events = reader_shared.stream.lock().unwrap().parse_line(&line);
@@ -344,6 +372,14 @@ impl crate::provider::AgentAdapter for ClaudeCodeSession {
                    emits PostureRefused and is killed",
     };
 
+    const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::Native {
+        evidence: "claude.rs `rewind`: the `rewind_conversation` control request, on the same \
+                   channel `interrupt` uses. DRIVEN LIVE 2026-08-31 against 2.1.251 — two \
+                   prompts, then a rewind to the first: it answered `rewound: true` with the \
+                   target's own text in `prefillText`, and the agent then denied any earlier \
+                   message existed, so the truncation reaches the CONTEXT and is not cosmetic.",
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         ClaudeCodeSession::spawn(cfg)
     }
@@ -456,6 +492,100 @@ impl AgentSession for ClaudeCodeSession {
             "request": { "subtype": "interrupt" },
         });
         write_frame(&self.stdin, &frame.to_string()).await
+    }
+
+    /// `rewind_conversation` — the CLI's own truncation, on the same
+    /// control channel `interrupt` uses.
+    ///
+    /// **Measured before it was written** (2026-08-31, 2.1.251): two
+    /// prompts, then a rewind to the first, answered
+    /// `{"rewound":true,"targetMessageUuid":…,"prefillText":"Say exactly:
+    /// ALPHA","precedingAssistantUuid":null}`. Asked afterwards what it
+    /// had been told first, the agent answered that the conversation had
+    /// only just begun — so this truncates the CONTEXT, and eave is not
+    /// merely hiding rows.
+    ///
+    /// Every refusal is the CLI's own word, forwarded verbatim. eave does
+    /// not pre-check any of them, and the reason is `last_seen_msg_id`:
+    /// `unseen later turn` is a race the client CANNOT evaluate, because
+    /// the fact it turns on is whether the provider's tail moved after
+    /// eave last rendered it. Asking is the only correct implementation.
+    async fn rewind(&mut self, target: &RewindTarget) -> Result<RewindOutcome, SessionError> {
+        let Some(msg_id) = target.msg_id.as_deref() else {
+            // Not a refusal from Claude — a refusal by eave, because a
+            // rewind has to name a message and this row never got a name.
+            return Ok(RewindOutcome::Refused {
+                reason: "eave never saw an id for that message".into(),
+            });
+        };
+        let request_id = format!(
+            "eave-rewind-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let (tx, rx) = oneshot::channel();
+        self.shared
+            .pending_control
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), tx);
+
+        let mut request = serde_json::json!({
+            "subtype": "rewind_conversation",
+            "target_message_uuid": msg_id,
+            // **Deliberately false, and this is the load-bearing choice
+            // in the whole slice.**
+            //
+            // `true` lets the CLI interrupt a running turn and rewind
+            // through it — but the turn's messages are then DISCARDED, so
+            // the `result` frame that would have closed it never arrives.
+            // eave's attention ledger has a documented hole exactly there
+            // (a turn nothing can close makes a healthy session report
+            // `quiet`, then `unresponsive`), and that hole is not fixed.
+            // Manufacturing the one input it cannot survive, to save the
+            // operator a click, is a bad trade.
+            //
+            // So a turn in flight makes the CLI answer `turn running`,
+            // eave shows that sentence, and the operator presses Stop
+            // first — through the interrupt path that already settles a
+            // turn properly.
+            "interrupt_if_running": false,
+        });
+        if let Some(seen) = &target.last_seen_msg_id {
+            request["last_seen_user_message_uuid"] = serde_json::Value::String(seen.clone());
+        }
+        let frame = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": request,
+        });
+        if let Err(e) = write_frame(&self.stdin, &frame.to_string()).await {
+            self.shared
+                .pending_control
+                .lock()
+                .unwrap()
+                .remove(&request_id);
+            return Err(e);
+        }
+
+        let reply = match tokio::time::timeout(CONTROL_REPLY_TIMEOUT, rx).await {
+            Ok(Ok(v)) => v,
+            // Timed out, or the reader task went away with the process.
+            // Both leave the map holding a sender nobody will ever use.
+            _ => {
+                self.shared
+                    .pending_control
+                    .lock()
+                    .unwrap()
+                    .remove(&request_id);
+                return Ok(RewindOutcome::Refused {
+                    reason: "the CLI did not answer the rewind".into(),
+                });
+            }
+        };
+        Ok(rewind_outcome(&reply))
     }
 
     async fn kill(&mut self) -> Result<KillReport, SessionError> {
@@ -601,8 +731,297 @@ async fn write_frame(stdin: &SharedStdin, line: &str) -> Result<(), SessionError
     Ok(())
 }
 
+/// Read `rewind_conversation`'s reply.
+///
+/// Pure, and separate from the send, so the shapes below can be pinned by
+/// tests against captured frames rather than a live CLI.
+///
+/// **A missing `rewound` is a refusal, never a success.** The one thing
+/// this must never do is report a rewind that did not happen: the
+/// operator would carry on typing into a conversation still holding
+/// everything they asked to discard.
+fn rewind_outcome(reply: &serde_json::Value) -> RewindOutcome {
+    let response = reply.get("response");
+    let subtype = response
+        .and_then(|r| r.get("subtype"))
+        .and_then(serde_json::Value::as_str);
+    if subtype == Some("error") {
+        return RewindOutcome::Refused {
+            reason: response
+                .and_then(|r| r.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the CLI refused the rewind without saying why")
+                .to_string(),
+        };
+    }
+    // `response.response` — the payload is nested one deeper than the
+    // envelope's own status, which is why this is not a single `get`.
+    let payload = response.and_then(|r| r.get("response"));
+    let rewound = payload
+        .and_then(|p| p.get("rewound"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !rewound {
+        return RewindOutcome::Refused {
+            reason: payload
+                .and_then(|p| p.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the CLI refused the rewind without saying why")
+                .to_string(),
+        };
+    }
+    RewindOutcome::Rewound {
+        prefill: payload
+            .and_then(|p| p.get("prefillText"))
+            .and_then(serde_json::Value::as_str)
+            // An empty prefill is not a prefill: seeding the composer with
+            // "" and seeding it with nothing are the same act, and `Some("")`
+            // would make every caller check for it.
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+    }
+}
+
+/// Hand a `control_response` to whoever is waiting for it, if anyone is.
+///
+/// Returns `true` when the line was claimed, and the reader then drops it
+/// — the same fate `stream.rs` gives every other control response, so no
+/// frame is handled twice and none becomes a journal record.
+///
+/// The `is_empty` guard is the whole reason this is affordable on the hot
+/// path: nothing is ever pending except while an operator's rewind is in
+/// flight, so the common case is one uncontended lock and no JSON parse.
+fn claim_control_reply(shared: &Shared, line: &str) -> bool {
+    if shared.pending_control.lock().unwrap().is_empty() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if v.get("type").and_then(serde_json::Value::as_str) != Some("control_response") {
+        return false;
+    }
+    // The id sits INSIDE `response`, not beside `type` — the shape of an
+    // outbound reply is not the mirror of an inbound request. Read off a
+    // live 2.1.251 reply, not assumed.
+    let Some(id) = v
+        .get("response")
+        .and_then(|r| r.get("request_id"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let waiting = shared.pending_control.lock().unwrap().remove(id);
+    match waiting {
+        Some(tx) => {
+            let _ = tx.send(v);
+            true
+        }
+        // Somebody else's reply (an approval echo). Not ours to eat.
+        None => false,
+    }
+}
+
 /// Best-effort write from the reader task, which has no one to report to:
 /// a closed pipe means the child is already going away.
 async fn write_line(stdin: &SharedStdin, line: &str) {
     let _ = write_frame(stdin, line).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::RewindOutcome;
+
+    /// **Verbatim from the wire**, 2026-08-31, claude 2.1.251 driven in
+    /// eave's exact spawn posture: two prompts, then a rewind to the
+    /// first. Written down rather than paraphrased because the nesting is
+    /// the part that is easy to get wrong — the envelope carries
+    /// `subtype`/`request_id`, and the payload is one level deeper again.
+    const REAL_REWIND_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"rw1","response":{"rewound":true,"targetMessageUuid":"fb99bae1-4e74-4061-964c-c05b50d897c5","prefillText":"Say exactly: ALPHA","precedingAssistantUuid":null}}}"#;
+
+    fn outcome(line: &str) -> RewindOutcome {
+        rewind_outcome(&serde_json::from_str(line).expect("valid json"))
+    }
+
+    #[test]
+    fn the_captured_reply_is_a_rewind_that_hands_back_the_message() {
+        assert_eq!(
+            outcome(REAL_REWIND_REPLY),
+            RewindOutcome::Rewound {
+                prefill: Some("Say exactly: ALPHA".into())
+            }
+        );
+    }
+
+    /// The CLI's own refusals, each a real string from its handler. eave
+    /// forwards them verbatim rather than mapping them onto a vocabulary
+    /// of its own — "turn running" and "unseen later turn" call for
+    /// different actions from the operator, and a house word for both
+    /// would erase that.
+    #[test]
+    fn a_refusal_is_reported_in_the_clis_own_words() {
+        for reason in [
+            "turn running",
+            "prompt pending",
+            "commands queued",
+            "target not found",
+            "stale target",
+            "unseen later turn",
+        ] {
+            let line = format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"r","response":{{"rewound":false,"prefillText":null,"error":"{reason}"}}}}}}"#
+            );
+            assert_eq!(
+                outcome(&line),
+                RewindOutcome::Refused {
+                    reason: reason.into()
+                }
+            );
+        }
+    }
+
+    /// **The one failure mode that must never happen.** A reply eave
+    /// cannot read is a rewind that did NOT happen — reporting success
+    /// would drop the operator's rows while the agent still remembers
+    /// every one of them, and nothing on screen would say so.
+    #[test]
+    fn an_unreadable_reply_is_a_refusal_and_never_a_success() {
+        for line in [
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{}}}"#,
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r"}}"#,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"r","error":"boom"}}"#,
+            r#"{"type":"control_response"}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                matches!(outcome(line), RewindOutcome::Refused { .. }),
+                "must not read as rewound: {line}"
+            );
+        }
+    }
+
+    /// An error envelope carries its reason beside `subtype`, not nested.
+    #[test]
+    fn an_error_envelope_states_its_own_reason() {
+        assert_eq!(
+            outcome(
+                r#"{"type":"control_response","response":{"subtype":"error","request_id":"r","error":"boom"}}"#
+            ),
+            RewindOutcome::Refused {
+                reason: "boom".into()
+            }
+        );
+    }
+
+    /// `Some("")` and `None` would make every caller test for both. An
+    /// empty prefill is no prefill.
+    #[test]
+    fn an_empty_prefill_is_no_prefill() {
+        assert_eq!(
+            outcome(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{"rewound":true,"prefillText":""}}}"#
+            ),
+            RewindOutcome::Rewound { prefill: None }
+        );
+    }
+
+    /// A rewind cannot be asked about a message the provider never named,
+    /// and eave refuses it ITSELF rather than writing a frame the CLI
+    /// would reject (`target_message_uuid` must be a string).
+    ///
+    /// **Told apart by the stdin, which is closed.** With no `msg_id` the
+    /// answer is `Refused` — reached without touching the pipe. With one,
+    /// the same call dies on the closed pipe instead. Two different
+    /// results from one broken session is the proof that the `None` arm
+    /// returns before `write_frame`, and an assertion on the refusal alone
+    /// could not tell them apart.
+    #[tokio::test]
+    async fn a_message_with_no_provider_id_never_reaches_the_pipe() {
+        let (_tx, exit_rx) = watch::channel(None);
+        let mut session = ClaudeCodeSession {
+            identity: ProcIdentity {
+                pid: 1,
+                start_tvsec: 0,
+                start_tvusec: 0,
+            },
+            pgid: 1,
+            stdin: Arc::new(tokio::sync::Mutex::new(None)),
+            shared: Arc::new(Shared {
+                stream: Mutex::new(ClaudeStream::new()),
+                pending_control: Mutex::new(HashMap::new()),
+                last_activity: Mutex::new(Instant::now()),
+                saw_init: AtomicBool::new(false),
+                kill_initiated: AtomicBool::new(false),
+            }),
+            exit_rx,
+            stdout_eof: Arc::new(AtomicBool::new(false)),
+            exited_flag: Arc::new(AtomicBool::new(false)),
+        };
+
+        let unnamed = session.rewind(&RewindTarget::default()).await;
+        assert!(
+            matches!(unnamed, Ok(RewindOutcome::Refused { .. })),
+            "an unaddressable message is refused here, not on the wire: {unnamed:?}"
+        );
+        assert!(
+            session.shared.pending_control.lock().unwrap().is_empty(),
+            "nothing may be registered for a request that was never sent"
+        );
+
+        let named = session
+            .rewind(&RewindTarget {
+                msg_id: Some("u-1".into()),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(named, Err(SessionError::StdinClosed)),
+            "with an id it really does try the pipe — which is what makes \
+             the assertion above mean something: {named:?}"
+        );
+        assert!(
+            session.shared.pending_control.lock().unwrap().is_empty(),
+            "a failed write must take its waiter back out of the map — a \
+             sender left behind is a slot that is never claimed and never \
+             freed, and the reader would pay to parse every frame forever"
+        );
+    }
+
+    /// The reader claims a reply only for a request eave is waiting on.
+    /// An approval echo shares the frame TYPE and must be left alone —
+    /// eating it would silently drop another slice's traffic.
+    #[test]
+    fn the_reader_claims_only_its_own_replies() {
+        let shared = Shared {
+            stream: Mutex::new(ClaudeStream::new()),
+            pending_control: Mutex::new(HashMap::new()),
+            last_activity: Mutex::new(Instant::now()),
+            saw_init: AtomicBool::new(false),
+            kill_initiated: AtomicBool::new(false),
+        };
+        // Nothing pending: the hot-path guard refuses without parsing.
+        assert!(!claim_control_reply(&shared, REAL_REWIND_REPLY));
+
+        let (tx, mut rx) = oneshot::channel();
+        shared
+            .pending_control
+            .lock()
+            .unwrap()
+            .insert("rw1".into(), tx);
+        // Somebody else's reply, with one of ours outstanding.
+        assert!(!claim_control_reply(
+            &shared,
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"someone-else"}}"#
+        ));
+        assert!(rx.try_recv().is_err(), "our waiter must still be waiting");
+        assert_eq!(shared.pending_control.lock().unwrap().len(), 1);
+
+        assert!(claim_control_reply(&shared, REAL_REWIND_REPLY));
+        assert!(rx.try_recv().is_ok(), "the waiter is handed the reply");
+        assert!(
+            shared.pending_control.lock().unwrap().is_empty(),
+            "a claimed reply is removed, so a second copy is not eaten"
+        );
+    }
 }

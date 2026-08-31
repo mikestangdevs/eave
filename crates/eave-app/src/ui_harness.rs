@@ -20661,7 +20661,7 @@ fn every_hover_blend_key_has_a_listener_that_writes_it(_cx: &mut TestAppContext)
     let prod = &src[..src.rfind("#[cfg(test)]").expect("ui.rs has a test module")];
     assert_eq!(
         prod.matches("hover_blend(").count(),
-        3,
+        4,
         "a hover_blend was added or removed — pair its key with a listener \
          and account for it here"
     );
@@ -20674,12 +20674,13 @@ fn every_hover_blend_key_has_a_listener_that_writes_it(_cx: &mut TestAppContext)
     );
     assert_eq!(
         prod.matches("msg-controls-{msg}").count(),
-        2,
-        "both message controls must BLEND on the cluster key the wrapper writes"
+        3,
+        "all three message controls must BLEND on the cluster key the wrapper \
+         writes — copy, quote, and Slice AG1 #10's rewind"
     );
     // Each control's own name is its id and debug_selector, and nothing
     // else. Blending on it is the defect: nothing registers it.
-    for own in ["msg-copy-{msg}", "msg-quote-{msg}"] {
+    for own in ["msg-copy-{msg}", "msg-quote-{msg}", "msg-rewind-{msg}"] {
         assert_eq!(
             prod.matches(own).count(),
             1,
@@ -20687,4 +20688,272 @@ fn every_hover_blend_key_has_a_listener_that_writes_it(_cx: &mut TestAppContext)
              invisible control that still takes clicks"
         );
     }
+}
+
+// ── Slice AG1 #10 — rewind to here ────────────────────────────────────
+
+/// A journalled user message together with the provider's echo naming it,
+/// which is the only way a row becomes addressable.
+fn user_record_named(seq: u64, text: &str, msg_id: &str) -> Vec<eave_core::journal::Record> {
+    vec![
+        user_record(seq, text),
+        eave_core::journal::Record {
+            seq: seq + 1,
+            ts_ms: (seq + 1) * 10,
+            event: eave_core::journal::JournalEvent::Provider {
+                event: eave_core::events::SessionEvent::UserEcho {
+                    text: text.into(),
+                    provider_msg_id: Some(msg_id.into()),
+                },
+            },
+        },
+    ]
+}
+
+fn rewound_reply(reply: eave_wire::RewindOk) -> FeedEvent {
+    FeedEvent::Rewound {
+        reply: Box::new(reply),
+    }
+}
+
+/// The control is drawn for a Claude row the provider has named, and
+/// clicking it asks for exactly that message.
+#[gpui::test]
+fn a_named_message_offers_a_rewind_and_asks_about_itself(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let mut records = user_record_named(1, "first ask", "u-1");
+    records.extend(user_record_named(3, "second ask", "u-2"));
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records,
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "msg-rewind-0"),
+        "a named message on a provider that can rewind gets the control"
+    );
+    let _ = h.drain();
+    click(vcx, "msg-rewind-0");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::Rewind { msg_id, last_seen_msg_id, dropped }]
+                if msg_id == "u-1"
+                    // BOTH user turns go: the target is discarded too.
+                    && *dropped == 2
+                    // The newest message the client has rendered, which is
+                    // the provider's interlock against discarding a turn
+                    // the operator never saw.
+                    && last_seen_msg_id.as_deref() == Some("u-2")
+        ),
+        "the click must carry the target, the count and the interlock: {cmds:?}"
+    );
+}
+
+/// **The gate is the provider, not the row.** Same records, same ids, a
+/// provider with no rewind on its wire — and no control at all.
+///
+/// waku answers this position the same way (`transcript_view.rs`: return
+/// `None`). A control that explains itself only after it fails is worse
+/// than one that was never offered.
+#[gpui::test]
+fn a_provider_that_cannot_rewind_is_offered_no_rewind(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut info = session("aaaa1111");
+    info.provider = "cursor-agent".into();
+    rail_with_selected(&h, vcx, vec![info], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: user_record_named(1, "first ask", "u-1"),
+    });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "msg-rewind-0"),
+        "cursor-agent has no conversation rewind; the control must be absent"
+    );
+    assert!(
+        shown(vcx, "msg-copy-0"),
+        "the rest of the cluster is unaffected"
+    );
+}
+
+/// A message the provider never named cannot be addressed, so it gets no
+/// control even on Claude — a send whose echo has not arrived yet.
+#[gpui::test]
+fn an_unnamed_message_offers_no_rewind_even_on_claude(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "in flight")],
+    });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "msg-rewind-0"),
+        "no id means no address means no control"
+    );
+}
+
+/// The point of the whole slice: the discarded message comes back as
+/// something to edit and send again.
+#[gpui::test]
+fn a_rewind_hands_the_message_back_to_the_composer(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: user_record_named(1, "first ask", "u-1"),
+    });
+    vcx.run_until_parked();
+
+    h.plumbing.push_feed(rewound_reply(eave_wire::RewindOk {
+        rewound: true,
+        prefill: Some("first ask".into()),
+        reason: None,
+        unsupported: false,
+    }));
+    vcx.run_until_parked();
+    assert_eq!(composer_draft(vcx, &h), "first ask");
+}
+
+/// **A rewind must never clobber a draft.** AG1 #15's rule, and it bites
+/// harder here: rewinding is something an operator does mid-thought, so
+/// the composer is exactly where their replacement wording already is.
+/// `set_content` would take it, and the undo history with it.
+#[gpui::test]
+fn a_prefill_is_inserted_and_never_replaces_what_was_being_typed(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: user_record_named(1, "first ask", "u-1"),
+    });
+    vcx.run_until_parked();
+    vcx.simulate_input("keep");
+    vcx.run_until_parked();
+    assert_eq!(
+        composer_draft(vcx, &h),
+        "keep",
+        "the draft never landed, so the assertion below would prove nothing"
+    );
+
+    h.plumbing.push_feed(rewound_reply(eave_wire::RewindOk {
+        rewound: true,
+        prefill: Some("back".into()),
+        reason: None,
+        unsupported: false,
+    }));
+    vcx.run_until_parked();
+    let draft = composer_draft(vcx, &h);
+    assert!(
+        draft.contains("keep"),
+        "the operator's own words were destroyed: {draft:?}"
+    );
+    assert!(
+        draft.contains("back"),
+        "the prefill never arrived: {draft:?}"
+    );
+}
+
+/// A refusal is the provider's sentence, shown as the provider's — and
+/// nothing is dropped from the transcript.
+#[gpui::test]
+fn a_refused_rewind_states_the_reason_and_keeps_every_row(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: user_record_named(1, "first ask", "u-1"),
+    });
+    vcx.run_until_parked();
+
+    h.plumbing.push_feed(rewound_reply(eave_wire::RewindOk {
+        rewound: false,
+        prefill: None,
+        reason: Some("turn running".into()),
+        unsupported: false,
+    }));
+    vcx.run_until_parked();
+    assert_eq!(
+        composer_draft(vcx, &h),
+        "",
+        "a refused rewind must not seed anything"
+    );
+    assert!(
+        shown(vcx, "msg-rewind-0"),
+        "the row is still there and still offers the control"
+    );
+}
+
+/// Applied ONCE. A reply left in the mailbox would paste the same message
+/// into the composer again on every unrelated notify — and the transcript
+/// notifies constantly.
+#[gpui::test]
+fn a_reply_is_applied_once_and_not_on_every_later_notify(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: user_record_named(1, "first ask", "u-1"),
+    });
+    vcx.run_until_parked();
+    h.plumbing.push_feed(rewound_reply(eave_wire::RewindOk {
+        rewound: true,
+        prefill: Some("once".into()),
+        reason: None,
+        unsupported: false,
+    }));
+    vcx.run_until_parked();
+    assert_eq!(composer_draft(vcx, &h), "once");
+    // Anything at all that makes the transcript notify again. The seq must
+    // CONTINUE the log — a gap is a resubscribe, which resets the state
+    // this test is about and made an earlier version of it pass against
+    // the very bug it was written for.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![assistant_record(3, "later")],
+    });
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "msg-rewind-0"),
+        "the notify never reached the transcript, so nothing was proven"
+    );
+    assert_eq!(
+        composer_draft(vcx, &h),
+        "once",
+        "the reply was applied a second time"
+    );
 }

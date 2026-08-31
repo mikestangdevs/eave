@@ -24,8 +24,8 @@ use eave_core::proc::ProcIdentity;
 use eave_core::session::AgentConfig;
 use eave_wire::{
     socket_path, BusyReport, Cursor, HelloOk, InterruptOk, KillOk, ListOk, OpenOk, Request,
-    RequestEnvelope, ResponseBody, ResponseEnvelope, SendOk, SessionInfo, SubscriptionItem,
-    ENGINE_BUSY_EXIT, PROTO_VERSION,
+    RequestEnvelope, ResponseBody, ResponseEnvelope, RewindOk, SendOk, SessionInfo,
+    SubscriptionItem, ENGINE_BUSY_EXIT, PROTO_VERSION,
 };
 
 const SPAWN_CONNECT_WINDOW: Duration = Duration::from_secs(10);
@@ -320,6 +320,28 @@ impl Client {
     pub async fn interrupt(&self, session_id: &str) -> Result<InterruptOk, ClientError> {
         self.request::<InterruptOk>(Request::Interrupt {
             session_id: session_id.into(),
+        })
+        .await
+    }
+
+    /// Slice AG1 #10 — drop the conversation back to a message.
+    ///
+    /// `Ok` covers all three outcomes, including refusals: a provider
+    /// declining to rewind is an ANSWER, not a transport failure, and the
+    /// reason it gives is the thing the operator needs to read. `Err` is
+    /// reserved for the socket.
+    pub async fn rewind(
+        &self,
+        session_id: &str,
+        msg_id: &str,
+        last_seen_msg_id: Option<String>,
+        dropped: usize,
+    ) -> Result<RewindOk, ClientError> {
+        self.request::<RewindOk>(Request::Rewind {
+            session_id: session_id.into(),
+            msg_id: msg_id.into(),
+            last_seen_msg_id,
+            dropped,
         })
         .await
     }

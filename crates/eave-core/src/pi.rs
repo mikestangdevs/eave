@@ -555,6 +555,11 @@ impl crate::provider::AgentAdapter for PiSession {
                    cannot see it. eave never sends it.",
     };
 
+    const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
+        reason: "Pi's RPC has no conversation rewind: zero occurrences of rewind, truncate, \
+                 rollback, fork or revert in the installed CLI — checked 2026-08-31.",
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         PiSession::spawn(cfg)
     }
@@ -682,6 +687,16 @@ impl AgentSession for PiSession {
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    /// Unsupported, and stated in one place only: the reason an operator
+    /// reads lives on `REWIND`, so this never grows a second sentence
+    /// that could drift from it.
+    async fn rewind(
+        &mut self,
+        _target: &crate::session::RewindTarget,
+    ) -> Result<crate::session::RewindOutcome, SessionError> {
+        Ok(crate::session::RewindOutcome::Unsupported)
     }
 
     /// Identical to Claude's, and deliberately so — this is spec 01 §Kill,
@@ -1167,7 +1182,10 @@ impl PiStream {
             "assistant" if !text.is_empty() => vec![SessionEvent::AssistantText { text }],
             // Pi echoes the user's own message back as a `user` message,
             // which is what `--replay-user-messages` gets from Claude.
-            "user" if !text.is_empty() => vec![SessionEvent::UserEcho { text }],
+            "user" if !text.is_empty() => vec![SessionEvent::UserEcho {
+                text,
+                provider_msg_id: None,
+            }],
             // Tool results arrive here too, but `tool_execution_end`
             // already reported them; emitting both would double every tool
             // in the transcript.
@@ -1640,6 +1658,7 @@ mod tests {
         assert_eq!(
             s.parse_line(line),
             vec![SessionEvent::UserEcho {
+                provider_msg_id: None,
                 text: "run the bash tool".into()
             }]
         );

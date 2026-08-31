@@ -244,6 +244,12 @@ enum FeedEvent {
     NoSession {
         error: Option<String>,
     },
+    /// Slice AG1 #10 — what the engine did about a rewind. Rides the feed
+    /// because it is a fact about THIS session's transcript, so it lands
+    /// and is dropped by exactly the same session-switch rules.
+    Rewound {
+        reply: Box<eave_wire::RewindOk>,
+    },
     Reset {
         id: String,
     },
@@ -316,6 +322,18 @@ enum Command {
     Kill,
     /// Composer Stop: interrupt the in-flight turn, keep the session.
     Stop,
+    /// Slice AG1 #10 — drop the conversation back to a message, so the
+    /// next turn runs as if it and everything after it never happened.
+    ///
+    /// The three fields are computed where the transcript is, because
+    /// nothing downstream holds the rows: the target's provider id, the
+    /// newest one the client has rendered (the provider's own
+    /// unseen-turn interlock), and how many user turns go.
+    Rewind {
+        msg_id: String,
+        last_seen_msg_id: Option<String>,
+        dropped: usize,
+    },
     /// Projection lost sync (seq gap): drop and fully resubscribe.
     Resubscribe,
     /// Rail row click: subscribe this session instead (cursorless — the
@@ -1461,6 +1479,8 @@ async fn feed_loop(
                             Some(Command::Send { .. })
                             | Some(Command::Kill)
                             | Some(Command::Stop)
+                            // Nothing to rewind before a session exists.
+                            | Some(Command::Rewind { .. })
                             | Some(Command::Resubscribe)
                             | Some(Command::Diff(_))
                             | Some(Command::Decide { .. }) => {}
@@ -1574,6 +1594,34 @@ async fn feed_loop(
                         }
                         Some(Command::Stop) => {
                             let _ = client.interrupt(&session_id).await;
+                        }
+                        // Slice AG1 #10. The reply matters — it carries the
+                        // discarded message's text for the composer, or the
+                        // provider's own sentence about why it declined —
+                        // so unlike Stop this is awaited and pushed back.
+                        //
+                        // A transport error is reported in the same shape as
+                        // a refusal: from where the operator is standing,
+                        // "the rewind did not happen and here is why" is one
+                        // outcome, and inventing a second control path for it
+                        // would only mean two places that can be wrong.
+                        Some(Command::Rewind {
+                            msg_id,
+                            last_seen_msg_id,
+                            dropped,
+                        }) => {
+                            let reply = client
+                                .rewind(&session_id, &msg_id, last_seen_msg_id, dropped)
+                                .await
+                                .unwrap_or_else(|e| eave_wire::RewindOk {
+                                    rewound: false,
+                                    prefill: None,
+                                    reason: Some(format!("the engine could not be asked: {e}")),
+                                    unsupported: false,
+                                });
+                            plumbing.push_feed(FeedEvent::Rewound {
+                                reply: Box::new(reply),
+                            });
                         }
                         Some(Command::Diff(path)) => {
                             // Off-loop: the reply lands on the diffs
@@ -4603,6 +4651,31 @@ struct TranscriptState {
     /// So the rows carry their own id: written where records are applied
     /// (already id-guarded), cleared by `reset()`.
     rows_session: Option<String>,
+    /// Slice AG1 #10 — whether the SELECTED session's provider has a
+    /// conversation rewind on its wire.
+    ///
+    /// Kept here rather than looked up in the paint because the answer
+    /// changes once a session and the paint runs constantly; written by
+    /// `Shell::refresh_rewind_gate` from the adapter registry, which is
+    /// the same table the engine will refuse or accept the request from —
+    /// so the control cannot be offered for something the engine would
+    /// then decline.
+    ///
+    /// **False is the safe default and it is what an unknown session
+    /// gets.** Hiding a control that would have worked costs an operator
+    /// one menu; offering one that cannot costs them their trust in every
+    /// other control on the row.
+    rewind_ok: bool,
+    /// Slice AG1 #10 — the engine's answer to a rewind, waiting to be
+    /// applied by `Shell`.
+    ///
+    /// A mailbox rather than a direct call because the command loop is
+    /// async and holds no `Shell`: it lands here, the transcript observer
+    /// picks it up, exactly the route `release_queued` takes. `take`n
+    /// when applied, so a reply is acted on ONCE — a replayed prefill
+    /// would paste the same message into the composer on every unrelated
+    /// notify.
+    rewind_reply: Option<eave_wire::RewindOk>,
     /// Slice Q2: the engine's own words when a launch was refused. Lives
     /// here rather than on `Shell` because it is cleared by the same feed
     /// event that clears the session — the two facts arrive together and
@@ -4684,6 +4757,8 @@ impl TranscriptState {
         Self {
             session_id: None,
             rows_session: None,
+            rewind_ok: false,
+            rewind_reply: None,
             launch_error: None,
             transcript: Transcript::new(),
             display: DisplayList::new(),
@@ -5179,6 +5254,13 @@ items={count} rows={} frames={} ops={}",
         // Slice AG1 #13: the rows are going, so the claim about whose they
         // were goes with them.
         self.rows_session = None;
+        // A reset means the rows belong to nobody yet; re-answered by the
+        // observer once the new session's provider is known.
+        self.rewind_ok = false;
+        // A reply to a rewind on a session we are no longer showing is not
+        // ours to apply — it would seed this composer with another
+        // session's message.
+        self.rewind_reply = None;
         self.transcript.reset();
         self.display.update(&self.transcript);
         self.list.reset(self.display.len() + 1);
@@ -10837,6 +10919,130 @@ impl Shell {
     /// Only ever for the OPEN session: `TranscriptState` holds exactly one,
     /// and eave will not subscribe to a session merely to name it. That is
     /// not a shortcut — it is the boundary. See [`crate::session_title`].
+    /// Slice AG1 #10 — ask the engine to rewind to `msg_id`.
+    ///
+    /// One walk of the rows, on the click, computing the two facts the
+    /// provider needs and only the client can supply:
+    ///
+    /// - **`dropped`** — how many user turns go, counted as the user rows
+    ///   from the target onward, the target INCLUDED. It is unsent, which
+    ///   is what makes its text a prefill rather than history.
+    /// - **`last_seen_msg_id`** — the NEWEST user message this client has
+    ///   rendered. Forwarded so the provider can refuse (`unseen later
+    ///   turn`) if its own tail has moved since. Deliberately taken from
+    ///   the rows rather than remembered separately: the rows ARE what
+    ///   this client has seen, and a second notion of "seen" would be a
+    ///   second thing that can be wrong.
+    ///
+    /// Silently does nothing if the target is not in the rows. That is a
+    /// click on a row that has since gone — a race, not an error, and the
+    /// same reading `decide` gives a withdrawn permission question.
+    fn rewind_to(&mut self, msg_id: &str, cx: &mut Context<Self>) {
+        let (dropped, last_seen) = {
+            let rows = &self.transcript.read(cx).transcript.rows;
+            let Some(at) = rows.iter().position(
+                |r| matches!(r, Row::User { provider_msg_id: Some(id), .. } if id == msg_id),
+            ) else {
+                return;
+            };
+            let dropped = rows[at..]
+                .iter()
+                .filter(|r| matches!(r, Row::User { .. }))
+                .count();
+            let last_seen = rows.iter().rev().find_map(|r| match r {
+                Row::User {
+                    provider_msg_id: Some(id),
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            });
+            (dropped, last_seen)
+        };
+        let _ = self.commands.send(Command::Rewind {
+            msg_id: msg_id.to_string(),
+            last_seen_msg_id: last_seen,
+            dropped,
+        });
+    }
+
+    /// Slice AG1 #10 — act on the engine's answer to a rewind.
+    ///
+    /// From the observer, and `take`n so it happens exactly once.
+    ///
+    /// **The prefill is INSERTED, never assigned.** This is AG1 #15's rule
+    /// and it matters more here, not less: a rewind is something an
+    /// operator does while thinking, and the composer may already hold the
+    /// replacement they were drafting. `set_content` would clear it, along
+    /// with the undo history that could get it back. Inserting into an
+    /// empty composer is indistinguishable from seeding it, so the safe
+    /// rule costs nothing in the common case.
+    fn apply_rewind_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(reply) = self.transcript.update(cx, |t, _| t.rewind_reply.take()) else {
+            return;
+        };
+        if !reply.rewound {
+            // Say it, and say WHOSE words they are. A refusal that reads
+            // like eave's own opinion sends an operator looking through
+            // eave's settings for a rewind toggle that does not exist.
+            let reason = reply
+                .reason
+                .unwrap_or_else(|| "the rewind did not happen".into());
+            self.transient_note(
+                if reply.unsupported {
+                    format!("no rewind here — {reason}")
+                } else {
+                    format!("not rewound — {reason}")
+                },
+                cx,
+            );
+            return;
+        }
+        let Some(prefill) = reply.prefill else {
+            // Rewound, with no text handed back. The rows are already gone
+            // and saying so is the whole report.
+            self.transient_note("rewound".into(), cx);
+            return;
+        };
+        self.composer.update(cx, |c, cx| {
+            c.field.update(cx, |f, cx| f.insert(&prefill, cx));
+        });
+        // The point of a rewind is to say it differently, so the caret
+        // belongs in the composer — the same reasoning, and the same two
+        // lines, as `quote_into_composer`.
+        let handle = gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx);
+        window.focus(&handle, cx);
+    }
+
+    /// Slice AG1 #10 — answer, once per change, whether the selected
+    /// session's provider can rewind at all.
+    ///
+    /// From the OBSERVER, never the paint, for the reason
+    /// [`Self::remember_title_proposal`] states: the answer changes once a
+    /// session and a paint runs for a hundred unrelated reasons.
+    ///
+    /// Answered from `eave_core::session::rewind_support` — the adapter
+    /// registry — and never from a second list here. The engine refuses
+    /// or accepts from that same table, so the control and the request
+    /// cannot disagree about what a provider can do.
+    fn refresh_rewind_gate(&self, cx: &mut Context<Self>) {
+        let Some(id) = self.transcript.read(cx).rows_session.clone() else {
+            self.transcript.update(cx, |t, _| t.rewind_ok = false);
+            return;
+        };
+        let ok = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .find(|s| s.session_id == id)
+            .is_some_and(|s| eave_core::session::rewind_support(&s.provider).is_native());
+        self.transcript.update(cx, |t, _| {
+            if t.rewind_ok != ok {
+                t.rewind_ok = ok;
+            }
+        });
+    }
+
     fn remember_title_proposal(&self, cx: &App) {
         let t = self.transcript.read(cx);
         // `rows_session`, NEVER `session_id` — see the field's doc. The
@@ -19738,6 +19944,60 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Slice AG1 #10 — "rewind to here": discard this message and
+    /// everything after it, and hand its text back to the composer.
+    ///
+    /// **Only on a message the provider can be asked about.** Three things
+    /// must all hold, and each rules out a different wrong offer:
+    /// `rewind_ok` (the provider has a rewind at all), a `provider_msg_id`
+    /// (this particular message has an address), and a `last_seen` (the
+    /// interlock the provider uses to refuse discarding turns the operator
+    /// never saw). Absent any of them the control is not drawn — waku's
+    /// answer too, which returns `None` from the same position rather than
+    /// drawing something that explains itself only after it fails.
+    ///
+    /// The other two facts a rewind needs — how many turns go, and the
+    /// newest message this client has rendered — are computed ON CLICK by
+    /// [`Shell::rewind_to`], never here. Both are properties of the whole
+    /// row list, and deriving them per user row per paint is a scan per
+    /// row over all rows: waku's quadratic scar, which AG1 #12 carried
+    /// deliberately and which would arrive here by the same door. A click
+    /// affords one O(rows) walk; a paint does not.
+    ///
+    /// Third in the cluster, left of quote, and sharing the cluster's
+    /// hover key for the reason `message_copy` spells out: a blend keyed
+    /// on a name no listener registers is a control that is laid out,
+    /// clickable and INVISIBLE, and every geometry assertion passes on it.
+    fn message_rewind(state: &TranscriptState, msg: u32, msg_id: String) -> AnyElement {
+        let shell = state.shell.clone();
+        let sel = format!("msg-rewind-{msg}");
+        let ink = motion::hover_blend(
+            &format!("msg-controls-{msg}"),
+            theme::wash_rest(),
+            theme::text_tertiary(),
+        );
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel)
+            .absolute()
+            .top(px(0.))
+            // Left of quote, which is itself left of copy: two glyphs and
+            // their padding.
+            .right(px((theme::ICON_SM + theme::SPACE_1 * 2.) * 2.))
+            .flex_none()
+            .px(px(theme::SPACE_1))
+            .cursor_pointer()
+            .child(icons::icon(icons::RESTART, theme::ICON_SM, ink))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                    let msg_id = msg_id.clone();
+                    shell.update(cx, |shell, cx| shell.rewind_to(&msg_id, cx));
+                }
+            })
+            .into_any_element()
+    }
+
     fn message_copy(state: &TranscriptState, msg: u32, text: String) -> AnyElement {
         let lines = text.lines().count();
         let shell = state.shell.clone();
@@ -20011,7 +20271,11 @@ impl Shell {
             // aligned raised block — an event in the run, not a chat
             // bubble; the only raised full blocks in the stream are the
             // operator's instructions.
-            Row::User { text, delivery } => {
+            Row::User {
+                text,
+                delivery,
+                provider_msg_id,
+            } => {
                 let block = div()
                     .max_w(px(theme::DIRECTIVE_MAX_W))
                     .min_w(px(0.))
@@ -20040,7 +20304,19 @@ impl Shell {
                     // gate is needed here — but it is still out of flow,
                     // for the same height reason.
                     .child(Self::message_copy(state, id.msg, text.clone()))
-                    .child(Self::message_quote(state, id.msg, text.clone()));
+                    .child(Self::message_quote(state, id.msg, text.clone()))
+                    // Slice AG1 #10. Both halves of the gate, and neither
+                    // is redundant: `rewind_ok` is about the PROVIDER,
+                    // `provider_msg_id` is about THIS message. A provider
+                    // that can rewind still has messages it never named
+                    // (a send whose echo has not arrived), and an id can
+                    // exist on a provider with no rewind.
+                    .children(match (state.rewind_ok, provider_msg_id) {
+                        (true, Some(msg_id)) => {
+                            Some(Self::message_rewind(state, id.msg, msg_id.clone()))
+                        }
+                        _ => None,
+                    });
                 match delivery {
                     // The acceptance-critical distinction: journaled but
                     // never reached the agent (spec 02 §Delivery state).
@@ -27281,6 +27557,13 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     transcript.update(cx, |state, cx| {
                         for ev in feed_events {
                             match ev {
+                                // Slice AG1 #10. Parked for the observer;
+                                // applying it here would mean the pump
+                                // reaching into the composer, and the pump
+                                // holds no `Shell`.
+                                FeedEvent::Rewound { reply } => {
+                                    state.rewind_reply = Some(*reply);
+                                }
                                 FeedEvent::Session { id } => {
                                     if state.session_id.as_deref() != Some(id.as_str()) {
                                         switched = true;
@@ -27784,11 +28067,21 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     cx.observe(&sessions, |shell: &mut Shell, _, cx| {
                         shell.release_queued(cx);
                         shell.prune_marks(cx);
+                        // Slice AG1 #10. BOTH observers, because the gate
+                        // reads one fact from each entity: the rail snapshot
+                        // carries the provider, the transcript carries whose
+                        // rows these are, and either can arrive first. Wiring
+                        // only the transcript left the control hidden on a
+                        // cold start until something unrelated moved.
+                        shell.refresh_rewind_gate(cx);
                         cx.notify();
                     })
                     .detach();
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&transcript, |shell, _, cx| {
+                    // `observe_in` rather than `observe`: Slice AG1 #10's
+                    // reply moves the keyboard into the composer, and focus
+                    // needs a `Window`. Nothing else in here changes.
+                    cx.observe_in(&transcript, window, |shell, _, window, cx| {
                         shell.maybe_auto_approve(cx);
                         // Slice AG1 #13. Remembered from the OBSERVER and
                         // never the paint, the same rule the marks and the
@@ -27798,6 +28091,9 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // work per frame for a string that changes once a
                         // session.
                         shell.remember_title_proposal(cx);
+                        // Slice AG1 #10, same rule and the same reason.
+                        shell.refresh_rewind_gate(cx);
+                        shell.apply_rewind_reply(window, cx);
                         // ...and the other half. A turn ending is a
                         // transcript fact — `TurnCompleted` arriving in a
                         // record batch, or the one-second heartbeat

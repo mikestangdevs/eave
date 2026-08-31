@@ -18,6 +18,47 @@ use crate::session::{AgentSession, ImageRef};
 use crate::store::Meta;
 use crate::thresholds::JOURNAL_FLUSH_INTERVAL;
 
+/// Ask the provider to rewind, and journal it **only if it agreed**
+/// (Slice AG1 #10).
+///
+/// **The order is the exact reverse of [`send_and_journal`], and the
+/// asymmetry is the point.** A send is journalled FIRST because a send
+/// that failed to reach the pipe is still a fact worth keeping — the
+/// operator typed it, and spec 02's delivery state exists to show it as
+/// undelivered. A rewind is journalled LAST because a rewind that did not
+/// happen is not a fact at all: the record makes the projection drop rows,
+/// so writing one for a refused rewind would hide turns the agent still
+/// remembers, and the transcript would disagree with the conversation
+/// permanently and silently.
+///
+/// So: refused or unsupported leaves the journal untouched.
+pub async fn rewind_and_journal<S: AgentSession + ?Sized>(
+    session: &mut S,
+    extra: &mpsc::Sender<JournalEvent>,
+    target: &crate::session::RewindTarget,
+) -> io::Result<crate::session::RewindOutcome> {
+    let gone = |_| io::Error::new(io::ErrorKind::BrokenPipe, "recorder is gone");
+    let outcome = session
+        .rewind(target)
+        .await
+        .map_err(|e| io::Error::other(format!("rewind failed: {e}")))?;
+    if let crate::session::RewindOutcome::Rewound { .. } = &outcome {
+        // `msg_id` is `Some` on this path or the adapter could not have
+        // addressed the rewind at all — Claude's own arm returns `Refused`
+        // for `None` before it writes a frame.
+        if let Some(id) = &target.msg_id {
+            extra
+                .send(JournalEvent::Rewound {
+                    through_msg_id: id.clone(),
+                    dropped: target.turns_dropped,
+                })
+                .await
+                .map_err(gone)?;
+        }
+    }
+    Ok(outcome)
+}
+
 /// Journal-then-send: append `UserSent` *before* touching the pipe, and
 /// confirm with `UserDelivered` only after the write succeeds. Returns
 /// whether the message was delivered. A pipe failure is not an error —
@@ -195,7 +236,122 @@ pub async fn record_session(
 mod tests {
     use super::*;
     use crate::journal::Header;
+    use crate::session::{RewindOutcome, SessionError};
     use crate::store::{Meta, META_FORMAT_VERSION};
+
+    /// A session that answers a rewind however the test says, and records
+    /// whether it was asked at all.
+    struct Rewinder(RewindOutcome);
+
+    #[async_trait::async_trait]
+    impl AgentSession for Rewinder {
+        fn identity(&self) -> crate::proc::ProcIdentity {
+            crate::proc::ProcIdentity {
+                pid: 1,
+                start_tvsec: 0,
+                start_tvusec: 0,
+            }
+        }
+        fn provider_session_id(&self) -> Option<String> {
+            None
+        }
+        fn in_flight_tools(&self) -> usize {
+            0
+        }
+        fn last_activity(&self) -> std::time::Instant {
+            std::time::Instant::now()
+        }
+        fn watch(&self) -> crate::session::SessionWatch {
+            crate::session::SessionWatch::new(
+                self.identity(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        }
+        async fn send_user_message(&mut self, _: &str, _: &[ImageRef]) -> Result<(), SessionError> {
+            Ok(())
+        }
+        fn pending_approvals(&self) -> usize {
+            0
+        }
+        async fn respond_to_approval(
+            &mut self,
+            _: &str,
+            _: &crate::session::ApprovalDecision,
+        ) -> Result<bool, SessionError> {
+            Ok(true)
+        }
+        async fn kill(&mut self) -> Result<crate::session::KillReport, SessionError> {
+            unreachable!("not killed in these tests")
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn rewind(
+            &mut self,
+            _: &crate::session::RewindTarget,
+        ) -> Result<RewindOutcome, SessionError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn a_target() -> crate::session::RewindTarget {
+        crate::session::RewindTarget {
+            msg_id: Some("u-1".into()),
+            last_seen_msg_id: Some("u-2".into()),
+            turns_dropped: 2,
+        }
+    }
+
+    /// **The invariant that keeps a transcript honest.** The record is what
+    /// makes the projection drop rows, so writing one for a rewind that did
+    /// not happen would hide turns the agent still remembers — permanently,
+    /// on every later replay, with nothing on screen to say so.
+    ///
+    /// This is the exact reverse of `send_and_journal`'s order, and the
+    /// test asserts the reversal rather than the mechanism: ask first,
+    /// journal only on yes.
+    #[tokio::test]
+    async fn a_refused_rewind_is_never_journalled() {
+        for outcome in [
+            RewindOutcome::Refused {
+                reason: "turn running".into(),
+            },
+            RewindOutcome::Unsupported,
+        ] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut session = Rewinder(outcome.clone());
+            let got = rewind_and_journal(&mut session, &tx, &a_target())
+                .await
+                .expect("the ask itself succeeded");
+            assert_eq!(got, outcome);
+            assert!(
+                rx.try_recv().is_err(),
+                "a rewind that did not happen must leave the journal alone"
+            );
+        }
+    }
+
+    /// And on yes, the record names the SAME message the provider was
+    /// asked about — the projection folds by that id, so a different one
+    /// would cut the transcript somewhere the conversation was not cut.
+    #[tokio::test]
+    async fn an_agreed_rewind_is_journalled_against_the_id_it_asked_about() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut session = Rewinder(RewindOutcome::Rewound {
+            prefill: Some("first ask".into()),
+        });
+        rewind_and_journal(&mut session, &tx, &a_target())
+            .await
+            .expect("rewound");
+        let rec = rx.try_recv().expect("one record");
+        assert!(
+            matches!(&rec, JournalEvent::Rewound { through_msg_id, dropped }
+                if through_msg_id == "u-1" && *dropped == 2),
+            "{rec:?}"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one record");
+    }
 
     /// **The two channels carry one causal order, and `select!` must not
     /// pick between them at random.**

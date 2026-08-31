@@ -121,6 +121,26 @@ pub enum JournalEvent {
     ToolInterrupted { id: String },
     /// Synthetic closer: the open turn ended without a `result`.
     TurnInterrupted { reason: String },
+    /// The operator rewound the conversation, and the provider agreed
+    /// (Slice AG1 #10).
+    ///
+    /// **An append, not a rewrite.** This file's contract is that history
+    /// is never edited in place, and a rewind is no exception — it is a
+    /// thing that HAPPENED, and a journal that quietly lost the turns
+    /// would be unable to say why the agent forgot them. The projection
+    /// folds this record by dropping the rows it names; the record itself
+    /// stays forever.
+    ///
+    /// `through_msg_id` is the provider's id for the message rewound TO,
+    /// which is the same address the provider was asked with, so a replay
+    /// lands on exactly the row the live session did. `dropped` is how
+    /// many user turns went, recorded because it is what the transcript
+    /// tells the operator afterwards and recomputing it from a fold is
+    /// how the two get to disagree.
+    Rewound {
+        through_msg_id: String,
+        dropped: usize,
+    },
     /// Terminal record for one **process segment**. A journal that was
     /// continued via `--resume` (spec 02 §Resume contract) holds one
     /// segment per CLI process, each ending in `Closed`; the journal as a
@@ -521,6 +541,14 @@ fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<Repai
             // record below settles it in the shared fold (spec 05
             // §Engine semantics), exactly as it settles a pending send.
             JournalEvent::ApprovalDecided { .. } => {}
+            // A rewind is only ever RECORDED for a session with no turn
+            // open — the CLI refuses one otherwise (`turn running`), and
+            // eave never asks it to override that. So there is no turn to
+            // close here and no in-flight tool to drop, and saying so is
+            // more honest than defensively clearing state that cannot be
+            // set. If that invariant ever breaks, the visible cost is one
+            // synthetic closer for a turn the fold already dropped.
+            JournalEvent::Rewound { .. } => {}
             JournalEvent::ToolInterrupted { id } => {
                 in_flight.remove(id);
             }

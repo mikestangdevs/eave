@@ -303,6 +303,13 @@ impl crate::provider::AgentAdapter for CursorSession {
                    checked against ASKING_MODES and anything else is PostureRefused.",
     };
 
+    const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
+        reason: "Cursor's ACP agent has no conversation rewind. The vendored ACP library routes \
+                 a `session/fork`, but cursor-agent never implements the handler it dispatches \
+                 to, so the call answers methodNotFound — checked 2026-08-31, and a count of \
+                 the string alone would have read as support.",
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         CursorSession::spawn(cfg)
     }
@@ -397,6 +404,16 @@ impl AgentSession for CursorSession {
             None => return Ok(()),
         };
         wire::write_frame(self.stdin(), &cancel_frame(&session_id)).await
+    }
+
+    /// Unsupported, and stated in one place only: the reason an operator
+    /// reads lives on `REWIND`, so this never grows a second sentence
+    /// that could drift from it.
+    async fn rewind(
+        &mut self,
+        _target: &crate::session::RewindTarget,
+    ) -> Result<crate::session::RewindOutcome, SessionError> {
+        Ok(crate::session::RewindOutcome::Unsupported)
     }
 
     async fn kill(&mut self) -> Result<KillReport, SessionError> {

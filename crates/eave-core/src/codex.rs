@@ -448,6 +448,16 @@ impl crate::provider::AgentAdapter for CodexSession {
                    writes inside the cwd with no request at all.",
     };
 
+    const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
+        reason: "Codex has a conversation rewind and eave has not been able to establish its \
+                 shape. `thread/revert` and a deprecated `thread/rollback` are both in the \
+                 installed app-server (2026-08-31), and `ThreadRevertParams` takes two fields, \
+                 but which two is not readable from the binary and there is no Codex auth on \
+                 this machine to ask. A revert addresses a TURN COUNT, so a guessed field name \
+                 does not fail loudly — it risks discarding the wrong number of turns. This is \
+                 the one row where eave knows support exists and still says no.",
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         CodexSession::spawn(cfg)
     }
@@ -564,6 +574,16 @@ impl AgentSession for CodexSession {
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    /// Unsupported *for now*, and for a different reason than the ACP
+    /// adapters: the wire has a revert, eave cannot yet address it. See
+    /// `REWIND`.
+    async fn rewind(
+        &mut self,
+        _target: &crate::session::RewindTarget,
+    ) -> Result<crate::session::RewindOutcome, SessionError> {
+        Ok(crate::session::RewindOutcome::Unsupported)
     }
 
     async fn kill(&mut self) -> Result<KillReport, SessionError> {
@@ -1317,6 +1337,10 @@ fn decode_item_started(params: &Value, line: &str) -> (SessionEvent, Bookkeeping
     if kind == "userMessage" {
         return unbooked(SessionEvent::UserEcho {
             text: user_text(item),
+            // A thread item has an id, but `thread/revert` addresses a
+            // TURN COUNT, not an item — so carrying it here would name a
+            // thing the rewind cannot be asked about.
+            provider_msg_id: None,
         });
     }
     let Some(name) = tool_name(kind, item) else {

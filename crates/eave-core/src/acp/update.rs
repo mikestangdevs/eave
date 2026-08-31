@@ -198,8 +198,11 @@ impl AcpStream {
                 Thoughts::Dropped => Vec::new(),
                 Thoughts::Journaled => vec![system(update, line)],
             },
+            // ACP names a user message nothing the client can address
+            // later, so there is no id to carry — see `UserEcho`.
             "user_message_chunk" => vec![SessionEvent::UserEcho {
                 text: chunk_text(update).unwrap_or_default(),
+                provider_msg_id: None,
             }],
             "tool_call" => {
                 let Some(id) = tool_call_id(update) else {

@@ -315,7 +315,24 @@ pub enum SessionEvent {
         items: Vec<crate::tool::TodoItem>,
     },
     /// The CLI echoed a user message back (`--replay-user-messages`).
-    UserEcho { text: String },
+    ///
+    /// `provider_msg_id` is the identity the PROVIDER gave that message,
+    /// and it is the only reason this event still exists: the projection
+    /// drops the echo's text (the `UserSent` row already renders it), so
+    /// without the id this would be a record that costs a journal line and
+    /// changes nothing.
+    ///
+    /// **`None` is the honest answer for most providers.** Claude puts a
+    /// `uuid` on every stream frame; Codex, Pi and the three ACP adapters
+    /// name their user messages nothing eave can address later. A rewind
+    /// needs a name to rewind *to*, so `None` here is exactly why
+    /// [`crate::session::AgentSession::rewind`] refuses for those
+    /// providers rather than guessing an index.
+    UserEcho {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_msg_id: Option<String>,
+    },
     /// Provider-terminal turn event (`result` line).
     TurnCompleted { subtype: String, is_error: bool },
     /// A `system` line other than `init`: `status`, `task_started`,

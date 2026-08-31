@@ -92,6 +92,46 @@ impl PostureProof {
     }
 }
 
+/// **Whether this provider's own wire can drop the tail of a conversation**
+/// (Slice AG1 #10).
+///
+/// Declared per adapter for the same reason [`PostureProof`] is: it is a
+/// fact about someone else's CLI, it is not derivable from anything in
+/// this crate, and a wrong guess is invisible. There is no default and no
+/// third state — an adapter that has not answered does not compile.
+///
+/// **Measured against the installed binaries on 2026-08-31, not read from
+/// a doc.** One of six is `Native`: Claude Code 2.1.251's
+/// `rewind_conversation`, driven live over the same control channel
+/// `interrupt` uses.
+///
+/// The five `None`s are not one fact. Cursor, Grok, Hermes and Pi have no
+/// conversation rewind on their wire at all, and cannot be *made* to by
+/// trying harder here — eave will not fake it by starting a fresh session
+/// and replaying a prefix, because a rewind that leaves the agent
+/// remembering what the operator discarded is worse than no rewind, with
+/// nothing on screen to say so. **Codex is different**: its wire has a
+/// revert and eave cannot yet address it. Its `reason` says so, so that a
+/// reader does not have to re-derive the difference between "cannot" and
+/// "not yet".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindSupport {
+    /// The wire truncates a conversation, and `evidence` names the request
+    /// that does it — a pointer to the measurement, exactly as
+    /// [`PostureProof::Verified`] carries one.
+    Native { evidence: &'static str },
+    /// It does not. `reason` is shown to the operator **verbatim**, so it
+    /// is written for one — the same house rule as
+    /// [`crate::capabilities::ModelSource::Silence`].
+    None { reason: &'static str },
+}
+
+impl RewindSupport {
+    pub fn is_native(&self) -> bool {
+        matches!(self, RewindSupport::Native { .. })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The adapter contract
 
@@ -107,8 +147,8 @@ impl PostureProof {
 /// function pointer that boxes the result, which is what makes the
 /// registry a table of data rather than a match.
 ///
-/// Neither const has a default, so **an adapter that has not declared a
-/// posture does not compile**. That is the whole of requirement 5: the
+/// No const has a default, so **an adapter that has not declared a
+/// posture — or a rewind answer — does not compile**. That is the whole of requirement 5: the
 /// declaration is not a convention, it is the type system.
 pub trait AgentAdapter: AgentSession + Sized + 'static {
     /// The value that appears in `AgentConfig::provider`, in the journal
@@ -118,6 +158,10 @@ pub trait AgentAdapter: AgentSession + Sized + 'static {
     /// This adapter's own answer to "does this CLI ask before it writes,
     /// and how do you know". See [`PostureProof`].
     const POSTURE: PostureProof;
+
+    /// This adapter's own answer to "can your wire drop the tail of a
+    /// conversation, and how do you know". See [`RewindSupport`].
+    const REWIND: RewindSupport;
 
     /// Spawn the CLI. The returned receiver's final event must be
     /// `SessionEvent::Exited` — the recorder waits on it.
@@ -174,6 +218,7 @@ fn spawn_boxed<A: AgentAdapter>(
 pub struct Adapter {
     pub id: &'static str,
     pub posture: PostureProof,
+    pub rewind: RewindSupport,
     spawn: SpawnFn,
 }
 
@@ -204,6 +249,7 @@ macro_rules! adapters {
         pub const ADAPTERS: &[Adapter] = &[$(Adapter {
             id: <$adapter as AgentAdapter>::PROVIDER_ID,
             posture: <$adapter as AgentAdapter>::POSTURE,
+            rewind: <$adapter as AgentAdapter>::REWIND,
             spawn: spawn_boxed::<$adapter>,
         }),*];
     };
@@ -677,6 +723,75 @@ mod tests {
                 a.id
             );
         }
+    }
+
+    /// Slice AG1 #10. Every adapter declares a rewind answer — that much
+    /// the compiler guarantees — and this checks the answers are USABLE:
+    /// a refusal an operator can read, and a support claim that points at
+    /// its evidence.
+    ///
+    /// The sentences are shown verbatim in the UI, so an empty one is a
+    /// control that fails silently.
+    #[test]
+    fn every_adapter_states_a_rewind_answer_written_for_an_operator() {
+        for a in ADAPTERS {
+            match a.rewind {
+                RewindSupport::Native { evidence } => assert!(
+                    evidence.len() > 40,
+                    "{}: a Native rewind must point at the measurement that \
+                     established it, exactly as PostureProof::Verified does",
+                    a.id
+                ),
+                RewindSupport::None { reason } => {
+                    assert!(
+                        reason.len() > 40,
+                        "{}: this sentence is shown to an operator verbatim",
+                        a.id
+                    );
+                    assert!(
+                        !reason.ends_with('.') || reason.contains(' '),
+                        "{}: not a placeholder",
+                        a.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// The gate and the request read the SAME table.
+    ///
+    /// `rewind_support` is what the UI asks before drawing the control and
+    /// what the engine asks before naming a refusal. A second list would
+    /// let eave offer a control the engine then declines — the failure
+    /// `posture_is_verified` was consolidated to prevent, and the reason
+    /// this is derived rather than maintained.
+    #[test]
+    fn the_rewind_gate_is_derived_from_the_registry_and_not_a_second_list() {
+        for a in ADAPTERS {
+            assert_eq!(
+                crate::session::rewind_support(a.id).is_native(),
+                a.rewind.is_native(),
+                "{} disagrees with its own registry row",
+                a.id
+            );
+        }
+        // An unknown provider is refused with a sentence, never a panic
+        // and never a silent `true`.
+        assert!(!crate::session::rewind_support("no-such-provider").is_native());
+    }
+
+    /// Claude is the one provider that can, measured live 2026-08-31. If
+    /// this ever flips, the CLI changed underneath eave — which is exactly
+    /// what happened to AG1 #14's `TodoWrite` — and the walk needs redoing
+    /// rather than the test relaxing.
+    #[test]
+    fn claude_is_the_provider_that_can_rewind_today() {
+        let native: Vec<&str> = ADAPTERS
+            .iter()
+            .filter(|a| a.rewind.is_native())
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(native, vec!["claude-code"]);
     }
 
     #[test]

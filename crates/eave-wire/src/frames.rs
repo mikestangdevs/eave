@@ -131,6 +131,34 @@ pub enum Request {
     Interrupt {
         session_id: String,
     },
+    /// Drop the tail of the conversation, so the next turn runs as if
+    /// everything after `msg_id` never happened (Slice AG1 #10).
+    ///
+    /// **Conversation only — no file on disk is touched.** Claude exposes
+    /// file rewinding as a separate request and eave does not send it.
+    ///
+    /// The client computes all three fields because it is the side that
+    /// holds the transcript; the engine forwards them and journals what
+    /// the provider agreed to. A provider whose wire cannot rewind
+    /// answers `unsupported` and nothing is journalled — see
+    /// `eave_core::session::rewind_support`, which is what should have
+    /// stopped the control being offered in the first place.
+    Rewind {
+        session_id: String,
+        /// The provider's own id for the message to rewind TO. That
+        /// message is discarded along with everything after it.
+        msg_id: String,
+        /// The newest user message the CLIENT had rendered. Forwarded as
+        /// a safety interlock: the provider refuses if its own tail moved
+        /// past this, so a rewind can never discard a turn the operator
+        /// never saw.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_seen_msg_id: Option<String>,
+        /// How many user turns the client counted as going away. Recorded
+        /// in the journal so the transcript can say what happened.
+        #[serde(default)]
+        dropped: usize,
+    },
     /// Observe the session SET (spec 05 §Watch): items flow on this
     /// request's id as `Sessions` snapshots — one immediately, one on
     /// every session-set / state / attention change. This is the only
@@ -1229,6 +1257,29 @@ pub struct KillOk {
 /// the wire besides the turn settling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct InterruptOk {}
+
+/// What the engine did about a [`Request::Rewind`].
+///
+/// Three outcomes, never collapsed: a rewind that HAPPENED, one the
+/// provider DECLINED (and its own words for why), and a provider that
+/// cannot rewind at all. A caller that folded the last two together would
+/// tell an operator "turn running" about a CLI that has no rewind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RewindOk {
+    pub rewound: bool,
+    /// The text of the discarded message, when the provider handed it
+    /// back, so the composer can be seeded with it for editing. `None`
+    /// never means the message was empty — only that no text was offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
+    /// Why not, in the provider's own words. `Some` iff `!rewound`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// This provider has no conversation rewind at all — a different fact
+    /// from a refusal, and the surface says a different thing about it.
+    #[serde(default)]
+    pub unsupported: bool,
+}
 
 /// Reply to [`Request::Unsubscribe`] (Slice I1). `stopped` is a fact, not
 /// a success bit: `false` means the id named no live stream on this

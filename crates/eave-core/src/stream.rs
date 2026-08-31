@@ -192,7 +192,7 @@ impl ClaudeStream {
             Some("control_response") => Vec::new(),
             Some("stream_event") => self.parse_stream_event(&v["event"]),
             Some("assistant") => self.parse_assistant(&v["message"]),
-            Some("user") => self.parse_user(&v["message"]),
+            Some("user") => self.parse_user(&v["message"], v.get("uuid").and_then(Value::as_str)),
             Some("result") => {
                 let mut out = Vec::new();
                 // Slice CC: usage first, then the bookend — the cost is a
@@ -411,7 +411,13 @@ impl ClaudeStream {
         out
     }
 
-    fn parse_user(&mut self, msg: &Value) -> Vec<SessionEvent> {
+    /// `frame_uuid` is the id Claude puts on the OUTER frame, not on
+    /// `message` — which is why this takes it as a second argument rather
+    /// than reading it here. It is the address
+    /// `rewind_conversation`'s `target_message_uuid` expects, and it is
+    /// attached only to a TEXT echo: a `tool_result` arrives on a `user`
+    /// frame too, and it is not a message anyone can rewind to.
+    fn parse_user(&mut self, msg: &Value, frame_uuid: Option<&str>) -> Vec<SessionEvent> {
         let mut out = Vec::new();
         match msg.get("content") {
             Some(Value::Array(blocks)) => {
@@ -440,6 +446,7 @@ impl ClaudeStream {
                             if let Some(text) = block.get("text").and_then(Value::as_str) {
                                 out.push(SessionEvent::UserEcho {
                                     text: text.to_string(),
+                                    provider_msg_id: frame_uuid.map(str::to_string),
                                 });
                             }
                         }
@@ -447,7 +454,10 @@ impl ClaudeStream {
                     }
                 }
             }
-            Some(Value::String(text)) => out.push(SessionEvent::UserEcho { text: text.clone() }),
+            Some(Value::String(text)) => out.push(SessionEvent::UserEcho {
+                text: text.clone(),
+                provider_msg_id: frame_uuid.map(str::to_string),
+            }),
             _ => {}
         }
         out
@@ -621,6 +631,62 @@ mod tests {
     /// `request`, the envelope-level `request_id`) are exactly where the
     /// CLI actually puts them.
     const REAL_BASH_REQUEST: &str = r#"{"type":"control_request","request_id":"df432c25-2da3-4a94-977d-99a1bf3931be","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"echo hello-from-bash > out.txt","description":"Write \"hello-from-bash\" to out.txt"},"description":"Write \"hello-from-bash\" to out.txt","permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"echo hello-from-bash *"}],"behavior":"allow","destination":"localSettings"},{"type":"addDirectories","directories":["/tmp/pc3"],"destination":"session"}],"blocked_path":"/tmp/pc3/out.txt","tool_use_id":"toolu_01Svext1o24ASnB6tJ8C4CLF"}}"#;
+
+    /// Verbatim from the 2026-08-31 capture of claude 2.1.251 in eave's
+    /// exact spawn posture, driving Slice AG1 #10. `isReplay: true` is
+    /// what `--replay-user-messages` puts on the echo of a message eave
+    /// itself sent, and `uuid` — on the OUTER frame, not on `message` —
+    /// is the address `rewind_conversation` takes.
+    const REAL_USER_ECHO: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Say exactly: ALPHA"}]},"session_id":"c5d65893-ff4c-44b7-842e-fed21927f89b","parent_tool_use_id":null,"uuid":"fb99bae1-4e74-4061-964c-c05b50d897c5","timestamp":"2026-08-31T13:47:52.448Z","isReplay":true}"#;
+
+    #[test]
+    fn a_user_echo_carries_the_frame_uuid_that_a_rewind_is_addressed_with() {
+        let mut s = ClaudeStream::new();
+        let out = s.parse_line(REAL_USER_ECHO);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SessionEvent::UserEcho { text, provider_msg_id: Some(id) }]
+                    if text == "Say exactly: ALPHA"
+                        && id == "fb99bae1-4e74-4061-964c-c05b50d897c5"
+            ),
+            "the echo must carry the OUTER frame's uuid: {out:?}"
+        );
+    }
+
+    /// A `tool_result` rides a `user` frame too, and it has a uuid — but it
+    /// is not a message anybody can rewind to, and eave has no `Row::User`
+    /// for it. Naming it would offer a control that addresses the wrong
+    /// thing.
+    #[test]
+    fn a_tool_result_on_a_user_frame_is_never_given_a_rewind_address() {
+        let mut s = ClaudeStream::new();
+        s.parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]},"uuid":"11111111-1111-1111-1111-111111111111"}"#;
+        let out = s.parse_line(line);
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, SessionEvent::UserEcho { .. })),
+            "a tool result is not a user message: {out:?}"
+        );
+    }
+
+    /// The other five providers name nothing addressable, and the parser
+    /// must not invent one when the CLI omits it either.
+    #[test]
+    fn a_user_echo_without_a_uuid_is_honestly_unaddressable() {
+        let mut s = ClaudeStream::new();
+        let out = s.parse_line(r#"{"type":"user","message":{"role":"user","content":"plain"}}"#);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SessionEvent::UserEcho { text, provider_msg_id: None }] if text == "plain"
+            ),
+            "no uuid on the frame means no address: {out:?}"
+        );
+    }
 
     const REAL_CANCEL: &str =
         r#"{"type":"control_cancel_request","request_id":"d9c7cd34-146f-4f74-ac01-db5258ee4070"}"#;

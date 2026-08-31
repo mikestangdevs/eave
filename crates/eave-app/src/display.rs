@@ -325,7 +325,9 @@ pub struct DisplayList {
 
 fn msg_content_hash(row: &Row) -> u64 {
     match row {
-        Row::User { text, delivery } => {
+        // `provider_msg_id` is deliberately NOT hashed: this key caches
+        // PARSED MARKDOWN BLOCKS, and an id changes none of them.
+        Row::User { text, delivery, .. } => {
             let tag: u8 = match delivery {
                 Delivery::Pending => 1,
                 Delivery::Delivered => 2,
@@ -350,12 +352,21 @@ fn msg_content_hash(row: &Row) -> u64 {
             // allocation per row inside the fold, and the 10k-row gate
             // builds every row cold.
             call: _,
-            // Not hashed either, on the FIRST ground above and only that
-            // one: the diff is written by `finish_tool` in the same breath
-            // as `result`, which IS hashed, so a row can never gain a diff
-            // without this fingerprint moving anyway. (Slice AG1 #4 added
-            // it; if it ever arrives independently of `result`, this must
-            // be revisited.)
+            // Not hashed either. The load-bearing fact is NOT that
+            // `result` is hashed alongside it — that was this note's first
+            // wording and it is the weaker ground. It is that
+            // `finish_tool` unconditionally sets `*status =
+            // ToolStatus::Finished`, and `status` IS hashed: it is the
+            // `tag` byte below. So a row cannot gain a diff without this
+            // fingerprint moving via status, whether or not the result
+            // changed.
+            //
+            // That makes the revisit condition narrow and specific: a
+            // SECOND `finish_tool` on an already-Finished row, carrying a
+            // result of identical length — identical length because the
+            // result hash is a bounded prefix plus length, not the whole
+            // payload. Nothing does that today. (Slice AG1 #4; ground
+            // sharpened by the AT1 lane, who owns this file.)
             diff: _,
         } => {
             let tag: u8 = match status {
@@ -782,6 +793,7 @@ mod tests {
         Row::User {
             text: text.into(),
             delivery: Delivery::Delivered,
+            provider_msg_id: None,
         }
     }
 

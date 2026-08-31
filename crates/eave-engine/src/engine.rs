@@ -1437,6 +1437,65 @@ impl Engine {
         Ok(eave_wire::InterruptOk {})
     }
 
+    /// Slice AG1 #10: drop the tail of the conversation.
+    ///
+    /// The session must be LIVE. A rewind is a request to a running CLI
+    /// about state it holds in memory; there is nothing to ask a process
+    /// that is not there, and spawning one just to rewind it would start
+    /// a CLI the operator did not ask to start.
+    async fn rewind(
+        self: &Arc<Self>,
+        id: &str,
+        msg_id: &str,
+        last_seen_msg_id: Option<String>,
+        dropped: usize,
+    ) -> Result<eave_wire::RewindOk, String> {
+        let handle = self.session(id)?;
+        let mut live = handle.live.lock().await;
+        let l = live.as_mut().ok_or("session is not live")?;
+        let target = eave_core::session::RewindTarget {
+            msg_id: Some(msg_id.to_string()),
+            last_seen_msg_id,
+            turns_dropped: dropped,
+        };
+        let outcome =
+            eave_core::recorder::rewind_and_journal(&mut *l.session, &l.extra_tx, &target)
+                .await
+                .map_err(|e| format!("rewind failed: {e}"))?;
+        Ok(match outcome {
+            eave_core::session::RewindOutcome::Rewound { prefill } => eave_wire::RewindOk {
+                rewound: true,
+                prefill,
+                reason: None,
+                unsupported: false,
+            },
+            eave_core::session::RewindOutcome::Refused { reason } => eave_wire::RewindOk {
+                rewound: false,
+                prefill: None,
+                reason: Some(reason),
+                unsupported: false,
+            },
+            eave_core::session::RewindOutcome::Unsupported => eave_wire::RewindOk {
+                rewound: false,
+                prefill: None,
+                // The sentence the adapter itself declared, so the engine
+                // never writes a second one that could drift from it.
+                reason: Some(
+                    match eave_core::session::rewind_support(provider_of(
+                        &self.cfg,
+                        &handle.shared.lock().unwrap().header.agent,
+                    )) {
+                        eave_core::provider::RewindSupport::None { reason } => reason.to_string(),
+                        eave_core::provider::RewindSupport::Native { .. } => {
+                            "this provider reported no rewind".to_string()
+                        }
+                    },
+                ),
+                unsupported: true,
+            },
+        })
+    }
+
     /// Slice I2: move a never-started session into its own worktree.
     /// Isolation is the operator's opt-in (decision 1) and is only legal
     /// while nothing has ever spawned — the provider CLI keys its resume
@@ -2186,6 +2245,18 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Err(message) => ResponseBody::Err { message },
             },
             Request::Interrupt { session_id } => match engine.interrupt(&session_id).await {
+                Ok(ok) => ok_value(&ok),
+                Err(message) => ResponseBody::Err { message },
+            },
+            Request::Rewind {
+                session_id,
+                msg_id,
+                last_seen_msg_id,
+                dropped,
+            } => match engine
+                .rewind(&session_id, &msg_id, last_seen_msg_id, dropped)
+                .await
+            {
                 Ok(ok) => ok_value(&ok),
                 Err(message) => ResponseBody::Err { message },
             },

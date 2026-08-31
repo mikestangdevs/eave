@@ -312,6 +312,12 @@ impl crate::provider::AgentAdapter for GrokSession {
                    every session refused.",
     };
 
+    const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
+        reason: "Grok's ACP wire has no conversation rewind: `session/load` only. Its binary \
+                 contains `session/fork`, but as a Rust MODULE PATH and never as a quoted \
+                 method name — checked 2026-08-31.",
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         GrokSession::spawn(cfg)
     }
@@ -432,6 +438,16 @@ impl AgentSession for GrokSession {
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    /// Unsupported, and stated in one place only: the reason an operator
+    /// reads lives on `REWIND`, so this never grows a second sentence
+    /// that could drift from it.
+    async fn rewind(
+        &mut self,
+        _target: &crate::session::RewindTarget,
+    ) -> Result<crate::session::RewindOutcome, SessionError> {
+        Ok(crate::session::RewindOutcome::Unsupported)
     }
 
     async fn kill(&mut self) -> Result<KillReport, SessionError> {

@@ -523,7 +523,7 @@ async fn undelivered_send_renders_distinct_from_sent() {
         if t.rows.iter().any(|r| {
             matches!(
                 r,
-                Row::User { text, delivery: Delivery::Pending } if text == "lost words"
+                Row::User { text, delivery: Delivery::Pending, .. } if text == "lost words"
             )
         }) {
             break;
@@ -540,7 +540,7 @@ async fn undelivered_send_renders_distinct_from_sent() {
     assert!(
         t.rows.iter().any(|r| matches!(
             r,
-            Row::User { text, delivery: Delivery::Undelivered } if text == "lost words"
+            Row::User { text, delivery: Delivery::Undelivered, .. } if text == "lost words"
         )),
         "undelivered send renders distinct: {:?}",
         t.rows
@@ -548,7 +548,7 @@ async fn undelivered_send_renders_distinct_from_sent() {
     assert!(
         !t.rows.iter().any(|r| matches!(
             r,
-            Row::User { text, delivery: Delivery::Delivered } if text == "lost words"
+            Row::User { text, delivery: Delivery::Delivered, .. } if text == "lost words"
         )),
         "the failed send must never render as sent"
     );

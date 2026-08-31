@@ -266,7 +266,7 @@ async fn a_normal_turn_streams_text_and_exits_cleanly() {
     );
     assert!(events
         .iter()
-        .any(|e| matches!(e, SessionEvent::UserEcho { text } if text == "say hello")));
+        .any(|e| matches!(e, SessionEvent::UserEcho { text, .. } if text == "say hello")));
     assert!(events
         .iter()
         .any(|e| matches!(e, SessionEvent::TextDelta { text } if text == "hello")));

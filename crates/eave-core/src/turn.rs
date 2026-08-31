@@ -441,6 +441,13 @@ impl TurnLedger {
                 self.unannounced_since_ms = None;
                 Fold::Activity
             }
+            // The operator rewound. Not a CLI byte and not agent work —
+            // the same reading `UserSent` gets, and for the same reason:
+            // what the attention clocks do next must be driven by what the
+            // provider says, not by eave's own request. Nothing is
+            // reset here because a rewind cannot happen mid-turn, so
+            // there is no counter standing that this could correct.
+            JournalEvent::Rewound { .. } => Fold::Silent,
             JournalEvent::Provider { event } => match event {
                 SessionEvent::TurnCompleted { .. } => {
                     // **The frame closes the turn that was actually open.**
@@ -997,7 +1004,10 @@ mod tests {
                 subtype: "status".into(),
                 raw: r#"{"status":"requesting"}"#.into(),
             },
-            SessionEvent::UserEcho { text: "go".into() },
+            SessionEvent::UserEcho {
+                text: "go".into(),
+                provider_msg_id: None,
+            },
             SessionEvent::TokenUsage {
                 turn: None,
                 context: None,

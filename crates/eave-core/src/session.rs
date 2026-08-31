@@ -82,6 +82,77 @@ pub fn posture_is_verified(provider: &str) -> bool {
     crate::provider::adapter(provider).is_some_and(|a| a.posture.is_verified())
 }
 
+/// What this provider's wire can do about rewinding a conversation
+/// (Slice AG1 #10), derived from the adapter registry the same way
+/// [`posture_is_verified`] is — never a second list.
+///
+/// An **unknown** provider answers [`RewindSupport::None`] rather than
+/// `Option::None`, because every caller has the same question ("may I
+/// offer this?") and the same right answer ("no, and here is why"). A
+/// nullable return would make each caller invent that sentence.
+/// Where to rewind to, carrying **every address a provider might use**
+/// because they do not agree on one (Slice AG1 #10).
+///
+/// Claude addresses a MESSAGE (`target_message_uuid`); Codex addresses a
+/// TURN COUNT (`thread/revert`). A trait method that took only one would
+/// force the other adapter to reconstruct it from state it does not have,
+/// so both facts are computed once by the caller — which holds the
+/// transcript and is the only place that can — and each adapter reads the
+/// one it can send.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RewindTarget {
+    /// The provider's own id for the message to rewind TO. `None` when
+    /// the provider never named it — which is most of them, and is why
+    /// the row cannot be a target at all.
+    pub msg_id: Option<String>,
+    /// The newest user message the CLIENT had rendered when the operator
+    /// asked.
+    ///
+    /// **This is a safety interlock, not bookkeeping.** Claude compares it
+    /// against its own tail and refuses with `unseen later turn` if
+    /// anything arrived in between — so a rewind can never silently
+    /// discard a turn the operator had not seen. eave forwards it rather
+    /// than deciding locally, because the provider's tail is the
+    /// authority on its own conversation.
+    pub last_seen_msg_id: Option<String>,
+    /// How many user turns the operator is asking to drop, counted by the
+    /// caller from its own rows. The address Codex takes.
+    pub turns_dropped: usize,
+}
+
+/// What the provider did about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewindOutcome {
+    /// The conversation was truncated.
+    ///
+    /// `prefill` is the text of the message rewound to, **when the
+    /// provider hands it back** — Claude does, in `prefillText`, and it is
+    /// what turns "revert to here" into "edit and resend". `None` means
+    /// the rewind happened and the text was not offered; it never means
+    /// the message was empty.
+    Rewound { prefill: Option<String> },
+    /// The provider can rewind, and declined this one. `reason` is the
+    /// provider's own words (Claude: `turn running`, `prompt pending`,
+    /// `commands queued`, `target not found`, `stale target`, `unseen
+    /// later turn`), shown rather than mapped onto a house vocabulary —
+    /// eave would be inventing the difference between them.
+    Refused { reason: String },
+    /// This provider has no conversation rewind at all.
+    ///
+    /// Reachable only if a caller skipped
+    /// [`crate::provider::AgentAdapter::REWIND`]; it exists so that
+    /// skipping the gate produces a true answer instead of a lie.
+    Unsupported,
+}
+
+pub fn rewind_support(provider: &str) -> crate::provider::RewindSupport {
+    crate::provider::adapter(provider)
+        .map(|a| a.rewind)
+        .unwrap_or(crate::provider::RewindSupport::None {
+            reason: "eave has no adapter for this provider",
+        })
+}
+
 /// Flags a caller may not smuggle through [`AgentConfig::extra_args`],
 /// because they would undo the posture proof rather than extend it.
 ///
@@ -334,4 +405,21 @@ pub trait AgentSession: Send {
     /// stdin. Adapters with no interrupt on their wire return `Ok` and
     /// do nothing — a no-op is honest; killing the session is not.
     async fn interrupt(&mut self) -> Result<(), SessionError>;
+
+    /// Ask the provider to drop the tail of its conversation, so the next
+    /// turn runs as if everything after `target` never happened
+    /// (Slice AG1 #10).
+    ///
+    /// **Conversation only. This never touches a file on disk**, and the
+    /// surface says so, because the two halves of "revert" are different
+    /// promises: Claude exposes `rewind_files` as a SEPARATE request and
+    /// eave does not send it. An operator who rewinds a conversation and
+    /// silently found their edits reverted would have lost work eave was
+    /// never asked to touch.
+    ///
+    /// No default: every adapter states its own answer, the same rule
+    /// [`crate::provider::AgentAdapter::REWIND`] enforces statically.
+    /// The two must agree, and
+    /// [`crate::provider::tests`] holds them together.
+    async fn rewind(&mut self, target: &RewindTarget) -> Result<RewindOutcome, SessionError>;
 }

@@ -1028,6 +1028,13 @@ impl crate::provider::AgentAdapter for HermesSession {
                    message never reaches the model.",
     };
 
+    const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
+        reason: "Hermes' ACP adapter has no conversation rewind. Its whole method set is \
+                 session/new, prompt, request_permission, set_config_option, set_mode and \
+                 update — read from the adapter's own Python source 2026-08-31, so this is a \
+                 complete list rather than a failed search.",
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         HermesSession::spawn(cfg)
     }
@@ -1126,6 +1133,16 @@ impl AgentSession for HermesSession {
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    /// Unsupported, and stated in one place only: the reason an operator
+    /// reads lives on `REWIND`, so this never grows a second sentence
+    /// that could drift from it.
+    async fn rewind(
+        &mut self,
+        _target: &crate::session::RewindTarget,
+    ) -> Result<crate::session::RewindOutcome, SessionError> {
+        Ok(crate::session::RewindOutcome::Unsupported)
     }
 
     async fn kill(&mut self) -> Result<KillReport, SessionError> {

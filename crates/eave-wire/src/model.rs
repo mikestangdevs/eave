@@ -183,13 +183,22 @@ pub enum Row {
     User {
         text: String,
         delivery: Delivery,
+        /// The id the PROVIDER gave this message, once it echoed one back
+        /// (Slice AG1 #10). This is the address a rewind is asked about,
+        /// so a row without one cannot be a rewind target — which is the
+        /// whole of the gate on the surface.
+        ///
+        /// `None` covers three different situations that must not be
+        /// confused: the provider names nothing addressable (Codex, Pi,
+        /// every ACP agent), the echo has not arrived yet (a send in
+        /// flight), and the journal predates this field. All three are
+        /// honestly "eave cannot rewind to this row", which is why one
+        /// `None` is enough and no second state is invented.
+        provider_msg_id: Option<String>,
     },
     /// Assistant text; `live` while streaming deltas, settled by the
     /// snapshot or a turn end.
-    Assistant {
-        text: String,
-        live: bool,
-    },
+    Assistant { text: String, live: bool },
     /// A tool call. `input` is the provider's request object as compact
     /// JSON and `result` its reply as text — both already bounded by
     /// `eave_core::events::TOOL_PAYLOAD_CAP` before they reach here, so a
@@ -230,9 +239,7 @@ pub enum Row {
     },
     /// Non-content markers rendered inline: session start, turn ends,
     /// interruptions, terminal outcome.
-    Marker {
-        text: String,
-    },
+    Marker { text: String },
 }
 
 /// One turn's extent in [`Transcript::rows`], with the only clock a fold
@@ -457,6 +464,8 @@ impl Transcript {
                 self.push_row(Row::User {
                     text: text.clone(),
                     delivery: Delivery::Pending,
+                    // Filled by the provider's own echo, if it sends one.
+                    provider_msg_id: None,
                 });
             }
             JournalEvent::UserDelivered {} => {
@@ -469,6 +478,63 @@ impl Transcript {
                             break;
                         }
                     }
+                }
+            }
+            // The operator rewound, and the provider agreed (Slice AG1
+            // #10). The record is an APPEND — this is where it becomes a
+            // shorter transcript.
+            //
+            // Addressed by the provider's own message id, the same address
+            // the provider was asked with, so a cold replay lands on
+            // exactly the row the live session did.
+            //
+            // **The target row goes too.** "Revert to here" means that
+            // message is unsent: Claude hands its text back as
+            // `prefillText` precisely so it can be edited and sent again,
+            // and leaving it on screen would show as history a message the
+            // agent no longer knows about.
+            //
+            // Note what is deliberately NOT undone: `turn_tokens` and
+            // `context` still describe a turn that may have just been
+            // dropped. That is not an oversight — those tokens were really
+            // spent, and a bill does not un-bill because the answer was
+            // discarded. Leaving them is the honest reading, and it makes
+            // the live fold and the cold replay agree, which is the
+            // property that actually matters here.
+            JournalEvent::Rewound {
+                through_msg_id,
+                dropped,
+            } => {
+                let target = self.rows.iter().position(|r| {
+                    matches!(r, Row::User { provider_msg_id: Some(id), .. } if id == through_msg_id)
+                });
+                // No match is not a corruption: a journal can be replayed
+                // by a client that trimmed its head, and a record naming a
+                // row that is not here has nothing to do. Silently doing
+                // nothing beats truncating to a guessed index.
+                if let Some(ix) = target {
+                    self.rows.truncate(ix);
+                    self.revs.truncate(ix);
+                    // A span anchored at or after the cut points into rows
+                    // that no longer exist. `start_row` is an INDEX, so
+                    // every surviving span keeps its meaning only because
+                    // the cut is a suffix — this would be wrong for any
+                    // removal from the middle.
+                    self.turns.retain(|t| t.start_row < ix);
+                    // The discarded turn's reasoning goes with the turn.
+                    self.thought.clear();
+                    self.thought_started_ms = None;
+                    // **Say it happened.** Rows vanishing with nothing to
+                    // explain them is the diff stat's `omitted > 0` lie in
+                    // another costume: an operator scrolling up would find
+                    // history simply different, and no way to tell a
+                    // rewind from a bug.
+                    self.push_row(Row::Marker {
+                        text: match dropped {
+                            1 => "rewound — 1 turn discarded".to_string(),
+                            n => format!("rewound — {n} turns discarded"),
+                        },
+                    });
                 }
             }
             JournalEvent::ApprovalDecided {
@@ -618,7 +684,31 @@ impl Transcript {
                 self.finish_tool(id, result, *is_error, diff.clone());
             }
             // The CLI's echo of our own message — the `UserSent` row already
-            // renders it; a duplicate row would be merge-by-accident.
+            // renders it; a duplicate row would be merge-by-accident. The
+            // echo is kept for ONE thing: the id the provider just gave
+            // that message (Slice AG1 #10).
+            //
+            // Order-paired the same way `UserDelivered` is, and for the
+            // same reason: the echo answers the oldest send that has not
+            // been named yet. Stamping by text would merge two identical
+            // prompts onto one row, and a rewind would then target the
+            // wrong turn — silently, since both rows read the same.
+            SessionEvent::UserEcho {
+                provider_msg_id: Some(id),
+                ..
+            } => {
+                for ix in 0..self.rows.len() {
+                    if let Row::User {
+                        provider_msg_id: slot @ None,
+                        ..
+                    } = &mut self.rows[ix]
+                    {
+                        *slot = Some(id.clone());
+                        self.touch(ix);
+                        break;
+                    }
+                }
+            }
             SessionEvent::UserEcho { .. } => {}
             SessionEvent::TurnCompleted { is_error, .. } => {
                 self.settle_live_rows();
@@ -1106,6 +1196,254 @@ mod tests {
         assert_eq!(t.inventory, None);
     }
 
+    // ── Slice AG1 #10: rewind ────────────────────────────────────────
+
+    fn echo(id: &str) -> JournalEvent {
+        JournalEvent::Provider {
+            event: SessionEvent::UserEcho {
+                text: String::new(),
+                provider_msg_id: Some(id.into()),
+            },
+        }
+    }
+
+    fn user_ids(t: &Transcript) -> Vec<Option<String>> {
+        t.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::User {
+                    provider_msg_id, ..
+                } => Some(provider_msg_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The echo names the OLDEST unnamed send, the same order-pairing
+    /// `UserDelivered` uses.
+    ///
+    /// **Two identical prompts is the case that decides it.** Matching on
+    /// text would put both ids on the first row and leave the second
+    /// unaddressable — and a rewind would then silently target the wrong
+    /// turn, with both rows reading the same on screen.
+    #[test]
+    fn an_echo_names_the_oldest_unnamed_send_even_when_two_read_alike() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    JournalEvent::UserSent {
+                        text: "same".into(),
+                    },
+                ),
+                rec(2, echo("u-1")),
+                rec(
+                    3,
+                    JournalEvent::UserSent {
+                        text: "same".into(),
+                    },
+                ),
+                rec(4, echo("u-2")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            user_ids(&t),
+            vec![Some("u-1".to_string()), Some("u-2".to_string())]
+        );
+    }
+
+    /// A provider that names nothing leaves every row unaddressable, and
+    /// that is the whole gate: no id, no rewind control.
+    #[test]
+    fn an_echo_without_an_id_leaves_the_row_unaddressable() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(1, JournalEvent::UserSent { text: "hi".into() }),
+                rec(
+                    2,
+                    JournalEvent::Provider {
+                        event: SessionEvent::UserEcho {
+                            text: "hi".into(),
+                            provider_msg_id: None,
+                        },
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(user_ids(&t), vec![None]);
+    }
+
+    /// The fold: the target row and everything after it goes, and the
+    /// transcript SAYS so.
+    #[test]
+    fn a_rewind_drops_the_target_and_everything_after_and_says_it_did() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(1, JournalEvent::UserSent { text: "one".into() }),
+                rec(2, echo("u-1")),
+                rec(
+                    3,
+                    JournalEvent::Provider {
+                        event: SessionEvent::AssistantText { text: "a".into() },
+                    },
+                ),
+                rec(4, JournalEvent::UserSent { text: "two".into() }),
+                rec(5, echo("u-2")),
+                rec(
+                    6,
+                    JournalEvent::Provider {
+                        event: SessionEvent::AssistantText { text: "b".into() },
+                    },
+                ),
+                rec(
+                    7,
+                    JournalEvent::Rewound {
+                        through_msg_id: "u-2".into(),
+                        dropped: 1,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            user_ids(&t),
+            vec![Some("u-1".to_string())],
+            "the rewound message is UNSENT — its text came back as a prefill"
+        );
+        assert!(
+            t.rows
+                .iter()
+                .any(|r| matches!(r, Row::Assistant { text, .. } if text == "a")),
+            "everything before the target survives: {:?}",
+            t.rows
+        );
+        assert!(
+            !t.rows
+                .iter()
+                .any(|r| matches!(r, Row::Assistant { text, .. } if text == "b")),
+            "the discarded turn's reply must go with it: {:?}",
+            t.rows
+        );
+        assert!(
+            matches!(t.rows.last(), Some(Row::Marker { text }) if text.contains("rewound")
+                && text.contains('1')),
+            "rows vanishing with nothing to explain them is unreadable: {:?}",
+            t.rows
+        );
+        assert_eq!(
+            t.revs.len(),
+            t.rows.len(),
+            "revs is parallel to rows and must be cut with it"
+        );
+    }
+
+    /// A span anchored past the cut points into rows that are gone.
+    #[test]
+    fn a_rewind_drops_the_turn_spans_it_invalidates() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(1, JournalEvent::UserSent { text: "one".into() }),
+                rec(2, echo("u-1")),
+                rec(
+                    3,
+                    JournalEvent::Provider {
+                        event: SessionEvent::TurnCompleted {
+                            subtype: "success".into(),
+                            is_error: false,
+                        },
+                    },
+                ),
+                rec(4, JournalEvent::UserSent { text: "two".into() }),
+                rec(5, echo("u-2")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(t.turns.len(), 2);
+        t.apply(
+            1,
+            &[rec(
+                6,
+                JournalEvent::Rewound {
+                    through_msg_id: "u-2".into(),
+                    dropped: 1,
+                },
+            )],
+        )
+        .unwrap();
+        assert_eq!(t.turns.len(), 1, "the dropped turn's span goes with it");
+        assert!(
+            t.turns.iter().all(|s| s.start_row < t.rows.len()),
+            "no span may point past the rows"
+        );
+    }
+
+    /// A record naming a row this client does not hold is a no-op, not a
+    /// guess. Truncating to a fallback index would discard real history.
+    #[test]
+    fn a_rewind_naming_an_unknown_row_changes_nothing() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(1, JournalEvent::UserSent { text: "one".into() }),
+                rec(2, echo("u-1")),
+            ],
+        )
+        .unwrap();
+        let before = t.rows.len();
+        t.apply(
+            1,
+            &[rec(
+                3,
+                JournalEvent::Rewound {
+                    through_msg_id: "nobody".into(),
+                    dropped: 9,
+                },
+            )],
+        )
+        .unwrap();
+        assert_eq!(t.rows.len(), before);
+    }
+
+    /// **Live and cold replay must agree.** The live session folds the
+    /// record as it arrives; a client opening the journal later folds the
+    /// same record after everything around it. Same rows, or the
+    /// transcript changes when you reopen it.
+    #[test]
+    fn a_replayed_rewind_lands_exactly_where_the_live_one_did() {
+        let records = vec![
+            rec(1, JournalEvent::UserSent { text: "one".into() }),
+            rec(2, echo("u-1")),
+            rec(3, JournalEvent::UserSent { text: "two".into() }),
+            rec(4, echo("u-2")),
+            rec(
+                5,
+                JournalEvent::Rewound {
+                    through_msg_id: "u-2".into(),
+                    dropped: 1,
+                },
+            ),
+        ];
+        let mut live = Transcript::new();
+        for r in &records {
+            live.apply(1, std::slice::from_ref(r)).unwrap();
+        }
+        let mut cold = Transcript::new();
+        cold.apply(1, &records).unwrap();
+        assert_eq!(live.rows, cold.rows);
+        assert_eq!(live.turns.len(), cold.turns.len());
+    }
+
     #[test]
     fn undelivered_send_is_distinct_from_sent() {
         let mut t = Transcript::new();
@@ -1133,14 +1471,16 @@ mod tests {
             t.rows[0],
             Row::User {
                 text: "hi".into(),
-                delivery: Delivery::Delivered
+                delivery: Delivery::Delivered,
+                provider_msg_id: None
             }
         );
         assert_eq!(
             t.rows[1],
             Row::User {
                 text: "lost".into(),
-                delivery: Delivery::Undelivered
+                delivery: Delivery::Undelivered,
+                provider_msg_id: None
             }
         );
     }
