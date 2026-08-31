@@ -285,6 +285,35 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
     },
+    /// The agent restated its whole plan, and named the tool call that
+    /// carries it (Slice AG1 #14).
+    ///
+    /// **Why this is not simply a second [`SessionEvent::ToolUseStarted`].**
+    /// The projection already restates a tool call in place, keyed by id,
+    /// and that is exactly the shape this needs — but the same restatement
+    /// re-adds the id to [`crate::turn::Turns`]' outstanding set, and a
+    /// plan arrives AFTER its tool has closed. The tool would be
+    /// outstanding forever and the quiet clock would never start, which is
+    /// the failure the restatement comment there warns about from the
+    /// other direction. So the plan says only the one thing it knows:
+    /// this call's decoded form is a checklist. Status, result and input
+    /// are somebody else's facts and stay theirs.
+    ///
+    /// `items` is a FULL-LIST REPLACEMENT, never a delta — ACP's own shape,
+    /// and Hermes' adapter says so in as many words (*"the client's
+    /// full-list replacement"*, `acp_adapter/events.py:39`).
+    PlanUpdate {
+        /// The tool call this plan belongs to.
+        ///
+        /// ACP's `plan` update carries no `toolCallId` of its own — it is
+        /// a session-level statement. The adapter supplies the call it
+        /// just closed, and only when eave could not type that call
+        /// itself, so a plan may fill a row eave has nothing better for
+        /// and can never overwrite one it does.
+        call_id: String,
+        #[serde(default)]
+        items: Vec<crate::tool::TodoItem>,
+    },
     /// The CLI echoed a user message back (`--replay-user-messages`).
     UserEcho { text: String },
     /// Provider-terminal turn event (`result` line).

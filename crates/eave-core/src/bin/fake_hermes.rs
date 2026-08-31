@@ -119,6 +119,63 @@ impl Acp {
                 }));
                 self.chunk("done");
             }
+            // Slice AG1 #14. The three frames Hermes 0.20.4 really sent
+            // for one `todo` call, captured 2026-08-30 off `hermes acp`
+            // over stdio and replayed here byte for byte. What matters
+            // about them is what is MISSING from the tool call: no
+            // `rawInput`, `kind: "other"`, and the items only inside a
+            // human preview string. The plan that follows is the one
+            // structured statement of the checklist on this wire.
+            "plan" => {
+                emit(&json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": { "sessionId": self.session_id, "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-caac208d6c1a",
+                        "title": "todo (3 items)",
+                        "kind": "other",
+                        "locations": [],
+                        "content": [{ "type": "content", "content": {
+                            "type": "text",
+                            "text": "Updating todo list\n\n\
+                                     - in_progress: Write the health-check handler\n\
+                                     - pending: Wire up the route\n\
+                                     - pending: Add a test" }}],
+                    }},
+                }));
+                emit(&json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": { "sessionId": self.session_id, "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-caac208d6c1a",
+                        "kind": "other",
+                        "status": "completed",
+                        "content": [{ "type": "content", "content": {
+                            "type": "text",
+                            "text": "**Todo list**\n\n\
+                                     - \u{1f504} Write the health-check handler\n\
+                                     - \u{23f3} Wire up the route\n\
+                                     - \u{23f3} Add a test\n\n\
+                                     **Progress:** 0 completed, 1 in progress, \
+                                     2 pending" }}],
+                    }},
+                }));
+                emit(&json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": { "sessionId": self.session_id, "update": {
+                        "sessionUpdate": "plan",
+                        "entries": [
+                            { "content": "Write the health-check handler",
+                              "priority": "medium", "status": "in_progress" },
+                            { "content": "Wire up the route",
+                              "priority": "medium", "status": "pending" },
+                            { "content": "Add a test",
+                              "priority": "medium", "status": "pending" },
+                        ],
+                    }},
+                }));
+                self.chunk("done");
+            }
             // A tool that starts and then nothing: no completion, no turn
             // reply, ever. The only mode in which `in_flight_tools()` can
             // be sampled deterministically — everywhere else the adapter's

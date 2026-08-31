@@ -680,6 +680,31 @@ impl Transcript {
                     }
                 }
             }
+            // Slice AG1 #14. A plan names the tool call it belongs to
+            // and says exactly one thing about it: its decoded form is a
+            // checklist. Status, result and input are untouched — the
+            // call has already finished, and what a tool RETURNED is not
+            // what it MEANS.
+            //
+            // No row is pushed when the id names nothing. The decoder
+            // only emits this for a call it watched close, so that is
+            // unreachable today; if it ever becomes reachable, a plan
+            // with no row is a plan with no place to go, and the journal
+            // still holds it.
+            SessionEvent::PlanUpdate { call_id, items } => {
+                if let Some(ix) = self
+                    .rows
+                    .iter()
+                    .position(|r| matches!(r, Row::Tool { id, .. } if id == call_id))
+                {
+                    if let Row::Tool { call, .. } = &mut self.rows[ix] {
+                        *call = Some(ToolCall::Todo {
+                            items: items.clone(),
+                        });
+                    }
+                    self.touch(ix);
+                }
+            }
             SessionEvent::ThoughtDelta { text } => self.push_thought(text),
             // Slice CJ. A child thread's frame is recorded, never
             // rendered: eave has no subagent surface, and painting a
@@ -1348,6 +1373,115 @@ mod tests {
             }
             other => panic!("expected a tool row, got {other:?}"),
         }
+    }
+
+    /// **Slice AG1 #14.** A plan lands on the tool row that produced it,
+    /// and changes exactly one thing about it.
+    ///
+    /// The row has already FINISHED by the time the plan arrives — Hermes
+    /// sends the `plan` update immediately after the `todo` tool's
+    /// completion — so this pins that the plan does not reopen the row,
+    /// does not push a second one, and does not touch the result the tool
+    /// actually returned. What a tool returned is not what it meant.
+    #[test]
+    fn a_plan_retypes_the_finished_tool_row_and_leaves_everything_else_alone() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    JournalEvent::Provider {
+                        event: SessionEvent::ToolUseStarted {
+                            id: "tc-caac208d6c1a".into(),
+                            name: "other".into(),
+                            input: r#"{"title":"todo (3 items)"}"#.into(),
+                            call: Some(ToolCall::Unknown {
+                                name: "other".into(),
+                            }),
+                        },
+                    },
+                ),
+                rec(
+                    2,
+                    JournalEvent::Provider {
+                        event: SessionEvent::ToolUseFinished {
+                            id: "tc-caac208d6c1a".into(),
+                            result: "**Todo list**".into(),
+                            is_error: false,
+                            diff: None,
+                        },
+                    },
+                ),
+                rec(
+                    3,
+                    JournalEvent::Provider {
+                        event: SessionEvent::PlanUpdate {
+                            call_id: "tc-caac208d6c1a".into(),
+                            items: vec![
+                                eave_core::tool::TodoItem {
+                                    text: "Write the health-check handler".into(),
+                                    done: true,
+                                },
+                                eave_core::tool::TodoItem {
+                                    text: "Wire up the route".into(),
+                                    done: false,
+                                },
+                            ],
+                        },
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(t.rows.len(), 1, "one tool ran, not two: {:?}", t.rows);
+        match &t.rows[0] {
+            Row::Tool {
+                status,
+                call,
+                result,
+                ..
+            } => {
+                assert_eq!(
+                    *status,
+                    ToolStatus::Finished,
+                    "the plan must not reopen the row"
+                );
+                assert_eq!(result, "**Todo list**", "the tool's own result, untouched");
+                assert_eq!(
+                    call.as_ref().and_then(ToolCall::detail).as_deref(),
+                    Some("1/2 · Wire up the route"),
+                    "the chip states progress and what is next"
+                );
+            }
+            other => panic!("expected a tool row, got {other:?}"),
+        }
+    }
+
+    /// A plan naming a call this transcript has never seen adds nothing.
+    /// The decoder only emits one for a call it watched close, so this is
+    /// unreachable today — and a checklist grafted onto the wrong row, or
+    /// onto no row at all, is worse than one the operator never saw.
+    #[test]
+    fn a_plan_for_an_unknown_call_pushes_no_row() {
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[rec(
+                1,
+                JournalEvent::Provider {
+                    event: SessionEvent::PlanUpdate {
+                        call_id: "tc-nobody".into(),
+                        items: vec![eave_core::tool::TodoItem {
+                            text: "Add a test".into(),
+                            done: false,
+                        }],
+                    },
+                },
+            )],
+        )
+        .unwrap();
+        assert!(t.rows.is_empty(), "{:?}", t.rows);
     }
 
     /// **Slice CJ.** A child thread's frames are journaled fully typed, and

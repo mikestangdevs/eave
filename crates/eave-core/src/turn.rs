@@ -166,6 +166,11 @@ fn marks_agent_work(event: &SessionEvent) -> bool {
         // mint a phantom `Unannounced`. `System` above carries the ACP
         // spelling of the same fact and is false for the same reason.
         | SessionEvent::ThoughtDelta { .. }
+        // Slice AG1 #14. A plan restates a tool call the agent already
+        // made, and `ToolUseStarted` marked that work when it arrived.
+        // Marking it again would let a plan open a turn nothing else
+        // opened — a phantom `Unannounced` built out of a checklist.
+        | SessionEvent::PlanUpdate { .. }
         | SessionEvent::ApprovalWithdrawn { .. }
         | SessionEvent::DialogRefused { .. }
         | SessionEvent::PostureRefused { .. }
@@ -799,6 +804,76 @@ mod tests {
         // come back.
         l.on_record(&completed(3_000), 3_000);
         assert_eq!(l.open(), None);
+    }
+
+    /// **Slice AG1 #14, and the reason the plan is not a second
+    /// `ToolUseStarted`.**
+    ///
+    /// Hermes sends its `plan` update AFTER the `todo` tool completes. The
+    /// projection restates a tool call in place keyed by id, which is
+    /// exactly the shape a plan needs — but the same restatement re-adds
+    /// the id here, and `ToolUseFinished` had already removed it. Carried
+    /// that way, one todo call would leave a tool outstanding forever and
+    /// the quiet clock would never start: a healthy session that had said
+    /// everything it was going to say would sit `running` for good.
+    ///
+    /// So the plan marks no work and holds nothing open. Both halves are
+    /// asserted, because a plan that quietly opened a turn of its own
+    /// would be a phantom `Unannounced` built out of a checklist.
+    #[test]
+    fn a_plan_neither_opens_a_turn_nor_holds_a_finished_tool_open() {
+        let plan = |ts_ms| {
+            provider(
+                ts_ms,
+                SessionEvent::PlanUpdate {
+                    call_id: "tc-1".into(),
+                    items: vec![crate::tool::TodoItem {
+                        text: "Wire up the route".into(),
+                        done: false,
+                    }],
+                },
+            )
+        };
+
+        let mut alone = TurnLedger::new(0);
+        alone.on_record(&plan(1_000), 1_000);
+        assert_eq!(
+            alone.open(),
+            None,
+            "a checklist is not the agent starting work"
+        );
+
+        let mut l = TurnLedger::new(0);
+        l.on_record(&text(1_000), 1_000);
+        l.on_record(
+            &provider(
+                1_000,
+                SessionEvent::ToolUseStarted {
+                    id: "tc-1".into(),
+                    name: "other".into(),
+                    input: String::new(),
+                    call: None,
+                },
+            ),
+            1_000,
+        );
+        l.on_record(
+            &provider(
+                1_000,
+                SessionEvent::ToolUseFinished {
+                    id: "tc-1".into(),
+                    result: String::new(),
+                    is_error: false,
+                    diff: None,
+                },
+            ),
+            1_000,
+        );
+        l.on_record(&plan(1_000), 1_000);
+        assert!(
+            l.settle(1_000 + QUIET, QUIET),
+            "the plan re-opened a tool that had already closed"
+        );
     }
 
     /// Nothing in flight is the gate, exactly as `WaitReason::Idle` has it:

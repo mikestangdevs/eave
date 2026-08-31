@@ -4581,6 +4581,28 @@ fn describe_ix(ix: usize, rows: usize) -> &'static str {
 
 struct TranscriptState {
     session_id: Option<String>,
+    /// The session the ROWS belong to, which is not always
+    /// [`Self::session_id`] (Slice AG1 #13).
+    ///
+    /// `FeedEvent::Session` moves the subscription id the moment the
+    /// operator switches; the rows underneath stay until the engine's
+    /// `Reset` arrives, deliberately — blanking the column on the switch
+    /// would flash empty between two sessions that both have content. So
+    /// there is a window where `session_id` names one session and `rows`
+    /// hold another's, and every other consumer is safe from it because
+    /// `Reset` and `Records` are both id-guarded and nothing else reads
+    /// the two together.
+    ///
+    /// The title proposal does read them together, and in that window it
+    /// derived a name for the session being switched TO out of the
+    /// transcript of the one being switched FROM — one session's content
+    /// under another session's identity, which is the exact shape
+    /// `crate::session_title` exists to prevent. Found by
+    /// `a_proposal_outlives_the_switch_away_and_is_never_invented`.
+    ///
+    /// So the rows carry their own id: written where records are applied
+    /// (already id-guarded), cleared by `reset()`.
+    rows_session: Option<String>,
     /// Slice Q2: the engine's own words when a launch was refused. Lives
     /// here rather than on `Shell` because it is cleared by the same feed
     /// event that clears the session — the two facts arrive together and
@@ -4661,6 +4683,7 @@ impl TranscriptState {
         list.set_follow_mode(gpui::FollowMode::Tail);
         Self {
             session_id: None,
+            rows_session: None,
             launch_error: None,
             transcript: Transcript::new(),
             display: DisplayList::new(),
@@ -5153,6 +5176,9 @@ items={count} rows={} frames={} ops={}",
     }
 
     fn reset(&mut self) {
+        // Slice AG1 #13: the rows are going, so the claim about whose they
+        // were goes with them.
+        self.rows_session = None;
         self.transcript.reset();
         self.display.update(&self.transcript);
         self.list.reset(self.display.len() + 1);
@@ -6770,6 +6796,23 @@ struct Shell {
     /// a session, so it must survive the feed events that rebuild the
     /// rail underneath it.
     rename: Option<RenameEdit>,
+    /// Slice AG1 #13. A title proposal per session, for sessions this
+    /// client has actually had open.
+    ///
+    /// **In memory, and it dies with the app** — like `rail_seen` above
+    /// and the composer's follow-up queue, and for a stronger reason than
+    /// either: a proposal is derived transcript content, so persisting it
+    /// would put a copy of one session's words somewhere the operator
+    /// never chose to publish them. Nothing here has ever been sent
+    /// anywhere; `Command::Rename` is the only route out, and a human
+    /// presses Enter on it.
+    ///
+    /// Kept per session rather than only for the open one so that a row
+    /// you visited earlier this run can still be named from the rail
+    /// without switching back to it. A row you have never opened has no
+    /// entry, and eave does not go and fetch one — see
+    /// [`crate::session_title`].
+    title_proposals: RefCell<HashMap<String, String>>,
     /// Folder ids that existed when New Folder was asked. The next
     /// snapshot that contains a folder not in this set is the one we
     /// open for naming. `None` = not waiting.
@@ -10750,14 +10793,30 @@ impl Shell {
     /// and a field that cleared the name you are trying to fix makes
     /// "leave it alone" the same gesture as "delete it".
     fn begin_rename(&mut self, id: String, cx: &mut Context<Self>) {
-        let text = self
+        let named = self
             .sessions
             .read(cx)
             .sessions
             .iter()
             .find(|s| s.session_id == id)
-            .and_then(|s| s.title.clone())
-            .unwrap_or_default();
+            .and_then(|s| s.title.clone());
+        // Slice AG1 #13. A session that HAS a name opens on that name,
+        // unchanged: the common edit is a correction, and replacing a
+        // name the operator chose with one eave derived is the wrong
+        // direction on the only question this feature turns on.
+        //
+        // An unnamed one opens on its proposal, marked `seeded` — so
+        // Enter accepts it, a keystroke replaces it, and Escape leaves
+        // the session unnamed. The proposal is a local string right up
+        // until Enter; `Command::Rename` is what makes it a fact, and a
+        // human is what presses it.
+        let (text, seeded) = match named {
+            Some(title) => (title, false),
+            None => match self.title_proposals.borrow().get(&id).cloned() {
+                Some(proposal) => (proposal, true),
+                None => (String::new(), false),
+            },
+        };
         // Slice AG2 #5: the two rail fields are exclusive — both claim the
         // keyboard in `chrome_holds_keyboard`, and two open at once gives
         // `on_key` two live branches and the caret two owners.
@@ -10767,9 +10826,31 @@ impl Shell {
             session_id: id,
             text,
             bookmark: false,
-            seeded: false,
+            seeded,
         });
         cx.notify();
+    }
+
+    /// Slice AG1 #13. Keep a title proposal for the session this client is
+    /// subscribed to, derived from the transcript it already holds.
+    ///
+    /// Only ever for the OPEN session: `TranscriptState` holds exactly one,
+    /// and eave will not subscribe to a session merely to name it. That is
+    /// not a shortcut — it is the boundary. See [`crate::session_title`].
+    fn remember_title_proposal(&self, cx: &App) {
+        let t = self.transcript.read(cx);
+        // `rows_session`, NEVER `session_id` — see the field's doc. The
+        // two disagree across a switch, and taking the wrong one names one
+        // session with another's words.
+        let Some(id) = t.rows_session.clone() else {
+            return;
+        };
+        // An empty transcript proposes nothing, and must not erase what an
+        // earlier pass over the same session already worked out — a
+        // resubscribe replays from zero rows.
+        if let Some(proposal) = crate::session_title::propose(&t.transcript.rows) {
+            self.title_proposals.borrow_mut().insert(id, proposal);
+        }
     }
 
     fn begin_bookmark_rename(&mut self, id: String, cx: &mut Context<Self>) {
@@ -20176,7 +20257,30 @@ impl Shell {
                                 )
                             })
                             .filter(|(_, (lines, _))| !lines.is_empty());
-                        if drawn.is_none() && !result.trim().is_empty() {
+                        // **Slice AG1 #14, found by the walk.** The same
+                        // rule again, on the other plate. When the plan
+                        // came from ACP the checklist is in the RESULT,
+                        // not the input: Hermes' `todo` tool returns its
+                        // own markdown rendering of the very list the card
+                        // is drawn from, so suppressing only the input
+                        // plate left the transcript showing the plan
+                        // twice — the card, and Hermes' emoji rendering of
+                        // it directly underneath. The card is the decoded
+                        // form of what this tool did, and the plate it
+                        // replaces is whichever one held the blob.
+                        //
+                        // Not caught by any surface test, because the test
+                        // asserted the INPUT plate was gone and never
+                        // looked below it.
+                        //
+                        // A FAILED call keeps its text for exactly the
+                        // reason the diff does: the plan is what the agent
+                        // intended, and the error is what actually
+                        // happened, which the card cannot say.
+                        if drawn.is_none()
+                            && (plan.is_none() || *is_error)
+                            && !result.trim().is_empty()
+                        {
                             parts.push((
                                 if *is_error { "error" } else { "result" },
                                 tool_body_view(result, theme::TOOL_BODY_MAX_LINES),
@@ -27208,6 +27312,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                     if state.session_id.as_deref() != Some(id.as_str()) {
                                         continue;
                                     }
+                                    // Slice AG1 #13. Past the id guard, so
+                                    // these rows provably belong to `id`.
+                                    state.rows_session = Some(id.clone());
                                     if state.apply_records(epoch, &records).is_err() {
                                         // Out-of-sequence: drop local
                                         // state, resubscribe; a fresh
@@ -27683,6 +27790,14 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     cx.observe(&files, |_, _, cx| cx.notify()).detach();
                     cx.observe(&transcript, |shell, _, cx| {
                         shell.maybe_auto_approve(cx);
+                        // Slice AG1 #13. Remembered from the OBSERVER and
+                        // never the paint, the same rule the marks and the
+                        // follow-up queue follow: a paint runs for reasons
+                        // that have nothing to do with the transcript, and
+                        // a proposal recomputed on every frame would be
+                        // work per frame for a string that changes once a
+                        // session.
+                        shell.remember_title_proposal(cx);
                         // ...and the other half. A turn ending is a
                         // transcript fact — `TurnCompleted` arriving in a
                         // record batch, or the one-second heartbeat
@@ -27785,6 +27900,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_walk: RefCell::new(Vec::new()),
                         rail_scrolled_to: RefCell::new(None),
                         rail_seen: RefCell::new(HashMap::new()),
+                        title_proposals: RefCell::new(HashMap::new()),
                         projects_scroll: ScrollHandle::new(),
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from

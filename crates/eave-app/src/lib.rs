@@ -118,6 +118,9 @@ pub mod theme_editor;
 pub mod import_dialog;
 /// settings.json — one struct, every pane reads and writes through it (S1).
 pub mod settings;
+/// Slice AG1 #13 — a session title proposed from the transcript, in the
+/// CLIENT. Read its header before moving one line of it.
+pub mod session_title;
 /// The Settings window (⌘,): frame + the real panes.
 pub mod settings_window;
 /// The Agents pane (S2): P2's defaults surface + provider status facts.

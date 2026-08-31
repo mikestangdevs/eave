@@ -102,6 +102,17 @@ pub struct AcpStream {
     /// `session/load` always errored and no replay was ever received.
     /// Fixing resume is what made this live.
     replaying: Option<u32>,
+    /// Tool calls eave could not type, in start order (Slice AG1 #14).
+    ///
+    /// A `plan` update names no tool call, so the decoder has to know
+    /// which one it belongs to. Keeping only the UNTYPED ones is what
+    /// makes that safe: a plan may fill a row eave had nothing better
+    /// for, and can never turn a `cargo test` row into a checklist.
+    untyped: Vec<String>,
+    /// The tool call that closed most recently, when eave could not type
+    /// it. Cleared by any typed close, because the plan belongs to the
+    /// call that just ended and not to an older one.
+    last_untyped_close: Option<String>,
 }
 
 impl AcpStream {
@@ -156,6 +167,12 @@ impl AcpStream {
 
     /// Take every tool still open, in the order they were started.
     pub fn take_outstanding(&mut self) -> Vec<String> {
+        // Slice AG1 #14: a call swept up as an orphan will never close,
+        // so it can never be named by a plan. Dropping the ids with it
+        // is what keeps `untyped` a mirror of `outstanding` rather than
+        // a list that only ever grows over a long session.
+        self.untyped.clear();
+        self.last_untyped_close = None;
         std::mem::take(&mut self.outstanding)
     }
 
@@ -197,8 +214,23 @@ impl AcpStream {
                 // Hermes' title convention each reach the decoder already
                 // settled.
                 let name = tool_name(spec.tool_naming, update);
+                let call = decode_acp_tool(update, &name);
+                // Slice AG1 #14: remember whether eave managed to type
+                // this call, so a `plan` that follows its close knows
+                // whether it is allowed to speak for the row. A restated
+                // start that DOES type revokes the permission.
+                match (
+                    matches!(call, ToolCall::Unknown { .. }),
+                    self.untyped.iter().position(|u| u == &id),
+                ) {
+                    (true, None) => self.untyped.push(id.clone()),
+                    (false, Some(at)) => {
+                        self.untyped.remove(at);
+                    }
+                    _ => {}
+                }
                 vec![SessionEvent::ToolUseStarted {
-                    call: Some(decode_acp_tool(update, &name)),
+                    call: Some(call),
                     id,
                     name,
                     input: tool_input(spec.tool_input, update),
@@ -234,6 +266,19 @@ impl AcpStream {
                     }
                 };
                 self.outstanding.retain(|o| o != &id);
+                // Slice AG1 #14. Hermes sends the `plan` immediately after
+                // the `todo` tool's completion, from the same synchronous
+                // sequence, at both of its call sites
+                // (`acp_adapter/events.py:253`, `server.py:1587`, each
+                // gated on `tool_name == "todo"`). That adjacency is what
+                // the plan arm reads; a typed close clears it.
+                self.last_untyped_close = match self.untyped.iter().position(|u| u == &id) {
+                    Some(at) => {
+                        self.untyped.remove(at);
+                        Some(id.clone())
+                    }
+                    None => None,
+                };
                 let content = update.get("content");
                 vec![SessionEvent::ToolUseFinished {
                     id,
@@ -248,6 +293,25 @@ impl AcpStream {
                     diff: first_diff(content),
                 }]
             }
+            // Slice AG1 #14. ACP's own plan update, and the only
+            // STRUCTURED statement of an agent's checklist on this wire —
+            // the `todo` tool call beside it carries its items as a human
+            // preview string (`- pending: Wire up the route`) and nothing
+            // else, so reading the plan here is not a preference between
+            // two sources, it is the difference between decoding a fact
+            // and re-parsing prose.
+            //
+            // A plan eave cannot place still reaches the journal verbatim,
+            // which is what it did before this arm existed. eave does not
+            // invent a row for it: a checklist attached to the wrong tool
+            // call is worse than one the operator never saw.
+            "plan" => match self.last_untyped_close.take() {
+                Some(call_id) => vec![SessionEvent::PlanUpdate {
+                    call_id,
+                    items: plan_items(update),
+                }],
+                None => vec![system(update, line)],
+            },
             // Slice CC: ACP's own context gauge. `used` is "Tokens
             // currently in context" and `size` is "Total context window
             // size in tokens" (`_UsageUpdate`, agent-client-protocol 1.x);
@@ -262,6 +326,47 @@ impl AcpStream {
             _ => vec![system(update, line)],
         }
     }
+}
+
+/// ACP `plan.entries` → eave's checklist (Slice AG1 #14).
+///
+/// **Two states, not three.** `in_progress` is not done — the same fold
+/// [`crate::stream`] applies to Claude's `TodoWrite`, and for the same
+/// reason: a third mark would be a state eave INVENTED, and the two
+/// providers would then disagree about a word neither of them sent.
+///
+/// **`priority` is read and dropped.** Hermes writes the constant
+/// `"medium"` on every entry it builds (`acp_adapter/events.py`), so a
+/// card that drew priority would be drawing a constant. When some agent
+/// varies it, this is where it becomes a fact.
+///
+/// **`cancelled` never reaches here.** Hermes maps it to `completed` and
+/// prefixes the content with `[cancelled] `, so a cancelled item arrives
+/// as done with its cancellation in the text. eave renders that verbatim
+/// rather than trying to be cleverer than the agent about its own plan.
+///
+/// An entry with no `content` is dropped rather than counted: it has
+/// nothing to render, and a checklist that says `0/4` while showing three
+/// lines is a worse answer than one that says `0/3`.
+pub fn plan_items(update: &Value) -> Vec<crate::tool::TodoItem> {
+    update
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            let text = entry.get("content").and_then(Value::as_str)?;
+            if text.is_empty() {
+                return None;
+            }
+            Some(crate::tool::TodoItem {
+                text: text.to_string(),
+                // The agent's own word.
+                done: entry.get("status").and_then(Value::as_str) == Some("completed"),
+            })
+        })
+        .collect()
 }
 
 /// The `sessionUpdate` discriminator, so an adapter can claim its own
@@ -428,5 +533,288 @@ fn decode_acp_tool(update: &Value, name: &str) -> ToolCall {
             ToolCall::Unknown { .. } => ToolCall::Unknown { name: name.into() },
             typed => typed,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Hermes' knobs, copied from `hermes.rs` rather than imported so a
+    /// change there shows up here as a failing assertion about a real
+    /// captured frame instead of silently re-parameterising the test.
+    fn hermes() -> UpdateSpec {
+        UpdateSpec {
+            tool_naming: ToolNaming::ProtocolKind,
+            tool_input: ToolInput::WholeUpdate,
+            thoughts: Thoughts::Journaled,
+            progress_events: false,
+            accumulate_turn_text: false,
+        }
+    }
+
+    fn decode(stream: &mut AcpStream, update: Value) -> Vec<SessionEvent> {
+        let line = update.to_string();
+        stream.decode(&hermes(), &update, &line)
+    }
+
+    /// The three frames Hermes 0.20.4 actually sent, captured 2026-08-30
+    /// from one `todo` call driven through `hermes acp` over stdio
+    /// (`docs/reports/stage-ag1-14-plan-decoder.md`). Verbatim: the
+    /// preview strings, the empty `locations`, the absent `rawInput` and
+    /// the constant `priority` are all part of what is under test.
+    fn captured_todo_call() -> Value {
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-caac208d6c1a",
+            "title": "todo (3 items)",
+            "kind": "other",
+            "locations": [],
+            "content": [{"type": "content", "content": {"type": "text", "text":
+                "Updating todo list\n\n- in_progress: Write the health-check handler\n\
+                 - pending: Wire up the route\n- pending: Add a test"}}],
+        })
+    }
+
+    fn captured_todo_close() -> Value {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-caac208d6c1a",
+            "kind": "other",
+            "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text":
+                "**Todo list**\n\n- 🔄 Write the health-check handler\n\
+                 - ⏳ Wire up the route\n- ⏳ Add a test\n\n\
+                 **Progress:** 0 completed, 1 in progress, 2 pending"}}],
+        })
+    }
+
+    fn captured_plan() -> Value {
+        json!({
+            "sessionUpdate": "plan",
+            "entries": [
+                {"content": "Write the health-check handler",
+                 "priority": "medium", "status": "in_progress"},
+                {"content": "Wire up the route", "priority": "medium", "status": "pending"},
+                {"content": "Add a test", "priority": "medium", "status": "pending"},
+            ],
+        })
+    }
+
+    /// The whole point of the slice, on the frames the agent really sends.
+    ///
+    /// Note what the tool call itself gives eave: `kind: "other"`, no
+    /// `rawInput`, and its items only inside a human preview string. That
+    /// is why the plan is read instead — not a preference between two
+    /// sources, but the difference between decoding a fact and re-parsing
+    /// prose.
+    #[test]
+    fn the_hermes_todo_sequence_puts_the_plan_on_the_row_it_belongs_to() {
+        let mut stream = AcpStream::default();
+
+        let started = decode(&mut stream, captured_todo_call());
+        assert!(
+            matches!(
+                &started[..],
+                [SessionEvent::ToolUseStarted {
+                    call: Some(ToolCall::Unknown { .. }),
+                    ..
+                }]
+            ),
+            "eave cannot type Hermes' todo call from the wire: {started:?}"
+        );
+
+        let closed = decode(&mut stream, captured_todo_close());
+        assert!(matches!(
+            &closed[..],
+            [SessionEvent::ToolUseFinished {
+                is_error: false,
+                ..
+            }]
+        ));
+
+        let plan = decode(&mut stream, captured_plan());
+        let [SessionEvent::PlanUpdate { call_id, items }] = &plan[..] else {
+            panic!("the plan did not land on a tool call: {plan:?}");
+        };
+        assert_eq!(call_id, "tc-caac208d6c1a", "the call that just closed");
+        assert_eq!(
+            items,
+            &vec![
+                crate::tool::TodoItem {
+                    text: "Write the health-check handler".into(),
+                    done: false,
+                },
+                crate::tool::TodoItem {
+                    text: "Wire up the route".into(),
+                    done: false,
+                },
+                crate::tool::TodoItem {
+                    text: "Add a test".into(),
+                    done: false,
+                },
+            ],
+            "`in_progress` is not done — two states, never three"
+        );
+    }
+
+    /// A plan is consumed once. A second one with nothing new to attach to
+    /// is a plan eave cannot place, and it goes to the journal rather than
+    /// onto whichever row happens to be last.
+    #[test]
+    fn a_plan_is_placed_once_and_never_reused() {
+        let mut stream = AcpStream::default();
+        decode(&mut stream, captured_todo_call());
+        decode(&mut stream, captured_todo_close());
+        assert!(matches!(
+            &decode(&mut stream, captured_plan())[..],
+            [SessionEvent::PlanUpdate { .. }]
+        ));
+        assert!(
+            matches!(
+                &decode(&mut stream, captured_plan())[..],
+                [SessionEvent::System { subtype, .. }] if subtype == "plan"
+            ),
+            "a repeat plan has no call left to speak for"
+        );
+    }
+
+    /// The guard that makes reading adjacency safe. A plan may fill a row
+    /// eave had nothing better for; it may never turn a `cargo test` row
+    /// into a checklist.
+    #[test]
+    fn a_plan_never_speaks_for_a_row_eave_could_type_itself() {
+        let mut stream = AcpStream::default();
+        let run = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-run",
+            "title": "terminal: cargo test",
+            "kind": "execute",
+        });
+        assert!(
+            matches!(
+                &decode(&mut stream, run)[..],
+                [SessionEvent::ToolUseStarted {
+                    call: Some(ToolCall::Run { .. }),
+                    ..
+                }]
+            ),
+            "the fixture must be a call eave CAN type, or the test proves nothing"
+        );
+        decode(
+            &mut stream,
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "tc-run",
+                   "kind": "execute", "status": "completed"}),
+        );
+        assert!(
+            matches!(
+                &decode(&mut stream, captured_plan())[..],
+                [SessionEvent::System { subtype, .. }] if subtype == "plan"
+            ),
+            "a typed close must not be claimed by the plan that follows it"
+        );
+    }
+
+    /// A typed close CLEARS an earlier untyped one: the plan belongs to
+    /// the call that just ended, not to an older one still lying around.
+    #[test]
+    fn a_later_typed_close_takes_the_plan_away_from_an_older_untyped_one() {
+        let mut stream = AcpStream::default();
+        decode(&mut stream, captured_todo_call());
+        decode(&mut stream, captured_todo_close());
+        decode(
+            &mut stream,
+            json!({"sessionUpdate": "tool_call", "toolCallId": "tc-run",
+                   "title": "terminal: cargo test", "kind": "execute"}),
+        );
+        decode(
+            &mut stream,
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "tc-run",
+                   "kind": "execute", "status": "completed"}),
+        );
+        assert!(matches!(
+            &decode(&mut stream, captured_plan())[..],
+            [SessionEvent::System { .. }]
+        ));
+    }
+
+    /// Before this arm existed a plan reached the journal verbatim, and
+    /// that is still what happens to one eave cannot place. The decoder
+    /// gained a case; it did not lose the record.
+    #[test]
+    fn a_plan_with_nothing_to_place_it_on_is_still_journalled_verbatim() {
+        let mut stream = AcpStream::default();
+        let out = decode(&mut stream, captured_plan());
+        let [SessionEvent::System { subtype, raw }] = &out[..] else {
+            panic!("expected the verbatim record: {out:?}");
+        };
+        assert_eq!(subtype, "plan");
+        assert!(
+            raw.contains("Wire up the route"),
+            "the frame, byte for byte"
+        );
+    }
+
+    /// A cleared plan is a fact — `entries: []` means the agent dropped
+    /// its checklist, which is not the same as never having had one.
+    #[test]
+    fn a_cleared_plan_is_an_empty_checklist_not_a_missing_one() {
+        let mut stream = AcpStream::default();
+        decode(&mut stream, captured_todo_call());
+        decode(&mut stream, captured_todo_close());
+        let out = decode(&mut stream, json!({"sessionUpdate": "plan", "entries": []}));
+        assert!(matches!(
+            &out[..],
+            [SessionEvent::PlanUpdate { items, .. }] if items.is_empty()
+        ));
+    }
+
+    /// `untyped` is a mirror of `outstanding`, not a list that only grows.
+    ///
+    /// A tool the agent never reports on is swept up as an orphan when the
+    /// turn ends, and a call that can never close can never be named by a
+    /// plan. Without this a long session accumulates one id per unresolved
+    /// `other`-kind call, forever.
+    #[test]
+    fn the_orphan_sweep_takes_the_untyped_ids_with_it() {
+        let mut stream = AcpStream::default();
+        decode(&mut stream, captured_todo_call());
+        assert_eq!(
+            stream.take_outstanding(),
+            vec!["tc-caac208d6c1a".to_string()]
+        );
+        assert!(stream.untyped.is_empty(), "{:?}", stream.untyped);
+        assert!(matches!(
+            &decode(&mut stream, captured_plan())[..],
+            [SessionEvent::System { .. }]
+        ));
+    }
+
+    /// Hermes maps `cancelled` to `completed` and moves the cancellation
+    /// into the text. eave renders that verbatim rather than inventing a
+    /// third mark for a state the wire cannot express.
+    #[test]
+    fn a_cancelled_entry_arrives_done_with_its_cancellation_in_the_text() {
+        let items = plan_items(&json!({"entries": [
+            {"content": "[cancelled] Wire up the route", "priority": "medium",
+             "status": "completed"},
+            {"content": "Add a test", "priority": "medium", "status": "in_progress"},
+            {"content": "", "priority": "medium", "status": "pending"},
+        ]}));
+        assert_eq!(
+            items,
+            vec![
+                crate::tool::TodoItem {
+                    text: "[cancelled] Wire up the route".into(),
+                    done: true,
+                },
+                crate::tool::TodoItem {
+                    text: "Add a test".into(),
+                    done: false,
+                },
+            ],
+            "an entry with no content has nothing to render and is not counted"
+        );
     }
 }

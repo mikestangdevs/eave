@@ -354,6 +354,80 @@ async fn a_tool_call_round_trip_reports_both_ends() {
     assert_eq!(session.in_flight_tools(), 0);
 }
 
+/// **Slice AG1 #14 — the plan reaches eave through the real adapter.**
+///
+/// This is the seam the row was blocked on. eave's plan card was built and
+/// tested against `ToolCall::Todo`, and had exactly one producer —
+/// Claude's `TodoWrite`, which the CLI stopped shipping. Hermes' ACP
+/// adapter translates its own `todo` tool into ACP's native `plan` update
+/// (`acp_adapter/events.py`), and eave dropped it into the catch-all.
+///
+/// The fake replays the three frames Hermes actually sent. What the tool
+/// call gives eave is the point: `kind: "other"`, no `rawInput`, and its
+/// items only inside a human preview string, so the plan is not one of two
+/// interchangeable sources — it is the only structured one.
+#[tokio::test]
+async fn a_plan_lands_on_the_todo_call_that_produced_it() {
+    let cfg = fake_cfg(&[("FAKE_HERMES_MODE", "plan")]);
+    let (mut session, mut rx) = spawn_hermes(&cfg).unwrap();
+    recv_until(&mut rx, is_init).await;
+    session.send_user_message("plan it", &[]).await.unwrap();
+
+    let seen = recv_until(&mut rx, |e| matches!(e, SessionEvent::PlanUpdate { .. })).await;
+
+    // The tool call itself must still arrive untyped: if eave ever learns
+    // to read Hermes' todo from its own payload this assertion is the one
+    // that says so, rather than the plan silently becoming redundant.
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            SessionEvent::ToolUseStarted { id, call: Some(eave_core::tool::ToolCall::Unknown { .. }), .. }
+                if id == "tc-caac208d6c1a"
+        )),
+        "expected an untyped todo call before the plan: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            SessionEvent::System { subtype, .. } if subtype == "plan"
+        )),
+        "the plan must be decoded, not journalled verbatim: {seen:?}"
+    );
+
+    let Some(SessionEvent::PlanUpdate { call_id, items }) = seen.last() else {
+        panic!("{seen:?}");
+    };
+    assert_eq!(call_id, "tc-caac208d6c1a", "the call that just closed");
+    assert_eq!(
+        items
+            .iter()
+            .map(|i| (i.text.as_str(), i.done))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Write the health-check handler", false),
+            ("Wire up the route", false),
+            ("Add a test", false),
+        ],
+        "`in_progress` is not done — two states, never three"
+    );
+    // What the card states on the closed row, from the same decode.
+    assert_eq!(
+        eave_core::tool::ToolCall::Todo {
+            items: items.clone()
+        }
+        .detail()
+        .as_deref(),
+        Some("0/3 · Write the health-check handler"),
+    );
+
+    recv_until(&mut rx, is_turn_done).await;
+    assert_eq!(
+        session.in_flight_tools(),
+        0,
+        "the plan closed nothing twice"
+    );
+}
+
 /// A tool Hermes starts and never reports on does not stay in flight
 /// forever. The turn ending IS the fact, and it is stated as one rather
 /// than left as a phantom the attention clocks would read as work.

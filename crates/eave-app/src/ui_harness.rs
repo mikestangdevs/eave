@@ -1006,6 +1006,24 @@ fn tool_finished(seq: u64, id: &str, result: &str, is_error: bool) -> eave_core:
     }
 }
 
+/// Slice AG1 #14. An ACP agent's plan, naming the tool call it belongs to.
+fn plan_update(
+    seq: u64,
+    id: &str,
+    items: Vec<eave_core::tool::TodoItem>,
+) -> eave_core::journal::Record {
+    eave_core::journal::Record {
+        seq,
+        ts_ms: seq * 10,
+        event: eave_core::journal::JournalEvent::Provider {
+            event: eave_core::events::SessionEvent::PlanUpdate {
+                call_id: id.into(),
+                items,
+            },
+        },
+    }
+}
+
 fn assistant_record(seq: u64, text: &str) -> eave_core::journal::Record {
     eave_core::journal::Record {
         seq,
@@ -6862,6 +6880,272 @@ fn the_rename_field_is_seeded_and_escape_sends_nothing(cx: &mut TestAppContext) 
     );
     assert_eq!(rename_buffer(vcx, &h), None, "escape left the field open");
     assert!(shown(vcx, "label-aaaa1111"), "the label never came back");
+}
+
+// ── Slice AG1 #13 — a proposed title, applied by a human ──────────────
+
+/// An unnamed session opens its rename field on the operator's own opening
+/// ask, ready to accept with one key.
+///
+/// **The whole design is in what this test does NOT assert.** Nothing is
+/// derived until the field opens, nothing leaves the app until Enter, and
+/// the thing that leaves is the ordinary `Command::Rename` a typed name
+/// sends — so the title reaching `watch` was published by a human, which
+/// is the line `eave-engine/tests/watch.rs::the_engine_never_mines_a_title_out_of_the_transcript`
+/// draws. eave proposes; only the operator applies.
+#[gpui::test]
+fn an_unnamed_session_proposes_its_opening_ask_and_enter_accepts(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            user_record(1, "rename the rail rows"),
+            assistant_record(2, "on it"),
+        ],
+    });
+    vcx.run_until_parked();
+
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some("rename the rail rows"),
+        "an unnamed session opened its field empty"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    let cmds = h.drain();
+    assert!(
+        matches!(cmds.as_slice(), [Command::Rename { id, title: Some(t) }]
+            if id == "aaaa1111" && t == "rename the rail rows"),
+        "accepting the proposal sent something else: {cmds:?}"
+    );
+}
+
+/// A proposal is a suggestion, so the first keystroke replaces it whole —
+/// the `seeded` behaviour the omnibox and a new bookmark folder already
+/// use. And escape still means escape: a session eave proposed a name for
+/// and the operator walked away from stays unnamed.
+#[gpui::test]
+fn a_proposal_is_typed_over_and_escaping_leaves_the_session_unnamed(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "rename the rail rows")],
+    });
+    vcx.run_until_parked();
+
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    vcx.simulate_input("x");
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some("x"),
+        "typing appended to the proposal instead of replacing it"
+    );
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "escape published a name eave derived — the one thing it must \
+         never do"
+    );
+}
+
+/// A session that already has a name opens on THAT name, not on a
+/// proposal.
+///
+/// The direction matters more than the convenience: a name the operator
+/// chose is a decision, and overwriting it with one eave worked out from
+/// the transcript would make the feature take something away.
+#[gpui::test]
+fn a_named_session_is_never_re_proposed(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut named = session("aaaa1111");
+    named.title = Some("the old name".into());
+    rail_with_selected(&h, vcx, vec![named], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "rename the rail rows")],
+    });
+    vcx.run_until_parked();
+
+    hover_row(&h, vcx, "rail-aaaa1111", "ren-aaaa1111");
+    click(vcx, "ren-aaaa1111");
+    vcx.run_until_parked();
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some("the old name"),
+        "a proposal overwrote a name the operator had chosen"
+    );
+}
+
+/// A session this client has never opened has nothing to propose, and
+/// eave does not go and get one — while one it opened EARLIER still can be
+/// named after you have moved on.
+///
+/// **Both halves are the boundary, not a gap.** Proposing for every row
+/// would mean subscribing to every session's transcript, which is the
+/// cross-session fan-out `watch` exists to avoid. Proposing for a session
+/// this client legitimately had open is free, and it does not go stale:
+/// the proposal is the FIRST thing that was asked, which no later turn
+/// changes.
+///
+/// Driven through `begin_rename` directly because that is the tab-strip
+/// menu's whole implementation of Rename (`TabMenuAction::Rename`), and
+/// it is the only door to naming a session that is not the selected one —
+/// the rail's pen appears on the selected row alone.
+#[gpui::test]
+fn a_proposal_outlives_the_switch_away_and_is_never_invented(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222")],
+        "aaaa1111",
+    );
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "rename the rail rows")],
+    });
+    vcx.run_until_parked();
+
+    // Move to the other session, which this client has never subscribed
+    // to and holds not one row of.
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "bbbb2222".into(),
+    });
+    vcx.run_until_parked();
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.begin_rename("bbbb2222".into(), cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some(""),
+        "a session this client never subscribed to came up with a name \
+         from somewhere"
+    );
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.begin_rename("aaaa1111".into(), cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        rename_buffer(vcx, &h).as_deref(),
+        Some("rename the rail rows"),
+        "the proposal did not survive switching away from the session it \
+         came from"
+    );
+}
+
+/// A proposal at the storage cap clips INSIDE the field and never grows
+/// the row, and the caret stays visible past the clip.
+///
+/// **Measured here rather than walked, and that is a limit worth stating.**
+/// The rail's pen is revealed by hover, and this machine's synthetic
+/// pointer events do not drive gpui's hover — a `CGEventMouseMoved` at the
+/// row leaves the affordance unrevealed, so a live window cannot reach this
+/// field at all (`docs/reports/stage-ag1-13-title-proposal.md`). Geometry
+/// is what `debug_bounds` genuinely can see, so geometry is what this
+/// asserts, in the same shape as
+/// `a_long_title_clips_itself_before_it_crowds_the_badge` above.
+///
+/// **Why the proposal is not cut to what the rail can DRAW.** The rail is
+/// resizable, so there is no fixed character budget to cut to; a cap
+/// derived from a width would change meaning when the operator drags the
+/// seam. It is cut to the STORE's cap, which is exactly what a typed title
+/// of the same length already does — the field truncates, the row
+/// truncates, and the operator can trim it before pressing Enter.
+#[gpui::test]
+fn a_proposal_at_the_cap_clips_inside_the_field(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    // Longer than the cap, in a font whose glyphs are wide, so the cut is
+    // real and the clip is real.
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(
+            1,
+            &"M".repeat(eave_core::store::TITLE_MAX_CHARS * 2),
+        )],
+    });
+    vcx.run_until_parked();
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.begin_rename("aaaa1111".into(), cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    let proposed = rename_buffer(vcx, &h).expect("the field is open");
+    assert_eq!(
+        proposed.chars().count(),
+        eave_core::store::TITLE_MAX_CHARS,
+        "a proposal must never exceed what the store will keep"
+    );
+
+    let row = vcx.debug_bounds("rail-aaaa1111").expect("the row renders");
+    let field = vcx
+        .debug_bounds("rename-aaaa1111")
+        .expect("the rename field renders");
+    assert!(
+        field.origin.x >= row.origin.x - px(1.)
+            && field.origin.x + field.size.width <= row.origin.x + row.size.width + px(1.),
+        "the field grew past its row: field {field:?} in row {row:?}"
+    );
+
+    // And it is really truncation being measured, not a happy fit.
+    let wanted = real_text_width(&proposed, theme::SANS, theme::RAIL_NAME_SIZE);
+    assert!(
+        wanted > field.size.width,
+        "a proposal at the cap ({wanted:?}) fits the field ({:?}) — then \
+         nothing here is testing the clip",
+        field.size.width
+    );
+
+    // The caret is the operator's place in the string, and the first thing
+    // a truncating box must not clip. It is a SIBLING of the text for
+    // exactly this reason.
+    assert!(
+        shown(vcx, "caret-rename-lit") || shown(vcx, "caret-rename-dark"),
+        "a long proposal clipped the insertion point"
+    );
 }
 
 /// Clearing a name is the same verb as setting one — an empty field sends
@@ -19918,6 +20202,136 @@ fn an_opened_plan_is_a_checklist_and_not_its_json(cx: &mut TestAppContext) {
         vcx.debug_bounds("tool-part-t1-input").is_none(),
         "the card is drawn and the JSON it was decoded from is still \
          under it — one fact rendered twice, and the worse one second"
+    );
+    assert!(
+        vcx.debug_bounds("tool-part-t1-result").is_none(),
+        "the card replaces the blob on BOTH plates: an ACP plan arrives \
+         in the result, and a provider's own rendering of the list under \
+         the card is the same duplication seen from the other side"
+    );
+}
+
+/// The same card, reached the way an ACP agent actually reaches it.
+///
+/// Hermes announces its `todo` tool as `kind: "other"` with no `rawInput`,
+/// so eave cannot type it and the row arrives `Unknown`; the checklist
+/// arrives a frame later as ACP's own `plan` update. This walks that whole
+/// path — untyped row, then plan — and asserts the card comes out the far
+/// end, because the card was never the missing half of #14. **The producer
+/// was.**
+///
+/// It also pins the thing a decoder-only test cannot see: the row is
+/// already FINISHED when the plan lands, and the card still draws.
+#[gpui::test]
+fn an_acp_plan_draws_the_card_on_a_row_eave_could_not_type(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started_typed(
+                1,
+                "tc-caac208d6c1a",
+                "other",
+                r#"{"title":"todo (3 items)","kind":"other"}"#,
+                Some(eave_core::tool::ToolCall::Unknown {
+                    name: "other".into(),
+                }),
+            ),
+            tool_finished(2, "tc-caac208d6c1a", "**Todo list**", false),
+            plan_update(
+                3,
+                "tc-caac208d6c1a",
+                vec![
+                    eave_core::tool::TodoItem {
+                        text: "Write the health-check handler".into(),
+                        done: true,
+                    },
+                    eave_core::tool::TodoItem {
+                        text: "Wire up the route".into(),
+                        done: false,
+                    },
+                ],
+            ),
+        ],
+    });
+    vcx.run_until_parked();
+
+    assert!(!shown(vcx, "tool-plan"), "a collapsed row drew its plan");
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "tool-plan"),
+        "the plan never reached the row it named"
+    );
+    assert!(
+        vcx.debug_bounds("tool-part-tc-caac208d6c1a-input")
+            .is_none(),
+        "the decoded card and the frame it was decoded from are both drawn"
+    );
+    // The half a window found and no test had looked at. An ACP plan
+    // arrives in the tool's RESULT, and Hermes' own markdown rendering of
+    // the same three items was drawing directly under the card.
+    assert!(
+        vcx.debug_bounds("tool-part-tc-caac208d6c1a-result")
+            .is_none(),
+        "the card and the provider's own rendering of it are both drawn"
+    );
+}
+
+/// A plan whose call FAILED keeps its error text under the card.
+///
+/// Same exception the drawn diff makes, and for the same reason: the card
+/// says what the agent intended, and only the error says what actually
+/// happened. Suppressing it would leave a checklist standing where a
+/// failure ought to be.
+#[gpui::test]
+fn a_failed_plan_call_still_states_what_went_wrong(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            tool_started_typed(
+                1,
+                "tc-fail",
+                "other",
+                "{}",
+                Some(eave_core::tool::ToolCall::Unknown {
+                    name: "other".into(),
+                }),
+            ),
+            tool_finished(2, "tc-fail", "todo store is read-only", true),
+            plan_update(
+                3,
+                "tc-fail",
+                vec![eave_core::tool::TodoItem {
+                    text: "Wire up the route".into(),
+                    done: false,
+                }],
+            ),
+        ],
+    });
+    vcx.run_until_parked();
+    click(vcx, "tool-head");
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "tool-plan"), "the plan itself is still a fact");
+    assert!(
+        vcx.debug_bounds("tool-part-tc-fail-error").is_some(),
+        "a checklist stands where the failure ought to be"
     );
 }
 
