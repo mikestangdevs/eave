@@ -89,6 +89,22 @@ actions!(
         /// is left without reaching for the mouse to close the field.
         SelectPrevSession,
         SelectNextSession,
+        /// Slice AG1 #12 — ⌥⌘↑ / ⌥⌘↓, the transcript's turn walk.
+        ///
+        /// Deliberately a DIFFERENT modifier from the rail's ⌘⇧ arrows
+        /// directly above, because they walk different things: ⌘⇧ moves
+        /// between sessions, ⌥⌘ moves within the one you are reading.
+        /// Sharing the arrows is the point — the axis is the same, the
+        /// scope is what the modifier names. Nothing in the app keymap or
+        /// `text_field::init` binds either chord, so no field pays for
+        /// them.
+        ///
+        /// **These work whether or not the rail is drawn.** The rail hides
+        /// when the well is too narrow to hold it clear of the reading
+        /// column, and a navigation chord that vanished with the map would
+        /// be worst exactly where the map could not fit.
+        JumpPrevTurn,
+        JumpNextTurn,
         /// Slice C5 — ⌘T.
         NewTab,
         /// **Slice W1 — ⌘N, a second window.**
@@ -11078,6 +11094,238 @@ impl Shell {
         let next = next.clone();
         self.cancel_rename(cx);
         let _ = self.commands.send(Command::Select(next));
+    }
+
+    /// **Slice AG1 #12 — the turn ticks and which one is lit.**
+    ///
+    /// The ONE place that decides, read by the rail's paint and by the
+    /// ⌥⌘ chords alike. Two copies of "which turn am I in" is the
+    /// disagreement `TurnSpan`'s own doc was written about — *"this
+    /// codebase has already paid for that once … `attention.rs` and
+    /// `ui.rs` kept two turn counters that disagreed"* — and here it
+    /// would show up as a chord that walks off one tick while the rail
+    /// lights another.
+    ///
+    /// **Derived at call time, deliberately unlike `rail_walk`.** The
+    /// rail's walk order is written by the PAINT because a collapsed
+    /// group, the filter and the window all hide rows, and a chord must
+    /// not reach what the eye cannot. Nothing hides a turn: `plan_folds`
+    /// folds `start_row + 1..`, so a turn's prompt row is in the display
+    /// list whether the turn is folded, expanded or still streaming.
+    /// There is no view state to miss, so there is nothing for the paint
+    /// to record.
+    fn turn_state(&self, cx: &App) -> (Vec<crate::turn_rail::Tick>, Option<usize>) {
+        let t = self.transcript.read(cx);
+        let ticks = crate::turn_rail::ticks(&t.transcript.rows, &t.transcript.turns, &t.display);
+        // **Where the reader ASKED to be beats where the list managed to
+        // put them, and this is not a nicety — without it the walk cannot
+        // move.** `ScrollMode::Pinned` is allowed to be a no-op: this
+        // file already documents it three hundred lines below, at the
+        // ↓-bottom affordance — *"there is nothing below to scroll into
+        // view, so `prepaint_items` walks the scroll top back to the
+        // first row and the pin is a no-op — but the MODE still reads
+        // Pinned"*. That is correct behaviour for a bottom-aligned list
+        // and it is unavoidable for the last turn or two, which have
+        // nothing under them to scroll up past.
+        //
+        // Deriving the lit tick from the scroll position alone therefore
+        // closes a loop: the pin does not take, the list is still at the
+        // end, `at_end` says the newest turn is active, and the next
+        // ⌥⌘↑ asks for the same unreachable turn again. **Walked live,
+        // that is exactly what happened — four presses, one destination,
+        // never reached, and the transcript byte-identical each time.**
+        // Reading the pin first breaks the loop: the second press starts
+        // from the turn the first one asked for.
+        //
+        // A wheel scroll drops the pin to `Free` (`on_wheel`), so taking
+        // the scrollbar back hands the answer to the position again.
+        if let ScrollMode::Pinned { msg } = t.scroll {
+            if let Some(ix) = ticks.iter().position(|k| k.start_row as u32 == msg) {
+                return (ticks, Some(ix));
+            }
+        }
+        let rows: Vec<usize> = ticks.iter().map(|k| k.display_row).collect();
+        // Follow-tail parks a bottom-aligned list on a glued anchor that
+        // does not report the newest turn's row, so "am I at the end" is
+        // asked separately rather than inferred from the top index.
+        let at_end = t.list.is_scrolled_to_end().unwrap_or(false);
+        let top = t.list.logical_scroll_top().item_ix;
+        let active = crate::turn_rail::active(&rows, top, at_end);
+        (ticks, active)
+    }
+
+    /// Put a turn's prompt at the top of the well.
+    ///
+    /// **No new scroll machinery, and that is the slice's central
+    /// claim.** [`ScrollMode::Pinned`] was built for the send-anchor flip
+    /// and does exactly this — *"pin the given transcript row's first
+    /// display row to the viewport top, re-asserted on every update"*.
+    /// The re-assertion is the part worth having: a jump taken while the
+    /// agent is streaming stays put instead of being scrolled out from
+    /// under the reader by the next batch, and it survives the structural
+    /// splice a fold transition performs.
+    ///
+    /// It also scrolls BY ITEM. See this module's `arm_replay_anchor`:
+    /// an unmeasured row is zero pixels tall in the sum-tree a pixel
+    /// scroll walks, so a pixel seek into unread history lands nowhere.
+    fn jump_to_turn(&mut self, start_row: usize, cx: &mut Context<Self>) {
+        self.transcript.update(cx, |t, cx| {
+            t.scroll = ScrollMode::Pinned {
+                msg: start_row as u32,
+            };
+            t.assert_scroll();
+            cx.notify();
+        });
+    }
+
+    /// ⌥⌘↑ / ⌥⌘↓ — one turn back, one turn on.
+    ///
+    /// **Clamps, like the rail's walk and for the same reason**: an arrow
+    /// is directional, and `strip::cycle` wraps only because ctrl-tab is
+    /// a cycler. Past the newest turn there is nothing to walk to, and
+    /// wrapping to the oldest would be a jump the reader did not ask for.
+    fn walk_turn(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let (ticks, active) = self.turn_state(cx);
+        if ticks.is_empty() {
+            return;
+        }
+        let want = match active {
+            Some(ix) if forward => ix + 1,
+            Some(ix) => match ix.checked_sub(1) {
+                Some(prev) => prev,
+                None => return,
+            },
+            // No active tick means nothing has been laid out yet; the
+            // oldest turn is as good an entry as the list has.
+            None => 0,
+        };
+        let Some(tick) = ticks.get(want) else {
+            return;
+        };
+        let start_row = tick.start_row;
+        self.jump_to_turn(start_row, cx);
+    }
+
+    /// **Slice AG1 #12 — the rail itself.**
+    ///
+    /// An overlay in the transcript's left gutter, never a sibling that
+    /// takes width: `Shell::column` centres every transcript row inside
+    /// one shared rhythm, and a rail that consumed layout would shift the
+    /// reading column out from under it.
+    ///
+    /// `None` on every frame the rail should not be drawn — including the
+    /// first, before any layout has run, when `viewport_bounds` is still
+    /// zero and `max_offset_for_scrollbar` cannot know the content is
+    /// taller than the well. The rail arrives on the second frame. That
+    /// is the same lateness waku's `chat_viewport_width` gate carries and
+    /// it is invisible at frame rate.
+    fn turn_rail_el(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (well_w, viewport_h, scrollable) = {
+            let t = self.transcript.read(cx);
+            let bounds = t.list.viewport_bounds();
+            (
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+                // The scrollbar's own question, asked the scrollbar's way:
+                // a positive max offset IS "the content is taller than the
+                // well". waku gates its rail on the same fact.
+                f32::from(t.list.max_offset_for_scrollbar().y) > 0.0,
+            )
+        };
+        let (ticks, active) = self.turn_state(cx);
+        if !crate::turn_rail::shows(scrollable, ticks.len(), well_w) {
+            return None;
+        }
+        let count = ticks.len();
+        let height = crate::turn_rail::rail_height(count, viewport_h);
+        let slot = crate::turn_rail::slot_h(count, height);
+        let marks = ticks
+            .into_iter()
+            .enumerate()
+            .map(|(ix, tick)| {
+                let is_active = active == Some(ix);
+                let start_row = tick.start_row;
+                let label = SharedString::from(tick.prompt);
+                // Quiet at rest, plain at the turn you are reading. The
+                // rail is a map, not an alarm: no `state_color` pigment
+                // appears here, for AG2 #8's reason — a mark eave derives
+                // may not borrow the vocabulary a mark eave was TOLD.
+                //
+                // **`text_tertiary`, and the first version's `border` was
+                // wrong — found by walking it, not by testing it.** A
+                // hairline ink measured +13 luminance over the well
+                // against the active tick's +132: a tenth the contrast,
+                // where waku's rail gives its inactive ticks 0.45 of the
+                // active one. At true size the marks were all but
+                // invisible while every geometry assertion passed, which
+                // is AG1 #15's defect exactly — `debug_bounds` reports
+                // geometry, never colour. The families are the tell:
+                // `border` is for separators, which carry no fact, and
+                // `text_tertiary` is documented as *"the quietest tier
+                // that is still allowed to carry a fact"*. A tick is a
+                // fact — there is a turn here.
+                let ink = if is_active {
+                    theme::text()
+                } else {
+                    theme::text_tertiary()
+                };
+                div()
+                    .id(("turn-tick", ix))
+                    .absolute()
+                    .top(px(crate::turn_rail::slot_top(ix, count, height)))
+                    .left_0()
+                    .w_full()
+                    .h(px(slot))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .rounded(px(theme::RADIUS_SELECT))
+                    // `hover_fade`, never a hand-split blend: AG1 #15
+                    // shipped a control that rendered nothing because its
+                    // blend key had no listener, and no behavioural test
+                    // could see it (`debug_bounds` reports geometry,
+                    // never colour). The wash is on the SLOT so the
+                    // pointer learns the whole strip is the target — the
+                    // mark itself is 2 px tall and nobody can aim at it.
+                    .hover_fade(
+                        format!("turn-tick-{start_row}"),
+                        theme::wash_rest(),
+                        theme::overlay(),
+                    )
+                    .debug_selector(move || format!("turn-tick-{start_row}").into())
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| PageTooltip {
+                            text: label.clone(),
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.jump_to_turn(start_row, cx)
+                    }))
+                    .child(
+                        div()
+                            .w(px(crate::turn_rail::TICK_W))
+                            .h(px(crate::turn_rail::TICK_H))
+                            .rounded_full()
+                            .bg(ink),
+                    )
+            })
+            .collect::<Vec<_>>();
+        Some(
+            div()
+                .absolute()
+                .left(px(crate::turn_rail::RAIL_LEFT))
+                .top_0()
+                .bottom_0()
+                .w(px(crate::turn_rail::RAIL_W))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .debug_selector(|| "turn-rail".into())
+                .child(div().relative().w_full().h(px(height)).children(marks))
+                .into_any_element(),
+        )
     }
 
     /// ⌘1–⌘8. Strip order, 0-based. Past the end is a silent no-op.
@@ -24779,10 +25027,24 @@ impl Render for Shell {
         // gave `never-anchored` its own verdict. The top-of-well behaviour
         // is still worth having; it needs an implementation that does not
         // add a per-frame layout pass to the hottest element in the app.
-        let transcript_el = list(list_state, move |ix, _window, cx| {
-            transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
-        })
-        .size_full();
+        // **Slice AG1 #12 — the jump-to-turn rail is wrapped on HERE, not
+        // at either mount.** The transcript has two render paths, exactly
+        // as a page does: `render_split_well` when the well is split and
+        // `render`'s own branch when it is not. Round two's report states
+        // the rule this follows — *"anything floating over a page must go
+        // in a helper both call"* — and wrapping the element itself, once,
+        // upstream of the branch, is the cheapest way to obey it: there is
+        // no second mount to forget.
+        let transcript_el = div()
+            .relative()
+            .size_full()
+            .child(
+                list(list_state, move |ix, _window, cx| {
+                    transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
+                })
+                .size_full(),
+            )
+            .children(self.turn_rail_el(cx));
 
         // Here rather than beside `composer_mounted` above: that read of the
         // transcript is still borrowed at that point, and this needs `cx`
@@ -25474,6 +25736,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| this.reopen_closed_tab(cx)))
             .on_action(cx.listener(|this, _: &SelectPrevSession, _, cx| this.walk_rail(false, cx)))
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.walk_rail(true, cx)))
+            .on_action(cx.listener(|this, _: &JumpPrevTurn, _, cx| this.walk_turn(false, cx)))
+            .on_action(cx.listener(|this, _: &JumpNextTurn, _, cx| this.walk_turn(true, cx)))
             .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| this.decide_oldest(true, cx)))
             .on_action(cx.listener(|this, _: &DenyOldest, _, cx| this.decide_oldest(false, cx)))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
@@ -26544,6 +26808,13 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // them.
         KeyBinding::new("cmd-shift-up", SelectPrevSession, None),
         KeyBinding::new("cmd-shift-down", SelectNextSession, None),
+        // Slice AG1 #12 — the turn walk, one modifier over from the
+        // session walk it shares an axis with. `text_field` binds
+        // `alt-left`/`alt-right` for word motion and `cmd-left`/`cmd-right`
+        // for line ends, but nothing binds `cmd-alt` with a vertical
+        // arrow, so the composer keeps everything it had.
+        KeyBinding::new("cmd-alt-up", JumpPrevTurn, None),
+        KeyBinding::new("cmd-alt-down", JumpNextTurn, None),
         // Slice Y: the three a macOS user reaches for without thinking.
         // Bound here rather than expressed as `OsAction`s because eave's
         // gpui pin has no Minimize/Close variants (see `app_menus`).

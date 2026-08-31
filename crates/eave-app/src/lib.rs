@@ -97,6 +97,8 @@ pub mod bookmarks;
 mod app_menus;
 pub mod display;
 pub mod fixture;
+/// Slice AG1 #12 — the jump-to-turn rail in the transcript's left gutter.
+pub mod turn_rail;
 pub mod markdown;
 pub mod theme;
 

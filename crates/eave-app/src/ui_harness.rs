@@ -19985,6 +19985,246 @@ fn quoting_a_message_puts_it_in_the_composer_as_a_blockquote(cx: &mut TestAppCon
     );
 }
 
+// ---------------------------------------------------------------------
+// Slice AG1 #12 — the jump-to-turn rail
+// ---------------------------------------------------------------------
+
+/// Four turns, each with enough answer under it to push the well past a
+/// scroll. Long paragraphs rather than many records: the rail's gate asks
+/// whether the CONTENT is taller than the viewport, and a short transcript
+/// deliberately gets no rail.
+fn four_turns(h: &Harness, vcx: &mut VisualTestContext) {
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let body = (0..14)
+        .map(|n| format!("paragraph {n} of an answer long enough to scroll"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut records = Vec::new();
+    let mut seq = 1u64;
+    for turn in 0..4 {
+        records.push(user_record(seq, &format!("prompt number {turn}")));
+        seq += 1;
+        records.push(assistant_record(seq, &body));
+        seq += 1;
+        records.push(turn_completed_record(seq));
+        seq += 1;
+    }
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records,
+    });
+    vcx.run_until_parked();
+}
+
+fn scroll_mode(vcx: &mut VisualTestContext, h: &Harness) -> ScrollMode {
+    vcx.read_window(&h.window, |shell, cx| {
+        shell.read(cx).transcript.read(cx).scroll
+    })
+    .unwrap()
+}
+
+/// **The whole slice, end to end.** Every turn is marked, and pressing a
+/// mark puts that turn's prompt at the top of the well.
+///
+/// The assertion is on `ScrollMode::Pinned`, not on a pixel offset, and
+/// that is deliberate: pinning is what the jump IS. `assert_scroll`
+/// re-applies it on every update, which is why a jump taken mid-stream is
+/// not scrolled away by the next batch — asserting a one-shot offset would
+/// pass over an implementation that had lost exactly that property.
+#[gpui::test]
+fn the_turn_rail_marks_every_turn_and_a_press_jumps_to_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    four_turns(&h, vcx);
+
+    assert!(shown(vcx, "turn-rail"), "four turns and no rail");
+    // Four prompts at transcript rows 0, 2, 4, 6 — one tick each, and the
+    // selector carries the row the tick will hand to the pin.
+    for sel in ["turn-tick-0", "turn-tick-2", "turn-tick-4", "turn-tick-6"] {
+        assert!(shown(vcx, sel), "no tick for {sel}");
+    }
+    assert!(
+        !shown(vcx, "turn-tick-8"),
+        "a tick appeared for a turn that does not exist"
+    );
+
+    click(vcx, "turn-tick-2");
+    vcx.run_until_parked();
+    assert_eq!(
+        scroll_mode(vcx, &h),
+        ScrollMode::Pinned { msg: 2 },
+        "pressing a tick must pin that turn's prompt to the top of the well"
+    );
+}
+
+/// waku's gate, and its reason: a rail over one turn is not a map of
+/// anything, it is a dot beside the only thing on screen.
+#[gpui::test]
+fn one_turn_is_not_a_map(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    h.plumbing.push_feed(FeedEvent::Session {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let body = (0..14)
+        .map(|n| format!("paragraph {n} of an answer long enough to scroll"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![
+            user_record(1, "the only prompt"),
+            assistant_record(2, &body),
+            turn_completed_record(3),
+        ],
+    });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "turn-rail"),
+        "a single turn drew a rail to itself"
+    );
+}
+
+/// ⌥⌘↑ / ⌥⌘↓, and the clamp.
+///
+/// **The chords are asserted from the keymap down**, not by calling
+/// `walk_turn`: gpui dispatches a matched action ahead of bubble-phase
+/// listeners, so a binding that collided with something already bound
+/// would still leave the method perfectly correct and unreachable.
+#[gpui::test]
+fn the_turn_chords_walk_one_turn_each_way_and_clamp(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    four_turns(&h, vcx);
+
+    // Parked at the tail, the newest turn is the one being read — so
+    // there is nothing forward of it and the chord is a no-op rather
+    // than a wrap back to the oldest.
+    vcx.simulate_keystrokes("cmd-alt-down");
+    vcx.run_until_parked();
+    assert_eq!(
+        scroll_mode(vcx, &h),
+        ScrollMode::Follow,
+        "⌥⌘↓ at the newest turn must clamp, not wrap to the oldest"
+    );
+
+    vcx.simulate_keystrokes("cmd-alt-up");
+    vcx.run_until_parked();
+    assert_eq!(
+        scroll_mode(vcx, &h),
+        ScrollMode::Pinned { msg: 4 },
+        "⌥⌘↑ from the newest turn should land on the one before it"
+    );
+
+    vcx.simulate_keystrokes("cmd-alt-up");
+    vcx.run_until_parked();
+    assert_eq!(scroll_mode(vcx, &h), ScrollMode::Pinned { msg: 2 });
+
+    vcx.simulate_keystrokes("cmd-alt-down");
+    vcx.run_until_parked();
+    assert_eq!(
+        scroll_mode(vcx, &h),
+        ScrollMode::Pinned { msg: 4 },
+        "the walk must be symmetric"
+    );
+
+    // And the other end clamps too.
+    vcx.simulate_keystrokes("cmd-alt-up");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-alt-up");
+    vcx.run_until_parked();
+    assert_eq!(scroll_mode(vcx, &h), ScrollMode::Pinned { msg: 0 });
+    vcx.simulate_keystrokes("cmd-alt-up");
+    vcx.run_until_parked();
+    assert_eq!(
+        scroll_mode(vcx, &h),
+        ScrollMode::Pinned { msg: 0 },
+        "⌥⌘↑ at the oldest turn must clamp"
+    );
+}
+
+/// **The walk reads the pin it asked for, not the scroll it got — and
+/// this test exists because the suite could not see the bug.**
+///
+/// `ScrollMode::Pinned` is allowed to be a no-op: a bottom-aligned list
+/// cannot put the last turn at the top, because nothing is below it to
+/// scroll up past, and `prepaint_items` walks the anchor back. Walked
+/// live, four ⌥⌘↑ presses produced four identical frames — the pin did
+/// not take, so `is_scrolled_to_end` stayed true, so the newest turn
+/// stayed active, so every press asked for the same unreachable turn.
+///
+/// The harness cannot reproduce the clamp (its list is laid out
+/// differently), so this pins the RULE instead: with a pin in force, the
+/// walk starts from the pinned turn, whatever the list did about it.
+#[gpui::test]
+fn the_walk_advances_from_the_pin_even_when_the_list_refused_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    four_turns(&h, vcx);
+
+    // Pin a MIDDLE turn by hand and leave the list parked at the end.
+    // That divergence is the whole test: `assert_scroll` is deliberately
+    // NOT called, so the pin is in force and the list never moved — the
+    // exact state a refused pin leaves behind.
+    //
+    // It has to be a middle turn. The first version of this test pinned
+    // the NEWEST one and passed with the fix reverted, because at the
+    // tail both rules name the same tick and the test could not tell
+    // them apart. It went green having asserted nothing.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell
+                .transcript
+                .update(cx, |t, _| t.scroll = ScrollMode::Pinned { msg: 2 });
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    // From turn 2, back one turn is turn 0. Reading the SCROLL instead
+    // would see a list still at the end, call the newest turn active,
+    // and walk to turn 4 — forward, from a press that means back.
+    vcx.simulate_keystrokes("cmd-alt-up");
+    vcx.run_until_parked();
+    assert_eq!(
+        scroll_mode(vcx, &h),
+        ScrollMode::Pinned { msg: 0 },
+        "the walk started from the list's position instead of the pin"
+    );
+}
+
+/// The rail must never take layout from the reading column.
+///
+/// `Shell::column` centres every transcript row inside one shared rhythm,
+/// so a rail that consumed width would shift the text of every message in
+/// the app. This pins the overlay structurally — the geometry itself is
+/// `turn_rail`'s to test, and it does, at every width.
+#[gpui::test]
+fn the_rail_is_an_overlay_and_never_takes_the_column_s_width(_cx: &mut TestAppContext) {
+    let src = include_str!("ui.rs");
+    let body = src
+        .split("fn turn_rail_el(")
+        .nth(1)
+        .and_then(|s| s.split("\n    fn ").next())
+        .expect("turn_rail_el exists");
+    assert!(
+        body.contains(".absolute()"),
+        "the rail must be positioned out of flow"
+    );
+    // One mount, upstream of both render paths.
+    assert_eq!(
+        src.matches("self.turn_rail_el(cx)").count(),
+        1,
+        "the rail is wrapped onto `transcript_el` once, above the \
+         split/docked branch — a second mount is a second thing to forget"
+    );
+}
+
 /// A `hover_blend` key that no `hover_listener` writes never moves off
 /// `rest` — and for these controls `rest` is `wash_rest`, which is
 /// invisible against the plate.
