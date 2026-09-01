@@ -250,6 +250,11 @@ enum FeedEvent {
     Rewound {
         reply: Box<eave_wire::RewindOk>,
     },
+    /// Slice AG1 #11 — the engine's answer to a restore (or to the
+    /// question that arms one).
+    Restored {
+        reply: Box<eave_wire::RestoreOk>,
+    },
     Reset {
         id: String,
     },
@@ -320,6 +325,13 @@ enum Command {
         images: Vec<PathBuf>,
     },
     Kill,
+    /// Slice AG1 #11 — put the working tree back to a turn's checkpoint.
+    /// `confirmed` false asks what would change; the engine's answer is
+    /// what arms the control.
+    Restore {
+        seq: u64,
+        confirmed: bool,
+    },
     /// Composer Stop: interrupt the in-flight turn, keep the session.
     Stop,
     /// Slice AG1 #10 — drop the conversation back to a message, so the
@@ -1479,8 +1491,10 @@ async fn feed_loop(
                             Some(Command::Send { .. })
                             | Some(Command::Kill)
                             | Some(Command::Stop)
-                            // Nothing to rewind before a session exists.
+                            // Nothing to rewind or restore before a
+                            // session exists.
                             | Some(Command::Rewind { .. })
+                            | Some(Command::Restore { .. })
                             | Some(Command::Resubscribe)
                             | Some(Command::Diff(_))
                             | Some(Command::Decide { .. }) => {}
@@ -1605,6 +1619,20 @@ async fn feed_loop(
                         // "the rewind did not happen and here is why" is one
                         // outcome, and inventing a second control path for it
                         // would only mean two places that can be wrong.
+                        Some(Command::Restore { seq, confirmed }) => {
+                            let reply = client
+                                .restore(&session_id, seq, confirmed)
+                                .await
+                                .unwrap_or_else(|e| eave_wire::RestoreOk {
+                                    seq,
+                                    restored: false,
+                                    files: Vec::new(),
+                                    reason: Some(format!("the engine could not be asked: {e}")),
+                                });
+                            plumbing.push_feed(FeedEvent::Restored {
+                                reply: Box::new(reply),
+                            });
+                        }
                         Some(Command::Rewind {
                             msg_id,
                             last_seen_msg_id,
@@ -4676,6 +4704,16 @@ struct TranscriptState {
     /// would paste the same message into the composer on every unrelated
     /// notify.
     rewind_reply: Option<eave_wire::RewindOk>,
+    /// Slice AG1 #11 — the engine's answer to a restore, same mailbox
+    /// route and same `take`-once rule as `rewind_reply`.
+    restore_reply: Option<eave_wire::RestoreOk>,
+    /// The turn whose restore is ARMED, and how many files the engine
+    /// said would change.
+    ///
+    /// One at a time, deliberately: two armed undos on screen is two
+    /// loaded guns, and the operator cannot see which one their next
+    /// click belongs to. Arming a second disarms the first.
+    restore_armed: Option<(u64, usize)>,
     /// Slice Q2: the engine's own words when a launch was refused. Lives
     /// here rather than on `Shell` because it is cleared by the same feed
     /// event that clears the session — the two facts arrive together and
@@ -4759,6 +4797,8 @@ impl TranscriptState {
             rows_session: None,
             rewind_ok: false,
             rewind_reply: None,
+            restore_reply: None,
+            restore_armed: None,
             launch_error: None,
             transcript: Transcript::new(),
             display: DisplayList::new(),
@@ -5261,6 +5301,12 @@ items={count} rows={} frames={} ops={}",
         // ours to apply — it would seed this composer with another
         // session's message.
         self.rewind_reply = None;
+        // An armed undo belongs to a turn in the rows that are going, and
+        // a seq means nothing in the next session's journal. Disarm — a
+        // confirmation that outlives what it was confirming is the worst
+        // kind.
+        self.restore_reply = None;
+        self.restore_armed = None;
         self.transcript.reset();
         self.display.update(&self.transcript);
         self.list.reset(self.display.len() + 1);
@@ -11011,6 +11057,68 @@ impl Shell {
         // lines, as `quote_into_composer`.
         let handle = gpui::Focusable::focus_handle(self.composer.read(cx).field.read(cx), cx);
         window.focus(&handle, cx);
+    }
+
+    /// Slice AG1 #11 — ask about, then perform, a restore.
+    ///
+    /// **Two clicks, and the first one is a question.** The engine
+    /// answers an unconfirmed call with the count and writes nothing;
+    /// that answer arms the control. The second click carries
+    /// `confirmed`. This is `RemoveWorktree`'s shape exactly — the same
+    /// verb-arms-on-the-engine's-refusal idiom, rather than a second
+    /// confirmation pattern that would have to be got right separately.
+    ///
+    /// Nothing is decided here about WHAT will change: the count comes
+    /// back from the same walk that does the work, so the number the
+    /// operator confirms cannot drift from the number that moves.
+    fn restore_turn(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let armed = self
+            .transcript
+            .read(cx)
+            .restore_armed
+            .is_some_and(|(s, _)| s == seq);
+        if armed {
+            self.transcript.update(cx, |t, _| t.restore_armed = None);
+        }
+        let _ = self.commands.send(Command::Restore {
+            seq,
+            confirmed: armed,
+        });
+    }
+
+    /// Slice AG1 #11 — act on the engine's answer to a restore.
+    ///
+    /// From the observer and `take`n, the same route and the same
+    /// once-only rule as [`Self::apply_rewind_reply`].
+    fn apply_restore_reply(&mut self, cx: &mut Context<Self>) {
+        let Some(reply) = self.transcript.update(cx, |t, _| t.restore_reply.take()) else {
+            return;
+        };
+        if reply.restored {
+            // The transcript already carries a `restored — N files`
+            // marker from the journal fold, so this says the short thing
+            // and does not repeat the count in two voices.
+            self.transcript.update(cx, |t, _| t.restore_armed = None);
+            self.transient_note("files restored".into(), cx);
+            return;
+        }
+        let reason = reply
+            .reason
+            .unwrap_or_else(|| "the restore did not happen".into());
+        // A count means it was a QUESTION and the answer arms the
+        // control. No count means it was a refusal, and the operator
+        // reads the engine's own words.
+        if reply.files.is_empty() {
+            self.transcript.update(cx, |t, _| t.restore_armed = None);
+            self.transient_note(format!("not restored — {reason}"), cx);
+            return;
+        }
+        let n = reply.files.len();
+        // The seq comes back on the reply, so the armed control cannot
+        // name a different turn from the one the count was measured for.
+        self.transcript
+            .update(cx, |t, _| t.restore_armed = Some((reply.seq, n)));
+        self.transient_note(reason, cx);
     }
 
     /// Slice AG1 #10 — answer, once per change, whether the selected
@@ -19998,6 +20106,87 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Slice AG1 #11 — "undo this turn's file changes", the exact mirror
+    /// of [`Self::message_rewind`] beside it.
+    ///
+    /// The pair is the point. A rewind moves the CONVERSATION and touches
+    /// no file; a restore moves the FILES and touches no conversation.
+    /// They address the same turn from the same cluster, and keeping them
+    /// separate verbs is deliberate — an operator who wants the agent to
+    /// forget a bad instruction usually does not want their own edits of
+    /// the last ten minutes reverted with it, and the reverse is just as
+    /// common.
+    ///
+    /// **Two clicks.** The first asks and the row states the count; the
+    /// second acts. Armed, the glyph goes danger-inked and an
+    /// out-of-flow label says how many files. Out of flow because a row's
+    /// height may depend only on its identity and content — an armed
+    /// state that grew the row would move the scroll anchor under the
+    /// operator's next click, which is the one click that must land.
+    ///
+    /// Fourth in the cluster, and on the cluster's hover key for the
+    /// reason `message_copy` spells out.
+    fn message_restore(state: &TranscriptState, msg: u32, seq: u64) -> AnyElement {
+        let shell = state.shell.clone();
+        let sel = format!("msg-restore-{msg}");
+        let armed = state.restore_armed.filter(|(s, _)| *s == seq);
+        let ink = match armed {
+            // Armed is a STATE, not a hover: it stays lit when the
+            // pointer leaves, because a loaded confirmation that looks
+            // disarmed the moment you move the mouse is worse than none.
+            Some(_) => theme::danger(),
+            None => motion::hover_blend(
+                &format!("msg-controls-{msg}"),
+                theme::wash_rest(),
+                theme::text_tertiary(),
+            ),
+        };
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel)
+            .absolute()
+            .top(px(0.))
+            // Left of rewind, which is left of quote, which is left of
+            // copy: three glyphs and their padding.
+            .right(px((theme::ICON_SM + theme::SPACE_1 * 2.) * 3.))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px(px(theme::SPACE_1))
+            .cursor_pointer()
+            .children(armed.map(|(_, n)| {
+                div()
+                    .flex_none()
+                    .text_size(px(theme::SMALL_SIZE))
+                    .line_height(px(theme::SMALL_LINE))
+                    .text_color(theme::danger())
+                    .child(SharedString::from(match n {
+                        1 => "undo 1 file?".to_string(),
+                        n => format!("undo {n} files?"),
+                    }))
+            }))
+            // **`DOCUMENT`, not a second circular arrow.** The obvious
+            // pick is `REFRESH`, and `refresh.svg` is `restart.svg`
+            // mirrored — the same arc with the arrowhead at the other
+            // end. Two of those at 14 px, adjacent, meaning different
+            // things, is a control an operator would click wrong and not
+            // know they had. So the glyphs differ by SUBJECT, which is
+            // the real distinction between these two verbs: an arrow for
+            // the conversation, a page for the files. The verb itself is
+            // carried in words when it is armed, which is the click that
+            // matters.
+            .child(icons::icon(icons::DOCUMENT, theme::ICON_SM, ink))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                if let Some(shell) = shell.as_ref().and_then(|s| s.upgrade()) {
+                    shell.update(cx, |shell, cx| shell.restore_turn(seq, cx));
+                }
+            })
+            .into_any_element()
+    }
+
     fn message_copy(state: &TranscriptState, msg: u32, text: String) -> AnyElement {
         let lines = text.lines().count();
         let shell = state.shell.clone();
@@ -20316,7 +20505,21 @@ impl Shell {
                             Some(Self::message_rewind(state, id.msg, msg_id.clone()))
                         }
                         _ => None,
-                    });
+                    })
+                    // Slice AG1 #11. One gate, and it is not the
+                    // provider's: a checkpoint is git's, so this works
+                    // for all six CLIs and for a turn whose provider
+                    // cannot rewind a word. Absent when the session is
+                    // not in a repository, when git refused, and for
+                    // every turn journalled before this slice — all of
+                    // which are the same fact, that there is nothing to
+                    // restore.
+                    .children(
+                        state
+                            .transcript
+                            .checkpoint_at(id.msg as usize)
+                            .map(|seq| Self::message_restore(state, id.msg, seq)),
+                    );
                 match delivery {
                     // The acceptance-critical distinction: journaled but
                     // never reached the agent (spec 02 §Delivery state).
@@ -27564,6 +27767,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                 FeedEvent::Rewound { reply } => {
                                     state.rewind_reply = Some(*reply);
                                 }
+                                FeedEvent::Restored { reply } => {
+                                    state.restore_reply = Some(*reply);
+                                }
                                 FeedEvent::Session { id } => {
                                     if state.session_id.as_deref() != Some(id.as_str()) {
                                         switched = true;
@@ -28094,6 +28300,10 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // Slice AG1 #10, same rule and the same reason.
                         shell.refresh_rewind_gate(cx);
                         shell.apply_rewind_reply(window, cx);
+                        // Slice AG1 #11, same mailbox, same once-only
+                        // `take`. It needs no `Window`: a restore moves
+                        // files and says so, and never touches focus.
+                        shell.apply_restore_reply(cx);
                         // ...and the other half. A turn ending is a
                         // transcript fact — `TurnCompleted` arriving in a
                         // record batch, or the one-second heartbeat

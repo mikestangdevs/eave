@@ -475,16 +475,23 @@ pub async fn scan_against_with(
     index: &Path,
 ) -> Result<FilesSnapshot, String> {
     // Ask before diffing, rather than pattern-matching git's stderr
-    // afterwards. The base is an UNREACHABLE object — nothing references
-    // it — so an agent that runs `git gc --prune=now` mid-turn is
-    // entitled to collect it, and eave has to be able to say so in words
-    // instead of reporting a git failure the operator cannot act on.
+    // afterwards.
+    //
+    // Since Slice AG1 #11 the base is also a checkpoint, pinned under
+    // `refs/eave/`, so the ordinary `git gc --prune=now` an agent runs
+    // mid-turn no longer collects it — which is a hazard this path used
+    // to be the only answer to. It is still the answer, because the
+    // operator owns their repository: deleting eave's refs, cloning
+    // without them, or a `git gc` after the session's checkpoints were
+    // dropped all leave a base that is genuinely gone. eave says so in
+    // words rather than reporting a git failure nobody can act on.
     match run(git, cwd, timeout, &["cat-file", "-t", base_tree]).await {
         Ok(out) if String::from_utf8_lossy(&out).trim() == "tree" => {}
         _ => {
             return Err(format!(
-                "the turn's base tree {} is no longer in the object store — a `git gc` \
-                 can prune it while the turn runs. The next turn starts a fresh base.",
+                "the turn's base tree {} is no longer in the object store — its \
+                 checkpoint ref was removed and a `git gc` collected it. The next \
+                 turn starts a fresh base.",
                 short_sha(base_tree)
             ))
         }
@@ -577,6 +584,361 @@ pub async fn scan_against_with(
         omitted,
         watching: false,
         basis: DiffBasis::WorkingTree,
+    })
+}
+
+// ---------------------------------------------------------------------
+// Turn checkpoints (Slice AG1 #11)
+// ---------------------------------------------------------------------
+
+/// The ref namespace every checkpoint lives under. One directory per
+/// session so a session's checkpoints can be dropped in one call, and
+/// `refs/eave/` as a whole is ignorable by anything that walks refs.
+pub const CHECKPOINT_NS: &str = "refs/eave";
+
+/// The ref one captured state is pinned under.
+///
+/// **Named by the commit, not by the turn.** The obvious name encodes the
+/// journal seq of the record that describes the checkpoint — but the ref
+/// has to be written by the engine at dispatch, and the seq is not
+/// assigned until the record is appended a moment later. Naming the ref
+/// after its own commit removes that ordering dependency: the name is
+/// derivable from the object itself, capturing the same tree twice is
+/// idempotent rather than a second ref, and the session prefix still
+/// makes the whole set droppable in one sweep.
+///
+/// The seq stays the *client-facing* address. It names the record; the
+/// record carries the tree; the tree is what a restore is asked for.
+pub fn pin_ref(session_id: &str, kind: &str, commit: &str) -> String {
+    format!("{CHECKPOINT_NS}/session-{session_id}/{kind}-{commit}")
+}
+
+/// A checkpoint taken before a turn.
+pub const KIND_TURN: &str = "turn";
+/// A state parked by a restore, so the restore can be walked back.
+pub const KIND_UNDO: &str = "undo";
+
+/// One captured worktree state, made **reachable**.
+///
+/// [`snapshot_tree`] alone is not a checkpoint. `write-tree` leaves a tree
+/// object nothing points at, and this file already documents what happens
+/// next: the base can be "collected out from under us (a `git gc
+/// --prune=now` can do it: the base tree is unreachable by
+/// construction)". That is a fair trade for a measurement basis one turn
+/// wide. It is not a fair trade for something the operator is invited to
+/// restore from an hour later, and the failure would be silent until the
+/// moment it was needed.
+///
+/// So the tree is wrapped in a commit and a ref is pointed at it. The
+/// commit has **no parent**, deliberately: a checkpoint is a STATE, not a
+/// piece of history. Parenting it to HEAD would pin the entire ancestry
+/// of every checkpoint, which is a storage leak the operator never asked
+/// for and cannot see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRef {
+    pub tree: String,
+    pub commit: String,
+    pub git_ref: String,
+}
+
+/// Capture the working tree and pin it under `git_ref`.
+pub async fn capture_checkpoint(
+    cwd: &Path,
+    index: &Path,
+    session_id: &str,
+) -> Result<CheckpointRef, GitState> {
+    capture_checkpoint_with(Path::new("git"), cwd, GIT_TIMEOUT, index, session_id).await
+}
+
+/// [`capture_checkpoint`] with the git binary and timeout injectable.
+pub async fn capture_checkpoint_with(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    index: &Path,
+    session_id: &str,
+) -> Result<CheckpointRef, GitState> {
+    let tree = snapshot_tree_with(git, cwd, timeout, index).await?;
+    pin_tree_with(git, cwd, timeout, &tree, session_id, KIND_TURN).await
+}
+
+/// Wrap an already-captured tree in a parentless commit and point
+/// `git_ref` at it. Split from [`capture_checkpoint`] because a restore
+/// has already paid for a capture and must not pay twice: the tree it
+/// took to build the patch IS the undo point.
+pub async fn pin_tree_with(
+    git: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    tree: &str,
+    session_id: &str,
+    kind: &str,
+) -> Result<CheckpointRef, GitState> {
+    // `commit-tree -m` rather than a message on stdin: `run_env` gives the
+    // child a null stdin on purpose, and one flag is cheaper than a
+    // second spawn shape that could feed it.
+    //
+    // The identity is stated, never inherited. `commit-tree` fails
+    // outright with "unable to auto-detect email address" on a machine
+    // with no global `user.email`, which would make checkpoints silently
+    // unavailable for exactly the operators least likely to diagnose it.
+    // Naming eave as the committer is also the honest answer: eave made
+    // this object, the operator did not, and it must never appear in a
+    // log as something they authored. `commit.gpgsign=false` for the same
+    // reason in reverse — a checkpoint must not prompt for a passphrase.
+    let out = run(
+        git,
+        cwd,
+        timeout,
+        &[
+            "-c",
+            "user.name=eave",
+            "-c",
+            "user.email=eave@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            tree,
+            "-m",
+            "eave turn checkpoint",
+        ],
+    )
+    .await?;
+    let commit = String::from_utf8_lossy(&out).trim().to_string();
+    if commit.is_empty() {
+        return Err(GitState::Error {
+            message: "git commit-tree printed nothing".into(),
+        });
+    }
+    let git_ref = pin_ref(session_id, kind, &commit);
+    run(git, cwd, timeout, &["update-ref", &git_ref, &commit]).await?;
+    Ok(CheckpointRef {
+        tree: tree.to_string(),
+        commit,
+        git_ref,
+    })
+}
+
+/// Is this checkpoint's tree still in the object store?
+///
+/// A ref makes the tree reachable, but the operator owns their own
+/// repository: `git update-ref -d`, a stray `refs/eave` cleanup, or a
+/// clone that never carried these refs all leave a checkpoint the
+/// transcript still names. That is a stated fact at the moment of
+/// restore, never a crash — the same shape [`scan_against`] uses for a
+/// basis that went away.
+pub async fn checkpoint_alive(cwd: &Path, tree: &str) -> bool {
+    checkpoint_alive_with(Path::new("git"), cwd, GIT_TIMEOUT, tree).await
+}
+
+/// [`checkpoint_alive`] with the git binary and timeout injectable.
+pub async fn checkpoint_alive_with(git: &Path, cwd: &Path, timeout: Duration, tree: &str) -> bool {
+    run(
+        git,
+        cwd,
+        timeout,
+        &["cat-file", "-e", &format!("{tree}^{{tree}}")],
+    )
+    .await
+    .is_ok()
+}
+
+/// How many of each kind of pin one session keeps.
+///
+/// **A cap exists because nothing else bounds this.** There is no
+/// session-delete path in the engine, so a ref written per turn is a ref
+/// kept forever — and a checkpoint holds every version of every file it
+/// captured, so an old one in a large repo is not free. A `drop
+/// everything` with no caller would have been the shape that grows
+/// without limit while looking tidy.
+///
+/// Turn checkpoints are what the operator reaches for, so they get the
+/// larger budget. Undo points are a recovery net for the last few
+/// restores, not history.
+pub const KEEP_TURNS: usize = 50;
+pub const KEEP_UNDOS: usize = 10;
+
+/// Keep the newest `keep` refs of one kind for one session; drop the
+/// rest. `keep: 0` drops them all.
+///
+/// Ordered by the commit's own date — the refs are named after their
+/// commits, so the name says nothing about age and `--sort=creatordate`
+/// is what does.
+///
+/// Best-effort by construction: this reclaims disk, and a failure to
+/// reclaim disk must never fail the operation that triggered it. **A
+/// pruned checkpoint is not silent** — the control still offers it and
+/// the restore refuses in words, the same sentence an operator who
+/// deleted the refs themselves would get.
+pub async fn prune_pins(cwd: &Path, session_id: &str, kind: &str, keep: usize) {
+    let git = Path::new("git");
+    let prefix = format!("{CHECKPOINT_NS}/session-{session_id}/{kind}-");
+    let Ok(out) = run(
+        git,
+        cwd,
+        GIT_TIMEOUT,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "--sort=creatordate",
+            &format!("{prefix}*"),
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let names: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let drop_count = names.len().saturating_sub(keep);
+    for name in names.iter().take(drop_count) {
+        let _ = run(git, cwd, GIT_TIMEOUT, &["update-ref", "-d", name]).await;
+    }
+}
+
+/// What a restore did — or, for a dry run, what it would do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Root-relative paths the restore actually wrote, created or
+    /// removed. Empty means the worktree already matched the checkpoint —
+    /// which is a success, and a different sentence.
+    pub files: Vec<String>,
+    /// The state that was replaced, pinned before anything was written.
+    /// `None` only when there was nothing to replace.
+    pub undo: Option<CheckpointRef>,
+}
+
+/// Put the working tree back to `tree`.
+///
+/// **The undo is taken first, and it is free.** Building the patch
+/// requires capturing the current worktree anyway, so pinning that same
+/// tree under a ref costs two cheap plumbing calls and makes the restore
+/// itself reversible. This codebase already decided that reversibility is
+/// what licenses a destructive verb — bulk archive ships and bulk delete
+/// "is absent and stays absent" — and a restore that could not be undone
+/// would be the one irreversible thing eave does to an operator's files.
+///
+/// The mechanism is a patch, not a checkout, for one reason: the patch is
+/// computed against a capture of the worktree **as it is right now**, so
+/// its preimage matches by construction and it can only touch paths that
+/// actually differ. A `read-tree`/`checkout-index` would rewrite every
+/// file in the tree, stamping mtimes across a repo the operator is in the
+/// middle of building.
+///
+/// Two things are deliberately NOT touched. **Ignored files**, because
+/// `snapshot_tree`'s `add -A` never captured them — a restore that
+/// deleted `target/` would be a catastrophe dressed as an undo. And **the
+/// operator's index**: eave read the working tree to make this
+/// checkpoint and it writes the working tree to restore it; what is
+/// staged is theirs and was never ours to move.
+pub async fn restore_checkpoint(
+    root: &Path,
+    index: &Path,
+    tree: &str,
+    patch_path: &Path,
+    session_id: &str,
+    apply: bool,
+) -> Result<RestoreReport, String> {
+    restore_checkpoint_with(
+        Path::new("git"),
+        root,
+        GIT_TIMEOUT,
+        index,
+        tree,
+        patch_path,
+        session_id,
+        apply,
+    )
+    .await
+}
+
+/// [`restore_checkpoint`] with the git binary and timeout injectable.
+#[allow(clippy::too_many_arguments)]
+pub async fn restore_checkpoint_with(
+    git: &Path,
+    root: &Path,
+    timeout: Duration,
+    index: &Path,
+    tree: &str,
+    patch_path: &Path,
+    session_id: &str,
+    apply: bool,
+) -> Result<RestoreReport, String> {
+    if !checkpoint_alive_with(git, root, timeout, tree).await {
+        return Err(format!(
+            "this turn's checkpoint is no longer in the repository — \
+             {} was collected or its ref removed",
+            short_sha(tree)
+        ));
+    }
+    let now = snapshot_tree_with(git, root, timeout, index)
+        .await
+        .map_err(|e| e.stated())?;
+    if now == tree {
+        return Ok(RestoreReport {
+            files: Vec::new(),
+            undo: None,
+        });
+    }
+    // Names first: after the patch lands, the two trees are equal and the
+    // question cannot be asked again.
+    let names = run(
+        git,
+        root,
+        timeout,
+        &["diff", "--name-only", "-z", &now, tree],
+    )
+    .await
+    .map_err(|e| e.stated())?;
+    let files: Vec<String> = names
+        .split(|b| *b == 0)
+        .filter(|c| !c.is_empty())
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect();
+
+    // **The dry run stops here**, holding the count and nothing else.
+    // It is the same walk the real thing does, so the number the operator
+    // is asked to confirm is the number that will change — not an
+    // estimate taken by a different route, which is how a confirmation
+    // dialog comes to lie.
+    if !apply {
+        return Ok(RestoreReport { files, undo: None });
+    }
+
+    // The undo point, pinned BEFORE a byte is written.
+    let undo = pin_tree_with(git, root, timeout, &now, session_id, KIND_UNDO)
+        .await
+        .map_err(|e| e.stated())?;
+
+    let patch = run(git, root, timeout, &["diff", "--binary", &now, tree])
+        .await
+        .map_err(|e| e.stated())?;
+    if let Some(parent) = patch_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("restore patch dir {}: {e}", parent.display()))?;
+    }
+    tokio::fs::write(patch_path, &patch)
+        .await
+        .map_err(|e| format!("write restore patch: {e}"))?;
+    let patch_arg = patch_path.to_string_lossy().into_owned();
+    // `--binary` to carry non-text blobs; no `--index`, so the operator's
+    // staged state is exactly as they left it.
+    run(
+        git,
+        root,
+        timeout,
+        &["apply", "--binary", "--whitespace=nowarn", &patch_arg],
+    )
+    .await
+    .map_err(|e| e.stated())?;
+    let _ = tokio::fs::remove_file(patch_path).await;
+    Ok(RestoreReport {
+        files,
+        undo: Some(undo),
     })
 }
 

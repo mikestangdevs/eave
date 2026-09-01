@@ -267,6 +267,7 @@ mod tests {
             start_row,
             started_ms: 1_000,
             ended_ms: ended.then_some(2_000),
+            checkpoint_seq: None,
         }
     }
 

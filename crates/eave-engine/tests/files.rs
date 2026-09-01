@@ -1241,12 +1241,70 @@ async fn a_restart_states_that_the_turn_basis_is_gone() {
     drop(engine);
 }
 
-/// A `git gc --prune=now` inside the session cwd can collect the base
-/// tree: it is written through a throwaway index and nothing references
-/// it, so it is unreachable by construction. eave states that in words
-/// instead of reporting a git failure — or, worse, an empty list.
+/// **A `git gc --prune=now` no longer collects the turn basis** — and it
+/// used to, which is what this test was originally written to accept.
+///
+/// The basis is written through a throwaway index, so it was unreachable
+/// by construction and an agent running housekeeping mid-turn could take
+/// it out from under us. Slice AG1 #11 pins the same tree under
+/// `refs/eave/` because a checkpoint has to survive far longer than one
+/// turn; the diff basis inherits that protection for free.
+///
+/// Kept as a live-engine test rather than folded into `checkpoint.rs`:
+/// the unit tests there prove `capture_checkpoint` pins a tree, and this
+/// proves the SEND PATH actually calls it. Those are different claims,
+/// and only the second one fails if the wiring is dropped.
 #[tokio::test]
-async fn a_pruned_base_tree_is_a_stated_fact() {
+async fn a_gc_no_longer_collects_the_turn_basis() {
+    let dir = scratch();
+    let repo = repo();
+    let engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), Some(repo.display().to_string()))
+        .await
+        .expect("open");
+    // Dirty first, so the captured tree is not simply HEAD's own tree —
+    // that one is reachable anyway and would prove nothing.
+    std::fs::write(repo.join("pre.txt"), "dirty before the turn\n").unwrap();
+    assert!(c.send("s1", "go").await.expect("send"));
+    std::fs::write(repo.join("during.txt"), "during the turn\n").unwrap();
+
+    let (turn_id, mut turn_rx) = c
+        .files_with_id_scoped("s1", FileScope::LatestTurn)
+        .await
+        .expect("files latest_turn");
+    let before = wait_for_snapshot(&mut turn_rx, "pre-gc turn snapshot", |s| {
+        matches!(s.basis, DiffBasis::Turn { .. }) && !s.files.is_empty()
+    })
+    .await;
+    assert_eq!(paths(&before), vec!["during.txt".to_string()]);
+
+    // What an agent running housekeeping does to us.
+    git(&repo, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&repo, &["gc", "--prune=now", "--quiet"]);
+    std::fs::write(repo.join("during.txt"), "during the turn, again\n").unwrap();
+
+    let after = wait_for_snapshot(&mut turn_rx, "post-gc turn snapshot", |s| {
+        !s.files.is_empty()
+    })
+    .await;
+    assert!(
+        matches!(after.basis, DiffBasis::Turn { .. }),
+        "the basis must survive a gc now that it is pinned: {:?}",
+        after.basis
+    );
+    assert_eq!(paths(&after), vec!["during.txt".to_string()]);
+
+    let _ = c.unsubscribe(turn_id).await;
+    drop(engine);
+}
+
+/// The other half, still true and still needed: the operator owns their
+/// repository. With eave's refs removed, the base really is collectable —
+/// and eave states that in words instead of reporting a git failure, or,
+/// worse, an empty list that reads as "this turn changed nothing".
+#[tokio::test]
+async fn a_base_the_operator_unpinned_is_a_stated_fact() {
     let dir = scratch();
     let repo = repo();
     let engine = EngineProc::spawn(&dir, "linger");
@@ -1273,7 +1331,21 @@ async fn a_pruned_base_tree_is_a_stated_fact() {
     .await;
     assert_eq!(paths(&before), vec!["during.txt".to_string()]);
 
-    // What an agent running housekeeping does to us.
+    // The operator (or a script of theirs) sweeps eave's refs, and THEN
+    // housekeeping runs. Only now is the base a genuine orphan.
+    let refs = std::process::Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/eave/"])
+        .current_dir(&repo)
+        .output()
+        .expect("list eave refs");
+    let listed = String::from_utf8_lossy(&refs.stdout);
+    assert!(
+        listed.contains("refs/eave/"),
+        "the send path must have pinned a checkpoint to unpin: {listed:?}"
+    );
+    for name in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        git(&repo, &["update-ref", "-d", name]);
+    }
     git(&repo, &["reflog", "expire", "--expire=now", "--all"]);
     git(&repo, &["gc", "--prune=now", "--quiet"]);
     // Nudge a rescan (the base is only consulted when one runs).
@@ -1287,8 +1359,8 @@ async fn a_pruned_base_tree_is_a_stated_fact() {
         unreachable!("selected by the predicate")
     };
     assert!(
-        reason.contains("gc"),
-        "the reason must name what collected the base: {reason:?}"
+        reason.contains("gc") && reason.contains("checkpoint ref"),
+        "the reason must name BOTH things that had to happen: {reason:?}"
     );
     assert!(after.files.is_empty());
     assert_eq!(after.state, GitState::Ok);

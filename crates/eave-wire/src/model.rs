@@ -271,6 +271,40 @@ pub struct TurnSpan {
     /// by nothing on the wire, so it stays `None` forever and never folds
     /// — the conservative half of that trade, taken deliberately.
     pub ended_ms: Option<u64>,
+    /// The journal seq of the `Checkpoint` record taken immediately
+    /// before this turn was dispatched (Slice AG1 #11) — which is also
+    /// the address of the git ref holding the bytes, so this one number
+    /// is the whole handle a client needs to ask for a restore.
+    ///
+    /// The captured tree is deliberately NOT carried here. It would make
+    /// `TurnSpan` allocate and stop being `Copy`, and no client has a use
+    /// for it: the engine reads it back from the record the seq names,
+    /// which is the same place a cold replay would.
+    ///
+    /// `None` for a session outside a git repository, for one whose git
+    /// refused, and for every turn journalled before this slice existed.
+    /// All three are one fact to a reader — there is nothing to restore,
+    /// so nothing offers to.
+    pub checkpoint_seq: Option<u64>,
+}
+
+impl Transcript {
+    /// The checkpoint taken before the turn opening at `start_row`
+    /// (Slice AG1 #11).
+    ///
+    /// A binary search, not a scan: this is asked once per user row per
+    /// paint, and a linear `find` would be a walk over all turns for
+    /// every turn — waku's quadratic scar, which AG1 #12 names and
+    /// refuses. `turns` is pushed in increasing `start_row` order by
+    /// `note_turn` and the only removal is a suffix truncation, so it is
+    /// sorted by construction.
+    pub fn checkpoint_at(&self, start_row: usize) -> Option<u64> {
+        let ix = self
+            .turns
+            .binary_search_by_key(&start_row, |t| t.start_row)
+            .ok()?;
+        self.turns[ix].checkpoint_seq
+    }
 }
 
 impl TurnSpan {
@@ -351,6 +385,14 @@ pub struct Transcript {
     /// no span and is never folded — stating less rather than guessing a
     /// boundary that is not on the wire.
     pub turns: Vec<TurnSpan>,
+    /// A `Checkpoint` record that has arrived but whose turn has not
+    /// opened yet. The two are adjacent by construction — the engine
+    /// writes the checkpoint one line before the `UserSent`, inside the
+    /// send lock — so this holds a value for the width of one record and
+    /// no longer. It is NOT an `Option<TurnSpan>` waiting to be filled:
+    /// a checkpoint whose send then failed to journal must be dropped by
+    /// the next capture, not attached to whatever turn happens along.
+    pending_checkpoint: Option<u64>,
     rev_counter: u64,
 }
 
@@ -431,8 +473,17 @@ impl Transcript {
                         start_row: rows_before,
                         started_ms: rec.ts_ms,
                         ended_ms: None,
+                        checkpoint_seq: self.pending_checkpoint.take(),
                     });
                 }
+            }
+            // Stashed, not attached: the turn it belongs to opens on the
+            // NEXT record. `replace` rather than a guarded set, so a
+            // checkpoint whose send never journalled is discarded by the
+            // next one instead of being inherited by a later turn it
+            // never described.
+            JournalEvent::Checkpoint { .. } => {
+                self.pending_checkpoint = Some(rec.seq);
             }
             JournalEvent::TurnInterrupted { .. } | JournalEvent::Closed { .. } => {
                 self.close_turn(rec.ts_ms)
@@ -536,6 +587,26 @@ impl Transcript {
                         },
                     });
                 }
+            }
+            // The capture itself adds no row: it happened before the
+            // prompt the operator typed, and a transcript line for
+            // "eave hashed your directory" is noise on every single turn.
+            // Its visible form is the affordance on the turn it belongs
+            // to, which `note_turn` attaches.
+            JournalEvent::Checkpoint { .. } => {}
+            // A restore, by contrast, is ALWAYS said out loud. Files on
+            // the operator's disk moved, and the transcript is the only
+            // place that records when — the same argument `Rewound` makes
+            // about rows, with more at stake, because git will not
+            // remember this for us.
+            JournalEvent::Restored { files, .. } => {
+                self.push_row(Row::Marker {
+                    text: match files.len() {
+                        0 => "restored — the files already matched this point".to_string(),
+                        1 => "restored files to before this turn — 1 file changed".to_string(),
+                        n => format!("restored files to before this turn — {n} files changed"),
+                    },
+                });
             }
             JournalEvent::ApprovalDecided {
                 request_id,

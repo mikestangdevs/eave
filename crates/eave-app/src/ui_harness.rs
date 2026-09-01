@@ -20653,15 +20653,17 @@ fn the_rail_is_an_overlay_and_never_takes_the_column_s_width(_cx: &mut TestAppCo
 /// `motion::HoverFade` exists precisely so the blend and the listener
 /// cannot be split — *"a blend with no listener never moves"*. These
 /// controls predate it and are hand-split, so the pairing is checked here
-/// instead. Adding a fourth `hover_blend` to `ui.rs` should fail this test
-/// until its key is paired too.
+/// instead. Adding another `hover_blend` to `ui.rs` should fail this test
+/// until its key is paired too — and it has, twice now: AG1 #10's rewind
+/// and AG1 #11's restore each tripped it on the way in, which is the only
+/// evidence that it works.
 #[gpui::test]
 fn every_hover_blend_key_has_a_listener_that_writes_it(_cx: &mut TestAppContext) {
     let src = include_str!("ui.rs");
     let prod = &src[..src.rfind("#[cfg(test)]").expect("ui.rs has a test module")];
     assert_eq!(
         prod.matches("hover_blend(").count(),
-        4,
+        5,
         "a hover_blend was added or removed — pair its key with a listener \
          and account for it here"
     );
@@ -20674,9 +20676,9 @@ fn every_hover_blend_key_has_a_listener_that_writes_it(_cx: &mut TestAppContext)
     );
     assert_eq!(
         prod.matches("msg-controls-{msg}").count(),
-        3,
-        "all three message controls must BLEND on the cluster key the wrapper \
-         writes — copy, quote, and Slice AG1 #10's rewind"
+        4,
+        "all four message controls must BLEND on the cluster key the wrapper \
+         writes — copy, quote, AG1 #10's rewind, and AG1 #11's restore"
     );
     // Each control's own name is its id and debug_selector, and nothing
     // else. Blending on it is the defect: nothing registers it.
@@ -20955,5 +20957,243 @@ fn a_reply_is_applied_once_and_not_on_every_later_notify(cx: &mut TestAppContext
         composer_draft(vcx, &h),
         "once",
         "the reply was applied a second time"
+    );
+}
+
+// ── Slice AG1 #11 — turn checkpoints ──────────────────────────────────
+
+/// A checkpoint record followed by the prompt it belongs to — the
+/// adjacency the engine writes under the send lock and the projection
+/// reads positionally.
+fn checkpointed_user(seq: u64, text: &str) -> Vec<eave_core::journal::Record> {
+    vec![
+        eave_core::journal::Record {
+            seq,
+            ts_ms: seq * 10,
+            event: eave_core::journal::JournalEvent::Checkpoint {
+                tree: format!("tree{seq}"),
+                commit: format!("commit{seq}"),
+            },
+        },
+        user_record(seq + 1, text),
+    ]
+}
+
+fn restored_reply(reply: eave_wire::RestoreOk) -> FeedEvent {
+    FeedEvent::Restored {
+        reply: Box::new(reply),
+    }
+}
+
+/// The control appears for a checkpointed turn, and the first click is a
+/// QUESTION: `confirmed` false, which writes nothing.
+#[gpui::test]
+fn a_checkpointed_turn_offers_an_undo_that_asks_first(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: checkpointed_user(1, "do the thing"),
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "msg-restore-0"),
+        "a turn with a checkpoint gets the undo control"
+    );
+    let _ = h.drain();
+    click(vcx, "msg-restore-0");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::Restore { seq, confirmed }] if *seq == 1 && !*confirmed
+        ),
+        "the first click must ASK about the checkpoint's own seq: {cmds:?}"
+    );
+}
+
+/// **The gate is git, not the provider.** This is the property that
+/// separates #11 from #10: a checkpoint is eave's own, so the control
+/// appears on a provider with no conversation rewind at all — where
+/// `msg-rewind` is absent on the very same row.
+#[gpui::test]
+fn undo_is_offered_on_a_provider_that_cannot_rewind_a_word(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut s = session("aaaa1111");
+    s.provider = "cursor-agent".into();
+    rail_with_selected(&h, vcx, vec![s], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: checkpointed_user(1, "do the thing"),
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        !shown(vcx, "msg-rewind-0"),
+        "cursor-agent has no conversation rewind"
+    );
+    assert!(
+        shown(vcx, "msg-restore-0"),
+        "...but its files are still git's, so the undo stands"
+    );
+}
+
+/// A turn with no checkpoint offers nothing. Covers a non-repo session, a
+/// git that refused, and every turn journalled before this slice — which
+/// are one fact to the reader and must be one branch here.
+#[gpui::test]
+fn a_turn_with_no_checkpoint_offers_no_undo(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "do the thing")],
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        !shown(vcx, "msg-restore-0"),
+        "no checkpoint, no control — there is nothing to restore to"
+    );
+}
+
+/// **The engine's count arms the control, and the second click carries
+/// `confirmed`.** The whole two-step, end to end.
+#[gpui::test]
+fn the_engines_count_arms_the_undo_and_the_next_click_means_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: checkpointed_user(1, "do the thing"),
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    // The engine answers the question with a count.
+    h.plumbing.push_feed(restored_reply(eave_wire::RestoreOk {
+        seq: 1,
+        restored: false,
+        files: vec!["a.rs".into(), "b.rs".into()],
+        reason: Some("undo 2 files?".into()),
+    }));
+    vcx.run_until_parked();
+
+    click(vcx, "msg-restore-0");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::Restore { seq, confirmed }] if *seq == 1 && *confirmed
+        ),
+        "armed, the next click must MEAN it: {cmds:?}"
+    );
+
+    // And acting disarms: a third click is a question again, never a
+    // second silent restore.
+    h.plumbing.push_feed(restored_reply(eave_wire::RestoreOk {
+        seq: 1,
+        restored: true,
+        files: vec!["a.rs".into(), "b.rs".into()],
+        reason: None,
+    }));
+    vcx.run_until_parked();
+    let _ = h.drain();
+    click(vcx, "msg-restore-0");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::Restore { confirmed, .. }] if !*confirmed
+        ),
+        "a completed restore must disarm: {cmds:?}"
+    );
+}
+
+/// A refusal — no count — states the engine's words and leaves the
+/// control UNARMED. An armed control after a refusal would mean the next
+/// click acted on a question that was never answered.
+#[gpui::test]
+fn a_refused_restore_states_the_reason_and_arms_nothing(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: checkpointed_user(1, "do the thing"),
+    });
+    vcx.run_until_parked();
+    let _ = h.drain();
+
+    h.plumbing.push_feed(restored_reply(eave_wire::RestoreOk {
+        seq: 1,
+        restored: false,
+        files: Vec::new(),
+        reason: Some("this session is not running".into()),
+    }));
+    vcx.run_until_parked();
+
+    click(vcx, "msg-restore-0");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Command::Restore { confirmed, .. }] if !*confirmed
+        ),
+        "a refusal must not arm anything: {cmds:?}"
+    );
+}
+
+/// **A checkpoint attaches to the turn it precedes, not to a later one.**
+/// Two turns, only the first checkpointed — which is exactly what a
+/// session that left its repository, or whose git refused once, produces.
+#[gpui::test]
+fn a_checkpoint_belongs_to_the_turn_it_preceded(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    let mut records = checkpointed_user(1, "first ask");
+    records.push(user_record(3, "second ask"));
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records,
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "msg-restore-0"),
+        "the checkpointed turn keeps it"
+    );
+    assert!(
+        !shown(vcx, "msg-restore-1"),
+        "an uncheckpointed turn must NOT inherit the previous turn's \
+         checkpoint — restoring it would silently undo two turns"
     );
 }

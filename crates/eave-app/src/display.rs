@@ -805,6 +805,7 @@ mod tests {
             start_row: 0,
             started_ms: 1_000,
             ended_ms: Some(13_000),
+            checkpoint_seq: None,
         });
         for r in work {
             t.push_row(r);
@@ -980,6 +981,7 @@ mod tests {
             start_row: 0,
             started_ms: 1_000,
             ended_ms: None,
+            checkpoint_seq: None,
         });
         for i in 0..5 {
             t.push_row(tool(

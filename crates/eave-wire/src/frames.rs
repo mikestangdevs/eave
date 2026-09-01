@@ -159,6 +159,35 @@ pub enum Request {
         #[serde(default)]
         dropped: usize,
     },
+    /// Put the working tree back to the checkpoint taken before a turn
+    /// (Slice AG1 #11).
+    ///
+    /// **Files only — the conversation is untouched.** The exact mirror
+    /// of [`Request::Rewind`], which moves the conversation and touches
+    /// no file. They are deliberately separate verbs: undoing an edit is
+    /// not the same act as making the agent forget it was asked, and an
+    /// operator wanting one almost never wants both silently.
+    ///
+    /// Addressed by the journal `seq` of the `Checkpoint` record, which
+    /// the client already holds on the turn's span. The engine reads the
+    /// tree back out of that record rather than taking one from the
+    /// client: a tree sha off the wire is an instruction to overwrite
+    /// files, and the engine will only act on one it wrote itself.
+    Restore {
+        session_id: String,
+        /// The `Checkpoint` record to restore to.
+        seq: u64,
+        /// `false` asks what WOULD change and writes nothing.
+        ///
+        /// The same two-step [`Request::RemoveWorktree`] uses: the engine
+        /// refuses the unconfirmed call and restates fresh counts, and it
+        /// is that refusal which arms the affordance. Keeping the shape
+        /// identical is deliberate — a second confirmation idiom is a
+        /// second thing to get subtly wrong, and this one is already
+        /// proven against a verb that destroys more.
+        #[serde(default)]
+        confirmed: bool,
+    },
     /// Observe the session SET (spec 05 §Watch): items flow on this
     /// request's id as `Sessions` snapshots — one immediately, one on
     /// every session-set / state / attention change. This is the only
@@ -1279,6 +1308,40 @@ pub struct RewindOk {
     /// from a refusal, and the surface says a different thing about it.
     #[serde(default)]
     pub unsupported: bool,
+}
+
+/// What the engine did about a [`Request::Restore`] (Slice AG1 #11).
+///
+/// `restored` false with a `reason` is the only failure shape: a
+/// checkpoint whose objects the operator removed, a session that is not
+/// live, or a git that refused. All three are sentences the surface
+/// shows verbatim, because each one asks something different of the
+/// operator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreOk {
+    /// The checkpoint this answer is ABOUT.
+    ///
+    /// Echoed rather than remembered by the caller. A reply that does not
+    /// name its subject has to be paired with a request the client held
+    /// separately, and AG1 #13 already paid for that class of bug once —
+    /// keying off the wrong one of two ids named session B with session
+    /// A's prompt. An armed confirmation is the same hazard with worse
+    /// consequences: it would arm the wrong turn.
+    #[serde(default)]
+    pub seq: u64,
+    /// The files actually moved. `false` covers both a refusal and the
+    /// unconfirmed dry run, which is not a fudge: nothing was restored in
+    /// either case, and `files` says what the difference is.
+    pub restored: bool,
+    /// Root-relative paths that changed on disk — or, for the
+    /// unconfirmed call, that WOULD change. Empty with `restored: true`
+    /// is a real outcome and a different sentence: the files already
+    /// matched the checkpoint.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Why not. `Some` iff `!restored`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Reply to [`Request::Unsubscribe`] (Slice I1). `stopped` is a fact, not

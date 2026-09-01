@@ -24,7 +24,7 @@ use eave_core::proc::ProcIdentity;
 use eave_core::session::AgentConfig;
 use eave_wire::{
     socket_path, BusyReport, Cursor, HelloOk, InterruptOk, KillOk, ListOk, OpenOk, Request,
-    RequestEnvelope, ResponseBody, ResponseEnvelope, RewindOk, SendOk, SessionInfo,
+    RequestEnvelope, ResponseBody, ResponseEnvelope, RestoreOk, RewindOk, SendOk, SessionInfo,
     SubscriptionItem, ENGINE_BUSY_EXIT, PROTO_VERSION,
 };
 
@@ -342,6 +342,26 @@ impl Client {
             msg_id: msg_id.into(),
             last_seen_msg_id,
             dropped,
+        })
+        .await
+    }
+
+    /// Put the working tree back to a turn's checkpoint (Slice AG1 #11).
+    ///
+    /// Like [`Client::rewind`], `Ok` covers the refusals: a checkpoint
+    /// the operator's git no longer holds, a session that is not running,
+    /// a git that said no. Each carries its own sentence. `Err` is
+    /// reserved for the socket.
+    pub async fn restore(
+        &self,
+        session_id: &str,
+        seq: u64,
+        confirmed: bool,
+    ) -> Result<RestoreOk, ClientError> {
+        self.request::<RestoreOk>(Request::Restore {
+            session_id: session_id.into(),
+            seq,
+            confirmed,
         })
         .await
     }

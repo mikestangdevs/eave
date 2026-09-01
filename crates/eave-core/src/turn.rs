@@ -448,6 +448,12 @@ impl TurnLedger {
             // reset here because a rewind cannot happen mid-turn, so
             // there is no counter standing that this could correct.
             JournalEvent::Rewound { .. } => Fold::Silent,
+            // Neither is a CLI byte and neither is agent work. A
+            // checkpoint is eave hashing a directory on its own account,
+            // and a restore is the operator moving their own files —
+            // letting either stand in for provider activity would make a
+            // session look alive because eave touched git.
+            JournalEvent::Checkpoint { .. } | JournalEvent::Restored { .. } => Fold::Silent,
             JournalEvent::Provider { event } => match event {
                 SessionEvent::TurnCompleted { .. } => {
                     // **The frame closes the turn that was actually open.**

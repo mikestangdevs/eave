@@ -1096,7 +1096,7 @@ impl Engine {
         // already contain the turn's own first write. This costs a
         // working-tree hash pass on the send path, which is the price of
         // the question being answerable at all.
-        capture_turn_basis(&handle).await;
+        let checkpoint = capture_turn_basis(&handle).await;
         // A returned recorder drops its `extra` receiver, so a closed
         // channel is proof the attached process segment is over even if the
         // completion task hasn't cleared the slot yet — respawn (with
@@ -1109,6 +1109,24 @@ impl Engine {
             *live = Some(self.spawn_live(&handle).await?);
         }
         let l = live.as_mut().unwrap();
+        // Slice AG1 #11: the checkpoint record goes in FIRST, so the
+        // projection can attach it to the turn the very next record
+        // opens. Positional, not matched — the two are adjacent by
+        // construction because both are written under the send lock.
+        //
+        // Best-effort on purpose. The tree is already captured and
+        // pinned; failing the operator's send because eave could not
+        // write a note about it would trade the thing they asked for
+        // against the thing they did not.
+        if let Some(cp) = checkpoint {
+            let _ = l
+                .extra_tx
+                .send(JournalEvent::Checkpoint {
+                    tree: cp.tree,
+                    commit: cp.commit,
+                })
+                .await;
+        }
         // `&mut *` unsizes the box to `dyn AgentSession`; `send_and_journal`
         // has always been `?Sized`, so nothing about it had to change to
         // accept a provider it does not know.
@@ -1493,6 +1511,138 @@ impl Engine {
                 ),
                 unsupported: true,
             },
+        })
+    }
+
+    /// Slice AG1 #11: put the working tree back to a turn's checkpoint.
+    ///
+    /// **The engine will only restore a tree it wrote itself.** The
+    /// client addresses a `Checkpoint` RECORD by seq and the tree is read
+    /// out of that record here — never taken from the wire. A tree sha in
+    /// a request is an instruction to overwrite an operator's files with
+    /// arbitrary repository content, and no amount of validation makes
+    /// accepting one a good idea when the journal already holds the
+    /// answer.
+    ///
+    /// **Requires a live session, and the reason is the journal, not the
+    /// files.** Restoring needs no agent — but recording that it happened
+    /// does, and a `Restored` appended after a segment's `Closed` would
+    /// break the contract that a journal is terminal iff its LAST record
+    /// is `Closed` (spec 02 §Resume contract), which is what the
+    /// crash-tail repair reads. Doing the work and skipping the record is
+    /// worse than refusing: it is exactly the silent history the append
+    /// rule exists to prevent. So this refuses, in words, and the surface
+    /// says so.
+    async fn restore(
+        self: &Arc<Self>,
+        id: &str,
+        seq: u64,
+        confirmed: bool,
+    ) -> Result<eave_wire::RestoreOk, String> {
+        let handle = self.session(id)?;
+        let refused = |reason: String| {
+            Ok(eave_wire::RestoreOk {
+                seq,
+                restored: false,
+                files: Vec::new(),
+                reason: Some(reason),
+            })
+        };
+        // The record names the tree. A seq that is not a `Checkpoint` is
+        // a client bug, not an operator's problem, but it still answers
+        // in words rather than panicking on an index.
+        let tree = {
+            let s = handle.shared.lock().unwrap();
+            s.records
+                .iter()
+                .find(|r| r.seq == seq)
+                .and_then(|r| match &r.event {
+                    JournalEvent::Checkpoint { tree, .. } => Some(tree.clone()),
+                    _ => None,
+                })
+        };
+        let Some(tree) = tree else {
+            return refused(format!("no checkpoint was recorded at seq {seq}"));
+        };
+        let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
+        // Root, not cwd: `snapshot_tree` states root-relative paths, so a
+        // patch built from it only applies from the top of the checkout.
+        // A session whose cwd is a subdirectory is the ordinary case, not
+        // an edge one.
+        let probe = crate::git::checkout_root(&cwd).await;
+        if !probe.is_repo {
+            return refused("not a git repository — there is no checkpoint to restore from".into());
+        }
+        let mut live = handle.live.lock().await;
+        let Some(l) = live.as_mut() else {
+            return refused(
+                "this session is not running, and eave will not change files it cannot                  record having changed — send a message to reopen it first"
+                    .into(),
+            );
+        };
+        let index = turn_index_path(&handle.dir, "restore");
+        let patch = handle.dir.join("restore.patch");
+        let report = match crate::git::restore_checkpoint(
+            &probe.root,
+            &index,
+            &tree,
+            &patch,
+            &handle.session_id,
+            confirmed,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(reason) => return refused(reason),
+        };
+        // The unconfirmed call answers with the count and stops. The
+        // refusal IS the arming step (`RemoveWorktree`'s shape), so the
+        // number shown is the number this same walk just measured.
+        if !confirmed {
+            return Ok(eave_wire::RestoreOk {
+                seq,
+                restored: false,
+                reason: Some(match report.files.len() {
+                    0 => "these files already match this point — nothing to undo".to_string(),
+                    1 => "undo 1 file?".to_string(),
+                    n => format!("undo {n} files?"),
+                }),
+                files: report.files,
+            });
+        }
+        crate::git::prune_pins(
+            &probe.root,
+            &handle.session_id,
+            crate::git::KIND_UNDO,
+            crate::git::KEEP_UNDOS,
+        )
+        .await;
+        // Journal LAST, the same order `rewind_and_journal` takes and for
+        // the same reason: a restore that did not happen must leave no
+        // record saying it did.
+        //
+        // `undo_tree` is the state that was replaced. When nothing was
+        // replaced there is no undo point and none is invented — the
+        // record says so by naming the checkpoint's own tree, which is
+        // what the worktree already held.
+        let undo_tree = report
+            .undo
+            .as_ref()
+            .map(|u| u.tree.clone())
+            .unwrap_or_else(|| tree.clone());
+        let _ = l
+            .extra_tx
+            .send(JournalEvent::Restored {
+                to_seq: seq,
+                files: report.files.clone(),
+                undo_tree,
+            })
+            .await;
+        Ok(eave_wire::RestoreOk {
+            seq,
+            restored: true,
+            files: report.files,
+            reason: None,
         })
     }
 
@@ -2260,6 +2410,14 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Ok(ok) => ok_value(&ok),
                 Err(message) => ResponseBody::Err { message },
             },
+            Request::Restore {
+                session_id,
+                seq,
+                confirmed,
+            } => match engine.restore(&session_id, seq, confirmed).await {
+                Ok(ok) => ok_value(&ok),
+                Err(message) => ResponseBody::Err { message },
+            },
             Request::Subscribe { session_id, cursor } => match engine.session(&session_id) {
                 Ok(handle) => {
                     let w = Arc::clone(&w);
@@ -2902,7 +3060,7 @@ fn turn_index_path(session_dir: &Path, which: &str) -> PathBuf {
 /// in `TurnBasis::Failed` so the rail states them, and neither is allowed
 /// to fail the send — the operator asked to talk to an agent, not to take
 /// a diff.
-async fn capture_turn_basis(handle: &Arc<SessionHandle>) {
+async fn capture_turn_basis(handle: &Arc<SessionHandle>) -> Option<crate::git::CheckpointRef> {
     let cwd = PathBuf::from(handle.shared.lock().unwrap().header.cwd.clone());
     // The checkout probe already asked git whether this is a repo (Slice
     // I2). Believing it here keeps a non-git session from paying for a
@@ -2912,17 +3070,40 @@ async fn capture_turn_basis(handle: &Arc<SessionHandle>) {
         handle.checkout.lock().unwrap().as_ref(),
         Some(probe) if !probe.is_repo
     );
+    let mut checkpoint = None;
     let basis = if known_non_repo {
         TurnBasis::Failed {
             reason: "not a git repository — there is no tree to measure a turn against".into(),
         }
     } else {
         let index = turn_index_path(&handle.dir, "base");
-        match crate::git::snapshot_tree(&cwd, &index).await {
-            Ok(sha) => TurnBasis::Tree {
-                sha,
-                at_ms: now_ms(),
-            },
+        // Slice AG1 #11: ONE working-tree hash pass answers both
+        // questions. The measurement basis wants a tree; the checkpoint
+        // wants that same tree kept reachable. Capturing twice would
+        // double the cost of every send to buy nothing, and worse, the
+        // two could disagree — an agent that wrote a file between them
+        // would leave a checkpoint that is not the basis the turn is
+        // measured against.
+        match crate::git::capture_checkpoint(&cwd, &index, &handle.session_id).await {
+            Ok(cp) => {
+                // Bound the namespace here rather than at some cleanup
+                // that does not exist: there is no session-delete path
+                // in this engine, so the moment a pin is written is the
+                // only moment anything is guaranteed to run.
+                crate::git::prune_pins(
+                    &cwd,
+                    &handle.session_id,
+                    crate::git::KIND_TURN,
+                    crate::git::KEEP_TURNS,
+                )
+                .await;
+                let sha = cp.tree.clone();
+                checkpoint = Some(cp);
+                TurnBasis::Tree {
+                    sha,
+                    at_ms: now_ms(),
+                }
+            }
             Err(eave_wire::GitState::NotARepo) => TurnBasis::Failed {
                 reason: "not a git repository — there is no tree to measure a turn against".into(),
             },
@@ -2943,6 +3124,7 @@ async fn capture_turn_basis(handle: &Arc<SessionHandle>) {
     if handle.turn_subs.load(Ordering::Relaxed) > 0 {
         tokio::spawn(refresh_files(Arc::clone(handle)));
     }
+    checkpoint
 }
 
 /// The turn-scoped half of a poll (Slice AA): the basis, then git.

@@ -141,6 +141,46 @@ pub enum JournalEvent {
         through_msg_id: String,
         dropped: usize,
     },
+    /// The working tree as it stood the instant before a turn was
+    /// dispatched (Slice AG1 #11).
+    ///
+    /// **This record is the checkpoint's address, and that is why it is a
+    /// record at all.** The bytes live in git — a parentless commit under
+    /// `refs/eave/session-<id>/turn-<seq>` — and the `seq` of THIS record
+    /// is what names them. Keying off a timestamp instead would mean
+    /// matching a capture against a turn by proximity, which is precisely
+    /// the class of near-miss the order-paired `provider_msg_id` stamp was
+    /// written to avoid.
+    ///
+    /// It is emitted before `UserSent`, from inside the send lock, so the
+    /// pairing with the turn it precedes is positional and not a guess.
+    /// A session whose cwd is not a repository, or whose git refused,
+    /// simply has no such record — absence is the honest encoding of "no
+    /// checkpoint", and it needs no words because nothing offers to
+    /// restore one.
+    Checkpoint { tree: String, commit: String },
+    /// The operator restored the working tree to an earlier checkpoint
+    /// (Slice AG1 #11).
+    ///
+    /// **An append, like `Rewound`** — and for a sharper reason. A rewind
+    /// changes what the agent remembers; a restore changes files on the
+    /// operator's disk, and a journal that could not say when that
+    /// happened would leave the most consequential thing eave does
+    /// unaccounted for.
+    ///
+    /// `undo_tree` is the state that was replaced, pinned under a ref
+    /// before the first byte was written. It is recorded rather than
+    /// recomputed because it is the ONLY way back, and a way back that has
+    /// to be re-derived from a worktree that has since moved is not a way
+    /// back at all. `files` is what actually changed on disk, kept for the
+    /// same reason `Rewound::dropped` is: it is what the transcript tells
+    /// the operator, and recomputing it later is how the record and the
+    /// sentence get to disagree.
+    Restored {
+        to_seq: u64,
+        files: Vec<String>,
+        undo_tree: String,
+    },
     /// Terminal record for one **process segment**. A journal that was
     /// continued via `--resume` (spec 02 §Resume contract) holds one
     /// segment per CLI process, each ending in `Closed`; the journal as a
@@ -549,6 +589,12 @@ fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<Repai
             // set. If that invariant ever breaks, the visible cost is one
             // synthetic closer for a turn the fold already dropped.
             JournalEvent::Rewound { .. } => {}
+            // Neither touches the turn ledger. A `Checkpoint` is written
+            // one line before the `UserSent` that opens a turn, so letting
+            // it open one here would double-count every turn in the
+            // session; and a restore, like a rewind, is only ever recorded
+            // while nothing is running.
+            JournalEvent::Checkpoint { .. } | JournalEvent::Restored { .. } => {}
             JournalEvent::ToolInterrupted { id } => {
                 in_flight.remove(id);
             }
