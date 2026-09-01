@@ -522,6 +522,9 @@ mod live {
             let log = std::fs::File::create(data_dir.join("engine-test.log")).unwrap();
             let child = Command::new(&engined)
                 .args(["--data-dir", &data_dir.display().to_string()])
+                // Never the developer's checkout — see the note in the
+                // other test engines.
+                .current_dir(data_dir)
                 .env("EAVE_AGENT", &fake)
                 .env("EAVE_FAKE_MODE", "linger")
                 .stdin(std::process::Stdio::null())

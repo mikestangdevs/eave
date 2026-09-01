@@ -74,6 +74,12 @@ impl EngineProc {
             .unwrap();
         let mut cmd = Command::new(engined_bin());
         cmd.args(["--data-dir", &data_dir.display().to_string()])
+            // A test engine must never inherit the DEVELOPER'S checkout as
+            // its default cwd: a session opened without one would then be
+            // a session on the real repo, and since AG1 #11 that means a
+            // checkpoint ref written into the shared git dir on every
+            // send. (It also hashed the whole eave work tree for nothing.)
+            .current_dir(data_dir)
             .env_remove("EAVE_AGENT")
             .env_remove("EAVE_FAKE_MODE")
             .stdin(Stdio::null())
