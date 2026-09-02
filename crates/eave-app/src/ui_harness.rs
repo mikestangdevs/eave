@@ -6473,8 +6473,8 @@ fn unnamed_twins_are_told_apart_by_naming_them_not_by_hex(cx: &mut TestAppContex
     rail_with_selected(&h, vcx, vec![named_a.clone(), named_b.clone()], "aaaa1111");
     assert!(shown(vcx, "label-aaaa1111") && shown(vcx, "label-bbbb2222"));
     assert_ne!(
-        row_label(&named_a, "claude code"),
-        row_label(&named_b, "claude code")
+        session_name(&named_a, None).0,
+        session_name(&named_b, None).0
     );
     // ...and the affordance that sets a name is reachable on the row, so
     // "name them" is advice the rail can actually take.
@@ -6500,8 +6500,12 @@ fn an_unnamed_session_states_no_title_and_draws_no_empty_line(cx: &mut TestAppCo
 
     let unnamed_row = vcx.debug_bounds("rail-aaaa1111").unwrap().size.height;
     let unnamed_label = vcx.debug_bounds("label-aaaa1111").unwrap().size.height;
-    // What it draws instead of nothing.
-    assert_eq!(row_label(&fresh, "claude code"), "claude code");
+    // What it draws instead of nothing (Slice ID2a: a stated placeholder,
+    // no longer the provider's name).
+    assert_eq!(
+        session_name(&fresh, None),
+        (NEW_SESSION_LABEL.to_string(), NameKind::Placeholder)
+    );
 
     let mut named = fresh.clone();
     named.title = Some("review the parser".into());
@@ -7084,9 +7088,11 @@ fn a_proposal_outlives_the_switch_away_and_is_never_invented(cx: &mut TestAppCon
 /// **Why the proposal is not cut to what the rail can DRAW.** The rail is
 /// resizable, so there is no fixed character budget to cut to; a cap
 /// derived from a width would change meaning when the operator drags the
-/// seam. It is cut to the STORE's cap, which is exactly what a typed title
-/// of the same length already does — the field truncates, the row
-/// truncates, and the operator can trim it before pressing Enter.
+/// seam. It is cut to a NAME's length (`session_title::DERIVED_MAX`, Slice
+/// ID2a — under the store's cap, so accepting it changes nothing), which
+/// is exactly what a typed title of the same length already does — the
+/// field truncates, the row truncates, and the operator can trim it before
+/// pressing Enter.
 #[gpui::test]
 fn a_proposal_at_the_cap_clips_inside_the_field(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -7114,9 +7120,17 @@ fn a_proposal_at_the_cap_clips_inside_the_field(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let proposed = rename_buffer(vcx, &h).expect("the field is open");
+    // Slice ID2a cut the proposal to `DERIVED_MAX` — a name's length,
+    // under the store's cap — so the field, the row and the store all
+    // hold the same string. The clip assertion below is what this test
+    // is for, and a 48-character run of `M` still overflows the field.
     assert_eq!(
         proposed.chars().count(),
-        eave_core::store::TITLE_MAX_CHARS,
+        crate::session_title::PROPOSAL_MAX,
+        "a proposal must be cut to the derived length"
+    );
+    assert!(
+        crate::session_title::PROPOSAL_MAX <= eave_core::store::TITLE_MAX_CHARS,
         "a proposal must never exceed what the store will keep"
     );
 
@@ -8211,10 +8225,31 @@ fn the_diffstat_sits_with_the_age_and_not_with_the_path(cx: &mut TestAppContext)
     let stat = at("stat-aaaa1111");
     let age = at("age-aaaa1111");
     let cwd = at("cwd-aaaa1111");
+    let prov = at("prov-aaaa1111");
+    let label = at("label-aaaa1111");
 
-    assert_eq!(
-        stat.origin.y, age.origin.y,
-        "the stat and the age should share line one"
+    // Slice ID2a re-ranked the card: the TITLE is line one and the age
+    // is its corner; the provider kicker is the metadata line under it
+    // and the stat sits there, beside the thing that yields. Both stay
+    // above the path, which is the fact AG2 #11 measured.
+    // Same LINE, not same origin: the title's box is taller than the
+    // age's (name metrics against micro metrics, plus the rename field's
+    // invisible border), and `items_center` aligns their centres.
+    assert!(
+        same_line(age, label),
+        "the age should share the title line: age {:?}, title {:?}",
+        age.origin,
+        label.origin
+    );
+    assert!(
+        same_line(stat, prov),
+        "the stat should share the metadata line with the provider"
+    );
+    assert!(
+        label.origin.y < prov.origin.y,
+        "the title is not the first line: title {:?}, provider {:?}",
+        label.origin,
+        prov.origin
     );
     assert!(
         stat.origin.y < cwd.origin.y,
@@ -8223,9 +8258,164 @@ fn the_diffstat_sits_with_the_age_and_not_with_the_path(cx: &mut TestAppContext)
         cwd.origin
     );
     assert!(
-        stat.origin.x + stat.size.width <= age.origin.x,
-        "the stat took the corner the age holds"
+        label.origin.x + label.size.width <= age.origin.x,
+        "the title ran under the corner the age holds"
     );
+}
+
+/// Two boxes on the same LINE of a row: their vertical centres agree to
+/// within the rounding a centred flex row produces. Origins do not — a
+/// name-size box and a micro-size box on one centred line start at
+/// different y — so origin equality is the wrong question for anything
+/// that shares a line with the title.
+fn same_line(a: gpui::Bounds<Pixels>, b: gpui::Bounds<Pixels>) -> bool {
+    let ca = a.origin.y + a.size.height / 2.;
+    let cb = b.origin.y + b.size.height / 2.;
+    (ca - cb).abs() <= px(2.)
+}
+
+/// **Slice ID2a — the card's anatomy, re-ranked.** The task is the row's
+/// identity and the provider is its metadata: title line, then the state
+/// dot + provider chip + kicker, then branch/cwd. Every fact Stage AB, AO
+/// and AG2 put on the row is still on it — asserted by presence, on the
+/// row carrying the most of them — and the row is no taller for the
+/// re-ranking, so the glide and the window budgets are untouched.
+#[gpui::test]
+fn the_task_is_the_row_and_the_provider_is_its_metadata(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut s = session("aaaa1111");
+    s.title = Some("Diagnose OMP chat blanking".into());
+    s.model = Some("claude-opus-4-1".into());
+    s.state = "quiet".into();
+    s.shared_with = vec!["bbbb2222".into()];
+    s.diff_stat = Some(DiffStat { adds: 12, dels: 3 });
+    s.last_activity_ms = Some(eave_core::journal::now_ms().saturating_sub(19 * 60 * 1_000));
+    let plain = session("bbbb2222");
+    h.plumbing.push_rail(vec![s, plain]);
+    vcx.run_until_parked();
+
+    let mut at = |sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} did not render"))
+    };
+    let label = at("label-aaaa1111");
+    let badge = at("badge-aaaa1111");
+    let age = at("age-aaaa1111");
+    let chip = at("chip-aaaa1111");
+    let prov = at("prov-aaaa1111");
+    let stat = at("stat-aaaa1111");
+    let cwd = at("cwd-aaaa1111");
+    let marks = at("marks-aaaa1111");
+
+    // Rank one: the title, with its attention word and its age.
+    assert!(same_line(badge, label), "the badge left the title line");
+    assert!(same_line(age, label), "the age left the title line");
+    // Rank two: the provider's chip and kicker, and the stat.
+    assert!(
+        label.origin.y + label.size.height <= chip.origin.y + px(1.),
+        "the provider chip is not under the title: title {:?}, chip {:?}",
+        label.origin,
+        chip.origin
+    );
+    assert!(
+        same_line(prov, chip),
+        "the kicker and the chip are on different lines"
+    );
+    assert!(same_line(stat, prov), "the stat left the metadata line");
+    // Rank three: where the work is.
+    assert!(
+        prov.origin.y < cwd.origin.y,
+        "the path is not the last rank"
+    );
+    assert!(same_line(marks, cwd), "the marks left the path line");
+
+    // Same rank order on a session with no title at all: the placeholder
+    // takes the title's slot, so the two rows have identical anatomy.
+    let plain_label = at("label-bbbb2222");
+    let plain_chip = at("chip-bbbb2222");
+    assert!(plain_label.origin.y < plain_chip.origin.y);
+    assert_eq!(
+        vcx.debug_bounds("rail-aaaa1111").unwrap().size.height,
+        vcx.debug_bounds("rail-bbbb2222").unwrap().size.height,
+        "a named row and a placeholder row must be the same height"
+    );
+}
+
+/// **Slice ID2a — the derived name is on the ROW, not only in the rename
+/// field, and it comes from the one resolver the paint uses.** A session
+/// this client opened is called by its opening ask; one it never opened
+/// stays a placeholder; and a title the operator applies outranks both.
+/// Asserted through `Shell::row_name` because it is what the rail, the
+/// strip and the breadcrumb all call — a test on the paint alone could
+/// pass while the strip still said `claude code`.
+#[gpui::test]
+fn a_session_you_opened_is_called_by_its_opening_ask(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.last_seq = 1;
+    let mut b = session("bbbb2222");
+    b.last_seq = 1;
+    rail_with_selected(&h, vcx, vec![a.clone(), b.clone()], "aaaa1111");
+    h.plumbing.push_feed(FeedEvent::Reset {
+        id: "aaaa1111".into(),
+    });
+    h.plumbing.push_feed(FeedEvent::Records {
+        id: "aaaa1111".into(),
+        epoch: 1,
+        records: vec![user_record(1, "/goal diagnose the OMP chat blanking")],
+    });
+    vcx.run_until_parked();
+
+    let names = h
+        .window
+        .update(vcx, |shell, _, _| (shell.row_name(&a), shell.row_name(&b)))
+        .unwrap();
+    assert_eq!(
+        names.0,
+        (
+            "diagnose the OMP chat blanking".to_string(),
+            NameKind::Derived
+        ),
+        "the opened session is not called by its ask"
+    );
+    assert_eq!(
+        names.1,
+        (UNTITLED_LABEL.to_string(), NameKind::Placeholder),
+        "a session this client never opened came up with a name"
+    );
+
+    // The operator's title wins over the derived one, on the same row.
+    let mut named = a.clone();
+    named.title = Some("OMP blanking".into());
+    let name = h
+        .window
+        .update(vcx, |shell, _, _| shell.row_name(&named))
+        .unwrap();
+    assert_eq!(name, ("OMP blanking".to_string(), NameKind::Named));
+
+    // And the strip's session tab carries the same answer: the task, not
+    // the provider, with a stand-in flagged as one.
+    let chips = h
+        .window
+        .update(vcx, |shell, _, cx| {
+            shell
+                .sessions
+                .read(cx)
+                .sessions
+                .iter()
+                .map(|s| {
+                    let (label, kind) = shell.row_name(s);
+                    (s.session_id.clone(), label, kind == NameKind::Placeholder)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert!(chips.iter().any(|(id, label, ph)| id == "aaaa1111"
+        && label == "diagnose the OMP chat blanking"
+        && !ph));
+    assert!(chips
+        .iter()
+        .any(|(id, label, ph)| id == "bbbb2222" && label == UNTITLED_LABEL && *ph));
 }
 
 /// Every row STATES its numbers; only the row you are in is a DOOR.

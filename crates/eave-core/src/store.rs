@@ -220,6 +220,52 @@ pub fn normalize_title(raw: &str) -> Option<String> {
     Some(folded.chars().take(TITLE_MAX_CHARS).collect())
 }
 
+/// Cap on the slug a title becomes in a branch name (Slice ID2a). Forty
+/// characters is what `eave/<slug>` needs to fit the rail's branch line
+/// beside its `repo/` prefix at the widths the rail actually opens at; a
+/// longer one would truncate mid-word on the very row that names it.
+pub const BRANCH_SLUG_MAX: usize = 40;
+
+/// The branch-name form of an operator's title (Slice ID2a): an isolated
+/// session's branch is `eave/<sid8>` until the operator names the session,
+/// and `eave/<slug of the name>` after.
+///
+/// Runs of alphanumerics, lowercased and joined by single dashes; every
+/// other character is a separator. Cut to [`BRANCH_SLUG_MAX`] at a dash
+/// where there is one. `None` when nothing survives — a title of
+/// punctuation has no branch in it, and the caller keeps the opaque name
+/// rather than minting `eave/`.
+///
+/// Derived from the TITLE the operator applied, never from a transcript:
+/// the branch name rides `watch` (`WorktreeInfo::branch`) and so keeps the
+/// same authorship line `SessionInfo::title` keeps.
+pub fn branch_slug(title: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for c in title.chars() {
+        if c.is_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.extend(c.to_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.chars().count() > BRANCH_SLUG_MAX {
+        let head: String = out.chars().take(BRANCH_SLUG_MAX).collect();
+        out = match head.rfind('-') {
+            Some(at) if at > 0 => head[..at].to_string(),
+            _ => head,
+        };
+    }
+    Some(out)
+}
+
 impl Meta {
     /// Atomic rewrite: temp file, fsync, rename (spec 02 §Layout).
     pub fn save(&self, session_dir: &Path) -> io::Result<()> {
@@ -287,6 +333,42 @@ mod tests {
         // the rail.
         assert_eq!(normalize_title(""), None);
         assert_eq!(normalize_title("   \n\t "), None);
+    }
+
+    /// Slice ID2a: the branch a named session's worktree moves to.
+    #[test]
+    fn a_title_slugs_to_a_branch_or_to_nothing() {
+        assert_eq!(
+            branch_slug("Diagnose OMP chat blanking").as_deref(),
+            Some("diagnose-omp-chat-blanking")
+        );
+        // Punctuation is a separator, never a character; runs of it are
+        // one dash; the ends carry none.
+        assert_eq!(
+            branch_slug("  fix: the `parser` (again!) ").as_deref(),
+            Some("fix-the-parser-again")
+        );
+        assert_eq!(branch_slug("Überprüfen"), Some("überprüfen".into()));
+        // Nothing alphanumeric is no slug — the caller keeps `eave/<sid8>`
+        // rather than minting a branch called `eave/`.
+        assert_eq!(branch_slug("--- !!! ---"), None);
+        assert_eq!(branch_slug(""), None);
+    }
+
+    #[test]
+    fn a_long_title_slugs_to_the_cap_at_a_dash() {
+        let long = "update the acp decoder so that it handles the plan session update";
+        let slug = branch_slug(long).unwrap();
+        assert!(slug.chars().count() <= BRANCH_SLUG_MAX, "{slug}");
+        assert!(!slug.ends_with('-'), "{slug}");
+        assert!(
+            long.replace(' ', "-").starts_with(&slug)
+                && long.replace(' ', "-")[slug.len()..].starts_with('-'),
+            "cut mid-word: {slug}"
+        );
+        // One word past the cap has no dash to back off to: cut hard.
+        let word = "a".repeat(BRANCH_SLUG_MAX * 2);
+        assert_eq!(branch_slug(&word).unwrap().len(), BRANCH_SLUG_MAX);
     }
 
     /// The cap counts characters, not bytes. A byte cap here would cut a

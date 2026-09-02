@@ -1117,6 +1117,26 @@ pub async fn worktree_prune(base: &Path) -> Result<(), String> {
         .map_err(stated)
 }
 
+/// `git branch -m <old> <new>` (Slice ID2a) — the engine only ever calls
+/// this for the `eave/<sid8>` branch it created, to move it under the name
+/// the operator gave the session. Never `-M`: a branch that already holds
+/// the wanted name belongs to somebody, and git's refusal is the answer.
+///
+/// Run from the BASE, the way every other worktree verb here is. Git
+/// updates the linked worktree's `HEAD` along with the ref, so the
+/// worktree stays on the branch under its new name.
+pub async fn branch_rename(base: &Path, old: &str, new: &str) -> Result<(), String> {
+    run(
+        Path::new("git"),
+        base,
+        GIT_TIMEOUT,
+        &["branch", "-m", "--", old, new],
+    )
+    .await
+    .map(drop)
+    .map_err(stated)
+}
+
 /// `git branch -D` — the engine only ever calls this for `eave/`
 /// branches it created (the guard lives at the call site).
 pub async fn branch_delete(base: &Path, branch: &str) -> Result<(), String> {

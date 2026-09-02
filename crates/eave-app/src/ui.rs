@@ -3578,13 +3578,26 @@ fn rail_filter_note(shown: usize, total: usize, hidden_askers: usize) -> AnyElem
 ///
 /// An all-whitespace needle matches everything: a field holding a stray
 /// space must not empty the rail.
-fn session_matches(info: &SessionInfo, needle: &str, home: Option<&str>) -> bool {
+fn session_matches(
+    info: &SessionInfo,
+    derived: Option<&str>,
+    needle: &str,
+    home: Option<&str>,
+) -> bool {
     let needle = needle.trim().to_lowercase();
     if needle.is_empty() {
         return true;
     }
     let hay = [
-        info.title.clone().unwrap_or_default(),
+        // Slice ID2a: the name the CARD SHOWS, which is the derived one
+        // when the operator has not applied a title. A filter that could
+        // not find a row by the name printed on it would be a broken
+        // filter. The placeholder is deliberately not searchable: `new`
+        // matching every empty session is a search hit nobody asked for.
+        info.title
+            .clone()
+            .or_else(|| derived.map(str::to_string))
+            .unwrap_or_default(),
         info.provider.clone(),
         info.model.clone().unwrap_or_default(),
         short_cwd(&info.cwd, home),
@@ -3609,9 +3622,14 @@ fn session_matches(info: &SessionInfo, needle: &str, home: Option<&str>) -> bool
 /// happened to be asking. So this states the number instead, and the rail
 /// says it, which is the same resolution `archived_line` reached: a
 /// filtered list must account for what it is not showing.
-fn hidden_askers(all: &[SessionInfo], needle: &str, home: Option<&str>) -> usize {
+fn hidden_askers(
+    all: &[SessionInfo],
+    derived: &dyn Fn(&str) -> Option<String>,
+    needle: &str,
+    home: Option<&str>,
+) -> usize {
     all.iter()
-        .filter(|s| !session_matches(s, needle, home))
+        .filter(|s| !session_matches(s, derived(&s.session_id).as_deref(), needle, home))
         .filter(|s| s.state == "awaiting_approval" || s.pending_approvals > 0)
         .count()
 }
@@ -4204,18 +4222,54 @@ fn fold_rail(rows: &mut Vec<SessionInfo>, snapshot: Vec<SessionInfo>) {
     *rows = arrivals;
 }
 
-/// The row's primary label: the operator's title when there is one, the
-/// provider label otherwise (Stage AB).
+/// How much a row's name is worth (Slice ID2a): who authored it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameKind {
+    /// The operator applied it (`SessionInfo::title`). A session fact,
+    /// on `watch`, the same on every client.
+    Named,
+    /// This client derived it from the opening ask of a transcript it
+    /// holds. Local: another client sees this row as a placeholder until
+    /// the operator applies a name (`docs/reports/stage-ag1-13-title-proposal.md`).
+    Derived,
+    /// eave has nothing to call this session and says so.
+    Placeholder,
+}
+
+/// The placeholder for a session nothing has been sent to yet.
+pub(crate) const NEW_SESSION_LABEL: &str = "new session";
+/// The placeholder for a session with a transcript this client has never
+/// held: it has an opening ask somewhere, and eave will not go and fetch it
+/// to label a row (the fan-out `watch` exists to avoid).
+pub(crate) const UNTITLED_LABEL: &str = "untitled";
+
+/// What a row, a tab and the breadcrumb call a session (Slice ID2a): the
+/// task first, the provider never.
 ///
-/// A fallback rather than a second line, because a session nobody has named
-/// must render no title at all — an empty line with a title's weight is a
-/// blank the operator reads as a bug. The provider identity is not lost
-/// when a title takes the slot: the chip beside it is drawn from the same
-/// `provider_identity` call.
-fn row_label(info: &SessionInfo, provider_label: &str) -> String {
-    info.title
-        .clone()
-        .unwrap_or_else(|| provider_label.to_string())
+/// Stage AB's `row_label` fell back to the PROVIDER's name, so a rail of
+/// unnamed sessions read `claude code, claude code, claude code` — process
+/// output, not a work queue. The provider is still on every row (the chip
+/// and the kicker on the metadata line, drawn from the same
+/// `provider_identity` call); it is simply no longer what the row is
+/// called.
+///
+/// The fallbacks are stand-ins and say so: a title that reads like a name
+/// but was invented would be a fake, and `NameKind::Placeholder` is what
+/// lets the paint draw them quieter. Which stand-in is a fact the wire
+/// already carries — `last_seq == 0` is a session nothing was ever sent
+/// to, and that is the one case where `new session` is true.
+fn session_name(info: &SessionInfo, derived: Option<&str>) -> (String, NameKind) {
+    if let Some(t) = info.title.as_deref().filter(|t| !t.trim().is_empty()) {
+        return (t.to_string(), NameKind::Named);
+    }
+    if let Some(d) = derived.filter(|d| !d.trim().is_empty()) {
+        return (d.to_string(), NameKind::Derived);
+    }
+    if info.last_seq == 0 {
+        (NEW_SESSION_LABEL.to_string(), NameKind::Placeholder)
+    } else {
+        (UNTITLED_LABEL.to_string(), NameKind::Placeholder)
+    }
 }
 
 /// Home-relative cwd — the whole of a rail row's second line (Slice AO).
@@ -7712,6 +7766,92 @@ fn save_groups_collapsed(shut: &std::collections::HashSet<String>) {
     }
 }
 
+/// The `frame.json` key holding the titles this client DERIVED (Slice
+/// ID2a): a map of session id to the opening ask, folded and cut.
+///
+/// **Why this may live on disk when AG1 #13 said a proposal may not.**
+/// That report kept proposals in memory because persisting one "would put
+/// a copy of one session's words somewhere the operator never chose to
+/// publish them". This file is `<data_dir>/frame.json`, the same directory
+/// as `<data_dir>/sessions/<id>/journal.jsonl`, which holds every word of
+/// that prompt already. A 48-character prefix beside the whole is not a
+/// publication; the line the invariant draws is the WIRE, and nothing here
+/// goes near it. What would cross the line is syncing this file somewhere
+/// the journal is not, and nothing does.
+const DERIVED_TITLES_KEY: &str = "derived_titles";
+
+/// The derived titles saved last run. Unreadable, missing or malformed
+/// all mean none — the rows fall back to their placeholders and fill back
+/// in as sessions are opened; a broken preferences file cannot hide a
+/// session and does not get to invent a name either.
+fn load_derived_titles() -> HashMap<String, String> {
+    let Some(path) = frame_prefs_path() else {
+        return Default::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Default::default();
+    };
+    derived_titles_from(&v)
+}
+
+/// The pure half of [`load_derived_titles`]: the map under
+/// [`DERIVED_TITLES_KEY`], or empty. Values that are not strings are
+/// skipped rather than failing the whole map — one bad line written by
+/// another build must not cost every other session its name.
+fn derived_titles_from(doc: &serde_json::Value) -> HashMap<String, String> {
+    doc.get(DERIVED_TITLES_KEY)
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .filter(|(_, s)| !s.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the derived titles back, keeping every other key — the merged
+/// read-modify-write every writer of this file uses, for the reason at
+/// the top of this section.
+fn save_derived_titles(titles: &HashMap<String, String>) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    put_derived_titles(&mut doc, titles);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!(
+                    "eave: cannot save derived titles to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise derived titles: {e}"),
+    }
+}
+
+/// The pure half of [`save_derived_titles`]. Sorted by session id so the
+/// file does not churn because a `HashMap` iterated differently — this
+/// file is read by people diagnosing the rail.
+fn put_derived_titles(doc: &mut serde_json::Value, titles: &HashMap<String, String>) {
+    let mut list: Vec<(&String, &String)> = titles.iter().collect();
+    list.sort();
+    let map: serde_json::Map<String, serde_json::Value> = list
+        .into_iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    doc[DERIVED_TITLES_KEY] = serde_json::Value::Object(map);
+}
+
 /// The zone keys, named once so the reader and the writer cannot drift.
 pub(crate) const ZONE_PROJECTS: &str = "zone_projects_collapsed";
 pub(crate) const ZONE_FOLDERS: &str = "zone_folders_collapsed";
@@ -11162,9 +11302,63 @@ impl Shell {
         // An empty transcript proposes nothing, and must not erase what an
         // earlier pass over the same session already worked out — a
         // resubscribe replays from zero rows.
-        if let Some(proposal) = crate::session_title::propose(&t.transcript.rows) {
-            self.title_proposals.borrow_mut().insert(id, proposal);
+        let Some(proposal) = crate::session_title::propose(&t.transcript.rows) else {
+            return;
+        };
+        let mut titles = self.title_proposals.borrow_mut();
+        if titles.get(&id).is_some_and(|have| *have == proposal) {
+            return;
         }
+        titles.insert(id, proposal);
+        // Slice ID2a: the derived names outlive the app, in `frame.json`
+        // beside the collapsed groups — pruned to the sessions the rail
+        // still lists, so a file three other things write does not keep a
+        // line per session ever opened. Written on change, which is once
+        // per session: the opening ask does not move.
+        let known: std::collections::HashSet<&str> = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        // A session the rail has not listed yet (the transcript can land
+        // before its first watch frame) is kept; only one the rail has
+        // listed and dropped is gone.
+        if !known.is_empty() {
+            titles.retain(|sid, _| known.contains(sid.as_str()) || !self.rail_ever_listed(sid, cx));
+        }
+        save_derived_titles(&titles);
+    }
+
+    /// Whether the rail has ever listed `id` this run — so a derived title
+    /// for a session that is merely not listed YET survives the prune.
+    fn rail_ever_listed(&self, id: &str, cx: &App) -> bool {
+        self.rail_seen.borrow().contains_key(id)
+            || self
+                .sessions
+                .read(cx)
+                .sessions
+                .iter()
+                .any(|s| s.session_id == id)
+    }
+
+    /// The one resolver for what a session is called (Slice ID2a): the
+    /// operator's title, else the title THIS CLIENT derived from a
+    /// transcript it holds, else a stated placeholder. The rail row, the
+    /// strip tab and the breadcrumb all read this and nothing else.
+    ///
+    /// The derived half is local by design. It is the AG1 #13 proposal —
+    /// the operator's own opening ask, kept per session in memory and in
+    /// `frame.json` — shown on the row instead of only inside the rename
+    /// field. It never reaches the engine: a title on `watch` is still
+    /// one a person applied, and the invariant that keeps a transcript off
+    /// the cross-session broadcast is not relaxed by a byte
+    /// (`docs/reports/stage-ag1-13-title-proposal.md`). What that costs is
+    /// stated in `NameKind::Derived`.
+    pub(crate) fn row_name(&self, info: &SessionInfo) -> (String, NameKind) {
+        let derived = self.title_proposals.borrow();
+        session_name(info, derived.get(&info.session_id).map(String::as_str))
     }
 
     fn begin_bookmark_rename(&mut self, id: String, cx: &mut Context<Self>) {
@@ -13509,13 +13703,7 @@ impl Shell {
                     .cloned();
                 let home = std::env::var("HOME").ok();
                 let (name, meta) = match &info {
-                    Some(i) => {
-                        let (_, provider_label) = provider_identity(&i.provider);
-                        (
-                            row_label(i, &provider_label),
-                            Some(short_cwd(&i.cwd, home.as_deref())),
-                        )
-                    }
+                    Some(i) => (self.row_name(i).0, Some(short_cwd(&i.cwd, home.as_deref()))),
                     // The strip's own fallback for a tab whose session the
                     // rail has not listed. Same string, one source.
                     None => (strip::ORPHAN_SESSION_LABEL.to_string(), None),
@@ -14177,11 +14365,15 @@ impl Shell {
             .sessions
             .iter()
             .map(|s| {
-                let (_, provider_label) = provider_identity(&s.provider);
+                // Slice ID2a: the tab says what the row says — the task,
+                // with the provider's mark as its icon — and a stand-in
+                // is flagged so the tab draws it as one.
+                let (label, kind) = self.row_name(s);
                 (
                     s.session_id.clone(),
                     strip::SessionChip {
-                        label: row_label(s, &provider_label),
+                        label,
+                        placeholder: kind == NameKind::Placeholder,
                         state: s.state.clone(),
                         provider: s.provider.clone(),
                     },
@@ -17364,10 +17556,18 @@ impl Shell {
         // Counted BEFORE the rows are dropped, because after that the
         // information is gone — this is the number the rail owes the
         // operator for hiding a session that is waiting on them.
-        let filtered_askers = hidden_askers(&sessions, &needle, home.as_deref());
+        let derived = |id: &str| self.title_proposals.borrow().get(id).cloned();
+        let filtered_askers = hidden_askers(&sessions, &derived, &needle, home.as_deref());
         let sessions: Vec<SessionInfo> = sessions
             .into_iter()
-            .filter(|s| session_matches(s, &needle, home.as_deref()))
+            .filter(|s| {
+                session_matches(
+                    s,
+                    derived(&s.session_id).as_deref(),
+                    &needle,
+                    home.as_deref(),
+                )
+            })
             .collect();
         let filtered_out = before_filter - sessions.len();
         // Slice AG2 #10 — the window, and WHERE it runs is the design
@@ -17438,7 +17638,12 @@ impl Shell {
                 // different fact from being the row you are looking at.
                 let is_marked = self.rail_marked.contains(&info.session_id);
                 let (glyph, provider_label) = provider_identity(&info.provider);
-                let label = row_label(&info, &provider_label);
+                // Slice ID2a — the TASK is the row's identity and the
+                // provider is its metadata. The name comes from the one
+                // resolver every surface uses (`Shell::row_name`), so the
+                // rail, the strip and the breadcrumb cannot call one
+                // session three things.
+                let (label, name_kind) = self.row_name(&info);
                 let kicker = provider_kicker(&info, &provider_label);
                 let repo_line = row_repo_line(&info, home.as_deref(), group_root);
                 // Slice RS1: `coarse_age`, not `fmt_elapsed`. The row's
@@ -17659,6 +17864,181 @@ impl Shell {
                     .gap(px(theme::SPACE_1))
                     .child(
                         div()
+                            .pl(px(meta_indent))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(match editing_here {
+                                // Stage AC: the rename field, in the
+                                // label's own slot. Same box, same
+                                // metrics — see the transparent border on
+                                // the label below for why the row does not
+                                // wobble when this appears.
+                                Some(text) => div()
+                                    .id(SharedString::from(format!(
+                                        "rename-{}",
+                                        info.session_id
+                                    )))
+                                    .debug_selector(|| format!("rename-{}", info.session_id))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .border_1()
+                                    .border_color(theme::border_strong())
+                                    .rounded(px(theme::RADIUS_SELECT))
+                                    // Slice AO: the field wears the name's
+                                    // exact metrics because it replaces the
+                                    // name in place. Any other size and
+                                    // opening rename would change the row's
+                                    // height under the operator's pointer.
+                                    .text_size(px(theme::RAIL_NAME_SIZE))
+                                    .line_height(px(theme::RAIL_NAME_LINE))
+                                    .font_weight(theme::WEIGHT_BODY)
+                                    .text_color(theme::text())
+                                    // Clicking inside the field is not a
+                                    // click on the row: without this, a
+                                    // pointer landing in the box you are
+                                    // typing in re-selects the session and
+                                    // the field survives only by accident.
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    // An I-beam, not a hand. The field is
+                                    // the one thing in eave's rail that is
+                                    // typed into rather than pressed, and
+                                    // `every_clickable_element_says_it_is_clickable`
+                                    // counts both — its property is that a
+                                    // handler always states a cursor, not
+                                    // that every cursor is a pointer.
+                                    .cursor_text()
+                                    // The title and the caret are SIBLINGS
+                                    // here, unlike the composer's, whose
+                                    // caret is drawn inside the text field
+                                    // because that text wraps. This one
+                                    // truncates instead, and a truncating
+                                    // box has to keep the caret out of the
+                                    // string it is clipping — otherwise the
+                                    // first thing a long title clips is the
+                                    // insertion point.
+                                    //
+                                    // It blinks now. The comment that stood
+                                    // here traded the blink for N4's idle
+                                    // floor at 30 fps, which was the right
+                                    // call against the only clock there was;
+                                    // a caret costs 100 ms ticks now, and
+                                    // only while its field owns the
+                                    // keyboard, so the floor is bought back
+                                    // without spending the caret.
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .child(SharedString::from(text.to_string())),
+                                    )
+                                    .child(caret_glyph(
+                                        "rename",
+                                        caret_lit,
+                                        theme::RAIL_NAME_SIZE,
+                                        theme::text(),
+                                    ))
+                                    .into_any_element(),
+                                // Stage AB: `min_w(0)` is what makes
+                                // `truncate` bite inside a flex row — a
+                                // flex item's default minimum is its
+                                // content, so without it a long title
+                                // grows the row and pushes the badge off
+                                // the end instead of clipping itself.
+                                None => div()
+                                    .debug_selector(|| format!("label-{}", info.session_id))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    // Stage AC: a border nobody can see,
+                                    // carrying the exact height the rename
+                                    // field's visible one costs. Opening
+                                    // the field must not move the rows
+                                    // under it — a list that shifts while
+                                    // you are typing into it is the comet
+                                    // bug this rail already refuses once,
+                                    // in `fold_rail`.
+                                    .border_1()
+                                    .border_color(gpui::transparent_black())
+                                    .rounded(px(theme::RADIUS_SELECT))
+                                    // Slice AO — the anchor of the row.
+                                    // 13 px, and deliberately NOT
+                                    // `NAME_SIZE` (16), which is correct in
+                                    // a 560 px panel and "gigantic" (the
+                                    // operator's word) in a 248 px rail.
+                                    //
+                                    // Three channels separate this from the
+                                    // folder line — size, weight and ink —
+                                    // and all three at full strength read
+                                    // as a shout rather than as an anchor.
+                                    // Weight and ink do the work; the size
+                                    // step is 13 against 12.5, half a
+                                    // point, and it is enough. Every pixel
+                                    // the name does not spend on its own
+                                    // height is one more character of it on
+                                    // screen, which is the fact this row
+                                    // was actually failing at.
+                                    //
+                                    // Inline rather than a `ROW_NAME_SIZE`
+                                    // constant: ten named sizes across four
+                                    // pixels is the disease Slice AL is
+                                    // curing, and `NAME_SIZE` is still
+                                    // correct where it is used — panel
+                                    // headings, in a 560 px column.
+                                    .text_size(px(theme::RAIL_NAME_SIZE))
+                                    .line_height(px(theme::RAIL_NAME_LINE))
+                                    .font_weight(theme::WEIGHT_BODY)
+                                    // Slice AO: primary ink on every row,
+                                    // not just the selected one. Selection
+                                    // is carried by the bar, the rim and
+                                    // the wash — three signals — so it no
+                                    // longer has to be carried by dimming
+                                    // every OTHER session's name, which is
+                                    // what made an unselected row hard to
+                                    // read rather than merely unselected.
+                                    //
+                                    // Slice ID2a: a PLACEHOLDER is not a
+                                    // name and does not wear a name's ink.
+                                    // Same rule and same tier the strip
+                                    // uses for a page tab's stand-in
+                                    // (`tab.placeholder`), so `new session`
+                                    // reads as a blank the operator can
+                                    // fill, never as a session called
+                                    // "new session".
+                                    .text_color(if name_kind == NameKind::Placeholder {
+                                        theme::text_secondary()
+                                    } else {
+                                        theme::text()
+                                    })
+                                    .child(SharedString::from(label))
+                                    .into_any_element(),
+                            })
+                            .children(badge.map(|word| {
+                                div()
+                                    .debug_selector(|| format!("badge-{}", info.session_id))
+                                    .flex_none()
+                                    .text_size(px(theme::SMALL_SIZE))
+                                    .line_height(px(theme::SMALL_LINE))
+                                    .font_weight(theme::WEIGHT_LABEL)
+                                    .text_color(dot)
+                                    .child(SharedString::from(word))
+                            }))
+                            .children(age.map(|word| {
+                                div()
+                                    .debug_selector(|| format!("age-{}", info.session_id))
+                                    .flex_none()
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(word))
+                            })),
+                    )
+                    .child(
+                        div()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -17824,168 +18204,6 @@ impl Shell {
                                             .child(format!("-{}", coarse_lines(dels))),
                                     )
                             }))
-                            .children(age.map(|word| {
-                                div()
-                                    .debug_selector(|| format!("age-{}", info.session_id))
-                                    .flex_none()
-                                    .text_size(px(theme::MICRO_SIZE))
-                                    .line_height(px(theme::MICRO_LINE))
-                                    .text_color(theme::text_tertiary())
-                                    .child(SharedString::from(word))
-                            })),
-                    )
-                    .child(
-                        div()
-                            .pl(px(meta_indent))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(match editing_here {
-                                // Stage AC: the rename field, in the
-                                // label's own slot. Same box, same
-                                // metrics — see the transparent border on
-                                // the label below for why the row does not
-                                // wobble when this appears.
-                                Some(text) => div()
-                                    .id(SharedString::from(format!(
-                                        "rename-{}",
-                                        info.session_id
-                                    )))
-                                    .debug_selector(|| format!("rename-{}", info.session_id))
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .border_1()
-                                    .border_color(theme::border_strong())
-                                    .rounded(px(theme::RADIUS_SELECT))
-                                    // Slice AO: the field wears the name's
-                                    // exact metrics because it replaces the
-                                    // name in place. Any other size and
-                                    // opening rename would change the row's
-                                    // height under the operator's pointer.
-                                    .text_size(px(theme::RAIL_NAME_SIZE))
-                                    .line_height(px(theme::RAIL_NAME_LINE))
-                                    .font_weight(theme::WEIGHT_BODY)
-                                    .text_color(theme::text())
-                                    // Clicking inside the field is not a
-                                    // click on the row: without this, a
-                                    // pointer landing in the box you are
-                                    // typing in re-selects the session and
-                                    // the field survives only by accident.
-                                    .on_click(|_, _, cx| cx.stop_propagation())
-                                    // An I-beam, not a hand. The field is
-                                    // the one thing in eave's rail that is
-                                    // typed into rather than pressed, and
-                                    // `every_clickable_element_says_it_is_clickable`
-                                    // counts both — its property is that a
-                                    // handler always states a cursor, not
-                                    // that every cursor is a pointer.
-                                    .cursor_text()
-                                    // The title and the caret are SIBLINGS
-                                    // here, unlike the composer's, whose
-                                    // caret is drawn inside the text field
-                                    // because that text wraps. This one
-                                    // truncates instead, and a truncating
-                                    // box has to keep the caret out of the
-                                    // string it is clipping — otherwise the
-                                    // first thing a long title clips is the
-                                    // insertion point.
-                                    //
-                                    // It blinks now. The comment that stood
-                                    // here traded the blink for N4's idle
-                                    // floor at 30 fps, which was the right
-                                    // call against the only clock there was;
-                                    // a caret costs 100 ms ticks now, and
-                                    // only while its field owns the
-                                    // keyboard, so the floor is bought back
-                                    // without spending the caret.
-                                    .child(
-                                        div()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .child(SharedString::from(text.to_string())),
-                                    )
-                                    .child(caret_glyph(
-                                        "rename",
-                                        caret_lit,
-                                        theme::RAIL_NAME_SIZE,
-                                        theme::text(),
-                                    ))
-                                    .into_any_element(),
-                                // Stage AB: `min_w(0)` is what makes
-                                // `truncate` bite inside a flex row — a
-                                // flex item's default minimum is its
-                                // content, so without it a long title
-                                // grows the row and pushes the badge off
-                                // the end instead of clipping itself.
-                                None => div()
-                                    .debug_selector(|| format!("label-{}", info.session_id))
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    // Stage AC: a border nobody can see,
-                                    // carrying the exact height the rename
-                                    // field's visible one costs. Opening
-                                    // the field must not move the rows
-                                    // under it — a list that shifts while
-                                    // you are typing into it is the comet
-                                    // bug this rail already refuses once,
-                                    // in `fold_rail`.
-                                    .border_1()
-                                    .border_color(gpui::transparent_black())
-                                    .rounded(px(theme::RADIUS_SELECT))
-                                    // Slice AO — the anchor of the row.
-                                    // 13 px, and deliberately NOT
-                                    // `NAME_SIZE` (16), which is correct in
-                                    // a 560 px panel and "gigantic" (the
-                                    // operator's word) in a 248 px rail.
-                                    //
-                                    // Three channels separate this from the
-                                    // folder line — size, weight and ink —
-                                    // and all three at full strength read
-                                    // as a shout rather than as an anchor.
-                                    // Weight and ink do the work; the size
-                                    // step is 13 against 12.5, half a
-                                    // point, and it is enough. Every pixel
-                                    // the name does not spend on its own
-                                    // height is one more character of it on
-                                    // screen, which is the fact this row
-                                    // was actually failing at.
-                                    //
-                                    // Inline rather than a `ROW_NAME_SIZE`
-                                    // constant: ten named sizes across four
-                                    // pixels is the disease Slice AL is
-                                    // curing, and `NAME_SIZE` is still
-                                    // correct where it is used — panel
-                                    // headings, in a 560 px column.
-                                    .text_size(px(theme::RAIL_NAME_SIZE))
-                                    .line_height(px(theme::RAIL_NAME_LINE))
-                                    .font_weight(theme::WEIGHT_BODY)
-                                    // Slice AO: primary ink on every row,
-                                    // not just the selected one. Selection
-                                    // is carried by the bar, the rim and
-                                    // the wash — three signals — so it no
-                                    // longer has to be carried by dimming
-                                    // every OTHER session's name, which is
-                                    // what made an unselected row hard to
-                                    // read rather than merely unselected.
-                                    .text_color(theme::text())
-                                    .child(SharedString::from(label))
-                                    .into_any_element(),
-                            })
-                            .children(badge.map(|word| {
-                                div()
-                                    .debug_selector(|| format!("badge-{}", info.session_id))
-                                    .flex_none()
-                                    .text_size(px(theme::SMALL_SIZE))
-                                    .line_height(px(theme::SMALL_LINE))
-                                    .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(dot)
-                                    .child(SharedString::from(word))
-                            })),
                     )
                     // LINE THREE — branch / cwd, and the marks group.
                     //
@@ -28406,7 +28624,10 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_walk: RefCell::new(Vec::new()),
                         rail_scrolled_to: RefCell::new(None),
                         rail_seen: RefCell::new(HashMap::new()),
-                        title_proposals: RefCell::new(HashMap::new()),
+                        // Slice ID2a: the names this client derived last
+                        // run come back with it, so a restart does not
+                        // turn a work queue back into `untitled` ×N.
+                        title_proposals: RefCell::new(load_derived_titles()),
                         projects_scroll: ScrollHandle::new(),
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from
@@ -29154,12 +29375,15 @@ mod tests {
         s.cwd = "/w/eave".into();
         s.checkout_root = Some("/w/eave".into());
 
-        assert!(session_matches(&s, "sweep", None), "the title");
-        assert!(session_matches(&s, "claude", None), "the provider");
-        assert!(session_matches(&s, "opus", None), "the model kicker");
-        assert!(session_matches(&s, "eave", None), "the project");
-        assert!(session_matches(&s, "SWEEP", None), "case-insensitive");
-        assert!(!session_matches(&s, "codex", None), "matched nothing shown");
+        assert!(session_matches(&s, None, "sweep", None), "the title");
+        assert!(session_matches(&s, None, "claude", None), "the provider");
+        assert!(session_matches(&s, None, "opus", None), "the model kicker");
+        assert!(session_matches(&s, None, "eave", None), "the project");
+        assert!(session_matches(&s, None, "SWEEP", None), "case-insensitive");
+        assert!(
+            !session_matches(&s, None, "codex", None),
+            "matched nothing shown"
+        );
 
         // The session id is NOT matched: it is not on the card. A row that
         // appeared for a hex string nobody can see is the exact defect this
@@ -29168,7 +29392,7 @@ mod tests {
         hidden_id.title = Some("nightly sweep".into());
         hidden_id.cwd = "/w/eave".into();
         assert!(
-            !session_matches(&hidden_id, "zzz99999", None),
+            !session_matches(&hidden_id, None, "zzz99999", None),
             "the filter matched a session id, which is not on the card"
         );
     }
@@ -29179,8 +29403,8 @@ mod tests {
     #[test]
     fn a_blank_needle_hides_nothing() {
         let s = info("a", 100, None);
-        assert!(session_matches(&s, "", None));
-        assert!(session_matches(&s, "   ", None));
+        assert!(session_matches(&s, None, "", None));
+        assert!(session_matches(&s, None, "   ", None));
     }
 
     /// **The clause that keeps the filter honest.** A text filter may hide a
@@ -29200,13 +29424,21 @@ mod tests {
         asking2.pending_approvals = 2;
         let all = vec![a, asking, asking2];
 
-        assert_eq!(hidden_askers(&all, "eave", None), 2, "both are hidden");
         assert_eq!(
-            hidden_askers(&all, "waku", None),
+            hidden_askers(&all, &|_| None, "eave", None),
+            2,
+            "both are hidden"
+        );
+        assert_eq!(
+            hidden_askers(&all, &|_| None, "waku", None),
             0,
             "an asker the filter KEPT is not hidden"
         );
-        assert_eq!(hidden_askers(&all, "", None), 0, "no filter hides nothing");
+        assert_eq!(
+            hidden_askers(&all, &|_| None, "", None),
+            0,
+            "no filter hides nothing"
+        );
     }
 
     /// The sentence itself. The asker clause appears only when there is one
@@ -29895,15 +30127,84 @@ mod tests {
         assert_eq!(ids, ["aaaa", "bbbb"]);
     }
 
-    /// Stage AB: the row's primary label. A named session says its name; an
-    /// unnamed one says its provider — never an empty string, which is what
-    /// would draw the blank line this slice is not allowed to produce.
+    /// Slice ID2a: the row's primary label is the TASK, ranked by who
+    /// authored it — the operator's title over the derived one over a
+    /// placeholder — and never the provider, which Stage AB used as the
+    /// fallback and which made a rail of unnamed sessions read as process
+    /// output. Never an empty string either, which would draw the blank
+    /// line Stage AB was not allowed to produce.
     #[test]
-    fn an_unnamed_row_falls_back_to_the_provider_rather_than_to_nothing() {
+    fn a_row_is_named_for_its_task_and_never_for_its_provider() {
         let mut s = info("aaaa1111", 1, None);
-        assert_eq!(row_label(&s, "claude code"), "claude code");
-        s.title = Some("review the parser".into());
-        assert_eq!(row_label(&s, "claude code"), "review the parser");
+        // Nothing sent, nothing derived: the one case `new session` is true.
+        assert_eq!(
+            session_name(&s, None),
+            (NEW_SESSION_LABEL.to_string(), NameKind::Placeholder)
+        );
+        // A transcript exists but this client never held it: eave will
+        // not pretend to know what it is about, and will not call it new.
+        s.last_seq = 7;
+        assert_eq!(
+            session_name(&s, None),
+            (UNTITLED_LABEL.to_string(), NameKind::Placeholder)
+        );
+        // This client derived a name from the opening ask.
+        assert_eq!(
+            session_name(&s, Some("review the parser")),
+            ("review the parser".to_string(), NameKind::Derived)
+        );
+        // The operator's own title outranks the derived one.
+        s.title = Some("parser week".into());
+        assert_eq!(
+            session_name(&s, Some("review the parser")),
+            ("parser week".to_string(), NameKind::Named)
+        );
+        // Blank strings are not names at either rank.
+        s.title = Some("   ".into());
+        assert_eq!(
+            session_name(&s, Some("  ")),
+            (UNTITLED_LABEL.to_string(), NameKind::Placeholder)
+        );
+        // And the provider never appears in the answer.
+        for derived in [None, Some("x")] {
+            let (name, _) = session_name(&s, derived);
+            assert!(!name.to_lowercase().contains("claude"), "{name:?}");
+        }
+    }
+
+    /// Slice ID2a: the derived titles survive a restart through
+    /// `frame.json`, and the round trip keeps every other key in that
+    /// file — three other writers share it.
+    #[test]
+    fn derived_titles_round_trip_through_frame_json_and_keep_their_neighbours() {
+        let mut doc = serde_json::json!({
+            "rail_w": 228.0,
+            "rail_groups_collapsed": ["/a"],
+        });
+        let mut titles = HashMap::new();
+        titles.insert("bbbb2222".to_string(), "chase the flake".to_string());
+        titles.insert("aaaa1111".to_string(), "review the parser".to_string());
+        put_derived_titles(&mut doc, &titles);
+        assert_eq!(doc["rail_w"], 228.0, "a neighbour was dropped");
+        assert_eq!(doc["rail_groups_collapsed"][0], "/a");
+        // Sorted, so the file does not churn on map order.
+        let keys: Vec<&String> = doc[DERIVED_TITLES_KEY]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(keys, ["aaaa1111", "bbbb2222"]);
+        assert_eq!(derived_titles_from(&doc), titles);
+
+        // Absent, wrong-typed and blank entries all read as "no name",
+        // never as an error that costs the other sessions theirs.
+        assert!(derived_titles_from(&serde_json::json!({})).is_empty());
+        let mixed = serde_json::json!({
+            DERIVED_TITLES_KEY: {"ok": "fine", "num": 3, "blank": "  "}
+        });
+        let got = derived_titles_from(&mixed);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["ok"], "fine");
     }
 
     /// Slice AO: line two is the FOLDER, whole, and nothing else shares

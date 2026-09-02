@@ -103,9 +103,16 @@ pub fn strip_for_window(snapshot: &TabsSnapshot, window: &str) -> TabsSnapshot {
 /// of is a decidable, tested case rather than an `unwrap`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionChip {
-    /// The name the rail draws. Never mined from a transcript — see
-    /// `snapshot.rs`'s "one rule a client must keep".
+    /// The name the rail draws: the operator's title, the title this
+    /// client derived from a transcript it holds (Slice ID2a), or the
+    /// rail's placeholder. Never mined from another client's session —
+    /// see `snapshot.rs`'s "one rule a client must keep".
     pub label: String,
+    /// `label` is the rail's stand-in (`new session`, `untitled`) rather
+    /// than a name anybody chose or derived (Slice ID2a). The tab draws it
+    /// in the same quieter ink a page tab uses for a stand-in, so a row of
+    /// tabs never presents a placeholder at a name's weight.
+    pub placeholder: bool,
     /// The rail's own state word (`running`, `idle`, …), for the dot.
     pub state: String,
     /// The provider id, for the mark.
@@ -414,7 +421,7 @@ fn strip_tab(
         TabContent::Session { session_id } => {
             let chip = sessions.get(session_id).cloned();
             let (label, placeholder) = match &chip {
-                Some(c) if !c.label.trim().is_empty() => (c.label.clone(), false),
+                Some(c) if !c.label.trim().is_empty() => (c.label.clone(), c.placeholder),
                 _ => (ORPHAN_SESSION_LABEL.to_string(), true),
             };
             (
@@ -730,6 +737,7 @@ mod tests {
                     id.to_string(),
                     SessionChip {
                         label: label.to_string(),
+                        placeholder: false,
                         state: "idle".into(),
                         provider: "claude".into(),
                     },
@@ -830,6 +838,24 @@ mod tests {
                 assert!(t.active, "the session tab is the active one");
                 assert!(matches!(&t.kind, TabKind::Session { session_id, chip }
                     if session_id == "sess-1" && chip.is_some()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Slice ID2a: the rail's stand-in for an unnamed session reaches the
+    /// tab flagged as one, so the tab draws it in a stand-in's ink — the
+    /// same rule a page tab's placeholder already follows.
+    #[test]
+    fn a_session_tab_wears_the_rails_placeholder_as_a_placeholder() {
+        let s = snap(vec![session_tab("t", "sess-new")], Some("t"));
+        let mut chips = chips(&[("sess-new", "new session")]);
+        chips.get_mut("sess-new").unwrap().placeholder = true;
+        let items = items(&s, &chips, &|_| true);
+        match &items[0] {
+            StripItem::Tab(t) => {
+                assert_eq!(t.label, "new session");
+                assert!(t.placeholder, "the rail's stand-in drew at a name's weight");
             }
             other => panic!("{other:?}"),
         }

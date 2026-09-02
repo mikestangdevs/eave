@@ -355,6 +355,14 @@ struct WorktreeState {
     branch: String,
     present: bool,
     dirty_files: Option<u64>,
+    /// Slice ID2a: the branch is still the opaque `eave/<sid8>` eave
+    /// minted at `isolate`, on a worktree created since branch naming
+    /// exists — so the first title the operator applies may move it to
+    /// `eave/<slug>`. Cleared by that move, and `false` from the start for
+    /// a worktree whose `worktree.json` predates the rule: existing
+    /// worktrees keep their names, because an operator may have scripts,
+    /// remotes or another tool holding the old one.
+    provisional: bool,
 }
 
 /// What `worktree.json` persists: the identity claim only — presence and
@@ -367,7 +375,37 @@ struct WorktreeMeta {
     branch: String,
 }
 
-const WORKTREE_META_VERSION: u32 = 1;
+/// Version 2 (Slice ID2a) changed nothing in the file. It marks the
+/// worktrees whose branch may follow the session's title; a version-1
+/// claim is left on the name it has, whatever the operator calls the
+/// session.
+const WORKTREE_META_VERSION: u32 = 2;
+
+/// The first version whose opaque branch a title is allowed to rename.
+const WORKTREE_META_NAMEABLE: u32 = 2;
+
+/// `sid8` — the session id's first 8 alphanumerics, lowercased — and the
+/// opaque branch `eave/<sid8>` every isolated session starts on. `None`
+/// for an id with nothing usable in it.
+fn opaque_branch(session_id: &str) -> Option<(String, String)> {
+    let sid8: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_lowercase();
+    (!sid8.is_empty()).then(|| {
+        let branch = format!("eave/{sid8}");
+        (sid8, branch)
+    })
+}
+
+/// Whether a worktree claim loaded from disk may still have its branch
+/// named by a title: new enough, and still on the opaque name.
+fn branch_is_provisional(session_id: &str, meta: &WorktreeMeta) -> bool {
+    meta.format_version >= WORKTREE_META_NAMEABLE
+        && opaque_branch(session_id).is_some_and(|(_, opaque)| meta.branch == opaque)
+}
 
 fn worktree_meta_path(session_dir: &Path) -> PathBuf {
     session_dir.join("worktree.json")
@@ -1023,6 +1061,7 @@ impl Engine {
         // dirtiness stay unknown until verified against git
         // (`verify_worktree` — never from memory, Slice I2).
         let worktree = load_worktree_meta(&dir).map(|m| WorktreeState {
+            provisional: branch_is_provisional(id, &m),
             base: m.base,
             path: m.path,
             branch: m.branch,
@@ -1685,15 +1724,15 @@ impl Engine {
         // The stated naming scheme: dir `<root>/<repo>/<sid8>`, branch
         // `eave/<sid8>` — sid8 = the session id's first 8 alphanumerics.
         // Predictable, session-owned, and safe to delete on clean removal.
-        let sid8: String = id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(8)
-            .collect::<String>()
-            .to_lowercase();
-        if sid8.is_empty() {
+        //
+        // Slice ID2a: a session the operator has ALREADY named opens its
+        // worktree on `eave/<slug>` straight away; an unnamed one takes
+        // the opaque branch and `rename` moves it later. The directory
+        // keeps `<sid8>` either way — a path is an address other tools
+        // hold, and a title changes.
+        let Some((sid8, opaque)) = opaque_branch(id) else {
             return Err("session id yields no worktree name".into());
-        }
+        };
         let repo_name = base
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1708,10 +1747,32 @@ impl Engine {
         if let Some(parent) = wt_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create worktrees dir: {e}"))?;
         }
-        let branch = format!("eave/{sid8}");
-        crate::git::worktree_add(&base, &wt_path, &branch)
-            .await
-            .map_err(|e| format!("git worktree add refused: {e}"))?;
+        let named = handle
+            .shared
+            .lock()
+            .unwrap()
+            .title
+            .as_deref()
+            .and_then(eave_core::store::branch_slug)
+            .map(|slug| format!("eave/{slug}"));
+        // The slug first, the opaque name as the fallback — a branch
+        // called `eave/<slug>` may already be somebody's, and git's
+        // refusal of the first is not a reason to refuse the isolation.
+        let mut branch = None;
+        let mut last_err = String::new();
+        for cand in named.into_iter().chain(std::iter::once(opaque.clone())) {
+            match crate::git::worktree_add(&base, &wt_path, &cand).await {
+                Ok(()) => {
+                    branch = Some(cand);
+                    break;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        let Some(branch) = branch else {
+            return Err(format!("git worktree add refused: {last_err}"));
+        };
+        let provisional = branch == opaque;
         // Rewrite the header-only journal with the new cwd: fresh journal
         // at a temp path, rename over — atomic, header fsync'd by
         // `create`. Legal precisely because no records exist (checked
@@ -1754,6 +1815,7 @@ impl Engine {
             present: true,
             // git just created it — clean by construction.
             dirty_files: Some(0),
+            provisional,
         });
         *handle.checkout.lock().unwrap() = Some(crate::git::CheckoutProbe {
             root: std::fs::canonicalize(&wt_path).unwrap_or(wt_path),
@@ -1862,7 +1924,7 @@ impl Engine {
     /// serialize against — the title touches no process, no journal and no
     /// provider-side cursor — so refusing during a turn would be ceremony
     /// with no fact behind it.
-    fn rename(&self, id: &str, title: Option<String>) -> Result<SessionInfo, String> {
+    async fn rename(&self, id: &str, title: Option<String>) -> Result<SessionInfo, String> {
         let handle = self.session(id)?;
         let title = title.as_deref().and_then(normalize_title);
         let mut meta = Meta::load(&handle.dir).map_err(|e| {
@@ -1874,7 +1936,14 @@ impl Engine {
         meta.title = title.clone();
         meta.save(&handle.dir)
             .map_err(|e| format!("save meta: {e}"))?;
-        handle.shared.lock().unwrap().title = title;
+        handle.shared.lock().unwrap().title = title.clone();
+        // Slice ID2a: the first name an isolated session gets also names
+        // its branch. After the title is saved, so a git refusal costs
+        // the branch and never the name — and best-effort past that: the
+        // reply carries whatever branch git actually holds.
+        if let Some(title) = title.as_deref() {
+            name_branch_after(&handle, title).await;
+        }
         // A rail row's label changed — watchers re-snapshot. Deliberately
         // NOT a `settle_state` stamp: naming a session is not the session
         // doing anything, and sorting the rail by "most recently renamed"
@@ -2113,6 +2182,79 @@ async fn probe_checkout(handle: Arc<SessionHandle>) {
 /// eager scan so an orphan's dirty count reaches the rail without anyone
 /// subscribing; absent ones are stated (`present: false`), never pruned
 /// automatically — the operator's delete affordance owns destruction.
+/// Slice ID2a: move a session's provisional `eave/<sid8>` branch to
+/// `eave/<slug of its title>`, once.
+///
+/// **Once** is structural, not remembered: the state's `provisional` flag
+/// is cleared by the move and reloads `false` from a `worktree.json` whose
+/// branch is no longer the opaque one, so a second rename — a correction
+/// of the title — leaves the branch alone. A branch is an address other
+/// tools hold; a title that changes every day is not.
+///
+/// The wanted name may be taken, and `git branch -m` refuses rather than
+/// `-M`-ing over it: then the same slug with the session's `sid8` behind
+/// it, and if that is taken too the opaque name stays. Every refusal is
+/// logged and none is an error — the title has already landed, and a
+/// rename that failed because of a branch would teach the operator that
+/// naming a session is unsafe.
+async fn name_branch_after(handle: &Arc<SessionHandle>, title: &str) {
+    let Some(wt) = handle.worktree.lock().unwrap().clone() else {
+        return;
+    };
+    if !wt.provisional {
+        return;
+    }
+    let Some(slug) = eave_core::store::branch_slug(title) else {
+        return;
+    };
+    let Some((sid8, _)) = opaque_branch(&handle.session_id) else {
+        return;
+    };
+    let wanted = format!("eave/{slug}");
+    let mut moved = None;
+    for cand in [wanted.clone(), format!("{wanted}-{sid8}")] {
+        if cand == wt.branch {
+            break;
+        }
+        match crate::git::branch_rename(&wt.base, &wt.branch, &cand).await {
+            Ok(()) => {
+                moved = Some(cand);
+                break;
+            }
+            Err(e) => eprintln!(
+                "eave: session {} keeps branch {}: git refused {cand}: {e}",
+                handle.session_id, wt.branch
+            ),
+        }
+    }
+    let Some(branch) = moved else {
+        return;
+    };
+    if let Err(e) = save_worktree_meta(
+        &handle.dir,
+        &WorktreeMeta {
+            format_version: WORKTREE_META_VERSION,
+            base: wt.base.clone(),
+            path: wt.path.clone(),
+            branch: branch.clone(),
+        },
+    ) {
+        // The branch moved and the claim on disk still says the old name:
+        // state it. On restart the claim would name a branch that no
+        // longer exists, which `verify_worktree` measures by PATH and so
+        // survives — the row would just say the old name.
+        eprintln!(
+            "eave: session {} branch is {branch} but worktree.json save failed: {e}",
+            handle.session_id
+        );
+    }
+    let mut slot = handle.worktree.lock().unwrap();
+    if let Some(w) = slot.as_mut() {
+        w.branch = branch;
+        w.provisional = false;
+    }
+}
+
 async fn verify_worktree(handle: Arc<SessionHandle>) {
     let Some(wt) = handle.worktree.lock().unwrap().clone() else {
         return;
@@ -2494,10 +2636,15 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 Ok(info) => ok_value(&ArchiveOk { info }),
                 Err(message) => ResponseBody::Err { message },
             },
-            Request::Rename { session_id, title } => match engine.rename(&session_id, title) {
-                Ok(info) => ok_value(&RenameOk { info }),
-                Err(message) => ResponseBody::Err { message },
-            },
+            // Slice ID2a made this `async`: a rename may shell out to git
+            // once, to move a provisional `eave/<sid8>` branch under the
+            // new name. Bounded by `GIT_TIMEOUT` like every git call.
+            Request::Rename { session_id, title } => {
+                match engine.rename(&session_id, title).await {
+                    Ok(info) => ok_value(&RenameOk { info }),
+                    Err(message) => ResponseBody::Err { message },
+                }
+            }
             Request::Decide {
                 session_id,
                 request_id,

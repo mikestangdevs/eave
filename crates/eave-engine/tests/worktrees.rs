@@ -338,6 +338,128 @@ async fn sharing_is_stated_and_isolate_is_the_opt_in() {
     );
 }
 
+/// Slice ID2a: the first title an isolated session gets names its
+/// branch, ONCE; a title applied before isolation names it at creation;
+/// and a worktree whose claim predates the rule keeps its name whatever
+/// the session is called.
+///
+/// The name comes from the TITLE the operator applied, never from the
+/// transcript — `WorktreeInfo::branch` rides `watch`, and this is what
+/// keeps `watch_channel_never_carries_transcript_content` true with a
+/// branch on the row.
+#[tokio::test]
+async fn the_operators_title_names_the_branch_once_and_old_claims_keep_theirs() {
+    let dir = scratch();
+    let wtroot = scratch();
+    let base = repo();
+    let engine = EngineProc::spawn_with_env(
+        &dir,
+        "linger",
+        &[("EAVE_WORKTREES_DIR", &wtroot.display().to_string())],
+    );
+    let c = Client::connect(&dir).await.expect("connect");
+    for sid in ["s1", "s2", "s3"] {
+        c.open(Some(sid.into()), Some(base.display().to_string()))
+            .await
+            .expect("open");
+    }
+
+    // s1: isolated unnamed, then named. The branch follows the name.
+    let info = c.isolate("s1").await.expect("isolate s1");
+    assert_eq!(info.worktree.as_ref().unwrap().branch, "eave/s1");
+    let info = c
+        .rename("s1", Some("Diagnose: OMP chat blanking!"))
+        .await
+        .expect("rename s1");
+    let wt = info.worktree.expect("worktree fact");
+    assert_eq!(wt.branch, "eave/diagnose-omp-chat-blanking");
+    assert!(wt.present);
+    // git agrees, and the worktree's HEAD moved with the ref.
+    let head = git(Path::new(&info.cwd), &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(head.trim(), "eave/diagnose-omp-chat-blanking");
+    assert!(
+        git(&base, &["branch", "--list", "eave/s1"])
+            .trim()
+            .is_empty(),
+        "the opaque branch is still there"
+    );
+
+    // Once: a correction of the title leaves the branch where other tools
+    // can find it.
+    let info = c
+        .rename("s1", Some("blanking, round two"))
+        .await
+        .expect("rename again");
+    assert_eq!(
+        info.worktree.unwrap().branch,
+        "eave/diagnose-omp-chat-blanking",
+        "a second rename moved the branch"
+    );
+    // ...and clearing the name is not a reason to move it either.
+    let info = c.rename("s1", None).await.expect("clear");
+    assert_eq!(
+        info.worktree.unwrap().branch,
+        "eave/diagnose-omp-chat-blanking"
+    );
+
+    // s2: named BEFORE isolation opens straight onto the slug — and a
+    // slug already taken falls back to `-<sid8>` rather than refusing.
+    c.rename("s2", Some("Diagnose OMP chat blanking"))
+        .await
+        .expect("rename s2");
+    let info = c.isolate("s2").await.expect("isolate s2");
+    assert_eq!(
+        info.worktree.unwrap().branch,
+        "eave/s2",
+        "the slug is s1's; the opaque name is the honest fallback at creation"
+    );
+    // A later title on that opaque branch tries the slug, finds it taken,
+    // and takes the slug with the session id behind it.
+    let info = c
+        .rename("s2", Some("Diagnose OMP chat blanking"))
+        .await
+        .expect("rename s2");
+    assert_eq!(
+        info.worktree.unwrap().branch,
+        "eave/diagnose-omp-chat-blanking-s2"
+    );
+
+    // s3: a version-1 claim — a worktree from before the rule — keeps
+    // its opaque name whatever the session is called, across a restart.
+    c.isolate("s3").await.expect("isolate s3");
+    drop(c);
+    drop(engine);
+    let claim = dir.join("sessions").join("s3").join("worktree.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&claim).unwrap()).unwrap();
+    assert_eq!(v["format_version"], 2, "new claims are version 2");
+    v["format_version"] = serde_json::json!(1);
+    std::fs::write(&claim, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let _engine = EngineProc::spawn_with_env(
+        &dir,
+        "linger",
+        &[("EAVE_WORKTREES_DIR", &wtroot.display().to_string())],
+    );
+    let c = Client::connect(&dir).await.expect("reconnect");
+    let info = c
+        .rename("s3", Some("an old worktree"))
+        .await
+        .expect("rename s3");
+    assert_eq!(
+        info.worktree.unwrap().branch,
+        "eave/s3",
+        "an existing worktree's branch was renamed"
+    );
+    // And s1's moved branch survived the restart as the session's claim.
+    let listed = wait_list(&c, "s1 reloaded", |s| {
+        s.iter().any(|i| i.session_id == "s1")
+    })
+    .await;
+    assert_eq!(
+        by_id(&listed, "s1").worktree.as_ref().unwrap().branch,
+        "eave/diagnose-omp-chat-blanking"
+    );
+}
+
 /// Refusal shapes are stated, never crashes: after the first send the
 /// cwd is fixed; a non-git cwd has no worktree to offer; isolation is
 /// not repeatable.

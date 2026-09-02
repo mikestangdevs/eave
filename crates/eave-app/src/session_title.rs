@@ -38,14 +38,20 @@
 
 use eave_wire::model::Row;
 
-/// The cap the engine will apply anyway (`eave_core::store::TITLE_MAX_CHARS`).
-///
-/// Proposing something longer would mean showing the operator a string the
-/// store would silently shorten — a field whose contents and whose result
-/// disagree.
-pub const PROPOSAL_MAX: usize = eave_core::store::TITLE_MAX_CHARS;
+/// The length a derived title is cut to (Slice ID2a): a name, not a
+/// sentence. Forty-eight characters is what a rail at its default width
+/// shows whole on the title line beside an age; it is under the store's
+/// `TITLE_MAX_CHARS`, so a derived title that the operator accepts through
+/// the rename field lands unchanged.
+pub const DERIVED_MAX: usize = 48;
 
-/// What to put in the rename field for a session that has no name.
+/// What the rename field is seeded with. The same string the rail shows,
+/// so the field never proposes a name the row would draw differently.
+pub const PROPOSAL_MAX: usize = DERIVED_MAX;
+
+/// What to put in the rename field for a session that has no name — and,
+/// since Slice ID2a, what the rail row and the strip tab call an unnamed
+/// session this client has opened.
 ///
 /// The first thing the operator asked, folded and cut. **Their own words,
 /// which is the point** — this is not a summary of the conversation and
@@ -53,21 +59,38 @@ pub const PROPOSAL_MAX: usize = eave_core::store::TITLE_MAX_CHARS;
 /// session turned out to be; the opening ask is a fact about what it was
 /// for, it is already the sentence the operator would have typed, and it
 /// costs no tokens and no model call.
-///
-/// Whitespace is folded exactly the way `eave_core::store::normalize_title`
-/// folds it, so what the field shows and what the store keeps are the same
-/// string. A prompt whose first line is a greeting therefore still reaches
-/// the ask behind it, instead of proposing `Hi.`
 pub fn propose(rows: &[Row]) -> Option<String> {
     let asked = rows.iter().find_map(|row| match row {
         Row::User { text, .. } => Some(text.as_str()),
         _ => None,
     })?;
-    let folded = asked.split_whitespace().collect::<Vec<_>>().join(" ");
+    derive(asked)
+}
+
+/// Derive a title from one prompt (Slice ID2a). Deterministic, no model.
+///
+/// 1. **Slash prefixes go.** A prompt that opens `/goal /build Slice X …`
+///    is about Slice X; the leading `/word` tokens are how the operator
+///    addressed the CLI, not what they asked for. Only the HEAD of the
+///    prompt is stripped — a `/` later in the sentence is a path.
+/// 2. **Whitespace folds** exactly the way `eave_core::store::normalize_title`
+///    folds it, so what the field shows and what the store keeps are the
+///    same string, and a prompt whose first line is a greeting still
+///    reaches the ask behind it instead of proposing `Hi.`
+/// 3. **Cut at a word** to [`DERIVED_MAX`], no ellipsis (see [`cut`]).
+///
+/// `None` when nothing is left — a prompt that was only a slash command
+/// derives nothing, and the row keeps its honest placeholder.
+pub fn derive(prompt: &str) -> Option<String> {
+    let words: Vec<&str> = prompt
+        .split_whitespace()
+        .skip_while(|w| w.starts_with('/') && w.len() > 1)
+        .collect();
+    let folded = words.join(" ");
     if folded.is_empty() {
         return None;
     }
-    Some(cut(&folded, PROPOSAL_MAX))
+    Some(cut(&folded, DERIVED_MAX))
 }
 
 /// Cut to `max` characters, backing off to a word boundary.
@@ -154,6 +177,50 @@ mod tests {
         let word = "a".repeat(PROPOSAL_MAX * 2);
         let out = propose(&[user(&word)]).unwrap();
         assert_eq!(out.chars().count(), PROPOSAL_MAX);
+    }
+
+    /// Slice ID2a: how the operator addressed the CLI is not what they
+    /// asked it. Only the head is stripped — a path mid-sentence stays.
+    #[test]
+    fn slash_prefixes_are_addressing_and_not_the_ask() {
+        assert_eq!(
+            derive("/goal /build Slice ID2a — task identity").as_deref(),
+            Some("Slice ID2a — task identity")
+        );
+        assert_eq!(
+            derive("/build fix crates/eave-app/src/ui.rs").as_deref(),
+            Some("fix crates/eave-app/src/ui.rs")
+        );
+        assert_eq!(
+            derive("look at /tmp/x").as_deref(),
+            Some("look at /tmp/x"),
+            "a slash that is not at the head is a path"
+        );
+        // A lone `/` is a character, not a command.
+        assert_eq!(derive("/ and then").as_deref(), Some("/ and then"));
+        // A prompt that was ONLY a command derives nothing: the row keeps
+        // its placeholder rather than being named `/clear`.
+        assert_eq!(derive("/clear"), None);
+        assert_eq!(derive("/goal /build"), None);
+    }
+
+    /// The derived title is a NAME and is cut like one: at a word, to
+    /// `DERIVED_MAX`, which is under the store's cap so accepting it in
+    /// the rename field changes nothing.
+    #[test]
+    fn a_derived_title_is_cut_to_a_name_and_the_store_keeps_it_whole() {
+        assert!(DERIVED_MAX < eave_core::store::TITLE_MAX_CHARS);
+        let long = "Diagnose the OMP chat blanking that shows up after the second reconnect";
+        let out = derive(long).unwrap();
+        assert!(out.chars().count() <= DERIVED_MAX, "{out:?}");
+        assert!(
+            long.starts_with(&out) && long[out.len()..].starts_with(' '),
+            "{out:?}"
+        );
+        assert_eq!(
+            eave_core::store::normalize_title(&out).as_deref(),
+            Some(out.as_str())
+        );
     }
 
     #[test]
