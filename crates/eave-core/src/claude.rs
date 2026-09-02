@@ -138,6 +138,11 @@ impl ClaudeCodeSession {
         if let Some(model) = &cfg.model {
             cmd.args(["--model", model]);
         }
+        // Tuning (`crate::tuning`): both knobs are argv-only on this CLI
+        // (2.1.258 has `set_model` and `set_max_thinking_tokens` control
+        // requests but no `set_effort` and no fast-mode one), so a change
+        // is a restart — the engine's job, not this adapter's.
+        cmd.args(tuning_args(&cfg.tuning));
         for arg in &cfg.extra_args {
             cmd.arg(arg);
         }
@@ -378,6 +383,26 @@ impl crate::provider::AgentAdapter for ClaudeCodeSession {
                    prompts, then a rewind to the first: it answered `rewound: true` with the \
                    target's own text in `prefillText`, and the agent then denied any earlier \
                    message existed, so the truncation reaches the CONTEXT and is not cosmetic.",
+    };
+
+    const TUNING: crate::tuning::TuningSupport = crate::tuning::TuningSupport {
+        effort: crate::tuning::EffortSupport::Levels {
+            levels: &["low", "medium", "high", "xhigh", "max"],
+            applies: crate::tuning::Applies::NextSpawn,
+            evidence: "`claude --help` 2.1.258: `--effort <level>` \"(low, medium, high, xhigh, \
+                       max)\" — measured 2026-09-02. Argv only: the control channel has \
+                       `set_model` and `set_max_thinking_tokens` but no `set_effort`.",
+        },
+        speed: crate::tuning::SpeedSupport::Toggle {
+            applies: crate::tuning::Applies::NextSpawn,
+            evidence: "2.1.258 carries the settings key `fastMode` and a headless \
+                       disabled-reason `sdk_opt_in_required` (\"Fast mode is not available \
+                       in the Agent SDK\"), so eave opts in with `--settings \
+                       '{\"fastMode\":true}'`. The opt-in path was read from the binary \
+                       2026-09-02, NOT walked live: a paid-plan check (\"Fast mode requires \
+                       a paid subscription\") sits in front of it and eave cannot see \
+                       which answer this machine gets.",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -828,10 +853,51 @@ async fn write_line(stdin: &SharedStdin, line: &str) {
     let _ = write_frame(stdin, line).await;
 }
 
+/// The argv this CLI takes for a session's tuning (Slice TN1). `--effort`
+/// is the flag `--help` documents; fast mode has no flag, so it rides
+/// `--settings` as a JSON string — the binary's own headless
+/// disabled-reason is `sdk_opt_in_required`, and this is the opt-in.
+/// Nothing for the default: absent is the CLI's own choice, and an empty
+/// `--effort` is not the same thing.
+fn tuning_args(t: &crate::tuning::Tuning) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(level) = &t.effort {
+        out.push("--effort".into());
+        out.push(level.clone());
+    }
+    if t.fast {
+        out.push("--settings".into());
+        out.push(r#"{"fastMode":true}"#.into());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::RewindOutcome;
+
+    /// Slice TN1. The default passes NOTHING; a level is `--effort`
+    /// verbatim; fast mode is the settings opt-in, as JSON the CLI's
+    /// `--settings` accepts inline.
+    #[test]
+    fn tuning_is_argv_and_the_default_is_silence() {
+        use crate::tuning::Tuning;
+        assert!(tuning_args(&Tuning::default()).is_empty());
+        let both = tuning_args(&Tuning {
+            effort: Some("xhigh".into()),
+            fast: true,
+        });
+        assert_eq!(
+            both,
+            vec!["--effort", "xhigh", "--settings", r#"{"fastMode":true}"#]
+        );
+        let v: serde_json::Value = serde_json::from_str(&both[3]).expect("settings is JSON");
+        assert_eq!(v["fastMode"], true);
+        assert!(!<ClaudeCodeSession as crate::provider::AgentAdapter>::TUNING
+            .levels()
+            .is_empty());
+    }
 
     /// **Verbatim from the wire**, 2026-08-31, claude 2.1.251 driven in
     /// eave's exact spawn posture: two prompts, then a rewind to the

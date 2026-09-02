@@ -183,6 +183,13 @@ pub struct Meta {
     /// key at all. `format_version` did not move.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// The operator's effort level / fast lane for this session
+    /// (`crate::tuning`). Operator-owned like `title` and `archived`:
+    /// the engine's own meta writes never touch it
+    /// (`save_keeping_operator_fields`), and a fresh session starts on
+    /// the provider's default.
+    #[serde(default, skip_serializing_if = "crate::tuning::Tuning::is_default")]
+    pub tuning: crate::tuning::Tuning,
 }
 
 /// The longest operator title eave will hold, in **characters** — a cap in
@@ -298,6 +305,7 @@ impl Meta {
         if let Ok(on_disk) = Self::load(session_dir) {
             self.title = on_disk.title;
             self.archived = on_disk.archived;
+            self.tuning = on_disk.tuning;
         }
         self.save(session_dir)
     }
@@ -432,6 +440,7 @@ mod tests {
             child: None,
             title: None,
             archived: false,
+            tuning: Default::default(),
         };
         m.save(dir).expect("save");
         m
@@ -468,6 +477,7 @@ mod tests {
             child: None,
             title: None,
             archived: false,
+            tuning: Default::default(),
         };
         spawn_snapshot
             .save_keeping_operator_fields(dir)

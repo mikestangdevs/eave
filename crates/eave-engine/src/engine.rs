@@ -32,6 +32,8 @@ use eave_core::session::{
 };
 use eave_core::store::{normalize_title, EngineLock, LockError, Meta, Store, META_FORMAT_VERSION};
 use eave_core::thresholds::AttentionThresholds;
+use eave_core::tuning::Tuning;
+use eave_wire::{TakesHold, TuneOk};
 use eave_wire::{
     socket_path, ArchiveOk, ChangedFile, ChangedOk, CreatedOk, Cursor, DecideOk, Decision,
     DiffBasis, DiffOk, FileScope, FileStatus, FilesSnapshot, HelloOk, IsolateOk, KillOk,
@@ -195,6 +197,11 @@ struct Shared {
     /// When [`Shared::reported_state`] last changed (Stage AB). `None`
     /// until it moves; the rail falls back to `created_ts_ms`.
     last_activity_ms: Option<u64>,
+    /// Slice TN1 — the operator's effort level / fast lane, read from
+    /// `meta.json` beside `title` and `archived` and written only by
+    /// `tune`. What the NEXT spawn carries; what a live agent was
+    /// spawned under is on `Live::tuning`.
+    tuning: Tuning,
 }
 
 impl Shared {
@@ -230,7 +237,17 @@ struct Live {
     /// enum.
     session: BoxedSession,
     extra_tx: mpsc::Sender<JournalEvent>,
+    /// Slice TN1 — what this process was started under, so `send` can
+    /// tell a changed argv-only knob from an unchanged one.
+    tuning: Tuning,
+    /// Which spawn this is. The task that clears `live` when the recorder
+    /// ends compares against it, so a process replaced under the lock
+    /// (a tuning restart) does not have its SUCCESSOR's handle cleared
+    /// by the predecessor's exit.
+    serial: u64,
 }
+
+static SPAWN_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub struct SessionHandle {
     session_id: String,
@@ -473,6 +490,8 @@ impl SessionHandle {
             // isolation invariant (spec 05 §Watch). `None` = the CLI's own
             // default, which eave neither knows nor invents.
             model: s.header.agent.model.clone(),
+            effort: s.tuning.effort.clone(),
+            fast: s.tuning.fast,
             cwd: s.header.cwd.clone(),
             created_ts_ms: s.header.created_ts_ms,
             last_activity_ms: s.last_activity_ms,
@@ -739,6 +758,28 @@ enum Freshness {
 /// A free function over [`EngineConfig`] rather than a method, so the
 /// resolution policy can be tested with plain values and no engine, no
 /// socket and no child process. It is a decision, not an action.
+/// Is a turn open on this session, by the journal: the newest of a
+/// `UserSent` and the records that close one. Slice TN1 asks this before
+/// restarting an agent for a tuning change; the answer errs towards
+/// "open" (a session that has sent and heard nothing back is open).
+fn turn_open(handle: &SessionHandle) -> bool {
+    let s = handle.shared.lock().unwrap();
+    for r in s.records.iter().rev() {
+        match &r.event {
+            JournalEvent::UserSent { .. } => return true,
+            JournalEvent::Provider {
+                event:
+                    eave_core::events::SessionEvent::TurnCompleted { .. }
+                    | eave_core::events::SessionEvent::Exited { .. },
+            }
+            | JournalEvent::TurnInterrupted { .. }
+            | JournalEvent::Closed { .. } => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn provider_of<'a>(cfg: &'a EngineConfig, agent: &'a AgentConfig) -> &'a str {
     agent.provider.as_deref().unwrap_or(&cfg.provider)
 }
@@ -970,6 +1011,7 @@ impl Engine {
                 title: None,
                 // Stage AC: a session is born in the rail, not out of it.
                 archived: false,
+                tuning: Default::default(),
             };
             meta.save(&dir).map_err(|e| format!("save meta: {e}"))?;
             let (bcast, _) = broadcast::channel(BROADCAST_CAP);
@@ -994,6 +1036,7 @@ impl Engine {
                     // Stage AC: a session is born in the rail.
                     archived: false,
                     last_activity_ms: None,
+                    tuning: Tuning::default(),
                 }),
                 bcast,
                 live: TokioMutex::new(None),
@@ -1042,6 +1085,7 @@ impl Engine {
         // Keep meta in step with what repair concluded.
         let mut title = None;
         let mut archived = false;
+        let mut tuning = Tuning::default();
         if let Ok(mut meta) = Meta::load(&dir) {
             // Stage AB: the operator's name for this session is durable —
             // it is read back here and nowhere else. A meta that fails to
@@ -1053,6 +1097,8 @@ impl Engine {
             // operator would have no way to tell that from a session the
             // engine lost.
             archived = meta.archived;
+            // Slice TN1, same rule: unreadable = the provider's default.
+            tuning = meta.tuning.clone();
             if meta.state != state || meta.child.is_some() {
                 meta.state = state.clone();
                 meta.child = None;
@@ -1092,6 +1138,7 @@ impl Engine {
                 title,
                 archived,
                 last_activity_ms,
+                tuning,
             }),
             bcast,
             live: TokioMutex::new(None),
@@ -1146,6 +1193,42 @@ impl Engine {
         // working-tree hash pass on the send path, which is the price of
         // the question being answerable at all.
         let checkpoint = capture_turn_basis(&handle).await;
+        // Slice TN1: an argv-only provider takes a changed effort level /
+        // fast lane only at a start, so a live agent spawned under a
+        // different tuning is restarted HERE — at a send that finds no
+        // turn open — and resumed under the provider's cursor by the
+        // ordinary spawn path below. Never mid-turn.
+        if let Some(l) = live.as_mut().filter(|l| !l.extra_tx.is_closed()) {
+            let (want, provider) = {
+                let s = handle.shared.lock().unwrap();
+                (
+                    s.tuning.clone(),
+                    provider_of(&self.cfg, &s.header.agent).to_string(),
+                )
+            };
+            let restart = l.tuning != want
+                && provider::tuning_support(&provider)
+                    .is_some_and(|t| t.needs_respawn(&l.tuning, &want))
+                && !turn_open(&handle);
+            if restart {
+                l.session
+                    .kill()
+                    .await
+                    .map_err(|e| format!("restart for tuning: kill failed: {e}"))?;
+                // The recorder writes the segment's closing `meta.json`
+                // on its way out, through the same `meta.json.tmp` the
+                // next spawn is about to use. `kill` proves the PROCESS
+                // is gone, not that the recorder has returned — wait for
+                // its `extra` receiver to drop, which happens after that
+                // write. Bounded: a recorder that never returns is a
+                // different bug and must not wedge the send lock.
+                let gone = Instant::now() + Duration::from_secs(5);
+                while !l.extra_tx.is_closed() && Instant::now() < gone {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                *live = None;
+            }
+        }
         // A returned recorder drops its `extra` receiver, so a closed
         // channel is proof the attached process segment is over even if the
         // completion task hasn't cleared the slot yet — respawn (with
@@ -1197,7 +1280,7 @@ impl Engine {
     }
 
     async fn spawn_live(self: &Arc<Self>, handle: &Arc<SessionHandle>) -> Result<Live, String> {
-        let (header, next_seq, resume) = {
+        let (header, next_seq, resume, tuning) = {
             let s = handle.shared.lock().unwrap();
             // The resume cursor is the LAST provider id this session was
             // told about — `rev()`, not `find()`. A session that has been
@@ -1221,6 +1304,7 @@ impl Engine {
                 s.header.clone(),
                 s.records.last().map(|r| r.seq + 1).unwrap_or(1),
                 resume,
+                s.tuning.clone(),
             )
         };
         let journal_path = Store::journal_path(&handle.dir);
@@ -1284,6 +1368,8 @@ impl Engine {
             .filter(|a| !conflicts_with_eave_flags(a))
             .cloned()
             .collect();
+        cfg.tuning = tuning.clone();
+        let serial = SPAWN_SERIAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // **The dispatch.** This used to be `ClaudeCodeSession::spawn`
         // spelled out; the engine now looks the provider up and never
         // learns which adapter it got. Adding a fifth agent touches no
@@ -1311,6 +1397,7 @@ impl Engine {
             // operator methods are the only writers of these two fields.
             title: None,
             archived: false,
+            tuning: Default::default(),
         };
         meta.save_keeping_operator_fields(&handle.dir)
             .map_err(|e| format!("save meta: {e}"))?;
@@ -1420,10 +1507,18 @@ impl Engine {
                 .bcast
                 .send(Fanout::Attention(AttentionSnapshot::Running));
             done_handle.poke_watch();
-            *done_handle.live.lock().await = None;
+            let mut live = done_handle.live.lock().await;
+            if live.as_ref().is_some_and(|l| l.serial == serial) {
+                *live = None;
+            }
         });
 
-        Ok(Live { session, extra_tx })
+        Ok(Live {
+            session,
+            extra_tx,
+            tuning,
+            serial,
+        })
     }
 
     /// Answer one open permission question (Slice K). Serialized on the
@@ -1986,6 +2081,55 @@ impl Engine {
     /// session becoming *unreachable*, and that is a listing rule kept by
     /// the client that draws the list (`ui::rail_shows`), not a refusal
     /// here.
+    /// Slice TN1 — set a session's effort level / fast lane. Checked
+    /// against the adapter's own measured `TUNING` (an unknown level is
+    /// refused with the CLI's list; an absent knob with its reason),
+    /// persisted in `meta.json` as an operator field, then carried to a
+    /// live agent over its wire when the provider takes it that way, or
+    /// left for `send` to restart the agent when it does not. The reply
+    /// states which.
+    async fn tune(&self, id: &str, tuning: Tuning) -> Result<TuneOk, String> {
+        let handle = self.session(id)?;
+        let provider = {
+            let s = handle.shared.lock().unwrap();
+            provider_of(&self.cfg, &s.header.agent).to_string()
+        };
+        let support = provider::tuning_support(&provider).ok_or_else(|| {
+            format!("eave has no adapter for {provider}, so there is nothing to tune")
+        })?;
+        support.check(&provider, &tuning)?;
+        let mut meta = Meta::load(&handle.dir).map_err(|e| {
+            format!(
+                "cannot tune {id}: its meta.json is unreadable ({e}) — refusing to write a \
+                 reconstructed one over it"
+            )
+        })?;
+        meta.tuning = tuning.clone();
+        meta.save(&handle.dir)
+            .map_err(|e| format!("save meta: {e}"))?;
+        handle.shared.lock().unwrap().tuning = tuning.clone();
+        let takes_hold = {
+            let mut live = handle.live.lock().await;
+            match live.as_mut().filter(|l| !l.extra_tx.is_closed()) {
+                None => TakesHold::NextSpawn,
+                Some(l) if support.needs_respawn(&l.tuning, &tuning) => TakesHold::NextSend,
+                Some(l) => {
+                    l.session
+                        .tune(&tuning)
+                        .await
+                        .map_err(|e| format!("tune: {e}"))?;
+                    l.tuning = tuning.clone();
+                    TakesHold::Now
+                }
+            }
+        };
+        handle.poke_watch();
+        Ok(TuneOk {
+            info: self.info_with_sharing(id)?,
+            takes_hold,
+        })
+    }
+
     fn set_archived(&self, id: &str, archived: bool) -> Result<SessionInfo, String> {
         let handle = self.session(id)?;
         let mut meta = Meta::load(&handle.dir).map_err(|e| {
@@ -2649,6 +2793,15 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 archived,
             } => match engine.set_archived(&session_id, archived) {
                 Ok(info) => ok_value(&ArchiveOk { info }),
+                Err(message) => ResponseBody::Err { message },
+            },
+            // Slice TN1. Async because a live agent may be written to.
+            Request::Tune {
+                session_id,
+                effort,
+                fast,
+            } => match engine.tune(&session_id, Tuning { effort, fast }).await {
+                Ok(ok) => ok_value(&ok),
                 Err(message) => ResponseBody::Err { message },
             },
             // Slice ID2a made this `async`: a rename may shell out to git

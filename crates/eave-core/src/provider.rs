@@ -49,6 +49,7 @@ use tokio::sync::mpsc;
 
 use crate::events::SessionEvent;
 use crate::session::{AgentSession, SessionError, SpawnConfig};
+use crate::tuning::TuningSupport;
 
 // ---------------------------------------------------------------------------
 // Posture
@@ -163,6 +164,12 @@ pub trait AgentAdapter: AgentSession + Sized + 'static {
     /// conversation, and how do you know". See [`RewindSupport`].
     const REWIND: RewindSupport;
 
+    /// This adapter's own answer to "does your CLI take an effort level
+    /// or a fast lane, spelled how, and when does a change take hold".
+    /// See [`crate::tuning`]. Measured from the installed binary, never
+    /// read from a doc.
+    const TUNING: TuningSupport;
+
     /// Spawn the CLI. The returned receiver's final event must be
     /// `SessionEvent::Exited` — the recorder waits on it.
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError>;
@@ -219,6 +226,7 @@ pub struct Adapter {
     pub id: &'static str,
     pub posture: PostureProof,
     pub rewind: RewindSupport,
+    pub tuning: TuningSupport,
     spawn: SpawnFn,
 }
 
@@ -250,6 +258,7 @@ macro_rules! adapters {
             id: <$adapter as AgentAdapter>::PROVIDER_ID,
             posture: <$adapter as AgentAdapter>::POSTURE,
             rewind: <$adapter as AgentAdapter>::REWIND,
+            tuning: <$adapter as AgentAdapter>::TUNING,
             spawn: spawn_boxed::<$adapter>,
         }),*];
     };
@@ -280,6 +289,13 @@ adapters! {
 /// launcher tile.
 pub fn adapter(provider_id: &str) -> Option<&'static Adapter> {
     ADAPTERS.iter().find(|a| a.id == provider_id)
+}
+
+/// What this provider's CLI can be tuned to (effort level, fast lane),
+/// read from the registry. `None` for a provider eave has no adapter for —
+/// which is also "no knobs", but the caller should say WHICH no.
+pub fn tuning_support(provider_id: &str) -> Option<&'static TuningSupport> {
+    adapter(provider_id).map(|a| &a.tuning)
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,5 +1097,89 @@ mod tests {
             first, second,
             "the same filesystem answered two different things"
         );
+    }
+
+    /// Slice TN1. Every adapter declares a tuning answer — the compiler
+    /// guarantees that — and this checks the answers are USABLE: a level
+    /// list that is the CLI's own words (lowercase, no spaces, no
+    /// duplicates), and a refusal a person can read.
+    #[test]
+    fn every_tuning_answer_is_usable() {
+        for a in ADAPTERS {
+            match a.tuning.effort {
+                crate::tuning::EffortSupport::Levels {
+                    levels, evidence, ..
+                } => {
+                    assert!(!levels.is_empty(), "{}: an empty level list", a.id);
+                    assert!(evidence.len() > 40, "{}: effort evidence is a stub", a.id);
+                    let mut seen = std::collections::HashSet::new();
+                    for l in levels {
+                        assert!(
+                            !l.is_empty()
+                                && l.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                            "{}: level {l:?} is not a CLI word",
+                            a.id
+                        );
+                        assert!(seen.insert(l), "{}: level {l:?} twice", a.id);
+                    }
+                }
+                crate::tuning::EffortSupport::None { reason } => {
+                    assert!(reason.len() > 40, "{}: effort refusal is a stub", a.id);
+                }
+            }
+            match a.tuning.speed {
+                crate::tuning::SpeedSupport::Toggle { evidence, .. } => {
+                    assert!(evidence.len() > 40, "{}: speed evidence is a stub", a.id);
+                }
+                crate::tuning::SpeedSupport::None { reason } => {
+                    assert!(reason.len() > 20, "{}: speed refusal is a stub", a.id);
+                }
+            }
+        }
+        assert!(tuning_support("claude-code").is_some_and(|t| t.has_effort()));
+        assert!(tuning_support("hermes").is_some_and(|t| !t.has_effort() && !t.has_speed()));
+        assert!(tuning_support("nobody").is_none());
+    }
+
+    /// Slice TN1. `AgentSession::tune` defaults to a no-op, which is
+    /// right for an argv-only CLI and WRONG for one that declares a knob
+    /// takes hold on the next turn — that adapter must write something.
+    /// A source pin, because every fake agent would pass a runtime one.
+    #[test]
+    fn an_adapter_that_promises_next_turn_overrides_tune() {
+        use crate::tuning::{Applies, EffortSupport, SpeedSupport};
+        let sources: &[(&str, &str)] = &[
+            ("claude-code", include_str!("claude.rs")),
+            ("codex", include_str!("codex.rs")),
+            ("cursor-agent", include_str!("cursor.rs")),
+            ("grok", include_str!("grok.rs")),
+            ("hermes", include_str!("hermes.rs")),
+            ("pi", include_str!("pi.rs")),
+        ];
+        for a in ADAPTERS {
+            let next_turn = matches!(
+                a.tuning.effort,
+                EffortSupport::Levels {
+                    applies: Applies::NextTurn,
+                    ..
+                }
+            ) || matches!(
+                a.tuning.speed,
+                SpeedSupport::Toggle {
+                    applies: Applies::NextTurn,
+                    ..
+                }
+            );
+            let (_, src) = sources
+                .iter()
+                .find(|(id, _)| *id == a.id)
+                .unwrap_or_else(|| panic!("{}: add its source to this table", a.id));
+            let overrides = src.contains("async fn tune(&mut self");
+            assert_eq!(
+                overrides, next_turn,
+                "{}: promises next-turn={next_turn} but overrides tune={overrides}",
+                a.id
+            );
+        }
     }
 }

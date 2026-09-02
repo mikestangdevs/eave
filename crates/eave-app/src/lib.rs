@@ -125,6 +125,8 @@ pub mod session_title;
 pub mod settings_window;
 /// The Agents pane (S2): P2's defaults surface + provider status facts.
 pub mod settings_agents;
+/// Slice TN1 — the composer's effort / speed chips, as data.
+pub mod tuning_ui;
 
 pub mod ui;
 

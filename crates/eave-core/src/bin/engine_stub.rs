@@ -89,6 +89,7 @@ async fn main() {
         child: Some(session.identity()),
         title: None,
         archived: false,
+        tuning: Default::default(),
     };
     meta.save(&dir).expect("save meta");
 

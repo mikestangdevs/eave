@@ -84,6 +84,10 @@ use crate::thresholds::{KILL_GRACE, KILL_VERIFY_WINDOW};
 use crate::tool::{self, ToolCall};
 
 const STDERR_RING_CAP: usize = 4096;
+/// Codex's fast lane, by the id `model/list` advertises for it
+/// (`serviceTiers: [{id: "priority", name: "Fast"}]`, 0.148.0, 2026-09-02).
+const CODEX_FAST_TIER: &str = "priority";
+
 const EVENT_CHANNEL_CAP: usize = 256;
 const MALFORMED_LINE_CAP: usize = 512;
 
@@ -123,6 +127,11 @@ struct PendingApproval {
 struct Shared {
     proto: Mutex<CodexProtocol>,
     last_activity: Mutex<Instant>,
+    /// The effort level / fast lane the NEXT `turn/start` carries
+    /// (`crate::tuning`). Per turn on this wire, so `tune` just replaces
+    /// it and the next prompt states it. `serviceTier: "priority"` is the
+    /// tier id `model/list` names "Fast" (measured 2026-09-02, 0.148.0).
+    tuning: Mutex<crate::tuning::Tuning>,
     /// The thread was announced at least once. A process that dies without
     /// this never got far enough to state its posture.
     saw_thread: AtomicBool,
@@ -241,6 +250,7 @@ impl CodexSession {
         let shared = Arc::new(Shared {
             proto: Mutex::new(CodexProtocol::new()),
             last_activity: Mutex::new(Instant::now()),
+            tuning: Mutex::new(cfg.tuning.clone()),
             saw_thread: AtomicBool::new(false),
             kill_initiated: AtomicBool::new(false),
         });
@@ -458,6 +468,24 @@ impl crate::provider::AgentAdapter for CodexSession {
                  the one row where eave knows support exists and still says no.",
     };
 
+    const TUNING: crate::tuning::TuningSupport = crate::tuning::TuningSupport {
+        effort: crate::tuning::EffortSupport::Levels {
+            levels: &["low", "medium", "high", "xhigh", "max", "ultra"],
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "`turn/start.effort` (\"Override the reasoning effort for this turn and \
+                       subsequent turns\", generate-json-schema 0.148.0) and a live `model/list` \
+                       2026-09-02: gpt-5.6-sol/terra take low…ultra, gpt-5.6-luna low…max, \
+                       gpt-5.5 and gpt-5.2 low…xhigh. This list is the UNION; a level a \
+                       particular model lacks is Codex's error to state.",
+        },
+        speed: crate::tuning::SpeedSupport::Toggle {
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "`turn/start.serviceTier`; the same `model/list` names one tier on every \
+                       gpt-5.5+ model: `{id: \"priority\", name: \"Fast\"}` (gpt-5.2 has none). \
+                       eave sends the id.",
+        },
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         CodexSession::spawn(cfg)
     }
@@ -500,14 +528,15 @@ impl AgentSession for CodexSession {
         for img in crate::media::encode_all(images)? {
             input.push(crate::media::codex_image_item(&img));
         }
+        let params = {
+            let t = self.shared.tuning.lock().unwrap();
+            turn_params(&thread_id, input, &t)
+        };
         let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": input,
-            },
+            "params": params,
         });
         write_frame(&self.stdin, &frame.to_string()).await
     }
@@ -573,6 +602,15 @@ impl AgentSession for CodexSession {
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    /// Per turn on this wire: the next `turn/start` carries it. Nothing
+    /// is written now, so a change during a running turn lands on the
+    /// following one, exactly as the schema's "this turn and subsequent
+    /// turns" reads.
+    async fn tune(&mut self, tuning: &crate::tuning::Tuning) -> Result<(), SessionError> {
+        *self.shared.tuning.lock().unwrap() = tuning.clone();
         Ok(())
     }
 
@@ -764,6 +802,24 @@ impl Opening {
         })
         .to_string()
     }
+}
+
+/// `turn/start`'s params (Slice TN1). "Override the reasoning effort /
+/// service tier for this turn and subsequent turns" (`TurnStartParams`,
+/// generate-json-schema 0.148.0). Absent = the model's own default, never
+/// a guessed one.
+fn turn_params(thread_id: &str, input: Vec<Value>, t: &crate::tuning::Tuning) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": input,
+    });
+    if let Some(level) = &t.effort {
+        params["effort"] = json!(level);
+    }
+    if t.fast {
+        params["serviceTier"] = json!(CODEX_FAST_TIER);
+    }
+    params
 }
 
 fn initialize_frame() -> String {
@@ -1721,6 +1777,27 @@ async fn write_line(stdin: &SharedStdin, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slice TN1. A turn under the default names neither key — Codex's
+    /// own default is not a word eave knows. A tuned turn names both,
+    /// the tier by the id `model/list` advertises.
+    #[test]
+    fn a_turn_carries_effort_and_the_fast_tier_only_when_set() {
+        use crate::tuning::Tuning;
+        let plain = turn_params("t1", vec![json!({"type":"text","text":"hi"})], &Tuning::default());
+        assert_eq!(plain["threadId"], "t1");
+        assert!(plain.get("effort").is_none() && plain.get("serviceTier").is_none(), "{plain}");
+        let tuned = turn_params(
+            "t1",
+            vec![],
+            &Tuning {
+                effort: Some("ultra".into()),
+                fast: true,
+            },
+        );
+        assert_eq!(tuned["effort"], "ultra");
+        assert_eq!(tuned["serviceTier"], "priority");
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()

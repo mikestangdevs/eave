@@ -91,6 +91,8 @@ fn session(id: &str) -> SessionInfo {
         archived: false,
         provider: "claude-code".into(),
         model: None,
+        effort: None,
+        fast: false,
         cwd: "/tmp/eave-harness".into(),
         created_ts_ms: 1,
         last_activity_ms: None,
@@ -6010,6 +6012,7 @@ fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
             cwd,
             extra_args,
             prompt,
+            tuning: _,
         } => {
             assert_eq!(prompt.as_ref().map(|(t, _)| t.as_str()), Some("hello"));
             assert_eq!(provider, "claude-code");
@@ -12826,6 +12829,171 @@ fn the_access_picker_offers_the_four_modes(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+// ── Slice TN1 — the composer's effort and speed chips ─────────────────────
+
+/// A chip is drawn only for a knob the provider's CLI takes (the
+/// registry's own `TUNING`): Claude gets both, Grok the gauge alone,
+/// Hermes neither. A control that cannot do anything is a lie.
+#[gpui::test]
+fn the_composer_wears_effort_and_speed_only_where_the_cli_takes_them(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    assert!(shown(vcx, "composer-effort"), "Claude takes --effort");
+    assert!(shown(vcx, "composer-speed"), "Claude has a fast lane");
+    assert!(shown(vcx, "composer-speed-off"), "the bolt states its side");
+    assert!(shown(vcx, "composer-effort-gauge-0"), "the default draws a hollow gauge");
+
+    for (provider, effort, speed) in [("grok", true, false), ("hermes", false, false)] {
+        let mut s = session("bbbb2222");
+        s.provider = provider.into();
+        s.last_seq = 0;
+        h.plumbing.push_rail(vec![s]);
+        h.plumbing.push_feed(FeedEvent::Session {
+            id: "bbbb2222".into(),
+        });
+        vcx.run_until_parked();
+        assert_eq!(shown(vcx, "composer-effort"), effort, "{provider}: effort chip");
+        assert_eq!(shown(vcx, "composer-speed"), speed, "{provider}: speed chip");
+    }
+}
+
+/// The effort menu offers Default then the CLI's own words, and choosing
+/// one is a `Command::Tune` on the selected session — never a spawn-flag
+/// rewrite and never a new session.
+#[gpui::test]
+fn choosing_an_effort_level_tunes_the_selected_session(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let _ = h.drain();
+    click(vcx, "composer-effort");
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(200));
+    // Default + Claude's five levels (low, medium, high, xhigh, max).
+    for sel in [
+        "menu-row-0",
+        "menu-row-1",
+        "menu-row-2",
+        "menu-row-3",
+        "menu-row-4",
+        "menu-row-5",
+    ] {
+        assert!(shown(vcx, sel), "{sel} is missing from the effort menu");
+    }
+    click(vcx, "menu-row-4");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    match cmds.as_slice() {
+        [Command::Tune { id, tuning }] => {
+            assert_eq!(id, "aaaa1111");
+            assert_eq!(tuning.effort.as_deref(), Some("xhigh"));
+            assert!(!tuning.fast, "the speed knob must ride along unchanged");
+        }
+        other => panic!("choosing a level emitted {other:?}, not one Tune"),
+    }
+    assert!(
+        !cmds.iter().any(|c| matches!(c, Command::NewSession | Command::Launch { .. })),
+        "a tuning change must not start a new session"
+    );
+
+    // The chip reads what the engine reports, not what was clicked.
+    let mut s = session("aaaa1111");
+    s.effort = Some("xhigh".into());
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-effort-gauge-3"), "xhigh lights three of four bars");
+}
+
+/// Choosing a level must carry the OTHER knob along unchanged: a session
+/// on the fast lane that picks Max stays on the fast lane. (The live walk
+/// came up on `max` with the fast lane off, once, unexplained — this pins
+/// the client's half of that.)
+#[gpui::test]
+fn choosing_a_level_keeps_the_fast_lane_as_it_was(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let mut s = session("aaaa1111");
+    s.effort = Some("xhigh".into());
+    s.fast = true;
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-speed-on"));
+    let _ = h.drain();
+    click(vcx, "composer-effort");
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(200));
+    click(vcx, "menu-row-5");
+    vcx.run_until_parked();
+    match h.drain().as_slice() {
+        [Command::Tune { tuning, .. }] => {
+            assert_eq!(tuning.effort.as_deref(), Some("max"));
+            assert!(tuning.fast, "picking a level dropped the fast lane");
+        }
+        other => panic!("picking Max emitted {other:?}"),
+    }
+}
+
+/// The bolt is a toggle: one click, one Tune with the other value; and it
+/// states its side as a selector, because geometry is all a test can see.
+#[gpui::test]
+fn the_speed_bolt_toggles_and_states_its_side(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let _ = h.drain();
+    click(vcx, "composer-speed");
+    vcx.run_until_parked();
+    match h.drain().as_slice() {
+        [Command::Tune { id, tuning }] => {
+            assert_eq!(id, "aaaa1111");
+            assert!(tuning.fast);
+            assert_eq!(tuning.effort, None);
+        }
+        other => panic!("the bolt emitted {other:?}"),
+    }
+    let mut s = session("aaaa1111");
+    s.fast = true;
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+    assert!(shown(vcx, "composer-speed-on"));
+    assert!(!shown(vcx, "composer-speed-off"));
+    click(vcx, "composer-speed");
+    vcx.run_until_parked();
+    match h.drain().as_slice() {
+        [Command::Tune { tuning, .. }] => assert!(!tuning.fast, "second click turns it off"),
+        other => panic!("the bolt emitted {other:?}"),
+    }
+}
+
+/// At the launcher there is no session to tune yet, so the choice rides
+/// the launch itself and lands on the session it makes.
+#[gpui::test]
+fn a_launch_carries_the_tuning_chosen_before_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    assert!(shown(vcx, "launcher"));
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.set_effort(Some("high".into()), cx);
+            shell.toggle_fast(cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(
+        h.drain().is_empty(),
+        "with no session selected, a tuning is held, not sent"
+    );
+    // NC1: the launcher is a chat — the send IS the start.
+    start_chat(vcx, "hello");
+    let cmds = h.drain();
+    let launch = cmds
+        .iter()
+        .find_map(|c| match c {
+            Command::Launch { tuning, .. } => Some(tuning.clone()),
+            _ => None,
+        })
+        .expect("no launch went out");
+    assert_eq!(launch.effort.as_deref(), Some("high"));
+    assert!(launch.fast);
 }
 
 // ── Slice C5 — the tab strip and the omnibox ──────────────────────────────

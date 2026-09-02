@@ -200,6 +200,9 @@ Line {
     VOLUME_LOUD => "volume-loud.svg",
     WIDGET => "widget.svg",
     WIFI_OFF => "wifi-off.svg",
+    // Slice TN1 — the composer's fast-lane toggle. Not a Solar file: drawn
+    // to the same 24-grid / 1.5 stroke so it sits beside them.
+    BOLT => "bolt.svg",
 }
 
 // eave's own. The family has no VCS status set, and these are the only P3
@@ -493,10 +496,12 @@ mod tests {
         // `volume-loud` and neither it nor comet's vendored set has the
         // crossed variant, so it is `volume-loud`'s cone with the two
         // arcs replaced by an X at the same 1.5 stroke and round caps.
-        assert_eq!(of(Class::Line).count(), 60, "the Line family");
+        // BOLT (Slice TN1) is the composer's fast-lane toggle, drawn the
+        // same way — Solar's own bolt was not among the vendored files.
+        assert_eq!(of(Class::Line).count(), 61, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 71);
+        assert_eq!(REGISTRY.len(), 72);
     }
 
     /// Every registered path is a file that exists on disk under exactly

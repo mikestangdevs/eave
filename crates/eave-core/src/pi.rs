@@ -291,6 +291,11 @@ impl PiSession {
         if let Some(model) = &cfg.model {
             cmd.args(["--model", model]);
         }
+        // Tuning at spawn (`--thinking <level>`); a later change goes over
+        // RPC as `set_thinking_level` — see `tune`. No fast lane on Pi.
+        if let Some(level) = &cfg.tuning.effort {
+            cmd.args(["--thinking", level]);
+        }
         // `extra_args` has already been filtered of Claude's posture flags
         // at the engine boundary; Pi's own must-not-override set is
         // different and is applied here (see `conflicts_with_pi_flags`).
@@ -560,6 +565,21 @@ impl crate::provider::AgentAdapter for PiSession {
                  rollback, fork or revert in the installed CLI — checked 2026-08-31.",
     };
 
+    const TUNING: crate::tuning::TuningSupport = crate::tuning::TuningSupport {
+        effort: crate::tuning::EffortSupport::Levels {
+            levels: &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "`pi --help` 0.84.2: `--thinking <level>` \"off, minimal, low, medium, \
+                       high, xhigh, max\"; mid-session `{type: set_thinking_level, level}` in \
+                       `modes/rpc/rpc-mode.js` — both read 2026-09-02. Whether a given model \
+                       honours a level is Pi's to say.",
+        },
+        speed: crate::tuning::SpeedSupport::None {
+            reason: "no fast lane on this CLI: nothing in `--help` or the RPC verb list \
+                     (2026-09-02).",
+        },
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         PiSession::spawn(cfg)
     }
@@ -689,6 +709,17 @@ impl AgentSession for PiSession {
         Ok(())
     }
 
+    /// `{type: set_thinking_level, level}` — Pi's own RPC verb
+    /// (`modes/rpc/rpc-mode.js` 0.84.2: `session.setThinkingLevel(command.level)`).
+    /// A `None` level sends nothing: the RPC has no "back to default" and
+    /// eave will not guess which word Pi's default is.
+    async fn tune(&mut self, tuning: &crate::tuning::Tuning) -> Result<(), SessionError> {
+        let Some(level) = &tuning.effort else {
+            return Ok(());
+        };
+        write_frame(&self.stdin, &set_thinking_frame(level)).await
+    }
+
     /// Unsupported, and stated in one place only: the reason an operator
     /// reads lives on `REWIND`, so this never grows a second sentence
     /// that could drift from it.
@@ -776,6 +807,18 @@ impl AgentSession for PiSession {
 /// rest can only narrow what the agent may do. An extra `-e` is likewise
 /// harmless: a second `tool_call` handler can block a call but has no way
 /// to un-block one the gate refused.
+/// `{type: set_thinking_level, level}` (Slice TN1) — Pi's own RPC verb,
+/// `modes/rpc/rpc-mode.js` 0.84.2. The `id` lets the reply be told apart
+/// from the probes'; nothing waits on it.
+fn set_thinking_frame(level: &str) -> String {
+    serde_json::json!({
+        "id": "eave-tune",
+        "type": "set_thinking_level",
+        "level": level,
+    })
+    .to_string()
+}
+
 pub fn conflicts_with_pi_flags(arg: &str) -> bool {
     let head = arg.split('=').next().unwrap_or(arg);
     matches!(
@@ -1334,6 +1377,18 @@ fn flatten_content(v: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slice TN1. The verb and the field are Pi's (`rpc-mode.js`:
+    /// `case "set_thinking_level": session.setThinkingLevel(command.level)`).
+    #[test]
+    fn a_thinking_change_is_pis_own_rpc_verb() {
+        let v: serde_json::Value = serde_json::from_str(&set_thinking_frame("xhigh")).unwrap();
+        assert_eq!(v["type"], "set_thinking_level");
+        assert_eq!(v["level"], "xhigh");
+        assert!(<PiSession as crate::provider::AgentAdapter>::TUNING
+            .levels()
+            .contains(&"off"));
+    }
 
     fn stream() -> PiStream {
         PiStream::new(PathBuf::from("/tmp/eave-pi-gate-test.ts"))

@@ -313,6 +313,20 @@ pub enum Request {
         /// `true` files it away; `false` brings it back.
         archived: bool,
     },
+    /// Set a session's effort level and fast lane (Slice TN1,
+    /// `eave_core::tuning`). **A whole replacement, never a merge**: the
+    /// caller states both knobs every time, and `effort: None` means the
+    /// provider's own default — there is no "leave that one". Refused
+    /// with the CLI's own list for a level the provider never named, and
+    /// refused outright on a provider whose adapter declares no such
+    /// knob. The reply says WHEN it takes hold; see [`TakesHold`].
+    Tune {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fast: bool,
+    },
     /// Answer one open permission question (Slice K). The agent is parked
     /// until this arrives and there is no other way out — eave never
     /// auto-approves, never auto-denies, and never times out into either.
@@ -802,6 +816,15 @@ pub struct SessionInfo {
     /// of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The operator's effort level for this session (Slice TN1,
+    /// `eave_core::tuning`), the CLI's own word verbatim. A fact ABOUT
+    /// the session in the same class as `model`, so `watch` may carry
+    /// it. `None` = the provider's own default, never a guessed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The provider's fast lane is on for this session (Slice TN1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
     pub cwd: String,
     pub created_ts_ms: u64,
     /// When this session's reported [`state`](SessionInfo::state) last
@@ -1406,6 +1429,28 @@ pub struct ArchiveOk {
     pub info: SessionInfo,
 }
 
+/// When a [`Request::Tune`] reaches the model — stated, not assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakesHold {
+    /// A live agent took it over its wire; the next turn runs under it.
+    Now,
+    /// Nothing is running; the next start carries it.
+    NextSpawn,
+    /// A live agent on a provider that reads the knob from argv only.
+    /// The engine restarts it at the next send that finds no turn open,
+    /// resuming the conversation under the provider's cursor. A running
+    /// turn is never interrupted for a knob.
+    NextSend,
+}
+
+/// Reply to [`Request::Tune`] (Slice TN1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuneOk {
+    pub info: SessionInfo,
+    pub takes_hold: TakesHold,
+}
+
 /// Reply to [`Request::RemoveWorktree`] (Slice I2). `removed: false` is
 /// a refusal with its facts: the counts the operator must confirm
 /// against (`force: true` re-sends meaning it). The counts are measured
@@ -1628,6 +1673,8 @@ mod tests {
                     archived: false,
                     provider: "claude-code".into(),
                     model: None,
+                    effort: None,
+                    fast: false,
                     cwd: "/tmp".into(),
                     created_ts_ms: 1,
                     last_activity_ms: Some(1_700),
@@ -2515,6 +2562,47 @@ mod tests {
         let info: SessionInfo = serde_json::from_str(old).expect("old SessionInfo must parse");
         assert_eq!(info.model, None);
         assert_eq!(info.provider, "claude-code");
+    }
+
+    /// Slice TN1. An engine predating tuning puts no `effort`/`fast` on
+    /// the wire, and that reads as "the provider's default" — never as a
+    /// level eave made up.
+    #[test]
+    fn a_session_info_without_tuning_parses_as_the_providers_default() {
+        let old = r#"{
+            "session_id":"s1","provider":"claude-code","cwd":"/tmp",
+            "created_ts_ms":1,"state":"new","live":false,"epoch":7,"last_seq":0
+        }"#;
+        let info: SessionInfo = serde_json::from_str(old).expect("old SessionInfo must parse");
+        assert_eq!(info.effort, None);
+        assert!(!info.fast);
+        let raw = serde_json::to_string(&info).unwrap();
+        assert!(!raw.contains("effort") && !raw.contains("fast"), "{raw}");
+    }
+
+    #[test]
+    fn a_tune_round_trips_and_a_default_tune_states_nothing() {
+        let req = Request::Tune {
+            session_id: "s1".into(),
+            effort: Some("xhigh".into()),
+            fast: true,
+        };
+        let raw = serde_json::to_string(&req).expect("serialize");
+        assert!(raw.contains("\"method\":\"tune\""), "{raw}");
+        let back: Request = serde_json::from_str(&raw).expect("round trip");
+        assert_eq!(back, req);
+        let bare = serde_json::to_string(&Request::Tune {
+            session_id: "s1".into(),
+            effort: None,
+            fast: false,
+        })
+        .unwrap();
+        assert!(!bare.contains("effort") && !bare.contains("fast"), "{bare}");
+        let ok = TuneOk {
+            info: serde_json::from_str(r#"{"session_id":"s1","provider":"p","cwd":"/","created_ts_ms":1,"state":"new","live":false,"epoch":1,"last_seq":0}"#).unwrap(),
+            takes_hold: TakesHold::NextSend,
+        };
+        assert!(serde_json::to_string(&ok).unwrap().contains("\"takes_hold\":\"next_send\""));
     }
 
     /// The config a session states is carried whole across the wire — the

@@ -38,6 +38,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use eave_core::events::{ContextWindow, TurnTokens};
 use eave_core::session::AgentConfig;
+use eave_core::tuning::Tuning;
 use eave_engine::client::{Client, ClientError, EngineSpawn};
 use eave_wire::model::{ApprovalStatus, Delivery, Row, ToolStatus, Transcript};
 use eave_wire::{
@@ -47,6 +48,7 @@ use eave_wire::{
 };
 
 use crate::access::{self, RuntimeMode};
+use crate::tuning_ui;
 use crate::attach::{self, StagedFile};
 use crate::bookmarks;
 use crate::composer;
@@ -392,6 +394,11 @@ enum Command {
         /// loop DROPS `Send` — a refused launch would have handed the
         /// words to whichever session opened next.
         prompt: Option<(String, Vec<PathBuf>)>,
+        /// Slice TN1 — the effort level / fast lane chosen at the
+        /// launcher, applied by a `tune` right after the open succeeds
+        /// (a session's tuning is an operator fact in `meta.json`, not
+        /// part of its fixed agent config). The default sends nothing.
+        tuning: Tuning,
     },
     /// Files-rail basis toggle (Slice AA): re-open the `files`
     /// subscription against the other basis. It is a resubscribe, not a
@@ -414,6 +421,13 @@ enum Command {
     Rename {
         id: String,
         title: Option<String>,
+    },
+    /// Slice TN1 — set a session's effort level / fast lane from the
+    /// composer chips. A whole replacement; the engine says when it takes
+    /// hold and refuses a level the CLI never named.
+    Tune {
+        id: String,
+        tuning: Tuning,
     },
     /// Rail archive click (Stage AC): file a session away, or bring it
     /// back. One bit; the engine never touches the journal for it, so it
@@ -1412,6 +1426,7 @@ async fn feed_loop(
                                 cwd,
                                 extra_args,
                                 prompt,
+                                tuning,
                             }) => {
                                 let agent = AgentConfig {
                                     provider: Some(provider),
@@ -1421,6 +1436,22 @@ async fn feed_loop(
                                 };
                                 match client.open_with_agent(None, cwd, Some(agent)).await {
                                     Ok(info) => {
+                                        // Slice TN1: the launcher's tuning
+                                        // lands on the session it made,
+                                        // before it is subscribed. A
+                                        // refusal is a row note, not a
+                                        // failed launch — the session is
+                                        // real either way.
+                                        if !tuning.is_default() {
+                                            if let Err(e) =
+                                                client.tune(&info.session_id, &tuning).await
+                                            {
+                                                plumbing.push_row_note((
+                                                    info.session_id.clone(),
+                                                    Some(RowNote::Error(e.to_string())),
+                                                ));
+                                            }
+                                        }
                                         // Slice NC1: the words that started
                                         // the chat go first, before the
                                         // subscription — the replay then
@@ -1480,6 +1511,14 @@ async fn feed_loop(
                             // does nothing depending on which pane is up.
                             Some(Command::Rename { id, title }) => {
                                 let note = match client.rename(&id, title.as_deref()).await {
+                                    Ok(_) => None,
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
+                                };
+                                plumbing.push_row_note((id, note));
+                            }
+                            // Slice TN1. Same two-loop rule as Rename.
+                            Some(Command::Tune { id, tuning }) => {
+                                let note = match client.tune(&id, &tuning).await {
                                     Ok(_) => None,
                                     Err(e) => Some(RowNote::Error(e.to_string())),
                                 };
@@ -1727,6 +1766,21 @@ async fn feed_loop(
                         // not stick has to SAY so — the field closes
                         // either way, and a row quietly showing the old
                         // name is the worst reading of that.
+                        // Slice TN1. Off the loop like Rename: a tune may
+                        // write to a live agent, and the refusal (an
+                        // unknown level, a provider with no knob) is a row
+                        // note in the engine's own words.
+                        Some(Command::Tune { id, tuning }) => {
+                            let client = Arc::clone(&client);
+                            let plumbing = plumbing.clone();
+                            tokio::spawn(async move {
+                                let note = match client.tune(&id, &tuning).await {
+                                    Ok(_) => None,
+                                    Err(e) => Some(RowNote::Error(e.to_string())),
+                                };
+                                plumbing.push_row_note((id, note));
+                            });
+                        }
                         Some(Command::Rename { id, title }) => {
                             let client = Arc::clone(&client);
                             let plumbing = plumbing.clone();
@@ -1911,6 +1965,8 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         // loud that nothing real is attached.
         provider: std::env::var("EAVE_REPLAY_PROVIDER").unwrap_or_else(|_| "replay".into()),
         model: None,
+        effort: None,
+        fast: false,
         // Slice AR: `EAVE_REPLAY_CWD` overrides this for captures that
         // need the cwd to be a real DIRECTORY rather than the fixture
         // file — the `/` palette reads `<cwd>/.claude/skills`, and a path
@@ -7413,6 +7469,9 @@ struct Shell {
     mention: MentionPalette,
     /// Access / runtime-mode menu, anchored on the composer chip.
     access: Popup<Point<Pixels>>,
+    /// Slice TN1 — the effort-level menu, anchored on the composer's
+    /// effort chip. The speed chip is a toggle and has no popup.
+    effort_menu: Popup<Point<Pixels>>,
     /// MonoCode model picker — tab, search, favorites. The popup's
     /// open/close/motion is still `launcher.models`.
     model_picker: model_picker::State,
@@ -7839,6 +7898,10 @@ struct LauncherUi {
     /// The chosen `--model`. **`None` means pass no flag at all** — only
     /// when this provider has no catalog (Hermes / an empty CLI answer).
     model: Option<&'static str>,
+    /// Slice TN1 — the effort level / fast lane the next launch carries.
+    /// Starts on the provider's default every time; a tuning is a fact
+    /// about a session, not a remembered preference.
+    tuning: Tuning,
 }
 
 impl Default for LauncherUi {
@@ -7847,6 +7910,7 @@ impl Default for LauncherUi {
         Self {
             provider,
             models: Popup::default(),
+            tuning: Tuning::default(),
             // Slice S2: open on the stored default for the default
             // provider — pre-selected into the picker, never filled in
             // behind it (see `Shell::launch`).
@@ -9711,6 +9775,9 @@ impl Shell {
     }
 
     fn open_access_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.effort_menu.is_open() {
+            self.close_effort_menu(cx);
+        }
         let now = cx.background_executor().now();
         self.access
             .open(at, vec![true; access::MODES.len()], now);
@@ -9762,6 +9829,275 @@ impl Shell {
             rows,
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_access_menu(cx)),
         )
+    }
+
+    // ── Slice TN1 — the composer's tuning chips ──────────────────────────
+
+    /// Whose tuning the chips show and a click changes: the selected
+    /// session's (by id), or at the launcher the choice-in-progress. The
+    /// same split `choose_entry` makes for the model.
+    fn tuning_target(&self, cx: &App) -> (String, Option<String>, Tuning) {
+        if self.transcript.read(cx).session_id.is_some() {
+            if let Some(info) = self.selected_session(cx) {
+                return (
+                    info.provider.clone(),
+                    Some(info.session_id.clone()),
+                    tuning_ui::of_session(info.effort.as_deref(), info.fast),
+                );
+            }
+        }
+        (
+            self.provider().id.to_string(),
+            None,
+            self.launcher.tuning.clone(),
+        )
+    }
+
+    fn apply_tuning(&mut self, tuning: Tuning, cx: &mut Context<Self>) {
+        let (_, session, _) = self.tuning_target(cx);
+        match session {
+            Some(id) => {
+                let _ = self.commands.send(Command::Tune { id, tuning });
+            }
+            None => self.launcher.tuning = tuning,
+        }
+        cx.notify();
+    }
+
+    fn set_effort(&mut self, level: Option<String>, cx: &mut Context<Self>) {
+        let (_, _, mut tuning) = self.tuning_target(cx);
+        tuning.effort = level;
+        self.apply_tuning(tuning, cx);
+        self.close_effort_menu(cx);
+    }
+
+    fn toggle_fast(&mut self, cx: &mut Context<Self>) {
+        let (_, _, mut tuning) = self.tuning_target(cx);
+        tuning.fast = !tuning.fast;
+        self.apply_tuning(tuning, cx);
+    }
+
+    fn open_effort_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.access.is_open() {
+            self.close_access_menu(cx);
+        }
+        let (provider, _, _) = self.tuning_target(cx);
+        let rows = eave_core::provider::tuning_support(&provider)
+            .map(|t| t.levels().len() + 1)
+            .unwrap_or(1);
+        // The chip sits on the composer at the bottom of the well, so the
+        // menu opens UPWARD: the shared layer anchors top-left and snaps
+        // into the window, and six rows dropped from here were pinned to
+        // the bottom margin over the composer (seen live 2026-09-02).
+        // Lift by the menu's own height PLUS the chip's half-height and
+        // the anchor gap: `at` is the pointer on the chip, and a menu
+        // whose bottom row ends exactly there put "Max" under the second
+        // click of a double-click (seen live 2026-09-02 — the session
+        // came up on Max). The snap still guards the top.
+        let lift = rows as f32 * theme::MENU_ROW_H
+            + theme::MENU_PAD_Y * 2.0
+            + theme::CONTROL_H / 2.0
+            + theme::MENU_ANCHOR_GAP
+            + 2.0;
+        let now = cx.background_executor().now();
+        self.effort_menu
+            .open(point(at.x, at.y - px(lift)), vec![true; rows], now);
+        cx.notify();
+    }
+
+    fn close_effort_menu(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self.effort_menu.begin_close(now, cx.reduce_motion()) {
+            overlay::reap(cx, |shell, cx| {
+                let now = cx.background_executor().now();
+                shell.effort_menu.finish_close(now);
+            });
+        }
+        cx.notify();
+    }
+
+    /// The effort menu: *Default*, then the CLI's own levels lowest
+    /// first, each with the CLI's word as its detail so the flag that
+    /// will be passed is never hidden. The current row wears the check.
+    fn effort_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let anchor = *self.effort_menu.data()?;
+        let now = cx.background_executor().now();
+        let reduced = cx.reduce_motion();
+        let live = self.effort_menu.is_open();
+        let highlighted = self.effort_menu.highlighted();
+        let (provider, _, tuning) = self.tuning_target(cx);
+        let levels = eave_core::provider::tuning_support(&provider)
+            .map(|t| t.levels())
+            .unwrap_or(&[]);
+        let rows = tuning_ui::effort_rows(levels, tuning.effort.as_deref())
+            .into_iter()
+            .enumerate()
+            .map(|(ix, row)| {
+                let mut item = MenuItem::new(row.label.clone()).detail(row.detail.clone());
+                if row.current {
+                    item = item.trailing("✓");
+                }
+                let level = row.level.map(str::to_string);
+                overlay::menu_row(
+                    ix,
+                    &item,
+                    highlighted == Some(ix),
+                    live,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_effort(level.clone(), cx);
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        overlay::menu_layer(
+            &self.effort_menu,
+            anchor,
+            now,
+            reduced,
+            rows,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_effort_menu(cx)),
+        )
+    }
+
+    /// The row a highlighted effort-menu key picks: row 0 is Default.
+    fn effort_menu_pick(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let (provider, _, _) = self.tuning_target(cx);
+        let levels = eave_core::provider::tuning_support(&provider)
+            .map(|t| t.levels())
+            .unwrap_or(&[]);
+        let level = match ix {
+            0 => None,
+            n => levels.get(n - 1).map(|l| (*l).to_string()),
+        };
+        self.set_effort(level, cx);
+    }
+
+    /// The two chips, for what `provider` can actually do — an effort
+    /// gauge with the level's word, and a bolt for the fast lane. Nothing
+    /// for a knob the CLI does not take: a control that cannot do
+    /// anything is a lie, so Hermes draws neither and Grok one.
+    ///
+    /// The bolt's on/off is ALSO a selector (`composer-speed-on` /
+    /// `composer-speed-off`), and the gauge's fill count is one, because
+    /// `debug_bounds` reports geometry and never colour — the AG1 #15
+    /// lesson, applied before the walk.
+    fn tuning_chips(
+        &self,
+        provider_id: &str,
+        tuning: &Tuning,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(support) = eave_core::provider::tuning_support(provider_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if support.has_effort() {
+            let levels = support.levels();
+            let lit = tuning_ui::gauge_fill(levels, tuning.effort.as_deref());
+            let label = tuning_ui::effort_chip_label(tuning.effort.as_deref());
+            let ink = if lit > 0 {
+                theme::text()
+            } else {
+                theme::text_secondary_on_wash()
+            };
+            let gauge = div()
+                .debug_selector(move || format!("composer-effort-gauge-{lit}"))
+                .flex_none()
+                .h(px(12.0))
+                .flex()
+                .flex_row()
+                .items_end()
+                .gap(px(1.5))
+                .children((0..tuning_ui::GAUGE_BARS).map(|i| {
+                    let h = 4.0 + 8.0 * (i as f32) / ((tuning_ui::GAUGE_BARS - 1) as f32);
+                    let on = i < lit;
+                    div()
+                        .w(px(2.5))
+                        .h(px(h))
+                        .rounded(px(1.0))
+                        .bg(if on {
+                            theme::accent()
+                        } else {
+                            theme::text_tertiary().opacity(0.35)
+                        })
+                }));
+            out.push(
+                div()
+                    .id("composer-effort")
+                    .debug_selector(|| "composer-effort".into())
+                    .flex_none()
+                    .h(px(theme::CONTROL_H))
+                    .px(px(theme::CONTROL_PAD_X))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::CONTROL_GAP))
+                    .hover_fade("composer-effort", theme::wash_rest(), theme::overlay())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        let at = window.mouse_position();
+                        this.open_effort_menu(
+                            point(at.x, at.y - px(theme::MENU_ANCHOR_GAP)),
+                            cx,
+                        );
+                    }))
+                    .child(gauge)
+                    .child(
+                        div()
+                            .text_size(px(theme::LABEL_SIZE))
+                            .line_height(px(theme::LABEL_LINE))
+                            .text_color(ink)
+                            .child(SharedString::from(label)),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if support.has_speed() {
+            let on = tuning.fast;
+            let ink = if on {
+                theme::accent()
+            } else {
+                theme::text_secondary_on_wash()
+            };
+            out.push(
+                div()
+                    .id("composer-speed")
+                    .debug_selector(|| "composer-speed".into())
+                    .flex_none()
+                    .h(px(theme::CONTROL_H))
+                    .px(px(theme::CONTROL_PAD_X))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
+                    .hover_fade("composer-speed", theme::wash_rest(), theme::overlay())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_fast(cx);
+                    }))
+                    .child(icons::tagged_icon(
+                        icons::BOLT,
+                        14.0,
+                        ink,
+                        if on {
+                            "composer-speed-on"
+                        } else {
+                            "composer-speed-off"
+                        },
+                    ))
+                    .children(on.then(|| {
+                        div()
+                            .text_size(px(theme::LABEL_SIZE))
+                            .line_height(px(theme::LABEL_LINE))
+                            .text_color(ink)
+                            .child(SharedString::from("Fast"))
+                    }))
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     fn maybe_auto_approve(&mut self, cx: &mut Context<Self>) {
@@ -10979,6 +11315,25 @@ impl Shell {
                         }
                     }
                     None => self.close_access_menu(cx),
+                },
+                _ => {}
+            }
+            return;
+        }
+        if self.effort_menu.is_open() {
+            match ks.key.as_str() {
+                "escape" => self.close_effort_menu(cx),
+                "down" => {
+                    self.effort_menu.highlight_next();
+                    cx.notify();
+                }
+                "up" => {
+                    self.effort_menu.highlight_prev();
+                    cx.notify();
+                }
+                "enter" => match self.effort_menu.highlighted() {
+                    Some(ix) => self.effort_menu_pick(ix, cx),
+                    None => self.close_effort_menu(cx),
                 },
                 _ => {}
             }
@@ -25153,6 +25508,9 @@ impl Shell {
         if self.access.is_open() {
             self.close_access_menu(cx);
         }
+        if self.effort_menu.is_open() {
+            self.close_effort_menu(cx);
+        }
         let now = cx.background_executor().now();
         let current_ix = self.picker_provider_ix(cx);
         if let Some(path) = Self::picker_store_path() {
@@ -25390,6 +25748,7 @@ impl Shell {
                 .extra_args_for(p.id)
                 .to_vec(),
             prompt,
+            tuning: self.launcher.tuning.clone(),
         });
         cx.notify();
     }
@@ -26896,6 +27255,18 @@ impl Render for Shell {
 
         let context_window = self.transcript.read(cx).transcript.context;
         let runtime_mode = self.composer.read(cx).runtime_mode;
+        // Slice TN1: whose tuning the chips show — the chat's, or at the
+        // launcher the choice-in-progress (the model chip's own split).
+        let tuning_target: Option<(String, Tuning)> = if show_launcher {
+            Some((
+                self.provider().id.to_string(),
+                self.launcher.tuning.clone(),
+            ))
+        } else {
+            composer_session
+                .as_ref()
+                .map(|i| (i.provider.clone(), tuning_ui::of_session(i.effort.as_deref(), i.fast)))
+        };
         let home = home_dir();
         let project_name = composer_session
             .as_ref()
@@ -27109,6 +27480,12 @@ impl Render for Shell {
                             }))
                             .into_any_element()
                         }))
+                        .children(
+                            tuning_target
+                                .as_ref()
+                                .map(|(p, t)| self.tuning_chips(p, t, cx))
+                                .unwrap_or_default(),
+                        )
                         .child(
                             div()
                                 .id("composer-access")
@@ -27396,6 +27773,7 @@ impl Render for Shell {
         // split/well branch.
         let launcher_menu = self.launcher_menu_layer(cx);
         let access_layer = self.access_layer(cx);
+        let effort_layer = self.effort_layer(cx);
         // Built here for the same reason the launcher and its menu are:
         // it needs `self` and `cx`, and the element chain below has
         // neither to spare. Slash and `@` never share a frame.
@@ -28047,6 +28425,7 @@ impl Render for Shell {
             // surface and the demo is a test fixture.
             .children(launcher_menu)
             .children(access_layer)
+            .children(effort_layer)
             // Slice E1. Root-mounted for the reason `overlay::menu_layer`
             // gives: `deferred` fixes paint order but layout stays where it
             // is written, and this menu opens over a region that also holds
@@ -29606,6 +29985,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         slash: SlashPalette::default(),
                         mention: MentionPalette::default(),
                         access: Popup::default(),
+                        effort_menu: Popup::default(),
                         model_picker: model_picker::State::default(),
                         mention_files: HashMap::new(),
                         mention_loading: false,
@@ -30397,6 +30777,8 @@ mod tests {
             archived: false,
             provider: "claude-code".into(),
             model: None,
+            effort: None,
+            fast: false,
             cwd: "/tmp/repo".into(),
             created_ts_ms: created,
             last_activity_ms: activity,
@@ -31031,6 +31413,8 @@ mod tests {
             archived: false,
             provider: "claude-code".into(),
             model: None,
+            effort: None,
+            fast: false,
             cwd: "/w".into(),
             created_ts_ms: 1,
             last_activity_ms: Some(2),
@@ -31097,6 +31481,8 @@ mod tests {
             archived: false,
             provider: "claude-code".into(),
             model: None,
+            effort: None,
+            fast: false,
             cwd: "/w".into(),
             created_ts_ms: 1,
             last_activity_ms: Some(200),
@@ -31813,6 +32199,8 @@ mod tests {
             archived: false,
             provider: "claude-code".into(),
             model: None,
+            effort: None,
+            fast: false,
             cwd: "/w/eave".into(),
             created_ts_ms: 1,
             last_activity_ms: None,

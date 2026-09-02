@@ -411,6 +411,7 @@ mod tests {
             child: None,
             title: None,
             archived: false,
+            tuning: Default::default(),
         };
         meta.save(&dir).expect("meta");
 

@@ -1035,6 +1035,20 @@ impl crate::provider::AgentAdapter for HermesSession {
                  complete list rather than a failed search.",
     };
 
+    const TUNING: crate::tuning::TuningSupport = crate::tuning::TuningSupport {
+        effort: crate::tuning::EffortSupport::None {
+            reason: "Hermes 0.20.4 reads its effort from `config.yaml` (`agent.reasoning_effort`) \
+                     only: the top-level `--reasoning LEVEL` reaches `hermes chat` and not \
+                     `hermes acp`, whose parser has no such flag, and the ACP adapter's \
+                     `set_config_option` stores the value on the session and nothing reads it \
+                     back (acp_adapter/server.py, 2026-09-02). Setting it would mean writing the \
+                     operator's config file, which eave does not do.",
+        },
+        speed: crate::tuning::SpeedSupport::None {
+            reason: "no fast lane on this CLI (2026-09-02).",
+        },
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         HermesSession::spawn(cfg)
     }

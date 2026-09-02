@@ -217,6 +217,10 @@ pub struct SpawnConfig {
     /// own flags. Already filtered by [`conflicts_with_eave_flags`] at the
     /// engine boundary — the adapter trusts this list.
     pub extra_args: Vec<String>,
+    /// The session's effort level and fast lane at this spawn
+    /// (`crate::tuning`). Already checked against the adapter's own
+    /// `TUNING` at the engine boundary — an unknown level never gets here.
+    pub tuning: crate::tuning::Tuning,
 }
 
 impl SpawnConfig {
@@ -229,6 +233,7 @@ impl SpawnConfig {
             extra_env: Vec::new(),
             model: None,
             extra_args: Vec::new(),
+            tuning: crate::tuning::Tuning::default(),
         }
     }
 }
@@ -405,6 +410,18 @@ pub trait AgentSession: Send {
     /// stdin. Adapters with no interrupt on their wire return `Ok` and
     /// do nothing — a no-op is honest; killing the session is not.
     async fn interrupt(&mut self) -> Result<(), SessionError>;
+
+    /// Carry a changed effort level / fast lane to the RUNNING process,
+    /// for providers whose wire takes it mid-conversation
+    /// (`Applies::NextTurn` in this adapter's `TUNING`). The default does
+    /// nothing, which is the right answer for an adapter whose CLI only
+    /// reads the value from argv — the engine restarts those between
+    /// turns instead (see `crate::tuning`). An adapter that declares
+    /// `NextTurn` on any axis MUST override this; a source test in
+    /// `provider.rs` refuses one that does not.
+    async fn tune(&mut self, _tuning: &crate::tuning::Tuning) -> Result<(), SessionError> {
+        Ok(())
+    }
 
     /// Ask the provider to drop the tail of its conversation, so the next
     /// turn runs as if everything after `target` never happened

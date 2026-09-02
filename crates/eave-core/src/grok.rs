@@ -266,6 +266,14 @@ fn spawn_args(cfg: &SpawnConfig) -> Vec<String> {
         args.push("-m".into());
         args.push(model.clone());
     }
+    // Tuning: argv only (`grok agent --reasoning-effort`, alias `--effort`),
+    // an option of `grok agent` like `-m`, so before the subcommand. Absent
+    // = the CLI's remembered per-model choice, which is what a bare start
+    // gets. No fast lane on this CLI.
+    if let Some(level) = &cfg.tuning.effort {
+        args.push("--reasoning-effort".into());
+        args.push(level.clone());
+    }
     args.push("stdio".into());
     // Verbatim and last, already filtered of anything that would undo the
     // posture at the engine boundary (`session::conflicts_with_eave_flags`).
@@ -316,6 +324,24 @@ impl crate::provider::AgentAdapter for GrokSession {
         reason: "Grok's ACP wire has no conversation rewind: `session/load` only. Its binary \
                  contains `session/fork`, but as a Rust MODULE PATH and never as a quoted \
                  method name — checked 2026-08-31.",
+    };
+
+    const TUNING: crate::tuning::TuningSupport = crate::tuning::TuningSupport {
+        effort: crate::tuning::EffortSupport::Levels {
+            levels: &["low", "medium", "high", "xhigh"],
+            applies: crate::tuning::Applies::NextSpawn,
+            evidence: "`grok agent --reasoning-effort <EFFORT>` (1.0.13 `--help`, no enum \
+                       printed). The words are from a live `session/new` 2026-09-02: \
+                       `availableModels[]._meta.reasoningEfforts` lists low/medium/high/xhigh \
+                       for grok-4.6 (default high) and low/medium/high for grok-4.5; with the \
+                       flag set to `low` the same handshake's `_x.ai/models/update` echoed \
+                       `reasoningEffort: low`. Union across models; argv only — the ACP surface \
+                       has `session/set_model` but no effort setter.",
+        },
+        speed: crate::tuning::SpeedSupport::None {
+            reason: "no fast lane on this CLI: `grok agent --help` has no speed/fast option and \
+                     the binary's only `speed` strings are scroll settings (2026-09-02).",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -1721,5 +1747,23 @@ mod tests {
         }
         assert!(backgrounded > 0, "the backgrounding push must be recorded");
         assert!(completed > 0, "the completion push must be recorded");
+    }
+
+    /// Slice TN1. `--reasoning-effort` is an option of `grok agent`, so
+    /// it sits before `stdio` like `-m`; the default passes nothing.
+    #[test]
+    fn a_reasoning_effort_is_argv_before_the_subcommand() {
+        let mut cfg = SpawnConfig::new("/bin/false", "/tmp", "s".into());
+        assert!(!spawn_args(&cfg)
+            .iter()
+            .any(|a| a == "--reasoning-effort"));
+        cfg.tuning.effort = Some("xhigh".into());
+        let args = spawn_args(&cfg);
+        let e = args
+            .iter()
+            .position(|a| a == "--reasoning-effort")
+            .expect("flag");
+        assert_eq!(args[e + 1], "xhigh");
+        assert!(e < args.iter().position(|a| a == "stdio").unwrap());
     }
 }

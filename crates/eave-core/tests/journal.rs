@@ -50,6 +50,7 @@ fn test_meta(session_id: &str) -> Meta {
         child: None,
         title: None,
         archived: false,
+        tuning: Default::default(),
     }
 }
 

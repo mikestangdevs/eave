@@ -533,6 +533,21 @@ impl Client {
             .info)
     }
 
+    /// Slice TN1 — set a session's effort level / fast lane. A whole
+    /// replacement; the reply says when it takes hold.
+    pub async fn tune(
+        &self,
+        session_id: &str,
+        tuning: &eave_core::tuning::Tuning,
+    ) -> Result<eave_wire::TuneOk, ClientError> {
+        self.request::<eave_wire::TuneOk>(Request::Tune {
+            session_id: session_id.into(),
+            effort: tuning.effort.clone(),
+            fast: tuning.fast,
+        })
+        .await
+    }
+
     /// File a session away, or bring it back (Stage AC).
     ///
     /// One bit in `meta.json`; the journal is never touched, so this is

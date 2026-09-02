@@ -310,6 +310,20 @@ impl crate::provider::AgentAdapter for CursorSession {
                  the string alone would have read as support.",
     };
 
+    const TUNING: crate::tuning::TuningSupport = crate::tuning::TuningSupport {
+        effort: crate::tuning::EffortSupport::None {
+            reason: "cursor-agent takes effort INSIDE the model id (`--help` 2026.08.11: \
+                     `claude-opus-4-8[context=1m,effort=high,fast=false]`), and the words each \
+                     model accepts are only listed by `--list-models`, which answered \
+                     \"Authentication required\" on this machine 2026-09-02. Not offered until \
+                     measured — the mechanics are a `session/set_model` resend.",
+        },
+        speed: crate::tuning::SpeedSupport::None {
+            reason: "same seam and the same unmeasured list as the effort level: `fast=` inside \
+                     the model id, listable only after `agent login`.",
+        },
+    };
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         CursorSession::spawn(cfg)
     }
