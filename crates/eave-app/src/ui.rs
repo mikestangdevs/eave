@@ -108,6 +108,22 @@ actions!(
         /// be worst exactly where the map could not fit.
         JumpPrevTurn,
         JumpNextTurn,
+        /// Slice AG1 #16 — ⌥⌘T, hand this session to its CLI's own TUI,
+        /// and take it back.
+        ///
+        /// An ACTION and not an `on_key` arm, which matters more here than
+        /// anywhere else it has mattered: gpui dispatches a matched action
+        /// ahead of the bubble-phase listeners, so this fires even while
+        /// the terminal has the keyboard. The `on_key` gate that forwards
+        /// keystrokes to the pty runs in the bubble phase and never sees
+        /// it, which is what stops a handed-over session swallowing its
+        /// own way out.
+        ///
+        /// ⌥⌘ rather than ⌘⇧: it is a fact about the session you are
+        /// reading, like the turn walk directly above, not a move between
+        /// sessions. T for terminal — ⌘T is the new tab and stays that
+        /// way.
+        ToggleTerminal,
         /// Slice C5 — ⌘T.
         NewTab,
         /// **Slice W1 — ⌘N, a second window.**
@@ -287,6 +303,26 @@ enum FeedEvent {
     Restored {
         reply: Box<eave_wire::RestoreOk>,
     },
+    /// Slice AG1 #16 — the engine's answer to a handover request. Carries
+    /// refusals too, which is the whole reason it is a feed event and not
+    /// a silent success: the sentence is what the operator needs.
+    TermOpened {
+        reply: Box<eave_wire::TermOpenOk>,
+    },
+    /// Everything the TUI had drawn when this client attached. Fed to the
+    /// emulator from the start, which is what makes a re-attach land on
+    /// the screen the TUI is actually showing.
+    TermScreen {
+        cols: u16,
+        rows: u16,
+        data: Vec<u8>,
+    },
+    /// Bytes the TUI wrote since.
+    TermBytes {
+        data: Vec<u8>,
+    },
+    /// The TUI ended — quit by the operator, or gone.
+    TermExited,
     Reset {
         id: String,
     },
@@ -308,6 +344,65 @@ enum FeedEvent {
         epoch: u64,
         records: Vec<eave_core::journal::Record>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Slice AG1 #16 — the terminal panel's geometry
+
+/// Menlo's advance, as a fraction of the font size.
+///
+/// `theme::MONO` is Menlo and `theme.rs` already states the number ("its
+/// advance is a fixed 0.60 em"); this is that fact, used. It is arithmetic
+/// rather than a text-system measurement because the grid has to agree
+/// with what the pty was told, and a measurement that drifted by a
+/// half-pixel would put the last column off the edge.
+/// `a_menlo_cell_is_the_width_this_grid_assumes` measures the real font and
+/// fails if the assumption stops holding.
+const TERM_ADVANCE_EM: f32 = 0.60;
+/// **Rounded UP, deliberately.** gpui rounds a glyph advance to whole
+/// pixels when it paints, so Menlo's 6.9 px cell occupies 7. Computing the
+/// pty's column count from the unrounded value promises the TUI more
+/// columns than the panel can draw, and the overflow is invisible — the
+/// last column simply falls off the right edge. Rounding up under-counts
+/// by less than a column and can only leave a sliver of unused panel.
+const TERM_CELL_W: f32 = theme::CODE_SIZE * TERM_ADVANCE_EM;
+const TERM_CELL_PAINTED: f32 = 7.0;
+
+/// Where the terminal panel last painted, in pixels. Written by the
+/// panel's canvas, read when a handover is opened or the window resizes.
+thread_local! {
+    static TERM_BOUNDS: std::cell::Cell<Option<(f32, f32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The panel's size in CELLS — what the pty is told it is.
+///
+/// Before the first paint there is nothing measured, and 80×24 is the
+/// conventional answer. It is corrected on the very next frame, and the
+/// pty is only told when the number CHANGES, so an opening handover that
+/// briefly assumed 80×24 costs one resize rather than a wrong screen.
+fn term_grid() -> (u16, u16) {
+    let Some((w, h)) = TERM_BOUNDS.with(|b| b.get()) else {
+        return (80, 24);
+    };
+    let pad = theme::SPACE_2 * 2.;
+    let cols = ((w - pad) / TERM_CELL_PAINTED).floor();
+    let rows = ((h - pad) / theme::CODE_LINE).floor();
+    (
+        (cols as i64).clamp(20, 1000) as u16,
+        (rows as i64).clamp(4, 500) as u16,
+    )
+}
+
+/// A terminal colour as a gpui one.
+fn rgb_to_hsla(c: alacritty_terminal::vte::ansi::Rgb) -> gpui::Hsla {
+    gpui::Rgba {
+        r: c.r as f32 / 255.,
+        g: c.g as f32 / 255.,
+        b: c.b as f32 / 255.,
+        a: 1.,
+    }
+    .into()
 }
 
 /// One drained attention burst; last frame wins (the overlay is a current-
@@ -391,6 +486,23 @@ enum Command {
         last_seen_msg_id: Option<String>,
         dropped: usize,
     },
+    /// Slice AG1 #16 — hand this session to the provider's own TUI, and
+    /// attach to it. The size is the panel's, so the pty is born the shape
+    /// it will be painted at.
+    TermOpen {
+        cols: u16,
+        rows: u16,
+    },
+    /// Keystrokes for the attached TUI, already encoded as terminal bytes
+    /// by `terminal::encode_key` — the shell does the encoding because it
+    /// is the side that knows the application-cursor mode.
+    TermInput(Vec<u8>),
+    TermResize {
+        cols: u16,
+        rows: u16,
+    },
+    /// End the handover and give the session back to eave.
+    TermClose,
     /// Projection lost sync (seq gap): drop and fully resubscribe.
     Resubscribe,
     /// Rail row click: subscribe this session instead (cursorless — the
@@ -1677,6 +1789,13 @@ async fn feed_loop(
                             // session exists.
                             | Some(Command::Rewind { .. })
                             | Some(Command::Restore { .. })
+                            // Slice AG1 #16: there is no session to hand
+                            // over while nothing is selected, and no pty
+                            // to type at.
+                            | Some(Command::TermOpen { .. })
+                            | Some(Command::TermInput(_))
+                            | Some(Command::TermResize { .. })
+                            | Some(Command::TermClose)
                             | Some(Command::Resubscribe)
                             | Some(Command::Diff(_))
                             | Some(Command::Decide { .. }) => {}
@@ -1708,6 +1827,13 @@ async fn feed_loop(
                     Ok((id, rx)) => (id, Some(rx)),
                     Err(_) => continue 'conn,
                 };
+            // Slice AG1 #16. Unlike files, this is not opened on switch:
+            // there is a pty to attach to only for a session that has been
+            // handed over, and asking for one that has not is an error the
+            // operator never asked to see. `TermOpen` opens it; a switch
+            // drops it with the loop.
+            let mut term_id: Option<u64> = None;
+            let mut term_rx: Option<tokio_mpsc::UnboundedReceiver<SubscriptionItem>> = None;
             // Why the loop breaks with a reason instead of continuing its
             // labels directly: a switch must first unsubscribe the old
             // streams (Slice I1) — without that the engine keeps streaming
@@ -1737,6 +1863,48 @@ async fn feed_loop(
                             // fact and stop polling the dead receiver.
                             plumbing.push_files((session_id.clone(), None));
                             files_rx = None;
+                        }
+                    },
+                    item = async {
+                        match term_rx.as_mut() {
+                            Some(trx) => trx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match item {
+                        Some(SubscriptionItem::TermScreen { cols, rows, data, .. }) => {
+                            match eave_wire::b64_decode(&data) {
+                                Ok(data) => plumbing.push_feed(FeedEvent::TermScreen {
+                                    cols,
+                                    rows,
+                                    data,
+                                }),
+                                // Undecodable bytes are a protocol fault,
+                                // not a screen. Feeding the emulator
+                                // garbage would leave a plausible-looking
+                                // wrong screen; ending the attach makes
+                                // the surface say the terminal went away.
+                                Err(_) => plumbing.push_feed(FeedEvent::TermExited),
+                            }
+                        }
+                        Some(SubscriptionItem::TermOutput { data, .. }) => {
+                            if let Ok(data) = eave_wire::b64_decode(&data) {
+                                plumbing.push_feed(FeedEvent::TermBytes { data });
+                            }
+                        }
+                        Some(SubscriptionItem::TermExited { .. }) => {
+                            plumbing.push_feed(FeedEvent::TermExited);
+                            term_id = None;
+                            term_rx = None;
+                        }
+                        Some(_) => {} // the terminal stream carries nothing else
+                        None => {
+                            // The engine dropped the stream — including
+                            // because it lagged, which it answers by
+                            // ending rather than by skipping bytes a vt
+                            // stream cannot resynchronise after.
+                            plumbing.push_feed(FeedEvent::TermExited);
+                            term_id = None;
+                            term_rx = None;
                         }
                     },
                     item = watch_rx.recv() => match item {
@@ -1769,7 +1937,14 @@ async fn feed_loop(
                         | Some(SubscriptionItem::Files { .. })
                         | Some(SubscriptionItem::Tabs { .. })
                         | Some(SubscriptionItem::Permissions { .. })
-                        | Some(SubscriptionItem::Bookmarks { .. }) => {}
+                        | Some(SubscriptionItem::Bookmarks { .. })
+                        // Slice AG1 #16: a handed-over session's pty rides
+                        // its own `term_attach` stream, for the same reason
+                        // files do — it is the busiest subscription in the
+                        // protocol and nothing else should pay for it.
+                        | Some(SubscriptionItem::TermScreen { .. })
+                        | Some(SubscriptionItem::TermOutput { .. })
+                        | Some(SubscriptionItem::TermExited { .. }) => {}
                         None => break StreamEnd::Conn, // connection gone → reconnect
                     },
                     cmd = commands.recv() => match cmd {
@@ -1975,6 +2150,49 @@ async fn feed_loop(
                                 }
                             }
                         }
+                        Some(Command::TermOpen { cols, rows }) => {
+                            let reply = client
+                                .term_open(&session_id, cols, rows)
+                                .await
+                                .unwrap_or_else(|e| eave_wire::TermOpenOk {
+                                    opened: false,
+                                    cols: 0,
+                                    rows: 0,
+                                    reason: Some(format!("the engine could not be asked: {e}")),
+                                    unsupported: false,
+                                });
+                            // Attach BEFORE the surface is told it opened,
+                            // so the first paint has a stream behind it.
+                            if reply.opened {
+                                match client.term_attach(&session_id).await {
+                                    Ok((id, rx)) => {
+                                        term_id = Some(id);
+                                        term_rx = Some(rx);
+                                    }
+                                    Err(_) => break StreamEnd::Conn,
+                                }
+                            }
+                            plumbing.push_feed(FeedEvent::TermOpened {
+                                reply: Box::new(reply),
+                            });
+                        }
+                        Some(Command::TermInput(bytes)) => {
+                            // A keystroke that misses is not worth a
+                            // notice: the TUI has exited, and the
+                            // `TermExited` frame is what says so.
+                            let _ = client.term_input(&session_id, &bytes).await;
+                        }
+                        Some(Command::TermResize { cols, rows }) => {
+                            let _ = client.term_resize(&session_id, cols, rows).await;
+                        }
+                        Some(Command::TermClose) => {
+                            if let Some(id) = term_id.take() {
+                                let _ = client.unsubscribe(id).await;
+                            }
+                            term_rx = None;
+                            let _ = client.term_close(&session_id).await;
+                            plumbing.push_feed(FeedEvent::TermExited);
+                        }
                         Some(Command::Resubscribe) => {
                             cursor = None;
                             break StreamEnd::Switch;
@@ -2048,6 +2266,14 @@ async fn feed_loop(
                     // connection is discovered by the next subscribe.
                     let _ = client.unsubscribe(sub_id).await;
                     let _ = client.unsubscribe(files_id).await;
+                    // The terminal stream is the busiest subscription in
+                    // the protocol; leaving one attached to a deselected
+                    // session streams a TUI nobody is painting for the
+                    // connection's whole life. The pty itself stays open —
+                    // switching away is not ending the handover.
+                    if let Some(id) = term_id.take() {
+                        let _ = client.unsubscribe(id).await;
+                    }
                     continue 'session;
                 }
                 StreamEnd::Conn => continue 'conn,
@@ -2230,7 +2456,10 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
                 | SubscriptionItem::Files { .. }
                 | SubscriptionItem::Tabs { .. }
                 | SubscriptionItem::Permissions { .. }
-                | SubscriptionItem::Bookmarks { .. } => {}
+                | SubscriptionItem::Bookmarks { .. }
+                | SubscriptionItem::TermScreen { .. }
+                | SubscriptionItem::TermOutput { .. }
+                | SubscriptionItem::TermExited { .. } => {}
             }
         }
     }
@@ -3281,6 +3510,11 @@ fn state_color(state: &str) -> Hsla {
         // but not a fault, so warning and never danger.
         "quiet" | "awaiting_approval" => theme::warning(),
         "unresponsive" | "failed" => theme::danger(),
+        // Slice AG1 #16. Neutral on purpose: a handed-over session is not
+        // a fault and not a request for attention — it is a session
+        // somebody is driving by hand. eave may not derive alarm about a
+        // state the operator deliberately chose.
+        "terminal" => theme::text_secondary(),
         _ => theme::text_secondary(),
     }
 }
@@ -3296,6 +3530,12 @@ fn state_badge(state: &str) -> Option<&'static str> {
         "unresponsive" => Some("unresponsive"),
         "failed" => Some("failed"),
         "awaiting_approval" => Some("waiting on you"),
+        // Slice AG1 #16. It earns a WORD, unlike the other neutral
+        // states, because it is the one case where the rail's silence
+        // would be read as knowledge: every other wordless row means
+        // "settled, nothing to say", and this one means "eave cannot
+        // see". Those must not look alike.
+        "terminal" => Some("terminal"),
         _ => None,
     }
 }
@@ -3961,6 +4201,11 @@ fn attention_rank(state: &str) -> u8 {
         "unresponsive" => 3,
         "quiet" => 2,
         "running" => 1,
+        // Slice AG1 #16: below `running` deliberately. A handed-over
+        // session has the operator's attention already — they are typing
+        // in it — so sorting it up the rail would push a session that
+        // does need looking at further down.
+        "terminal" => 0,
         _ => 0,
     }
 }
@@ -5201,6 +5446,19 @@ struct TranscriptState {
     /// loaded guns, and the operator cannot see which one their next
     /// click belongs to. Arming a second disarms the first.
     restore_armed: Option<(u64, usize)>,
+    /// Slice AG1 #16 — the emulator for a session handed to its provider's
+    /// TUI. `Some` **is** the handed-over state: the surface draws a
+    /// terminal exactly when there is one to draw, so the mode cannot get
+    /// out of step with the thing it describes.
+    term: Option<crate::terminal::Emulator>,
+    /// The engine's answer to a handover request, same `take`-once mailbox
+    /// rule as `rewind_reply` — a refusal must be shown once, not on every
+    /// unrelated notify.
+    term_reply: Option<eave_wire::TermOpenOk>,
+    /// The last refusal, kept on screen until the operator tries again.
+    /// Separate from `term_reply` because that one is taken and gone; this
+    /// is what the panel renders.
+    term_error: Option<String>,
     /// Slice Q2: the engine's own words when a launch was refused. Lives
     /// here rather than on `Shell` because it is cleared by the same feed
     /// event that clears the session — the two facts arrive together and
@@ -5285,6 +5543,9 @@ impl TranscriptState {
             rewind_ok: false,
             rewind_reply: None,
             restore_reply: None,
+            term: None,
+            term_reply: None,
+            term_error: None,
             restore_armed: None,
             launch_error: None,
             transcript: Transcript::new(),
@@ -5794,6 +6055,14 @@ items={count} rows={} frames={} ops={}",
         // kind.
         self.restore_reply = None;
         self.restore_armed = None;
+        // The emulator holds ANOTHER session's screen. Keeping it across a
+        // switch would paint one session's TUI under a different session's
+        // name — the exact class of bug `rows_session` exists to prevent.
+        // The pty is not closed: switching away is not ending a handover,
+        // and coming back re-attaches and replays.
+        self.term = None;
+        self.term_reply = None;
+        self.term_error = None;
         self.transcript.reset();
         self.display.update(&self.transcript);
         self.list.reset(self.display.len() + 1);
@@ -12680,6 +12949,23 @@ impl Shell {
             self.omnibox_key(ks, cx);
             return;
         }
+        // ── Slice AG1 #16 ─────────────────────────────────────────────
+        //
+        // A handed-over session's keyboard belongs to the TUI. It sits
+        // below the two modal gates above (a page dialog stops Chromium;
+        // the omnibox is a field the operator opened instead of typing)
+        // and above everything else, because while a terminal is up it IS
+        // the input — the composer is not mounted, so there is nothing
+        // else a character could reasonably reach.
+        //
+        // **⌘ chords fall through on purpose.** `encode_key` answers
+        // `None` for them, and that is what keeps eave reachable from
+        // inside a terminal: ⌘⌥T toggles back out, ⌘W closes, the menus
+        // work. A terminal that swallowed ⌘ would trap the operator in it.
+        if let Some((bytes, _)) = self.term_key(ks, cx) {
+            let _ = self.commands.send(Command::TermInput(bytes));
+            return;
+        }
         // ── Slice E1 ──────────────────────────────────────────────────
         //
         // The find bar owns the keyboard while it is up, but **not all of
@@ -13533,6 +13819,49 @@ impl Shell {
     ///
     /// From the observer and `take`n, the same route and the same
     /// once-only rule as [`Self::apply_rewind_reply`].
+    /// Whether the selected session is handed over to its provider's TUI.
+    ///
+    /// The emulator's presence **is** the mode — there is no second flag
+    /// that could disagree with it, which is the same rule the rail's
+    /// `unseen_finish` follows: one place decides, everything else reads.
+    fn handed_over(&self, cx: &App) -> bool {
+        self.transcript.read(cx).term.is_some()
+    }
+
+    /// The bytes a keystroke should send to the attached TUI, if any.
+    ///
+    /// `None` when nothing is handed over, or when the chord belongs to
+    /// eave (see `encode_key`). The second element is the application
+    /// cursor mode it was encoded under, kept so a test can assert the
+    /// mode actually reached the encoder rather than being defaulted.
+    fn term_key(&self, ks: &gpui::Keystroke, cx: &App) -> Option<(Vec<u8>, bool)> {
+        let t = self.transcript.read(cx);
+        let em = t.term.as_ref()?;
+        let app_cursor = em.app_cursor();
+        crate::terminal::encode_key(ks, app_cursor).map(|b| (b, app_cursor))
+    }
+
+    /// The toggle. Hands the session over, or takes it back.
+    ///
+    /// **One method for both directions**, because they are one decision —
+    /// "who is driving this session". It is drawn twice, once in each
+    /// mode's own chrome (the composer strip hands over; the terminal's
+    /// own bar hands back), because the composer is unmounted while a
+    /// session is handed over and a control that vanished in one direction
+    /// would strand the operator in the terminal.
+    fn toggle_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.handed_over(cx) {
+            let _ = self.commands.send(Command::TermClose);
+        } else {
+            // The size the panel will paint at, so the pty is born the
+            // right shape. `term_grid` falls back to a conventional 80×24
+            // only before the first paint has measured anything.
+            let (cols, rows) = term_grid();
+            let _ = self.commands.send(Command::TermOpen { cols, rows });
+        }
+        cx.notify();
+    }
+
     fn apply_restore_reply(&mut self, cx: &mut Context<Self>) {
         let Some(reply) = self.transcript.update(cx, |t, _| t.restore_reply.take()) else {
             return;
@@ -13575,6 +13904,23 @@ impl Shell {
     /// registry — and never from a second list here. The engine refuses
     /// or accepts from that same table, so the control and the request
     /// cannot disagree about what a provider can do.
+    /// The provider running the session whose ROWS are on screen.
+    ///
+    /// `rows_session`, not `session_id` — the same distinction AG1 #13
+    /// paid for: `FeedEvent::Session` moves the subscription id the moment
+    /// the operator switches, while the rows stay until `Reset`, so keying
+    /// off the wrong one offers a control for session B against session
+    /// A's content.
+    fn selected_provider(&self, cx: &App) -> Option<String> {
+        let id = self.transcript.read(cx).rows_session.clone()?;
+        self.sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .find(|s| s.session_id == id)
+            .map(|s| s.provider.clone())
+    }
+
     fn refresh_rewind_gate(&self, cx: &mut Context<Self>) {
         let Some(id) = self.transcript.read(cx).rows_session.clone() else {
             self.transcript.update(cx, |t, _| t.rewind_ok = false);
@@ -16656,6 +17002,235 @@ impl Shell {
     /// taller than the well. The rail arrives on the second frame. That
     /// is the same lateness waku's `chat_viewport_width` gate carries and
     /// it is invisible at frame rate.
+    /// The terminal panel: a handed-over session's TUI, painted (Slice
+    /// AG1 #16).
+    ///
+    /// Substituted for the transcript at the ONE place the transcript
+    /// element is built, upstream of the split/docked branch — the same
+    /// spot, and for the same reason, as the turn rail: a page has two
+    /// render paths and anything replacing the well must not be written
+    /// twice.
+    fn terminal_el(&self, cx: &mut Context<Self>) -> AnyElement {
+        // **Resize the EMULATOR and the pty together, or neither is right.**
+        //
+        // The first version told the pty its new size and left the local
+        // emulator at the old one, so the pty was 214 columns wide while
+        // the grid parsing its output still wrapped at 80 — a TUI drawing
+        // full-width lines into a screen that folded them a third of the
+        // way across. Walked, seen, fixed. The two sizes are one fact and
+        // they are set in one place.
+        let (cols, rows) = term_grid();
+        let (screen, resized) = self.transcript.update(cx, |t, _| match t.term.as_mut() {
+            Some(em) => {
+                let resized = em.resize(cols, rows);
+                (em.screen(), resized)
+            }
+            None => (crate::terminal::Screen::default(), false),
+        });
+        // **The pty is told the size from the paint, because the paint is
+        // the only thing that knows it** — and only when it CHANGES.
+        //
+        // A side effect in render, which this codebase otherwise refuses
+        // (the follow-up queue releases from the observers, never the
+        // paint). The difference is that a resize is derived from geometry
+        // and geometry exists nowhere else, and the guard makes it
+        // idempotent: `Emulator::resize` answers whether anything actually
+        // moved, and every forwarded resize raises SIGWINCH which every TUI
+        // repaints on — so an unguarded version would paint, resize,
+        // repaint, forever.
+        if resized {
+            let _ = self.commands.send(Command::TermResize { cols, rows });
+        }
+        let cell_w = px(TERM_CELL_PAINTED);
+        let cell_h = px(theme::CODE_LINE);
+
+        let mut grid = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .font_family(theme::MONO)
+            .text_size(px(theme::CODE_SIZE))
+            .line_height(cell_h);
+
+        for line in &screen.lines {
+            let mut row = div().flex().flex_row().h(cell_h).flex_none();
+            for run in line {
+                let mut span = div()
+                    .flex_none()
+                    // **NEVER a fixed width, and never wrapping.**
+                    //
+                    // The first draft pinned each run to `cell_w × chars`,
+                    // which is the obvious way to state the grid — and it
+                    // wrapped every run one character early, because gpui
+                    // rounds a glyph advance UP and Menlo's 6.9 px cell
+                    // paints at 7. An 8-character run in a 55.2 px box
+                    // needs 56, so the last character went to its own line
+                    // and a TUI's whole screen came apart. Walked, seen,
+                    // fixed. `whitespace_nowrap` is what actually holds a
+                    // terminal line together; the alignment comes from the
+                    // font being monospaced, which
+                    // `every_character_in_the_terminal_font_is_the_same_width`
+                    // is there to keep true.
+                    .whitespace_nowrap()
+                    .text_color(rgb_to_hsla(run.fg))
+                    .child(run.text.clone());
+                if let Some(bg) = run.bg {
+                    span = span.bg(rgb_to_hsla(bg));
+                }
+                if run.bold {
+                    span = span.font_weight(gpui::FontWeight::BOLD);
+                }
+                if run.italic {
+                    span = span.italic();
+                }
+                if run.underline {
+                    span = span.underline();
+                }
+                row = row.child(span);
+            }
+            grid = grid.child(row);
+        }
+
+        // The cursor is drawn OVER the grid rather than by restyling the
+        // cell under it: splitting a run to invert one character would
+        // break the run collapsing that keeps a screen to a few dozen
+        // elements, and it would do so on the one cell that moves every
+        // keystroke.
+        if let Some((line, col)) = screen.cursor {
+            grid = grid.child(
+                div()
+                    .absolute()
+                    .top(cell_h * line as f32)
+                    .left(cell_w * col as f32)
+                    .w(cell_w)
+                    .h(cell_h)
+                    .bg(theme::accent().alpha(0.55)),
+            );
+        }
+
+        div()
+            .id("terminal-panel")
+            .debug_selector(|| "terminal-panel".into())
+            .relative()
+            .size_full()
+            // The terminal paints its OWN background, not the theme's. A
+            // TUI's palette was chosen against a dark terminal, and
+            // re-hosting it on eave's surface changes contrast its authors
+            // picked — the same rule `project_color` keeps from the other
+            // side: a colour somebody CHOSE is rendered verbatim.
+            .bg(rgb_to_hsla(crate::terminal::DEFAULT_BG))
+            .child(
+                // A zero-paint canvas records the panel's size, which is
+                // what the cols/rows the pty is told are computed from.
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        TERM_BOUNDS.with(|b| {
+                            b.set(Some((
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                            )))
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(div().absolute().inset_0().p(px(theme::SPACE_2)).child(grid))
+            // **The bar that says eave is not watching.**
+            //
+            // Not decoration. Everywhere else in eave the surface reports
+            // what the journal saw; for the length of a handover it saw
+            // nothing, and a terminal drawn without that sentence would
+            // look like eave rendering the session. It also carries the
+            // way back, because the composer — which is where the other
+            // half of this toggle lives — is unmounted right now.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .m(px(theme::SPACE_2))
+                    .px(px(theme::SPACE_2))
+                    .py(px(theme::SPACE_HALF))
+                    .rounded(px(composer::TOOL_RADIUS))
+                    .child(
+                        div()
+                            .debug_selector(|| "terminal-notice".into())
+                            .text_size(px(theme::MICRO_SIZE))
+                            .text_color(theme::text_tertiary())
+                            .child("eave is not watching this stretch"),
+                    )
+                    .child(
+                        div()
+                            .id("terminal-back")
+                            .debug_selector(|| "terminal-back".into())
+                            .px(px(theme::SPACE_1))
+                            .rounded(px(composer::TOOL_RADIUS))
+                            .text_size(px(theme::LABEL_SIZE))
+                            .text_color(theme::text_secondary_on_wash())
+                            .child("back to eave")
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|shell, _, _, cx| shell.toggle_terminal(cx)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The hand-over control, for the composer strip.
+    ///
+    /// Absent — not disabled — for a provider with no TUI eave can point
+    /// at a conversation. `terminal_support` is the gate, read from the
+    /// same registry the engine reads, so the surface cannot offer a
+    /// handover the engine would refuse.
+    fn terminal_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let provider = self.selected_provider(cx)?;
+        if !eave_core::session::terminal_support(&provider).is_native() {
+            return None;
+        }
+        Some(
+            div()
+                .id("composer-terminal")
+                .debug_selector(|| "composer-terminal".into())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACE_HALF))
+                .flex_none()
+                .px(px(theme::SPACE_2))
+                .rounded(px(composer::TOOL_RADIUS))
+                // eave has no terminal glyph and this slice does not add
+                // one: MONITOR is the closest by SUBJECT (a screen you
+                // type at), which is the rule AG1 #11 settled when it
+                // reached for a history icon and found `refresh.svg` was
+                // `restart.svg` mirrored.
+                .child(icons::tagged_icon(
+                    icons::MONITOR,
+                    theme::ICON_STATUS,
+                    theme::text_secondary_on_wash(),
+                    "composer-terminal-glyph",
+                ))
+                .child(
+                    div()
+                        .text_size(px(theme::LABEL_SIZE))
+                        .text_color(theme::text_secondary_on_wash())
+                        .child("terminal"),
+                )
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|shell, _, _, cx| shell.toggle_terminal(cx)),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn turn_rail_el(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (well_w, viewport_h, scrollable) = {
             let t = self.transcript.read(cx);
@@ -31377,7 +31952,22 @@ impl Render for Shell {
         // typed into existence, so a blank ⌘T tab now RAISES the composer
         // with the launcher. `dock_mounted` is the old meaning: the
         // composer in the well's bottom stack or the empty cluster.
-        let composer_mounted = show_launcher || !well_taken;
+        //
+        // Slice AG1 #16: and a handed-over session's composer is UNMOUNTED.
+        // Not disabled — unmounted, the way the launcher unmounts it. A
+        // composer sends to the headless agent, and while a session is
+        // handed over there is no headless agent: the engine settled it so
+        // two CLIs could not write one conversation. Leaving a greyed
+        // composer on screen would show an input whose only honest
+        // behaviour is to refuse, next to a terminal that accepts the same
+        // text. One input, no ambiguity about where a message goes.
+        //
+        // **NC1 INVERTED this line after #16 was written.** #16's own
+        // version read `!show_launcher && !showing_page`, from before the
+        // launcher hosted the composer — taking it verbatim would have
+        // reverted NC1. The handover is ANDed onto NC1's rule instead.
+        let handed_over = state.term.is_some();
+        let composer_mounted = (show_launcher || !well_taken) && !handed_over;
         let dock_mounted = composer_mounted && !show_launcher;
         // Only when the page element is actually in the tree this frame.
         // Focusing a handle that is not mounted is how the whole
@@ -31430,16 +32020,54 @@ impl Render for Shell {
         // in a helper both call"* — and wrapping the element itself, once,
         // upstream of the branch, is the cheapest way to obey it: there is
         // no second mount to forget.
-        let transcript_el = div()
-            .relative()
-            .size_full()
-            .child(
-                list(list_state, move |ix, _window, cx| {
-                    transcript_entity.read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
-                })
-                .size_full(),
-            )
-            .children(self.turn_rail_el(cx));
+        // Slice AG1 #16: the terminal takes the well when the session is
+        // handed over. Substituted HERE, at the one place the transcript
+        // element is built and upstream of the split/docked branch, so
+        // there is no second mount to forget.
+        let transcript_el = if handed_over {
+            self.terminal_el(cx)
+        } else {
+            div()
+                .relative()
+                .size_full()
+                // **The transcript measures the well for the terminal.**
+                //
+                // A pty is created at a size, and the TUI draws its first
+                // screen immediately — Claude's trust prompt is on screen
+                // before any resize could arrive, and it does not redraw on
+                // SIGWINCH because it is already finished drawing. So the
+                // FIRST size has to be right, and the only thing that knows
+                // the well's size before a terminal is in it is whatever is
+                // in it now. The two occupy exactly the same box.
+                //
+                // Walked: without this the first handover opened at 80×24
+                // inside a 214-column panel and Claude wrapped its prompt a
+                // third of the way across.
+                .child(
+                    gpui::canvas(
+                        move |bounds, _, _| {
+                            TERM_BOUNDS.with(|b| {
+                                b.set(Some((
+                                    f32::from(bounds.size.width),
+                                    f32::from(bounds.size.height),
+                                )))
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(
+                    list(list_state, move |ix, _window, cx| {
+                        transcript_entity
+                            .read_with(cx, |state, _| Shell::render_row(state, ix, pulse))
+                    })
+                    .size_full(),
+                )
+                .children(self.turn_rail_el(cx))
+                .into_any_element()
+        };
 
         // Here rather than beside `composer_mounted` above: that read of the
         // transcript is still borrowed at that point, and this needs `cx`
@@ -31627,6 +32255,12 @@ impl Render for Shell {
                                 .into_any_element()
                         }))
                         .child(div().flex_1())
+                        // Slice AG1 #16 — hand this session to its CLI's
+                        // own TUI. Beside the meter rather than among the
+                        // send controls: it changes who is driving, which
+                        // is a fact about the session, not an action on
+                        // the message being written.
+                        .children(self.terminal_toggle(cx))
                         .children(composer::context_meter(context_window))
                         .children((!usage.is_empty()).then(|| {
                             div()
@@ -32196,6 +32830,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.walk_rail(true, cx)))
             .on_action(cx.listener(|this, _: &JumpPrevTurn, _, cx| this.walk_turn(false, cx)))
             .on_action(cx.listener(|this, _: &JumpNextTurn, _, cx| this.walk_turn(true, cx)))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, _, cx| this.toggle_terminal(cx)))
             .on_action(cx.listener(|this, _: &ApproveOldest, _, cx| this.decide_oldest(true, cx)))
             .on_action(cx.listener(|this, _: &DenyOldest, _, cx| this.decide_oldest(false, cx)))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
@@ -32607,6 +33242,25 @@ impl Render for Shell {
                                                 .children(diff_el)
                                                 .children(frame.dock.map(|d| -> AnyElement { match d {} }))
                                                 .when(!well_taken && empty_el.is_none(), |d| {
+                                                    // **A terminal takes the well
+                                                    // WITHOUT the fade or the top pad**
+                                                    // (Slice AG1 #16). Both exist so a
+                                                    // scrolling transcript dissolves at
+                                                    // its edges instead of being guillotined
+                                                    // — a terminal does not scroll under
+                                                    // anything: it is an exact rectangle of
+                                                    // cells, and the pty was told how many.
+                                                    //
+                                                    // Walked, and the fade was hiding the
+                                                    // STATUS BAR — the densest line a TUI
+                                                    // draws, and the one it puts at the very
+                                                    // bottom. The pad would have shifted the
+                                                    // grid off its own row height too.
+                                                    if handed_over {
+                                                        return d.child(
+                                                            div().size_full().child(transcript_el),
+                                                        );
+                                                    }
                                                     d.child(
                                                         edge_faded(
                                                             theme::TRANSCRIPT_FADE_BAND_TOP,
@@ -33454,6 +34108,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // arrow, so the composer keeps everything it had.
         KeyBinding::new("cmd-alt-up", JumpPrevTurn, None),
         KeyBinding::new("cmd-alt-down", JumpNextTurn, None),
+        KeyBinding::new("cmd-alt-t", ToggleTerminal, None),
         // Slice Y: the three a macOS user reaches for without thinking.
         // Bound here rather than expressed as `OsAction`s because eave's
         // gpui pin has no Minimize/Close variants (see `app_menus`).
@@ -33847,6 +34502,40 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                 }
                                 FeedEvent::Restored { reply } => {
                                     state.restore_reply = Some(*reply);
+                                }
+                                // Slice AG1 #16.
+                                FeedEvent::TermOpened { reply } => {
+                                    state.term_error = if reply.opened {
+                                        None
+                                    } else {
+                                        reply.reason.clone()
+                                    };
+                                    if reply.opened && state.term.is_none() {
+                                        state.term = Some(crate::terminal::Emulator::new(
+                                            reply.cols, reply.rows,
+                                        ));
+                                    }
+                                    state.term_reply = Some(*reply);
+                                }
+                                FeedEvent::TermScreen { cols, rows, data } => {
+                                    // The replay is the screen. A fresh
+                                    // emulator sized to the pty, fed from
+                                    // the start, arrives where the TUI is
+                                    // — feeding a replay into an emulator
+                                    // that already has content would paint
+                                    // the screen twice.
+                                    let mut em = crate::terminal::Emulator::new(cols, rows);
+                                    em.feed(&data);
+                                    state.term = Some(em);
+                                    state.term_error = None;
+                                }
+                                FeedEvent::TermBytes { data } => {
+                                    if let Some(em) = state.term.as_mut() {
+                                        em.feed(&data);
+                                    }
+                                }
+                                FeedEvent::TermExited => {
+                                    state.term = None;
                                 }
                                 FeedEvent::Session { id } => {
                                     if state.session_id.as_deref() != Some(id.as_str()) {

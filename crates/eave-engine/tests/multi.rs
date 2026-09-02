@@ -197,7 +197,10 @@ async fn drain_records(
             // rather than drop it into the ignore arm above.
             SubscriptionItem::Tabs { .. }
             | SubscriptionItem::Bookmarks { .. }
-            | SubscriptionItem::Permissions { .. } => {
+            | SubscriptionItem::Permissions { .. }
+            | SubscriptionItem::TermScreen { .. }
+            | SubscriptionItem::TermOutput { .. }
+            | SubscriptionItem::TermExited { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
         }

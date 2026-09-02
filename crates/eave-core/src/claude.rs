@@ -418,6 +418,28 @@ impl crate::provider::AgentAdapter for ClaudeCodeSession {
         },
     };
 
+    const TERMINAL: crate::provider::TerminalSupport = crate::provider::TerminalSupport::Native {
+        evidence: "`claude --resume <id>`. The CLI is interactive BY DEFAULT — its own `--help` \
+                   reads \"starts an interactive session by default, use -p/--print for \
+                   non-interactive output\" — so eave gets the TUI by NOT passing the headless \
+                   flags, rather than by finding a flag that asks for one. Claude is also the \
+                   one provider whose conversation id eave NAMES (`--session-id` at spawn, see \
+                   the module header), so the cursor handed to the TUI is the same string eave \
+                   has been journalling all along. Read 2026-09-01 from 2.1.251's `--help`.",
+    };
+
+    fn tui_args(cursor: Option<&str>) -> Option<Vec<String>> {
+        // No cursor means this session has never run a provider, so there
+        // is nothing to resume and the bare interactive invocation is
+        // right. That is not a degraded case: handing over a session that
+        // has not started yet is exactly what an operator who wants to
+        // begin in the TUI is asking for.
+        Some(match cursor {
+            Some(id) => vec!["--resume".into(), id.into()],
+            None => Vec::new(),
+        })
+    }
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         ClaudeCodeSession::spawn(cfg)
     }

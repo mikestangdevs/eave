@@ -130,6 +130,8 @@ pub mod display;
 pub mod fixture;
 /// Slice AG1 #12 — the jump-to-turn rail in the transcript's left gutter.
 pub mod turn_rail;
+/// Slice AG1 #16 — the emulator half of a handover to a provider's TUI.
+pub mod terminal;
 pub mod markdown;
 pub mod theme;
 

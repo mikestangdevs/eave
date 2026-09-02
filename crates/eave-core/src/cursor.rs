@@ -331,6 +331,23 @@ impl crate::provider::AgentAdapter for CursorSession {
         },
     };
 
+    const TERMINAL: crate::provider::TerminalSupport = crate::provider::TerminalSupport::None {
+        reason: "cursor-agent has a TUI and eave cannot prove it would open on the right \
+                 conversation. Its `--resume [chatId]` (read 2026-09-01) addresses a chatId, \
+                 and what eave holds for this session is the id cursor-agent issued over ACP; \
+                 that those name the same thing has not been measured. Resuming the wrong chat \
+                 fails SILENTLY — the operator lands in a real conversation that simply is not \
+                 theirs — so this is a \"not yet\", not a \"cannot\", and it needs one live \
+                 check to become Native.",
+    };
+
+    fn tui_args(_cursor: Option<&str>) -> Option<Vec<String>> {
+        // Deliberately not `--resume` with the ACP id on the chance the
+        // spaces coincide. A guessed cursor here does not fail loudly; it
+        // opens somebody else's conversation.
+        None
+    }
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         CursorSession::spawn(cfg)
     }

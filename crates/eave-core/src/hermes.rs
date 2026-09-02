@@ -1056,6 +1056,26 @@ impl crate::provider::AgentAdapter for HermesSession {
         },
     };
 
+    const TERMINAL: crate::provider::TerminalSupport = crate::provider::TerminalSupport::Native {
+        evidence: "`hermes --tui --resume <SESSION>`. Both flags are in its top-level usage line \
+                   (read 2026-09-01): `--resume SESSION` and an explicit `--tui`. Hermes is the \
+                   one provider that needs the flag rather than getting the TUI by default — \
+                   the module header already records that `--cli` / `--tui` are its human \
+                   REPLs and emit no machine-readable frames, which is the same fact from the \
+                   other side.",
+    };
+
+    fn tui_args(cursor: Option<&str>) -> Option<Vec<String>> {
+        // `--tui` is not optional here even for a fresh session: without
+        // it Hermes picks a surface from its own config, and a handover
+        // that lands in `--cli` because of a setting eave never read is a
+        // silent substitution of one product for another.
+        Some(match cursor {
+            Some(id) => vec!["--tui".into(), "--resume".into(), id.into()],
+            None => vec!["--tui".into()],
+        })
+    }
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         HermesSession::spawn(cfg)
     }

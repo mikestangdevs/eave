@@ -50,7 +50,10 @@ fn replay(mut check: impl FnMut(usize, &eave_app::display::DiffOps, usize, usize
             // they were.
             SubscriptionItem::Tabs { .. }
             | SubscriptionItem::Bookmarks { .. }
-            | SubscriptionItem::Permissions { .. } => {}
+            | SubscriptionItem::Permissions { .. }
+            | SubscriptionItem::TermScreen { .. }
+            | SubscriptionItem::TermOutput { .. }
+            | SubscriptionItem::TermExited { .. } => {}
             SubscriptionItem::Events { epoch, records, .. } => {
                 let before = open_fences(&display);
                 transcript
@@ -145,7 +148,10 @@ fn incremental_fold_equals_batch_rebuild() {
             // they were.
             SubscriptionItem::Tabs { .. }
             | SubscriptionItem::Bookmarks { .. }
-            | SubscriptionItem::Permissions { .. } => {}
+            | SubscriptionItem::Permissions { .. }
+            | SubscriptionItem::TermScreen { .. }
+            | SubscriptionItem::TermOutput { .. }
+            | SubscriptionItem::TermExited { .. } => {}
         }
     }
     let mut batch = DisplayList::new();

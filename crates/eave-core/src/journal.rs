@@ -181,6 +181,45 @@ pub enum JournalEvent {
         files: Vec<String>,
         undo_tree: String,
     },
+    /// The operator handed this session to the provider's own TUI
+    /// (Slice AG1 #16), and **eave stopped watching**.
+    ///
+    /// This is the record that keeps the journal honest across a stretch
+    /// it did not witness. A TUI speaks to a human over a byte stream —
+    /// there are no frames to decode — so between this record and
+    /// [`JournalEvent::TerminalReturned`] the conversation continued and
+    /// eave saw none of it. Without the pair, a transcript would show the
+    /// turns before and after with nothing between them, which reads as
+    /// "nothing happened" and is the `omitted > 0` lie in another costume.
+    ///
+    /// `cursor` is the provider conversation the TUI was pointed at, kept
+    /// because it is what makes the handover checkable: if the operator
+    /// lands somewhere unexpected, this record says exactly which id eave
+    /// asked for.
+    TerminalOpened {
+        cursor: Option<String>,
+        /// The argv eave ran, after the program. Recorded because the
+        /// support table is a measurement that can go stale — when a CLI
+        /// changes its flags underneath eave (which is what happened to
+        /// AG1 #14's `TodoWrite`), this is the line that says what was
+        /// actually tried.
+        args: Vec<String>,
+    },
+    /// The TUI ended and eave is watching again (Slice AG1 #16).
+    ///
+    /// **eave cannot say what happened in between, and does not guess.**
+    /// It knows when the handover started and when it ended, and that is
+    /// what the transcript states. Counting turns by reading the
+    /// provider's own session file afterwards was considered and refused:
+    /// it would mean eave's journal quoting a file eave does not own, and
+    /// a count that silently disagreed with the conversation would be
+    /// worse than the honest gap.
+    TerminalReturned {
+        /// Whether the TUI exited on its own (the operator quit it) or
+        /// eave closed it because the operator toggled back. Not the same
+        /// event, and only the record can tell them apart afterwards.
+        closed_by_operator: bool,
+    },
     /// Terminal record for one **process segment**. A journal that was
     /// continued via `--resume` (spec 02 §Resume contract) holds one
     /// segment per CLI process, each ending in `Closed`; the journal as a
@@ -595,6 +634,11 @@ fn crash_tail_repair(path: &Path, records: &mut Vec<Record>) -> io::Result<Repai
             // session; and a restore, like a rewind, is only ever recorded
             // while nothing is running.
             JournalEvent::Checkpoint { .. } | JournalEvent::Restored { .. } => {}
+            // A handover touches no turn either. It is deliberately NOT an
+            // implicit close: the turns eave already recorded stay exactly
+            // as they were, and the pair of records brackets the gap
+            // rather than pretending the session ended.
+            JournalEvent::TerminalOpened { .. } | JournalEvent::TerminalReturned { .. } => {}
             JournalEvent::ToolInterrupted { id } => {
                 in_flight.remove(id);
             }

@@ -22973,7 +22973,6 @@ fn a_checkpoint_belongs_to_the_turn_it_preceded(cx: &mut TestAppContext) {
     );
 }
 
-
 // ── Slice ID2b — the containment flip ──────────────────────────────────
 
 /// A session in a stated task under a stated project (Slice ID2b).
@@ -25021,4 +25020,48 @@ fn a_closed_tab_does_not_hand_its_hang_to_the_next_one(cx: &mut TestAppContext) 
         !shown(vcx, "page-hung"),
         "a reused tab id inherited the last page's hang"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Slice AG1 #16 — handing a session to its provider's TUI
+
+/// **The terminal grid is arithmetic, and this is what licenses that.**
+///
+/// `TERM_CELL_W` is `CODE_SIZE × 0.60` because `theme.rs` states Menlo's
+/// advance is a fixed 0.60 em. The panel tells the pty a column count
+/// computed from that number and then paints cells at it, so if the real
+/// font disagrees the last column falls off the edge and every box-drawing
+/// character in every TUI is a fraction out. Measured against the real
+/// macOS text system rather than trusted from the comment it came from.
+#[test]
+fn a_menlo_cell_is_the_width_this_grid_assumes() {
+    // Twenty characters, so a per-glyph rounding error shows up twenty
+    // times over instead of hiding under one pixel of tolerance.
+    let n = 20;
+    let sample = "M".repeat(n);
+    let measured = f32::from(real_text_width(&sample, theme::MONO, theme::CODE_SIZE)) / n as f32;
+    let assumed = theme::CODE_SIZE * 0.60;
+    assert!(
+        (measured - assumed).abs() < 0.05,
+        "Menlo's advance at {}px measured {measured} and the grid assumes \
+         {assumed} — the terminal's columns would drift {} px across an \
+         80-column screen",
+        theme::CODE_SIZE,
+        (measured - assumed).abs() * 80.,
+    );
+}
+
+/// Menlo really is monospaced — the whole grid rests on it, and a font
+/// substitution would show up here first.
+#[test]
+fn every_character_in_the_terminal_font_is_the_same_width() {
+    let w = |s: &str| f32::from(real_text_width(s, theme::MONO, theme::CODE_SIZE));
+    let m = w("M");
+    for s in ["i", "W", "1", ".", "@", "█"] {
+        assert!(
+            (w(s) - m).abs() < 0.05,
+            "{s:?} is {} wide where M is {m} — the grid assumes one advance",
+            w(s)
+        );
+    }
 }

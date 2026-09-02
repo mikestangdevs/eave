@@ -588,6 +588,21 @@ impl crate::provider::AgentAdapter for PiSession {
         },
     };
 
+    const TERMINAL: crate::provider::TerminalSupport = crate::provider::TerminalSupport::None {
+        reason: "pi has a TUI and its resume-by-id flag has the wrong failure mode. `--session-id \
+                 <id>` is documented (2026-09-01) as \"Use exact project session ID, creating it \
+                 if missing\" — so a cursor eave got wrong does not error, it silently opens an \
+                 EMPTY session under that name, which reads on screen as a conversation that \
+                 lost its history. `--session <path|id>` takes a partial UUID and eave has not \
+                 measured that it accepts pi's own announced id. One live check away.",
+    };
+
+    fn tui_args(_cursor: Option<&str>) -> Option<Vec<String>> {
+        // See TERMINAL: the flag that would do this creates on miss, and a
+        // handover that invents an empty conversation is worse than none.
+        None
+    }
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         PiSession::spawn(cfg)
     }

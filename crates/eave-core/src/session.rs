@@ -153,6 +153,33 @@ pub fn rewind_support(provider: &str) -> crate::provider::RewindSupport {
         })
 }
 
+/// Whether this provider's CLI has a TUI eave can hand a session to
+/// (Slice AG1 #16), derived from the adapter registry exactly as
+/// [`rewind_support`] and [`posture_is_verified`] are — never a second
+/// list.
+///
+/// An **unknown** provider answers [`TerminalSupport::None`] rather than
+/// `Option::None`, for the reason spelled out on `rewind_support`: every
+/// caller has the same question and the same right answer, and a nullable
+/// return would make each one invent the sentence.
+pub fn terminal_support(provider: &str) -> crate::provider::TerminalSupport {
+    crate::provider::adapter(provider)
+        .map(|a| a.terminal)
+        .unwrap_or(crate::provider::TerminalSupport::None {
+            reason: "eave has no adapter for this provider",
+        })
+}
+
+/// The argv that opens `provider`'s TUI on `cursor`, or `None` when it
+/// has none eave can use.
+///
+/// The engine calls this; the app calls [`terminal_support`] to decide
+/// whether to draw the control. Both read the same registry row, which is
+/// what stops the app offering a handover the engine would refuse.
+pub fn tui_argv(provider: &str, cursor: Option<&str>) -> Option<Vec<String>> {
+    crate::provider::adapter(provider).and_then(|a| a.tui_args(cursor))
+}
+
 /// Flags a caller may not smuggle through [`AgentConfig::extra_args`],
 /// because they would undo the posture proof rather than extend it.
 ///

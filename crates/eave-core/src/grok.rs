@@ -382,6 +382,26 @@ impl crate::provider::AgentAdapter for GrokSession {
         },
     };
 
+    const TERMINAL: crate::provider::TerminalSupport = crate::provider::TerminalSupport::Native {
+        evidence: "`grok --resume <ID>`. Its `--help` (read 2026-09-01) documents `-r, --resume \
+                   [<SESSION_ID_OR_TITLE>]` with \"UUID-shaped values always mean IDs\", which \
+                   is what makes an id unambiguous against the title matching it also does. \
+                   Grok mints its own session ids and eave already journals the one it \
+                   announced (see the module header), so that is the cursor handed over. The \
+                   binary's own name for itself is \"Grok Build TUI\".",
+    };
+
+    fn tui_args(cursor: Option<&str>) -> Option<Vec<String>> {
+        // `--resume` with no value resumes the most recent session for the
+        // cwd, which is a DIFFERENT conversation than the one being handed
+        // over whenever the operator has two open on one checkout. So a
+        // session with no cursor gets a fresh TUI, never a bare `--resume`.
+        Some(match cursor {
+            Some(id) => vec!["--resume".into(), id.into()],
+            None => Vec::new(),
+        })
+    }
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         GrokSession::spawn(cfg)
     }

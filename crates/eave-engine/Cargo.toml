@@ -13,6 +13,10 @@ libc = "0.2"
 notify = "8"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+# Slice AG1 #16: the pty a provider's TUI runs in. Chosen over driving
+# forkpty directly because it also carries the resize and the process-group
+# leader, which is what lets eave's existing kill ladder apply unchanged.
+portable-pty = "0.8"
 
 # The engine role's process entry. The shipped app embeds the same role in
 # the `eave` binary (`eave --engine`); this standalone bin exists so wire

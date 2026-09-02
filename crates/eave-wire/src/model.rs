@@ -608,6 +608,31 @@ impl Transcript {
                     },
                 });
             }
+            // The pair that keeps the transcript honest across a stretch
+            // eave did not witness. Both are said out loud, and the words
+            // are careful: eave states that it STOPPED WATCHING, never
+            // that nothing happened, because it does not know.
+            JournalEvent::TerminalOpened { .. } => {
+                self.push_row(Row::Marker {
+                    text: "handed to the terminal — eave is not watching this stretch".to_string(),
+                });
+            }
+            JournalEvent::TerminalReturned { closed_by_operator } => {
+                self.push_row(Row::Marker {
+                    text: if *closed_by_operator {
+                        "back from the terminal — anything done there is not in this transcript"
+                            .to_string()
+                    } else {
+                        // The TUI ended by itself. Worth distinguishing:
+                        // the operator did not ask to come back, so the
+                        // surface returning is something that happened TO
+                        // them, and a transcript that said "back from the
+                        // terminal" would imply they chose it.
+                        "the terminal exited — anything done there is not in this transcript"
+                            .to_string()
+                    },
+                });
+            }
             JournalEvent::ApprovalDecided {
                 request_id,
                 allowed,
@@ -1203,6 +1228,80 @@ mod tests {
             ts_ms: 0,
             event,
         }
+    }
+
+    /// **The handover bracket must be VISIBLE**, not merely journalled.
+    ///
+    /// The whole honesty argument rests on an operator scrolling back and
+    /// seeing that eave stopped watching. Two records that fold to no rows
+    /// would leave the turns before and after a handover adjacent with
+    /// nothing between them, which reads as "nothing happened" — the exact
+    /// lie the records exist to prevent.
+    #[test]
+    fn a_handover_puts_two_markers_in_the_transcript() {
+        let mut t = Transcript::default();
+        t.apply(
+            1,
+            &[
+                rec(1, JournalEvent::UserSent { text: "hi".into() }),
+                rec(
+                    2,
+                    JournalEvent::TerminalOpened {
+                        cursor: Some("abc".into()),
+                        args: vec!["--resume".into(), "abc".into()],
+                    },
+                ),
+                rec(
+                    3,
+                    JournalEvent::TerminalReturned {
+                        closed_by_operator: true,
+                    },
+                ),
+            ],
+        )
+        .expect("no gaps");
+        let markers: Vec<&str> = t
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Marker { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            markers.iter().any(|m| m.contains("not watching")),
+            "the handover states that eave stopped watching: {markers:?}"
+        );
+        assert!(
+            markers.iter().any(|m| m.contains("not in this transcript")),
+            "and the return says what it cannot show: {markers:?}"
+        );
+    }
+
+    /// A TUI the operator did not close reads differently from one they
+    /// did — coming back is something that happened TO them.
+    #[test]
+    fn a_terminal_that_exited_by_itself_says_so() {
+        let mut t = Transcript::default();
+        t.apply(
+            1,
+            &[rec(
+                1,
+                JournalEvent::TerminalReturned {
+                    closed_by_operator: false,
+                },
+            )],
+        )
+        .expect("no gaps");
+        let m = t
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Marker { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a marker");
+        assert!(m.contains("terminal exited"), "{m}");
     }
 
     /// **Slice CC.** The two token facts fold independently, and a

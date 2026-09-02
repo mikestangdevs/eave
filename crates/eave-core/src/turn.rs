@@ -454,6 +454,14 @@ impl TurnLedger {
             // letting either stand in for provider activity would make a
             // session look alive because eave touched git.
             JournalEvent::Checkpoint { .. } | JournalEvent::Restored { .. } => Fold::Silent,
+            // Slice AG1 #16. Neither opens nor closes a turn: a handover
+            // brackets a stretch eave did not see, and inventing a turn
+            // boundary around it would put a turn in the ledger that no
+            // `TurnCompleted` can ever close — the exact input the
+            // documented ledger hole cannot survive.
+            JournalEvent::TerminalOpened { .. } | JournalEvent::TerminalReturned { .. } => {
+                Fold::Silent
+            }
             JournalEvent::Provider { event } => match event {
                 SessionEvent::TurnCompleted { .. } => {
                     // **The frame closes the turn that was actually open.**

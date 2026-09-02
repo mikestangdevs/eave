@@ -456,6 +456,84 @@ impl Client {
         Ok((id, rx))
     }
 
+    /// Slice AG1 #16 — hand this session to the provider's own TUI.
+    ///
+    /// `Ok` covers refusals as well, the same contract
+    /// [`rewind`](Self::rewind) keeps: a session with a turn in flight, or
+    /// a provider with no TUI, is an ANSWER whose sentence the operator
+    /// needs to read. `Err` is reserved for the socket.
+    pub async fn term_open(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<eave_wire::TermOpenOk, ClientError> {
+        self.request::<eave_wire::TermOpenOk>(Request::TermOpen {
+            session_id: session_id.into(),
+            cols,
+            rows,
+        })
+        .await
+    }
+
+    /// Follow a handed-over session's pty: one `TermScreen` with
+    /// everything drawn so far, then `TermOutput` as it arrives.
+    ///
+    /// Returns the request id too, because a client that switches
+    /// sessions **must** unsubscribe the old one — an attached terminal
+    /// stream is the busiest subscription in the protocol.
+    pub async fn term_attach(
+        &self,
+        session_id: &str,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<SubscriptionItem>), ClientError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending.lock().unwrap().insert(id, Pending::Stream(tx));
+        self.write(&RequestEnvelope {
+            id,
+            request: Request::TermAttach {
+                session_id: session_id.into(),
+            },
+        })
+        .await?;
+        Ok((id, rx))
+    }
+
+    /// Raw bytes for the TUI's stdin.
+    pub async fn term_input(
+        &self,
+        session_id: &str,
+        bytes: &[u8],
+    ) -> Result<eave_wire::TermOk, ClientError> {
+        self.request::<eave_wire::TermOk>(Request::TermInput {
+            session_id: session_id.into(),
+            data: eave_wire::b64_encode(bytes),
+        })
+        .await
+    }
+
+    pub async fn term_resize(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<eave_wire::TermOk, ClientError> {
+        self.request::<eave_wire::TermOk>(Request::TermResize {
+            session_id: session_id.into(),
+            cols,
+            rows,
+        })
+        .await
+    }
+
+    /// End the handover and give the session back to eave.
+    pub async fn term_close(&self, session_id: &str) -> Result<eave_wire::TermOk, ClientError> {
+        self.request::<eave_wire::TermOk>(Request::TermClose {
+            session_id: session_id.into(),
+        })
+        .await
+    }
+
     /// Cancel a streaming request by its id (Slice I1): the engine stops
     /// the task and releases what it held; this side drops the pending
     /// entry so stray in-flight frames on the id fall on the floor.

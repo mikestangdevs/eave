@@ -133,6 +133,57 @@ impl RewindSupport {
     }
 }
 
+/// **Whether this provider's CLI has a TUI eave can hand a session to**
+/// (Slice AG1 #16).
+///
+/// The third declaration on this trait, and it is declared for exactly
+/// the reasons [`PostureProof`] and [`RewindSupport`] are: it is a fact
+/// about someone else's CLI, it is not derivable from anything in this
+/// crate, and **a wrong guess is invisible** — an adapter that guessed
+/// would open a TUI on the wrong conversation, or on a fresh one, and the
+/// operator would see a plausible empty prompt rather than an error.
+///
+/// The bar is deliberately higher than "has an interactive mode". All six
+/// CLIs have one. What a *handover* needs is an interactive mode that
+/// resumes a named conversation **by id, with no picker**, because eave
+/// is handing over a session that already exists and the operator must
+/// land in it — not in a list of it and forty others.
+///
+/// Measured against the installed binaries on 2026-09-01 by reading each
+/// CLI's own `--help` contract, not from a doc:
+///
+/// | Provider | Opens on an id |
+/// | --- | --- |
+/// | Claude Code | `claude --resume <id>` — and eave NAMES the id |
+/// | Codex | `codex resume <SESSION_ID>` |
+/// | Grok | `grok --resume <ID>` — "UUID-shaped values always mean IDs" |
+/// | Hermes | `hermes --tui --resume <SESSION>` |
+/// | Cursor | `--resume [chatId]` — a chatId, which is not the ACP id eave holds |
+/// | Pi | `--session-id <id>` creates when missing, which is the wrong failure |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSupport {
+    /// This CLI opens its TUI on a conversation eave names, and
+    /// `evidence` names the measurement — a pointer to one, exactly as
+    /// [`PostureProof::Verified`] carries one.
+    Native { evidence: &'static str },
+    /// It does not, or eave cannot yet address it. `reason` is shown to
+    /// the operator **verbatim**, so it is written for one — the same
+    /// house rule as [`RewindSupport::None`].
+    ///
+    /// The two `None`s here are **not the same fact**, and their reasons
+    /// say which is which: Cursor and Pi both have a TUI, and eave simply
+    /// cannot prove it would land on the right conversation. That is a
+    /// "not yet", and it is written as one so the next reader does not
+    /// re-derive the difference.
+    None { reason: &'static str },
+}
+
+impl TerminalSupport {
+    pub fn is_native(&self) -> bool {
+        matches!(self, TerminalSupport::Native { .. })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The adapter contract
 
@@ -169,6 +220,24 @@ pub trait AgentAdapter: AgentSession + Sized + 'static {
     /// See [`crate::tuning`]. Measured from the installed binary, never
     /// read from a doc.
     const TUNING: TuningSupport;
+    /// This adapter's own answer to "does your CLI have a TUI eave can
+    /// hand this session to, and how do you know". See
+    /// [`TerminalSupport`].
+    const TERMINAL: TerminalSupport;
+
+    /// The arguments that open this CLI's TUI on `cursor` — the
+    /// provider's own id for the conversation, or `None` for one that has
+    /// never run.
+    ///
+    /// Returns the argv **after the program**, and `None` when this
+    /// adapter cannot open a TUI at all. That makes the two halves of the
+    /// declaration checkable against each other rather than merely
+    /// adjacent: [`tests::a_terminal_claim_comes_with_arguments`] refuses
+    /// an adapter whose const and whose argv disagree, in both
+    /// directions. A `Native` that built no command would offer a control
+    /// that does nothing; a `None` that built one would mean the reason
+    /// shown to the operator is a lie.
+    fn tui_args(cursor: Option<&str>) -> Option<Vec<String>>;
 
     /// Spawn the CLI. The returned receiver's final event must be
     /// `SessionEvent::Exited` — the recorder waits on it.
@@ -213,6 +282,8 @@ pub type BoxedSession = Box<dyn AgentSession>;
 type SpawnFn =
     fn(&SpawnConfig) -> Result<(BoxedSession, mpsc::Receiver<SessionEvent>), SessionError>;
 
+type TuiArgsFn = fn(Option<&str>) -> Option<Vec<String>>;
+
 fn spawn_boxed<A: AgentAdapter>(
     cfg: &SpawnConfig,
 ) -> Result<(BoxedSession, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -227,6 +298,8 @@ pub struct Adapter {
     pub posture: PostureProof,
     pub rewind: RewindSupport,
     pub tuning: TuningSupport,
+    pub terminal: TerminalSupport,
+    tui_args: TuiArgsFn,
     spawn: SpawnFn,
 }
 
@@ -237,6 +310,14 @@ impl Adapter {
         cfg: &SpawnConfig,
     ) -> Result<(BoxedSession, mpsc::Receiver<SessionEvent>), SessionError> {
         (self.spawn)(cfg)
+    }
+
+    /// The argv that opens this provider's TUI on `cursor`, or `None` if
+    /// it has no TUI eave can hand a session to. **Called by the engine
+    /// process only**, for the same reason [`Adapter::spawn`] is: it is
+    /// the thing that becomes a process.
+    pub fn tui_args(&self, cursor: Option<&str>) -> Option<Vec<String>> {
+        (self.tui_args)(cursor)
     }
 }
 
@@ -259,6 +340,8 @@ macro_rules! adapters {
             posture: <$adapter as AgentAdapter>::POSTURE,
             rewind: <$adapter as AgentAdapter>::REWIND,
             tuning: <$adapter as AgentAdapter>::TUNING,
+            terminal: <$adapter as AgentAdapter>::TERMINAL,
+            tui_args: <$adapter as AgentAdapter>::tui_args,
             spawn: spawn_boxed::<$adapter>,
         }),*];
     };
@@ -808,6 +891,94 @@ mod tests {
             .map(|a| a.id)
             .collect();
         assert_eq!(native, vec!["claude-code"]);
+    }
+
+    /// **The two halves of a terminal declaration must agree.**
+    ///
+    /// The const says whether eave may offer a handover; `tui_args` is
+    /// what becomes a process. Nothing but this test stops them drifting
+    /// apart, and both directions are a real bug with a different shape:
+    /// a `Native` that builds no command offers a control that silently
+    /// does nothing, and a `None` that builds one means the sentence eave
+    /// shows the operator is a lie about a command it would have run.
+    #[test]
+    fn a_terminal_claim_comes_with_arguments() {
+        for a in ADAPTERS {
+            let with = a.tui_args(Some("some-session-id"));
+            let without = a.tui_args(None);
+            assert_eq!(
+                a.terminal.is_native(),
+                with.is_some(),
+                "{} claims {:?} but its argv for a known conversation says otherwise",
+                a.id,
+                a.terminal
+            );
+            assert_eq!(
+                with.is_some(),
+                without.is_some(),
+                "{} can open a TUI on a resumed session but not a fresh one (or the reverse) \
+                 — a handover must be offerable for both or neither",
+                a.id
+            );
+            if let Some(args) = with {
+                assert!(
+                    args.iter().any(|x| x == "some-session-id"),
+                    "{} builds a TUI command that never names the conversation, so it would \
+                     open on the wrong one",
+                    a.id
+                );
+                assert!(
+                    !args.iter().any(|x| x == "-p" || x == "--print"),
+                    "{} passes a headless flag to a TUI",
+                    a.id
+                );
+            }
+            if let crate::provider::TerminalSupport::None { reason } = a.terminal {
+                assert!(
+                    reason.len() > 40,
+                    "{}: this sentence is shown to an operator verbatim",
+                    a.id
+                );
+            }
+        }
+    }
+
+    /// The gate and the spawn read the SAME table — the rule
+    /// `the_rewind_gate_is_derived_from_the_registry_and_not_a_second_list`
+    /// states, applied to the third declaration.
+    #[test]
+    fn the_terminal_gate_is_derived_from_the_registry_and_not_a_second_list() {
+        for a in ADAPTERS {
+            assert_eq!(
+                crate::session::terminal_support(a.id).is_native(),
+                a.terminal.is_native(),
+                "{} disagrees with its own registry row",
+                a.id
+            );
+            assert_eq!(
+                crate::session::tui_argv(a.id, Some("x")).is_some(),
+                a.terminal.is_native(),
+                "{}: the derived argv and the derived gate disagree",
+                a.id
+            );
+        }
+        assert!(!crate::session::terminal_support("no-such-provider").is_native());
+        assert!(crate::session::tui_argv("no-such-provider", Some("x")).is_none());
+    }
+
+    /// The four the operator asked for, measured 2026-09-01. Cursor and Pi
+    /// are absent for reasons their `None` states in full, and both are a
+    /// "not yet" rather than a "cannot" — if either flips, it is because
+    /// somebody did the live check, and this list is where they say so.
+    #[test]
+    fn four_providers_can_be_handed_to_a_terminal_today() {
+        let mut native: Vec<&str> = ADAPTERS
+            .iter()
+            .filter(|a| a.terminal.is_native())
+            .map(|a| a.id)
+            .collect();
+        native.sort_unstable();
+        assert_eq!(native, vec!["claude-code", "codex", "grok", "hermes"]);
     }
 
     #[test]

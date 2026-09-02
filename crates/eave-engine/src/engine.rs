@@ -175,6 +175,15 @@ struct Shared {
     records: Vec<Record>,
     state: String,
     live: bool,
+    /// Slice AG1 #16: this session is being driven by hand in its
+    /// provider's TUI, so eave is not watching it.
+    ///
+    /// Here rather than derived from the engine's `TerminalHost` because
+    /// `reported_state` is on this struct and takes no engine — and
+    /// because it must be set BEFORE the agent is killed, so a watcher
+    /// never sees the intermediate "the CLI just died" state and reports
+    /// a healthy handover as a failure.
+    handed_over: bool,
     /// The live agent leader's pid, set beside `live` and cleared with it
     /// (Stage L). Its only use is sampling resident memory for the
     /// aggregate resource fact — the (pid, start_time) identity that
@@ -211,6 +220,17 @@ impl Shared {
     /// compare it before and after a mutation, and two copies of this rule
     /// would eventually disagree about what "the state" is.
     fn reported_state(&self) -> String {
+        // **Slice AG1 #16, and this arm is FIRST for a reason.** While a
+        // session is handed over to its provider's TUI, eave is not
+        // watching it: no frames are decoded, no turn opens or closes, and
+        // the attention clocks are reading a process that no longer
+        // exists. Every other answer this function could give would be a
+        // claim about activity eave cannot see — `running` for a settled
+        // session, or `quiet` for one the operator is typing into right
+        // now. Saying `terminal` is the only true thing available.
+        if self.handed_over {
+            return "terminal".to_string();
+        }
         match (&self.attention, self.live) {
             (Some(a), true) if !matches!(a, AttentionSnapshot::Running) => {
                 a.state_name().to_string()
@@ -747,6 +767,15 @@ pub struct Engine {
     /// "closing a tab does not end a session" a structural fact rather
     /// than a rule somebody has to remember.
     browser: Arc<Browser>,
+    /// Every provider TUI the engine is currently hosting (Slice AG1 #16).
+    ///
+    /// Beside `sessions` for the same reason `browser` is: a pty is a
+    /// process eave holds ON BEHALF of a session, not part of the
+    /// session's own record. Nothing here reads a journal and the session
+    /// path does not read this — which is what keeps "eave is not watching
+    /// while a session is handed over" a structural fact rather than a
+    /// rule to remember.
+    terminals: Arc<crate::terminal::TerminalHost>,
 }
 
 /// Whether a program resolution may come from the memo or must hit the
@@ -1026,6 +1055,7 @@ impl Engine {
                 session_id: id.clone(),
                 dir,
                 shared: StdMutex::new(Shared {
+                    handed_over: false,
                     header,
                     epoch: new_epoch(),
                     records: Vec::new(),
@@ -1134,6 +1164,7 @@ impl Engine {
             session_id: id.to_string(),
             dir,
             shared: StdMutex::new(Shared {
+                handed_over: false,
                 header: loaded.header.clone(),
                 epoch: new_epoch(),
                 records: loaded.records,
@@ -1822,6 +1853,287 @@ impl Engine {
         })
     }
 
+    /// Append one record to a session **whose recorder is not running**.
+    ///
+    /// The live path is `extra_tx`, which hands the record to the recorder
+    /// that owns the journal writer. There is no such owner when a session
+    /// is not live, so this opens the journal itself — and then does by
+    /// hand the two things the recorder's tap would have done, because a
+    /// record that is on disk but not in `shared.records` is invisible to
+    /// every subscriber until the next load.
+    fn journal_offline(
+        &self,
+        handle: &Arc<SessionHandle>,
+        event: JournalEvent,
+    ) -> Result<(), String> {
+        let next_seq = {
+            let s = handle.shared.lock().unwrap();
+            s.records.last().map(|r| r.seq + 1).unwrap_or(1)
+        };
+        let path = Store::journal_path(&handle.dir);
+        let mut w = JournalWriter::append_existing(&path, next_seq)
+            .map_err(|e| format!("open journal for append: {e}"))?;
+        let rec = w.append(event).map_err(|e| format!("append: {e}"))?;
+        w.flush().map_err(|e| format!("flush: {e}"))?;
+        handle.shared.lock().unwrap().records.push(rec.clone());
+        let _ = handle.bcast.send(Fanout::Record(rec));
+        Ok(())
+    }
+
+    /// Drop the `handed_over` claim for any session whose pty has gone.
+    ///
+    /// A TUI can exit on its own — the operator types `/quit`, or it
+    /// crashes — and nothing asks eave to close a handover it did not end.
+    /// Without this the rail would say `terminal` for a session with no
+    /// terminal, which is the failure this whole flag exists to prevent,
+    /// arrived at from the other side. Called wherever the session set is
+    /// read, so the claim can never outlive the process by more than a
+    /// poll.
+    fn reap_dead_terminals(&self) {
+        let alive = self.terminals.open_sessions();
+        let handles: Vec<Arc<SessionHandle>> =
+            self.sessions.lock().unwrap().values().cloned().collect();
+        for h in handles {
+            let stale = {
+                let mut s = h.shared.lock().unwrap();
+                if s.handed_over && !alive.contains(&h.session_id) {
+                    s.handed_over = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if stale {
+                h.poke_watch();
+            }
+        }
+    }
+
+    /// Slice AG1 #16: hand this session to the provider's own TUI.
+    async fn term_open(
+        self: &Arc<Self>,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<eave_wire::TermOpenOk, String> {
+        let handle = self.session(id)?;
+        let refused = |reason: String, unsupported: bool| {
+            Ok(eave_wire::TermOpenOk {
+                opened: false,
+                cols: 0,
+                rows: 0,
+                reason: Some(reason),
+                unsupported,
+            })
+        };
+
+        // Already handed over. Idempotent on purpose: a second window, or
+        // a click on a control the first click already actioned, must not
+        // settle an agent twice or write a second handover record.
+        if let Some(p) = self.terminals.get(id) {
+            if p.is_alive() {
+                let (c, r) = p.size();
+                return Ok(eave_wire::TermOpenOk {
+                    opened: true,
+                    cols: c,
+                    rows: r,
+                    reason: None,
+                    unsupported: false,
+                });
+            }
+        }
+
+        let (header, cursor, records_len) = {
+            let s = handle.shared.lock().unwrap();
+            // The same reverse scan `spawn_live` does, and it must stay the
+            // same: the TUI has to be pointed at the conversation eave
+            // would itself resume, or the toggle shows the operator a
+            // different one.
+            let cursor = s.records.iter().rev().find_map(|r| match &r.event {
+                JournalEvent::Provider {
+                    event: eave_core::events::SessionEvent::Init { session_id, .. },
+                } => Some(session_id.clone()),
+                _ => None,
+            });
+            (s.header.clone(), cursor, s.records.len())
+        };
+        let provider = provider_of(&self.cfg, &header.agent).to_string();
+        if let eave_core::provider::TerminalSupport::None { reason } =
+            eave_core::session::terminal_support(&provider)
+        {
+            // The provider's own measured sentence, verbatim. The gate that
+            // should have stopped this is in the app, reading the same
+            // table; this is the engine refusing to be the second list.
+            return refused(reason.to_string(), true);
+        }
+
+        // Hold the live lock across the settle and the spawn. `send`
+        // serializes on it too, so a message cannot be dispatched into a
+        // CLI this function is in the middle of killing.
+        let mut live = handle.live.lock().await;
+
+        // **A turn in flight is refused, not interrupted.**
+        //
+        // The same call AG1 #10 made about rewinding through a running
+        // turn, for the same reason: killing the CLI mid-turn leaves a turn
+        // no `TurnCompleted` can ever close, and the attention ledger's
+        // documented hole is exactly there. The operator presses Stop
+        // first, through the interrupt path that settles a turn properly.
+        if live.is_some() && records_len > 0 {
+            let mut ledger = eave_core::turn::TurnLedger::new(now_ms());
+            {
+                let s = handle.shared.lock().unwrap();
+                for rec in &s.records {
+                    ledger.on_record(rec, now_ms());
+                }
+            }
+            if ledger.in_turn() {
+                return refused(
+                    "a turn is still running — press Stop first, then hand the session over"
+                        .to_string(),
+                    false,
+                );
+            }
+        }
+
+        // **A session that has never run cannot be handed over.**
+        //
+        // Not a technical limit — the TUI would start perfectly well. It
+        // would start a conversation under an id the provider mints and
+        // eave never learns, because eave only ever learns one from the
+        // `Init` frame on its own wire. eave could then never resume it:
+        // the operator would come back to an empty transcript beside a
+        // real conversation, with no way to reconnect them. Refusing is
+        // the honest answer, and the sentence says what to do instead.
+        //
+        // **Checked AFTER the turn guard, and a test found the order the
+        // hard way.** A session whose first turn is still running has no
+        // `Init` on the journal yet, so this arm fires first and answers
+        // "has not run yet" about a session the operator is watching run.
+        // Both sentences are true of the journal; only one is true of what
+        // is on screen.
+        let Some(cursor) = cursor.filter(|c| !c.is_empty()) else {
+            return refused(
+                "this session has not run yet, so there is no conversation to hand over — send \
+                 one message here first and eave will know the id to point the terminal at"
+                    .to_string(),
+                false,
+            );
+        };
+
+        let Some(argv) = eave_core::session::tui_argv(&provider, Some(&cursor)) else {
+            return refused(
+                format!("eave cannot open a terminal for provider {provider:?}"),
+                true,
+            );
+        };
+        let program: PathBuf = match program_plan(&self.cfg, &header.agent, Freshness::Uncached) {
+            ProgramResolution::Found(p) => p,
+            missing => {
+                return refused(
+                    missing
+                        .why_not(&provider)
+                        .unwrap_or_else(|| "the agent CLI could not be resolved".into()),
+                    false,
+                )
+            }
+        };
+
+        // Journal the handover BEFORE the CLI is settled, so it goes down
+        // the live path while the recorder still exists. It is also the
+        // truthful order: from this record on, eave is not watching.
+        let event = JournalEvent::TerminalOpened {
+            cursor: Some(cursor.clone()),
+            args: argv.clone(),
+        };
+        match live.as_ref() {
+            Some(l) => l
+                .extra_tx
+                .send(event)
+                .await
+                .map_err(|_| "recorder gone".to_string())?,
+            None => self.journal_offline(&handle, event)?,
+        }
+
+        // **Set BEFORE the kill.** The kill drops `live`, and the
+        // completion task that follows it settles the session's state from
+        // the recorder's outcome — so a watcher polling in between would
+        // see a session whose CLI just died and report it as `interrupted`.
+        // Stating the handover first means every snapshot from here on says
+        // `terminal`, which is true from the moment the decision is made.
+        handle.shared.lock().unwrap().handed_over = true;
+        // Claimed BEFORE the poke, because the poke is what makes a
+        // watcher call `list`, and `list` reaps. Without the claim this
+        // function's own notification clears the flag it just set.
+        self.terminals.begin_opening(id);
+        handle.poke_watch();
+
+        // **One process per conversation.** Two CLIs writing one provider
+        // session file is not a race to be won, it is corruption: both hold
+        // the conversation in memory and the last to exit overwrites.
+        if let Some(l) = live.as_mut() {
+            let _ = l.session.kill().await;
+        }
+        drop(live);
+
+        let cwd = PathBuf::from(&header.cwd);
+        let opened = self.terminals.open(id, &program, &argv, &cwd, cols, rows);
+        // Released either way. A failed open must not leave a session
+        // claiming a terminal it does not have — the same lie the reaper
+        // exists to prevent, arrived at from the other side.
+        self.terminals.end_opening(id);
+        let pty = match opened {
+            Ok(p) => p,
+            Err(e) => {
+                handle.shared.lock().unwrap().handed_over = false;
+                handle.poke_watch();
+                return Err(e);
+            }
+        };
+        let (c, r) = pty.size();
+        handle.poke_watch();
+        Ok(eave_wire::TermOpenOk {
+            opened: true,
+            cols: c,
+            rows: r,
+            reason: None,
+            unsupported: false,
+        })
+    }
+
+    /// End a handover and give the session back to eave.
+    ///
+    /// `closed_by_operator` distinguishes the toggle from a TUI that
+    /// exited on its own; the journal keeps the difference because only
+    /// the record can tell them apart afterwards.
+    async fn term_close(
+        self: &Arc<Self>,
+        id: &str,
+        closed_by_operator: bool,
+    ) -> Result<eave_wire::TermOk, String> {
+        let handle = self.session(id)?;
+        let had = self.terminals.close(id).await;
+        // Cleared even when there was no pty: a `handed_over` left set by
+        // a pty that died without eave noticing would report `terminal`
+        // forever, which is the same lie in the other direction.
+        handle.shared.lock().unwrap().handed_over = false;
+        if had {
+            let event = JournalEvent::TerminalReturned { closed_by_operator };
+            let live = handle.live.lock().await;
+            match live.as_ref() {
+                Some(l) => {
+                    let _ = l.extra_tx.send(event).await;
+                }
+                None => {
+                    drop(live);
+                    let _ = self.journal_offline(&handle, event);
+                }
+            }
+            handle.poke_watch();
+        }
+        Ok(eave_wire::TermOk { ok: had })
+    }
+
     /// Slice I2: move a never-started session into its own worktree.
     /// Isolation is the operator's opt-in (decision 1) and is only legal
     /// while nothing has ever spawned — the provider CLI keys its resume
@@ -2047,6 +2359,7 @@ impl Engine {
     }
 
     fn list(&self) -> ListOk {
+        self.reap_dead_terminals();
         let sessions = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = sessions.values().map(|h| h.info()).collect();
         drop(sessions);
@@ -2542,6 +2855,7 @@ async fn serve_locked(
         sessions: StdMutex::new(HashMap::new()),
         watch_tx,
         browser,
+        terminals: Arc::new(crate::terminal::TerminalHost::default()),
     });
 
     // Startup scan (spec 02 §Resume contract): reap orphans from the meta
@@ -2774,6 +3088,64 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 subs.insert(id, tokio::spawn(run_watch(Arc::clone(&engine), w, id)));
                 continue; // snapshots flow on this id; no unary reply
             }
+            // Slice AG1 #16. Opening is side-effectful (it settles the
+            // agent and journals), so it runs off the connection loop like
+            // `isolate` and deliberately NOT in `subs`: an aborted
+            // half-handover would leave a killed agent and no pty.
+            Request::TermOpen {
+                session_id,
+                cols,
+                rows,
+            } => {
+                let w = Arc::clone(&w);
+                let engine = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    let body = match engine.term_open(&session_id, cols, rows).await {
+                        Ok(ok) => ok_value(&ok),
+                        Err(message) => ResponseBody::Err { message },
+                    };
+                    let _ = write_frame(&w, &ResponseEnvelope { id, body }).await;
+                });
+                continue;
+            }
+            Request::TermAttach { session_id } => match engine.terminals.attach(&session_id) {
+                Some(att) => {
+                    let w = Arc::clone(&w);
+                    subs.insert(id, tokio::spawn(run_terminal(session_id, att, w, id)));
+                    continue; // bytes flow on this id; no unary reply
+                }
+                None => ResponseBody::Err {
+                    message: "this session is not handed over to a terminal".into(),
+                },
+            },
+            Request::TermInput { session_id, data } => {
+                match eave_wire::b64_decode(&data) {
+                    Ok(bytes) => match engine.terminals.get(&session_id) {
+                        // A write to a pty whose TUI has exited is not an
+                        // error; it is what every keystroke between the
+                        // exit and the client noticing looks like.
+                        Some(p) => ok_value(&eave_wire::TermOk {
+                            ok: p.write(&bytes).is_ok(),
+                        }),
+                        None => ok_value(&eave_wire::TermOk { ok: false }),
+                    },
+                    Err(message) => ResponseBody::Err { message },
+                }
+            }
+            Request::TermResize {
+                session_id,
+                cols,
+                rows,
+            } => match engine.terminals.get(&session_id) {
+                Some(p) => ok_value(&eave_wire::TermOk {
+                    ok: p.resize(cols, rows).is_ok(),
+                }),
+                None => ok_value(&eave_wire::TermOk { ok: false }),
+            },
+            Request::TermClose { session_id } => match engine.term_close(&session_id, true).await {
+                Ok(ok) => ok_value(&ok),
+                Err(message) => ResponseBody::Err { message },
+            },
             Request::Files { session_id, scope } => match engine.session(&session_id) {
                 Ok(handle) => {
                     let w = Arc::clone(&w);
@@ -3594,6 +3966,72 @@ async fn refresh_files(handle: Arc<SessionHandle>) {
 /// task holds one session's handle and can serialize nothing but that
 /// session's [`FilesSnapshot`]; the raw-byte leak test in
 /// `tests/files.rs` enforces it end-to-end.
+/// Stream one handed-over session's pty to a client (Slice AG1 #16).
+///
+/// Replay first, then follow — the same contract `run_subscription` keeps,
+/// and for the same reason: a client that started late must arrive at the
+/// state the stream is actually in, not at the next delta.
+async fn run_terminal(
+    session_id: String,
+    att: crate::terminal::Attachment,
+    w: Arc<TokioMutex<OwnedWriteHalf>>,
+    id: u64,
+) {
+    let mut rx = att.output;
+    if send_item(
+        &w,
+        id,
+        SubscriptionItem::TermScreen {
+            session_id: session_id.clone(),
+            cols: att.cols,
+            rows: att.rows,
+            data: eave_wire::b64_encode(&att.replay),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    loop {
+        match rx.recv().await {
+            Ok(chunk) => {
+                if send_item(
+                    &w,
+                    id,
+                    SubscriptionItem::TermOutput {
+                        session_id: session_id.clone(),
+                        data: eave_wire::b64_encode(&chunk),
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+            // **A lagged terminal cannot be caught up by skipping.** The
+            // dropped bytes are part of a vt stream, and resuming after a
+            // hole leaves the emulator painting the wrong screen with no
+            // way to notice. Ending the stream is honest: the client
+            // re-attaches and gets a replay that is whole.
+            Err(broadcast::error::RecvError::Lagged(_)) => return,
+            // The pty ended.
+            Err(broadcast::error::RecvError::Closed) => {
+                let _ = send_item(
+                    &w,
+                    id,
+                    SubscriptionItem::TermExited {
+                        session_id: session_id.clone(),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
 async fn run_files(
     handle: Arc<SessionHandle>,
     w: Arc<TokioMutex<OwnedWriteHalf>>,

@@ -174,7 +174,12 @@ async fn drain_records(
             // rather than drop it into the ignore arm above.
             SubscriptionItem::Tabs { .. }
             | SubscriptionItem::Bookmarks { .. }
-            | SubscriptionItem::Permissions { .. } => {
+            | SubscriptionItem::Permissions { .. }
+            // Slice AG1 #16: a handed-over session's pty rides its own
+            // `term_attach` stream, never this one.
+            | SubscriptionItem::TermScreen { .. }
+            | SubscriptionItem::TermOutput { .. }
+            | SubscriptionItem::TermExited { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
         }
@@ -389,7 +394,12 @@ async fn engine_restart_resets_epoch_and_replays_repair() {
             // rather than drop it into the ignore arm above.
             SubscriptionItem::Tabs { .. }
             | SubscriptionItem::Bookmarks { .. }
-            | SubscriptionItem::Permissions { .. } => {
+            | SubscriptionItem::Permissions { .. }
+            // Slice AG1 #16: a handed-over session's pty rides its own
+            // `term_attach` stream, never this one.
+            | SubscriptionItem::TermScreen { .. }
+            | SubscriptionItem::TermOutput { .. }
+            | SubscriptionItem::TermExited { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
         }
@@ -762,7 +772,12 @@ async fn deltas_fold_into_120ms_frames() {
             // rather than drop it into the ignore arm above.
             SubscriptionItem::Tabs { .. }
             | SubscriptionItem::Bookmarks { .. }
-            | SubscriptionItem::Permissions { .. } => {
+            | SubscriptionItem::Permissions { .. }
+            // Slice AG1 #16: a handed-over session's pty rides its own
+            // `term_attach` stream, never this one.
+            | SubscriptionItem::TermScreen { .. }
+            | SubscriptionItem::TermOutput { .. }
+            | SubscriptionItem::TermExited { .. } => {
                 panic!("a browser frame arrived on a session subscription")
             }
             SubscriptionItem::Events { epoch, records, .. } => {

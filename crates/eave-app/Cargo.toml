@@ -52,6 +52,17 @@ eave-core = { path = "../eave-core" }
 eave-wire = { path = "../eave-wire" }
 eave-engine = { path = "../eave-engine" }
 
+# Slice AG1 #16 — the emulator half of a handover. The pty lives in the
+# engine; this parses the byte stream it sends back and keeps the grid.
+#
+# `alacritty_terminal` and NOT zed's `terminal` crate, which is the
+# reference this was written against (it is in the gpui fork's own
+# checkout, `crates/terminal`, 6,495 lines): that crate depends on zed's
+# `settings`, `theme`, `theme_settings`, `task` and `util`, so adopting it
+# would mean adopting zed's configuration system to draw a grid. The
+# emulator underneath it is this crate, and it is the part that is hard.
+alacritty_terminal = "0.26"
+
 # --- the `web` feature's graph ------------------------------------------
 cef = { version = "151", features = ["build-util"], optional = true }
 core-video = { version = "0.5.2", features = ["metal"], optional = true }

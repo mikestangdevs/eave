@@ -188,6 +188,61 @@ pub enum Request {
         #[serde(default)]
         confirmed: bool,
     },
+    /// Hand this session to the provider's own TUI (Slice AG1 #16).
+    ///
+    /// **Side-effectful and refusable**, which is why it is a separate
+    /// verb from [`Request::TermAttach`]. Opening settles the headless
+    /// agent — two processes on one provider conversation is corruption,
+    /// not a race — and journals the handover so the transcript can mark
+    /// the stretch eave did not witness.
+    ///
+    /// A turn in flight is REFUSED rather than interrupted. That is the
+    /// same decision, for the same reason, as `interrupt_if_running:
+    /// false` on [`Request::Rewind`]: killing a running turn leaves a turn
+    /// nothing can close, and eave's attention ledger has a documented
+    /// hole exactly there. The operator presses Stop first.
+    TermOpen {
+        session_id: String,
+        /// The size the client will paint at. The pty is created at this
+        /// size rather than at 80×24-then-resized, so the TUI's first
+        /// paint is already the right shape — a TUI that starts small and
+        /// is resized redraws visibly.
+        cols: u16,
+        rows: u16,
+    },
+    /// Follow a TUI the engine is already holding: one `TermScreen` with
+    /// everything written so far, then `TermOutput` as it arrives.
+    ///
+    /// Separate from `TermOpen` because attaching is **not** a state
+    /// change — a second window, or the same window after a restart, may
+    /// attach to a session already handed over, and none of those should
+    /// re-settle an agent or write a journal record.
+    TermAttach {
+        session_id: String,
+    },
+    /// Keystrokes for the TUI, base64 of the raw bytes.
+    ///
+    /// Bytes, not text: a terminal's input is escape sequences and control
+    /// characters, most of which are not valid UTF-8 and none of which
+    /// survive a lossy decode.
+    TermInput {
+        session_id: String,
+        data: String,
+    },
+    /// The window changed. Raises SIGWINCH, which is what makes the TUI
+    /// redraw at the new size.
+    TermResize {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// End the handover: close the TUI and give the session back to eave.
+    ///
+    /// SIGHUP first — what a closing terminal window sends, and what these
+    /// CLIs save their conversation on.
+    TermClose {
+        session_id: String,
+    },
     /// Observe the session SET (spec 05 §Watch): items flow on this
     /// request's id as `Sessions` snapshots — one immediately, one on
     /// every session-set / state / attention change. This is the only
@@ -747,6 +802,28 @@ pub enum SubscriptionItem {
     /// session's transcript**, which is the same rule `watch` keeps and
     /// for the same reason: this is a broadcast every client sees.
     Tabs { snapshot: TabsSnapshot },
+    /// Everything the TUI has drawn so far (Slice AG1 #16), base64.
+    ///
+    /// The first item on a `TermAttach`, and the analogue of `Reset`: feed
+    /// it to the emulator from the start and you arrive at the screen the
+    /// TUI last drew. It is a REPLAY, not a scrollback — the engine caps
+    /// it, and cuts only at an escape boundary so it can never begin
+    /// inside a sequence.
+    TermScreen {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+        data: String,
+    },
+    /// Bytes the TUI wrote, base64. The analogue of `Events`.
+    TermOutput { session_id: String, data: String },
+    /// The TUI exited — the operator typed `/quit`, or it crashed.
+    ///
+    /// A fact worth its own frame rather than a silent end of stream: the
+    /// surface has to stop offering a terminal for a process that is gone,
+    /// and "the stream stopped" is also what a dropped connection looks
+    /// like.
+    TermExited { session_id: String },
     /// Bookmark-hierarchy frame (Slice B1). Same contract.
     Bookmarks { snapshot: BookmarksSnapshot },
     /// Permission-answer frame (G1). Same contract.
@@ -759,6 +836,40 @@ pub struct DecideOk {
     /// The decision reached the agent. `false` = the question was no
     /// longer open (already answered, or withdrawn under the click).
     pub answered: bool,
+}
+
+/// Unary reply to [`Request::TermOpen`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermOpenOk {
+    /// The TUI is running and can be attached to.
+    pub opened: bool,
+    /// The pty's size. Not necessarily what was asked for — the engine
+    /// floors it, because a pty of zero columns is not a small terminal.
+    pub cols: u16,
+    pub rows: u16,
+    /// Why not, shown to the operator **verbatim** when `opened` is
+    /// false. Carries the provider's own `TerminalSupport::None` reason
+    /// when that is the answer, so the sentence an operator reads is the
+    /// one measured against their CLI rather than a house paraphrase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// This provider has no TUI eave can hand a session to — a permanent
+    /// answer, distinct from a refusal that would succeed later. The
+    /// surface should not have offered the control; see
+    /// `eave_core::session::terminal_support`, which is the gate that
+    /// should have stopped it.
+    #[serde(default)]
+    pub unsupported: bool,
+}
+
+/// Unary reply to [`Request::TermInput`], [`Request::TermResize`] and
+/// [`Request::TermClose`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermOk {
+    /// A pty was there to receive it. `false` is not an error — it is the
+    /// ordinary answer for a TUI that has already exited, and a client
+    /// that sees it should stop drawing a terminal.
+    pub ok: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2722,5 +2833,63 @@ mod tests {
             let back: GitState = serde_json::from_str(&raw).expect("round trip");
             assert_eq!(back, st);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal bytes on a JSON wire (Slice AG1 #16)
+
+/// Encode raw pty bytes for the wire.
+///
+/// **Bytes, not text.** A terminal stream is escape sequences, control
+/// characters and — while a TUI is drawing a box — bytes that are not
+/// valid UTF-8 at all, because a multi-byte character can be split across
+/// two reads. `String::from_utf8_lossy` would replace each half with U+FFFD
+/// and the box would draw with holes in it that never heal, since the
+/// emulator has already consumed the corrupted bytes. Base64 costs a third
+/// more wire and is exact.
+pub fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode what [`b64_encode`] wrote. The error is a sentence, because it
+/// reaches an operator through the engine's `Err` reply.
+pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| format!("terminal input was not valid base64: {e}"))
+}
+
+#[cfg(test)]
+mod terminal_bytes_tests {
+    use super::*;
+
+    /// The property the whole encoding exists for: bytes that are not
+    /// valid UTF-8 survive the round trip unchanged. A lossy text encoding
+    /// passes every ASCII test and fails exactly here.
+    #[test]
+    fn a_split_multibyte_character_survives_the_wire() {
+        // The first two bytes of "→" (E2 86 92), as a read boundary would
+        // hand them over.
+        let torn = vec![0x1b, b'[', b'3', b'1', b'm', 0xE2, 0x86];
+        assert_eq!(b64_decode(&b64_encode(&torn)).unwrap(), torn);
+        assert!(
+            String::from_utf8(torn.clone()).is_err(),
+            "the fixture must actually be invalid UTF-8 or this proves nothing"
+        );
+    }
+
+    #[test]
+    fn every_byte_value_round_trips() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(b64_decode(&b64_encode(&all)).unwrap(), all);
+    }
+
+    #[test]
+    fn a_malformed_payload_is_a_sentence_and_not_a_panic() {
+        let err = b64_decode("not valid base64!!").unwrap_err();
+        assert!(err.contains("base64"), "{err}");
     }
 }

@@ -492,6 +492,26 @@ impl crate::provider::AgentAdapter for CodexSession {
         },
     };
 
+    const TERMINAL: crate::provider::TerminalSupport = crate::provider::TerminalSupport::Native {
+        evidence: "`codex resume <SESSION_ID>`. `codex resume --help` (read 2026-09-01) takes a \
+                   positional `[SESSION_ID]` documented as \"Session id (UUID) or session name. \
+                   UUIDs take precedence if it parses\", and the picker appears only when the \
+                   id is OMITTED — which is the property a handover needs, since eave is \
+                   resuming a conversation it can name. Note this is the interactive `resume`, \
+                   not the `exec resume` eave drives headlessly.",
+    };
+
+    fn tui_args(cursor: Option<&str>) -> Option<Vec<String>> {
+        // Without a thread id, `codex resume` would show its PICKER — a
+        // list of other conversations, which is the one outcome a handover
+        // must never produce. The bare interactive `codex` starts a fresh
+        // thread instead, which is honest for a session that has none.
+        Some(match cursor {
+            Some(id) => vec!["resume".into(), id.into()],
+            None => Vec::new(),
+        })
+    }
+
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
         CodexSession::spawn(cfg)
     }
