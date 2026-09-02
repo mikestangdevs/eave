@@ -222,6 +222,7 @@ async fn the_strip_survives_a_kill_9_and_comes_back_unloaded() {
             title: Some("work".into()),
             color: Some("blue".into()),
             workspace: Some("/repo/eave".into()),
+            base: None,
             index: None,
         })
         .await
@@ -427,6 +428,7 @@ async fn closing_a_group_takes_its_tabs_and_leaves_its_sessions() {
             title: Some("eave".into()),
             color: None,
             workspace: None,
+            base: None,
             index: None,
         })
         .await
@@ -905,6 +907,7 @@ async fn a_group_update_can_leave_alone_set_and_clear() {
             title: Some("one".into()),
             color: Some("blue".into()),
             workspace: Some("/repo".into()),
+            base: None,
             index: None,
         })
         .await
@@ -921,6 +924,7 @@ async fn a_group_update_can_leave_alone_set_and_clear() {
             }),
             color: None,
             workspace: Some(Setting::Clear),
+            base: None,
             collapsed: Some(true),
         })
         .await

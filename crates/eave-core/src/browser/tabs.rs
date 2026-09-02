@@ -395,6 +395,17 @@ pub struct TabGroup {
     /// likewise acted on by nobody.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The base repository `workspace` belongs to (Slice ID2b), when the
+    /// client that minted the group knew it: a task group names its
+    /// project so a task whose sessions are all gone still files under
+    /// its repository instead of reading as a project of its own.
+    ///
+    /// The same class of fact as `workspace`, with the same contract:
+    /// stated, never acted on by the engine. `None` on every group written
+    /// before this field existed, which reads back as "the task is its own
+    /// project" — the rail it drew before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     /// The tab this group was last showing, so re-entering a group lands
     /// where the operator left it. Derived from activations, never set
     /// directly.
@@ -508,6 +519,10 @@ pub enum TabEvent {
         color: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<String>,
+        /// Slice ID2b — see [`TabGroup::base`]. `#[serde(default)]`, so
+        /// every `GroupCreated` written before it folds as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
         #[serde(default)]
         index: usize,
         ts_ms: u64,
@@ -523,6 +538,8 @@ pub enum TabEvent {
         color: Option<Setting<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<Setting<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<Setting<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collapsed: Option<bool>,
     },
@@ -913,6 +930,7 @@ impl TabsState {
                 title,
                 color,
                 workspace,
+                base,
                 index,
                 ts_ms,
             } => {
@@ -927,6 +945,7 @@ impl TabsState {
                         color: color.clone(),
                         collapsed: false,
                         workspace: workspace.clone(),
+                        base: base.clone(),
                         last_active: None,
                         created_ts_ms: *ts_ms,
                     },
@@ -942,6 +961,7 @@ impl TabsState {
                 title,
                 color,
                 workspace,
+                base,
                 collapsed,
             } => {
                 let Some(g) = self.groups.get_mut(id) else {
@@ -956,6 +976,9 @@ impl TabsState {
                 }
                 if let Some(s) = workspace.clone() {
                     g.workspace = s.into_option();
+                }
+                if let Some(s) = base.clone() {
+                    g.base = s.into_option();
                 }
                 if let Some(c) = collapsed {
                     g.collapsed = *c;
@@ -1338,6 +1361,7 @@ mod tests {
                 title: None,
                 color: None,
                 workspace: None,
+                base: None,
                 collapsed: Some(true),
             },
             TabEvent::GroupMoved {
@@ -1466,6 +1490,7 @@ mod tests {
             title: None,
             color: None,
             workspace: None,
+            base: None,
             index: usize::MAX,
             ts_ms: 0,
         });
@@ -1520,6 +1545,7 @@ mod tests {
             title: None,
             color: None,
             workspace: None,
+            base: None,
             index: usize::MAX,
             ts_ms: 0,
         });
@@ -1566,6 +1592,7 @@ mod tests {
             title: None,
             color: None,
             workspace: None,
+            base: None,
             index: usize::MAX,
             ts_ms: 0,
         });
@@ -1633,6 +1660,7 @@ mod tests {
             title: None,
             color: None,
             workspace: None,
+            base: None,
             index: usize::MAX,
             ts_ms: 0,
         });
@@ -1734,6 +1762,7 @@ mod tests {
             title: Some("one".into()),
             color: Some("blue".into()),
             workspace: Some("/repo".into()),
+            base: None,
             index: usize::MAX,
             ts_ms: 0,
         });
@@ -1744,6 +1773,7 @@ mod tests {
             }),
             color: None,
             workspace: Some(Setting::Clear),
+            base: None,
             collapsed: None,
         }));
         let g = &s.groups["g"];
@@ -1754,7 +1784,20 @@ mod tests {
             "an absent field was touched"
         );
         assert_eq!(g.workspace, None);
+        assert_eq!(g.base, None, "an absent base was touched");
         assert!(!g.collapsed);
+        // Slice ID2b: `base` follows the same three-state rule.
+        assert!(s.apply(&TabEvent::GroupUpdated {
+            id: "g".into(),
+            title: None,
+            color: None,
+            workspace: None,
+            base: Some(Setting::Value {
+                value: "/w/eave".into()
+            }),
+            collapsed: None,
+        }));
+        assert_eq!(s.groups["g"].base.as_deref(), Some("/w/eave"));
         // An update that changes nothing reports nothing.
         assert!(!s.apply(&TabEvent::GroupUpdated {
             id: "g".into(),
@@ -1763,6 +1806,7 @@ mod tests {
             }),
             color: None,
             workspace: None,
+            base: None,
             collapsed: Some(false),
         }));
     }
@@ -1772,6 +1816,30 @@ mod tests {
     /// ordinary case writes no key at all.
     #[test]
     fn an_older_builds_event_still_parses_and_the_plain_case_is_silent() {
+        // Slice ID2b: a `GroupCreated` from before `base` existed folds
+        // with no base — the task is its own project — and a group minted
+        // without one writes no key, so an existing `tabs.jsonl` is
+        // neither rewritten nor misread.
+        let old = r#"{"kind":"group_created","id":"g","workspace":"/w/eave","ts_ms":7}"#;
+        let e: TabEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            e,
+            TabEvent::GroupCreated {
+                id: "g".into(),
+                window: PRIMARY_WINDOW.to_string(),
+                title: None,
+                color: None,
+                workspace: Some("/w/eave".into()),
+                base: None,
+                index: 0,
+                ts_ms: 7,
+            }
+        );
+        let back = serde_json::to_string(&e).unwrap();
+        assert!(!back.contains("base"), "a baseless group wrote a base key: {back}");
+        let mut s = TabsState::new();
+        s.apply(&e);
+        assert_eq!(s.groups["g"].base, None);
         // An `Opened` from before content/opener/url existed.
         let old = r#"{"kind":"opened","id":"t","ts_ms":7}"#;
         let e: TabEvent = serde_json::from_str(old).unwrap();
@@ -1903,6 +1971,7 @@ mod tests {
             title: None,
             color: None,
             workspace: None,
+            base: None,
             index: 0,
             ts_ms: 1,
         });

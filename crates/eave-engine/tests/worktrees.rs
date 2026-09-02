@@ -338,6 +338,73 @@ async fn sharing_is_stated_and_isolate_is_the_opt_in() {
     );
 }
 
+/// Slice ID2b: the PROJECT key. A session in the base checkout has
+/// `project_root == checkout_root` — it is the primary task — and an
+/// isolated session, whose `checkout_root` is its worktree directory,
+/// still names the base repository as its project. Before this field the
+/// rail grouped on `checkout_root` alone and drew one repository as two
+/// headers (`<repo>` and `<sid8>`); this is the fact that lets it draw one.
+///
+/// Both stamps are read off `list`, i.e. the same probe that stamps
+/// `checkout_root`, one field over — and on the isolated session it is
+/// present on the very reply that announces the worktree, not a poll
+/// later.
+#[tokio::test]
+async fn an_isolated_session_names_the_base_repository_as_its_project() {
+    let dir = scratch();
+    let wtroot = scratch();
+    let base = repo();
+    let _engine = EngineProc::spawn_with_env(
+        &dir,
+        "linger",
+        &[("EAVE_WORKTREES_DIR", &wtroot.display().to_string())],
+    );
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("p1".into()), Some(base.display().to_string()))
+        .await
+        .expect("open p1");
+    c.open(Some("w1".into()), Some(base.display().to_string()))
+        .await
+        .expect("open w1");
+    let canon_base = std::fs::canonicalize(&base).unwrap();
+    let listed = wait_list(&c, "both probed", |s| {
+        s.len() == 2 && s.iter().all(|i| i.project_root.is_some())
+    })
+    .await;
+    for id in ["p1", "w1"] {
+        let info = by_id(&listed, id);
+        assert_eq!(
+            info.project_root.as_deref(),
+            Some(canon_base.to_str().unwrap()),
+            "{id}: the base checkout is its own project"
+        );
+        assert_eq!(info.project_root, info.checkout_root, "{id}: primary");
+    }
+
+    let info = c.isolate("w1").await.expect("isolate w1");
+    assert_ne!(
+        info.checkout_root, info.project_root,
+        "an isolated session's task is its worktree, not the base"
+    );
+    assert_eq!(
+        info.project_root.as_deref(),
+        Some(canon_base.to_str().unwrap()),
+        "the isolate reply already files the worktree under its repository"
+    );
+    // And after the off-loop probe re-runs, git agrees with the stamp.
+    let listed = wait_list(&c, "worktree probed", |s| {
+        by_id(s, "w1").worktree.is_some()
+            && by_id(s, "w1").project_root.as_deref() == Some(canon_base.to_str().unwrap())
+    })
+    .await;
+    let w1 = by_id(&listed, "w1");
+    assert_eq!(
+        w1.checkout_root.as_deref(),
+        Some(std::fs::canonicalize(&w1.cwd).unwrap().to_str().unwrap()),
+        "the task key is still the worktree directory"
+    );
+}
+
 /// Slice ID2a: the first title an isolated session gets names its
 /// branch, ONCE; a title applied before isolation names it at creation;
 /// and a worktree whose claim predates the rule keeps its name whatever

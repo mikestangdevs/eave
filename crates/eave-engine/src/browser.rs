@@ -576,6 +576,7 @@ impl Browser {
         title: Option<String>,
         color: Option<String>,
         workspace: Option<String>,
+        base: Option<String>,
         index: Option<usize>,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -585,6 +586,7 @@ impl Browser {
             title,
             color,
             workspace,
+            base,
             index: index.unwrap_or(usize::MAX),
             ts_ms: now_ms(),
         })?;
@@ -597,6 +599,7 @@ impl Browser {
         title: Option<Setting<String>>,
         color: Option<Setting<String>>,
         workspace: Option<Setting<String>>,
+        base: Option<Setting<String>>,
         collapsed: Option<bool>,
     ) -> Result<bool, String> {
         self.tab(TabEvent::GroupUpdated {
@@ -604,6 +607,7 @@ impl Browser {
             title,
             color,
             workspace,
+            base,
             collapsed,
         })
     }

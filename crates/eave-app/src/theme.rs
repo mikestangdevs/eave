@@ -2314,6 +2314,11 @@ pub const RAIL_TAB_H: f32 = 24.0;
 /// that made the axis a frame problem rather than a styling one.
 pub const RAIL_TABS_VISIBLE: usize = 9;
 
+/// How far a TASK header and the rows under it sit in from the project
+/// header above them (Slice ID2b). One gutter step, not a tree's worth:
+/// the rail is 228 px and a row's facts were settled against that width.
+pub const TASK_INDENT: f32 = SPACE_3;
+
 /// The OPEN section's height cap: [`RAIL_TABS_VISIBLE`] rows and the gaps
 /// **between** them, which is one fewer gap than rows.
 pub fn rail_tabs_max_h() -> f32 {

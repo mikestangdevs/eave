@@ -463,7 +463,12 @@ enum BrowserCmd {
     ///
     /// `window` is the strip it lands in (Slice W1). `None` means the
     /// primary window — which is what ⌘T meant when there was only one.
-    NewTab { window: Option<eave_wire::WindowId> },
+    NewTab {
+        window: Option<eave_wire::WindowId>,
+        /// Slice ID2b — the task group the page is filed into, or `None`
+        /// for the window's Browse set.
+        group: Option<String>,
+    },
     /// ⌘⇧N: an empty private page tab.
     NewIncognitoTab { window: Option<eave_wire::WindowId> },
     /// The omnibox committing on a tab that already exists.
@@ -523,6 +528,11 @@ enum BrowserCmd {
         /// engine never creates a group for a worktree*. It still does not.
         /// The client does, because the client is where the snapshot is.
         workspace: Option<String>,
+        /// Slice ID2b — the session's `project_root`, written onto the
+        /// minted group as `TabGroup::base` so the task files under its
+        /// repository even after its last session is gone. Only read
+        /// when `workspace` is `Some`.
+        base: Option<String>,
     },
     /// Slice T1 — file a page on the bookmarks bar.
     ///
@@ -582,7 +592,6 @@ enum BrowserCmd {
     /// nothing does. `collapsed` is already on the group and `strip.rs`
     /// already draws a collapsed one as a head and a count; nothing had
     /// ever set it, so every project was permanently open.
-    GroupSetCollapsed { group_id: String, collapsed: bool },
     /// Take a project off the rail (Slice D4.2 stage 3). Closes the group
     /// and its tabs; by `Request::GroupClose`'s own contract the sessions
     /// those tabs viewed are NOT ended, and nothing on disk is touched.
@@ -776,13 +785,19 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 .browser_do(eave_wire::Request::TabClose { tab_id })
                 .await;
         }
-        BrowserCmd::NewTab { window } => {
+        BrowserCmd::NewTab { window, group } => {
             let _ = client
                 .browser_create(eave_wire::Request::TabOpen {
                     window,
                     url: None,
-                    group: None,
-                    index: None,
+                    group,
+                    // At the TOP of its section — the PAGES list, or the
+                    // task's docked pages — under the New Tab pill, not
+                    // appended under every older tab (Slice SP1, operator
+                    // report: "a new tab needs to stay at the top of the
+                    // section not pushed down"). Arc's order too: newest
+                    // first, and the pill it came from is right above it.
+                    index: Some(0),
                     content: eave_wire::TabContent::Page,
                     opener: None,
                     activate: true,
@@ -796,7 +811,8 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     window,
                     url: None,
                     group: None,
-                    index: None,
+                    // Top of the list, as `NewTab` above.
+                    index: Some(0),
                     content: eave_wire::TabContent::Page,
                     opener: None,
                     activate: true,
@@ -878,20 +894,6 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 .browser_do(eave_wire::Request::GroupClose { group_id })
                 .await;
         }
-        BrowserCmd::GroupSetCollapsed {
-            group_id,
-            collapsed,
-        } => {
-            let _ = client
-                .browser_do(eave_wire::Request::GroupUpdate {
-                    group_id,
-                    title: None,
-                    color: None,
-                    workspace: None,
-                    collapsed: Some(collapsed),
-                })
-                .await;
-        }
         BrowserCmd::NewProject { workspace } => {
             let _ = client
                 .browser_create(eave_wire::Request::GroupCreate {
@@ -902,6 +904,10 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     title: Some(strip::project_title(&workspace)),
                     color: None,
                     workspace: Some(workspace),
+                    // A folder the operator picked: which repository it
+                    // belongs to is the engine's probe to make, once a
+                    // session opens there. Left for the fold to derive.
+                    base: None,
                     index: None,
                 })
                 .await;
@@ -946,6 +952,7 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
             activate,
             group,
             workspace,
+            base,
         } => {
             // Mint the project first when the checkout has none. A failure
             // here is swallowed like every other failure in this function
@@ -962,6 +969,9 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                         title: Some(strip::project_title(&workspace)),
                         color: None,
                         workspace: Some(workspace),
+                        // Slice ID2b: the task group names its project,
+                        // from the session that minted it.
+                        base,
                         index: None,
                     })
                     .await
@@ -1891,6 +1901,7 @@ fn replay_loop(path: PathBuf, speed: f64, plumbing: Plumbing) {
         epoch: 0,
         last_seq: 0,
         checkout_root: None,
+        project_root: None,
         shared_with: Vec::new(),
         worktree: None,
         // Slice AG2 #11: from the SAME snapshot the files rail is handed
@@ -3760,13 +3771,25 @@ fn unseen_finish(info: &SessionInfo, seen: Option<u64>) -> bool {
     }
 }
 
+#[derive(Clone)]
 struct RailGroup {
-    /// The checkout root. The group's IDENTITY — collapse is keyed on it,
-    /// and it is what `TabGroup::workspace` binds to — never its label.
+    /// The root this header speaks for. The group's IDENTITY — collapse is
+    /// keyed on it — never its label. For a PROJECT header (Slice ID2b)
+    /// this is `SessionInfo::project_root`; for a TASK header it is the
+    /// task's `checkout_root`, which is what `TabGroup::workspace` binds
+    /// to.
     root: String,
-    /// [`strip::project_title`] of the root. What a person reads.
+    /// What a person reads: [`strip::project_title`] of the root for a
+    /// project and for the primary task; the worktree's branch for a task
+    /// eave cut, because `~/.eave/worktrees/<repo>/<sid8>`'s last segment
+    /// is an address nobody chose.
     title: String,
     count: usize,
+    /// Slice ID2b — a TASK header only: this task's root is its project's
+    /// root, so it is the repository's own checkout. Drawn with the star
+    /// the reference gives its primary worktree. Always `false` on a
+    /// project header.
+    primary: bool,
     /// The state of the child with the highest [`attention_rank`], when any
     /// child has a claim at all. The header renders THIS through the same
     /// two functions a row uses.
@@ -3829,30 +3852,117 @@ fn group_badge(lead_state: Option<&str>, asking: usize, unseen: usize) -> Option
 }
 
 /// One line in the rail's session list.
+#[derive(Clone)]
 enum RailEntry {
+    /// A project: the repository, keyed on `project_root` (Slice ID2b).
     Header(RailGroup),
+    /// A task under a project: one checkout root, keyed on
+    /// `checkout_root` (Slice ID2b). Emitted only when its project holds
+    /// more than one task — a lone task is the project, and a header that
+    /// repeats the line above it states nothing.
+    Task(RailGroup),
     Row(SessionInfo),
 }
 
-/// Fold the rail's rows into projects, **without moving a single one**
-/// (Slice AG2 #2).
+/// The project a session files under (Slice ID2b): its `project_root`,
+/// else its `checkout_root` — a task with no stated project is its own,
+/// which is exactly the rail an engine predating the field draws.
+fn project_key(info: &SessionInfo) -> Option<String> {
+    info.project_root
+        .clone()
+        .filter(|r| !r.is_empty())
+        .or_else(|| info.checkout_root.clone().filter(|r| !r.is_empty()))
+}
+
+/// The attention a set of rows carries, as the facts a header states
+/// (Slice AG2 #3/#4, shared by both header levels since ID2b).
 ///
-/// The grouping key is `checkout_root`, which the engine already stamps and
-/// already documents as the thing that makes two sessions share files. The
-/// derivation is not new either: `ui.rs` folds the same field into a
-/// `HashMap` to mint a project TAB, and `strip::project_title` /
-/// `strip::group_for_workspace` have named and looked up projects since T1.
-/// The rail is the last surface that had the key and did not use it.
+/// The lead is a CHILD, not a computed word. `max_by_key` keeps the FIRST
+/// maximum on ties, which is the child already highest in the list — so a
+/// tie is broken by the order on screen and the header never disagrees
+/// with the first row under it.
 ///
-/// **Order is preserved, absolutely.** Groups appear in the order of their
-/// first member and rows keep their order inside a group, so every row is
-/// still where the operator last saw it. `fold_rail` decides position once
-/// when a row arrives and then refuses to re-decide it, for a reason with a
-/// user report attached: comet ordered its rail by attention, so opening a
-/// session changed that session's state, which re-sorted the rail, which
-/// slid the row out from under the pointer that had just clicked it.
-/// Grouping is a second chance to make exactly that mistake and does not
-/// take it — a group cannot bubble because its child started running.
+/// **"Is this child asking?" is the DISJUNCTION `rail_shows` tests, not a
+/// state name** — the count and the name come from two engine structures
+/// and the name can lag the count. Slice ID2b ranks by that disjunction:
+/// a child with `pending_approvals > 0` under a `running` state leads the
+/// header as *waiting on you*, which is RS1's acceptance case ("seed the
+/// asker by the count alone, state left running") and the case a
+/// state-name-only rollup silently drops. The row's own badge still reads
+/// its state name — recorded, not changed here.
+fn rollup(children: &[SessionInfo], unseen: &HashSet<String>) -> (Option<String>, usize, usize) {
+    let asks = |s: &SessionInfo| s.state == "awaiting_approval" || s.pending_approvals > 0;
+    let rank = |s: &SessionInfo| {
+        if asks(s) {
+            attention_rank("awaiting_approval")
+        } else {
+            attention_rank(&s.state)
+        }
+    };
+    let lead_state = children
+        .iter()
+        .max_by_key(|s| rank(s))
+        .filter(|s| rank(s) > 0)
+        .map(|s| {
+            if asks(s) {
+                "awaiting_approval".to_string()
+            } else {
+                s.state.clone()
+            }
+        });
+    let asking = children.iter().filter(|s| asks(s)).count();
+    let unseen_here = children
+        .iter()
+        .filter(|s| unseen.contains(&s.session_id))
+        .count();
+    (lead_state, asking, unseen_here)
+}
+
+/// What a task header is called (Slice ID2b).
+///
+/// The primary task is the repository's own checkout and reads as its
+/// folder, the same word its project header wears. A task eave cut reads
+/// as its BRANCH — `eave/fix-parser` after ID2a names it, `eave/a1b2c3d4`
+/// before — because the worktree directory's last segment is `<sid8>`,
+/// an address nobody chose, and the rail ruled against drawing those
+/// (Slice AO). A worktree the operator made by hand carries no branch
+/// fact and keeps its folder.
+fn task_title(root: &str, children: &[SessionInfo]) -> String {
+    children
+        .iter()
+        .find_map(|s| s.worktree.as_ref())
+        .map(|w| w.branch.clone())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| strip::project_title(root))
+}
+
+/// Fold the rail's rows into projects and tasks, **without moving a
+/// single one** (Slice AG2 #2, then ID2b).
+///
+/// Two keys, two levels. The TASK key is `checkout_root`, which the engine
+/// already stamps and already documents as the thing that makes two
+/// sessions share files. The PROJECT key is `project_root` (Slice ID2b):
+/// the base repository that root belongs to. Until ID2b the rail grouped
+/// on the task key alone, and an isolated session — whose `checkout_root`
+/// is its worktree directory — drew a header of its own titled `<sid8>`
+/// beside the `<repo>` header its siblings sat under: one repository as
+/// two projects. That is the bug this fold fixes as a consequence of
+/// having the second key, and `an_isolated_task_files_under_its_repository`
+/// pins it.
+///
+/// **Order is preserved, absolutely.** Projects appear in the order of
+/// their first member, tasks in the order of theirs, and rows keep their
+/// order inside a task, so every row is still where the operator last saw
+/// it. `fold_rail` decides position once when a row arrives and then
+/// refuses to re-decide it, for a reason with a user report attached:
+/// comet ordered its rail by attention, so opening a session changed that
+/// session's state, which re-sorted the rail, which slid the row out from
+/// under the pointer that had just clicked it. Grouping is a second chance
+/// to make exactly that mistake and does not take it — a group cannot
+/// bubble because its child started running. The ONE ordering rule ID2b
+/// adds is by identity, never by state: the primary task leads its
+/// project, because a starred row that wandered under the worktrees it
+/// was cut for would be a star that means nothing.
 ///
 /// **A session with no `checkout_root` is ungrouped and keeps the top of
 /// the list, headerless.** The field is `None` when the probe has not run
@@ -3860,43 +3970,58 @@ enum RailEntry {
 /// project" — and a header is a stated fact. Filing an unknown under an
 /// invented name is the one thing this rail does not do.
 ///
-/// **Headers appear only when they divide something.** One header over
-/// every row is a line that states what the absence of any other header
-/// already said. So: no headers unless the sessions actually fall into two
-/// or more parts, counting the ungrouped ones as a part.
+/// **Headers appear only when they divide something.** A project header
+/// is drawn when the sessions fall into two or more parts (counting the
+/// ungrouped ones as a part) OR when the project holds two or more tasks
+/// — the second case is what the task headers under it need in order to
+/// read as *tasks of this repository*. A task header is drawn only when
+/// its project holds two or more tasks: a lone task IS the project, and a
+/// header repeating the line above it states nothing.
 fn group_rail(sessions: Vec<SessionInfo>, unseen: &HashSet<String>) -> Vec<RailEntry> {
-    // First pass: the order roots appear in, and the members of each.
-    // `Vec` of pairs rather than a map because the ORDER is the output —
-    // a `HashMap` here is how the row-shuffling bug gets in.
-    let mut order: Vec<String> = Vec::new();
-    let mut loose: Vec<SessionInfo> = Vec::new();
+    // First pass: the order projects appear in, the order tasks appear in
+    // under each, and the members of each task. `Vec`s of pairs rather
+    // than maps because the ORDER is the output — a `HashMap` here is
+    // how the row-shuffling bug gets in.
+    let mut projects: Vec<String> = Vec::new();
+    let mut tasks_of: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let mut members: std::collections::HashMap<String, Vec<SessionInfo>> =
         std::collections::HashMap::new();
+    let mut loose: Vec<SessionInfo> = Vec::new();
     for info in sessions {
-        match info.checkout_root.clone().filter(|r| !r.is_empty()) {
-            Some(root) => {
-                if !members.contains_key(&root) {
-                    order.push(root.clone());
-                }
-                members.entry(root).or_default().push(info);
-            }
-            None => loose.push(info),
+        let Some(task) = info.checkout_root.clone().filter(|r| !r.is_empty()) else {
+            loose.push(info);
+            continue;
+        };
+        let project = project_key(&info).unwrap_or_else(|| task.clone());
+        if !tasks_of.contains_key(&project) {
+            projects.push(project.clone());
         }
+        let tasks = tasks_of.entry(project).or_default();
+        if !tasks.contains(&task) {
+            tasks.push(task.clone());
+        }
+        members.entry(task).or_default().push(info);
     }
 
-    // The parts test, before any header is built: distinct roots, plus one
-    // if anything is ungrouped.
-    let parts = order.len() + usize::from(!loose.is_empty());
-    if parts < 2 {
+    // The parts test, before any header is built: distinct projects, plus
+    // one if anything is ungrouped.
+    let parts = projects.len() + usize::from(!loose.is_empty());
+    let multi_task = projects
+        .iter()
+        .any(|p| tasks_of.get(p).is_some_and(|t| t.len() > 1));
+    if parts < 2 && !multi_task {
         let mut flat: Vec<RailEntry> = loose.into_iter().map(RailEntry::Row).collect();
-        for root in order {
-            flat.extend(
-                members
-                    .remove(&root)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(RailEntry::Row),
-            );
+        for project in projects {
+            for task in tasks_of.remove(&project).unwrap_or_default() {
+                flat.extend(
+                    members
+                        .remove(&task)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(RailEntry::Row),
+                );
+            }
         }
         return flat;
     }
@@ -3906,34 +4031,50 @@ fn group_rail(sessions: Vec<SessionInfo>, unseen: &HashSet<String>) -> Vec<RailE
     // `fold_rail` put them there; a header would be a claim, and there is
     // nothing to claim.
     out.extend(loose.into_iter().map(RailEntry::Row));
-    for root in order {
-        let children = members.remove(&root).unwrap_or_default();
-        // The lead is a CHILD, not a computed word. `max_by_key` keeps the
-        // FIRST maximum on ties, which is the child already highest in the
-        // list — so a tie is broken by the order on screen and the header
-        // never disagrees with the first row under it.
-        let lead_state = children
+    for project in projects {
+        let mut tasks = tasks_of.remove(&project).unwrap_or_default();
+        // The primary leads — by identity, never by state.
+        if let Some(ix) = tasks.iter().position(|t| *t == project) {
+            let primary = tasks.remove(ix);
+            tasks.insert(0, primary);
+        }
+        let per_task: Vec<(String, Vec<SessionInfo>)> = tasks
+            .into_iter()
+            .map(|t| {
+                let rows = members.remove(&t).unwrap_or_default();
+                (t, rows)
+            })
+            .collect();
+        let all: Vec<SessionInfo> = per_task
             .iter()
-            .max_by_key(|s| attention_rank(&s.state))
-            .filter(|s| attention_rank(&s.state) > 0)
-            .map(|s| s.state.clone());
-        let asking = children
-            .iter()
-            .filter(|s| s.state == "awaiting_approval" || s.pending_approvals > 0)
-            .count();
-        let unseen_here = children
-            .iter()
-            .filter(|s| unseen.contains(&s.session_id))
-            .count();
+            .flat_map(|(_, rows)| rows.iter().cloned())
+            .collect();
+        let (lead_state, asking, unseen_here) = rollup(&all, unseen);
         out.push(RailEntry::Header(RailGroup {
-            title: strip::project_title(&root),
-            root,
-            count: children.len(),
+            title: strip::project_title(&project),
+            root: project.clone(),
+            count: all.len(),
+            primary: false,
             lead_state,
             asking,
             unseen: unseen_here,
         }));
-        out.extend(children.into_iter().map(RailEntry::Row));
+        let divided = per_task.len() > 1;
+        for (task, rows) in per_task {
+            if divided {
+                let (lead_state, asking, unseen_here) = rollup(&rows, unseen);
+                out.push(RailEntry::Task(RailGroup {
+                    title: task_title(&task, &rows),
+                    primary: task == project,
+                    root: task,
+                    count: rows.len(),
+                    lead_state,
+                    asking,
+                    unseen: unseen_here,
+                }));
+            }
+            out.extend(rows.into_iter().map(RailEntry::Row));
+        }
     }
     out
 }
@@ -5976,38 +6117,216 @@ impl Render for RailResize {
     }
 }
 
-/// Two tabs painted in one well. Shell-local: the engine still has one
-/// `active`; this is which two the card is showing.
+/// Slice ID2b — **what the content well is showing, decided ONCE.**
+///
+/// Before the flip the same fact was decided three times: `pane_header`'s
+/// three-arm match on the active tab's `TabContent`, `Shell::render`'s
+/// `active_is_page` / `showing_page` / `blank_page`, and `split_pane`'s
+/// own `is_page`. Three readers of one fact is how the launcher came to
+/// draw straight through a loaded example.com (Slice C1): each reader
+/// silently assumed the thing beneath it. Every surface now asks
+/// [`Shell::frame_for`] and reads this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Frame {
+    view: FrameView,
+    /// **Amendment 1 — the right-side review dock's slot, reserved.**
+    /// [`Dock`] has no variants, so this is `None` by construction and no
+    /// surface can draw a dock by accident; building the review dock is
+    /// adding a variant here and one child beside the well in
+    /// `Shell::render`, and nowhere else. Not built, not precluded.
+    dock: Option<Dock>,
+}
+
+/// See [`Frame::dock`]. Uninhabited on purpose: the seam exists, the
+/// surface does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dock {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FrameView {
+    /// Browse: the well is one of this window's loose pages — a row in the
+    /// rail's PAGES zone (ID2b′) — and A′ is exactly what it was: eave is
+    /// a real browser and pure browsing needs no task.
+    Browse { tab: Option<String> },
+    /// A task, showing one of its tools. `group` is the task's tool set —
+    /// its `TabGroup`, once the reconcile has minted one — and `root` its
+    /// checkout root, when known.
+    Task {
+        group: Option<String>,
+        root: Option<String>,
+        tool: Tool,
+    },
+    /// Nothing open in this window.
+    Empty,
+}
+
+/// One tool inside a task (Slice ID2b): chat, page, or the task's diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tool {
+    Chat { session_id: String },
+    Page { tab: String },
+    /// A task's changed files, full-well. **Keyed on the task's CHECKOUT
+    /// ROOT, never on a session** (ID2b′ sign-off, answer 2): two chats in
+    /// one checkout share one working tree, and a diff that named the
+    /// first of them went dark the moment that chat closed. Not a tab and
+    /// not journaled: a face of the selection, dropped by the next tab
+    /// activation — the same durability `Split` has, for the same reason.
+    Diff { root: String },
+}
+
+impl Frame {
+    /// The well belongs to a page.
+    fn active_is_page(&self) -> bool {
+        matches!(
+            self.view,
+            FrameView::Browse { tab: Some(_) }
+                | FrameView::Task {
+                    tool: Tool::Page { .. },
+                    ..
+                }
+        )
+    }
+
+    /// The well is the diff tool's.
+    fn showing_diff(&self) -> bool {
+        matches!(
+            self.view,
+            FrameView::Task {
+                tool: Tool::Diff { .. },
+                ..
+            }
+        )
+    }
+
+    /// The task's group, when the frame is a task with one — where ⌘T
+    /// files a new page.
+    fn task_group(&self) -> Option<&str> {
+        match &self.view {
+            FrameView::Task { group, .. } => group.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Up to [`SPLIT_MAX`] tabs painted in one well. Shell-local: the engine
+/// still has one `active`; this is which tabs the card shows together.
 ///
 /// Brave's `split_view` is two pages inside one tab. eave's tabs are
-/// already first-class (page *or* session), so the split is a VIEW of two
+/// already first-class (page *or* session), so the split is a VIEW of
 /// existing tabs — which is what lets a page sit next to an agent, the
 /// thing the browser spec named as the reason eave wants this.
-#[derive(Clone, Debug)]
+///
+/// **A split is an arrangement the operator made, and it outlives the
+/// selection (Slice SP1).** Choosing a tab outside it shows that tab
+/// alone; choosing any member brings the whole arrangement back. The
+/// first cut dissolved the split on the next click elsewhere, and the
+/// operator's report was exact: *"when I combine two tabs and click off
+/// of them they separate."* A tab belongs to at most one split, and the
+/// shell keeps every split it has been given — see [`Shell::splits`].
+#[derive(Clone, Debug, PartialEq)]
 struct Split {
-    left: String,
-    right: String,
-    /// Left (or top) pane as a fraction of the well. Clamped to
+    /// The panes in well order: left to right, or top to bottom.
+    panes: Vec<String>,
+    /// Each pane's share of the well, one per pane, summing to 1. A
+    /// divider drag keeps its two neighbours' sum and holds each above
     /// [`theme::SPLIT_RATIO_MIN`].
-    ratio: f32,
+    shares: Vec<f32>,
     /// Top/bottom rather than left/right. The menu's "Convert to Vertical
     /// Split View" is this bit, not a second split type.
     vertical: bool,
 }
 
+/// The most panes one well holds. Four at [`theme::SPLIT_RATIO_MIN`] each
+/// still fit (0.8 of the well); a fifth is refused, not squeezed.
+const SPLIT_MAX: usize = 4;
+
 impl Split {
-    fn contains(&self, id: &str) -> bool {
-        self.left == id || self.right == id
+    fn pair(left: String, right: String) -> Self {
+        Self {
+            panes: vec![left, right],
+            shares: vec![0.5, 0.5],
+            vertical: false,
+        }
     }
 
-    fn other(&self, id: &str) -> Option<&str> {
-        if self.left == id {
-            Some(self.right.as_str())
-        } else if self.right == id {
-            Some(self.left.as_str())
-        } else {
-            None
+    fn contains(&self, id: &str) -> bool {
+        self.panes.iter().any(|p| p == id)
+    }
+
+    fn position(&self, id: &str) -> Option<usize> {
+        self.panes.iter().position(|p| p == id)
+    }
+
+    fn share_of(&self, id: &str) -> Option<f32> {
+        self.position(id)
+            .and_then(|ix| self.shares.get(ix).copied())
+    }
+
+    /// A split of one pane is a tab. A split of more than [`SPLIT_MAX`]
+    /// is one this build never made.
+    fn is_viable(&self) -> bool {
+        (2..=SPLIT_MAX).contains(&self.panes.len()) && self.shares.len() == self.panes.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.panes.len() >= SPLIT_MAX
+    }
+
+    /// Put `id` in at `at`. Every pane goes back to an equal share: the
+    /// operator asked for another pane, not for the old proportions
+    /// squeezed, and the divider is theirs from here.
+    fn insert(&mut self, at: usize, id: String) {
+        let at = at.min(self.panes.len());
+        self.panes.insert(at, id);
+        let n = self.panes.len() as f32;
+        self.shares = vec![1.0 / n; self.panes.len()];
+    }
+
+    /// Take `id` out. Its share goes to the pane before it (the first
+    /// pane's goes to the one after), so the others keep their
+    /// proportions and the well stays full.
+    fn remove(&mut self, id: &str) -> bool {
+        let Some(ix) = self.position(id) else {
+            return false;
+        };
+        self.panes.remove(ix);
+        let share = self.shares.remove(ix);
+        if let Some(to) = self.shares.get_mut(ix.saturating_sub(1)) {
+            *to += share;
         }
+        true
+    }
+
+    /// The divider after pane `ix`, dragged so that pane wants `share`.
+    /// The pair's sum is kept and each side held above the minimum;
+    /// returns whether anything moved enough to repaint.
+    fn set_share(&mut self, ix: usize, share: f32) -> bool {
+        if ix + 1 >= self.shares.len() {
+            return false;
+        }
+        let total = self.shares[ix] + self.shares[ix + 1];
+        if total < 2.0 * theme::SPLIT_RATIO_MIN {
+            return false;
+        }
+        let a = share.clamp(theme::SPLIT_RATIO_MIN, total - theme::SPLIT_RATIO_MIN);
+        if (a - self.shares[ix]).abs() < 0.002 {
+            return false;
+        }
+        self.shares[ix] = a;
+        self.shares[ix + 1] = total - a;
+        true
+    }
+}
+
+/// The debug name of pane `ix` of `n`: the ends keep the names the
+/// two-pane split had, so a test written against `split-pane-left` still
+/// finds the left pane of four.
+fn pane_side(ix: usize, n: usize) -> &'static str {
+    match ix {
+        0 => "left",
+        i if i + 1 == n => "right",
+        1 => "mid-1",
+        _ => "mid-2",
     }
 }
 
@@ -6015,6 +6334,8 @@ impl Split {
 /// rather than snapping the seam to the cursor.
 #[derive(Clone, Copy, Debug)]
 struct SplitDrag {
+    /// Which divider: the one after pane `handle`.
+    handle: usize,
     grab_x: f32,
     start_ratio: f32,
     well_w: f32,
@@ -6695,8 +7016,8 @@ enum TabMenuTarget {
     /// A project row (Slice D4.2 stage 3). A project is a tab GROUP bound
     /// to a worktree, so its menu acts on the group.
     Group(String),
-    /// The combined pill: the two tabs in the well.
-    Split { left: String, right: String },
+    /// The combined pill: the tabs of one split, in pane order.
+    Split { members: Vec<String> },
     /// A chip on the bookmarks bar — a link or a folder.
     ///
     /// The bar is not the strip, but the menu is the same menu: one
@@ -6846,10 +7167,16 @@ struct Shell {
     /// and no scroll POSITION is authoritative here (spec 03: the UI
     /// holds no authoritative state).
     rail_scroll: ScrollHandle,
-    /// The Projects zone's own scroller (the rail-sections split). Its own
-    /// handle because it is its own list: sharing `tabs_scroll` would mean
-    /// scrolling projects moved the tabs under them.
-    projects_scroll: ScrollHandle,
+    /// Slice ID2b — the TASK (checkout root) whose diff is up in the well,
+    /// if any (ID2b′: a root, not a session — see [`Tool::Diff`]).
+    ///
+    /// Read only while the transcript's session works in that root; a
+    /// stale root is ignored rather than cleared, so a selection change
+    /// never has to remember to reset it. Cleared by `activate_tab`, because choosing a
+    /// tab is choosing a tool. Shell-local and never persisted, exactly
+    /// as `split` is and for the same reason (the render path writes
+    /// nothing).
+    diff_tool: Option<String>,
     files_scroll: ScrollHandle,
     /// **The rail's live width (Slice D3).** `theme::RAIL_W` is only the
     /// value a data dir with no saved width starts at; this is the one the
@@ -6862,8 +7189,12 @@ struct Shell {
     /// a *choice in progress*, not a fact about anything, and it must survive
     /// the feed events that rebuild the rail underneath the pointer.
     rail_drag: Option<RailDrag>,
-    /// Two tabs in the well, or `None` for the ordinary single-tab card.
-    split: Option<Split>,
+    /// Every split arrangement this window holds (Slice SP1). The well
+    /// shows the one the active tab belongs to — [`Self::showing_split`]
+    /// — and the rest wait on the rail as pills until a member is chosen.
+    /// Saved in `frame.json` under [`SPLITS_KEY`] and pruned against the
+    /// strip in the tabs observer, never in the paint.
+    splits: Vec<Split>,
     /// The split-divider drag in progress, or `None`.
     split_drag: Option<SplitDrag>,
     /// The DevTools dock's share of its page well. One ratio for the app,
@@ -6917,6 +7248,11 @@ struct Shell {
     /// the render pass, where an entity write would notify and a notify
     /// per frame is what N4's idle floor forbids.
     rail_walk: RefCell<Vec<String>>,
+    /// ID2b′ — the tabs in the order the sidebar draws them, written by
+    /// the rail's paint on every pass (an empty list is a fact). What
+    /// ctrl-tab and ⌘1-9 walk, through [`Shell::spine_order`]. A `RefCell`
+    /// for `rail_walk`'s reason.
+    spine_walk: RefCell<Vec<String>>,
     /// How many session rows the rail is currently willing to draw
     /// (Slice AG2 #10).
     ///
@@ -7213,8 +7549,8 @@ struct Shell {
     folder_search: Option<String>,
     /// Which rail zones are collapsed (Slice D4.2 stage 2). Loaded from
     /// `frame.json` at construction and written back on the click, so the
-    /// rail comes back the way it was left.
-    zone_projects_collapsed: std::cell::Cell<bool>,
+    /// rail comes back the way it was left. Slice ID2b deleted the
+    /// Projects zone; its key stays in the file, unread.
     zone_folders_collapsed: std::cell::Cell<bool>,
     zone_sessions_collapsed: std::cell::Cell<bool>,
     /// Which PROJECT groups in the sessions zone are collapsed, by
@@ -7852,7 +8188,147 @@ fn put_derived_titles(doc: &mut serde_json::Value, titles: &HashMap<String, Stri
     doc[DERIVED_TITLES_KEY] = serde_json::Value::Object(map);
 }
 
+/// The `frame.json` key holding each window's split arrangements (Slice
+/// SP1): a map of window id to a list of `{panes, shares, vertical}`.
+/// Tab ids are the engine's and survive a restart (`tabs.jsonl` is folded
+/// back with the same ids), so an arrangement comes back with its tabs;
+/// one whose tabs did not is pruned by the first non-empty snapshot.
+const SPLITS_KEY: &str = "splits";
+
+/// This window's splits saved last run. Unreadable, missing or malformed
+/// all mean none — the well opens single and the operator arranges it
+/// again; a broken preferences file cannot invent a pane.
+fn load_splits(window: &str) -> Vec<Split> {
+    let Some(path) = frame_prefs_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    splits_from(&v, window)
+}
+
+/// The pure half of [`load_splits`]. An entry is kept only when it is a
+/// split this build could have written: two to [`SPLIT_MAX`] distinct
+/// string ids, and shares that are one finite positive number per pane
+/// (anything else falls back to equal shares rather than failing the
+/// entry — the panes are the fact, the proportions are a preference).
+fn splits_from(doc: &serde_json::Value, window: &str) -> Vec<Split> {
+    let Some(list) = doc
+        .get(SPLITS_KEY)
+        .and_then(|v| v.get(window))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<Split> = Vec::new();
+    for entry in list {
+        let Some(panes) = entry.get("panes").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let panes: Vec<String> = panes
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        let distinct = panes.iter().collect::<std::collections::HashSet<_>>().len() == panes.len();
+        if !(2..=SPLIT_MAX).contains(&panes.len()) || !distinct {
+            continue;
+        }
+        // A tab is in one split at a time, on disk as in memory.
+        if panes.iter().any(|p| out.iter().any(|s| s.contains(p))) {
+            continue;
+        }
+        let n = panes.len();
+        let shares: Vec<f32> = entry
+            .get("shares")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_f64())
+                    .map(|x| x as f32)
+                    .collect::<Vec<f32>>()
+            })
+            .filter(|v| v.len() == n && v.iter().all(|x| x.is_finite() && *x > 0.0))
+            .map(|v| {
+                let sum: f32 = v.iter().sum();
+                v.into_iter().map(|x| x / sum).collect()
+            })
+            .unwrap_or_else(|| vec![1.0 / n as f32; n]);
+        let vertical = entry
+            .get("vertical")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        out.push(Split {
+            panes,
+            shares,
+            vertical,
+        });
+    }
+    out
+}
+
+/// Write this window's splits back, keeping every other key and every
+/// other window's entry — the merged read-modify-write every writer of
+/// this file uses.
+fn save_splits(window: &str, splits: &[Split]) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    put_splits(&mut doc, window, splits);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\\n") {
+                eprintln!("eave: cannot save splits to {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise splits: {e}"),
+    }
+}
+
+/// The pure half of [`save_splits`]. A window with no splits has its
+/// entry removed rather than written empty, so the file does not collect
+/// the ghosts of every ⌘N window that ever opened.
+fn put_splits(doc: &mut serde_json::Value, window: &str, splits: &[Split]) {
+    if !doc.get(SPLITS_KEY).is_some_and(|v| v.is_object()) {
+        doc[SPLITS_KEY] = serde_json::Value::Object(Default::default());
+    }
+    let Some(map) = doc[SPLITS_KEY].as_object_mut() else {
+        return;
+    };
+    if splits.is_empty() {
+        map.remove(window);
+        return;
+    }
+    let list: Vec<serde_json::Value> = splits
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "panes": s.panes,
+                "shares": s.shares,
+                "vertical": s.vertical,
+            })
+        })
+        .collect();
+    map.insert(window.to_string(), serde_json::Value::Array(list));
+}
+
 /// The zone keys, named once so the reader and the writer cannot drift.
+///
+/// `ZONE_PROJECTS` lost its reader in Slice ID2b — the Projects zone is
+/// gone, its content redistributed into the Projects → Tasks tree and the
+/// pane header's tool strip — and keeps its key so an existing
+/// `frame.json` is neither rewritten nor misread.
+#[allow(dead_code)]
 pub(crate) const ZONE_PROJECTS: &str = "zone_projects_collapsed";
 pub(crate) const ZONE_FOLDERS: &str = "zone_folders_collapsed";
 pub(crate) const ZONE_SESSIONS: &str = "zone_sessions_collapsed";
@@ -7862,7 +8338,6 @@ pub(crate) const ZONE_SESSIONS: &str = "zone_sessions_collapsed";
 /// collapsing zone — their add is the standing `tab-new` pill.
 fn zone_add_id(key: &'static str) -> &'static str {
     match key {
-        ZONE_PROJECTS => "project-new",
         ZONE_FOLDERS => "folder-new",
         ZONE_SESSIONS => "new-session",
         other => unreachable!("unknown zone key: {other}"),
@@ -11402,6 +11877,178 @@ impl Shell {
         strip::strip_for_window(&self.web_tabs.read(cx).snapshot, &self.window_key)
     }
 
+    /// Slice ID2b — **the one Frame decision.** See [`Frame`].
+    ///
+    /// `tab` overrides the active tab: a split pane asks about its own tab.
+    /// The diff tool is a fact about the ACTIVE frame only, so an override
+    /// never sees it, and it is honoured only while it names the selected
+    /// session — a stale id is ignored, not cleared.
+    fn frame_for(&self, snapshot: &eave_wire::TabsSnapshot, tab: Option<&str>, cx: &App) -> Frame {
+        let sessions = self.sessions.read(cx);
+        let root_of = |sid: &str| {
+            sessions
+                .sessions
+                .iter()
+                .find(|s| s.session_id == sid)
+                .and_then(|s| s.checkout_root.clone())
+        };
+        let group_root = |g: &str| {
+            snapshot
+                .groups
+                .iter()
+                .find(|x| x.id == g)
+                .and_then(|x| x.workspace.clone())
+        };
+        let wanted = tab.or(snapshot.active.as_deref());
+        let active = wanted.and_then(|a| snapshot.tabs.iter().find(|t| t.id == a));
+        let group = match wanted.and_then(|a| strip::container_of(snapshot, a)) {
+            Some(strip::Container::Group(g)) => Some(g),
+            _ => None,
+        };
+        if tab.is_none() {
+            if let Some(root) = self.diff_tool.as_deref() {
+                // Honoured only while the transcript's session works in
+                // that checkout — the well shows ITS scan, and that scan is
+                // the task's tree. A stale root is ignored, not cleared.
+                let selected = self.transcript.read(cx).session_id.clone();
+                let in_root = selected.as_deref().and_then(root_of).as_deref() == Some(root);
+                if in_root {
+                    return Frame {
+                        view: FrameView::Task {
+                            group: strip::group_for_workspace(snapshot, root),
+                            root: Some(root.to_string()),
+                            tool: Tool::Diff {
+                                root: root.to_string(),
+                            },
+                        },
+                        dock: None,
+                    };
+                }
+            }
+        }
+        let view = match active {
+            Some(t) => match &t.content {
+                eave_wire::TabContent::Page => match group {
+                    Some(g) => {
+                        let root = group_root(&g);
+                        FrameView::Task {
+                            group: Some(g),
+                            root,
+                            tool: Tool::Page { tab: t.id.clone() },
+                        }
+                    }
+                    None => FrameView::Browse {
+                        tab: Some(t.id.clone()),
+                    },
+                },
+                eave_wire::TabContent::Session { session_id } => {
+                    let root = root_of(session_id).or_else(|| group.as_deref().and_then(group_root));
+                    FrameView::Task {
+                        group,
+                        root,
+                        tool: Tool::Chat {
+                            session_id: session_id.clone(),
+                        },
+                    }
+                }
+            },
+            // No active tab. ID2b′: a session the transcript is on is still
+            // the frame — the well shows its log — even before the
+            // reconcile has minted its tab (the first paint after a cold
+            // start, and every harness fixture that pushes no strip). Empty
+            // is only ever "nothing selected, nothing open".
+            None => match self.transcript.read(cx).session_id.clone() {
+                Some(sid) => {
+                    let root = root_of(&sid);
+                    FrameView::Task {
+                        group: root.as_deref().and_then(|r| strip::group_for_workspace(snapshot, r)),
+                        root,
+                        tool: Tool::Chat { session_id: sid },
+                    }
+                }
+                None => FrameView::Empty,
+            },
+        };
+        Frame { view, dock: None }
+    }
+
+    /// Put a task's diff in the well (ID2b′). Cleared by the next tab
+    /// activation — see [`Shell::diff_tool`].
+    ///
+    /// The well reads the files scan of the TRANSCRIPT's session, so the
+    /// transcript has to be on a session in this checkout. When it is not,
+    /// the task's first chat still in the rail is selected first — chosen
+    /// at the click from the rows as they stand, never remembered, so a
+    /// chat closing moves the next click to the next chat instead of
+    /// leaving the row dark (the "reads the first X" trap, sign-off
+    /// answer 2).
+    fn show_diff_tool(&mut self, root: String, cx: &mut Context<Self>) {
+        let selected = self.transcript.read(cx).session_id.clone();
+        let first_in_root = {
+            let sessions = &self.sessions.read(cx).sessions;
+            let in_root = |s: &&SessionInfo| s.checkout_root.as_deref() == Some(root.as_str());
+            let already = selected
+                .as_deref()
+                .is_some_and(|sel| sessions.iter().filter(in_root).any(|s| s.session_id == sel));
+            if already {
+                None
+            } else {
+                match sessions.iter().filter(in_root).find(|s| !s.archived) {
+                    Some(s) => Some(s.session_id.clone()),
+                    // No chat in this checkout is on the rail: there is
+                    // no scan to show, and the row is not drawn (see
+                    // `task_tool_rows`).
+                    None => return,
+                }
+            }
+        };
+        if let Some(sid) = first_in_root {
+            self.cancel_rename(cx);
+            let _ = self.commands.send(Command::Select(sid));
+        }
+        self.diff_tool = Some(root);
+        cx.notify();
+    }
+
+    /// The diff tool in the well (Slice ID2b): the files face, at the
+    /// well's width. The rail's files face is untouched — the list stays a
+    /// face of the rail too — and this is the same element with more room.
+    fn diff_tool_el(&self, phase: Option<f32>, cx: &Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "diff-tool".into())
+            .size_full()
+            .min_h(px(0.))
+            .px(px(theme::SPACE_4))
+            .pt(px(theme::SPACE_2))
+            .flex()
+            .flex_col()
+            .child(self.files_rail(cx, phase))
+            .into_any_element()
+    }
+
+    /// Slice ID2b — select a session AND bring its tool forward.
+    ///
+    /// A rail row is a task's chat; selecting it means the frame swaps to
+    /// that task, and that is `TabActivate` on the chat's tab — *the only
+    /// way the active tab changes, whoever asked* (`activate_tab`). The
+    /// `Select` still goes out first, so a session with no tab yet (the
+    /// reconcile mints one on the next snapshot) is subscribed exactly as
+    /// it was before this existed.
+    fn select_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        // An open rename field is a keyboard grab on a row the operator
+        // is walking away from.
+        self.cancel_rename(cx);
+        self.diff_tool = None;
+        let _ = self.commands.send(Command::Select(session_id.to_string()));
+        let snapshot = self.strip_snapshot(cx);
+        if let Some(tab) = strip::tab_for_session(&snapshot, session_id) {
+            if snapshot.active.as_deref() != Some(tab.as_str()) {
+                self.activate_tab(&tab, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// **A window's tabs go with it (Slice W1).**
     ///
     /// Closing the surface has to close the strip, or the tabs stay in
@@ -11443,26 +12090,80 @@ impl Shell {
     /// actual state, never a UI-held selection — and it is what makes
     /// `TabsState::active` a single notion rather than a cache.
     fn activate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        // A split is a view of two tabs. Clicking a third one leaves it;
-        // clicking one of the two just focuses that pane.
-        if let Some(s) = &self.split {
-            if !s.contains(tab_id) {
-                self.split = None;
-            }
-        }
+        // Slice ID2b: choosing a tab is choosing a tool; the diff tool is
+        // a face of the selection and gives the well back.
+        self.diff_tool = None;
+        // A split is an arrangement, not a lock (Slice SP1): a tab outside
+        // every split shows alone and the splits keep — `showing_split`
+        // reads the active tab — so nothing here has to be cleared.
         let _ = self
             .commands
             .send(Command::Browser(BrowserCmd::Activate(tab_id.to_string())));
         cx.notify();
     }
 
+    /// The split holding `id`, if any. A tab is in at most one.
+    fn split_of(&self, id: &str) -> Option<usize> {
+        self.splits.iter().position(|s| s.contains(id))
+    }
+
+    /// The split the well is showing: the one the active tab belongs to.
+    /// A tab outside every split shows alone, and the splits keep.
+    fn showing_split(&self, snapshot: &eave_wire::TabsSnapshot) -> Option<&Split> {
+        let active = snapshot.active.as_deref()?;
+        self.splits.iter().find(|s| s.contains(active))
+    }
+
+    /// Whether `id` is a session tab in this window's strip.
+    fn tab_is_session(snapshot: &eave_wire::TabsSnapshot, id: &str) -> bool {
+        snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == id && matches!(t.content, eave_wire::TabContent::Session { .. }))
+    }
+
+    /// Drop every member the strip no longer has, and every split left
+    /// with one pane. Runs from the tabs observer — a tab closed from
+    /// another window, or by the engine, must not leave a pane the well
+    /// cannot draw. **Not against an empty strip**: the splits are loaded
+    /// before the engine's first snapshot arrives, and pruning them
+    /// against nothing would erase every arrangement on every launch.
+    fn prune_splits(&mut self, cx: &App) {
+        let snapshot = self.strip_snapshot(cx);
+        if snapshot.tabs.is_empty() {
+            return;
+        }
+        let before = self.splits.clone();
+        for split in &mut self.splits {
+            let gone: Vec<String> = split
+                .panes
+                .iter()
+                .filter(|id| !snapshot.tabs.iter().any(|t| &t.id == *id))
+                .cloned()
+                .collect();
+            for id in gone {
+                split.remove(&id);
+            }
+        }
+        self.splits.retain(Split::is_viable);
+        if self.splits != before {
+            self.persist_splits();
+        }
+    }
+
+    fn persist_splits(&self) {
+        save_splits(&self.window_key, &self.splits);
+    }
+
     /// Put `dragged` beside `host` in the well.
     ///
     /// `dragged_on_right` is the drop: onto the right half of the well, or
     /// onto a tab (the host stays left, the dragged tab opens to its right —
-    /// Arc's default). Two session tabs are refused: this shell has one
-    /// transcript subscription, and a second session pane would be a
-    /// caption over an empty log.
+    /// Arc's default). If the host is already in a split the dragged tab
+    /// joins it beside the host, up to [`SPLIT_MAX`]; a full split refuses
+    /// the drop rather than squeezing a fifth pane in. A split holds at
+    /// most one session tab: this shell has one transcript subscription,
+    /// and a second session pane would be a caption over an empty log.
     fn split_tabs(
         &mut self,
         dragged: &str,
@@ -11474,48 +12175,71 @@ impl Shell {
             return;
         }
         let snapshot = self.strip_snapshot(cx);
-        let kind = |id: &str| {
-            snapshot
-                .tabs
-                .iter()
-                .find(|t| t.id == id)
-                .map(|t| t.content.clone())
-        };
-        let Some(a) = kind(dragged) else {
+        let known = |id: &str| snapshot.tabs.iter().any(|t| t.id == id);
+        if !known(dragged) || !known(host) {
             return;
-        };
-        let Some(b) = kind(host) else {
-            return;
-        };
-        if matches!(a, eave_wire::TabContent::Session { .. })
-            && matches!(b, eave_wire::TabContent::Session { .. })
+        }
+        let host_split = self.split_of(host);
+        if Self::tab_is_session(&snapshot, dragged) {
+            let session_already = match host_split {
+                Some(ix) => self.splits[ix]
+                    .panes
+                    .iter()
+                    .any(|p| p != dragged && Self::tab_is_session(&snapshot, p)),
+                None => Self::tab_is_session(&snapshot, host),
+            };
+            if session_already {
+                return;
+            }
+        }
+        if host_split
+            .is_some_and(|ix| !self.splits[ix].contains(dragged) && self.splits[ix].is_full())
         {
             return;
         }
-        let (left, right) = if dragged_on_right {
-            (host.to_string(), dragged.to_string())
-        } else {
-            (dragged.to_string(), host.to_string())
-        };
-        self.split = Some(Split {
-            left,
-            right,
-            ratio: 0.5,
-            vertical: false,
-        });
+        // One split at a time: leave the old one. A pair left with one
+        // pane is a tab again — unless it is the host's own split, where
+        // this is a reorder and the pane comes straight back.
+        if let Some(old) = self.split_of(dragged) {
+            self.splits[old].remove(dragged);
+            if Some(old) != host_split && !self.splits[old].is_viable() {
+                self.splits.remove(old);
+            }
+        }
+        match self.split_of(host) {
+            Some(ix) => {
+                let at =
+                    self.splits[ix].position(host).unwrap_or(0) + usize::from(dragged_on_right);
+                self.splits[ix].insert(at, dragged.to_string());
+            }
+            None => {
+                let (left, right) = if dragged_on_right {
+                    (host.to_string(), dragged.to_string())
+                } else {
+                    (dragged.to_string(), host.to_string())
+                };
+                self.splits.push(Split::pair(left, right));
+            }
+        }
+        self.persist_splits();
         self.activate_tab(dragged, cx);
     }
 
     /// Drop a tab onto the content well. The host is the tab already
-    /// showing in that half (the opposite pane of a split, or the active
-    /// tab when the well is single).
+    /// showing at that edge (the outermost pane of the split on screen,
+    /// or the active tab when the well is single), so the dropped tab
+    /// lands where the pointer let go of it.
     fn drop_tab_on_well(&mut self, dragged: &str, on_right: bool, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
-        let host = if let Some(s) = &self.split {
-            if on_right {
-                s.left.clone()
+        let host = if let Some(s) = self.showing_split(&snapshot) {
+            let edge = if on_right {
+                s.panes.last()
             } else {
-                s.right.clone()
+                s.panes.first()
+            };
+            match edge {
+                Some(id) => id.clone(),
+                None => return,
             }
         } else {
             match snapshot.active.clone() {
@@ -11565,20 +12289,31 @@ impl Shell {
             }
         }
         let was_active = snapshot.active.as_deref() == Some(tab_id);
-        // Closing one side of a split leaves the other filling the card.
-        // Activate that other tab ourselves so the successor walk cannot
-        // land on a third tab and drop the one that was still on screen.
+        // Closing one pane leaves the rest filling the card. When it was
+        // the focused pane, activate a neighbour ourselves so the successor
+        // walk cannot land on a third tab and drop the ones still on
+        // screen. A pair left with one pane is a tab again.
         let mut skip_successor = false;
-        if let Some(s) = &self.split {
-            if s.contains(tab_id) {
-                if let Some(other) = s.other(tab_id) {
+        if let Some(ix) = self.split_of(tab_id) {
+            let pos = self.splits[ix].position(tab_id).unwrap_or(0);
+            self.splits[ix].remove(tab_id);
+            if was_active {
+                let neighbour = self.splits[ix]
+                    .panes
+                    .get(pos.saturating_sub(1))
+                    .or_else(|| self.splits[ix].panes.first())
+                    .cloned();
+                if let Some(other) = neighbour {
                     let _ = self
                         .commands
-                        .send(Command::Browser(BrowserCmd::Activate(other.to_string())));
+                        .send(Command::Browser(BrowserCmd::Activate(other)));
                     skip_successor = true;
                 }
-                self.split = None;
             }
+            if !self.splits[ix].is_viable() {
+                self.splits.remove(ix);
+            }
+            self.persist_splits();
         }
         if was_active && !skip_successor {
             if let Some(next) = strip::successor(&snapshot, tab_id) {
@@ -11603,8 +12338,17 @@ impl Shell {
     /// the tab somehow has not arrived, [`Shell::commit_omnibox`] opens one
     /// at the address instead of dropping it.
     fn new_tab(&mut self, cx: &mut Context<Self>) {
+        // Slice ID2b: where a new page lands follows what is active — in
+        // the selected task's group, or loosely in Browse. Read from the
+        // frame, which is the one place that knows.
+        let snapshot = self.strip_snapshot(cx);
+        let group = self
+            .frame_for(&snapshot, None, cx)
+            .task_group()
+            .map(str::to_string);
         let _ = self.commands.send(Command::Browser(BrowserCmd::NewTab {
             window: Some(self.window_key.clone()),
+            group,
         }));
         self.open_omnibox(cx);
     }
@@ -11621,9 +12365,37 @@ impl Shell {
     /// ctrl-tab / ctrl-shift-tab.
     fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
-        if let Some(next) = strip::cycle(&snapshot, forward) {
+        // ID2b′ (sign-off answer 3): the whole window, in the sidebar's
+        // order. ID2b scoped this to one task's tools; the sidebar is the
+        // spine, and a cycler that could not leave a task broke the
+        // muscle memory the Arc shape is chosen for.
+        let order = self.spine_order(&snapshot);
+        if let Some(next) = strip::cycle_in(&order, snapshot.active.as_deref(), forward) {
             self.activate_tab(&next, cx);
         }
+    }
+
+    /// ID2b′ — every tab in this window, in the order the sidebar draws
+    /// them: PAGES, then each task's chats and docked pages down the tree
+    /// (`spine_walk`, written by the rail's paint), then any tab the paint
+    /// did not place — a session past the rail's window (AG2 #10), a tab
+    /// that arrived since — in the engine's order, so nothing open is
+    /// unreachable by keyboard. Filtered to what is live NOW: the paint's
+    /// list can be a frame behind the snapshot.
+    fn spine_order(&self, snapshot: &eave_wire::TabsSnapshot) -> Vec<String> {
+        let live: HashSet<&str> = snapshot.tabs.iter().map(|t| t.id.as_str()).collect();
+        let mut out: Vec<String> = Vec::with_capacity(snapshot.tabs.len());
+        for id in self.spine_walk.borrow().iter() {
+            if live.contains(id.as_str()) && !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        for id in strip::cycle_order(snapshot) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// ⌘⇧↑ / ⌘⇧↓ — move the selection one row along the rail (AG2 #7).
@@ -11681,8 +12453,7 @@ impl Shell {
         // click site gives: an open rename field is a keyboard grab on a
         // row the operator is walking away from.
         let next = next.clone();
-        self.cancel_rename(cx);
-        let _ = self.commands.send(Command::Select(next));
+        self.select_session(&next, cx);
     }
 
     /// **Slice AG1 #12 — the turn ticks and which one is lit.**
@@ -11928,7 +12699,7 @@ impl Shell {
             return;
         }
         let snapshot = self.strip_snapshot(cx);
-        let order = strip::cycle_order(&snapshot);
+        let order = self.spine_order(&snapshot);
         let Some(id) = order.get(index) else {
             return;
         };
@@ -11941,7 +12712,7 @@ impl Shell {
             return;
         }
         let snapshot = self.strip_snapshot(cx);
-        let order = strip::cycle_order(&snapshot);
+        let order = self.spine_order(&snapshot);
         let Some(id) = order.last() else {
             return;
         };
@@ -12003,8 +12774,8 @@ impl Shell {
         // focused pane is the page — otherwise the transcript empties the
         // moment you click the document.
         let session_id = strip::active_session(snapshot).or_else(|| {
-            self.split.as_ref().and_then(|s| {
-                [&s.left, &s.right].into_iter().find_map(|id| {
+            self.showing_split(snapshot).and_then(|s| {
+                s.panes.iter().find_map(|id| {
                     snapshot.tabs.iter().find_map(|t| match &t.content {
                         eave_wire::TabContent::Session { session_id } if t.id == *id => {
                             Some(session_id.clone())
@@ -12050,7 +12821,7 @@ impl Shell {
         // still exist, and closing something that immediately returns is
         // not closing it. Reaching this line means a session has no view,
         // which is the one moment a project genuinely has to exist.
-        let roots: HashMap<&str, &str> = self
+        let roots: HashMap<&str, (&str, Option<&str>)> = self
             .sessions
             .read(cx)
             .sessions
@@ -12058,7 +12829,7 @@ impl Shell {
             .filter_map(|s| {
                 s.checkout_root
                     .as_deref()
-                    .map(|root| (s.session_id.as_str(), root))
+                    .map(|root| (s.session_id.as_str(), (root, s.project_root.as_deref())))
             })
             .collect();
 
@@ -12089,7 +12860,10 @@ impl Shell {
                 continue;
             }
 
-            let root = roots.get(session_id.as_str()).copied();
+            let (root, base) = match roots.get(session_id.as_str()).copied() {
+                Some((root, base)) => (Some(root), base),
+                None => (None, None),
+            };
             let group = root.and_then(|r| strip::group_for_workspace(snapshot, r));
             // Ask for a project only when there is not one AND nobody has
             // already asked for this same checkout. Two sessions in one new
@@ -12100,6 +12874,12 @@ impl Shell {
                 (None, Some(root)) if minting.insert(root.to_string()) => Some(root.to_string()),
                 _ => None,
             };
+            // Slice ID2b: the group's `base` rides with the ask, and only
+            // when a group is being minted — an existing group keeps
+            // whatever it recorded.
+            let base = workspace
+                .as_ref()
+                .and_then(|_| base.map(str::to_string));
             let _ = self
                 .commands
                 .send(Command::Browser(BrowserCmd::OpenSessionTab {
@@ -12111,6 +12891,7 @@ impl Shell {
                     activate: false,
                     group,
                     workspace,
+                    base,
                 }));
         }
     }
@@ -12811,19 +13592,38 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
-        let is_session = |id: &str| {
-            snapshot
-                .tabs
-                .iter()
-                .any(|t| t.id == id && matches!(t.content, eave_wire::TabContent::Session { .. }))
-        };
-        let (left_tr, right_tr, left_co, right_co) = if is_session(&split.left) {
-            (Some(transcript_el), None, Some(composer), None)
-        } else if is_session(&split.right) {
-            (None, Some(transcript_el), None, Some(composer))
-        } else {
-            (None, None, None, None)
-        };
+        // The one session pane, if any, takes the transcript and the
+        // composer; `split_tabs` refuses a second.
+        let session_ix = split
+            .panes
+            .iter()
+            .position(|id| Self::tab_is_session(&snapshot, id));
+        let mut transcript_el = Some(transcript_el);
+        let mut composer = Some(composer);
+        let n = split.panes.len();
+        let mut children: Vec<AnyElement> = Vec::with_capacity(2 * n);
+        for (ix, id) in split.panes.iter().enumerate() {
+            if ix > 0 {
+                children.push(self.split_handle(split.vertical, ix - 1, cx));
+            }
+            let (tr, co) = if session_ix == Some(ix) {
+                (transcript_el.take(), composer.take())
+            } else {
+                (None, None)
+            };
+            children.push(self.split_pane(
+                id,
+                pane_side(ix, n),
+                split.shares.get(ix).copied().unwrap_or(1.0 / n as f32),
+                ix == 0,
+                ix + 1 == n,
+                rail_collapsed,
+                tr,
+                co,
+                phase,
+                cx,
+            ));
+        }
         div()
             .debug_selector(|| "split-well".into())
             .size_full()
@@ -12836,19 +13636,20 @@ impl Shell {
                     let Some(drag) = this.split_drag else {
                         return;
                     };
-                    let Some(split) = this.split.as_mut() else {
+                    let Some(active) = this.strip_snapshot(cx).active else {
                         return;
                     };
+                    let Some(ix) = this.split_of(&active) else {
+                        return;
+                    };
+                    let split = &mut this.splits[ix];
                     let pos = if split.vertical {
                         f32::from(e.event.position.y)
                     } else {
                         f32::from(e.event.position.x)
                     };
                     let delta = (pos - drag.grab_x) / drag.well_w;
-                    let r = (drag.start_ratio + delta)
-                        .clamp(theme::SPLIT_RATIO_MIN, 1.0 - theme::SPLIT_RATIO_MIN);
-                    if (r - split.ratio).abs() >= 0.002 {
-                        split.ratio = r;
+                    if split.set_share(drag.handle, drag.start_ratio + delta) {
                         cx.notify();
                     }
                 }),
@@ -12857,6 +13658,7 @@ impl Shell {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                     if this.split_drag.take().is_some() {
+                        this.persist_splits();
                         cx.notify();
                     }
                 }),
@@ -12865,38 +13667,15 @@ impl Shell {
                 let on_right = this.well_drop_is_right(window, cx);
                 this.drop_tab_on_well(&drag.id, on_right, cx);
             }))
-            .child(self.split_pane(
-                &split.left,
-                "left",
-                split.ratio,
-                true,
-                false,
-                rail_collapsed,
-                left_tr,
-                left_co,
-                phase,
-                cx,
-            ))
-            .child(self.split_handle(split.vertical, cx))
-            .child(self.split_pane(
-                &split.right,
-                "right",
-                1.0 - split.ratio,
-                false,
-                true,
-                rail_collapsed,
-                right_tr,
-                right_co,
-                phase,
-                cx,
-            ))
+            .children(children)
             .into_any_element()
     }
 
-    fn split_handle(&self, vertical: bool, cx: &Context<Self>) -> AnyElement {
+    /// The divider after pane `ix`.
+    fn split_handle(&self, vertical: bool, ix: usize, cx: &Context<Self>) -> AnyElement {
         div()
-            .id("split-handle")
-            .debug_selector(|| "split-handle".into())
+            .id(SharedString::from(format!("split-handle-{ix}")))
+            .debug_selector(move || format!("split-handle-{ix}"))
             .flex_none()
             .when(vertical, |d| {
                 d.h(px(theme::RAIL_HANDLE_W)).w_full().cursor_row_resize()
@@ -12907,32 +13686,39 @@ impl Shell {
             .occlude()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, e: &MouseDownEvent, window, cx| {
-                    let Some(s) = this.split.as_ref() else {
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    let snapshot = this.strip_snapshot(cx);
+                    let Some(s) = this.showing_split(&snapshot) else {
                         return;
                     };
+                    let (vertical, start_ratio, handles) = (
+                        s.vertical,
+                        s.shares.get(ix).copied().unwrap_or(0.5),
+                        s.panes.len().saturating_sub(1) as f32,
+                    );
                     let rail = if this.sessions.read(cx).collapsed {
                         0.0
                     } else {
                         this.rail_w
                     };
-                    let well_w = if s.vertical {
+                    let well_w = if vertical {
                         f32::from(window.viewport_size().height)
                             - 2.0 * theme::CARD_GUTTER
-                            - theme::RAIL_HANDLE_W
+                            - handles * theme::RAIL_HANDLE_W
                     } else {
                         f32::from(window.viewport_size().width)
                             - rail
                             - 2.0 * theme::CARD_GUTTER
-                            - theme::RAIL_HANDLE_W
+                            - handles * theme::RAIL_HANDLE_W
                     };
                     this.split_drag = Some(SplitDrag {
-                        grab_x: if s.vertical {
+                        handle: ix,
+                        grab_x: if vertical {
                             f32::from(e.position.y)
                         } else {
                             f32::from(e.position.x)
                         },
-                        start_ratio: s.ratio,
+                        start_ratio,
                         well_w: well_w.max(1.0),
                     });
                     cx.stop_propagation();
@@ -13148,20 +13934,15 @@ impl Shell {
                         - rail
                         - 2.0 * theme::CARD_GUTTER
                         - theme::RAIL_HANDLE_W;
-                    if let Some(s) = this.split.as_ref() {
+                    let snapshot = this.strip_snapshot(cx);
+                    if let Some(s) = this.showing_split(&snapshot) {
                         if !s.vertical {
-                            well_w -= theme::RAIL_HANDLE_W;
-                            let share = if s.left == for_tab {
-                                s.ratio
-                            } else if s.right == for_tab {
-                                1.0 - s.ratio
-                            } else {
-                                1.0
-                            };
-                            well_w *= share;
+                            well_w -= s.panes.len().saturating_sub(1) as f32 * theme::RAIL_HANDLE_W;
+                            well_w *= s.share_of(&for_tab).unwrap_or(1.0);
                         }
                     }
                     this.devtools_drag = Some(SplitDrag {
+                        handle: 0,
                         grab_x: f32::from(e.position.x),
                         start_ratio: this.devtools_ratio,
                         well_w: well_w.max(1.0),
@@ -13272,10 +14053,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let snapshot = self.strip_snapshot(cx);
-        let is_page = snapshot
-            .tabs
-            .iter()
-            .any(|t| t.id == tab_id && t.content == eave_wire::TabContent::Page);
+        // Slice ID2b: the one decision, asked about THIS pane's tab.
+        let is_page = self.frame_for(&snapshot, Some(tab_id), cx).active_is_page();
         let page_el = if is_page {
             crate::web::page_element(tab_id, cx)
                 .map(|el| self.devtools_dock(tab_id, el, cx))
@@ -13295,14 +14074,17 @@ impl Shell {
         } else {
             Some(PAGE_NO_ENGINE)
         };
-        let header_tag = if side == "left" {
-            "pane-header-left"
-        } else {
-            "pane-header-right"
+        let header_tag = match side {
+            "left" => "pane-header-left",
+            "right" => "pane-header-right",
+            "mid-1" => "pane-header-mid-1",
+            _ => "pane-header-mid-2",
         };
         let activate = tab_id.to_string();
         let drop_id = tab_id.to_string();
-        let on_right = side == "right";
+        // A drop on any pane but the first opens to that pane's right;
+        // the first pane takes it on its left, so both edges are reachable.
+        let on_right = side != "left";
         let is_focused = snapshot.active.as_deref() == Some(tab_id);
         div()
             .id(SharedString::from(format!("split-pane-{side}")))
@@ -13388,6 +14170,10 @@ impl Shell {
             .into_any_element()
     }
 
+    /// ID2b′: this line holds the ACTIVE thing's controls and nothing
+    /// else — the address for a page, the crumb for a chat or the diff.
+    /// The tabs live in the rail, at every level; ID2b's strip on this
+    /// line was the reference's single-hero presentation and was reverted.
     fn pane_header(
         &self,
         cx: &mut Context<Self>,
@@ -13401,6 +14187,8 @@ impl Shell {
         let snapshot = self.strip_snapshot(cx);
         let wanted = for_tab.or(snapshot.active.as_deref());
         let active = wanted.and_then(|a| snapshot.tabs.iter().find(|t| t.id == a));
+        // Slice ID2b: the one decision.
+        let frame = self.frame_for(&snapshot, for_tab, cx);
 
         // This strip is the card's top, inside the radius. Shut, the card
         // starts at CARD_GUTTER, so the pad is what the traffic lights need
@@ -13437,9 +14225,16 @@ impl Shell {
 
         let row = if show_rail { row.child(rail) } else { row };
 
-        let inner = match active.map(|t| (t, t.content.clone())) {
+        let inner = match (frame.view.clone(), active) {
             // ── a page: the browser toolbar ──────────────────────────────
-            Some((tab, eave_wire::TabContent::Page)) => {
+            (FrameView::Browse { tab: Some(_) }, Some(tab))
+            | (
+                FrameView::Task {
+                    tool: Tool::Page { .. },
+                    ..
+                },
+                Some(tab),
+            ) => {
                 let back = tab.can_go_back;
                 let fwd = tab.can_go_forward;
                 let has_url = tab.url.is_some();
@@ -13693,7 +14488,13 @@ impl Shell {
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── a session: the breadcrumb ────────────────────────────────
-            Some((_, eave_wire::TabContent::Session { session_id })) => {
+            (
+                FrameView::Task {
+                    tool: Tool::Chat { session_id },
+                    ..
+                },
+                _,
+            ) => {
                 let info = self
                     .sessions
                     .read(cx)
@@ -13732,6 +14533,27 @@ impl Shell {
                 }))
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
+            // ── the diff tool: what it is, and the files face toggle ──────
+            (
+                FrameView::Task {
+                    tool: Tool::Diff { .. },
+                    ..
+                },
+                _,
+            ) => row
+                .child(
+                    div()
+                        .debug_selector(|| "pane-crumb".into())
+                        .flex_none()
+                        .truncate()
+                        .text_size(px(theme::DETAIL_SIZE))
+                        .line_height(px(theme::DETAIL_LINE))
+                        .font_weight(theme::WEIGHT_LABEL)
+                        .text_color(theme::text_secondary())
+                        .child("changes"),
+                )
+                .child(div().flex_1())
+                .when(show_files, |d| d.child(self.files_toggle(cx))),
             // ── nothing open: the line still exists ───────────────────────
             //
             // It keeps its height rather than collapsing, because a header
@@ -14329,338 +15151,6 @@ impl Shell {
                 theme::text_secondary(),
                 "files-toggle-glyph",
             ))
-    }
-
-    /// **Slice D1 — the strip, vertical, in the rail.**    /// **Slice D1 — the strip, vertical, in the rail.**
-    ///
-    /// Same projection of B1's browser store that Slice C5 built, same single
-    /// notion of active, same two kinds of tab on one ordering. What changed
-    /// is the axis, and the axis was a capacity ceiling: a horizontal strip
-    /// shares the titlebar line with everything else on it, and
-    /// `five_sessions_fit_the_strip_without_scrolling` measured the result at
-    /// **five tabs** in the default window. A browser's tab strip with a
-    /// five-tab ceiling is a frame defect, and no restyling of a tab reaches
-    /// it — turning the axis is the only fix, because vertical space is what
-    /// the window has spare.
-    ///
-    /// **It sits ABOVE the session list rather than replacing it.** A tab is
-    /// a view and a session is work that outlives every view of it (B1's
-    /// ruling), so a session with no tab open has to stay visible or the rail
-    /// stops being the instrument this frame was chosen for. The two
-    /// references in `frame-refs/` that have a rail both do exactly this —
-    /// Radius carries a Projects tree and a Tabs list in one column. A
-    /// session with a tab open appears in both, and that is correct: one
-    /// section is what is open, the other is what exists.
-    fn rail_tabs(
-        &self,
-        cx: &Context<Self>,
-        phase: Option<f32>,
-        caret_lit: bool,
-        folder_caret_lit: bool,
-    ) -> AnyElement {
-        let snapshot = self.strip_snapshot(cx);
-        let chips: HashMap<String, strip::SessionChip> = self
-            .sessions
-            .read(cx)
-            .sessions
-            .iter()
-            .map(|s| {
-                // Slice ID2a: the tab says what the row says — the task,
-                // with the provider's mark as its icon — and a stand-in
-                // is flagged so the tab draws it as one.
-                let (label, kind) = self.row_name(s);
-                (
-                    s.session_id.clone(),
-                    strip::SessionChip {
-                        label,
-                        placeholder: kind == NameKind::Placeholder,
-                        state: s.state.clone(),
-                        provider: s.provider.clone(),
-                    },
-                )
-            })
-            .collect();
-        let items = strip::items(&snapshot, &chips, &page_resident);
-
-        let split_members: Option<(strip::StripTab, strip::StripTab)> =
-            self.split.as_ref().and_then(|s| {
-                let find = |id: &str| {
-                    items.iter().find_map(|item| match item {
-                        strip::StripItem::Tab(t) if t.id == id => Some(t.clone()),
-                        _ => None,
-                    })
-                };
-                Some((find(&s.left)?, find(&s.right)?))
-            });
-
-        // Slice T1 — where the projects stop and the loose tabs start.
-        // `strip::drawn_order` has already hoisted every group above every
-        // loose tab; this only asks the same module where it put the seam,
-        // rather than re-deriving it and risking a different answer from
-        // the one ctrl-tab walks.
-        //
-        // The divider is pushed into `rows` like any other row, and that is
-        // what keeps `active_row` correct for free: it is tracked as
-        // `rows.len()` at push time — machinery split view needed, because
-        // a split draws two tabs as one row — and that absorbs an inserted
-        // divider without knowing it exists.
-        let projects = strip::project_item_count(&items);
-        let project_count = items[..projects]
-            .iter()
-            .filter(|i| matches!(i, strip::StripItem::Group { .. }))
-            .count();
-        let folder_count = bookmarks::folders(&self.bookmarks.read(cx).snapshot).len();
-
-        let proj_shut = self.zone_projects_collapsed.get();
-        let folders_shut = self.zone_folders_collapsed.get();
-
-        let mut rows: Vec<AnyElement> = Vec::new();
-        // Rows in this list that are not tabs: zone headers, the zone
-        // rule, bookmark folder rows, and the standing New Tab pill.
-        // Counted so they do not spend the tab budget — see
-        // `theme::rail_rows_h`.
-        let mut extra = 0usize;
-        let mut folder_block: Vec<AnyElement> = Vec::new();
-        let mut active_row: Option<usize> = None;
-        // Where the Projects zone stops and Folders/Tabs begins. The rail's
-        // sections are separate scrollers (the operator's report: "each
-        // section needs to be its own scrollable section"), and this index
-        // is the cut — recorded where the folders head is emitted rather
-        // than recomputed, so the two cannot drift.
-        let mut seam_ix: Option<usize> = None;
-        rows.push(self.zone_toggle(
-            "zone-projects",
-            ZONE_PROJECTS,
-            "Projects",
-            proj_shut,
-            project_count,
-            false,
-            |this, cx| this.pick_project(cx),
-            cx,
-        ));
-        extra += 1;
-        let mut emitted_split = false;
-        let mut emitted_tabs_seam = false;
-        for (ix, item) in items.iter().enumerate() {
-            if ix == projects && !emitted_tabs_seam {
-                seam_ix = Some(rows.len());
-                extra += self.emit_folders_and_tabs_head(
-                    &mut folder_block,
-                    &mut rows,
-                    folders_shut,
-                    folder_count,
-                    caret_lit,
-                    folder_caret_lit,
-                    cx,
-                );
-                emitted_tabs_seam = true;
-            }
-            if ix < projects && proj_shut {
-                continue;
-            }
-            match item {
-                strip::StripItem::Group {
-                    id,
-                    title,
-                    color,
-                    workspace,
-                    collapsed,
-                    count,
-                    holds_active,
-                } => {
-                    if *holds_active {
-                        active_row = Some(rows.len());
-                    }
-                    rows.push(self.group_head(
-                        id,
-                        title,
-                        color,
-                        workspace,
-                        *collapsed,
-                        *count,
-                        *holds_active,
-                        cx,
-                    ));
-                }
-                strip::StripItem::Tab(tab) => {
-                    if let Some(s) = &self.split {
-                        if s.contains(&tab.id) {
-                            if !emitted_split {
-                                if let Some((left, right)) = split_members.as_ref() {
-                                    if s.contains(snapshot.active.as_deref().unwrap_or("")) {
-                                        active_row = Some(rows.len());
-                                    }
-                                    rows.push(self.split_tabs_row(&[left, right], phase, cx));
-                                    emitted_split = true;
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    // A bookmark tab lives behind its tile, not in this
-                    // list (the peek-walk ruling). Membership already
-                    // implies "still on its bookmark's host" — the map
-                    // was pruned this same frame. After the split arm on
-                    // purpose: a split's row is the two panes together,
-                    // whatever else either of them is.
-                    if self
-                        .bookmark_tabs
-                        .borrow()
-                        .values()
-                        .any(|id| id == &tab.id)
-                    {
-                        continue;
-                    }
-                    if tab.active {
-                        active_row = Some(rows.len());
-                    }
-                    rows.push(self.rail_tab(tab, phase, false, cx));
-                }
-            }
-        }
-        if !emitted_tabs_seam {
-            seam_ix = Some(rows.len());
-            extra += self.emit_folders_and_tabs_head(
-                &mut folder_block,
-                &mut rows,
-                folders_shut,
-                folder_count,
-                caret_lit,
-                folder_caret_lit,
-                cx,
-            );
-        }
-
-        // Scroll the active tab into view on the EDGE of it changing, never
-        // every frame. `scroll_to_item` arms an active item that prepaint
-        // consumes, so re-arming it every pass would pin the list and the
-        // operator could never scroll to anything else. Index is the ROW,
-        // not the strip item: a split draws two tabs as one child.
-        // The cut. Everything before the folders head is the Projects
-        // zone; everything from it on is Folders/Tabs.
-        let seam = seam_ix.unwrap_or(rows.len()).min(rows.len());
-        let tab_rows: Vec<AnyElement> = rows.split_off(seam);
-        let project_rows: Vec<AnyElement> = rows;
-        // `extra` counted the whole list. Split it the same way, so each
-        // section's height is computed from its OWN rows: the Projects zone
-        // keeps its header, Folders/Tabs keeps everything the head emitted.
-        let project_extra = 1usize.min(project_rows.len());
-        let tab_extra = extra.saturating_sub(project_extra);
-
-        {
-            let mut been = self.tab_scrolled_to.borrow_mut();
-            match snapshot.active.as_deref() {
-                Some(active) if been.as_deref() != Some(active) => {
-                    if let Some(ix) = active_row {
-                        // The index was taken against the WHOLE list, so it
-                        // has to be re-based onto whichever section now owns
-                        // that row — scrolling the tabs list to a project's
-                        // index would jump to an unrelated tab.
-                        if ix >= seam {
-                            self.tabs_scroll.scroll_to_item(ix - seam);
-                        } else {
-                            self.projects_scroll.scroll_to_item(ix);
-                        }
-                        *been = Some(active.to_string());
-                    }
-                }
-                None => *been = None,
-                _ => {}
-            }
-        }
-
-        // A SECTION each, and neither may starve the one below it.
-        //
-        // This used to be one scroll box holding Projects, Folders and Tabs
-        // together, at a definite height computed from a row count, marked
-        // `flex_none`. Measured on a rail 520 px tall it took 277 of them
-        // and left the SESSIONS list 27 px — a header and three pixels —
-        // and no amount of window height fixed it, because `flex_none` is a
-        // refusal to yield rather than a size.
-        //
-        // So: `min_h` + `max_h` + shrink instead of an exact `h`. The
-        // minimum is what keeps a scroll container from collapsing (its
-        // automatic minimum size is zero, which is the Slice D1 bug the
-        // definite height was introduced to fix — `min_h` fixes it without
-        // also making the box unable to yield). The maximum is the old
-        // computed height, so nothing GREW. And because the box can now
-        // scroll rather than clip, a row whose height the formula does not
-        // know about costs a scroll instead of an unreachable row.
-        div()
-            .debug_selector(|| "rail-tabs".into())
-            .flex_shrink(1.)
-            .min_h(px(0.))
-            .w_full()
-            .flex()
-            .flex_col()
-            .children((!project_rows.is_empty()).then(|| {
-                div()
-                    .id("projects-strip")
-                    .debug_selector(|| "projects-strip".into())
-                    .w_full()
-                    .flex_shrink(1.)
-                    .min_h(px(theme::RAIL_TAB_H))
-                    .max_h(px(theme::rail_section_h(
-                        project_rows.len().min(theme::RAIL_TABS_VISIBLE + 1),
-                    )))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.projects_scroll)
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::RAIL_ROW_GAP))
-                    .children(project_rows)
-            }))
-            .child(
-                div()
-                    .id("folders-strip")
-                    .debug_selector(|| "folders-strip".into())
-                    .w_full()
-                    .flex_none()
-                    .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::RAIL_ROW_GAP))
-                    .children(folder_block),
-            )
-            .child(
-                div()
-                    .id("tab-strip")
-                    // The selector the C5 harness measures. Kept through the
-                    // axis change on purpose: the tests that ask "is this tab
-                    // inside the strip's box" are asking the right question
-                    // still, and renaming the box would have been a test edit
-                    // pretending to be a product change.
-                    .debug_selector(|| "tab-strip".into())
-                    .w_full()
-                    // **A DEFINITE height, not a `max_h`.** This is a scroll
-                    // container, and a scroll container's automatic minimum
-                    // size is zero — so `max_h` alone let it collapse to
-                    // nothing. The harness did not catch it: nine tabs
-                    // measure exactly `rail_tabs_max_h()`, so the box came
-                    // out the right size for the wrong reason and every
-                    // containment assertion passed. It took a capture with
-                    // twelve tabs in the journal and an empty OPEN section on
-                    // screen to see it — the render-vs-measure gap the
-                    // webview spike named, arriving from the other side.
-                    .flex_shrink(1.)
-                    .min_h(px(theme::RAIL_TAB_H))
-                    .max_h(px(theme::rail_rows_h(tab_rows.len(), tab_extra)))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.tabs_scroll)
-                    // Same reason the horizontal strip stopped propagation:
-                    // `Shell::on_wheel` is on the root and would otherwise
-                    // take every wheel event that happened to be over here,
-                    // breaking the transcript's follow mode.
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::RAIL_ROW_GAP))
-                    .children(tab_rows),
-            )
-            .into_any_element()
     }
 
     /// Slice T1b — **the rail's bookmarks section**: pinned marks, and the
@@ -15464,11 +15954,15 @@ impl Shell {
     /// in the same segment, and `debug_bounds` resolves a selector to the
     /// last-painted element — so title-keyed selectors would hand the
     /// harness one project's header while it believed it had the other's.
+    /// `lit` (ID2b′): this header is collapsed and hides the row the frame
+    /// names, so it wears the selection rim in that row's stead — the one
+    /// lit row is never off screen.
     fn rail_group_header(
         &self,
         g: RailGroup,
         ink: Hsla,
         collapsed: bool,
+        lit: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let sel = format!("rail-group-{}", g.root);
@@ -15481,6 +15975,10 @@ impl Shell {
         let sel_badge = sel.clone();
         let sel_chev = sel.clone();
         let sel_swatch = sel.clone();
+        // Slice ID2b: the project's menu (`Remove from rail`) lived on the
+        // strip's group head, which is gone. It hangs on this header now,
+        // for the group bound to this root, when there is one.
+        let menu_group = strip::group_for_workspace(&self.strip_snapshot(cx), &g.root);
         rail_inset()
             .child(
                 div()
@@ -15491,7 +15989,17 @@ impl Shell {
                     .px(px(theme::RAIL_HOVER_PAD))
                     .rounded(px(theme::RADIUS_SELECT))
                     .cursor_pointer()
+                    .when(lit, |d| d.shadow(theme::selection_rim()))
                     .hover_fade(sel_chev.clone(), theme::wash_rest(), theme::overlay())
+                    .when_some(menu_group, |d, gid| {
+                        d.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_project_menu(&gid, ev.position, cx);
+                            }),
+                        )
+                    })
                     .flex()
                     .flex_row()
                     .items_center()
@@ -15710,30 +16218,24 @@ impl Shell {
 
     fn zone_cell(&self, key: &'static str) -> &std::cell::Cell<bool> {
         match key {
-            ZONE_PROJECTS => &self.zone_projects_collapsed,
             ZONE_FOLDERS => &self.zone_folders_collapsed,
             ZONE_SESSIONS => &self.zone_sessions_collapsed,
             other => unreachable!("unknown zone key: {other}"),
         }
     }
 
-    /// Folders zone, then the tabs seam + the standing New Tab pill.
+    /// Slice ID2b — the Folders zone, on its own.
     ///
-    /// Folders are written into `folder_block` so they can sit OUTSIDE
-    /// the tabs scroller — bookmark peeks work because tiles are not
-    /// inside `overflow_y_scroll`; the inventory is the same shape.
-    /// The divider and New Tab pill stay in `rows` (the tabs strip).
-    fn emit_folders_and_tabs_head(
-        &self,
-        folder_block: &mut Vec<AnyElement>,
-        rows: &mut Vec<AnyElement>,
-        folders_shut: bool,
-        folder_count: usize,
-        caret_lit: bool,
-        folder_caret_lit: bool,
-        cx: &Context<Self>,
-    ) -> usize {
-        folder_block.push(self.zone_toggle(
+    /// It used to share a list with the Projects zone and the Tabs zone
+    /// (`rail_tabs`, Slice D1/D4). Both of those are gone: a project is a
+    /// header in the sessions tree now, and a tab is a tool on the pane
+    /// header's strip. Bookmark folders are neither — they are app-wide,
+    /// like the pinned grid above them — so they stay here, between the
+    /// grid and the Browse row.
+    fn rail_folders(&self, cx: &Context<Self>, caret_lit: bool, folder_caret_lit: bool) -> AnyElement {
+        let folder_count = bookmarks::folders(&self.bookmarks.read(cx).snapshot).len();
+        let folders_shut = self.zone_folders_collapsed.get();
+        let mut folder_block: Vec<AnyElement> = vec![self.zone_toggle(
             "zone-folders",
             ZONE_FOLDERS,
             "Folders",
@@ -15742,19 +16244,183 @@ impl Shell {
             false,
             |this, cx| this.new_bookmark_folder(cx),
             cx,
-        ));
+        )];
         if !folders_shut {
             // No empty-state row: add is the header `+` (and still the
-            // right-click menu). An empty zone has nothing
-            // nested, so it is just the header.
+            // right-click menu). An empty zone has nothing nested, so it
+            // is just the header.
             folder_block.extend(self.bookmark_folder_rows(caret_lit, folder_caret_lit, cx));
         }
-        let mut extra = 0usize;
-        rows.push(self.zone_rule("tabs-divider"));
-        extra += 1;
-        rows.push(self.new_tab_row(cx));
-        extra += 1;
-        extra
+        div()
+            .id("folders-strip")
+            .debug_selector(|| "folders-strip".into())
+            .w_full()
+            .flex_none()
+            .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
+            .flex()
+            .flex_col()
+            .gap(px(theme::RAIL_ROW_GAP))
+            .children(folder_block)
+            .into_any_element()
+    }
+
+    /// The strip's tabs by id, for the rail's page rows (ID2b′). The same
+    /// projection D1's vertical strip drew from: `strip::items`, one
+    /// `active`, two kinds of tab, the chat's label the row's own
+    /// (`row_name`, Slice ID2a).
+    fn strip_tabs_by_id(
+        &self,
+        snapshot: &eave_wire::TabsSnapshot,
+        cx: &Context<Self>,
+    ) -> HashMap<String, strip::StripTab> {
+        let chips: HashMap<String, strip::SessionChip> = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .map(|s| {
+                let (label, kind) = self.row_name(s);
+                (
+                    s.session_id.clone(),
+                    strip::SessionChip {
+                        label,
+                        placeholder: kind == NameKind::Placeholder,
+                        state: s.state.clone(),
+                        provider: s.provider.clone(),
+                    },
+                )
+            })
+            .collect();
+        strip::items(snapshot, &chips, &page_resident)
+            .into_iter()
+            .filter_map(|i| match i {
+                strip::StripItem::Tab(t) => Some((t.id.clone(), t)),
+                strip::StripItem::Group { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Page rows for a list of tab ids, in that order (ID2b′): one
+    /// `rail_tab` each, a split's members as ONE pill at the first
+    /// member's place, a tab a bookmark tile owns skipped (the peek-walk
+    /// ruling). Shared by PAGES and by a task's docked pages, so the two
+    /// cannot draw a tab two ways. Returns the rows and the index of the
+    /// active one among them.
+    fn tab_rows(
+        &self,
+        ids: &[String],
+        by_id: &HashMap<String, strip::StripTab>,
+        snapshot: &eave_wire::TabsSnapshot,
+        phase: Option<f32>,
+        cx: &Context<Self>,
+    ) -> (Vec<AnyElement>, Option<usize>) {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut active_row: Option<usize> = None;
+        let mut emitted_split = vec![false; self.splits.len()];
+        for id in ids {
+            // A split's row is its members together, drawn once where its
+            // first member falls in this list (Slice SP1: every split keeps
+            // its pill, on screen or not). A split this list holds fewer
+            // than two members of draws the tab as an ordinary row.
+            if let Some(sx) = self.split_of(id) {
+                let members: Vec<&strip::StripTab> = self.splits[sx]
+                    .panes
+                    .iter()
+                    .filter_map(|p| by_id.get(p))
+                    .collect();
+                if members.len() >= 2 {
+                    if !emitted_split[sx] {
+                        if self.splits[sx].contains(snapshot.active.as_deref().unwrap_or("")) {
+                            active_row = Some(rows.len());
+                        }
+                        rows.push(self.split_tabs_row(&members, phase, cx));
+                        emitted_split[sx] = true;
+                    }
+                    continue;
+                }
+            }
+            let Some(tab) = by_id.get(id) else {
+                continue;
+            };
+            if self.bookmark_tabs.borrow().values().any(|b| b == id) {
+                continue;
+            }
+            if tab.active {
+                active_row = Some(rows.len());
+            }
+            rows.push(self.rail_tab(tab, phase, false, cx));
+        }
+        (rows, active_row)
+    }
+
+    /// ID2b′ — **PAGES: the window's loose page tabs, each a row.**
+    ///
+    /// The half of D1's vertical strip that was never a project: a page
+    /// with no task is a first-class row here, Arc-shaped, draggable, at
+    /// the same rank a chat has in the tree below. No header — the divider
+    /// above and the standing `+ New Tab` pill below are its edges, the
+    /// shape the HEAD Tabs zone had — and no collapse, no filter and no
+    /// window can hide it: it holds no session, so every rule written for
+    /// session rows is one it is exempt from. With nothing loose it is the
+    /// pill alone (sign-off answer 5): hiding the zone would hide the
+    /// browser half of eave at rest, the exact demotion ID2b′ corrects.
+    ///
+    /// A SECTION with its own scroller, sized `min_h` + `max_h` + shrink
+    /// and never an exact `h` (the AG2 starvation finding), keeping the
+    /// `tab-strip` selector the C5 harness measures through THREE axis
+    /// changes now: the question "is this tab inside the strip's box" is
+    /// still the right one.
+    fn rail_pages(
+        &self,
+        snapshot: &eave_wire::TabsSnapshot,
+        by_id: &HashMap<String, strip::StripTab>,
+        phase: Option<f32>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let loose = strip::loose_pages(snapshot);
+        let (tab_rows, active_row) = self.tab_rows(&loose, by_id, snapshot, phase, cx);
+        // Scroll the active page into view on the EDGE of it changing,
+        // never every frame: `scroll_to_item` arms an active item that
+        // prepaint consumes, so re-arming it each pass would pin the list.
+        {
+            let mut been = self.tab_scrolled_to.borrow_mut();
+            match snapshot.active.as_deref() {
+                Some(active) if been.as_deref() != Some(active) => {
+                    if let Some(ix) = active_row {
+                        // `+ 1`: the divider is this box's first item.
+                        self.tabs_scroll.scroll_to_item(ix + 1);
+                        *been = Some(active.to_string());
+                    }
+                }
+                None => *been = None,
+                _ => {}
+            }
+        }
+        let count = tab_rows.len();
+        div()
+            .id("tab-strip")
+            .debug_selector(|| "tab-strip".into())
+            .w_full()
+            .flex_shrink(1.)
+            .min_h(px(theme::RAIL_TAB_H))
+            // The divider (the formula's rule) and the pill are two rows
+            // of this box that are not tabs: `rows` counts them, `extra`
+            // names them. Passing the tab count alone here sized the box
+            // to 43 px under 3 tabs and every click on them missed.
+            .max_h(px(theme::rail_rows_h(count + 2, 2)))
+            .overflow_y_scroll()
+            .track_scroll(&self.tabs_scroll)
+            // `Shell::on_wheel` is on the root and would otherwise take
+            // every wheel event that happened to be over here.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .px(px(theme::RAIL_GUTTER - theme::RAIL_CARD_BLEED))
+            .flex()
+            .flex_col()
+            .gap(px(theme::RAIL_ROW_GAP))
+            .child(self.zone_rule("tabs-divider"))
+            .children(tab_rows)
+            .child(self.new_tab_row(cx))
+            .into_any_element()
     }
 
     /// Standing New Tab control. Not a zone header: no caret, no count,
@@ -15796,6 +16462,265 @@ impl Shell {
                             .text_color(theme::text_secondary())
                             .child("New Tab"),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// ID2b′ — the `changes` row under a task: the task's diff as a tool.
+    ///
+    /// 24 px, one step in, a files glyph, the word, and the task's
+    /// `+N −N` in Menlo (`coarse_lines`, AG2 #11's ladder) — the three
+    /// facts ID2b's strip chip stated. Selected the way a page row is (a
+    /// raised fill, never an accent: it is a location). Never a drag
+    /// source: it is a face of the selection, not a tab.
+    fn rail_diff_row(
+        &self,
+        root: &str,
+        stat: Option<String>,
+        is_sel: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let sel = format!("rail-diff-{root}");
+        let sel_id = SharedString::from(sel.clone());
+        let sel_stat = sel.clone();
+        let root = root.to_string();
+        rail_inset()
+            .child(
+                div()
+                    .id(sel_id)
+                    .debug_selector(move || sel.clone().into())
+                    .w_full()
+                    .h(px(theme::RAIL_TAB_H))
+                    .px(px(theme::RAIL_HOVER_PAD))
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .cursor_pointer()
+                    .when(is_sel, |d| d.shadow(theme::selection_rim()))
+                    .hover_fade(
+                        format!("rail-diff-{}", root),
+                        if is_sel {
+                            theme::overlay_strong()
+                        } else {
+                            theme::wash_rest()
+                        },
+                        if is_sel {
+                            theme::overlay_strong()
+                        } else {
+                            theme::overlay()
+                        },
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.show_diff_tool(root.clone(), cx);
+                    }))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_2))
+                    .child(icons::tagged_icon(
+                        icons::DOCUMENT,
+                        theme::ICON_SM,
+                        theme::text_secondary(),
+                        format!("{sel_stat}-glyph"),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_BODY)
+                            .text_color(theme::text_secondary())
+                            .child("changes"),
+                    )
+                    .children(stat.map(|s| {
+                        div()
+                            .debug_selector(move || format!("{sel_stat}-stat"))
+                            .flex_none()
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(s))
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// ID2b′ — the tool rows under one task: `changes`, then the task's
+    /// docked pages. (Its chats are the session rows above these.)
+    ///
+    /// `chats` are the task's sessions as the rail holds them THIS paint —
+    /// the diff row exists while any of them does and states the stat of
+    /// the transcript's session when it is one of them, else the first
+    /// that carries one. Nothing here is remembered across paints, which
+    /// is the whole defence against a task-level fact derived from
+    /// whichever child came first (sign-off answer 2). Docked pages are
+    /// the task's group's page tabs; a task whose group is not minted yet
+    /// has none, and nothing invents one.
+    #[allow(clippy::too_many_arguments)]
+    fn task_tool_rows(
+        &self,
+        root: &str,
+        chats: &[&SessionInfo],
+        by_id: &HashMap<String, strip::StripTab>,
+        snapshot: &eave_wire::TabsSnapshot,
+        lit_diff: Option<&str>,
+        selected: Option<&str>,
+        phase: Option<f32>,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if !chats.is_empty() {
+            let stat = chats
+                .iter()
+                .find(|s| Some(s.session_id.as_str()) == selected)
+                .and_then(|s| s.diff_stat)
+                .or_else(|| chats.iter().find_map(|s| s.diff_stat))
+                .map(|d| format!("+{} −{}", coarse_lines(d.adds), coarse_lines(d.dels)));
+            rows.push(self.rail_diff_row(root, stat, lit_diff == Some(root), cx));
+        }
+        let docked = self.docked_pages(root, by_id, snapshot);
+        let (page_rows, _) = self.tab_rows(&docked, by_id, snapshot, phase, cx);
+        rows.extend(page_rows);
+        rows.into_iter()
+            .map(|row| {
+                div()
+                    .w_full()
+                    .flex_none()
+                    .pl(px(theme::TASK_INDENT))
+                    .child(row)
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// The page tabs docked into a task: its group's tabs that are pages,
+    /// in the group's order. Empty for a task with no group.
+    fn docked_pages(
+        &self,
+        root: &str,
+        by_id: &HashMap<String, strip::StripTab>,
+        snapshot: &eave_wire::TabsSnapshot,
+    ) -> Vec<String> {
+        strip::group_for_workspace(snapshot, root)
+            .map(|g| strip::container_tabs(snapshot, &strip::Container::Group(g)))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| by_id.get(id).is_some_and(|t| matches!(t.kind, strip::TabKind::Page)))
+            .collect()
+    }
+
+    /// Slice ID2b — a TASK header under a project header: the starred
+    /// primary checkout, or a worktree named by its branch.
+    ///
+    /// The same anatomy as `rail_group_header` one step in (identity
+    /// left, attention right; the rollup a CHILD's own state), keyed on the
+    /// task's root in the same collapsed set. It carries no colour swatch:
+    /// identity is the project's, and a second dot one step in would say
+    /// the task is a different thing from its repository.
+    fn rail_task_header(
+        &self,
+        g: RailGroup,
+        collapsed: bool,
+        lit: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let sel = format!("rail-task-{}", g.root);
+        let sel_id = SharedString::from(sel.clone());
+        let root = g.root.clone();
+        let badge = group_badge(g.lead_state.as_deref(), g.asking, g.unseen);
+        let dot = g.lead_state.as_deref().map(state_color);
+        let sel_label = sel.clone();
+        let sel_count = sel.clone();
+        let sel_badge = sel.clone();
+        let sel_chev = sel.clone();
+        let sel_mark = sel.clone();
+        rail_inset()
+            .child(
+                div()
+                    .id(sel_id)
+                    .debug_selector(move || sel.clone().into())
+                    .w_full()
+                    .h(px(theme::RAIL_GHOST_H))
+                    .pl(px(theme::RAIL_HOVER_PAD + theme::TASK_INDENT))
+                    .pr(px(theme::RAIL_HOVER_PAD))
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .cursor_pointer()
+                    .when(lit, |d| d.shadow(theme::selection_rim()))
+                    .hover_fade(sel_chev.clone(), theme::wash_rest(), theme::overlay())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
+                    .child(icons::tagged_icon(
+                        if collapsed {
+                            icons::ALT_ARROW_RIGHT
+                        } else {
+                            icons::ALT_ARROW_DOWN
+                        },
+                        theme::ICON_STATUS,
+                        theme::text_tertiary(),
+                        format!("{sel_chev}-chevron"),
+                    ))
+                    // The reference's own marks: a star on the primary
+                    // worktree, a branch on the rest.
+                    .child(icons::tagged_icon(
+                        if g.primary {
+                            icons::STAR
+                        } else {
+                            icons::GIT_BRANCH
+                        },
+                        theme::ICON_STATUS,
+                        theme::text_tertiary(),
+                        format!("{sel_mark}-mark"),
+                    ))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("{sel_label}-label"))
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_BODY)
+                            .text_color(theme::text_secondary())
+                            .child(SharedString::from(g.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("{sel_count}-count"))
+                            .flex_none()
+                            .text_size(px(theme::RAIL_NAME_SIZE))
+                            .line_height(px(theme::RAIL_NAME_LINE))
+                            .font_weight(theme::WEIGHT_BODY)
+                            .text_color(theme::text_tertiary())
+                            .child(SharedString::from(format!("{}", g.count))),
+                    )
+                    .child(div().flex_1())
+                    .children(dot.map(|c| div().size(px(theme::STATE_DOT)).rounded_full().bg(c)))
+                    .children(badge.map(|word| {
+                        div()
+                            .debug_selector(move || format!("{sel_badge}-badge"))
+                            .flex_none()
+                            .text_size(px(theme::MICRO_SIZE))
+                            .line_height(px(theme::MICRO_LINE))
+                            .text_color(
+                                g.lead_state
+                                    .as_deref()
+                                    .map(state_color)
+                                    .unwrap_or_else(theme::text_tertiary),
+                            )
+                            .child(SharedString::from(word))
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        {
+                            let mut shut = this.rail_groups_collapsed.borrow_mut();
+                            if !shut.remove(&root) {
+                                shut.insert(root.clone());
+                            }
+                            save_groups_collapsed(&shut);
+                        }
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -16959,123 +17884,13 @@ impl Shell {
         .detach();
     }
 
-    /// A group's head on the strip: its colour, its name, and — when it is
-    /// collapsed — how many tabs it is holding.
-    ///
-    /// **A collapsed group that holds the active tab says so.** Without
-    /// that, ctrl-tab into a collapsed group looks like nothing happened:
-    /// the tab is active, the page is on screen, and the strip shows no
-    /// mark anywhere.
-    #[allow(clippy::too_many_arguments)]
-    fn group_head(
-        &self,
-        id: &str,
-        title: &Option<String>,
-        color: &Option<String>,
-        workspace: &Option<String>,
-        collapsed: bool,
-        count: usize,
-        holds_active: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let gid = id.to_string();
-        let click_id = id.to_string();
-        let menu_gid = id.to_string();
-        rail_inset()
-            .child(
-                div()
-                    .id(SharedString::from(format!("group-{id}")))
-                    .debug_selector(move || format!("group-{gid}"))
-                    .w_full()
-                    .h(px(theme::GROUP_HEAD_H))
-                    .px(px(theme::RAIL_HOVER_PAD))
-                    .rounded(px(theme::RADIUS_SELECT))
-                    .when(holds_active, |d| d.shadow(theme::selection_rim()))
-                    .bg(theme::wash_rest())
-                    .cursor_pointer()
-                    // Slice T1 — the head folds its project. `collapsed` has been on
-                    // the group since B1 and `strip.rs` has always drawn a collapsed
-                    // one as a head plus a count; nothing ever set it, so every
-                    // project was permanently open and the count was unreachable.
-                    // Slice D4.2 stage 3 — the project row's menu.
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.open_project_menu(&menu_gid, ev.position, cx);
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let _ =
-                            this.commands
-                                .send(Command::Browser(BrowserCmd::GroupSetCollapsed {
-                                    group_id: click_id.clone(),
-                                    collapsed: !collapsed,
-                                }));
-                        cx.notify();
-                    }))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(theme::SPACE_1))
-                    // Which way the project is folded, stated before its name.
-                    // A disclosure that only reads as a count ("3") says how much
-                    // is hidden and not that anything is; the count disappears when
-                    // the project is open, so on its own it is a mark that vanishes
-                    // rather than a control that changes.
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(theme::MICRO_SIZE))
-                            .text_color(theme::text_tertiary())
-                            .child(if collapsed { "\u{25b8}" } else { "\u{25be}" }),
-                    )
-                    .child(
-                        div()
-                            .size(px(theme::GROUP_DOT))
-                            .flex_none()
-                            .rounded_full()
-                            // Slice AG2 #8 — the project's colour, and the SAME
-                            // one the rail's project header wears, because both
-                            // ask `project_color` about the same checkout root
-                            // rather than passing a colour between them.
-                            //
-                            // The operator's word still wins verbatim (B1 kept
-                            // `color` a `String` so this crate is not where a
-                            // palette gets frozen into a file format). What
-                            // changed is the other branch: nothing in the app has
-                            // ever SET that field, so every project on this strip
-                            // drew the same accent violet and the colour
-                            // vocabulary distinguished nothing at all.
-                            .bg(project_color(workspace.as_deref(), color.as_deref())),
-                    )
-                    .children(title.as_ref().map(|t| {
-                        div()
-                            .text_size(px(theme::MICRO_SIZE))
-                            .font_weight(theme::WEIGHT_BODY)
-                            .text_color(theme::text())
-                            .child(SharedString::from(t.clone()))
-                    }))
-                    .when(collapsed, |d| {
-                        d.child(
-                            div()
-                                .font_family(theme::MONO)
-                                .text_size(px(theme::MICRO_SIZE))
-                                .text_color(theme::text_secondary())
-                                .child(SharedString::from(count.to_string())),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// The two (or more) tabs currently in the well, as one pill.
+    /// One split's tabs, as one pill — up to [`SPLIT_MAX`] chips.
     ///
     /// T3 draws split tabs as chips in a single rounded bar rather than as
-    /// two stacked rows, so the strip says "these are on screen together"
-    /// instead of "these happen to be adjacent". Left chip is the left
-    /// pane, right chip the right pane. A third pane later is another
-    /// chip in the same bar, not a new row.
+    /// stacked rows, so the strip says "these are on screen together"
+    /// instead of "these happen to be adjacent". Chips run in pane order.
+    /// A split that is not the one on screen keeps its pill: the
+    /// arrangement exists whether or not it is in front (Slice SP1).
     fn split_tabs_row(
         &self,
         members: &[&strip::StripTab],
@@ -17241,11 +18056,12 @@ impl Shell {
         cx: &Context<Self>,
     ) -> AnyElement {
         let id = tab.id.clone();
-        let is_sel = if compact {
-            tab.active
-        } else {
-            tab.active || self.split.as_ref().is_some_and(|s| s.contains(&id))
-        };
+        // ID2b′: lit iff the frame is this tab. The engine's `active` is
+        // still active while the diff is in the well; the diff row is the
+        // lit one then.
+        let active = tab.active && self.diff_tool.is_none();
+        // Selection is the focused pane only — the pill is the split's mark.
+        let is_sel = active;
         let activate = id.clone();
         let closing = id.clone();
         let tab = div()
@@ -17484,6 +18300,32 @@ impl Shell {
         // arrived, and deliberately does not re-decide it here (Stage AB).
         let all = self.sessions.read(cx).sessions.clone();
         let selected = self.transcript.read(cx).session_id.clone();
+        // ID2b′ — the one Frame decision, read once for the whole rail. It
+        // names the ONE lit row (sign-off answer 4: selection is the
+        // frame, and there is one hierarchy now), and the tool rows under
+        // a task are read from the same snapshot it was decided from.
+        let snapshot = self.strip_snapshot(cx);
+        let frame = self.frame_for(&snapshot, None, cx);
+        let lit_chat: Option<String> = match &frame.view {
+            FrameView::Task {
+                tool: Tool::Chat { session_id },
+                ..
+            } => Some(session_id.clone()),
+            _ => None,
+        };
+        let lit_diff: Option<String> = match &frame.view {
+            FrameView::Task {
+                tool: Tool::Diff { root },
+                ..
+            } => Some(root.clone()),
+            _ => None,
+        };
+        let lit_tab: Option<String> = if frame.active_is_page() {
+            snapshot.active.clone()
+        } else {
+            None
+        };
+        let by_id = self.strip_tabs_by_id(&snapshot, cx);
         let row_notes = self.sessions.read(cx).row_notes.clone();
         // Stage AC. The filter runs HERE, over the folded rows, and the
         // rows themselves are untouched — so the count below is a real
@@ -17632,8 +18474,11 @@ impl Shell {
         // the argument to a `map`, because the loop below has to decide
         // whether to call it at all: a row under a collapsed project header
         // is not built. Nothing inside it changed.
-        let build_row = |info: SessionInfo, group_root: Option<&str>| -> AnyElement {
-                let is_sel = selected.as_deref() == Some(info.session_id.as_str());
+        let build_row = |info: SessionInfo, group_root: Option<&str>, under_task: bool| -> AnyElement {
+                // ID2b′: lit iff the FRAME is this chat — not iff the
+                // transcript is subscribed to it. The two differ while a
+                // page or the diff is in the well.
+                let is_sel = lit_chat.as_deref() == Some(info.session_id.as_str());
                 // Slice AG2 #12 — staged for a bulk act, which is a
                 // different fact from being the row you are looking at.
                 let is_marked = self.rail_marked.contains(&info.session_id);
@@ -17645,7 +18490,16 @@ impl Shell {
                 // session three things.
                 let (label, name_kind) = self.row_name(&info);
                 let kicker = provider_kicker(&info, &provider_label);
-                let repo_line = row_repo_line(&info, home.as_deref(), group_root);
+                // ID2b′ (sign-off answer 1): under a TASK header the row is
+                // two lines. The task row already states the checkout and
+                // the branch, and restating it per chat is the redundancy
+                // AG2 #9's subline swap exists to prevent. Location comes
+                // back only on a chat that is not under a task.
+                let repo_line = if under_task {
+                    None
+                } else {
+                    row_repo_line(&info, home.as_deref(), group_root)
+                };
                 // Slice RS1: `coarse_age`, not `fmt_elapsed`. The row's
                 // corner had been rendering the transcript's turn clock —
                 // `2m 05s`, `1h 03m` — which is right where an operator
@@ -17844,8 +18698,9 @@ impl Shell {
                         // unstaging — looking at one of the rows you have
                         // collected before acting on all of them is the
                         // whole reason the two are separate.
-                        this.cancel_rename(cx);
-                        let _ = this.commands.send(Command::Select(sid.clone()));
+                        // Slice ID2b: and the frame follows — the task's
+                        // chat comes forward, see `select_session`.
+                        this.select_session(&sid, cx);
                     }))
                     .children(is_marked.then(|| {
                         let sel_mark = format!("mark-{}", info.session_id);
@@ -18536,9 +19391,15 @@ impl Shell {
             .collect();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut group_shut = false;
+        // Slice ID2b: a collapsed TASK hides its rows the way a collapsed
+        // project hides its tasks — one set, keyed on either root. A row
+        // under a task header is stepped in with it.
+        let mut task_shut = false;
+        let mut under_task = false;
         // The header a row sits under, for #9's subline. `None` until the
         // first header, which is exactly right: the ungrouped rows come
-        // first and have no header to repeat.
+        // first and have no header to repeat. Under a task header it is the
+        // TASK's root: that is the checkout the row's cwd sits in.
         let mut group_root: Option<String> = None;
         // Slice AG2 #7. The walk's order, recorded from the ONE loop that
         // decides what is on screen — see [`Shell::rail_walk`]. `sel_at`
@@ -18547,28 +19408,166 @@ impl Shell {
         // gone.
         let mut walk: Vec<String> = Vec::new();
         let mut sel_at: Option<usize> = None;
-        for entry in group_rail(sessions, &unseen) {
+        let entries = group_rail(sessions, &unseen);
+        // ID2b′ — what each header hides, decided BEFORE the header is
+        // drawn: a collapsed project or task whose rows or tools hold the
+        // frame wears the selection rim itself, so the one lit row is
+        // never off screen. The sets are keyed on the header's root; a
+        // project's set is every task's under it.
+        let hidden_under: HashMap<String, Vec<&SessionInfo>> = {
+            let mut m: HashMap<String, Vec<&SessionInfo>> = HashMap::new();
+            let mut project: Option<&str> = None;
+            let mut task: Option<&str> = None;
+            for e in &entries {
+                match e {
+                    RailEntry::Header(g) => {
+                        project = Some(g.root.as_str());
+                        task = None;
+                        m.entry(g.root.clone()).or_default();
+                    }
+                    RailEntry::Task(g) => {
+                        task = Some(g.root.as_str());
+                        m.entry(g.root.clone()).or_default();
+                    }
+                    RailEntry::Row(info) => {
+                        if let Some(p) = project {
+                            m.entry(p.to_string()).or_default().push(info);
+                        }
+                        if let Some(t) = task {
+                            m.entry(t.to_string()).or_default().push(info);
+                        }
+                    }
+                }
+            }
+            m
+        };
+        let holds_frame = |root: &str| -> bool {
+            let Some(under) = hidden_under.get(root) else {
+                return false;
+            };
+            let chats = under.iter().any(|s| {
+                lit_chat.as_deref() == Some(s.session_id.as_str())
+                    || lit_tab.as_deref().is_some_and(|t| {
+                        strip::tab_for_session(&snapshot, &s.session_id).as_deref() == Some(t)
+                    })
+            });
+            let tasks: Vec<&str> = {
+                let mut v: Vec<&str> = under.iter().filter_map(|s| s.checkout_root.as_deref()).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let diff = lit_diff.as_deref().is_some_and(|d| tasks.contains(&d));
+            let pages = lit_tab.as_deref().is_some_and(|t| {
+                tasks
+                    .iter()
+                    .any(|r| self.docked_pages(r, &by_id, &snapshot).iter().any(|id| id == t))
+            });
+            chats || diff || pages
+        };
+        // ID2b′ — the spine's order for ctrl-tab and ⌘1-9 (sign-off
+        // answer 3): PAGES first, then every task's chats and pages in the
+        // order the tree draws them — INCLUDING the ones a collapsed
+        // header hides, on `strip::cycle_order`'s own rule (a cycling key
+        // that skipped them would make them unreachable by keyboard while
+        // the fold hid them from the mouse). See [`Shell::spine_order`].
+        let mut spine: Vec<String> = strip::loose_pages(&snapshot);
+        // The task whose rows are being emitted, and its chats so far —
+        // flushed as its tool rows when the next header arrives or the
+        // list ends. Read from the ROWS' own `checkout_root`, never from
+        // the header: a lone-task project's header is the project.
+        let mut cur_task: Option<String> = None;
+        let mut cur_chats: Vec<&SessionInfo> = Vec::new();
+        let mut cur_hidden = false;
+        let flush = |rows: &mut Vec<AnyElement>,
+                         spine: &mut Vec<String>,
+                         cur_task: &mut Option<String>,
+                         cur_chats: &mut Vec<&SessionInfo>,
+                         cur_hidden: bool| {
+            if let Some(root) = cur_task.take() {
+                for id in self.docked_pages(&root, &by_id, &snapshot) {
+                    spine.push(id);
+                }
+                if !cur_hidden {
+                    rows.extend(self.task_tool_rows(
+                        &root,
+                        cur_chats,
+                        &by_id,
+                        &snapshot,
+                        lit_diff.as_deref(),
+                        selected.as_deref(),
+                        phase,
+                        cx,
+                    ));
+                }
+            }
+            cur_chats.clear();
+        };
+        for entry in &entries {
             match entry {
                 RailEntry::Header(g) => {
+                    flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
                     group_shut = shut_groups.contains(&g.root);
+                    task_shut = false;
+                    under_task = false;
                     let ink = project_color(
                         Some(&g.root),
                         chosen_colors.get(&g.root).map(String::as_str),
                     );
                     group_root = Some(g.root.clone());
-                    rows.push(self.rail_group_header(g, ink, group_shut, cx));
+                    let lit = group_shut && holds_frame(&g.root);
+                    rows.push(self.rail_group_header(g.clone(), ink, group_shut, lit, cx));
+                }
+                RailEntry::Task(g) => {
+                    flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
+                    task_shut = shut_groups.contains(&g.root);
+                    under_task = true;
+                    group_root = Some(g.root.clone());
+                    if !group_shut {
+                        let lit = task_shut && holds_frame(&g.root);
+                        rows.push(self.rail_task_header(g.clone(), task_shut, lit, cx));
+                    }
                 }
                 RailEntry::Row(info) => {
-                    if !group_shut {
+                    cur_hidden = group_shut || task_shut;
+                    // Any row with a checkout is in a task — under a
+                    // header or not. The commonest rail is ONE repository,
+                    // which draws no header at all (AG2 #2: headers only
+                    // when they divide), and its task's tools still hang
+                    // under its chats.
+                    if let Some(root) = info.checkout_root.as_deref() {
+                        if cur_task.as_deref() != Some(root) {
+                            flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
+                            cur_task = Some(root.to_string());
+                        }
+                        cur_chats.push(info);
+                    }
+                    if let Some(t) = strip::tab_for_session(&snapshot, &info.session_id) {
+                        spine.push(t);
+                    }
+                    if !group_shut && !task_shut {
                         if selected.as_deref() == Some(info.session_id.as_str()) {
                             sel_at = Some(rows.len());
                         }
                         walk.push(info.session_id.clone());
-                        rows.push(build_row(info, group_root.as_deref()));
+                        let row = build_row(info.clone(), group_root.as_deref(), under_task);
+                        rows.push(if under_task {
+                            div()
+                                .w_full()
+                                .flex_none()
+                                .pl(px(theme::TASK_INDENT))
+                                .child(row)
+                                .into_any_element()
+                        } else {
+                            row
+                        });
                     }
                 }
             }
         }
+        flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
+        // Written on EVERY pass, for the reason `rail_walk` gives below.
+        *self.spine_walk.borrow_mut() = spine;
         // No empty-state copy under Sessions. Add is the header `+`.
         // If every session is archived, the archived toggle below is the
         // reason the list is empty — restating it is noise.
@@ -18594,10 +19593,15 @@ impl Shell {
             walk
         };
         let body = rows;
+        // Slice ID2b: the zone is the Projects → Tasks tree, and since
+        // ID2b′ each task carries its tools under it. The selector and the
+        // `frame.json` key keep their names — a rename there would be a
+        // test edit and a preference migration pretending to be a product
+        // change — and the label says what the list is.
         let mut rows = vec![self.zone_toggle(
             "zone-sessions",
             ZONE_SESSIONS,
-            "Sessions",
+            "Projects",
             sess_shut,
             sess_count,
             false,
@@ -18790,7 +19794,12 @@ impl Shell {
             // Slice T1b — the pinned marks head the rail, above the
             // projects, as the reference frame has them.
             .children(self.bookmarks_grid(cx))
-            .child(self.rail_tabs(cx, phase, caret_lit, folder_caret_lit))
+            // ID2b′: folders, then PAGES — every loose page as a row, the
+            // `+ New Tab` pill under them — then the Projects → Tasks tree,
+            // whose tasks carry their own tools. The sidebar is the spine:
+            // no tab is drawn anywhere else.
+            .child(self.rail_folders(cx, caret_lit, folder_caret_lit))
+            .child(self.rail_pages(&snapshot, &by_id, phase, cx))
             .child(self.rail_handle(cx))
             // Tabs/sessions seam. Same painter as folders/tabs, sitting
             // BETWEEN the two containers so scrolling either list does
@@ -23005,10 +24014,9 @@ impl Shell {
         if self.page_menu.is_open() {
             self.close_page_menu(cx);
         }
-        let target = match &self.split {
-            Some(s) if s.contains(tab_id) => TabMenuTarget::Split {
-                left: s.left.clone(),
-                right: s.right.clone(),
+        let target = match self.split_of(tab_id) {
+            Some(ix) => TabMenuTarget::Split {
+                members: self.splits[ix].panes.clone(),
             },
             _ => TabMenuTarget::Tab(tab_id.to_string()),
         };
@@ -23143,7 +24151,7 @@ impl Shell {
         match &req.target {
             TabMenuTarget::Tab(id) => self.single_tab_menu(id, cx),
             TabMenuTarget::Group(id) => self.project_menu(id, cx),
-            TabMenuTarget::Split { left, right } => self.split_tab_menu(left, right, cx),
+            TabMenuTarget::Split { members } => self.split_tab_menu(members, cx),
             TabMenuTarget::Bookmark(id) => self.bookmark_menu(id, cx),
             TabMenuTarget::Folders => self.folders_header_menu(),
             TabMenuTarget::Downloads => self.downloads_menu(),
@@ -23369,6 +24377,10 @@ impl Shell {
             .and_then(|t| t.url.as_deref())
             .is_some_and(|u| !u.is_empty());
         let partner = self.split_partner_for(tab_id, cx);
+        // A pane of a full split cannot take another.
+        let full = self
+            .split_of(tab_id)
+            .is_some_and(|ix| self.splits[ix].is_full());
         let below = {
             let order = strip::cycle_order(&snapshot);
             order
@@ -23435,7 +24447,7 @@ impl Shell {
             TabMenuEntry::Separator,
             TabMenuEntry::Action(
                 TabMenuAction::AddSplit,
-                if partner.is_some() {
+                if partner.is_some() && !full {
                     add_split
                 } else {
                     add_split.disabled()
@@ -23458,8 +24470,9 @@ impl Shell {
         ]
     }
 
-    fn split_tab_menu(&self, left: &str, right: &str, cx: &App) -> Vec<TabMenuEntry> {
+    fn split_tab_menu(&self, members: &[String], cx: &App) -> Vec<TabMenuEntry> {
         let snapshot = self.strip_snapshot(cx);
+        let is_member = |id: &str| members.iter().any(|m| m == id);
         let label = |id: &str| {
             snapshot
                 .tabs
@@ -23475,29 +24488,28 @@ impl Shell {
                 })
                 .unwrap_or_else(|| "Tab".into())
         };
-        let any_url = snapshot.tabs.iter().any(|t| {
-            (t.id == left || t.id == right) && t.url.as_deref().is_some_and(|u| !u.is_empty())
-        });
-        let vertical = self.split.as_ref().is_some_and(|s| s.vertical);
+        let any_url = snapshot
+            .tabs
+            .iter()
+            .any(|t| is_member(&t.id) && t.url.as_deref().is_some_and(|u| !u.is_empty()));
+        let vertical = members
+            .first()
+            .and_then(|m| self.split_of(m))
+            .is_some_and(|ix| self.splits[ix].vertical);
         let convert = if vertical {
             "Convert to Horizontal Split View"
         } else {
             "Convert to Vertical Split View"
         };
-        let left_label = elide(&label(left), 28);
-        let right_label = elide(&label(right), 28);
         let share = MenuItem::new("Share Split View…");
         let dup = MenuItem::new("Duplicate");
         let below = {
             let order = strip::cycle_order(&snapshot);
-            let last = order
-                .iter()
-                .rposition(|id| id == left || id == right)
-                .unwrap_or(0);
+            let last = order.iter().rposition(|id| is_member(id)).unwrap_or(0);
             last + 1 < order.len()
         };
 
-        vec![
+        let mut entries = vec![
             TabMenuEntry::Action(
                 TabMenuAction::ShareSplit,
                 if any_url { share } else { share.disabled() },
@@ -23508,14 +24520,15 @@ impl Shell {
             TabMenuEntry::Action(TabMenuAction::ConvertAxis, MenuItem::new(convert)),
             TabMenuEntry::Separator,
             TabMenuEntry::Header("Tab Options"),
-            TabMenuEntry::Action(
-                TabMenuAction::SplitMember(left.to_string()),
-                MenuItem::new(left_label).trailing("›"),
-            ),
-            TabMenuEntry::Action(
-                TabMenuAction::SplitMember(right.to_string()),
-                MenuItem::new(right_label).trailing("›"),
-            ),
+        ];
+        // One row per pane, in pane order — a four-pane split lists four.
+        for member in members {
+            entries.push(TabMenuEntry::Action(
+                TabMenuAction::SplitMember(member.clone()),
+                MenuItem::new(elide(&label(member), 28)).trailing("›"),
+            ));
+        }
+        entries.extend([
             TabMenuEntry::Separator,
             TabMenuEntry::Action(
                 TabMenuAction::Duplicate,
@@ -23531,24 +24544,31 @@ impl Shell {
                     MenuItem::new("Archive Tabs Below").disabled()
                 },
             ),
-        ]
+        ]);
+        entries
     }
 
+    /// The next tab "Add Split View" would put beside `tab_id`: the first
+    /// in cycle order that is not already in its split, and not a second
+    /// session for a split that has one.
     fn split_partner_for(&self, tab_id: &str, cx: &App) -> Option<String> {
         let snapshot = self.strip_snapshot(cx);
-        let this_session = snapshot
-            .tabs
-            .iter()
-            .any(|t| t.id == tab_id && matches!(t.content, eave_wire::TabContent::Session { .. }));
+        let own = self.split_of(tab_id);
+        let has_session = Self::tab_is_session(&snapshot, tab_id)
+            || own.is_some_and(|ix| {
+                self.splits[ix]
+                    .panes
+                    .iter()
+                    .any(|p| Self::tab_is_session(&snapshot, p))
+            });
         for id in strip::cycle_order(&snapshot) {
             if id == tab_id {
                 continue;
             }
-            let other_session = snapshot
-                .tabs
-                .iter()
-                .any(|t| t.id == id && matches!(t.content, eave_wire::TabContent::Session { .. }));
-            if this_session && other_session {
+            if own.is_some_and(|ix| self.splits[ix].contains(&id)) {
+                continue;
+            }
+            if has_session && Self::tab_is_session(&snapshot, &id) {
                 continue;
             }
             return Some(id);
@@ -23717,12 +24737,13 @@ impl Shell {
                 return;
             }
             TabMenuTarget::Tab(id) => id.clone(),
-            TabMenuTarget::Split { left, right } => self
+            TabMenuTarget::Split { members } => self
                 .strip_snapshot(cx)
                 .active
                 .clone()
-                .filter(|a| a == left || a == right)
-                .unwrap_or_else(|| left.clone()),
+                .filter(|a| members.contains(a))
+                .or_else(|| members.first().cloned())
+                .unwrap_or_default(),
         };
         match action {
             TabMenuAction::CopyLink => {
@@ -23811,8 +24832,8 @@ impl Shell {
             TabMenuAction::ArchiveBelow => self.archive_tabs_below(&tab_id, cx),
             TabMenuAction::ShareSplit => {
                 let urls: Vec<String> = match &req.target {
-                    TabMenuTarget::Split { left, right } => [left.as_str(), right.as_str()]
-                        .into_iter()
+                    TabMenuTarget::Split { members } => members
+                        .iter()
                         .filter_map(|id| self.tab_url(id, cx))
                         .collect(),
                     TabMenuTarget::Tab(_)
@@ -23828,13 +24849,17 @@ impl Shell {
                 }
             }
             TabMenuAction::Separate => {
-                self.split = None;
-                cx.notify();
+                if let Some(ix) = self.split_of(&tab_id) {
+                    self.splits.remove(ix);
+                    self.persist_splits();
+                    cx.notify();
+                }
             }
             TabMenuAction::AddTab => self.new_tab(cx),
             TabMenuAction::ConvertAxis => {
-                if let Some(s) = self.split.as_mut() {
-                    s.vertical = !s.vertical;
+                if let Some(ix) = self.split_of(&tab_id) {
+                    self.splits[ix].vertical = !self.splits[ix].vertical;
+                    self.persist_splits();
                     cx.notify();
                 }
             }
@@ -23849,10 +24874,16 @@ impl Shell {
                 return;
             }
             TabMenuAction::ArchiveItem => {
-                if let TabMenuTarget::Split { left, right } = req.target {
-                    self.split = None;
-                    self.close_tab(&left, cx);
-                    self.close_tab(&right, cx);
+                if let TabMenuTarget::Split { members } = &req.target {
+                    // The split goes first, so each close is an ordinary
+                    // close and the successor walk runs once at the end.
+                    if let Some(ix) = members.first().and_then(|m| self.split_of(m)) {
+                        self.splits.remove(ix);
+                        self.persist_splits();
+                    }
+                    for id in members {
+                        self.close_tab(id, cx);
+                    }
                 }
             }
             TabMenuAction::NestedFolder
@@ -25461,6 +26492,10 @@ impl Render for Shell {
             let every_window = self.web_tabs.read(cx).snapshot.clone();
             self.reconcile_strip(&every_window, cx);
         }
+        // Slice ID2b — **the one Frame decision for this window.** Every
+        // "is the well a page" below is a read of this; the pane header
+        // and a split pane ask the same function about their own tab.
+        let frame = self.frame_for(&strip_snapshot, None, cx);
 
         let shown_pages: Vec<String> = {
             let mut ids = Vec::new();
@@ -25473,9 +26508,10 @@ impl Render for Shell {
                     ids.push(id.to_string());
                 }
             };
-            if let Some(s) = &self.split {
-                push_page(&s.left);
-                push_page(&s.right);
+            if let Some(s) = self.showing_split(&strip_snapshot) {
+                for id in &s.panes {
+                    push_page(id);
+                }
             } else if let Some(a) = strip_snapshot.active.as_deref() {
                 push_page(a);
             }
@@ -25572,7 +26608,7 @@ impl Render for Shell {
         let page_status = strip_snapshot
             .active
             .as_deref()
-            .filter(|_| strip::active_is_page(&strip_snapshot))
+            .filter(|_| frame.active_is_page())
             .and_then(|id| self.page_status_bubble(id));
         // The page's own dialog. Computed here beside `page_el` because it
         // belongs to the same tab and is mounted in the same well — and
@@ -25590,8 +26626,18 @@ impl Render for Shell {
         // has to mean "the well is the page's" and not "there are pixels",
         // or the transcript renders under a page tab — an agent's
         // conversation sitting where a document was asked for.
-        let active_is_page = strip::active_is_page(&strip_snapshot);
-        let showing_page = self.split.is_some() || page_el.is_some() || active_is_page;
+        let active_is_page = frame.active_is_page();
+        // The split the active tab belongs to, if any — the one the well
+        // draws this frame. Cloned once here and read at the mount below.
+        let showing_split = self.showing_split(&strip_snapshot).cloned();
+        let showing_page = showing_split.is_some() || page_el.is_some() || active_is_page;
+        // Slice ID2b: the diff tool takes the well the way a page does —
+        // no transcript, no composer, no floating agent chrome — without
+        // being a page. `well_taken` is the gate every transcript-only
+        // surface reads; `showing_page` stays what it says.
+        let showing_diff = frame.showing_diff();
+        let well_taken = showing_page || showing_diff;
+        let diff_el = showing_diff.then(|| self.diff_tool_el(None, cx));
         // Slice T1 — ⌘T's tab before anything has been typed into it.
         //
         // A page tab that has never been anywhere owns the well like any
@@ -25605,8 +26651,9 @@ impl Render for Shell {
         // **Never in a split.** A split is two tabs sharing the well by the
         // operator's explicit act; putting the launcher over half of it
         // would take away the arrangement they just made.
-        let blank_page =
-            active_is_page && self.split.is_none() && strip::active_is_blank_page(&strip_snapshot);
+        let blank_page = active_is_page
+            && showing_split.is_none()
+            && strip::active_is_blank_page(&strip_snapshot);
         // What the well says when a page tab is active and nothing can draw
         // it. Two different absences, and only one of them is eave's fault.
         let page_absence: Option<&'static str> = if blank_page {
@@ -25629,8 +26676,8 @@ impl Render for Shell {
         // Every surface that floats over the content well must answer one
         // question at the moment it is written: **suppressed, or shown over
         // a page?** There is no third answer and there is no default, and
-        // `showing_page` is how you say which — see the `.when(!showing_page,
-        // …)` and `.filter(|_| !showing_page)` sites below.
+        // `showing_page` is how you say which — see the `.when(!well_taken,
+        // …)` and `.filter(|_| !well_taken)` sites below.
         //
         // This is not a style preference, it is a defect class. Every
         // floating surface in this file was written when the well could only
@@ -25773,7 +26820,7 @@ impl Render for Shell {
         // the only thing it could ever cover was an empty transcript.
         // Slice T1 adds the second way to reach the launcher: a blank page
         // tab. The first — no session selected and no page — is unchanged.
-        let show_launcher = (state.session_id.is_none() && !showing_page) || blank_page;
+        let show_launcher = (state.session_id.is_none() && !well_taken) || blank_page;
         // **The one mount decision**, used twice: to put the composer in the
         // tree at the bottom of this function, and to decide whether its field
         // may hold the keyboard (`sync_composer_focus`, called below once the
@@ -25784,7 +26831,7 @@ impl Render for Shell {
         // the launcher, which unmounts the composer — which is what a blank
         // tab wants, and what T1's own harness asserts by checking `send` is
         // absent there.
-        let composer_mounted = !show_launcher && !showing_page;
+        let composer_mounted = !show_launcher && !well_taken;
         // Only when the page element is actually in the tree this frame.
         // Focusing a handle that is not mounted is how the whole
         // window's actions go silent (Slice CM). A blank ⌘T tab is a
@@ -26660,9 +27707,9 @@ impl Render for Shell {
                             .min_h(px(0.))
                             .p(px(if fullscreen { 0.0 } else { theme::CARD_GUTTER }))
                             .child(content_card({
-                                if let Some(split) = self.split.clone() {
+                                if let Some(split) = showing_split.as_ref() {
                                     self.render_split_well(
-                                        &split,
+                                        split,
                                         rail_collapsed,
                                         transcript_el.into_any_element(),
                                         composer.into_any_element(),
@@ -26675,15 +27722,15 @@ impl Render for Shell {
                                     // (and its slash/notice/trailer siblings)
                                     // so a draft and focus handle survive the
                                     // first turn.
-                                    let empty_here = empty_state.filter(|_| !showing_page);
+                                    let empty_here = empty_state.filter(|_| !well_taken);
                                     let (empty_el, dock_notice, dock_trailer, dock_slash, dock_composer) =
                                         match empty_here {
                                             Some(e) if composer_mounted => (
                                                 Some(Self::transcript_empty_view(
                                                     e,
-                                                    notice.filter(|_| !showing_page),
-                                                    trailer.filter(|_| !showing_page),
-                                                    slash_layer.filter(|_| !showing_page),
+                                                    notice.filter(|_| !well_taken),
+                                                    trailer.filter(|_| !well_taken),
+                                                    slash_layer.filter(|_| !well_taken),
                                                     composer.into_any_element(),
                                                 )),
                                                 None,
@@ -26693,9 +27740,9 @@ impl Render for Shell {
                                             ),
                                             _ => (
                                                 None,
-                                                notice.filter(|_| !showing_page),
-                                                trailer.filter(|_| !showing_page),
-                                                slash_layer.filter(|_| !showing_page),
+                                                notice.filter(|_| !well_taken),
+                                                trailer.filter(|_| !well_taken),
+                                                slash_layer.filter(|_| !well_taken),
                                                 composer_mounted.then_some(
                                                     composer.into_any_element(),
                                                 ),
@@ -26811,7 +27858,14 @@ impl Render for Shell {
                                                         .text_color(theme::text_secondary())
                                                         .child(note)
                                                 }))
-                                                .when(!showing_page && empty_el.is_none(), |d| {
+                                                // Slice ID2b: the diff tool, in the
+                                                // transcript's slot. And the reserved
+                                                // dock seam (Amendment 1): `Dock` has
+                                                // no variants, so this draws nothing
+                                                // until one exists.
+                                                .children(diff_el)
+                                                .children(frame.dock.map(|d| -> AnyElement { match d {} }))
+                                                .when(!well_taken && empty_el.is_none(), |d| {
                                                     d.child(
                                                         edge_faded(
                                                             theme::TRANSCRIPT_FADE_BAND_TOP,
@@ -26859,7 +27913,7 @@ impl Render for Shell {
                                                 // suppressed over a page for exactly
                                                 // the reason this is not.
                                                 .children(omnibox_el)
-                                                .when(show_affordance && !showing_page, |d| {
+                                                .when(show_affordance && !well_taken, |d| {
                                                     // §1.6, 180 ms. comet approximates a
                                                     // `scale 0.96→1` with fade + a 2 px
                                                     // rise because gpui divs have no
@@ -26980,7 +28034,7 @@ impl Render for Shell {
                                                         .children(dock_composer),
                                                 ),
                                         )
-                                        .when(!showing_page, |d| d.child(self.footer(cx)))
+                                        .when(!well_taken, |d| d.child(self.footer(cx)))
                                         .into_any_element()
                                 }
                             })),
@@ -28532,7 +29586,11 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     })
                     .detach();
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&web_tabs, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&web_tabs, |shell, _, cx| {
+                        shell.prune_splits(cx);
+                        cx.notify();
+                    })
+                    .detach();
                     cx.observe(&bookmarks, |shell, _, cx| {
                         shell.arm_pending_folder_rename(cx);
                         cx.notify();
@@ -28582,9 +29640,6 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         folder_popup_leave_since: RefCell::new(None),
                         folder_popup_suppress: RefCell::new(None),
                         folder_search: None,
-                        zone_projects_collapsed: std::cell::Cell::new(load_zone_collapsed(
-                            ZONE_PROJECTS,
-                        )),
                         zone_folders_collapsed: std::cell::Cell::new(load_zone_collapsed(
                             ZONE_FOLDERS,
                         )),
@@ -28622,20 +29677,21 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_marked: std::collections::HashSet::new(),
                         rail_mark_anchor: None,
                         rail_walk: RefCell::new(Vec::new()),
+                        spine_walk: RefCell::new(Vec::new()),
                         rail_scrolled_to: RefCell::new(None),
                         rail_seen: RefCell::new(HashMap::new()),
                         // Slice ID2a: the names this client derived last
                         // run come back with it, so a restart does not
                         // turn a work queue back into `untitled` ×N.
                         title_proposals: RefCell::new(load_derived_titles()),
-                        projects_scroll: ScrollHandle::new(),
+                        diff_tool: None,
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from
                         // then on. A per-frame read would also make an
                         // external edit fight the pointer mid-drag.
                         rail_w: cx.global::<crate::settings::SettingsStore>().rail_w,
                         rail_drag: None,
-                        split: None,
+                        splits: load_splits(&window_key),
                         split_drag: None,
                         devtools_ratio: DEVTOOLS_RATIO,
                         devtools_drag: None,
@@ -29353,6 +30409,7 @@ mod tests {
             epoch: 1,
             last_seq: 0,
             checkout_root: None,
+            project_root: None,
             shared_with: Vec::new(),
             worktree: None,
             diff_stat: None,
@@ -29712,9 +30769,136 @@ mod tests {
             .iter()
             .map(|e| match e {
                 RailEntry::Header(g) => format!("[{}]", g.title),
+                RailEntry::Task(g) if g.primary => format!("  ★{}", g.title),
+                RailEntry::Task(g) => format!("  ⎇{}", g.title),
                 RailEntry::Row(s) => s.session_id.clone(),
             })
             .collect()
+    }
+
+    /// Slice ID2b. A session in a stated task under a stated project.
+    fn in_task(id: &str, task: &str, project: &str, state: &str) -> SessionInfo {
+        let mut s = in_root(id, Some(task), state);
+        s.project_root = Some(project.to_string());
+        s
+    }
+
+    /// **The regression ID2b exists to fix.** An isolated session's
+    /// `checkout_root` is its worktree directory, so the one-key fold drew
+    /// it under a header titled `<sid8>` beside the `<repo>` header its
+    /// siblings sat under — one repository as two projects. With the
+    /// project key the worktree is a TASK under its repository: the
+    /// primary starred and first, the worktree named by its branch and
+    /// indented, and the `<sid8>` segment drawn nowhere.
+    #[test]
+    fn an_isolated_task_files_under_its_repository() {
+        let mut wt = in_task(
+            "w",
+            "/Users/x/.eave/worktrees/eave/a1b2c3d4",
+            "/w/eave",
+            "running",
+        );
+        wt.worktree = Some(eave_wire::WorktreeInfo {
+            base: "/w/eave".into(),
+            branch: "eave/fix-parser".into(),
+            present: true,
+            dirty_files: Some(2),
+        });
+        let rows = vec![
+            wt,
+            in_task("a", "/w/eave", "/w/eave", "idle"),
+            in_task("b", "/w/eave", "/w/eave", "idle"),
+        ];
+        let got = shape(&group_rail(rows, &HashSet::new()));
+        assert_eq!(
+            got,
+            vec!["[eave]", "  ★eave", "a", "b", "  ⎇eave/fix-parser", "w"],
+            "one repository, two tasks, the primary first: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|l| l.contains("a1b2c3d4")),
+            "the worktree's <sid8> segment was drawn as a name: {got:?}"
+        );
+    }
+
+    /// Before ID2b, the same rows: two headers for one repository. Kept as
+    /// the statement of what an engine predating `project_root` still
+    /// draws — `None` folds as "the task is its own project", so an old
+    /// engine degrades to the rail it always had, not to a broken one.
+    #[test]
+    fn without_a_project_root_a_worktree_is_still_its_own_project() {
+        let rows = vec![
+            in_root("w", Some("/Users/x/.eave/worktrees/eave/a1b2c3d4"), "running"),
+            in_root("a", Some("/w/eave"), "idle"),
+        ];
+        assert_eq!(
+            shape(&group_rail(rows, &HashSet::new())),
+            vec!["[a1b2c3d4]", "w", "[eave]", "a"]
+        );
+    }
+
+    /// A lone task IS the project. No task header repeats the project
+    /// line, and one project holding every row still gets no header at
+    /// all — the flat rail of every existing test.
+    #[test]
+    fn a_project_with_one_task_draws_no_task_header() {
+        let rows = vec![
+            in_task("a", "/w/eave", "/w/eave", "idle"),
+            in_task("b", "/w/eave", "/w/eave", "idle"),
+            in_task("z", "/w/zed", "/w/zed", "idle"),
+        ];
+        assert_eq!(
+            shape(&group_rail(rows, &HashSet::new())),
+            vec!["[eave]", "a", "b", "[zed]", "z"]
+        );
+    }
+
+    /// RS1's binding rule, one level up: a collapsed PROJECT must surface
+    /// a child that is waiting, wherever under it that child sits. The
+    /// project header rolls up every task; the task header rolls up its
+    /// own rows; and both pick a CHILD's state, never a word of their own.
+    /// Seeded with `pending_approvals` alone and `state` left `running`
+    /// on the asker, which is the case a state-name-only rollup silently
+    /// drops.
+    #[test]
+    fn a_project_header_rolls_up_every_task_under_it() {
+        let mut asker = in_task("w", "/wt/eave/a1b2c3d4", "/w/eave", "running");
+        asker.pending_approvals = 1;
+        let rows = vec![
+            in_task("a", "/w/eave", "/w/eave", "idle"),
+            asker,
+            in_task("z", "/w/zed", "/w/zed", "idle"),
+        ];
+        let entries = group_rail(rows, &HashSet::new());
+        let project = entries
+            .iter()
+            .find_map(|e| match e {
+                RailEntry::Header(g) if g.title == "eave" => Some(g),
+                _ => None,
+            })
+            .expect("a header for eave");
+        assert_eq!(project.count, 2);
+        assert_eq!(project.asking, 1, "the worktree's question did not reach the project");
+        // The lead is the ASKER, though its state name still reads
+        // `running`: the rollup ranks by the disjunction, and the header
+        // says `waiting on you`, not `running`.
+        assert_eq!(project.lead_state.as_deref(), Some("awaiting_approval"));
+        assert_eq!(
+            project.lead_state.as_deref().and_then(state_badge),
+            Some("waiting on you")
+        );
+        let tasks: Vec<&RailGroup> = entries
+            .iter()
+            .filter_map(|e| match e {
+                RailEntry::Task(g) => Some(g),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tasks.len(), 2, "two tasks under eave: {:?}", shape(&entries));
+        assert!(tasks[0].primary && tasks[0].root == "/w/eave");
+        assert_eq!(tasks[0].asking, 0);
+        assert!(!tasks[1].primary);
+        assert_eq!(tasks[1].asking, 1);
     }
 
     /// A header has to DIVIDE something. One project holding every session
@@ -29859,6 +31043,7 @@ mod tests {
             epoch: 1,
             last_seq: 0,
             checkout_root: None,
+            project_root: None,
             shared_with: Vec::new(),
             worktree: None,
             diff_stat: None,
@@ -29924,6 +31109,7 @@ mod tests {
             epoch: 1,
             last_seq: 0,
             checkout_root: None,
+            project_root: None,
             shared_with: Vec::new(),
             worktree: None,
             diff_stat: None,
@@ -30205,6 +31391,116 @@ mod tests {
         let got = derived_titles_from(&mixed);
         assert_eq!(got.len(), 1);
         assert_eq!(got["ok"], "fine");
+    }
+
+    /// Slice SP1: a window's splits round-trip through `frame.json`, keep
+    /// their neighbours and the other windows' entries, and a malformed
+    /// entry costs only itself.
+    #[test]
+    fn splits_round_trip_through_frame_json_and_keep_their_neighbours() {
+        let mut doc = serde_json::json!({
+            "rail_w": 228.0,
+            SPLITS_KEY: { "other-window": [{"panes": ["x", "y"]}] },
+        });
+        let mut three = Split::pair("a".into(), "b".into());
+        three.insert(2, "c".into());
+        three.set_share(0, 0.4);
+        let mut pair = Split::pair("d".into(), "e".into());
+        pair.vertical = true;
+        let splits = vec![three.clone(), pair.clone()];
+        put_splits(&mut doc, "primary", &splits);
+        assert_eq!(doc["rail_w"], 228.0, "a neighbour was dropped");
+        assert_eq!(
+            splits_from(&doc, "other-window").len(),
+            1,
+            "another window's entry was dropped"
+        );
+        let back = splits_from(&doc, "primary");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].panes, three.panes);
+        assert!(!back[0].vertical);
+        assert!(back[1].vertical);
+        let sum: f32 = back[0].shares.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "shares came back as {:?}",
+            back[0].shares
+        );
+        assert!((back[0].shares[0] - 0.4).abs() < 1e-4);
+
+        // No splits removes the window's entry rather than writing `[]`.
+        put_splits(&mut doc, "primary", &[]);
+        assert!(doc[SPLITS_KEY].get("primary").is_none());
+        assert!(splits_from(&doc, "primary").is_empty());
+
+        // A one-pane split, a five-pane split, a duplicate id, a tab
+        // already in an earlier split, and bad shares: only the shares
+        // are forgiven (they fall back to equal), the rest is dropped.
+        let mixed = serde_json::json!({
+            SPLITS_KEY: { "w": [
+                {"panes": ["lone"]},
+                {"panes": ["1", "2", "3", "4", "5"]},
+                {"panes": ["dup", "dup"]},
+                {"panes": ["p", "q"], "shares": [0.0, "no"]},
+                {"panes": ["q", "r"]},
+                7,
+            ]}
+        });
+        let got = splits_from(&mixed, "w");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].panes, ["p", "q"]);
+        assert_eq!(got[0].shares, [0.5, 0.5]);
+        assert!(splits_from(&serde_json::json!({}), "w").is_empty());
+    }
+
+    /// Slice SP1: the pure arithmetic of a split. Inserting equalises,
+    /// removing hands the share to the pane before, a divider keeps its
+    /// pair's sum and the floor, and the cap is the cap.
+    #[test]
+    fn a_split_shares_its_well_and_stops_at_four() {
+        let mut s = Split::pair("a".into(), "b".into());
+        assert!(s.set_share(0, 0.7));
+        assert_eq!(s.shares, [0.7, 0.3]);
+        assert!(!s.set_share(0, 0.701), "a hair's move must not repaint");
+        assert!(s.set_share(0, 0.99), "clamped, but moved");
+        assert!((s.shares[0] - (1.0 - theme::SPLIT_RATIO_MIN)).abs() < 1e-6);
+        assert!(
+            !s.set_share(1, 0.5),
+            "there is no divider after the last pane"
+        );
+
+        s.insert(1, "c".into());
+        assert_eq!(s.panes, ["a", "c", "b"]);
+        assert_eq!(s.shares.len(), 3);
+        assert!(s.shares.iter().all(|x| (x - 1.0 / 3.0).abs() < 1e-6));
+        s.insert(9, "d".into());
+        assert_eq!(s.panes, ["a", "c", "b", "d"], "past the end is the end");
+        assert!(s.is_full() && s.is_viable());
+        assert_eq!(pane_side(0, 4), "left");
+        assert_eq!(pane_side(1, 4), "mid-1");
+        assert_eq!(pane_side(2, 4), "mid-2");
+        assert_eq!(pane_side(3, 4), "right");
+        assert_eq!(pane_side(1, 2), "right");
+
+        assert!(s.set_share(1, 0.4));
+        let (c, b) = (s.shares[1], s.shares[2]);
+        assert!(s.remove("b"));
+        assert_eq!(s.panes, ["a", "c", "d"]);
+        assert!(
+            (s.shares[1] - (c + b)).abs() < 1e-6,
+            "the pane before absorbs"
+        );
+        assert!(s.remove("a"));
+        assert!(
+            (s.shares[0] - (c + b + 0.25)).abs() < 1e-6,
+            "the first pane's goes forward"
+        );
+        assert!(!s.remove("a"), "already gone");
+        assert!(s.is_viable());
+        s.remove("c");
+        assert!(!s.is_viable(), "one pane is a tab");
+        assert_eq!(s.share_of("d"), Some(s.shares[0]));
+        assert_eq!(s.share_of("a"), None);
     }
 
     /// Slice AO: line two is the FOLDER, whole, and nothing else shares
@@ -30529,6 +31825,7 @@ mod tests {
             epoch: 1,
             last_seq: 0,
             checkout_root: None,
+            project_root: None,
             shared_with: Vec::new(),
             worktree: None,
             diff_stat: None,

@@ -443,6 +443,17 @@ impl SessionHandle {
         // (spec 01 §States: quiet/unresponsive/failed are what the badge
         // shows); terminal names still come from the journal's truth.
         let state = s.reported_state();
+        // ONE lock, read twice. Two `.lock()` temporaries inside a struct
+        // literal both live to the end of the statement, and `std::sync::Mutex`
+        // is not reentrant — the second would wait on the first for ever.
+        // Found by the engine suite hanging in `info()` on 2026-09-02.
+        let (checkout_root, project_root) = {
+            let probe = self.checkout.lock().unwrap();
+            (
+                probe.as_ref().map(|c| c.root.display().to_string()),
+                probe.as_ref().map(|c| c.project.display().to_string()),
+            )
+        };
         SessionInfo {
             session_id: self.session_id.clone(),
             // Stage AB. Read straight from the operator-set field — there
@@ -469,12 +480,11 @@ impl SessionHandle {
             live: s.live,
             epoch: s.epoch,
             last_seq: s.records.last().map(|r| r.seq).unwrap_or(0),
-            checkout_root: self
-                .checkout
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|c| c.root.display().to_string()),
+            checkout_root,
+            // Slice ID2b: the same probe, one field over. A path,
+            // identity-only, the same class as `checkout_root` — so the
+            // isolation invariant (spec 05 §Watch) lets it cross.
+            project_root,
             // Cross-session by definition; the engine's list() fills it.
             shared_with: Vec::new(),
             pending_approvals: {
@@ -1808,6 +1818,10 @@ impl Engine {
         )
         .map_err(|e| format!("worktree created but worktree.json save failed: {e}"))?;
         handle.shared.lock().unwrap().header = header;
+        // Slice ID2b: the worktree's project is the base it was cut from.
+        // Stamped here rather than re-probed, so the rail files the new
+        // task under its repository on the very snapshot that announces it.
+        let project = base.clone();
         *handle.worktree.lock().unwrap() = Some(WorktreeState {
             base,
             path: wt_path.clone(),
@@ -1820,6 +1834,7 @@ impl Engine {
         *handle.checkout.lock().unwrap() = Some(crate::git::CheckoutProbe {
             root: std::fs::canonicalize(&wt_path).unwrap_or(wt_path),
             is_repo: true,
+            project,
         });
         drop(live);
         handle.poke_watch();
@@ -2713,10 +2728,11 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 title,
                 color,
                 workspace,
+                base,
                 index,
             } => match engine
                 .browser
-                .group_create(window, title, color, workspace, index)
+                .group_create(window, title, color, workspace, base, index)
             {
                 Ok(id) => ok_value(&CreatedOk { id }),
                 Err(message) => ResponseBody::Err { message },
@@ -2726,11 +2742,12 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 title,
                 color,
                 workspace,
+                base,
                 collapsed,
             } => changed(
                 engine
                     .browser
-                    .group_update(group_id, title, color, workspace, collapsed),
+                    .group_update(group_id, title, color, workspace, base, collapsed),
             ),
             Request::GroupMove { group_id, index } => {
                 changed(engine.browser.group_move(group_id, index))

@@ -469,6 +469,13 @@ pub enum Request {
         /// only; nothing in the engine acts on it (Slice B1 decision).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<String>,
+        /// The base repository `workspace` belongs to (Slice ID2b) — a
+        /// task group names its project so the rail can file it even
+        /// after every session in it is gone. Written by the client at
+        /// auto-create from the session's `project_root`; inert
+        /// engine-side, exactly like `workspace`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
     },
@@ -484,6 +491,8 @@ pub enum Request {
         color: Option<Setting<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<Setting<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<Setting<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collapsed: Option<bool>,
     },
@@ -824,6 +833,22 @@ pub struct SessionInfo {
     /// `shared_with` is derived from equality of this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_root: Option<String>,
+    /// The base repository `checkout_root` belongs to (Slice ID2b): the
+    /// primary checkout for a linked worktree, `checkout_root` itself for
+    /// the primary checkout and for a non-git directory. **The rail's
+    /// PROJECT key**, where `checkout_root` is its TASK key — an isolated
+    /// session's root is its worktree directory, and grouping on that
+    /// alone drew one repository as two headers.
+    ///
+    /// `None` = not determined yet (same probe as `checkout_root`, one
+    /// field over) or an engine predating ID2b; a client folds a `None`
+    /// exactly as it folds an unknown `checkout_root` — the task is its
+    /// own project — so an old engine draws the rail it always drew.
+    ///
+    /// A path, identity-only, the same class as `checkout_root`, so the
+    /// isolation invariant (spec 05 §Watch) lets it cross.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
     /// Other sessions whose checkout root equals this one's (Slice I2),
     /// stamped by the engine at snapshot time. Identity-only, like every
     /// watch fact: session ids, no content. Empty = sole occupant (or
@@ -1611,6 +1636,7 @@ mod tests {
                     epoch: 9,
                     last_seq: 41,
                     checkout_root: Some("/tmp".into()),
+                    project_root: None,
                     shared_with: vec!["s2".into()],
                     worktree: Some(WorktreeInfo {
                         base: "/repo".into(),
@@ -2013,6 +2039,79 @@ mod tests {
         assert_eq!(info.worktree, None);
     }
 
+    /// Slice ID2b, both directions of the wire, against literal JSON.
+    ///
+    /// **Old engine, new client:** a `SessionInfo` that carries
+    /// `checkout_root` and no `project_root` parses with the project
+    /// unknown — which the rail folds as "the task is its own project",
+    /// the exact rail it drew before the field existed. **New engine, old
+    /// client:** the field is one more key an older client ignores, and
+    /// an engine that has not probed yet writes no key at all.
+    #[test]
+    fn a_session_info_without_a_project_root_parses_and_an_unprobed_one_writes_none() {
+        let old_engine = r#"{"session_id":"s1","provider":"claude-code","cwd":"/w/eave","created_ts_ms":1,"state":"new","live":false,"epoch":9,"last_seq":0,"checkout_root":"/w/eave"}"#;
+        let info: SessionInfo = serde_json::from_str(old_engine).unwrap();
+        assert_eq!(info.checkout_root.as_deref(), Some("/w/eave"));
+        assert_eq!(info.project_root, None, "an absent project must read as unknown");
+
+        let stamped = r#"{"session_id":"s2","provider":"claude-code","cwd":"/wt/eave/a1b2c3d4","created_ts_ms":1,"state":"new","live":false,"epoch":9,"last_seq":0,"checkout_root":"/wt/eave/a1b2c3d4","project_root":"/w/eave"}"#;
+        let info: SessionInfo = serde_json::from_str(stamped).unwrap();
+        assert_eq!(info.project_root.as_deref(), Some("/w/eave"));
+        let back = serde_json::to_string(&info).unwrap();
+        assert!(back.contains(r#""project_root":"/w/eave""#), "{back}");
+
+        let mut unprobed = info.clone();
+        unprobed.project_root = None;
+        let back = serde_json::to_string(&unprobed).unwrap();
+        assert!(!back.contains("project_root"), "an unknown wrote a key: {back}");
+    }
+
+    /// Slice ID2b: `base` on `group_create` / `group_update` is optional
+    /// both ways — a client that predates it sends none and the engine
+    /// reads `None`; an engine that predates it ignores the key.
+    #[test]
+    fn a_group_create_without_a_base_parses_and_a_plain_one_writes_none() {
+        let old = r#"{"id":1,"method":"group_create","params":{"workspace":"/w/eave"}}"#;
+        let env: RequestEnvelope = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            env.request,
+            Request::GroupCreate {
+                window: None,
+                title: None,
+                color: None,
+                workspace: Some("/w/eave".into()),
+                base: None,
+                index: None,
+            }
+        );
+        let req = RequestEnvelope {
+            id: 2,
+            request: Request::GroupCreate {
+                window: None,
+                title: None,
+                color: None,
+                workspace: Some("/wt/eave/a1b2c3d4".into()),
+                base: Some("/w/eave".into()),
+                index: None,
+            },
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""base":"/w/eave""#), "{line}");
+        let plain = RequestEnvelope {
+            id: 3,
+            request: Request::GroupCreate {
+                window: None,
+                title: None,
+                color: None,
+                workspace: None,
+                base: None,
+                index: None,
+            },
+        };
+        let line = serde_json::to_string(&plain).unwrap();
+        assert!(!line.contains("base"), "a plain create wrote a base key: {line}");
+    }
+
     // -----------------------------------------------------------------
     // Slice B1 — the compatibility contract for browser state.
     //
@@ -2075,6 +2174,7 @@ mod tests {
                 }),
                 color: None,
                 workspace: Some(Setting::Clear),
+                base: None,
                 collapsed: Some(true),
             },
             Request::BookmarkAdd {
@@ -2247,6 +2347,7 @@ mod tests {
                 title: None,
                 color: None,
                 workspace: None,
+                base: None,
                 collapsed: Some(true),
             },
             "an absent field must mean LEAVE ALONE, never clear"

@@ -1020,6 +1020,18 @@ fn parse_name_status(bytes: &[u8]) -> Vec<ChangedFile> {
 pub struct CheckoutProbe {
     pub root: std::path::PathBuf,
     pub is_repo: bool,
+    /// The base repository `root` belongs to (Slice ID2b): for a linked
+    /// worktree, the checkout that owns `.git`; for the primary checkout
+    /// and for a non-git directory, `root` itself. `root == project` is
+    /// what makes a checkout the project's PRIMARY task.
+    ///
+    /// One probe more than `--show-toplevel`: `--git-common-dir` names the
+    /// shared `.git` directory, and its parent is the primary checkout.
+    /// A common dir that is not literally named `.git` (a submodule's
+    /// `modules/<name>`, a bare repository) has no primary checkout to
+    /// name, and the honest answer is `root` — the task is its own
+    /// project, exactly as it read before this field existed.
+    pub project: std::path::PathBuf,
 }
 
 pub async fn checkout_root(cwd: &Path) -> CheckoutProbe {
@@ -1037,21 +1049,63 @@ pub async fn checkout_root(cwd: &Path) -> CheckoutProbe {
             if top.is_empty() {
                 // Inside a bare repo / .git dir: no worktree. Fall back
                 // to the directory itself.
+                let root = canon(cwd);
                 CheckoutProbe {
-                    root: canon(cwd),
+                    project: root.clone(),
+                    root,
                     is_repo: false,
                 }
             } else {
+                let root = canon(Path::new(&top));
+                let project = project_root_of(cwd, &root).await;
                 CheckoutProbe {
-                    root: canon(Path::new(&top)),
+                    root,
                     is_repo: true,
+                    project,
                 }
             }
         }
-        Err(_) => CheckoutProbe {
-            root: canon(cwd),
-            is_repo: false,
-        },
+        Err(_) => {
+            let root = canon(cwd);
+            CheckoutProbe {
+                project: root.clone(),
+                root,
+                is_repo: false,
+            }
+        }
+    }
+}
+
+/// The primary checkout that owns `root`'s `.git` (Slice ID2b), or `root`
+/// itself when there is none to name.
+///
+/// `git rev-parse --git-common-dir` answers `<base>/.git` from inside a
+/// linked worktree and `<root>/.git` from the primary checkout, so the
+/// parent of a common dir named `.git` IS the primary checkout. Anything
+/// else — a submodule (`<super>/.git/modules/<name>`), a bare repository,
+/// a `GIT_DIR` pointed somewhere by hand — has no primary checkout in the
+/// sense the rail groups by, and falls back to `root` rather than to a
+/// directory that is not a checkout at all.
+async fn project_root_of(cwd: &Path, root: &Path) -> std::path::PathBuf {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let Ok(out) = run(
+        Path::new("git"),
+        cwd,
+        GIT_TIMEOUT,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await
+    else {
+        return root.to_path_buf();
+    };
+    let common = String::from_utf8_lossy(&out).trim().to_string();
+    if common.is_empty() {
+        return root.to_path_buf();
+    }
+    let common = Path::new(&common);
+    match (common.file_name(), common.parent()) {
+        (Some(name), Some(parent)) if name == ".git" => canon(parent),
+        _ => root.to_path_buf(),
     }
 }
 

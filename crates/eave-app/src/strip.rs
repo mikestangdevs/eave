@@ -514,20 +514,7 @@ pub fn cycle_order(snapshot: &TabsSnapshot) -> Vec<String> {
 /// the strip (which the fold makes impossible, but a snapshot in flight can
 /// still show) starts from the beginning rather than refusing.
 pub fn cycle(snapshot: &TabsSnapshot, forward: bool) -> Option<String> {
-    let order = cycle_order(snapshot);
-    if order.is_empty() {
-        return None;
-    }
-    let at = snapshot
-        .active
-        .as_deref()
-        .and_then(|a| order.iter().position(|t| t == a));
-    let next = match at {
-        Some(ix) if forward => (ix + 1) % order.len(),
-        Some(ix) => (ix + order.len() - 1) % order.len(),
-        None => 0,
-    };
-    Some(order[next].clone())
+    cycle_in(&cycle_order(snapshot), snapshot.active.as_deref(), forward)
 }
 
 /// Which tab should become active when `closing` goes away.
@@ -677,6 +664,99 @@ pub fn active_workspace(snapshot: &TabsSnapshot) -> Option<String> {
         .iter()
         .find(|g| g.id == group)
         .and_then(|g| g.workspace.clone())
+}
+
+/// Which set of tabs a tab belongs to (Slice ID2b): a task's group, or the
+/// window's loose set — the rail's PAGES zone since ID2b′.
+///
+/// The containment flip is this distinction and nothing more. A page tab
+/// in a group belongs to the task that group is bound to; a page tab in no
+/// group is the window's Browse set, which needs no store, no event and no
+/// wire field, because it is exactly what `strip_for_window` already
+/// returns as ungrouped tabs. Incognito tabs are always loose, so Browse
+/// is where a private tab lives without ever naming a durable group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Container {
+    /// A task's tool set: the group, by id.
+    Group(String),
+    /// The window's loose tabs.
+    Loose,
+}
+
+/// The container `tab_id` sits in, or `None` for a tab the strip does not
+/// hold.
+pub fn container_of(snapshot: &TabsSnapshot, tab_id: &str) -> Option<Container> {
+    let (group, _) = tab_slot(snapshot, tab_id)?;
+    Some(match group {
+        Some(g) => Container::Group(g),
+        None => Container::Loose,
+    })
+}
+
+/// The tab ids one container holds, in the order they are drawn — a
+/// task's docked pages, or PAGES.
+///
+/// A group's tabs are its own `group_tabs` run; the loose set is every
+/// top-level `Slot::Tab` in `order`, which keeps the engine's ordering
+/// exactly as `cycle_order` does for the whole strip.
+pub fn container_tabs(snapshot: &TabsSnapshot, container: &Container) -> Vec<String> {
+    let live: HashMap<&str, ()> = snapshot.tabs.iter().map(|t| (t.id.as_str(), ())).collect();
+    match container {
+        Container::Group(id) => snapshot
+            .group_tabs
+            .iter()
+            .find(|(g, _)| g == id)
+            .map(|(_, ids)| {
+                ids.iter()
+                    .filter(|t| live.contains_key(t.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Container::Loose => snapshot
+            .order
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Tab { id } if live.contains_key(id.as_str()) => Some(id.clone()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// The window's loose PAGE tabs — the rows of the rail's PAGES zone
+/// (ID2b′). A loose session tab (one the reconcile has not filed yet) is
+/// not a page and is not one of them.
+pub fn loose_pages(snapshot: &TabsSnapshot) -> Vec<String> {
+    container_tabs(snapshot, &Container::Loose)
+        .into_iter()
+        .filter(|id| {
+            snapshot
+                .tabs
+                .iter()
+                .any(|t| &t.id == id && t.content == TabContent::Page)
+        })
+        .collect()
+}
+
+/// Which of `order` a cycling key lands on, from `active` (ID2b′).
+///
+/// The rule [`cycle`] has always had, over an order the caller supplies —
+/// the sidebar's, written by the paint (`Shell::spine_order`). Wraps, and
+/// wrapping is the point: with two tabs open, ctrl-tab has to come back
+/// or the second press does nothing. An active tab not in the order
+/// starts from the beginning rather than refusing.
+pub fn cycle_in(order: &[String], active: Option<&str>, forward: bool) -> Option<String> {
+    if order.is_empty() {
+        return None;
+    }
+    let at = active.and_then(|a| order.iter().position(|t| t == a));
+    let next = match at {
+        Some(ix) if forward => (ix + 1) % order.len(),
+        Some(ix) => (ix + order.len() - 1) % order.len(),
+        None => 0,
+    };
+    Some(order[next].clone())
 }
 
 #[cfg(test)]
@@ -915,6 +995,7 @@ mod tests {
                 color: Some("violet".into()),
                 collapsed: false,
                 workspace: None,
+                base: None,
                 last_active: None,
                 created_ts_ms: 0,
             }],
@@ -1014,6 +1095,7 @@ mod tests {
             color: None,
             collapsed: false,
             workspace: None,
+            base: None,
             last_active: None,
             created_ts_ms: 0,
         });
@@ -1335,6 +1417,42 @@ mod tests {
         let second = strip_for_window(&snapshot, "w-2");
         assert!(second.tabs.is_empty() && second.active.is_none());
     }
+
+    // ── Slice ID2b: containers ────────────────────────────────────────
+
+    /// A tab is in its task's group or in Browse, and the two sets are
+    /// the two things the tool strip can show.
+    #[test]
+    fn a_tab_is_in_its_group_or_in_the_windows_loose_set() {
+        let mut s = grouped();
+        s.tabs.push(page("loose2", Some("https://loose2.test/"), None));
+        s.order.push(Slot::Tab { id: "loose2".into() });
+        assert_eq!(
+            container_of(&s, "g2"),
+            Some(Container::Group("grp".into()))
+        );
+        assert_eq!(container_of(&s, "loose"), Some(Container::Loose));
+        assert_eq!(container_of(&s, "ghost"), None);
+        assert_eq!(
+            container_tabs(&s, &Container::Group("grp".into())),
+            vec!["g1", "g2", "g3"]
+        );
+        assert_eq!(
+            container_tabs(&s, &Container::Loose),
+            vec!["loose", "loose2"],
+            "Browse is the loose tabs in the engine's own order"
+        );
+        assert_eq!(loose_pages(&s), vec!["loose", "loose2"]);
+        // A loose SESSION tab is not browsing.
+        s.tabs.push(session_tab("t", "sess"));
+        s.order.push(Slot::Tab { id: "t".into() });
+        assert_eq!(loose_pages(&s), vec!["loose", "loose2"]);
+        assert_eq!(
+            container_tabs(&s, &Container::Loose),
+            vec!["loose", "loose2", "t"]
+        );
+    }
+
 
     /// A group is drawn by the window whose strip holds its slot, and its
     /// tab list travels with it — narrowing must not leave a group in one
