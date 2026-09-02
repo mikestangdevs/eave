@@ -57,7 +57,31 @@ pub struct ClaudeStream {
     pending_request_id: Option<String>,
 }
 
+/// The `modelUsage` row for `model`: the exact key, else the one that
+/// starts with it followed by a bracket — `init` says `claude-opus-5[1m]`
+/// and a `set_model` names `claude-opus-5` (Slice TN2), and both are one
+/// model.
+fn model_usage_row<'a>(model_usage: &'a Value, model: &str) -> Option<&'a Value> {
+    if let Some(row) = model_usage.get(model) {
+        return Some(row);
+    }
+    let map = model_usage.as_object()?;
+    map.iter()
+        .find(|(k, _)| {
+            k.strip_prefix(model)
+                .is_some_and(|rest| rest.starts_with('['))
+        })
+        .map(|(_, v)| v)
+}
+
 impl ClaudeStream {
+    /// The model this process now runs under (Slice TN2), after a
+    /// `set_model` the CLI accepted — so the next `result`'s `modelUsage`
+    /// is read from the right row.
+    pub fn set_model(&mut self, model: String) {
+        self.model = Some(model);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -317,7 +341,7 @@ impl ClaudeStream {
             limit_tokens: self
                 .model
                 .as_deref()
-                .and_then(|m| model_usage?.get(m)?.get("contextWindow")?.as_u64()),
+                .and_then(|m| model_usage_row(model_usage?, m)?.get("contextWindow")?.as_u64()),
         });
         if turn.is_none() && context.is_none() {
             return Vec::new();

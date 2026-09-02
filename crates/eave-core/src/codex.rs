@@ -484,6 +484,12 @@ impl crate::provider::AgentAdapter for CodexSession {
                        gpt-5.5+ model: `{id: \"priority\", name: \"Fast\"}` (gpt-5.2 has none). \
                        eave sends the id.",
         },
+        model: crate::tuning::ModelSupport::Switch {
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "`turn/start` takes `model` beside `effort` and `serviceTier` \
+                       (`codex app-server generate-json-schema`, TurnStartParams, 0.148.0, \
+                       2026-09-02); the ids come from the live `model/list`.",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -818,6 +824,12 @@ fn turn_params(thread_id: &str, input: Vec<Value>, t: &crate::tuning::Tuning) ->
     }
     if t.fast {
         params["serviceTier"] = json!(CODEX_FAST_TIER);
+    }
+    // Slice TN2: the model rides the same frame. Sent whenever the
+    // session's effective model is known, so a switch and a steady state
+    // look the same to the app-server.
+    if let Some(model) = &t.model {
+        params["model"] = json!(model);
     }
     params
 }
@@ -1792,12 +1804,24 @@ mod tests {
             "t1",
             vec![],
             &Tuning {
+                model: None,
                 effort: Some("ultra".into()),
                 fast: true,
             },
         );
         assert_eq!(tuned["effort"], "ultra");
         assert_eq!(tuned["serviceTier"], "priority");
+        assert!(tuned.get("model").is_none(), "no model until one is known");
+        // Slice TN2: the model rides the same frame.
+        let switched = turn_params(
+            "t1",
+            vec![],
+            &Tuning {
+                model: Some("gpt-5.6-sol".into()),
+                ..Tuning::default()
+            },
+        );
+        assert_eq!(switched["model"], "gpt-5.6-sol");
     }
 
     fn args(v: &[&str]) -> Vec<String> {

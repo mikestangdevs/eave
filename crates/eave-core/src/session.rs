@@ -317,6 +317,10 @@ pub enum SessionError {
     /// on hope (spec 01 §Kill step 4).
     #[error("kill unproven: surviving pids {remaining:?}")]
     KillUnproven { remaining: Vec<i32> },
+    /// The CLI answered a request with a refusal eave states verbatim
+    /// (Slice TN2: a model id it does not have).
+    #[error("{0}")]
+    Refused(String),
 }
 
 #[async_trait]

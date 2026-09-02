@@ -1,6 +1,24 @@
-//! Per-session **tuning**: how hard the model thinks and whether it runs
-//! on the provider's fast lane. Two knobs the operator turns from the
-//! composer, stated per provider by the adapter that drives it.
+//! Per-session **tuning**: which model answers, how hard it thinks and
+//! whether it runs on the provider's fast lane. Three knobs the operator
+//! turns from the composer, stated per provider by the adapter that
+//! drives it.
+//!
+//! The MODEL joined on 2026-09-02 (Slice TN2). Until then a session's
+//! model was fixed at open (`AgentConfig::model`, in the journal header),
+//! and picking another one in the composer started a NEW chat — the
+//! operator: *"i can switch models mid conversation in claude cli
+//! terminal and others. your telling me i cant in eave?"* The header's
+//! model is still the one the session was OPENED with; the tuning's
+//! model, when set, is the one it runs under now.
+//!
+//! | provider | model switch | how |
+//! | --- | --- | --- |
+//! | Claude Code 2.1.258 | live | `control_request { subtype: set_model, model }` (the same channel `interrupt` uses; answered by a `control_response`) |
+//! | Codex 0.148.0 | live | `turn/start.model` (beside `effort` and `serviceTier`, per the schema) |
+//! | Cursor 2026.08.11 | live | `session/set_model { sessionId, modelId }` — the frame the spawn already sends |
+//! | Grok 1.0.13 | live | `session/set_model` (ACP; `session/new` lists `availableModels`) |
+//! | Hermes 0.20.4 | **not offered** | its ACP adapter's method set has no `set_model` and `set_config_option` stores without reading |
+//! | Pi 0.84.2 | live | RPC `{type: set_model, provider, modelId}` — Pi's ids are `provider/id`, split at the first `/` |
 //!
 //! # Why this is a table and not a flag
 //!
@@ -53,11 +71,31 @@ pub struct Tuning {
     /// The provider's fast lane. `false` = do not pass anything.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    /// The model this session runs under NOW, the CLI's own id verbatim
+    /// (Slice TN2). `None` = whatever the session was opened with
+    /// (`AgentConfig::model`, or the CLI's default when that is `None`
+    /// too). The engine resolves that into the effective model before it
+    /// compares or applies anything, so an adapter never sees a `None`
+    /// that means "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Tuning {
     pub fn is_default(&self) -> bool {
-        self.effort.is_none() && !self.fast
+        self.effort.is_none() && !self.fast && self.model.is_none()
+    }
+
+    /// `self` with the model filled in from `opened_with` when it names
+    /// none — the tuning a process actually runs under.
+    pub fn effective(&self, opened_with: Option<&str>) -> Tuning {
+        Tuning {
+            model: self
+                .model
+                .clone()
+                .or_else(|| opened_with.map(str::to_string)),
+            ..self.clone()
+        }
     }
 }
 
@@ -98,6 +136,20 @@ pub enum SpeedSupport {
     },
 }
 
+/// Whether, and how, this provider's CLI switches model on a running
+/// conversation (Slice TN2). eave does not validate the id — that is
+/// the CLI's error to state, the same rule `AgentConfig::model` follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSupport {
+    Switch {
+        applies: Applies,
+        evidence: &'static str,
+    },
+    None {
+        reason: &'static str,
+    },
+}
+
 /// One adapter's whole answer. A required associated const on
 /// [`crate::provider::AgentAdapter`], like [`crate::provider::RewindSupport`]:
 /// no default, no third state, an adapter that has not answered does not
@@ -106,6 +158,7 @@ pub enum SpeedSupport {
 pub struct TuningSupport {
     pub effort: EffortSupport,
     pub speed: SpeedSupport,
+    pub model: ModelSupport,
 }
 
 impl TuningSupport {
@@ -114,6 +167,9 @@ impl TuningSupport {
             reason: "not measured",
         },
         speed: SpeedSupport::None {
+            reason: "not measured",
+        },
+        model: ModelSupport::None {
             reason: "not measured",
         },
     };
@@ -131,6 +187,18 @@ impl TuningSupport {
 
     pub fn has_speed(&self) -> bool {
         matches!(self.speed, SpeedSupport::Toggle { .. })
+    }
+
+    /// Can this CLI change model on a running conversation?
+    pub fn has_model(&self) -> bool {
+        matches!(self.model, ModelSupport::Switch { .. })
+    }
+
+    pub fn model_refusal(&self) -> Option<&'static str> {
+        match self.model {
+            ModelSupport::None { reason } => Some(reason),
+            _ => None,
+        }
     }
 
     /// Why the effort knob is absent, when it is.
@@ -172,6 +240,13 @@ impl TuningSupport {
                 return Err(format!("{provider_id} has no fast lane: {reason}"));
             }
         }
+        if t.model.is_some() {
+            if let ModelSupport::None { reason } = self.model {
+                return Err(format!(
+                    "{provider_id} cannot switch model on a running conversation: {reason}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -183,6 +258,12 @@ impl TuningSupport {
             out = Some(applies);
         }
         if let SpeedSupport::Toggle { applies, .. } = self.speed {
+            out = Some(match (out, applies) {
+                (Some(Applies::NextSpawn), _) | (_, Applies::NextSpawn) => Applies::NextSpawn,
+                _ => Applies::NextTurn,
+            });
+        }
+        if let ModelSupport::Switch { applies, .. } = self.model {
             out = Some(match (out, applies) {
                 (Some(Applies::NextSpawn), _) | (_, Applies::NextSpawn) => Applies::NextSpawn,
                 _ => Applies::NextTurn,
@@ -209,7 +290,15 @@ impl TuningSupport {
                     ..
                 }
             );
-        effort_moved || speed_moved
+        let model_moved = have.model != want.model
+            && matches!(
+                self.model,
+                ModelSupport::Switch {
+                    applies: Applies::NextSpawn,
+                    ..
+                }
+            );
+        effort_moved || speed_moved || model_moved
     }
 }
 
@@ -227,11 +316,42 @@ mod tests {
             applies: Applies::NextTurn,
             evidence: "test",
         },
+        model: ModelSupport::Switch {
+            applies: Applies::NextTurn,
+            evidence: "test",
+        },
     };
+
+    /// Slice TN2. A model is the third axis: refused where the CLI cannot
+    /// switch, resolved against what the session was opened with, and a
+    /// live axis here so a switch alone never restarts anything.
+    #[test]
+    fn a_model_is_an_axis_resolved_against_what_the_session_opened_with() {
+        let want = Tuning {
+            model: Some("opus".into()),
+            ..Tuning::default()
+        };
+        assert!(SUPPORT.check("x", &want).is_ok());
+        let err = TuningSupport::NONE_UNMEASURED
+            .check("x", &want)
+            .unwrap_err();
+        assert!(err.contains("cannot switch model"), "{err}");
+        assert!(
+            !SUPPORT.needs_respawn(&Tuning::default(), &want),
+            "live here"
+        );
+
+        let unset = Tuning::default();
+        assert_eq!(unset.effective(Some("sonnet")).model.as_deref(), Some("sonnet"));
+        assert_eq!(want.effective(Some("sonnet")).model.as_deref(), Some("opus"));
+        assert_eq!(unset.effective(None).model, None);
+        assert!(!want.is_default());
+    }
 
     #[test]
     fn a_level_the_cli_never_named_is_refused_with_the_list() {
         let t = Tuning {
+            model: None,
             effort: Some("ultra".into()),
             fast: false,
         };
@@ -244,6 +364,7 @@ mod tests {
             .check(
                 "x",
                 &Tuning {
+                    model: None,
                     effort: Some("high".into()),
                     fast: true
                 }
@@ -259,6 +380,7 @@ mod tests {
             .check(
                 "x",
                 &Tuning {
+                    model: None,
                     effort: None,
                     fast: true,
                 },
@@ -273,15 +395,18 @@ mod tests {
     #[test]
     fn a_respawn_is_needed_only_for_an_argv_axis_that_moved() {
         let a = Tuning {
+            model: None,
             effort: Some("low".into()),
             fast: false,
         };
         let b = Tuning {
+            model: None,
             effort: Some("low".into()),
             fast: true,
         };
         assert!(!SUPPORT.needs_respawn(&a, &b), "speed is next-turn here");
         let c = Tuning {
+            model: None,
             effort: Some("high".into()),
             fast: true,
         };

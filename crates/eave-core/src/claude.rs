@@ -73,6 +73,10 @@ struct Shared {
     /// `is_empty()` per line, and no second parse of any frame in the
     /// normal case.
     pending_control: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>,
+    /// The model this process runs under (Slice TN2): what it was spawned
+    /// with, then whatever `set_model` last switched it to. A `tune` that
+    /// names the same model writes nothing.
+    model: Mutex<Option<String>>,
 }
 
 type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
@@ -193,6 +197,7 @@ impl ClaudeCodeSession {
         let shared = Arc::new(Shared {
             stream: Mutex::new(ClaudeStream::new()),
             pending_control: Mutex::new(HashMap::new()),
+            model: Mutex::new(cfg.model.clone()),
             last_activity: Mutex::new(Instant::now()),
             saw_init: AtomicBool::new(false),
             kill_initiated: AtomicBool::new(false),
@@ -403,6 +408,14 @@ impl crate::provider::AgentAdapter for ClaudeCodeSession {
                        a paid subscription\") sits in front of it and eave cannot see \
                        which answer this machine gets.",
         },
+        model: crate::tuning::ModelSupport::Switch {
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "2.1.258's control channel has `set_model` (binary: `case\"set_model\":{let \
+                       i=e.request.model; …}`, answered by a `control_response`; the SDK's \
+                       `setModel` sends `{subtype:\"set_model\",model}`), so a switch is live on \
+                       the same channel `interrupt` and `rewind_conversation` use — measured \
+                       2026-09-02.",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -517,6 +530,77 @@ impl AgentSession for ClaudeCodeSession {
             "request": { "subtype": "interrupt" },
         });
         write_frame(&self.stdin, &frame.to_string()).await
+    }
+
+    /// `set_model` — a live model switch on the control channel
+    /// `interrupt` uses (Slice TN2). Effort and the fast lane are argv-only
+    /// on this CLI and never reach here: the engine restarts for those,
+    /// and the restart's argv carries the model too. Awaits the
+    /// `control_response` so a refused id is STATED, not swallowed — the
+    /// CLI answers `{subtype: "error", error: "…"}` for a model it does
+    /// not have.
+    async fn tune(&mut self, tuning: &crate::tuning::Tuning) -> Result<(), SessionError> {
+        let Some(model) = &tuning.model else {
+            return Ok(());
+        };
+        if self.shared.model.lock().unwrap().as_deref() == Some(model.as_str()) {
+            return Ok(());
+        }
+        let request_id = format!(
+            "eave-model-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let (tx, rx) = oneshot::channel();
+        self.shared
+            .pending_control
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), tx);
+        let frame = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": set_model_request(model),
+        });
+        if let Err(e) = write_frame(&self.stdin, &frame.to_string()).await {
+            self.shared
+                .pending_control
+                .lock()
+                .unwrap()
+                .remove(&request_id);
+            return Err(e);
+        }
+        let reply = match tokio::time::timeout(CONTROL_REPLY_TIMEOUT, rx).await {
+            Ok(Ok(v)) => v,
+            _ => {
+                self.shared
+                    .pending_control
+                    .lock()
+                    .unwrap()
+                    .remove(&request_id);
+                return Err(SessionError::Refused(
+                    "the CLI did not answer set_model".into(),
+                ));
+            }
+        };
+        if reply
+            .pointer("/response/subtype")
+            .and_then(serde_json::Value::as_str)
+            == Some("error")
+        {
+            let why = reply
+                .pointer("/response/error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason given");
+            return Err(SessionError::Refused(format!(
+                "the CLI refused model {model:?}: {why}"
+            )));
+        }
+        *self.shared.model.lock().unwrap() = Some(model.clone());
+        self.shared.stream.lock().unwrap().set_model(model.clone());
+        Ok(())
     }
 
     /// `rewind_conversation` — the CLI's own truncation, on the same
@@ -853,6 +937,12 @@ async fn write_line(stdin: &SharedStdin, line: &str) {
     let _ = write_frame(stdin, line).await;
 }
 
+/// The `request` half of a `set_model` control request (Slice TN2) —
+/// exactly what the CLI's own SDK sends: `{subtype:"set_model",model}`.
+fn set_model_request(model: &str) -> serde_json::Value {
+    serde_json::json!({ "subtype": "set_model", "model": model })
+}
+
 /// The argv this CLI takes for a session's tuning (Slice TN1). `--effort`
 /// is the flag `--help` documents; fast mode has no flag, so it rides
 /// `--settings` as a JSON string — the binary's own headless
@@ -881,10 +971,32 @@ mod tests {
     /// verbatim; fast mode is the settings opt-in, as JSON the CLI's
     /// `--settings` accepts inline.
     #[test]
+    /// Slice TN2: the model is NOT argv on a running process — it is the
+    /// SDK's own `set_model` request, and the argv path is only what a
+    /// restart (for an argv-only knob) carries.
+    #[test]
+    fn a_model_switch_is_the_set_model_control_request() {
+        let r = set_model_request("claude-opus-5");
+        assert_eq!(r["subtype"], "set_model");
+        assert_eq!(r["model"], "claude-opus-5");
+        assert!(<ClaudeCodeSession as crate::provider::AgentAdapter>::TUNING.has_model());
+        assert!(
+            !<ClaudeCodeSession as crate::provider::AgentAdapter>::TUNING.needs_respawn(
+                &crate::tuning::Tuning::default(),
+                &crate::tuning::Tuning {
+                    model: Some("claude-opus-5".into()),
+                    ..Default::default()
+                }
+            )
+        );
+    }
+
+    #[test]
     fn tuning_is_argv_and_the_default_is_silence() {
         use crate::tuning::Tuning;
         assert!(tuning_args(&Tuning::default()).is_empty());
         let both = tuning_args(&Tuning {
+            model: None,
             effort: Some("xhigh".into()),
             fast: true,
         });
@@ -1016,6 +1128,7 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(ClaudeStream::new()),
                 pending_control: Mutex::new(HashMap::new()),
+                model: Mutex::new(None),
                 last_activity: Mutex::new(Instant::now()),
                 saw_init: AtomicBool::new(false),
                 kill_initiated: AtomicBool::new(false),
@@ -1062,6 +1175,7 @@ mod tests {
         let shared = Shared {
             stream: Mutex::new(ClaudeStream::new()),
             pending_control: Mutex::new(HashMap::new()),
+            model: Mutex::new(None),
             last_activity: Mutex::new(Instant::now()),
             saw_init: AtomicBool::new(false),
             kill_initiated: AtomicBool::new(false),

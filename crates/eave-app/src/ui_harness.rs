@@ -12895,6 +12895,53 @@ fn choosing_an_effort_level_tunes_the_selected_session(cx: &mut TestAppContext) 
     assert!(shown(vcx, "composer-effort-gauge-3"), "xhigh lights three of four bars");
 }
 
+/// **Slice TN2.** Picking another model of the SAME provider on a live
+/// chat switches THAT chat — one `Tune` carrying the model, the other two
+/// knobs unchanged — and starts nothing. Before this the pick opened a
+/// new session (the agent was "fixed at open"); the operator: *"i can
+/// switch models mid conversation in claude cli terminal and others.
+/// your telling me i cant in eave?"*
+#[gpui::test]
+fn choosing_a_model_on_a_live_chat_switches_that_chat(cx: &mut TestAppContext) {
+    let _turn = eave_core::capabilities::probe_test_lock();
+    eave_core::capabilities::forget();
+    let (mut h, vcx) = boot(cx);
+    empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
+    let mut s = session("aaaa1111");
+    s.effort = Some("xhigh".into());
+    s.fast = true;
+    h.plumbing.push_rail(vec![s]);
+    vcx.run_until_parked();
+    let _ = h.drain();
+    click(vcx, "composer-model");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "model-picker"), "the model menu never opened");
+    // Row 1 is Opus 5 — row 0 is Sonnet 5 (the same list the launcher test reads).
+    click(vcx, "model-picker-row-1");
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(16));
+    let cmds = h.drain();
+    match cmds.as_slice() {
+        [Command::Tune { id, tuning }] => {
+            assert_eq!(id, "aaaa1111");
+            assert_eq!(tuning.model.as_deref(), Some("claude-opus-5"));
+            assert_eq!(
+                tuning.effort.as_deref(),
+                Some("xhigh"),
+                "effort must ride along"
+            );
+            assert!(tuning.fast, "the fast lane must ride along");
+        }
+        other => panic!("picking a model on a live chat emitted {other:?}, not one Tune"),
+    }
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::NewSession | Command::Launch { .. })),
+        "a model switch must not start a new session"
+    );
+}
+
 /// Choosing a level must carry the OTHER knob along unchanged: a session
 /// on the fast lane that picks Max stays on the fast lane. (The live walk
 /// came up on `max` with the fast lane off, once, unexplained — this pins
@@ -14307,15 +14354,16 @@ fn cmd_digits_pick_a_model_while_the_picker_is_open(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("cmd-2");
     vcx.run_until_parked();
     drive(&h, vcx, Duration::from_millis(16));
-    let chosen = vcx
-        .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
-        .unwrap();
-    assert_eq!(
-        chosen,
-        Some("claude-opus-5"),
-        "⌘2 with the picker open did not pick the second row"
-    );
     let cmds = h.drain();
+    // Slice TN2: on a live chat the pick SWITCHES that chat's model (one
+    // `Tune`), rather than choosing the next launch's model.
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Tune { id, tuning } if id == "aaaa1111" && tuning.model.as_deref() == Some("claude-opus-5")
+        )),
+        "⌘2 with the picker open did not pick the second row: {cmds:?}"
+    );
     assert!(
         !cmds
             .iter()

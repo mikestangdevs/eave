@@ -322,6 +322,13 @@ impl crate::provider::AgentAdapter for CursorSession {
             reason: "same seam and the same unmeasured list as the effort level: `fast=` inside \
                      the model id, listable only after `agent login`.",
         },
+        model: crate::tuning::ModelSupport::Switch {
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "`session/set_model { sessionId, modelId }` is the frame this adapter \
+                       already sends after `session/new` for a spawn-time model, and ACP \
+                       defines it for a live session; a refused id is Cursor's own error \
+                       response, journalled and shown (2026-09-02).",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -410,6 +417,21 @@ impl AgentSession for CursorSession {
             }
         }
         Ok(true)
+    }
+
+    /// `session/set_model`, live (Slice TN2) — the frame the spawn already
+    /// sends for a spawn-time model, now on the operator's word mid-way.
+    /// Cursor's effort and fast lane ride INSIDE the model id
+    /// (`…[effort=high,fast=false]`), so this is also the only tuning
+    /// verb this adapter has.
+    async fn tune(&mut self, tuning: &crate::tuning::Tuning) -> Result<(), SessionError> {
+        let Some(model) = &tuning.model else {
+            return Ok(());
+        };
+        let session_id = self.await_session().await?;
+        wire::write_frame(self.stdin(), &set_model_frame(&session_id, model)).await?;
+        self.shared.proto.lock().unwrap().model = Some(model.clone());
+        Ok(())
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
@@ -570,8 +592,19 @@ impl CursorProto {
                 // A failed model switch leaves the session on Cursor's
                 // default rather than killing it. The operator picked a
                 // native id; Cursor saying no is a CLI fact, not a spawn
-                // failure.
-                (Vec::new(), Vec::new())
+                // failure — and (Slice TN2) it is STATED: the error
+                // response is journalled under the subtype the transcript
+                // renders, so a live switch to an id Cursor lacks shows
+                // its own sentence instead of nothing.
+                let events = v
+                    .get("error")
+                    .map(|_| SessionEvent::System {
+                        subtype: "error".into(),
+                        raw: line.to_string(),
+                    })
+                    .into_iter()
+                    .collect();
+                (events, Vec::new())
             }
             _ => (
                 crate::acp::usage::from_prompt_response(v.get("result"))

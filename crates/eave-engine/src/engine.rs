@@ -489,7 +489,13 @@ impl SessionHandle {
             // content — so it is allowed on the watch channel by the
             // isolation invariant (spec 05 §Watch). `None` = the CLI's own
             // default, which eave neither knows nor invents.
-            model: s.header.agent.model.clone(),
+            // Slice TN2: the EFFECTIVE model — the operator's switch when
+            // there is one, else what the session was opened with.
+            model: s
+                .tuning
+                .model
+                .clone()
+                .or_else(|| s.header.agent.model.clone()),
             effort: s.tuning.effort.clone(),
             fast: s.tuning.fast,
             cwd: s.header.cwd.clone(),
@@ -1202,7 +1208,7 @@ impl Engine {
             let (want, provider) = {
                 let s = handle.shared.lock().unwrap();
                 (
-                    s.tuning.clone(),
+                    s.tuning.effective(s.header.agent.model.as_deref()),
                     provider_of(&self.cfg, &s.header.agent).to_string(),
                 )
             };
@@ -1222,8 +1228,29 @@ impl Engine {
                 // its `extra` receiver to drop, which happens after that
                 // write. Bounded: a recorder that never returns is a
                 // different bug and must not wedge the send lock.
+                //
+                // AND for the segment's `closed` record to have reached the
+                // in-memory mirror (`Shared::records`), because that is
+                // where `spawn_live` reads its next seq from. Walked
+                // 2026-09-02 (Slice TN2): the recorder had appended
+                // `closed` as seq 23, the mirror task had not pushed it
+                // yet, and the new segment wrote its `user_sent` as seq 23
+                // too — a journal the next engine start quarantined as
+                // corrupt. The recorder's last record is always `closed`,
+                // and the mirror pushes in order, so "the mirror ends in
+                // `closed`" is exactly "every record of the old segment is
+                // in".
                 let gone = Instant::now() + Duration::from_secs(5);
-                while !l.extra_tx.is_closed() && Instant::now() < gone {
+                let mirrored = |h: &SessionHandle| {
+                    matches!(
+                        h.shared.lock().unwrap().records.last(),
+                        Some(Record {
+                            event: JournalEvent::Closed { .. },
+                            ..
+                        })
+                    )
+                };
+                while (!l.extra_tx.is_closed() || !mirrored(&handle)) && Instant::now() < gone {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 *live = None;
@@ -1361,7 +1388,12 @@ impl Engine {
         // starting over — it would ask the provider to load nothing.
         cfg.resume = resume.filter(|id| !id.is_empty());
         cfg.extra_env = self.cfg.agent_env.clone();
-        cfg.model = agent.model.clone();
+        // Slice TN2: the process runs under the EFFECTIVE tuning — the
+        // operator's model when one was chosen, else the one the session
+        // opened with — and `Live::tuning` records exactly that, so a
+        // later compare never sees a `None` that means "unknown".
+        let tuning = tuning.effective(agent.model.as_deref());
+        cfg.model = tuning.model.clone();
         cfg.extra_args = agent
             .extra_args
             .iter()
@@ -2104,25 +2136,35 @@ impl Engine {
                  reconstructed one over it"
             )
         })?;
+        let effective = {
+            let s = handle.shared.lock().unwrap();
+            tuning.effective(s.header.agent.model.as_deref())
+        };
+        // The live wire is asked FIRST, and a refusal writes nothing:
+        // walked 2026-09-02 (Slice TN2), a model id Claude did not have
+        // came back as its own sentence — and the fact had already been
+        // saved, so the rail wore `not-a-model` after the CLI said no.
+        // The write now follows the answer. The lock is held across the
+        // save so a send cannot interleave and spawn under a fact that
+        // is about to change.
+        let mut live = handle.live.lock().await;
+        let takes_hold = match live.as_mut().filter(|l| !l.extra_tx.is_closed()) {
+            None => TakesHold::NextSpawn,
+            Some(l) if support.needs_respawn(&l.tuning, &effective) => TakesHold::NextSend,
+            Some(l) => {
+                l.session
+                    .tune(&effective)
+                    .await
+                    .map_err(|e| format!("tune: {e}"))?;
+                l.tuning = effective.clone();
+                TakesHold::Now
+            }
+        };
         meta.tuning = tuning.clone();
         meta.save(&handle.dir)
             .map_err(|e| format!("save meta: {e}"))?;
         handle.shared.lock().unwrap().tuning = tuning.clone();
-        let takes_hold = {
-            let mut live = handle.live.lock().await;
-            match live.as_mut().filter(|l| !l.extra_tx.is_closed()) {
-                None => TakesHold::NextSpawn,
-                Some(l) if support.needs_respawn(&l.tuning, &tuning) => TakesHold::NextSend,
-                Some(l) => {
-                    l.session
-                        .tune(&tuning)
-                        .await
-                        .map_err(|e| format!("tune: {e}"))?;
-                    l.tuning = tuning.clone();
-                    TakesHold::Now
-                }
-            }
-        };
+        drop(live);
         handle.poke_watch();
         Ok(TuneOk {
             info: self.info_with_sharing(id)?,
@@ -2800,7 +2842,18 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
                 session_id,
                 effort,
                 fast,
-            } => match engine.tune(&session_id, Tuning { effort, fast }).await {
+                model,
+            } => match engine
+                .tune(
+                    &session_id,
+                    Tuning {
+                        model,
+                        effort,
+                        fast,
+                    },
+                )
+                .await
+            {
                 Ok(ok) => ok_value(&ok),
                 Err(message) => ResponseBody::Err { message },
             },

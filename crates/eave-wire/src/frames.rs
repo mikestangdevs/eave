@@ -326,6 +326,11 @@ pub enum Request {
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fast: bool,
+        /// The model to run under from now on (Slice TN2), the CLI's own
+        /// id. `None` = the one the session was opened with. Like the
+        /// other two, a whole replacement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// Answer one open permission question (Slice K). The agent is parked
     /// until this arrives and there is no other way out — eave never
@@ -2586,6 +2591,7 @@ mod tests {
             session_id: "s1".into(),
             effort: Some("xhigh".into()),
             fast: true,
+            model: Some("claude-opus-5".into()),
         };
         let raw = serde_json::to_string(&req).expect("serialize");
         assert!(raw.contains("\"method\":\"tune\""), "{raw}");
@@ -2595,9 +2601,19 @@ mod tests {
             session_id: "s1".into(),
             effort: None,
             fast: false,
+            model: None,
         })
         .unwrap();
-        assert!(!bare.contains("effort") && !bare.contains("fast"), "{bare}");
+        assert!(
+            !bare.contains("effort") && !bare.contains("fast") && !bare.contains("model"),
+            "{bare}"
+        );
+        // Slice TN2: a `tune` from a client predating the model axis parses.
+        let old: Request = serde_json::from_str(
+            r#"{"method":"tune","params":{"session_id":"s1","effort":"low"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(old, Request::Tune { model: None, .. }));
         let ok = TuneOk {
             info: serde_json::from_str(r#"{"session_id":"s1","provider":"p","cwd":"/","created_ts_ms":1,"state":"new","live":false,"epoch":1,"last_seq":0}"#).unwrap(),
             takes_hold: TakesHold::NextSend,

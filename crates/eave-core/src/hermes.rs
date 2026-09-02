@@ -1048,6 +1048,12 @@ impl crate::provider::AgentAdapter for HermesSession {
         speed: crate::tuning::SpeedSupport::None {
             reason: "no fast lane on this CLI (2026-09-02).",
         },
+        model: crate::tuning::ModelSupport::None {
+            reason: "Hermes' ACP adapter has no `session/set_model`: its whole method set is \
+                     session/new, prompt, request_permission, set_config_option, set_mode and \
+                     update (acp_adapter/server.py, 2026-08-31), and `set_config_option` \
+                     stores a value nothing reads back. `hermes acp` takes no `--model` either.",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {

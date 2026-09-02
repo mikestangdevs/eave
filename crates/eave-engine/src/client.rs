@@ -544,6 +544,7 @@ impl Client {
             session_id: session_id.into(),
             effort: tuning.effort.clone(),
             fast: tuning.fast,
+            model: tuning.model.clone(),
         })
         .await
     }

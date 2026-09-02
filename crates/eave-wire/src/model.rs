@@ -1059,7 +1059,15 @@ impl Transcript {
 /// cannot. `None` for a frame shaped some other way — nothing is invented.
 fn provider_error_text(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let message = v.pointer("/params/error/message")?.as_str()?;
+    // Codex's notification carries it under `params`; a JSON-RPC error
+    // RESPONSE (an ACP agent refusing `session/set_model`, Slice TN2)
+    // carries it at the top.
+    let message = v
+        .pointer("/params/error/message")
+        .or_else(|| v.pointer("/error/message"))
+        // Pi's RPC response: `{"type":"response","success":false,"error":"…"}`.
+        .or_else(|| v.get("error").filter(|e| e.is_string()))?
+        .as_str()?;
     let inner = serde_json::from_str::<serde_json::Value>(message)
         .ok()
         .and_then(|e| {
@@ -1388,6 +1396,23 @@ mod tests {
         assert_eq!(
             provider_error_text(r#"{"method":"error","params":{}}"#),
             None
+        );
+        // Slice TN2: an ACP agent's refusal of `session/set_model` is a
+        // JSON-RPC error response, and it reads the same way.
+        assert_eq!(
+            provider_error_text(
+                r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"unknown model: nope"}}"#
+            )
+            .as_deref(),
+            Some("unknown model: nope")
+        );
+        // … and Pi's `response` shape, the real one from 2026-09-02.
+        assert_eq!(
+            provider_error_text(
+                r#"{"id":"eave-model","type":"response","command":"set_model","success":false,"error":"Model not found: nowhere/nothing"}"#
+            )
+            .as_deref(),
+            Some("Model not found: nowhere/nothing")
         );
     }
 

@@ -117,7 +117,20 @@ const GROK_MODE_YOLO: &str = "always-approve";
 /// First JSON-RPC id handed to a `session/prompt`. Above the two handshake
 /// ids the shared core owns, and only ever increasing, so a late response
 /// can always be attributed.
+/// `session/set_model` (Slice TN2). Its own id so its reply can never be
+/// read as a prompt's — the `_` arm below decodes a prompt response, and
+/// a `{}` result there would be a turn nobody ran.
+const RPC_SET_MODEL: i64 = 4;
 const RPC_PROMPT_BASE: i64 = 16;
+
+fn set_model_frame(session_id: &str, model: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": RPC_SET_MODEL,
+        "method": "session/set_model",
+        "params": { "sessionId": session_id, "modelId": model },
+    })
+}
 
 /// ACP session state and the outstanding-tool set, kept together because
 /// both are read by the trait methods off the reader task.
@@ -342,6 +355,14 @@ impl crate::provider::AgentAdapter for GrokSession {
             reason: "no fast lane on this CLI: `grok agent --help` has no speed/fast option and \
                      the binary's only `speed` strings are scroll settings (2026-09-02).",
         },
+        model: crate::tuning::ModelSupport::Switch {
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "ACP `session/set_model { sessionId, modelId }`; grok's `session/new` \
+                       answers with `availableModels[]` and its binary carries the method \
+                       (`grok.rs` note of 2026-09-02: \"has `session/set_model` but no effort \
+                       setter\"). A refused id is grok's own error response, journalled and \
+                       shown.",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -374,6 +395,17 @@ impl AgentSession for GrokSession {
 
     fn watch(&self) -> SessionWatch {
         self.child.watch()
+    }
+
+    /// `session/set_model`, live (Slice TN2). The effort level is
+    /// argv-only on this CLI and never reaches here — the engine restarts
+    /// for it, and that argv carries the model too.
+    async fn tune(&mut self, tuning: &crate::tuning::Tuning) -> Result<(), SessionError> {
+        let Some(model) = &tuning.model else {
+            return Ok(());
+        };
+        let session_id = self.await_session().await?;
+        wire::write_frame(self.stdin(), &set_model_frame(&session_id, model)).await
     }
 
     async fn send_user_message(
@@ -615,6 +647,19 @@ impl GrokProto {
             // empty: the settled response is where ACP puts the turn's
             // token bill, and reading the outcome while dropping the bill
             // was the narrowing this slice exists to stop (slice CC).
+            // Slice TN2. Success says nothing (the composer already shows
+            // the operator's choice); a refusal is grok's own error, kept
+            // verbatim under the subtype the transcript renders.
+            Some(RPC_SET_MODEL) => (
+                error
+                    .map(|_| SessionEvent::System {
+                        subtype: "error".into(),
+                        raw: line.to_string(),
+                    })
+                    .into_iter()
+                    .collect(),
+                Vec::new(),
+            ),
             _ => (
                 crate::acp::usage::from_prompt_response(v.get("result"))
                     .into_iter()
@@ -1753,6 +1798,19 @@ mod tests {
 
     /// Slice TN1. `--reasoning-effort` is an option of `grok agent`, so
     /// it sits before `stdio` like `-m`; the default passes nothing.
+    #[test]
+    fn a_model_switch_is_acp_set_model_on_its_own_id() {
+        let f = set_model_frame("sess-1", "grok-4.6");
+        assert_eq!(f["method"], "session/set_model");
+        assert_eq!(f["params"]["sessionId"], "sess-1");
+        assert_eq!(f["params"]["modelId"], "grok-4.6");
+        // Its reply must never be read as a prompt's, so the id is below
+        // the prompt range and is not the handshake's either.
+        assert_eq!(f["id"], RPC_SET_MODEL);
+        assert!(RPC_SET_MODEL < RPC_PROMPT_BASE);
+        assert!(RPC_SET_MODEL != wire::RPC_INITIALIZE && RPC_SET_MODEL != wire::RPC_SESSION);
+    }
+
     #[test]
     fn a_reasoning_effort_is_argv_before_the_subcommand() {
         let mut cfg = SpawnConfig::new("/bin/false", "/tmp", "s".into());

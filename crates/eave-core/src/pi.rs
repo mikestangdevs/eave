@@ -578,6 +578,14 @@ impl crate::provider::AgentAdapter for PiSession {
             reason: "no fast lane on this CLI: nothing in `--help` or the RPC verb list \
                      (2026-09-02).",
         },
+        model: crate::tuning::ModelSupport::Switch {
+            applies: crate::tuning::Applies::NextTurn,
+            evidence: "RPC `{type: set_model, provider, modelId}` — `modes/rpc/rpc-mode.js` \
+                       0.84.2: looks the pair up in `modelRuntime.getAvailableSnapshot()`, \
+                       answers `Model not found: provider/id` otherwise, then \
+                       `session.setModel(model)`. eave's Pi ids are `provider/id` and are \
+                       split at the first `/` (2026-09-02).",
+        },
     };
 
     fn spawn(cfg: &SpawnConfig) -> Result<(Self, mpsc::Receiver<SessionEvent>), SessionError> {
@@ -714,6 +722,16 @@ impl AgentSession for PiSession {
     /// A `None` level sends nothing: the RPC has no "back to default" and
     /// eave will not guess which word Pi's default is.
     async fn tune(&mut self, tuning: &crate::tuning::Tuning) -> Result<(), SessionError> {
+        // Slice TN2: `{type: set_model, provider, modelId}`. Pi's own ids
+        // are `provider/id` (see `MODELS`), and the RPC wants the pair.
+        if let Some(model) = &tuning.model {
+            let Some((provider, id)) = model.split_once('/') else {
+                return Err(SessionError::Refused(format!(
+                    "pi switches model by `provider/id`, and {model:?} names no provider"
+                )));
+            };
+            write_frame(&self.stdin, &set_model_frame(provider, id)).await?;
+        }
         let Some(level) = &tuning.effort else {
             return Ok(());
         };
@@ -810,6 +828,16 @@ impl AgentSession for PiSession {
 /// `{type: set_thinking_level, level}` (Slice TN1) — Pi's own RPC verb,
 /// `modes/rpc/rpc-mode.js` 0.84.2. The `id` lets the reply be told apart
 /// from the probes'; nothing waits on it.
+fn set_model_frame(provider: &str, model_id: &str) -> String {
+    serde_json::json!({
+        "id": "eave-model",
+        "type": "set_model",
+        "provider": provider,
+        "modelId": model_id,
+    })
+    .to_string()
+}
+
 fn set_thinking_frame(level: &str) -> String {
     serde_json::json!({
         "id": "eave-tune",
@@ -1070,6 +1098,15 @@ impl PiStream {
                 Vec::new()
             }
             Some(PROBE_GATE_ID) => self.verify_gate(v),
+            // Slice TN2: eave's own tuning verbs answer here. A `success:
+            // false` is Pi's refusal in Pi's words (`Model not found:
+            // provider/id`, measured 2026-09-02) and lands under the
+            // subtype the transcript renders; a success says nothing new.
+            Some("eave-model") | Some("eave-tune")
+                if v.get("success").and_then(Value::as_bool) == Some(false) =>
+            {
+                vec![system("error", line)]
+            }
             _ => vec![system("response", line)],
         }
     }
@@ -1386,6 +1423,13 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&set_thinking_frame("xhigh")).unwrap();
         assert_eq!(v["type"], "set_thinking_level");
         assert_eq!(v["level"], "xhigh");
+        // Slice TN2: a model switch is `set_model` with the pair Pi wants.
+        let m: serde_json::Value =
+            serde_json::from_str(&set_model_frame("anthropic", "claude-opus-4-5")).unwrap();
+        assert_eq!(m["type"], "set_model");
+        assert_eq!(m["provider"], "anthropic");
+        assert_eq!(m["modelId"], "claude-opus-4-5");
+        assert!(<PiSession as crate::provider::AgentAdapter>::TUNING.has_model());
         assert!(<PiSession as crate::provider::AgentAdapter>::TUNING
             .levels()
             .contains(&"off"));

@@ -9839,7 +9839,7 @@ impl Shell {
                 return (
                     info.provider.clone(),
                     Some(info.session_id.clone()),
-                    tuning_ui::of_session(info.effort.as_deref(), info.fast),
+                    tuning_ui::of_session(info.model.as_deref(), info.effort.as_deref(), info.fast),
                 );
             }
         }
@@ -9864,6 +9864,15 @@ impl Shell {
     fn set_effort(&mut self, level: Option<String>, cx: &mut Context<Self>) {
         let (_, _, mut tuning) = self.tuning_target(cx);
         tuning.effort = level;
+        self.apply_tuning(tuning, cx);
+    }
+
+    /// Switch the selected chat's model, live (Slice TN2). The other two
+    /// knobs ride along unchanged; the engine decides whether the CLI
+    /// takes it on the wire or at the next send.
+    fn set_model(&mut self, model: &str, cx: &mut Context<Self>) {
+        let (_, _, mut tuning) = self.tuning_target(cx);
+        tuning.model = Some(model.to_string());
         self.apply_tuning(tuning, cx);
     }
 
@@ -25478,8 +25487,20 @@ impl Shell {
         // to be typed, never a launch — `at_launcher`, not "is a session
         // subscribed", because behind a blank ⌘T tab one still is.
         if !self.at_launcher(cx) {
-            // A session's agent is fixed at open (`Engine::reject_config_change`).
-            if !(same_provider && same_model) {
+            // Slice TN2: on the SAME provider a pick switches the running
+            // chat's model — the CLIs all take it mid-conversation, and
+            // the operator does that in their terminals ("your telling me
+            // i cant in eave?"). Only the PROVIDER is fixed at open
+            // (`Engine::reject_config_change`): its journal and resume
+            // cursor were created under it, so a different provider is
+            // still a new chat.
+            if same_provider {
+                if !same_model {
+                    if let Some(model) = model {
+                        self.set_model(model, cx);
+                    }
+                }
+            } else {
                 self.pick_provider(entry.provider_ix, cx);
                 self.launcher.model = model;
                 self.new_session();
@@ -27160,7 +27181,12 @@ impl Render for Shell {
         } else {
             composer_session
                 .as_ref()
-                .map(|i| (i.provider.clone(), tuning_ui::of_session(i.effort.as_deref(), i.fast)))
+                .map(|i| {
+                    (
+                        i.provider.clone(),
+                        tuning_ui::of_session(i.model.as_deref(), i.effort.as_deref(), i.fast),
+                    )
+                })
         };
         let home = home_dir();
         let project_name = composer_session

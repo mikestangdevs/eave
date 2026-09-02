@@ -137,6 +137,7 @@ async fn a_tuning_is_a_durable_operator_fact_and_an_unknown_level_is_refused_wit
         .tune(
             "s1",
             &Tuning {
+                model: None,
                 effort: Some("xhigh".into()),
                 fast: true,
             },
@@ -156,6 +157,7 @@ async fn a_tuning_is_a_durable_operator_fact_and_an_unknown_level_is_refused_wit
         .tune(
             "s1",
             &Tuning {
+                model: None,
                 effort: Some("ultra".into()),
                 fast: false,
             },
@@ -194,6 +196,99 @@ async fn a_tuning_is_a_durable_operator_fact_and_an_unknown_level_is_refused_wit
     assert!(!ok.info.fast);
 }
 
+/// Slice TN2. A model switch on a live Claude-shaped agent is a
+/// `set_model` over its control channel: `takes_hold: now`, the pid
+/// untouched, the effective model reported at once, and the next send
+/// does not restart anything. The fake answers `set_model` like the CLI.
+#[tokio::test]
+async fn a_model_switch_is_live_and_restarts_nothing() {
+    let dir = scratch();
+    let _engine = EngineProc::spawn(&dir, "linger");
+    let c = Client::connect(&dir).await.expect("connect");
+    c.open(Some("s1".into()), None).await.expect("open s1");
+    c.send("s1", "go").await.expect("send");
+    wait_live(&c, "s1", true).await;
+    let first = Meta::load(&session_dir(&dir, "s1"))
+        .expect("meta")
+        .child
+        .expect("a live child")
+        .pid;
+    let seq0 = c
+        .list()
+        .await
+        .unwrap()
+        .iter()
+        .find(|s| s.session_id == "s1")
+        .unwrap()
+        .last_seq;
+    wait_turn_settled(&c, "s1", seq0.saturating_sub(3)).await;
+
+    let ok = c
+        .tune(
+            "s1",
+            &Tuning {
+                model: Some("claude-opus-5".into()),
+                ..Tuning::default()
+            },
+        )
+        .await
+        .expect("tune model");
+    assert_eq!(ok.takes_hold, TakesHold::Now, "a model switch is live here");
+    assert_eq!(ok.info.model.as_deref(), Some("claude-opus-5"));
+    let meta = Meta::load(&session_dir(&dir, "s1")).unwrap();
+    assert_eq!(meta.tuning.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(
+        meta.child.unwrap().pid,
+        first,
+        "a live switch must not restart"
+    );
+
+    c.send("s1", "again").await.expect("send again");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = Meta::load(&session_dir(&dir, "s1"))
+        .unwrap()
+        .child
+        .unwrap()
+        .pid;
+    assert_eq!(
+        after, first,
+        "a send after a live switch restarted the agent"
+    );
+
+    // A refused id is the CLI's own sentence, and it WRITES NOTHING: the
+    // session still reports the model the CLI accepted. (Walked live
+    // 2026-09-02 before this rule existed: the rail wore `not-a-model`.)
+    let err = c
+        .tune(
+            "s1",
+            &Tuning {
+                model: Some("not-a-model".into()),
+                ..Tuning::default()
+            },
+        )
+        .await
+        .expect_err("the fake refuses this id like the CLI");
+    assert!(
+        err.to_string().contains("not a recognized model id"),
+        "{err}"
+    );
+    let listed = c.list().await.unwrap();
+    let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+    assert_eq!(
+        s1.model.as_deref(),
+        Some("claude-opus-5"),
+        "a refusal was written"
+    );
+    assert_eq!(
+        Meta::load(&session_dir(&dir, "s1"))
+            .unwrap()
+            .tuning
+            .model
+            .as_deref(),
+        Some("claude-opus-5")
+    );
+}
+
 #[tokio::test]
 async fn an_argv_only_agent_is_restarted_at_the_next_send_never_mid_turn() {
     let dir = scratch();
@@ -224,6 +319,7 @@ async fn an_argv_only_agent_is_restarted_at_the_next_send_never_mid_turn() {
         .tune(
             "s1",
             &Tuning {
+                model: None,
                 effort: Some("high".into()),
                 fast: false,
             },
@@ -267,5 +363,32 @@ async fn an_argv_only_agent_is_restarted_at_the_next_send_never_mid_turn() {
     assert_eq!(
         third, second,
         "a send with nothing changed restarted the agent"
+    );
+
+    // Slice TN2 found the restart could write a seq TWICE (the old
+    // segment's `closed` and the new segment's `user_sent`), which a
+    // later engine start quarantines as corrupt. The journal must load,
+    // count strictly upward, and put `closed` before the resumed send.
+    wait_turn_settled(&c, "s1", 0).await;
+    let loaded = eave_core::journal::load(&session_dir(&dir, "s1").join("journal.jsonl"))
+        .expect("the journal loads");
+    let seqs: Vec<u64> = loaded.records.iter().map(|r| r.seq).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[1] == w[0] + 1),
+        "seqs are not consecutive: {seqs:?}"
+    );
+    let closed_at = loaded
+        .records
+        .iter()
+        .position(|r| matches!(r.event, eave_core::journal::JournalEvent::Closed { .. }))
+        .expect("the restart closed a segment");
+    let resumed_at = loaded
+        .records
+        .iter()
+        .position(|r| matches!(&r.event, eave_core::journal::JournalEvent::UserSent { text } if text == "again"))
+        .unwrap();
+    assert!(
+        closed_at < resumed_at,
+        "closed at {closed_at}, resumed send at {resumed_at}"
     );
 }

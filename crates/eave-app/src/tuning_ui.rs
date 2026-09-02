@@ -130,14 +130,19 @@ pub fn default_for(provider_id: &str) -> Tuning {
         .map(|t| default_effort(t.levels()))
         .unwrap_or(None);
     Tuning {
+        model: None,
         effort,
         fast: false,
     }
 }
 
 /// The tuning the composer shows for a session: what the engine reports.
-pub fn of_session(effort: Option<&str>, fast: bool) -> Tuning {
+/// `model` is `SessionInfo::model`, the EFFECTIVE model (Slice TN2), so a
+/// tune built from it restates the model the session already runs under
+/// and the engine sees no change on that axis.
+pub fn of_session(model: Option<&str>, effort: Option<&str>, fast: bool) -> Tuning {
     Tuning {
+        model: model.map(str::to_string),
         effort: effort.map(str::to_string),
         fast,
     }

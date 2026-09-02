@@ -1127,6 +1127,14 @@ mod tests {
                     assert!(reason.len() > 40, "{}: effort refusal is a stub", a.id);
                 }
             }
+            match a.tuning.model {
+                crate::tuning::ModelSupport::Switch { evidence, .. } => {
+                    assert!(evidence.len() > 40, "{}: model evidence is a stub", a.id);
+                }
+                crate::tuning::ModelSupport::None { reason } => {
+                    assert!(reason.len() > 40, "{}: model refusal is a stub", a.id);
+                }
+            }
             match a.tuning.speed {
                 crate::tuning::SpeedSupport::Toggle { evidence, .. } => {
                     assert!(evidence.len() > 40, "{}: speed evidence is a stub", a.id);
@@ -1147,7 +1155,7 @@ mod tests {
     /// A source pin, because every fake agent would pass a runtime one.
     #[test]
     fn an_adapter_that_promises_next_turn_overrides_tune() {
-        use crate::tuning::{Applies, EffortSupport, SpeedSupport};
+        use crate::tuning::{Applies, EffortSupport, ModelSupport, SpeedSupport};
         let sources: &[(&str, &str)] = &[
             ("claude-code", include_str!("claude.rs")),
             ("codex", include_str!("codex.rs")),
@@ -1166,6 +1174,12 @@ mod tests {
             ) || matches!(
                 a.tuning.speed,
                 SpeedSupport::Toggle {
+                    applies: Applies::NextTurn,
+                    ..
+                }
+            ) || matches!(
+                a.tuning.model,
+                ModelSupport::Switch {
                     applies: Applies::NextTurn,
                     ..
                 }

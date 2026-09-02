@@ -561,6 +561,37 @@ fn main() {
                 match stdin.read_line(&mut line) {
                     Ok(0) | Err(_) => std::process::exit(0),
                     Ok(_) => {
+                        // Slice TN2: the real CLI answers a `set_model`
+                        // control request on the same channel, and so
+                        // does this stand-in — success for any id, so the
+                        // engine's live-switch path can be walked without
+                        // a model catalogue. Not a turn.
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if v.get("type").and_then(|t| t.as_str()) == Some("control_request")
+                                && v.pointer("/request/subtype").and_then(|s| s.as_str())
+                                    == Some("set_model")
+                            {
+                                // One id is refused, in the real CLI's
+                                // words, so the engine's refuse-before-write
+                                // rule can be walked.
+                                let model = v.pointer("/request/model").and_then(|m| m.as_str());
+                                let response = if model == Some("not-a-model") {
+                                    json!({
+                                        "subtype": "error",
+                                        "request_id": v.get("request_id").cloned().unwrap_or(json!(null)),
+                                        "error": "Model \"not-a-model\" is not a recognized model id. Run /model to see available models.",
+                                    })
+                                } else {
+                                    json!({
+                                        "subtype": "success",
+                                        "request_id": v.get("request_id").cloned().unwrap_or(json!(null)),
+                                        "response": {},
+                                    })
+                                };
+                                emit(json!({ "type": "control_response", "response": response }));
+                                continue;
+                            }
+                        }
                         emit_text("turn done, lingering on stdin");
                         emit_result();
                     }
