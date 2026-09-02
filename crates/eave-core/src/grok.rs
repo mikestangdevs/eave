@@ -40,13 +40,20 @@
 //!   "always-approve"` makes the same session run with **zero** permission
 //!   requests — the tool call is auto-resolved internally
 //!   (`pending_interaction` → `interaction_resolved`, no client round
-//!   trip). There is no CLI flag on `grok agent stdio` that forces asking
-//!   back on, so eave cannot *make* it ask.
-//! - What eave can do is **refuse to run when it is not asking**, and that
-//!   is verifiable: the session's own `_x.ai/sessions/changed` record
-//!   carries `yolo: true|false`, and it arrives before the first
-//!   `tool_call`. `yolo: true` = auto-approve = refused
-//!   ([`posture_refusal`]).
+//!   trip).
+//! - **eave now forces it back on** (Slice TN2, 2026-09-02): the
+//!   top-level `grok --permission-mode default` — documented for TUI and
+//!   headless, and measured to reach `agent stdio`: with the operator's
+//!   `always-approve` config in place, a bare spawn's
+//!   `_x.ai/sessions/changed` said `yolo: true` and the same spawn with
+//!   the flag said `yolo: false`, and the prompt still ran. The flag
+//!   goes BEFORE `agent` (it is `grok`'s, not `agent`'s), and the engine
+//!   filters any `--permission-mode` from a session's own `extra_args`,
+//!   so ambient config cannot undo it either way.
+//! - And it still **verifies**: the session's own `_x.ai/sessions/changed`
+//!   record carries `yolo: true|false` before the first `tool_call`, and
+//!   `yolo: true` is refused ([`posture_refusal`]) — a Grok that ignored
+//!   the flag would be caught, not trusted.
 //!
 //! Fail-closed by construction, exactly like Slice K: a session whose
 //! posture is never stated at all is refused at the first tool call rather
@@ -274,7 +281,17 @@ impl GrokSession {
 /// agent`, not of `stdio`. An absent model means no `-m` at all, which is
 /// not the same as an empty one (Slice P2).
 fn spawn_args(cfg: &SpawnConfig) -> Vec<String> {
-    let mut args = vec!["agent".to_string(), "--no-leader".to_string()];
+    // `--permission-mode` is `grok`'s own flag, so it precedes the
+    // subcommand. `default` is the posture that asks (the possible values
+    // are `default, acceptEdits, auto, dontAsk, bypassPermissions, plan`;
+    // `bypassPermissions` IS `--always-approve`). Measured 2026-09-02 to
+    // override `[ui] permission_mode = "always-approve"` in config.toml.
+    let mut args = vec![
+        "--permission-mode".to_string(),
+        GROK_MODE_ASKS.to_string(),
+        "agent".to_string(),
+        "--no-leader".to_string(),
+    ];
     if let Some(model) = &cfg.model {
         args.push("-m".into());
         args.push(model.clone());
@@ -327,10 +344,10 @@ impl crate::provider::AgentAdapter for GrokSession {
                    wire before the first tool call, and a session that reports `yolo: true` emits \
                    PostureRefused and is killed. Slice AV verified denial is not advisory — a \
                    denied write left the directory empty and the turn ended PermissionRejected. \
-                   NOTE: eave cannot FORCE Grok to ask (`grok agent stdio` takes no \
-                   --permission-mode), so this is verify-and-refuse, not verify-and-correct: a \
-                   machine with `permission_mode = \"always-approve\"` in ~/.grok/config.toml has \
-                   every session refused.",
+                   Since Slice TN2 (2026-09-02) this is verify-AND-correct: eave spawns \
+                   `grok --permission-mode default agent … stdio`, measured to turn a machine's \
+                   `permission_mode = \"always-approve\"` config into `yolo: false` on the wire, \
+                   and the verification stays in front of the first tool call regardless.",
     };
 
     const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
@@ -921,10 +938,12 @@ fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
             Some(SessionEvent::PostureRefused {
                 mode: GROK_MODE_YOLO.into(),
                 reason: "this Grok session auto-approves every tool call, so eave would never be \
-                         asked before it writes. The cause is ambient config — `[ui] \
-                         permission_mode = \"always-approve\"` in ~/.grok/config.toml, or \
-                         /always-approve in a previous session — and no command-line flag \
-                         overrides it back on. Clear that setting and reopen the session."
+                         asked before it writes — and it does so DESPITE eave's own \
+                         `--permission-mode default` on its argv, which is measured to \
+                         override `[ui] permission_mode = \"always-approve\"` in \
+                         ~/.grok/config.toml. Either this Grok no longer honours the flag or \
+                         something switched the session after it started (/always-approve). \
+                         Reopen the session; if it repeats, the CLI changed."
                     .into(),
             })
         }
@@ -1481,7 +1500,16 @@ mod tests {
     fn the_spawn_argv_keeps_the_work_inside_a_killable_process_group() {
         let cfg = SpawnConfig::new("/bin/grok", "/tmp/probe", "sess-1".into());
         let args = spawn_args(&cfg);
-        assert_eq!(args, vec!["agent", "--no-leader", "stdio"]);
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode",
+                "default",
+                "agent",
+                "--no-leader",
+                "stdio"
+            ]
+        );
         // The subcommand must come after the options it belongs to, or
         // clap rejects the line.
         let leader = args.iter().position(|a| a == "--no-leader").unwrap();
@@ -1511,10 +1539,21 @@ mod tests {
     #[test]
     fn the_adapter_never_asks_grok_to_auto_approve() {
         let cfg = SpawnConfig::new("/bin/grok", "/tmp/probe", "sess-1".into());
-        assert!(!spawn_args(&cfg).iter().any(|a| a == "--always-approve"));
-        assert!(!spawn_args(&cfg)
+        let args = spawn_args(&cfg);
+        assert!(!args.iter().any(|a| a == "--always-approve"));
+        // Slice TN2: the ONE permission flag eave passes is the asking
+        // posture, and it is `grok`'s flag, so it precedes `agent`.
+        let modes: Vec<usize> = args
             .iter()
-            .any(|a| a.starts_with("--permission")));
+            .enumerate()
+            .filter(|(_, a)| a.starts_with("--permission"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(modes.len(), 1, "{args:?}");
+        assert_eq!(args[modes[0]], "--permission-mode");
+        assert_eq!(args[modes[0] + 1], GROK_MODE_ASKS);
+        assert!(modes[0] < args.iter().position(|a| a == "agent").unwrap());
+        assert_ne!(GROK_MODE_ASKS, "bypassPermissions");
     }
 
     // -----------------------------------------------------------------

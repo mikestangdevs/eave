@@ -1102,9 +1102,12 @@ impl PiStream {
             // false` is Pi's refusal in Pi's words (`Model not found:
             // provider/id`, measured 2026-09-02) and lands under the
             // subtype the transcript renders; a success says nothing new.
-            Some("eave-model") | Some("eave-tune")
-                if v.get("success").and_then(Value::as_bool) == Some(false) =>
-            {
+            // The same for a refused PROMPT — walked 2026-09-02: a Pi with
+            // no credentials answers `{"command":"prompt","success":false,
+            // "error":"No API key found for the selected model.\n\nUse
+            // /login …"}` and the transcript showed NOTHING, so the
+            // operator could not know why nothing happened.
+            _ if v.get("success").and_then(Value::as_bool) == Some(false) => {
                 vec![system("error", line)]
             }
             _ => vec![system("response", line)],
