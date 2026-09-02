@@ -12867,22 +12867,11 @@ fn choosing_an_effort_level_tunes_the_selected_session(cx: &mut TestAppContext) 
     let (mut h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
     let _ = h.drain();
+    // Slice NC3: a click STEPS the level, no menu. From the CLI's own
+    // default the first step lands on Extra high.
     click(vcx, "composer-effort");
     vcx.run_until_parked();
-    drive(&h, vcx, Duration::from_millis(200));
-    // Default + Claude's five levels (low, medium, high, xhigh, max).
-    for sel in [
-        "menu-row-0",
-        "menu-row-1",
-        "menu-row-2",
-        "menu-row-3",
-        "menu-row-4",
-        "menu-row-5",
-    ] {
-        assert!(shown(vcx, sel), "{sel} is missing from the effort menu");
-    }
-    click(vcx, "menu-row-4");
-    vcx.run_until_parked();
+    assert!(!shown(vcx, "menu-row-0"), "the effort chip opened a menu");
     let cmds = h.drain();
     match cmds.as_slice() {
         [Command::Tune { id, tuning }] => {
@@ -12920,10 +12909,8 @@ fn choosing_a_level_keeps_the_fast_lane_as_it_was(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!(shown(vcx, "composer-speed-on"));
     let _ = h.drain();
+    // Slice NC3: one click up from Extra high is Max.
     click(vcx, "composer-effort");
-    vcx.run_until_parked();
-    drive(&h, vcx, Duration::from_millis(200));
-    click(vcx, "menu-row-5");
     vcx.run_until_parked();
     match h.drain().as_slice() {
         [Command::Tune { tuning, .. }] => {
@@ -12967,6 +12954,60 @@ fn the_speed_bolt_toggles_and_states_its_side(cx: &mut TestAppContext) {
 
 /// At the launcher there is no session to tune yet, so the choice rides
 /// the launch itself and lands on the session it makes.
+/// Slice NC3: a new chat starts at Extra high (the operator's default),
+/// and the launch carries it without a click.
+#[gpui::test]
+fn a_new_chat_starts_at_extra_high_effort(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    assert!(shown(vcx, "launcher"));
+    assert!(shown(vcx, "composer-effort-gauge-3"), "the launcher's gauge is not at Extra high");
+    let _ = h.drain();
+    start_chat(vcx, "hello");
+    let launch = h
+        .drain()
+        .into_iter()
+        .find_map(|c| match c {
+            Command::Launch { tuning, .. } => Some(tuning),
+            _ => None,
+        })
+        .expect("no launch went out");
+    assert_eq!(launch.effort.as_deref(), Some("xhigh"));
+    assert!(!launch.fast);
+}
+
+/// Slice NC3 — the operator's report, verbatim: *"when i open a new tab
+/// the chat pops up then opens the search bar like it should but the
+/// screen instantly goes blank."* The engine's ⌘T tab arrives as CEF
+/// left it: at `about:blank`, one history entry. That tab is blank, the
+/// launcher stays, and no page is drawn under it.
+#[gpui::test]
+fn a_tab_the_engine_reports_at_about_blank_is_still_the_launcher(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let mut fresh = page_tab("blank", Some("about:blank"), None);
+    fresh.history_len = 1;
+    strip_tabs(
+        &h,
+        vcx,
+        vec![fresh, session_tab("aaaa1111")],
+        Some("blank"),
+    );
+    assert!(shown(vcx, "launcher"), "CEF's about:blank commit hid the launcher");
+    assert!(shown(vcx, "composer-hint"));
+    assert!(!shown(vcx, "page-absence"));
+
+    // Asked to go somewhere, it is a page again.
+    let mut going = page_tab("blank", Some("about:blank"), None);
+    going.history_len = 1;
+    going.pending = Some(eave_core::browser::tabs::PendingNav {
+        url: "https://docs.rs/".into(),
+        seq: 1,
+        delta: None,
+    });
+    strip_tabs(&h, vcx, vec![going, session_tab("aaaa1111")], Some("blank"));
+    assert!(!shown(vcx, "launcher"), "a navigating tab kept the launcher");
+}
+
 #[gpui::test]
 fn a_launch_carries_the_tuning_chosen_before_it(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);

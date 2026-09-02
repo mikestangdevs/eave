@@ -7469,9 +7469,6 @@ struct Shell {
     mention: MentionPalette,
     /// Access / runtime-mode menu, anchored on the composer chip.
     access: Popup<Point<Pixels>>,
-    /// Slice TN1 — the effort-level menu, anchored on the composer's
-    /// effort chip. The speed chip is a toggle and has no popup.
-    effort_menu: Popup<Point<Pixels>>,
     /// MonoCode model picker — tab, search, favorites. The popup's
     /// open/close/motion is still `launcher.models`.
     model_picker: model_picker::State,
@@ -7910,7 +7907,7 @@ impl Default for LauncherUi {
         Self {
             provider,
             models: Popup::default(),
-            tuning: Tuning::default(),
+            tuning: tuning_ui::default_for(PROVIDERS[provider].id),
             // Slice S2: open on the stored default for the default
             // provider — pre-selected into the picker, never filled in
             // behind it (see `Shell::launch`).
@@ -9775,9 +9772,6 @@ impl Shell {
     }
 
     fn open_access_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.effort_menu.is_open() {
-            self.close_effort_menu(cx);
-        }
         let now = cx.background_executor().now();
         self.access
             .open(at, vec![true; access::MODES.len()], now);
@@ -9837,7 +9831,10 @@ impl Shell {
     /// session's (by id), or at the launcher the choice-in-progress. The
     /// same split `choose_entry` makes for the model.
     fn tuning_target(&self, cx: &App) -> (String, Option<String>, Tuning) {
-        if self.transcript.read(cx).session_id.is_some() {
+        // Slice NC3: `at_launcher`, not "is a session subscribed" — behind
+        // a blank ⌘T tab one still is, and the chips there are the NEXT
+        // chat's (the same rule `chip_agent` and `picker_target` keep).
+        if !self.at_launcher(cx) {
             if let Some(info) = self.selected_session(cx) {
                 return (
                     info.provider.clone(),
@@ -9868,108 +9865,25 @@ impl Shell {
         let (_, _, mut tuning) = self.tuning_target(cx);
         tuning.effort = level;
         self.apply_tuning(tuning, cx);
-        self.close_effort_menu(cx);
+    }
+
+    /// A click on the effort chip (Slice NC3): step the level. The menu it
+    /// replaced (`effort_layer`, `effort_menu_pick`) is gone — the
+    /// operator: *"effort shouldnt be a menu. it should default to extra
+    /// and be toggleable by click"*. See [`tuning_ui::next_level`].
+    fn cycle_effort(&mut self, cx: &mut Context<Self>) {
+        let (provider, _, tuning) = self.tuning_target(cx);
+        let levels = eave_core::provider::tuning_support(&provider)
+            .map(|t| t.levels())
+            .unwrap_or(&[]);
+        let next = tuning_ui::next_level(levels, tuning.effort.as_deref());
+        self.set_effort(next, cx);
     }
 
     fn toggle_fast(&mut self, cx: &mut Context<Self>) {
         let (_, _, mut tuning) = self.tuning_target(cx);
         tuning.fast = !tuning.fast;
         self.apply_tuning(tuning, cx);
-    }
-
-    fn open_effort_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.access.is_open() {
-            self.close_access_menu(cx);
-        }
-        let (provider, _, _) = self.tuning_target(cx);
-        let rows = eave_core::provider::tuning_support(&provider)
-            .map(|t| t.levels().len() + 1)
-            .unwrap_or(1);
-        // The chip sits on the composer at the bottom of the well, so the
-        // menu opens UPWARD: the shared layer anchors top-left and snaps
-        // into the window, and six rows dropped from here were pinned to
-        // the bottom margin over the composer (seen live 2026-09-02).
-        // Lift by the menu's own height PLUS the chip's half-height and
-        // the anchor gap: `at` is the pointer on the chip, and a menu
-        // whose bottom row ends exactly there put "Max" under the second
-        // click of a double-click (seen live 2026-09-02 — the session
-        // came up on Max). The snap still guards the top.
-        let lift = rows as f32 * theme::MENU_ROW_H
-            + theme::MENU_PAD_Y * 2.0
-            + theme::CONTROL_H / 2.0
-            + theme::MENU_ANCHOR_GAP
-            + 2.0;
-        let now = cx.background_executor().now();
-        self.effort_menu
-            .open(point(at.x, at.y - px(lift)), vec![true; rows], now);
-        cx.notify();
-    }
-
-    fn close_effort_menu(&mut self, cx: &mut Context<Self>) {
-        let now = cx.background_executor().now();
-        if self.effort_menu.begin_close(now, cx.reduce_motion()) {
-            overlay::reap(cx, |shell, cx| {
-                let now = cx.background_executor().now();
-                shell.effort_menu.finish_close(now);
-            });
-        }
-        cx.notify();
-    }
-
-    /// The effort menu: *Default*, then the CLI's own levels lowest
-    /// first, each with the CLI's word as its detail so the flag that
-    /// will be passed is never hidden. The current row wears the check.
-    fn effort_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let anchor = *self.effort_menu.data()?;
-        let now = cx.background_executor().now();
-        let reduced = cx.reduce_motion();
-        let live = self.effort_menu.is_open();
-        let highlighted = self.effort_menu.highlighted();
-        let (provider, _, tuning) = self.tuning_target(cx);
-        let levels = eave_core::provider::tuning_support(&provider)
-            .map(|t| t.levels())
-            .unwrap_or(&[]);
-        let rows = tuning_ui::effort_rows(levels, tuning.effort.as_deref())
-            .into_iter()
-            .enumerate()
-            .map(|(ix, row)| {
-                let mut item = MenuItem::new(row.label.clone()).detail(row.detail.clone());
-                if row.current {
-                    item = item.trailing("✓");
-                }
-                let level = row.level.map(str::to_string);
-                overlay::menu_row(
-                    ix,
-                    &item,
-                    highlighted == Some(ix),
-                    live,
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_effort(level.clone(), cx);
-                    }),
-                )
-            })
-            .collect::<Vec<_>>();
-        overlay::menu_layer(
-            &self.effort_menu,
-            anchor,
-            now,
-            reduced,
-            rows,
-            cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_effort_menu(cx)),
-        )
-    }
-
-    /// The row a highlighted effort-menu key picks: row 0 is Default.
-    fn effort_menu_pick(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let (provider, _, _) = self.tuning_target(cx);
-        let levels = eave_core::provider::tuning_support(&provider)
-            .map(|t| t.levels())
-            .unwrap_or(&[]);
-        let level = match ix {
-            0 => None,
-            n => levels.get(n - 1).map(|l| (*l).to_string()),
-        };
-        self.set_effort(level, cx);
     }
 
     /// The two chips, for what `provider` can actually do — an effort
@@ -10035,12 +9949,8 @@ impl Shell {
                     .gap(px(theme::CONTROL_GAP))
                     .hover_fade("composer-effort", theme::wash_rest(), theme::overlay())
                     .cursor_pointer()
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        let at = window.mouse_position();
-                        this.open_effort_menu(
-                            point(at.x, at.y - px(theme::MENU_ANCHOR_GAP)),
-                            cx,
-                        );
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.cycle_effort(cx);
                     }))
                     .child(gauge)
                     .child(
@@ -11315,25 +11225,6 @@ impl Shell {
                         }
                     }
                     None => self.close_access_menu(cx),
-                },
-                _ => {}
-            }
-            return;
-        }
-        if self.effort_menu.is_open() {
-            match ks.key.as_str() {
-                "escape" => self.close_effort_menu(cx),
-                "down" => {
-                    self.effort_menu.highlight_next();
-                    cx.notify();
-                }
-                "up" => {
-                    self.effort_menu.highlight_prev();
-                    cx.notify();
-                }
-                "enter" => match self.effort_menu.highlighted() {
-                    Some(ix) => self.effort_menu_pick(ix, cx),
-                    None => self.close_effort_menu(cx),
                 },
                 _ => {}
             }
@@ -25508,9 +25399,6 @@ impl Shell {
         if self.access.is_open() {
             self.close_access_menu(cx);
         }
-        if self.effort_menu.is_open() {
-            self.close_effort_menu(cx);
-        }
         let now = cx.background_executor().now();
         let current_ix = self.picker_provider_ix(cx);
         if let Some(path) = Self::picker_store_path() {
@@ -25699,6 +25587,8 @@ impl Shell {
     fn pick_provider(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.launcher.provider != ix {
             self.launcher.provider = ix;
+            // Slice NC3: the effort default is the new provider's.
+            self.launcher.tuning = tuning_ui::default_for(PROVIDERS[ix].id);
             // Slice S2: the cleared picker opens on the NEW provider's
             // stored default (visible, overridable) rather than bare
             // None — carrying the old provider's model across would send
@@ -26965,6 +26855,11 @@ impl Render for Shell {
         let blank_page = active_is_page
             && showing_split.is_none()
             && strip::active_is_blank_page(&strip_snapshot);
+        // Slice NC3: a blank tab's page is CEF's white `about:blank`, and
+        // the launcher is an overlay with no plate of its own — mounted,
+        // the page showed through around the cluster. A tab that has been
+        // nowhere has nothing to draw; the launcher is the well.
+        let page_el = page_el.filter(|_| !blank_page);
         // What the well says when a page tab is active and nothing can draw
         // it. Two different absences, and only one of them is eave's fault.
         let page_absence: Option<&'static str> = if blank_page {
@@ -27773,7 +27668,6 @@ impl Render for Shell {
         // split/well branch.
         let launcher_menu = self.launcher_menu_layer(cx);
         let access_layer = self.access_layer(cx);
-        let effort_layer = self.effort_layer(cx);
         // Built here for the same reason the launcher and its menu are:
         // it needs `self` and `cx`, and the element chain below has
         // neither to spare. Slash and `@` never share a frame.
@@ -28425,7 +28319,6 @@ impl Render for Shell {
             // surface and the demo is a test fixture.
             .children(launcher_menu)
             .children(access_layer)
-            .children(effort_layer)
             // Slice E1. Root-mounted for the reason `overlay::menu_layer`
             // gives: `deferred` fixes paint order but layout stays where it
             // is written, and this menu opens over a region that also holds
@@ -29985,7 +29878,6 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         slash: SlashPalette::default(),
                         mention: MentionPalette::default(),
                         access: Popup::default(),
-                        effort_menu: Popup::default(),
                         model_picker: model_picker::State::default(),
                         mention_files: HashMap::new(),
                         mention_loading: false,

@@ -96,36 +96,43 @@ pub fn gauge_fill(levels: &[&str], level: Option<&str>) -> usize {
     spread.clamp(1, GAUGE_BARS - 1)
 }
 
-/// One row of the effort menu.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffortRow {
-    /// `None` is the *Default* row.
-    pub level: Option<&'static str>,
-    pub label: String,
-    /// The CLI's own word, shown beside the label so the flag is never
-    /// hidden; empty for the Default row.
-    pub detail: String,
-    pub current: bool,
+/// The level a NEW chat starts at. The operator's call (2026-09-02):
+/// *"it should default to extra"* — `xhigh` wherever the provider offers
+/// it; otherwise the provider's own default (`None`, pass nothing), never
+/// a guess at a neighbouring level a particular model may refuse.
+pub fn default_effort(levels: &[&'static str]) -> Option<String> {
+    levels.contains(&"xhigh").then(|| "xhigh".to_string())
 }
 
-/// The rows the effort menu offers for a provider: Default first, then
-/// the CLI's levels lowest first. Exactly one row is `current`.
-pub fn effort_rows(levels: &[&'static str], current: Option<&str>) -> Vec<EffortRow> {
-    let mut rows = vec![EffortRow {
-        level: None,
-        label: "Default".into(),
-        detail: "the CLI's own".into(),
-        current: current.is_none(),
-    }];
-    for l in levels {
-        rows.push(EffortRow {
-            level: Some(l),
-            label: level_label(l),
-            detail: (*l).to_string(),
-            current: current == Some(*l),
-        });
+/// What a click on the effort chip does (Slice NC3): it STEPS the level.
+/// Not a menu — *"effort shouldnt be a menu. it should default to extra
+/// and be toggleable by click"*. From the provider's default it lands on
+/// [`default_effort`] (the top level when there is no `xhigh`); from a
+/// level it goes one up, and past the top it wraps to the lowest.
+pub fn next_level(levels: &[&'static str], current: Option<&str>) -> Option<String> {
+    if levels.is_empty() {
+        return None;
     }
-    rows
+    let Some(current) = current else {
+        return default_effort(levels).or_else(|| levels.last().map(|l| (*l).to_string()));
+    };
+    let ix = levels.iter().position(|l| *l == current);
+    let next = match ix {
+        Some(i) => levels[(i + 1) % levels.len()],
+        None => levels[0],
+    };
+    Some(next.to_string())
+}
+
+/// A new chat's tuning for `provider_id`: the default effort, no fast lane.
+pub fn default_for(provider_id: &str) -> Tuning {
+    let effort = eave_core::provider::tuning_support(provider_id)
+        .map(|t| default_effort(t.levels()))
+        .unwrap_or(None);
+    Tuning {
+        effort,
+        fast: false,
+    }
 }
 
 /// The tuning the composer shows for a session: what the engine reports.
@@ -172,13 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_leads_with_default_and_marks_exactly_one_row() {
-        let rows = effort_rows(&["low", "high"], Some("high"));
-        assert_eq!(rows[0].label, "Default");
-        assert_eq!(rows.iter().filter(|r| r.current).count(), 1);
-        assert!(rows[2].current);
-        assert_eq!(rows[2].detail, "high");
-        let none = effort_rows(&["low"], None);
-        assert!(none[0].current);
+    fn a_click_steps_the_level_and_a_new_chat_starts_at_extra_high() {
+        let claude = ["low", "medium", "high", "xhigh", "max"];
+        assert_eq!(default_effort(&claude).as_deref(), Some("xhigh"));
+        assert_eq!(next_level(&claude, None).as_deref(), Some("xhigh"));
+        assert_eq!(next_level(&claude, Some("xhigh")).as_deref(), Some("max"));
+        assert_eq!(next_level(&claude, Some("max")).as_deref(), Some("low"));
+        let short = ["low", "high"];
+        assert_eq!(default_effort(&short), None, "no xhigh: the CLI's own default");
+        assert_eq!(next_level(&short, None).as_deref(), Some("high"));
+        assert_eq!(next_level(&short, Some("nope")).as_deref(), Some("low"));
+        assert_eq!(next_level(&[], None), None);
     }
 }

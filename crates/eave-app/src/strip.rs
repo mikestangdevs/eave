@@ -609,6 +609,16 @@ pub fn active_is_page(snapshot: &TabsSnapshot) -> bool {
 /// the tab that has been asked to go somewhere and not yet arrived, which
 /// is emphatically not blank; and `history_len` is what tells a fresh tab
 /// from one the operator navigated back off the front of.
+///
+/// **`about:blank` with one history entry is blank too (Slice NC3).** The
+/// live engine never keeps `url: None` on a ⌘T tab: CEF creates the
+/// browser at `about:blank`, `on_load_start` reports it as a commit, and
+/// the tab arrives with a url and `history_len == 1`. The harness modelled
+/// the blank tab as `url: None` and the rule matched only that, so the
+/// launcher showed for one snapshot and then gave the well to a white
+/// `about:blank` — the operator's *"the screen instantly goes blank"*.
+/// A tab navigated back onto `about:blank` has two entries and is not
+/// blank; a tab asked to go somewhere is `pending` and is not blank.
 pub fn active_is_blank_page(snapshot: &TabsSnapshot) -> bool {
     let Some(active) = snapshot.active.as_deref() else {
         return false;
@@ -616,9 +626,12 @@ pub fn active_is_blank_page(snapshot: &TabsSnapshot) -> bool {
     snapshot.tabs.iter().any(|t| {
         t.id == active
             && matches!(t.content, TabContent::Page)
-            && t.url.is_none()
             && t.pending.is_none()
-            && t.history_len == 0
+            && match t.url.as_deref() {
+                None => t.history_len == 0,
+                Some("about:blank") => t.history_len <= 1,
+                Some(_) => false,
+            }
     })
 }
 
