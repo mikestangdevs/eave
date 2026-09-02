@@ -21853,6 +21853,48 @@ fn pages_with_nothing_loose_is_the_new_tab_pill_alone(cx: &mut TestAppContext) {
     );
 }
 
+/// Slice SP1 — the `+ New Tab` pill is the head of PAGES, above every
+/// page row, and stays there however many pages there are: the operator
+/// found it "pushed down" one row per tab. ⌘T opens at index 0, so the
+/// newest page is the row right under it (the plumbing's `NewTab` arm
+/// sends `TabOpen { index: Some(0) }`; the harness sees the command, not
+/// the request, and folds no engine — so the placement is the engine's
+/// `place` test's to prove and this one pins the pill and the ask).
+#[gpui::test]
+fn the_new_tab_pill_heads_pages_and_a_new_page_lands_under_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ],
+        Some("p1"),
+    );
+    let divider = vcx.debug_bounds("tabs-divider").expect("divider");
+    let pill = vcx.debug_bounds("tab-new").expect("pill");
+    let first = vcx.debug_bounds("tab-p1").expect("tab-p1");
+    let last = vcx.debug_bounds("tab-p3").expect("tab-p3");
+    assert!(
+        divider.origin.y < pill.origin.y && pill.origin.y < first.origin.y,
+        "the pill must sit between the divider and the first page: divider {divider:?} pill {pill:?} first {first:?}"
+    );
+    assert!(
+        last.origin.y > pill.origin.y,
+        "three pages pushed the pill below them: pill {pill:?} last {last:?}"
+    );
+    h.drain();
+    click(vcx, "tab-new");
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
+        "the pill did not ask for a tab: {cmds:?}"
+    );
+}
+
 /// ⌘T files a new page into the selected task's group, and loosely —
 /// into PAGES — when a loose page is what is active (Slice ID2b, ID2b′).
 /// Where a page lands follows the one Frame decision.

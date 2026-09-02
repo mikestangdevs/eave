@@ -16358,8 +16358,8 @@ impl Shell {
     /// The half of D1's vertical strip that was never a project: a page
     /// with no task is a first-class row here, Arc-shaped, draggable, at
     /// the same rank a chat has in the tree below. No header — the divider
-    /// above and the standing `+ New Tab` pill below are its edges, the
-    /// shape the HEAD Tabs zone had — and no collapse, no filter and no
+    /// and the standing `+ New Tab` pill are its head (the pill FIRST, so
+    /// a growing list never pushes it down; SP1) — and no collapse, no filter and no
     /// window can hide it: it holds no session, so every rule written for
     /// session rows is one it is exempt from. With nothing loose it is the
     /// pill alone (sign-off answer 5): hiding the zone would hide the
@@ -16387,8 +16387,9 @@ impl Shell {
             match snapshot.active.as_deref() {
                 Some(active) if been.as_deref() != Some(active) => {
                     if let Some(ix) = active_row {
-                        // `+ 1`: the divider is this box's first item.
-                        self.tabs_scroll.scroll_to_item(ix + 1);
+                        // `+ 2`: the divider and the New Tab pill are
+                        // this box's first two items.
+                        self.tabs_scroll.scroll_to_item(ix + 2);
                         *been = Some(active.to_string());
                     }
                 }
@@ -16418,8 +16419,12 @@ impl Shell {
             .flex_col()
             .gap(px(theme::RAIL_ROW_GAP))
             .child(self.zone_rule("tabs-divider"))
-            .children(tab_rows)
+            // The pill is the section's FIRST row, and ⌘T opens at index
+            // 0 right under it (Slice SP1, operator: "a new tab needs to
+            // stay at the top of the section not pushed down"). Below the
+            // rows it sank one row per tab; Arc keeps it at the head too.
             .child(self.new_tab_row(cx))
+            .children(tab_rows)
             .into_any_element()
     }
 
