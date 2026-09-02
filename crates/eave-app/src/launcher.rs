@@ -84,12 +84,7 @@
 //! probe is never allowed to hold a frame and so a frame has to be able
 //! to admit it is showing yesterday's answer.
 
-use gpui::{
-    div, px, AnyElement, App, ClickEvent, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window,
-};
-
-use crate::{icons, theme};
+use crate::icons;
 
 /// One agent eave knows how to name, and the things only a UI needs to
 /// know about it. Whether eave can *run* it is not a field here — see
@@ -321,108 +316,10 @@ pub fn model_source_note(p: &Provider) -> Option<String> {
     }
 }
 
-/// One provider tile.
-///
-/// **A dead tile still occludes and still has a hitbox.** It takes no
-/// handler, so a click on it does nothing at all — which is the point:
-/// "does nothing" is a clearer answer than "falls through to whatever is
-/// behind me". Same treatment P1 gave a disabled menu row, same
-/// [`theme::DISABLED_OPACITY`].
-///
-/// The caption is [`eave_core::provider::Availability::tile_status`] —
-/// the state read off the registry at draw time, not a string chosen
-/// here. A provider eave can drive but whose CLI is absent reads *not
-/// installed* and stays live to the click; see the module doc for why
-/// that split falls where it does.
-pub fn tile(
-    ix: usize,
-    p: &Provider,
-    selected: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    // Two different questions, and the tile answers both. `live` is
-    // eave's capability and decides the click; `status` is this machine's
-    // and decides the caption.
-    let live = eave_can_drive(p);
-    let status = availability(p).tile_status();
-    // The mark's colour is a required argument (`icons::icon`) — gpui does
-    // not cascade text colour into an SVG, so a tile that forgets this
-    // lays out a perfectly correct 28px box and paints nothing.
-    let mark_color = if !live {
-        theme::text_tertiary()
-    } else if p.id == "claude-code" {
-        // The one mark with a sourced brand colour. The other five render
-        // in eave's own text colour rather than a hex I invented.
-        icons::claude_brand()
-    } else {
-        theme::text()
-    };
-    let body = div()
-        .id(("provider-tile", ix))
-        .debug_selector(move || format!("provider-tile-{ix}"))
-        .w(px(theme::TILE_W))
-        .h(px(theme::TILE_H))
-        .rounded(px(theme::RADIUS_TILE))
-        .border_1()
-        // Slice AL tried the accent here and put it back. A chosen tile is
-        // a SELECTION — where you are, not where you are acting — and the
-        // accent's rule (see `theme::accent`) does not care that this
-        // particular selection happens to be short-lived. The rim stays
-        // neutral and the tile's own wash carries the state.
-        .border_color(if selected {
-            theme::border_strong()
-        } else {
-            theme::border()
-        })
-        .bg(if selected {
-            theme::overlay()
-        } else {
-            theme::wash_rest()
-        })
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(theme::SPACE_2))
-        .child(icons::icon(p.mark, theme::ICON_MARK_LG, mark_color))
-        .child(
-            div()
-                .text_size(px(theme::DETAIL_SIZE))
-                .line_height(px(theme::DETAIL_LINE))
-                .text_color(if live {
-                    theme::text()
-                } else {
-                    theme::text_tertiary()
-                })
-                .child(p.name),
-        )
-        .child(
-            div()
-                .text_size(px(theme::MICRO_SIZE))
-                .line_height(px(theme::MICRO_LINE))
-                .text_color(theme::text_tertiary())
-                .child(status),
-        );
-
-    if live {
-        body.cursor_pointer().on_click(on_click).into_any_element()
-    } else {
-        // No handler, and dimmed by TOKEN rather than by opacity. The
-        // container multiply used to live here and it could not work: over
-        // the glass ground it took the tile's name from 2.72:1 to **1.54:1**
-        // and its caption to 1.28:1, on the six tiles that are the first
-        // thing anyone sees. It was not a bad constant — pure white through
-        // the same multiply only reaches 3.11:1, so no tier could have
-        // survived it (`a_container_opacity_cannot_express_disabled`).
-        //
-        // The relationship the old comment wanted is kept by the tokens
-        // themselves: a dead tile already picks `text_tertiary` for its
-        // name and its mark where a live one picks `text`, which is the
-        // whole distinction, and it still has no pointer and still says
-        // "no adapter yet".
-        body.into_any_element()
-    }
-}
+/// Slice NC1 removed the tile grid: the launcher is a chat, and the agent
+/// is chosen from the composer's model chip (the picker spans providers).
+/// The registry facts the tiles read — [`availability`], [`eave_can_drive`]
+/// — are still what gates a pick.
 
 #[cfg(test)]
 mod tests {

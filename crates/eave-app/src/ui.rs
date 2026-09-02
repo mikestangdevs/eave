@@ -383,6 +383,15 @@ enum Command {
         /// posture gate refuses anything smuggled that it would refuse
         /// from any other caller.
         extra_args: Vec<String>,
+        /// The first message, when the session was started by SENDING
+        /// (Slice NC1 — ⌘T is a chat). Delivered by the connection loop
+        /// the moment the open succeeds, on the same connection, before
+        /// the session is subscribed; on a refused open it goes nowhere,
+        /// and the refusal is stated on the launcher as before. Carried
+        /// here and not as a trailing `Command::Send` because the rest
+        /// loop DROPS `Send` — a refused launch would have handed the
+        /// words to whichever session opened next.
+        prompt: Option<(String, Vec<PathBuf>)>,
     },
     /// Files-rail basis toggle (Slice AA): re-open the `files`
     /// subscription against the other basis. It is a resubscribe, not a
@@ -1402,6 +1411,7 @@ async fn feed_loop(
                                 model,
                                 cwd,
                                 extra_args,
+                                prompt,
                             }) => {
                                 let agent = AgentConfig {
                                     provider: Some(provider),
@@ -1411,6 +1421,20 @@ async fn feed_loop(
                                 };
                                 match client.open_with_agent(None, cwd, Some(agent)).await {
                                     Ok(info) => {
+                                        // Slice NC1: the words that started
+                                        // the chat go first, before the
+                                        // subscription — the replay then
+                                        // shows them as the first row, the
+                                        // same as any send.
+                                        if let Some((text, images)) = prompt {
+                                            if client
+                                                .send_parts(&info.session_id, &text, &images)
+                                                .await
+                                                .is_err()
+                                            {
+                                                continue 'conn;
+                                            }
+                                        }
                                         at_launcher = false;
                                         selected = Some(info.session_id);
                                         continue 'session;
@@ -3389,15 +3413,6 @@ fn row_marks(info: &SessionInfo) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-/// Quiet first line of a session card: provider, plus the model when one
-/// was configured. The title stays the hero on the line below.
-fn provider_kicker(info: &SessionInfo, provider_label: &str) -> String {
-    match info.model.as_deref().filter(|m| !m.is_empty()) {
-        Some(model) => model_picker::display_name(&info.provider, model),
-        None => provider_label.to_string(),
-    }
-}
-
 /// Branch when the session has a worktree (`repo/branch`); otherwise the
 /// home-relative cwd. Replaces stacking a files list under the sessions.
 ///
@@ -4106,6 +4121,14 @@ const ROW_ACTION_HIT: f32 = 24.0;
 /// every rail width test measures the room it measured before. Inset from
 /// the pill's corners rather than run to them, or `RADIUS_SELECT` would
 /// clip it into two stubs.
+/// The provider's mark on a session row (Slice NC2): a plain glyph on
+/// the TITLE line, `text_secondary` ink, no plate. The 18 px plated chip
+/// was the metadata line's; a mark that sits beside 12.5 px text is a
+/// label for the name and takes what a status glyph takes. The same slot
+/// width carries the location line's glyph, so the two lines' text
+/// aligns.
+const ROW_PROVIDER_MARK: f32 = 12.0;
+
 const ROW_MARK_W: f32 = 2.0;
 
 /// Slice AO — the ceiling on the marks group at the end of line two.
@@ -7098,7 +7121,6 @@ enum TabMenuAction {
     MemoryFact,
     /// The `+` menu's launcher row — `Command::NewSession`, the same
     /// route `+ new` takes.
-    NewSessionRow,
     /// The `+` menu's project row — the same folder picker as the
     /// projects zone's own `+` ([`Shell::pick_project`]).
     NewProjectRow,
@@ -8503,6 +8525,42 @@ const DIFF_CONTEXT: usize = 2;
 impl Shell {
     /// Send the composer draft (enter key and send button share this).
     fn send_current(&mut self, cx: &mut Context<Self>) {
+        // Slice NC1 — at the launcher there is no session to hold for
+        // and none to send to: the send IS the start. A session still
+        // subscribed behind a blank ⌘T tab is deselected first, because
+        // the session loop drops `Launch` (see its arm) and the words
+        // must not land in the chat you just left.
+        if self.at_launcher(cx) {
+            let (text, files) = self.composer.update(cx, |c, cx| {
+                let text = c.field.read(cx).content().to_string();
+                let files = std::mem::take(&mut c.attachments);
+                (text, files)
+            });
+            let mentions: Vec<String> = files.iter().map(|f| f.mention.clone()).collect();
+            let Some(body) = attach::compose_send(&text, &mentions) else {
+                self.composer.update(cx, |c, _| c.attachments = files);
+                return;
+            };
+            self.composer.update(cx, |c, cx| {
+                c.field.update(cx, |f, cx| f.clear(cx));
+                c.overflow = 0;
+                cx.notify();
+            });
+            let images: Vec<PathBuf> = files
+                .iter()
+                .filter_map(|f| f.image_send_path().map(Path::to_path_buf))
+                .collect();
+            if self.transcript.read(cx).session_id.is_some() {
+                self.new_session();
+            }
+            self.transcript.update(cx, |t, _| {
+                t.scroll = ScrollMode::PinOnNextUserRow;
+            });
+            self.launch_with(Some((body, images)), cx);
+            self.sync_slash_palette(cx);
+            self.sync_mention_palette(cx);
+            return;
+        }
         let held = self.send_is_held(cx);
         let (text, files) = self.composer.update(cx, |c, cx| {
             let text = c.field.read(cx).content().to_string();
@@ -11203,7 +11261,12 @@ impl Shell {
         //
         // Ahead of the caret-anchor reset for the same reason as the
         // overlay gates: nobody is typing in a composer that is not there.
-        if self.transcript.read(cx).session_id.is_none() {
+        //
+        // Slice NC1 lifts the gate for the launcher itself: it hosts the
+        // composer now, so typing there is typing into a field that is on
+        // screen and Return is the start. What stays gated is a well with
+        // no session AND no composer — a page or the diff has it.
+        if self.transcript.read(cx).session_id.is_none() && !self.composer_reachable(cx) {
             // The friction log survives, on ⌘⇧L since Slice C5 moved it
             // off ⌘L for the omnibox. It stamps the MOMENT, not a session,
             // and it already states "no session" when there is none — the
@@ -12897,6 +12960,30 @@ impl Shell {
     }
 
     // ── Slice C5: the omnibox ──────────────────────────────────────────
+
+    /// Slice NC1 — whether the well is the launcher's: nothing
+    /// subscribed, or a blank ⌘T tab on screen (T1's rule, which paints
+    /// the launcher over a page that has never been anywhere). The
+    /// render's `show_launcher` is this same fact read off the frame.
+    fn at_launcher(&self, cx: &App) -> bool {
+        let snapshot = self.strip_snapshot(cx);
+        let blank = self.showing_split(&snapshot).is_none()
+            && strip::active_is_blank_page(&snapshot);
+        self.transcript.read(cx).session_id.is_none() || blank
+    }
+
+    /// Whether a keystroke has a composer to land in (Slice NC1): the
+    /// launcher hosts one now, so "no session" alone no longer means
+    /// "nothing to type into" — only a well a page or the diff has taken
+    /// does.
+    fn composer_reachable(&self, cx: &App) -> bool {
+        let snapshot = self.strip_snapshot(cx);
+        let frame = self.frame_for(&snapshot, None, cx);
+        let split = self.showing_split(&snapshot).is_some();
+        let well_taken = split || frame.active_is_page() || frame.showing_diff();
+        let blank = !split && strip::active_is_blank_page(&snapshot);
+        !well_taken || blank
+    }
 
     /// Whether the omnibox is up and owning the keyboard.
     fn omnibox_open(&self) -> bool {
@@ -14799,16 +14886,22 @@ impl Shell {
         if strip::active_is_page(&strip_snapshot) && !strip::active_is_blank_page(&strip_snapshot) {
             return None;
         }
-        // The composer is mounted with a session and not before, and that
-        // is what keeps N4's idle floor reachable: a window sitting at the
-        // launcher has no field, so it takes no lease and schedules
-        // nothing. The floor was never about carets — it is about a window
-        // nobody is typing into.
-        self.transcript
-            .read(cx)
-            .session_id
-            .is_some()
-            .then_some(Field::Composer)
+        // A menu or an ask over the shell owns the keys (the same list
+        // `sync_composer_focus` reads), so the composer under it takes no
+        // caret and no lease — a caret blinking under a menu is a lie
+        // about where the next key goes. Slice NC1 made this visible: the
+        // launcher's composer sat under the overlay demo's menu.
+        if self.chrome_holds_keyboard(cx) {
+            return None;
+        }
+        // The composer is mounted with a session, and (Slice NC1) at the
+        // launcher, which hosts it. N4's idle floor is still reachable —
+        // a window whose well a page or the diff has taken has no field,
+        // takes no lease and schedules nothing. The floor was never about
+        // carets; it is about a window nobody is typing into, and a
+        // launcher is a field waiting for its first words, the same as an
+        // empty session.
+        self.composer_reachable(cx).then_some(Field::Composer)
     }
 
     /// Is `field`'s caret drawn this frame? (inventory §1.20 — 500 ms
@@ -18487,14 +18580,13 @@ impl Shell {
                 // Slice AG2 #12 — staged for a bulk act, which is a
                 // different fact from being the row you are looking at.
                 let is_marked = self.rail_marked.contains(&info.session_id);
-                let (glyph, provider_label) = provider_identity(&info.provider);
+                let (glyph, _) = provider_identity(&info.provider);
                 // Slice ID2a — the TASK is the row's identity and the
                 // provider is its metadata. The name comes from the one
                 // resolver every surface uses (`Shell::row_name`), so the
                 // rail, the strip and the breadcrumb cannot call one
                 // session three things.
                 let (label, name_kind) = self.row_name(&info);
-                let kicker = provider_kicker(&info, &provider_label);
                 // ID2b′ (sign-off answer 1): under a TASK header the row is
                 // two lines. The task row already states the checkout and
                 // the branch, and restating it per chat is the redundancy
@@ -18722,13 +18814,79 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(theme::SPACE_1))
+                    // Slice NC2 — TWO lines: title, then location. The
+                    // metadata line that carried the state dot, the
+                    // plated provider chip and the model kicker was the
+                    // operator's *"entire pointless line for the provider
+                    // logos"*; its facts moved up: the dot to the strip
+                    // column (where D3 drew it), the mark beside the name
+                    // as a plain glyph, and the stat to the corner beside
+                    // the age, which is where AG2 #11 had already put it
+                    // in spirit. The dot cell is `STATE_DOT` wide and the
+                    // gap is `SPACE_2`, which is exactly `meta_indent`
+                    // (`RAIL_STRIP_W`), so the location line's `pl` lands
+                    // its glyph under the mark and its text under the name.
                     .child(
                         div()
-                            .pl(px(meta_indent))
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_2()
+                            .gap(px(theme::SPACE_2))
+                            .child(
+                                div()
+                                    .w(px(theme::STATE_DOT))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        // Slice N3: a running session's dot
+                                        // works; every other state keeps
+                                        // the solid dot it has always had.
+                                        loaders::work_dot(
+                                            theme::STATE_DOT,
+                                            dot,
+                                            phase.filter(|_| info.state == "running"),
+                                        )
+                                        .flex_none(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(ROW_PROVIDER_MARK))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(match provider_mark(&info.provider) {
+                                        // Slice AO's own mark, Slice NC2's
+                                        // ink: `text_secondary`, not the
+                                        // brand. The plate existed to lift
+                                        // `claude_brand` over the non-text
+                                        // floor on a washed row; a
+                                        // text-ink glyph clears it on its
+                                        // own, and the row asked for one
+                                        // quiet glyph, not a badge.
+                                        Some(mark) => icons::tagged_icon(
+                                            mark,
+                                            ROW_PROVIDER_MARK,
+                                            theme::text_secondary(),
+                                            format!("chip-{}", info.session_id),
+                                        )
+                                        .into_any_element(),
+                                        // The fallback for a provider eave
+                                        // has no logo for: the initials.
+                                        None => div()
+                                            .debug_selector(|| {
+                                                format!("chip-{}", info.session_id)
+                                            })
+                                            .font_family(theme::MONO)
+                                            .text_size(px(theme::MICRO_SIZE))
+                                            .text_color(theme::text_secondary())
+                                            .child(SharedString::from(glyph))
+                                            .into_any_element(),
+                                    }),
+                            )
                             .child(match editing_here {
                                 // Stage AC: the rename field, in the
                                 // label's own slot. Same box, same
@@ -18887,140 +19045,6 @@ impl Shell {
                                     .text_color(dot)
                                     .child(SharedString::from(word))
                             }))
-                            .children(age.map(|word| {
-                                div()
-                                    .debug_selector(|| format!("age-{}", info.session_id))
-                                    .flex_none()
-                                    .text_size(px(theme::MICRO_SIZE))
-                                    .line_height(px(theme::MICRO_LINE))
-                                    .text_color(theme::text_tertiary())
-                                    .child(SharedString::from(word))
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                // Slice N3: a running session's dot works;
-                                // every other state keeps the solid dot it
-                                // has always had. `quiet`/`failed`/`done`
-                                // are states, not activity — a pulsing
-                                // danger dot would say "still going" over
-                                // a session that is provably dead.
-                                loaders::work_dot(
-                                    theme::STATE_DOT,
-                                    dot,
-                                    phase.filter(|_| info.state == "running"),
-                                )
-                                .flex_none(),
-                            )
-                            // Slice AO: the provider's OWN mark, in the box
-                            // the initials chip used to occupy. Same size,
-                            // same slot, so line one's metrics are
-                            // unchanged — the marks and the monogram are
-                            // interchangeable and the row cannot tell which
-                            // it got.
-                            //
-                            // `launcher.rs` has painted these since Slice
-                            // Q2; the rail carried a monochrome `CC`
-                            // because Slice A's directive forbade a
-                            // third-party mark. That directive is
-                            // withdrawn. The initials remain the fallback
-                            // for a provider eave has no logo for, so a
-                            // future adapter cannot produce an empty chip.
-                            // Both shapes are the SAME 18 px plate, and
-                            // that is what makes them interchangeable: a
-                            // provider with a logo and one without produce
-                            // rows with identical metrics, so the folder
-                            // line under them aligns either way.
-                            //
-                            // The plate is not decoration. `claude_brand`
-                            // (#D97757) on a washed row measures 2.55:1 at
-                            // the bright end of the backdrop sweep, under
-                            // the 3:1 non-text floor; on `chip_plate` it is
-                            // 6.01:1 on every row in every state, because
-                            // an opaque plate takes the desktop out of the
-                            // question entirely. Measured in
-                            // `theme::tests::a_provider_mark_clears_the_non_text_floor_on_its_own_plate`.
-                            .child(
-                                div()
-                                    .size(px(theme::PROVIDER_CHIP))
-                                    .flex_none()
-                                    .rounded(px(theme::RADIUS_CHIP))
-                                    .bg(theme::chip_plate())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(match provider_mark(&info.provider) {
-                                        // 12 in an 18 px plate. A mark at
-                                        // the plate's full size reads as a
-                                        // crop rather than as an icon, and
-                                        // the launcher's `ICON_MARK_LG`
-                                        // (28) is sized for a 112 px tile
-                                        // where the mark is the subject —
-                                        // here it is a label for the name
-                                        // beside it, and every pixel it
-                                        // takes is one the name does not
-                                        // get.
-                                        Some(mark) => icons::tagged_icon(
-                                            mark,
-                                            12.0,
-                                            provider_mark_ink(&info.provider),
-                                            format!("chip-{}", info.session_id),
-                                        )
-                                        .into_any_element(),
-                                        // The fallback for a provider eave
-                                        // has no logo for. It keeps the
-                                        // plate, so an unknown provider is
-                                        // a different chip rather than a
-                                        // missing one.
-                                        None => div()
-                                            .debug_selector(|| {
-                                                format!("chip-{}", info.session_id)
-                                            })
-                                            .font_family(theme::MONO)
-                                            .text_size(px(theme::MICRO_SIZE))
-                                            .text_color(theme::text_secondary_on_wash())
-                                            .child(SharedString::from(glyph))
-                                            .into_any_element(),
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .debug_selector(|| format!("prov-{}", info.session_id))
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .text_size(px(theme::MICRO_SIZE))
-                                    .line_height(px(theme::MICRO_LINE))
-                                    .text_color(theme::text_tertiary())
-                                    .child(SharedString::from(kicker)),
-                            )
-                            // Slice AG2 #11 — the diffstat, beside the age.
-                            //
-                            // It sat on line three for one release, next to
-                            // the path, because the selected row was the
-                            // only row that had one. Once EVERY row has one
-                            // that line does not fit: measured on the
-                            // rail's own floor test, path + `+N −N` + the
-                            // marks group leaves the folder 25 px of the
-                            // 142 px it shares, and `/Us…` is the exact
-                            // failure `a_marked_row_still_shows_its_folder`
-                            // was written to catch.
-                            //
-                            // Line one is where it belongs anyway: the age
-                            // is here, and these are the same KIND of fact
-                            // — a magnitude you glance at down fifteen
-                            // rows, never a thing you read. What yields for
-                            // it is the kicker, which is `flex_1` and
-                            // truncates, and which its own docs call the
-                            // row's quiet line. A truncated provider name
-                            // costs less than a truncated path, which is
-                            // "the one thing on that line a person
-                            // recognises".
                             .children(stat.map(|DiffStat { adds, dels }| {
                                 div()
                                     .id(SharedString::from(format!(
@@ -19064,20 +19088,16 @@ impl Shell {
                                             .child(format!("-{}", coarse_lines(dels))),
                                     )
                             }))
+                            .children(age.map(|word| {
+                                div()
+                                    .debug_selector(|| format!("age-{}", info.session_id))
+                                    .flex_none()
+                                    .text_size(px(theme::MICRO_SIZE))
+                                    .line_height(px(theme::MICRO_LINE))
+                                    .text_color(theme::text_tertiary())
+                                    .child(SharedString::from(word))
+                            })),
                     )
-                    // LINE THREE — branch / cwd, and the marks group.
-                    //
-                    // Slice AG2 #9: the whole line is conditional. Under a
-                    // project header the path can be redundant and
-                    // `row_repo_line` returns `None` for it — but the
-                    // sharing count and the worktree mark live here too, so
-                    // the PATH going quiet may not take them with it. The
-                    // line is dropped only when it would carry nothing at
-                    // all.
-                    //
-                    // Slice AG2 #11 took the diffstat OFF this line rather
-                    // than adding fifteen of them to it; the reason is
-                    // written where it went, on line one.
                     .when(repo_line.is_some() || marks.is_some(), |row| {
                             row.child(
                         div()
@@ -19097,12 +19117,29 @@ impl Shell {
                                     .gap(px(theme::SPACE_2))
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .child(icons::tagged_icon(
-                                        icons::GIT_BRANCH,
-                                        theme::ICON_STATUS,
-                                        theme::text_tertiary(),
-                                        format!("git-{}", info.session_id),
-                                    ))
+                                    // Slice NC2: in the mark's slot, so the
+                                    // text under it aligns with the name.
+                                    // A branch glyph for a worktree, a
+                                    // folder for a plain checkout — the
+                                    // line says which it is.
+                                    .child(
+                                        div()
+                                            .w(px(ROW_PROVIDER_MARK))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(icons::tagged_icon(
+                                                if wt_present || wt_missing {
+                                                    icons::GIT_BRANCH
+                                                } else {
+                                                    icons::FOLDER
+                                                },
+                                                theme::ICON_STATUS,
+                                                theme::text_tertiary(),
+                                                format!("git-{}", info.session_id),
+                                            )),
+                                    )
                                     .child(
                                         div()
                                             .debug_selector(|| {
@@ -19610,7 +19647,9 @@ impl Shell {
             sess_shut,
             sess_count,
             false,
-            |this, _cx| this.new_session(),
+            // Slice NC1: the same door ⌘T opens. A chat is typed into
+            // existence on the launcher, and the launcher is a tab.
+            |this, cx| this.new_tab(cx),
             cx,
         )];
         if !sess_shut {
@@ -24262,7 +24301,9 @@ impl Shell {
     /// other two name features eave does not.
     fn plus_menu(&self) -> Vec<TabMenuEntry> {
         vec![
-            TabMenuEntry::Action(TabMenuAction::NewSessionRow, MenuItem::new("New Session")),
+            // Slice NC1: "New Session" is gone — a new tab IS a new chat,
+            // and two rows that opened the same screen were the split
+            // the operator asked to close.
             TabMenuEntry::Action(TabMenuAction::NewProjectRow, MenuItem::new("New Project…")),
             TabMenuEntry::Separator,
             TabMenuEntry::Action(TabMenuAction::NewFolder, MenuItem::new("New Folder")),
@@ -24656,7 +24697,6 @@ impl Shell {
         }
         if let TabMenuTarget::Plus = &req.target {
             match action {
-                TabMenuAction::NewSessionRow => self.new_session(),
                 TabMenuAction::NewProjectRow => self.pick_project(cx),
                 TabMenuAction::NewFolder => self.new_bookmark_folder(cx),
                 TabMenuAction::AddTab => self.new_tab(cx),
@@ -24901,7 +24941,6 @@ impl Shell {
             // reachable would close the menu rather than leave it open.
             | TabMenuAction::OpenSettings
             | TabMenuAction::MemoryFact
-            | TabMenuAction::NewSessionRow
             | TabMenuAction::NewProjectRow => {}
         }
         self.close_tab_menu(cx);
@@ -25013,7 +25052,6 @@ fn tab_menu_tag(action: &TabMenuAction) -> &'static str {
         TabMenuAction::Download(crate::web::DownloadAction::Nothing) => "download-inert",
         TabMenuAction::OpenSettings => "open-settings",
         TabMenuAction::MemoryFact => "memory-fact",
-        TabMenuAction::NewSessionRow => "new-session",
         TabMenuAction::NewProjectRow => "new-project",
     }
 }
@@ -25053,6 +25091,11 @@ impl Shell {
     /// — highlight is the KEYBOARD's cursor and means "this is where you
     /// are", which is a different fact from "this is what is set".
     fn picker_target(&self, cx: &App) -> (&'static launcher::Provider, Option<String>) {
+        // Slice NC1: at the launcher the chip is the NEXT chat's agent,
+        // even while a chat is still subscribed behind a blank ⌘T tab.
+        if self.at_launcher(cx) {
+            return (self.provider(), self.launcher.model.map(str::to_string));
+        }
         if let Some(info) = self.selected_session(cx) {
             let provider = PROVIDERS
                 .iter()
@@ -25185,16 +25228,19 @@ impl Shell {
         let (provider, current) = self.picker_target(cx);
         let same_provider = provider.id == entry.provider().id;
         let same_model = current.as_deref() == model;
-        if self.transcript.read(cx).session_id.is_some() {
+        // Slice NC1: at the launcher a pick is a choice for the chat about
+        // to be typed, never a launch — `at_launcher`, not "is a session
+        // subscribed", because behind a blank ⌘T tab one still is.
+        if !self.at_launcher(cx) {
             // A session's agent is fixed at open (`Engine::reject_config_change`).
             if !(same_provider && same_model) {
-                self.launcher.provider = entry.provider_ix;
+                self.pick_provider(entry.provider_ix, cx);
                 self.launcher.model = model;
                 self.new_session();
                 self.launch(cx);
             }
         } else {
-            self.launcher.provider = entry.provider_ix;
+            self.pick_provider(entry.provider_ix, cx);
             self.launcher.model = model;
         }
         self.close_model_menu(cx);
@@ -25307,6 +25353,12 @@ impl Shell {
     }
 
     fn launch(&mut self, cx: &mut Context<Self>) {
+        self.launch_with(None, cx);
+    }
+
+    /// Start a session with the launcher's agent, and `prompt` as its
+    /// first message when the start was a SEND (Slice NC1).
+    fn launch_with(&mut self, prompt: Option<(String, Vec<PathBuf>)>, cx: &mut Context<Self>) {
         // Slice T1 — if the launcher is up because a blank ⌘T tab is
         // active, the session that comes back belongs in THAT tab. Noted
         // here and consumed in `reconcile_strip`, because the session does
@@ -25337,6 +25389,7 @@ impl Shell {
             extra_args: crate::settings_agents::current_defaults()
                 .extra_args_for(p.id)
                 .to_vec(),
+            prompt,
         });
         cx.notify();
     }
@@ -25750,27 +25803,56 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The launcher itself: what eave looks like when nothing is running.
+    /// The launcher: **a new chat** (Slice NC1), and what eave looks like
+    /// when nothing is running.
+    ///
+    /// The same cluster an empty session draws — the disc, the composer,
+    /// a where-line — because from the operator's chair they are one
+    /// screen: ⌘T lands here with the address field lit, and the first
+    /// thing typed either goes to the web (the omnibox) or starts the
+    /// chat (the composer). Slice Q2's tile grid and its `Start` button
+    /// asked the agent question BEFORE there was anything to say, and the
+    /// operator called that a split between "new session" and the
+    /// browser. The agent is still chosen here — the composer's model chip
+    /// opens the picker, which spans providers — and it is chosen the way
+    /// it is chosen mid-chat, from the chip, not from a screen of its own.
     ///
     /// Positioned exactly where Slice M's "no session selected" ghost text
-    /// was — an absolute overlay above the composer's clearance, outside
-    /// the edge-fade scope and outside the virtualized list, so it can
-    /// never participate in a row height.
-    fn launcher_view(&self, error: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
-        let cwd = std::env::current_dir()
-            .map(|p| tilde(&p))
-            .unwrap_or_else(|_| "the current directory".into());
-        let selected = self.launcher.provider;
+    /// was — an absolute overlay above the well, outside the edge-fade
+    /// scope and outside the virtualized list, so it can never participate
+    /// in a row height. It stays an overlay (and not `transcript_empty_view`
+    /// itself) because it paints OVER a blank ⌘T page tab, which owns the
+    /// well beneath it.
+    ///
+    /// `composer` is `None` only when a split already took the element;
+    /// the launcher then states the agent and the folder and nothing else.
+    fn launcher_view(
+        &self,
+        error: Option<&str>,
+        composer: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // The folder the chat will run in: the task ⌘T was pressed in
+        // (the same read `launch` sends as `cwd`), else the engine's own.
+        let snapshot = self.strip_snapshot(cx);
+        let cwd = strip::active_workspace(&snapshot)
+            .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()));
+        let where_line = cwd
+            .as_deref()
+            .map(|c| format!("in {}", tilde(Path::new(c))))
+            .unwrap_or_else(|| "in the current directory".into());
         let p = self.provider();
-        let model = self
-            .launcher
-            .model
-            .map(|m| model_picker::display_name(p.id, m))
-            .unwrap_or_else(|| p.name.to_string());
-        // The entrance rides an INNER div: this box is absolute, and
-        // `relative()` on it would destroy that positioning outright (the
-        // scar Slice M's note left).
         let t = motion::entrance_t("in:launcher", motion::FADE_IN);
+        let quiet = |sel: &'static str, text: String| {
+            div()
+                .debug_selector(move || sel.into())
+                .w_full()
+                .min_w(px(0.))
+                .text_size(px(theme::MICRO_SIZE))
+                .line_height(px(theme::MICRO_LINE))
+                .text_color(theme::text_tertiary())
+                .child(text)
+        };
 
         div()
             .debug_selector(|| "launcher".into())
@@ -25778,231 +25860,96 @@ impl Shell {
             .top_0()
             .left_0()
             .right_0()
-            // Not `COMPOSER_CLEARANCE` — the composer is not mounted while
-            // this is up (see the render chain), so reserving its height
-            // would push the launcher off centre by half a composer.
             .bottom_0()
             .flex()
             .items_center()
-            .justify_center()
             .child(
                 div()
-                    .opacity(t)
-                    .relative()
-                    .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
+                    .id("launcher-cluster")
+                    .debug_selector(|| "launcher-cluster".into())
                     .w_full()
-                    .max_w(px(theme::LAUNCHER_MAX_W))
-                    .px(px(theme::GUTTER))
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .gap(px(theme::LAUNCHER_GAP))
+                    .gap(px(theme::EMPTY_CLUSTER_GAP))
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(px(theme::SPACE_1))
-                            .child(
-                                div()
-                                    .debug_selector(|| "launcher-title".into())
-                                    .text_size(px(theme::DISPLAY_SIZE))
-                                    .line_height(px(theme::DISPLAY_LINE))
-                                    .font_weight(theme::WEIGHT_STRONG)
-                                    .text_color(theme::text())
-                                    .child("Start a session"),
-                            )
-                            .child(
-                                // Where it will run, stated before it runs
-                                // rather than discovered afterwards. The
-                                // cwd is the single most consequential
-                                // fact about a coding agent's session.
-                                div()
-                                    .debug_selector(|| "launcher-cwd".into())
-                                    .text_size(px(theme::SMALL_SIZE))
-                                    .line_height(px(theme::SMALL_LINE))
-                                    .text_color(theme::text_tertiary())
-                                    .child(format!("in {cwd}")),
-                            ),
+                        empty_logo()
+                            .opacity(t)
+                            .relative()
+                            .top(px(motion::ENTRANCE_RISE * (1.0 - t)))
+                            .self_center(),
                     )
+                    .children(composer)
                     .child(
-                        div()
-                            .debug_selector(|| "provider-strip".into())
-                            // Capped at three tiles wide so six providers
-                            // wrap 3+3 rather than however many happen to
-                            // fit. Six across does not fit the transcript
-                            // column at eave's default window size with
-                            // both rails open, and the first build's 4+2
-                            // read as an accident — which is what an
-                            // uncapped `flex_wrap` always eventually does.
-                            .max_w(px(theme::STRIP_MAX_W))
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .justify_center()
-                            .gap(px(theme::TILE_GAP))
-                            .children(PROVIDERS.iter().enumerate().map(|(ix, provider)| {
-                                launcher::tile(
-                                    ix,
-                                    provider,
-                                    ix == selected,
-                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.pick_provider(ix, cx)
-                                    }),
-                                )
-                            })),
-                    )
-                    // Slice AT: **the machine's side of the answer, in a
-                    // whole sentence.** The tile says which state the
-                    // selected provider is in ("not installed", "no
-                    // adapter yet"); this says what to do about it —
-                    // install the CLI, or point `EAVE_PROVIDER_BIN_*` at
-                    // it. Absent entirely when the provider is ready, so
-                    // the resting launcher is unchanged.
-                    //
-                    // Read in the APP process from the same
-                    // `eave_core::provider` table the ENGINE spawns from.
-                    // The engine is still the authority — it re-resolves
-                    // uncached at spawn and its refusal lands on
-                    // `launcher-error` below — but stating this before
-                    // the click is the whole point: an operator should
-                    // not have to press start to find out.
-                    .children(launcher::availability(p).why_not(p.id).map(|why| {
-                        div()
-                            .debug_selector(|| "launcher-availability".into())
-                            .max_w(px(theme::LAUNCHER_MAX_W))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::text_tertiary())
-                            .child(why)
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACE_2))
-                            // The model picker. A button that opens P1's
-                            // menu — the launcher is the overlay layer's
-                            // first product consumer.
-                            .child(
-                                div()
-                                    .id("launcher-model")
-                                    .debug_selector(|| "launcher-model".into())
-                                    .px(px(theme::SPACE_3))
-                                    .py(px(theme::SPACE_1))
-                                    .rounded(px(theme::RADIUS_SELECT))
-                                    .border_1()
-                                    .border_color(theme::border())
-                                    .text_size(px(theme::LABEL_SIZE))
-                                    .line_height(px(theme::LABEL_LINE))
-                                    .text_color(theme::text_secondary_on_wash())
-                                    .hover_fade(
-                                        "launcher-model",
-                                        theme::wash_rest(),
-                                        theme::overlay(),
-                                    )
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                        let at = window.mouse_position();
-                                        this.toggle_model_menu(
-                                            point(at.x, at.y - px(theme::MENU_ANCHOR_GAP)),
-                                            cx,
-                                        );
-                                    }))
-                                    // The chevron is the ICON, not the
-                                    // character `⌄` (U+2304). That codepoint
-                                    // sits low in its em box, so it rendered
-                                    // visibly below the label's optical
-                                    // centre — a flex row with `items_center`
-                                    // centres the glyph on the line box
-                                    // instead of trusting a font's metrics
-                                    // for a character almost no face is
-                                    // designed to set beside text.
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(theme::SPACE_1))
-                                    .child(model.to_string())
-                                    .child(icons::tagged_icon(
-                                        icons::ALT_ARROW_DOWN,
-                                        MODEL_CHEVRON,
-                                        theme::text_secondary_on_wash(),
-                                        "launcher-model-chevron",
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("launcher-start")
-                                    .debug_selector(|| "launcher-start".into())
-                                    .px(px(theme::SPACE_4))
-                                    .py(px(theme::SPACE_1))
-                                    .rounded(px(theme::RADIUS_SELECT))
-                                    .bg(theme::solid())
-                                    .text_size(px(theme::LABEL_SIZE))
-                                    .line_height(px(theme::LABEL_LINE))
-                                    .font_weight(theme::WEIGHT_LABEL)
-                                    .text_color(theme::on_solid())
-                                    .cursor_pointer()
-                                    .on_click(
-                                        cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx)),
-                                    )
-                                    .child(format!("Start {}", p.name)),
-                            ),
-                    )
-                    // Slice CK: **who said what the picker is showing.**
-                    // The list above is either the installed CLI's answer
-                    // or eave's own guess, and those are different claims;
-                    // absent entirely in the one case where they are not
-                    // (the CLI answered and named models), so the resting
-                    // launcher on a working machine is unchanged.
-                    //
-                    // A probe cannot be allowed to hold this frame — see
-                    // `launcher::model_source_note` — so the frame has to
-                    // be able to say it is showing a stale list, and this
-                    // is where it says it.
-                    .children(launcher::model_source_note(p).map(|note| {
-                        div()
-                            .debug_selector(|| "launcher-model-source".into())
-                            .max_w(px(theme::LAUNCHER_MAX_W))
-                            .text_size(px(theme::MICRO_SIZE))
-                            .line_height(px(theme::MICRO_LINE))
-                            .text_color(theme::text_tertiary())
-                            .child(note)
-                    }))
-                    // Slice S2: default flags apply at start with no
-                    // per-session picker, so the screen that starts the
-                    // session is the screen that states them — a default
-                    // applied where nothing says so would be invisible
-                    // configuration.
-                    .children({
-                        let flags =
-                            crate::settings_agents::current_defaults().extra_args_for(p.id).to_vec();
-                        (!flags.is_empty()).then(|| {
+                        Self::column(
                             div()
-                                .debug_selector(|| "launcher-default-flags".into())
-                                .max_w(px(theme::LAUNCHER_MAX_W))
-                                .text_size(px(theme::MICRO_SIZE))
-                                .line_height(px(theme::MICRO_LINE))
-                                .text_color(theme::text_tertiary())
-                                .child(format!(
-                                    "starts with {} — Settings → Agents",
-                                    flags.join(" ")
-                                ))
-                        })
-                    })
-                    // The engine's own words on a refusal. Not a toast and
-                    // not a log line: the screen that asked is the screen
-                    // that answers.
-                    .children(error.map(|e| {
-                        div()
-                            .debug_selector(|| "launcher-error".into())
-                            .max_w(px(theme::LAUNCHER_MAX_W))
-                            .text_size(px(theme::SMALL_SIZE))
-                            .line_height(px(theme::SMALL_LINE))
-                            .text_color(theme::danger())
-                            .child(e.to_string())
-                    })),
+                                .w_full()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACE_1))
+                                .child(
+                                    div()
+                                        .id("launcher-cwd")
+                                        .debug_selector(|| "launcher-cwd".into())
+                                        .w_full()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(theme::SPACE_2))
+                                        .text_size(px(theme::DETAIL_SIZE))
+                                        .line_height(px(theme::DETAIL_LINE))
+                                        .text_color(theme::text_tertiary())
+                                        .when_some(cwd.clone(), |el, cwd| {
+                                            el.cursor_pointer().on_click(move |_, _, _| {
+                                                open_in_system(Path::new(&cwd));
+                                            })
+                                        })
+                                        .child(icons::tagged_icon(
+                                            icons::FOLDER,
+                                            theme::ICON_SM,
+                                            theme::text_tertiary(),
+                                            "launcher-cwd-glyph",
+                                        ))
+                                        .child(where_line),
+                                )
+                                .children(
+                                    launcher::availability(p)
+                                        .why_not(p.id)
+                                        .map(|why| quiet("launcher-availability", why)),
+                                )
+                                .children(
+                                    launcher::model_source_note(p)
+                                        .map(|note| quiet("launcher-model-source", note)),
+                                )
+                                .children({
+                                    let flags = crate::settings_agents::current_defaults()
+                                        .extra_args_for(p.id)
+                                        .to_vec();
+                                    (!flags.is_empty()).then(|| {
+                                        quiet(
+                                            "launcher-default-flags",
+                                            format!(
+                                                "starts with {} — Settings → Agents",
+                                                flags.join(" ")
+                                            ),
+                                        )
+                                    })
+                                })
+                                .children(error.map(|e| {
+                                    div()
+                                        .debug_selector(|| "launcher-error".into())
+                                        .w_full()
+                                        .min_w(px(0.))
+                                        .text_size(px(theme::SMALL_SIZE))
+                                        .line_height(px(theme::SMALL_LINE))
+                                        .text_color(theme::danger())
+                                        .child(e.to_string())
+                                })),
+                        )
+                        .flex_none(),
+                    ),
             )
             .into_any_element()
     }
@@ -26777,17 +26724,44 @@ impl Render for Shell {
         let attachments = self.composer.read(cx).attachments.clone();
         let overflow = self.composer.read(cx).overflow;
         let queued = self.composer.read(cx).queued.clone();
-        let send_held = self.send_is_held(cx);
+        // Slice NC1 — the launcher hosts the composer. Decided here, ahead
+        // of everything the composer reads, because behind a blank ⌘T tab
+        // the transcript may still be subscribed to the chat you left:
+        // its project line, its running state, its approvals and its
+        // model chip are all facts about THAT chat, and the composer on
+        // the launcher belongs to the one you are about to start.
+        let show_launcher = (state.session_id.is_none() && !well_taken) || blank_page;
+        let send_held = !show_launcher && self.send_is_held(cx);
         let has_text = !composer_text.is_empty();
         let has_files = !attachments.is_empty();
         let has_draft = has_text || has_files;
-        let composer_session = self.selected_session(cx);
-        let pending_here = self
-            .transcript
-            .read(cx)
-            .transcript
-            .pending_approvals()
-            .count();
+        let composer_session = if show_launcher {
+            None
+        } else {
+            self.selected_session(cx)
+        };
+        let pending_here = if show_launcher {
+            0
+        } else {
+            self.transcript
+                .read(cx)
+                .transcript
+                .pending_approvals()
+                .count()
+        };
+        // The chip states whose model the next send goes to: the chat's,
+        // or at the launcher the picker's own choice (which spans
+        // providers — one chip is the whole agent choice).
+        let chip_agent: Option<(String, Option<String>)> = if show_launcher {
+            Some((
+                self.provider().id.to_string(),
+                self.launcher.model.map(str::to_string),
+            ))
+        } else {
+            composer_session
+                .as_ref()
+                .map(|i| (i.provider.clone(), i.model.clone()))
+        };
         // Slice M (§3.2): what an empty log actually means. Three cases,
         // and only two of them are facts this shell can back.
         //   - nothing subscribed -> "no session selected"
@@ -26825,18 +26799,19 @@ impl Render for Shell {
         // the only thing it could ever cover was an empty transcript.
         // Slice T1 adds the second way to reach the launcher: a blank page
         // tab. The first — no session selected and no page — is unchanged.
-        let show_launcher = (state.session_id.is_none() && !well_taken) || blank_page;
+        // (Slice NC1 moved the read up beside the composer's other inputs.)
         // **The one mount decision**, used twice: to put the composer in the
         // tree at the bottom of this function, and to decide whether its field
         // may hold the keyboard (`sync_composer_focus`, called below once the
         // transcript borrow has ended). Two expressions would be two chances
         // to disagree, and the way they fail is silent.
         //
-        // The two slices compose rather than collide: a blank ⌘T tab raises
-        // the launcher, which unmounts the composer — which is what a blank
-        // tab wants, and what T1's own harness asserts by checking `send` is
-        // absent there.
-        let composer_mounted = !show_launcher && !well_taken;
+        // Slice NC1: mounted at the launcher too — that is where a chat is
+        // typed into existence, so a blank ⌘T tab now RAISES the composer
+        // with the launcher. `dock_mounted` is the old meaning: the
+        // composer in the well's bottom stack or the empty cluster.
+        let composer_mounted = show_launcher || !well_taken;
+        let dock_mounted = composer_mounted && !show_launcher;
         // Only when the page element is actually in the tree this frame.
         // Focusing a handle that is not mounted is how the whole
         // window's actions go silent (Slice CM). A blank ⌘T tab is a
@@ -26905,7 +26880,7 @@ impl Render for Shell {
         self.sync_composer_focus(composer_mounted, keyboard_page.as_deref(), window, cx);
         if composer_mounted {
             self.warm_project_meta(cx);
-            let wanted = if empty_state.is_some() {
+            let wanted = if empty_state.is_some() || show_launcher {
                 composer::PLACEHOLDER_EMPTY
             } else {
                 composer::PLACEHOLDER_DOCKED
@@ -27119,11 +27094,11 @@ impl Render for Shell {
                                 this.pick_attachments(cx);
                             },
                         )))
-                        .children(composer_session.as_ref().map(|info| {
+                        .children(chip_agent.as_ref().map(|(provider, model)| {
                             model_chip(
                                 "composer-model",
-                                &info.provider,
-                                model_chip_label(&info.provider, info.model.as_deref()),
+                                provider,
+                                model_chip_label(provider, model.as_deref()),
                             )
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 let at = window.mouse_position();
@@ -27392,7 +27367,16 @@ impl Render for Shell {
         // Slice Q2, built here for the same reason: the launcher and its
         // model menu both need `self` and `cx`, and the element chain
         // below has neither to spare.
-        let launcher_el = show_launcher.then(|| self.launcher_view(launch_error.as_deref(), cx));
+        // Slice NC1: the launcher takes the composer; the well's dock and
+        // the empty cluster get it otherwise. One element, one mount.
+        let mut composer = Some(composer);
+        let launcher_el = show_launcher.then(|| {
+            self.launcher_view(
+                launch_error.as_deref(),
+                composer.take().map(|c| c.into_any_element()),
+                cx,
+            )
+        });
         let omnibox_el = self.omnibox_layer(cx);
         // Built here for the same reason the launcher is: the element
         // chain below has neither `self` nor `cx` to spare.
@@ -27717,7 +27701,10 @@ impl Render for Shell {
                                         split,
                                         rail_collapsed,
                                         transcript_el.into_any_element(),
-                                        composer.into_any_element(),
+                                        composer
+                                            .take()
+                                            .map(|c| c.into_any_element())
+                                            .unwrap_or_else(|| div().into_any_element()),
                                         pulse,
                                         cx,
                                     )
@@ -27730,13 +27717,16 @@ impl Render for Shell {
                                     let empty_here = empty_state.filter(|_| !well_taken);
                                     let (empty_el, dock_notice, dock_trailer, dock_slash, dock_composer) =
                                         match empty_here {
-                                            Some(e) if composer_mounted => (
+                                            Some(e) if dock_mounted => (
                                                 Some(Self::transcript_empty_view(
                                                     e,
                                                     notice.filter(|_| !well_taken),
                                                     trailer.filter(|_| !well_taken),
                                                     slash_layer.filter(|_| !well_taken),
-                                                    composer.into_any_element(),
+                                                    composer
+                                                        .take()
+                                                        .map(|c| c.into_any_element())
+                                                        .unwrap_or_else(|| div().into_any_element()),
                                                 )),
                                                 None,
                                                 None,
@@ -27748,9 +27738,10 @@ impl Render for Shell {
                                                 notice.filter(|_| !well_taken),
                                                 trailer.filter(|_| !well_taken),
                                                 slash_layer.filter(|_| !well_taken),
-                                                composer_mounted.then_some(
-                                                    composer.into_any_element(),
-                                                ),
+                                                composer
+                                                    .take()
+                                                    .filter(|_| dock_mounted)
+                                                    .map(|c| c.into_any_element()),
                                             ),
                                         };
                                     div()

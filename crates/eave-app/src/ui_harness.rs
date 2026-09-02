@@ -201,6 +201,30 @@ fn shown(vcx: &mut VisualTestContext, selector: &'static str) -> bool {
     vcx.debug_bounds(selector).is_some()
 }
 
+/// Slice NC1 — the idle floor's window: nothing selected AND no field.
+/// The launcher hosts a focused composer now, and a focused field costs
+/// its caret (`a_focused_field_puts_the_caret_on_the_clock_at_the_launcher_too`),
+/// so the window with NO timer at rest is one whose well a page has
+/// taken. Drives the tab's entrance out first — a settling glide is a
+/// timer, not a lease at rest.
+fn take_the_well_with_a_page(h: &Harness, vcx: &mut VisualTestContext) {
+    let mut visited = page_tab("visited", Some("https://docs.rs/"), Some("docs.rs"));
+    visited.history_len = 1;
+    strip_tabs(h, vcx, vec![visited], Some("visited"));
+    vcx.run_until_parked();
+    drive(h, vcx, Duration::from_millis(600));
+    assert!(!shown(vcx, "send"), "the page's well has a composer in it");
+}
+
+/// Slice NC1 — what `Start` used to be: type into the launcher's composer
+/// and press Return. The send IS the start.
+fn start_chat(vcx: &mut VisualTestContext, text: &str) {
+    vcx.simulate_input(text);
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+}
+
 /// Sessions are the default rail face. Tests that look at the files list
 /// have to open it — the footer library icon is the door.
 fn open_files_face(vcx: &mut VisualTestContext) {
@@ -2482,7 +2506,7 @@ fn the_bottom_pill_waits_for_a_log_taller_than_the_well(cx: &mut TestAppContext)
 /// site says an input that silently eats what you type is the one thing
 /// this must not be; this is the assertion that holds it to that.
 #[gpui::test]
-fn the_launcher_reaches_no_composer(cx: &mut TestAppContext) {
+fn the_launcher_is_a_composer_and_return_starts_the_chat(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     vcx.run_until_parked();
     let draft = |vcx: &mut VisualTestContext, h: &Harness| {
@@ -2499,31 +2523,86 @@ fn the_launcher_reaches_no_composer(cx: &mut TestAppContext) {
         .unwrap()
     };
 
-    // No `Session` event has been pushed: this is the launcher, and it
-    // states so by having no composer to find.
+    // Slice NC1: the launcher hosts the composer. Q2 unmounted it here
+    // and gated the keyboard so nothing typed could surface later in the
+    // first session opened; both are now the other way round, on
+    // purpose — the words typed at the launcher are the chat's opening.
+    assert!(shown(vcx, "launcher"));
+    assert!(shown(vcx, "composer-hint"), "the launcher has no composer");
     assert!(
-        vcx.debug_bounds("composer-text").is_none(),
-        "the launcher rendered a composer"
+        shown(vcx, "composer-model"),
+        "the launcher has no agent chip"
     );
 
     let _ = h.drain();
     vcx.simulate_input("typed at the launcher");
-    vcx.simulate_keystrokes("enter");
-    assert_eq!(draft(vcx, &h), "", "the launcher filled the hidden buffer");
-    assert!(
-        h.drain().is_empty(),
-        "the launcher dispatched a command with no session to address"
-    );
-
-    // ...and the session that opens next opens clean.
-    h.plumbing.push_feed(FeedEvent::Session {
-        id: "aaaa1111".into(),
-    });
     vcx.run_until_parked();
     assert_eq!(
         draft(vcx, &h),
-        "",
-        "the launcher's keystrokes surfaced in the first session opened"
+        "typed at the launcher",
+        "typing did not reach the field"
+    );
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    assert_eq!(draft(vcx, &h), "", "the send did not clear the field");
+    let cmds = h.drain();
+    assert_eq!(cmds.len(), 1, "return emitted {cmds:?}");
+    match &cmds[0] {
+        Command::Launch { prompt, .. } => {
+            assert_eq!(
+                prompt.as_ref().map(|(t, _)| t.as_str()),
+                Some("typed at the launcher"),
+                "the launch did not carry the words that started it"
+            );
+        }
+        other => panic!("return emitted {other:?}, not a launch"),
+    }
+    assert!(
+        !cmds.iter().any(|c| matches!(c, Command::Send { .. })),
+        "a bare Send went out with no session to address — the rest loop drops it"
+    );
+
+    // An empty Return starts nothing: there is nothing to say.
+    let _ = h.drain();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    assert!(h.drain().is_empty(), "an empty Return launched a chat");
+}
+
+/// Behind a blank ⌘T tab the transcript may still be subscribed to the
+/// chat you left. The send must deselect it first, because the session
+/// loop drops `Launch` — and the words must never land in that chat.
+#[gpui::test]
+fn a_send_on_a_blank_tab_leaves_the_old_chat_before_it_launches(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("blank", None, None)],
+        Some("blank"),
+    );
+    assert!(shown(vcx, "launcher"), "a blank tab is the launcher");
+    assert!(shown(vcx, "composer-hint"), "the launcher has no composer");
+
+    let _ = h.drain();
+    start_chat(vcx, "a new chat");
+    let cmds = h.drain();
+    let launch = cmds
+        .iter()
+        .position(|c| matches!(c, Command::Launch { .. }))
+        .expect("no launch went out");
+    let leave = cmds
+        .iter()
+        .position(|c| matches!(c, Command::NewSession))
+        .expect("the old chat was never deselected — the session loop drops Launch");
+    assert!(
+        leave < launch,
+        "the launch went out before the deselect: {cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|c| matches!(c, Command::Send { .. })),
+        "the words went to the chat you left: {cmds:?}"
     );
 }
 
@@ -4146,16 +4225,16 @@ fn the_empty_note_enters_once_and_does_not_replay_on_later_frames(cx: &mut TestA
 /// a parked clock is a caret that stopped blinking, and `PULSE_TICK` is a
 /// caret that pinned the window at the frame rate.
 #[gpui::test]
-fn a_focused_field_puts_the_caret_on_the_clock_and_a_launcher_does_not(cx: &mut TestAppContext) {
+fn a_focused_field_puts_the_caret_on_the_clock_at_the_launcher_too(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     drive(&h, vcx, Duration::from_millis(10));
-    // The floor, and the half that has not moved: no session, no composer,
-    // no field, no lease, no timer. `caret_field` returns `None` here, and
-    // `a_window_with_nothing_in_flight_never_starts_the_pulse_clock` holds
-    // it from the other side.
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(10));
+    // Slice NC1: the launcher has a field now, and a focused field blinks.
     assert!(
-        !clock_running(vcx),
-        "a launcher with no field in it constructed the pulse clock"
+        caret_only(vcx),
+        "the launcher's composer is focused and its caret is not on the clock"
     );
     // A session, because the caret is a property of a composer and there is
     // no composer at the launcher. This test used to type straight into a
@@ -4576,9 +4655,16 @@ fn caret_only(vcx: &mut VisualTestContext) -> bool {
 fn a_window_with_nothing_in_flight_never_starts_the_pulse_clock(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     // A session the engine is NOT running, and no selected transcript.
+    // Slice NC1: the launcher hosts a focused composer now, whose caret
+    // is on the clock like any field's — so the window with NO field is
+    // one whose well a page has taken.
     h.plumbing.push_rail(vec![session("aaaa1111")]);
-    vcx.run_until_parked();
-    assert!(!clock_running(vcx), "an idle shell leased the pulse clock");
+    take_the_well_with_a_page(&h, vcx);
+    assert!(
+        !clock_running(vcx),
+        "an idle shell leased the pulse clock (tick {:?})",
+        vcx.update(|_, cx| motion::clock_tick(cx))
+    );
 
     vcx.executor().advance_clock(Duration::from_secs(1));
     vcx.run_until_parked();
@@ -4648,6 +4734,8 @@ fn a_settled_window_is_never_told_to_re_render(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     h.plumbing.push_rail(vec![session("aaaa1111")]);
     vcx.run_until_parked();
+    // Slice NC1: the floor is measured with no field on screen.
+    take_the_well_with_a_page(&h, vcx);
     // Boot's entrance (N2) is legitimately mid-flight, and a window with a
     // tween running is not the state under test — it is the state the tween
     // is *supposed* to cost. Settle it first. `drive` panics rather than
@@ -4697,6 +4785,8 @@ fn a_settled_window_is_never_told_to_re_render(cx: &mut TestAppContext) {
 fn a_standing_notice_redraws_once_a_second_and_not_faster(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     h.plumbing.push_rail(vec![session("aaaa1111")]);
+    // Slice NC1: the floor is measured with no field on screen.
+    take_the_well_with_a_page(&h, vcx);
     h.plumbing.push_attn((
         "aaaa1111".into(),
         AttentionSnapshot::Quiet {
@@ -4729,6 +4819,8 @@ fn a_standing_notice_redraws_once_a_second_and_not_faster(cx: &mut TestAppContex
 #[gpui::test]
 fn a_running_session_leases_the_clock_and_a_settled_one_lets_it_park(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
+    // Slice NC1: the floor is measured with no field on screen.
+    take_the_well_with_a_page(&h, vcx);
     let mut running = session("aaaa1111");
     running.state = "running".into();
     h.plumbing.push_rail(vec![running.clone()]);
@@ -5692,6 +5784,10 @@ fn a_menu_costs_frames_only_while_it_moves(cx: &mut TestAppContext) {
     let (h, vcx) = boot_with_overlay(cx);
     h.plumbing.push_rail(vec![session("aaaa1111")]);
     vcx.run_until_parked();
+    // Slice NC1: the launcher's composer would already hold the caret's
+    // lease when the menu opens, and a lease taken before the menu is
+    // not what this measures — measure on a well with no field.
+    take_the_well_with_a_page(&h, vcx);
     drive(&h, vcx, Duration::from_millis(16));
 
     click(vcx, "overlay-demo");
@@ -5821,17 +5917,21 @@ fn reduced_motion_gets_a_menu_with_no_travel_at_all(cx: &mut TestAppContext) {
 fn a_bare_boot_lands_on_the_launcher(cx: &mut TestAppContext) {
     let (_h, vcx) = boot(cx);
     assert!(shown(vcx, "launcher"), "boot with no session shows nothing");
-    assert!(shown(vcx, "launcher-title"));
-    assert!(shown(vcx, "provider-strip"));
-    assert!(shown(vcx, "launcher-start"));
-    // Where it will run, stated before it runs.
+    // Slice NC1: the launcher is the new-chat cluster — the disc, the
+    // composer with its agent chip, and where the chat will run. No
+    // title, no tile grid, no Start button.
+    assert!(shown(vcx, "empty-logo"));
+    assert!(shown(vcx, "composer-hint"));
+    assert!(shown(vcx, "composer-model"));
+    assert!(shown(vcx, "send"));
     assert!(shown(vcx, "launcher-cwd"));
-    for ix in 0..crate::launcher::PROVIDERS.len() {
-        assert!(
-            vcx.debug_bounds(Box::leak(format!("provider-tile-{ix}").into_boxed_str()))
-                .is_some(),
-            "tile {ix} did not render",
-        );
+    for gone in [
+        "launcher-title",
+        "provider-strip",
+        "launcher-start",
+        "provider-tile-0",
+    ] {
+        assert!(!shown(vcx, gone), "{gone} is Q2's launcher, not a chat");
     }
 }
 
@@ -5894,50 +5994,13 @@ fn a_session_replaces_the_launcher(cx: &mut TestAppContext) {
 /// Slice AT: asked of the ADAPTER, never of whether the CLI is installed.
 /// A machine without `claude` on it would otherwise flip every tile in
 /// this test to dead and make the assertion mean nothing.
-#[gpui::test]
-fn a_provider_with_no_adapter_takes_no_click(cx: &mut TestAppContext) {
-    let (h, vcx) = boot(cx);
-    let picked = |vcx: &mut VisualTestContext| {
-        vcx.read_window(&h.window, |shell, cx| shell.read(cx).launcher.provider)
-            .unwrap()
-    };
-    let live: Vec<usize> = crate::launcher::PROVIDERS
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| crate::launcher::eave_can_drive(p))
-        .map(|(ix, _)| ix)
-        .collect();
-    let dead: Vec<usize> = (0..crate::launcher::PROVIDERS.len())
-        .filter(|ix| !live.contains(ix))
-        .collect();
-
-    let before = picked(vcx);
-    for ix in &dead {
-        click(
-            vcx,
-            Box::leak(format!("provider-tile-{ix}").into_boxed_str()),
-        );
-        vcx.run_until_parked();
-        assert_eq!(
-            picked(vcx),
-            before,
-            "clicking tile {ix} moved the selection, but eave cannot start it",
-        );
-    }
-    assert!(
-        dead.is_empty(),
-        "every named provider now has a verified adapter; a dead tile would still take no click"
-    );
-}
-
 /// Start emits the command, carrying the chosen provider and — by default
 /// — **no model at all**, which is not the same as an empty one.
 #[gpui::test]
 fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
     let cmds = h.drain();
     assert_eq!(cmds.len(), 1, "start emitted {} commands", cmds.len());
     match &cmds[0] {
@@ -5946,7 +6009,9 @@ fn start_emits_the_launch_with_the_chosen_agent(cx: &mut TestAppContext) {
             model,
             cwd,
             extra_args,
+            prompt,
         } => {
+            assert_eq!(prompt.as_ref().map(|(t, _)| t.as_str()), Some("hello"));
             assert_eq!(provider, "claude-code");
             assert_eq!(
                 model.as_deref(),
@@ -5973,7 +6038,7 @@ fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
     let _turn = eave_core::capabilities::probe_test_lock();
     eave_core::capabilities::forget();
     let (mut h, vcx) = boot(cx);
-    click(vcx, "launcher-model");
+    click(vcx, "composer-model");
     vcx.run_until_parked();
     assert!(shown(vcx, "model-picker"), "the model menu never opened");
 
@@ -5991,8 +6056,7 @@ fn the_model_menu_choice_reaches_the_launch(cx: &mut TestAppContext) {
     assert_eq!(chosen, Some("claude-opus-5"));
 
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
     match &h.drain()[0] {
         Command::Launch { model, .. } => {
             assert_eq!(model.as_deref(), Some("claude-opus-5"))
@@ -6031,7 +6095,7 @@ fn the_launcher_says_whose_model_list_it_is_showing(cx: &mut TestAppContext) {
     );
 
     // And the menu it opens is the CLI's list, not the hand-written one.
-    click(vcx, "launcher-model");
+    click(vcx, "composer-model");
     vcx.run_until_parked();
     click(vcx, "model-picker-row-0");
     vcx.run_until_parked();
@@ -6056,7 +6120,7 @@ fn the_launcher_says_whose_model_list_it_is_showing(cx: &mut TestAppContext) {
 #[gpui::test]
 fn switching_provider_clears_a_model_it_would_not_understand(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    click(vcx, "launcher-model");
+    click(vcx, "composer-model");
     vcx.run_until_parked();
     click(vcx, "model-picker-row-1");
     vcx.run_until_parked();
@@ -6105,16 +6169,19 @@ fn a_settled_launcher_asks_for_no_frames(cx: &mut TestAppContext) {
         "the launcher's entrance never asked for a frame"
     );
     assert!(shown(vcx, "launcher"));
-    assert_eq!(
-        h.window
-            .update(vcx, |_, window, cx| window.simulate_next_frame(cx))
-            .unwrap(),
-        0,
-        "a settled launcher is still asking for frames",
+    // Slice NC1: the launcher has a focused composer, so what it costs at
+    // rest is exactly what an empty session costs — the caret's tick,
+    // and never the frame rate.
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    drive(&h, vcx, Duration::from_millis(10));
+    assert!(
+        caret_only(vcx),
+        "the launcher leased the pulse clock for something other than its caret",
     );
     assert!(
-        !clock_running(vcx),
-        "the launcher leased the pulse clock — nothing here repeats",
+        !animating(vcx),
+        "a settled launcher is driving the clock at the frame rate",
     );
 }
 
@@ -6124,7 +6191,7 @@ fn a_settled_launcher_asks_for_no_frames(cx: &mut TestAppContext) {
 #[gpui::test]
 fn escape_closes_the_model_menu_and_not_the_launcher(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    click(vcx, "launcher-model");
+    click(vcx, "composer-model");
     vcx.run_until_parked();
     assert!(shown(vcx, "model-picker"));
     vcx.simulate_keystrokes("escape");
@@ -6142,7 +6209,7 @@ fn the_model_picker_is_monocodes_card(cx: &mut TestAppContext) {
     let _turn = eave_core::capabilities::probe_test_lock();
     eave_core::capabilities::forget();
     let (h, vcx) = boot(cx);
-    click(vcx, "launcher-model");
+    click(vcx, "composer-model");
     vcx.run_until_parked();
     for part in [
         "model-picker",
@@ -6181,13 +6248,14 @@ fn the_model_picker_search_narrows_the_list(cx: &mut TestAppContext) {
     let _turn = eave_core::capabilities::probe_test_lock();
     eave_core::capabilities::forget();
     let (h, vcx) = boot(cx);
-    click(vcx, "launcher-model");
+    click(vcx, "composer-model");
     vcx.run_until_parked();
     vcx.simulate_keystrokes("f a b l e");
     vcx.run_until_parked();
     vcx.read_window(&h.window, |shell, cx| {
         assert_eq!(
-            shell.read(cx).model_picker.query, "fable",
+            shell.read(cx).model_picker.query,
+            "fable",
             "typed search never reached the picker"
         );
     })
@@ -6207,14 +6275,16 @@ fn the_model_picker_search_narrows_the_list(cx: &mut TestAppContext) {
 /// This is a defect the first build of Q2 shipped: the launcher rendered
 /// over a live "Message eave…" field, and only a window capture showed it.
 #[gpui::test]
-fn the_launcher_shows_no_composer_to_type_into(cx: &mut TestAppContext) {
+fn the_launcher_shows_the_composer_to_type_into(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     assert!(shown(vcx, "launcher"));
+    // Slice NC1 inverts Q2's rule: the composer is on the launcher, and
+    // it is the SAME composer — one entity, one mount — so a draft typed
+    // here is the draft the session opens with.
     assert!(
-        !shown(vcx, "composer-hint"),
-        "the launcher offered a composer with no session to send to",
+        shown(vcx, "composer-hint"),
+        "the launcher offered no composer to type into",
     );
-
     h.plumbing.push_feed(FeedEvent::Session {
         id: "aaaa1111".into(),
     });
@@ -6222,7 +6292,7 @@ fn the_launcher_shows_no_composer_to_type_into(cx: &mut TestAppContext) {
     assert!(!shown(vcx, "launcher"));
     assert!(
         shown(vcx, "composer-hint"),
-        "the composer did not come back with the session",
+        "the composer did not stay with the session",
     );
 }
 
@@ -8227,7 +8297,6 @@ fn the_diffstat_sits_with_the_age_and_not_with_the_path(cx: &mut TestAppContext)
     let stat = at("stat-aaaa1111");
     let age = at("age-aaaa1111");
     let cwd = at("cwd-aaaa1111");
-    let prov = at("prov-aaaa1111");
     let label = at("label-aaaa1111");
 
     // Slice ID2a re-ranked the card: the TITLE is line one and the age
@@ -8243,15 +8312,11 @@ fn the_diffstat_sits_with_the_age_and_not_with_the_path(cx: &mut TestAppContext)
         age.origin,
         label.origin
     );
+    // Slice NC2: the row is two lines, and the stat is the title line's
+    // corner beside the age.
     assert!(
-        same_line(stat, prov),
-        "the stat should share the metadata line with the provider"
-    );
-    assert!(
-        label.origin.y < prov.origin.y,
-        "the title is not the first line: title {:?}, provider {:?}",
-        label.origin,
-        prov.origin
+        same_line(stat, label) && same_line(stat, age),
+        "the stat should sit in the title line's corner beside the age"
     );
     assert!(
         stat.origin.y < cwd.origin.y,
@@ -8304,38 +8369,39 @@ fn the_task_is_the_row_and_the_provider_is_its_metadata(cx: &mut TestAppContext)
     let badge = at("badge-aaaa1111");
     let age = at("age-aaaa1111");
     let chip = at("chip-aaaa1111");
-    let prov = at("prov-aaaa1111");
     let stat = at("stat-aaaa1111");
     let cwd = at("cwd-aaaa1111");
     let marks = at("marks-aaaa1111");
 
     // Rank one: the title, with its attention word and its age.
+    // Slice NC2: TWO ranks. The title line carries the mark, the name,
+    // the badge, the stat and the age; the location line carries the
+    // path and the marks. No metadata line, no model kicker.
     assert!(same_line(badge, label), "the badge left the title line");
     assert!(same_line(age, label), "the age left the title line");
-    // Rank two: the provider's chip and kicker, and the stat.
+    assert!(same_line(chip, label), "the provider's mark left the title line");
     assert!(
-        label.origin.y + label.size.height <= chip.origin.y + px(1.),
-        "the provider chip is not under the title: title {:?}, chip {:?}",
+        chip.origin.x < label.origin.x,
+        "the mark is not before the name: mark {:?}, name {:?}",
+        chip.origin,
+        label.origin
+    );
+    assert!(same_line(stat, label), "the stat left the title line");
+    assert!(
+        label.origin.y + label.size.height <= cwd.origin.y + px(1.),
+        "the path is not under the title: title {:?}, path {:?}",
         label.origin,
-        chip.origin
-    );
-    assert!(
-        same_line(prov, chip),
-        "the kicker and the chip are on different lines"
-    );
-    assert!(same_line(stat, prov), "the stat left the metadata line");
-    // Rank three: where the work is.
-    assert!(
-        prov.origin.y < cwd.origin.y,
-        "the path is not the last rank"
+        cwd.origin
     );
     assert!(same_line(marks, cwd), "the marks left the path line");
 
-    // Same rank order on a session with no title at all: the placeholder
-    // takes the title's slot, so the two rows have identical anatomy.
     let plain_label = at("label-bbbb2222");
     let plain_chip = at("chip-bbbb2222");
-    assert!(plain_label.origin.y < plain_chip.origin.y);
+    assert!(same_line(plain_label, plain_chip));
+    assert!(
+        vcx.debug_bounds("prov-aaaa1111").is_none(),
+        "the metadata line is back — the row is two lines"
+    );
     assert_eq!(
         vcx.debug_bounds("rail-aaaa1111").unwrap().size.height,
         vcx.debug_bounds("rail-bbbb2222").unwrap().size.height,
@@ -8488,7 +8554,7 @@ fn the_diffstat_is_a_door_only_on_the_row_you_are_in(cx: &mut TestAppContext) {
 /// changed lines AND a span near the year rollover AND a model name — all
 /// three at once.
 #[gpui::test]
-fn line_one_never_squeezes_the_provider_to_nothing(cx: &mut TestAppContext) {
+fn line_one_never_squeezes_the_title_to_nothing(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let mut s = session("aaaa1111");
     // Everything at its widest, at once: `+999k -999k` is the widest the
@@ -8507,13 +8573,18 @@ fn line_one_never_squeezes_the_provider_to_nothing(cx: &mut TestAppContext) {
     let _ = vcx
         .debug_bounds("age-aaaa1111")
         .expect("no age on the row — this is not the crowded line the test means");
-    let prov = vcx
-        .debug_bounds("prov-aaaa1111")
-        .expect("the kicker vanished");
+    // Slice NC2: the stat and the age share the title line with the
+    // name now, and the name is what yields. It must not yield to
+    // nothing: `+999999 −999999` plus a year is the widest corner a row
+    // can have, and the title still gets a word's width (45 px measured
+    // at the harness's rail width; the floor is 40).
+    let label = vcx
+        .debug_bounds("label-aaaa1111")
+        .expect("the title vanished");
     assert!(
-        prov.size.width >= px(36.),
-        "the kicker was squeezed to {:?} by the numbers beside it",
-        prov.size.width
+        label.size.width >= px(40.),
+        "the title was squeezed to {:?} by the numbers beside it",
+        label.size.width
     );
 }
 
@@ -9781,10 +9852,8 @@ async fn the_changes_rail_offers_a_remedy_only_when_there_is_one(cx: &mut TestAp
 /// way back to the launcher once a session is selected, which is what makes
 /// it load-bearing rather than a convenience — Slice AI's fix rides on it.
 #[gpui::test]
-fn pressing_new_session_asks_for_the_launcher(cx: &mut TestAppContext) {
+fn pressing_plus_on_projects_opens_a_new_tab(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    // A session on screen, so the launcher is NOT already up. This is the
-    // state in which `+ new` is the only route to it.
     h.plumbing.push_feed(FeedEvent::Session {
         id: "aaaa1111".into(),
     });
@@ -9792,25 +9861,25 @@ fn pressing_new_session_asks_for_the_launcher(cx: &mut TestAppContext) {
     assert!(!shown(vcx, "launcher"), "the launcher was already up");
     let _ = h.drain();
 
+    // Slice NC1: one door. `+ new` used to ask for the launcher alone
+    // (Q2); a new tab IS the launcher now, so this is ⌘T's act — the tab
+    // and the omnibox with it.
     click(vcx, "new-session");
     vcx.run_until_parked();
     let cmds = h.drain();
-    assert_eq!(cmds.len(), 1, "`+ new` emitted {cmds:?}");
     assert!(
-        matches!(cmds[0], Command::NewSession),
-        "`+ new` emitted {:?} rather than asking for the launcher",
-        cmds[0],
+        cmds.iter()
+            .any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
+        "`+ new` emitted {cmds:?} rather than opening a tab",
     );
-
-    // ...and it does NOT raise the launcher by itself. The UI is a pure
-    // projection: the launcher arrives when the engine agrees it should.
     assert!(
-        !shown(vcx, "launcher"),
-        "the shell raised a launcher the engine had not agreed to",
+        !cmds.iter().any(|c| matches!(c, Command::NewSession)),
+        "`+ new` still asks for Q2's launcher: {cmds:?}"
     );
-    h.plumbing.push_feed(FeedEvent::NoSession { error: None });
-    vcx.run_until_parked();
-    assert!(shown(vcx, "launcher"), "the launcher never arrived");
+    assert!(
+        shown(vcx, "omnibox"),
+        "`+ new` opened a tab with no way to aim it"
+    );
 }
 
 /// **The boot hook reaches the launcher before it presses start.**
@@ -10409,18 +10478,18 @@ fn a_session_row_is_two_lines(cx: &mut TestAppContext) {
         let h = vcx.debug_bounds(row).unwrap().size.height;
         assert!(
             h <= px(88.),
-            "{row} is {h:?} tall; the card is three lines (provider, title, \
-             branch), not the four-line disease"
+            "{row} is {h:?} tall; the card is two lines (title, \
+             location), not the four-line disease"
         );
     }
 
-    // All three ranks are actually there — a ceiling met by dropping a
-    // fact is not the same slice.
+    // Both ranks are actually there — a ceiling met by dropping a fact
+    // is not the same slice. (Slice NC2: the mark is on the title line.)
     for sel in [
-        "prov-aaaa1111",
+        "chip-aaaa1111",
         "label-aaaa1111",
         "cwd-aaaa1111",
-        "prov-bbbb2222",
+        "chip-bbbb2222",
         "label-bbbb2222",
         "cwd-bbbb2222",
     ] {
@@ -10994,14 +11063,25 @@ fn the_empty_state_is_gone_the_instant_a_turn_exists(cx: &mut TestAppContext) {
 fn the_empty_state_and_the_launcher_are_never_the_same_screen(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     assert!(shown(vcx, "launcher"), "a bare boot is the launcher");
+    // Slice NC1: the launcher draws the SAME cluster (disc, composer,
+    // where-line) — but as its own overlay, never the empty-session view
+    // stacked under it.
+    assert!(shown(vcx, "empty-logo"), "the launcher lost the disc");
     assert!(
-        !shown(vcx, "transcript-empty") && !shown(vcx, "empty-logo"),
+        !shown(vcx, "transcript-empty"),
         "the launcher and the empty-session cluster must never stack"
     );
 
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
     assert!(!shown(vcx, "launcher"));
-    assert!(shown(vcx, "empty-logo"), "selecting a session lost the cluster");
+    assert!(
+        shown(vcx, "transcript-empty"),
+        "selecting a session lost the cluster"
+    );
+    assert!(
+        shown(vcx, "empty-logo"),
+        "selecting a session lost the cluster"
+    );
     let logo = vcx.debug_bounds("empty-logo").expect("the logo");
     assert_eq!(
         logo.size.width, logo.size.height,
@@ -14429,9 +14509,11 @@ fn a_page_tab_takes_the_well_and_states_why_it_is_empty(cx: &mut TestAppContext)
         "a fresh tab explained the browser instead of offering a chat"
     );
     assert!(shown(vcx, "launcher"));
+    // Slice NC1: the launcher IS the composer — a blank tab is a chat
+    // waiting for its first words, and `send` is how they go.
     assert!(
-        !shown(vcx, "send"),
-        "the composer drew under the launcher on a blank tab"
+        shown(vcx, "send"),
+        "the launcher on a blank tab has no composer"
     );
 }
 
@@ -14572,6 +14654,69 @@ fn the_omnibox_opens_a_tab_when_the_active_one_is_a_session(cx: &mut TestAppCont
 /// ⌘T opens a page tab **and** the omnibox on it. A new tab with no way to
 /// say where it should go is a blank page and a second keystroke.
 #[gpui::test]
+fn cmd_t_lands_on_a_chat_with_the_omnibox_lit(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    strip_tabs(&h, vcx, vec![session_tab("aaaa1111")], Some("aaaa1111"));
+    assert!(!shown(vcx, "launcher"));
+
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-t");
+    vcx.run_until_parked();
+    // The tab is a round trip away; the engine answers with it active.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("blank", None, None), session_tab("aaaa1111")],
+        Some("blank"),
+    );
+    let _ = h.drain();
+
+    // Slice NC1: the blank tab is the launcher, the launcher is a chat,
+    // and the address field is the one lit — so the first keystrokes
+    // are the omnibox's, not the composer's.
+    assert!(shown(vcx, "launcher"), "⌘T did not land on the launcher");
+    assert!(shown(vcx, "composer-hint"), "the launcher has no composer");
+    assert!(shown(vcx, "empty-logo"));
+    let omnibox_up = vcx
+        .read_window(&h.window, |shell, cx| shell.read(cx).omnibox_open())
+        .unwrap();
+    assert!(omnibox_up, "⌘T did not light the address field");
+    vcx.simulate_input("rust docs");
+    vcx.run_until_parked();
+    let draft = vcx
+        .read_window(&h.window, |shell, cx| {
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .field
+                .read(cx)
+                .content()
+                .to_string()
+        })
+        .unwrap();
+    assert_eq!(
+        draft, "",
+        "typing at the lit address field leaked into the composer"
+    );
+
+    // Escape closes the address field; the chat is what is left, and the
+    // next words are its opening.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    start_chat(vcx, "start here");
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(
+            |c| matches!(c, Command::Launch { prompt: Some((t, _)), .. } if t == "start here")
+        ),
+        "return on the chat did not launch it: {cmds:?}"
+    );
+}
+
+#[gpui::test]
 fn cmd_t_opens_a_tab_and_the_omnibox_with_it(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
@@ -14655,13 +14800,18 @@ fn the_footer_panel_is_a_door_to_library_theme_and_new(cx: &mut TestAppContext) 
     click(vcx, "footer-plus");
     vcx.run_until_parked();
     for sel in [
-        "tab-menu-new-session",
         "tab-menu-new-project",
         "tab-menu-new-folder",
         "tab-menu-add-tab",
     ] {
         assert!(shown(vcx, sel), "{sel} missing from the + menu");
     }
+    // Slice NC1: a new tab IS a new chat; a second row for the same
+    // screen was the split the operator asked to close.
+    assert!(
+        !shown(vcx, "tab-menu-new-session"),
+        "the + menu still offers Q2's New Session beside New Tab"
+    );
 
     let _ = h.drain();
     click(vcx, "tab-menu-add-tab");
@@ -14687,17 +14837,11 @@ fn the_footer_panel_is_a_door_to_library_theme_and_new(cx: &mut TestAppContext) 
     click(vcx, "footer-plus");
     vcx.run_until_parked();
     assert!(
-        shown(vcx, "tab-menu-new-session"),
+        shown(vcx, "tab-menu-new-project"),
         "the + menu did not reopen"
     );
-    let _ = h.drain();
-    click(vcx, "tab-menu-new-session");
+    vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
-    let cmds = h.drain();
-    assert!(
-        cmds.iter().any(|c| matches!(c, Command::NewSession)),
-        "the + menu's New Session is not `+ new`'s act: {cmds:?}"
-    );
 
     // The library icon is ALWAYS present (operator ruling). It now opens
     // the files face; Downloads / Settings live on `files-library` in
@@ -15333,8 +15477,7 @@ fn a_session_started_from_a_blank_tab_takes_that_tabs_place(cx: &mut TestAppCont
     assert!(shown(vcx, "launcher"), "the launcher is not up");
 
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
 
     // The session the launch asked for now arrives on the rail.
     let _ = h.drain();
@@ -15379,8 +15522,7 @@ fn a_chat_launched_in_a_project_starts_in_its_worktree(cx: &mut TestAppContext) 
     assert!(shown(vcx, "launcher"), "the launcher is not up");
 
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
 
     let cmds = h.drain();
     let cwd = cmds
@@ -15419,8 +15561,7 @@ fn a_chat_launched_outside_a_project_names_no_worktree(cx: &mut TestAppContext) 
     );
 
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
 
     let cmds = h.drain();
     let cwd = cmds
@@ -19009,20 +19150,26 @@ fn a_default_model_preselects_the_launcher_and_reaches_the_launch(cx: &mut TestA
             d.set_model("claude-code", Some("opus".into()))
         })
     });
-    // The Shell's launcher state predates the write above, so re-enter
-    // the tile: `pick_provider` re-reads the store — the same call
-    // `LauncherUi::default()` makes at boot.
-    click(vcx, "provider-tile-3"); // grok — live, so the click lands
+    // Slice NC1: no tiles — the picker's provider switch is
+    // `pick_provider`, which re-reads the store on the way in.
+    h.window
+        .update(vcx, |shell, _, cx| shell.pick_provider(3, cx)) // grok
+        .unwrap();
     vcx.run_until_parked();
-    click(vcx, "provider-tile-0"); // claude again
+    h.window
+        .update(vcx, |shell, _, cx| shell.pick_provider(0, cx)) // claude again
+        .unwrap();
     vcx.run_until_parked();
     let chosen = vcx
         .read_window(&h.window, |shell, cx| shell.read(cx).launcher.model)
         .unwrap();
-    assert_eq!(chosen, Some("opus"), "the stored default did not pre-select");
+    assert_eq!(
+        chosen,
+        Some("opus"),
+        "the stored default did not pre-select"
+    );
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
     match &h.drain()[0] {
         Command::Launch { model, .. } => assert_eq!(model.as_deref(), Some("opus")),
         other => panic!("start emitted {other:?}"),
@@ -19045,11 +19192,15 @@ fn an_explicit_picker_choice_beats_the_stored_default(cx: &mut TestAppContext) {
             d.set_model("claude-code", Some("claude-opus-5".into()))
         })
     });
-    click(vcx, "provider-tile-3");
+    h.window
+        .update(vcx, |shell, _, cx| shell.pick_provider(3, cx))
+        .unwrap();
     vcx.run_until_parked();
-    click(vcx, "provider-tile-0");
+    h.window
+        .update(vcx, |shell, _, cx| shell.pick_provider(0, cx))
+        .unwrap();
     vcx.run_until_parked();
-    click(vcx, "launcher-model");
+    click(vcx, "composer-model");
     vcx.run_until_parked();
     assert!(shown(vcx, "model-picker"), "the model menu never opened");
     click(vcx, "model-picker-row-0"); // Sonnet 5, not the stored Opus 5
@@ -19064,8 +19215,7 @@ fn an_explicit_picker_choice_beats_the_stored_default(cx: &mut TestAppContext) {
         "the explicit pick did not stick"
     );
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
     match &h.drain()[0] {
         Command::Launch { model, .. } => assert_eq!(
             model.as_deref(),
@@ -19102,8 +19252,7 @@ fn default_flags_reach_the_launch_and_are_stated(cx: &mut TestAppContext) {
         "flags will apply at start and nothing on the launcher says so"
     );
     let _ = h.drain();
-    click(vcx, "launcher-start");
-    vcx.run_until_parked();
+    start_chat(vcx, "hello");
     match &h.drain()[0] {
         Command::Launch {
             model, extra_args, ..

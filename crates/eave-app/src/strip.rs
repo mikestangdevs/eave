@@ -142,7 +142,7 @@ pub enum TabKind {
 pub const ORPHAN_SESSION_LABEL: &str = "session";
 
 /// What a page tab says before it has been anywhere.
-pub const NEW_TAB_LABEL: &str = "New tab";
+pub const NEW_TAB_LABEL: &str = "New Chat";
 
 /// One tab, reduced to what the strip paints.
 #[derive(Debug, Clone, PartialEq, Eq)]
