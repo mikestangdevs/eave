@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::events::{ContextWindow, SessionEvent, TurnTokens};
+use crate::events::{ContextWindow, FastLane, SessionEvent, TurnTokens};
 use crate::tool::{self, TodoItem, ToolCall};
 
 const MALFORMED_LINE_CAP: usize = 512;
@@ -110,6 +110,18 @@ impl ClaudeStream {
                             // Slice CC: which `modelUsage` row is ours.
                             self.model = v.get("model").and_then(Value::as_str).map(str::to_string);
                             vec![SessionEvent::Init {
+                                // Slice TN1: the CLI's own fast-lane
+                                // answer, kept verbatim so a refusal of
+                                // what eave asked for is a journalled fact.
+                                fast_lane: v.get("fast_mode_state").and_then(Value::as_str).map(
+                                    |state| FastLane {
+                                        state: state.to_string(),
+                                        disabled_reason: v
+                                            .get("fast_mode_disabled_reason")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string),
+                                    },
+                                ),
                                 session_id: id.to_string(),
                                 // The posture the CLI says it is actually
                                 // running in — Slice K verifies this before
@@ -806,6 +818,39 @@ mod tests {
         }
     }
 
+    /// **Slice TN1.** Claude Code states its fast lane on `init`; both
+    /// lines are cut from real frames of 2026-09-02 — the second is what
+    /// the same CLI answers when spawned with eave's opt-in on a plan
+    /// whose extra usage is off.
+    #[test]
+    fn init_carries_the_clis_own_fast_lane_answer() {
+        let asked = r#"{"type":"system","subtype":"init","session_id":"abc","permissionMode":"default","fast_mode_state":"off","fast_mode_disabled_reason":"extra_usage_disabled"}"#;
+        match ClaudeStream::new().parse_line(asked).as_slice() {
+            [SessionEvent::Init { fast_lane, .. }] => {
+                let lane = fast_lane.as_ref().expect("stated");
+                assert_eq!(lane.state, "off");
+                assert_eq!(lane.refused(), Some("extra_usage_disabled"));
+            }
+            other => panic!("got {other:?}"),
+        }
+        let unasked = r#"{"type":"system","subtype":"init","session_id":"abc","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required"}"#;
+        match ClaudeStream::new().parse_line(unasked).as_slice() {
+            [SessionEvent::Init { fast_lane, .. }] => {
+                assert_eq!(
+                    fast_lane.as_ref().unwrap().refused(),
+                    None,
+                    "nothing was asked"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+        let older = r#"{"type":"system","subtype":"init","session_id":"abc"}"#;
+        match ClaudeStream::new().parse_line(older).as_slice() {
+            [SessionEvent::Init { fast_lane, .. }] => assert!(fast_lane.is_none()),
+            other => panic!("got {other:?}"),
+        }
+    }
+
     /// **Slice AR2.** The CLI announces its own complete inventory in the
     /// very first frame it writes, and this parser used to throw it away.
     ///
@@ -849,6 +894,7 @@ mod tests {
                     session_id,
                     permission_mode,
                     slash_commands,
+                    ..
                 }] => {
                     assert_eq!(session_id, "abc");
                     assert_eq!(permission_mode.as_deref(), Some("default"));

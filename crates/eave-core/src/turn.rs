@@ -703,6 +703,7 @@ mod tests {
         provider(
             ts_ms,
             SessionEvent::Init {
+                fast_lane: None,
                 session_id: session_id.into(),
                 permission_mode: Some("default".into()),
                 slash_commands: Vec::new(),
@@ -1002,6 +1003,7 @@ mod tests {
     fn provider_noise_never_opens_a_turn() {
         let noise = [
             SessionEvent::Init {
+                fast_lane: None,
                 session_id: "s".into(),
                 permission_mode: None,
                 slash_commands: Vec::new(),
@@ -1058,6 +1060,7 @@ mod tests {
                 provider(
                     20,
                     SessionEvent::Init {
+                        fast_lane: None,
                         session_id: "s".into(),
                         permission_mode: Some("default".into()),
                         slash_commands: Vec::new(),

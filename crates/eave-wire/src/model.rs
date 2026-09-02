@@ -9,7 +9,7 @@
 //! `UserDelivered` confirmation is seen; a `Closed` record finalizes every
 //! still-pending send as undelivered (spec 02 §Delivery state).
 
-use eave_core::events::{ContextWindow, SessionEvent, TurnTokens};
+use eave_core::events::{ContextWindow, FastLane, SessionEvent, TurnTokens};
 use eave_core::journal::{JournalEvent, Outcome, Record};
 use eave_core::tool::ToolCall;
 
@@ -664,6 +664,7 @@ impl Transcript {
             SessionEvent::Init {
                 session_id,
                 slash_commands,
+                fast_lane,
                 ..
             } => {
                 // Slice AR2. Stamped even when empty: "this CLI announced
@@ -673,6 +674,15 @@ impl Transcript {
                 self.push_row(Row::Marker {
                     text: format!("session started ({session_id})"),
                 });
+                // Slice TN1. The composer's bolt shows what the operator
+                // ASKED; this is what the CLI ANSWERED, and a refusal is
+                // said where the operator will read it. Silent when the
+                // CLI said nothing, said yes, or was never asked.
+                if let Some(reason) = fast_lane.as_ref().and_then(FastLane::refused) {
+                    self.push_row(Row::Marker {
+                        text: format!("fast lane refused by the CLI: {}", reason.replace('_', " ")),
+                    });
+                }
             }
             // Deltas and their snapshot pair with the *live* assistant row,
             // which is not necessarily the last row — engine-side records
@@ -838,6 +848,20 @@ impl Transcript {
                 if subtype == "agent_thought_chunk" {
                     if let Some(text) = thought_text(raw) {
                         self.push_thought(&text);
+                    }
+                }
+                // Codex's `error` notification (Slice TN1). It arrives one
+                // frame before `turn/completed: failed`, and it is the ONLY
+                // place the reason lives — measured 2026-09-02: an effort
+                // level the model lacks comes back as the API's own
+                // `Unsupported value: 'max' is not supported with the
+                // 'gpt-5.5' model …`, and without this the transcript said
+                // `turn completed with error` and nothing else.
+                if subtype == "error" {
+                    if let Some(text) = provider_error_text(raw) {
+                        self.push_row(Row::Marker {
+                            text: format!("the CLI reported an error: {text}"),
+                        });
                     }
                 }
             }
@@ -1029,6 +1053,25 @@ impl Transcript {
 
 /// Pull the thought text out of an ACP `agent_thought_chunk` frame. The
 /// journal stores the raw line; the activity box wants the words.
+/// The human sentence inside a Codex `error` notification. Codex wraps the
+/// API's error JSON as a STRING inside `params.error.message`, so this
+/// unwraps one level when it can and falls back to the string when it
+/// cannot. `None` for a frame shaped some other way — nothing is invented.
+fn provider_error_text(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let message = v.pointer("/params/error/message")?.as_str()?;
+    let inner = serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|e| {
+            e.pointer("/error/message")
+                .or_else(|| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        });
+    let text = inner.unwrap_or_else(|| message.trim().to_string());
+    (!text.is_empty()).then_some(text)
+}
+
 fn thought_text(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let update = v.pointer("/params/update").unwrap_or(&v);
@@ -1215,6 +1258,139 @@ mod tests {
         assert_eq!(t.context, None);
     }
 
+    /// **Slice TN1.** The bolt shows what was asked; the transcript says
+    /// what the CLI answered. The refusal here is the one measured live
+    /// on 2026-09-02 (`extra_usage_disabled`, this plan); the default's
+    /// own shape (`sdk_opt_in_required`, nothing asked) and a plain `on`
+    /// both stay silent, so a session that never touched the knob gains
+    /// no row.
+    #[test]
+    fn a_refused_fast_lane_is_said_in_the_transcript_and_a_default_is_not() {
+        let init = |lane: Option<FastLane>| JournalEvent::Provider {
+            event: SessionEvent::Init {
+                session_id: "s1".into(),
+                permission_mode: Some("default".into()),
+                slash_commands: Vec::new(),
+                fast_lane: lane,
+            },
+        };
+        let markers = |t: &Transcript| -> Vec<String> {
+            t.rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Marker { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut refused = Transcript::new();
+        refused
+            .apply(
+                1,
+                &[rec(
+                    1,
+                    init(Some(FastLane {
+                        state: "off".into(),
+                        disabled_reason: Some("extra_usage_disabled".into()),
+                    })),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            markers(&refused),
+            vec![
+                "session started (s1)".to_string(),
+                "fast lane refused by the CLI: extra usage disabled".to_string()
+            ]
+        );
+
+        for quiet in [
+            None,
+            Some(FastLane {
+                state: "off".into(),
+                disabled_reason: Some("sdk_opt_in_required".into()),
+            }),
+            Some(FastLane {
+                state: "on".into(),
+                disabled_reason: None,
+            }),
+        ] {
+            let mut t = Transcript::new();
+            t.apply(1, &[rec(1, init(quiet.clone()))]).unwrap();
+            assert_eq!(
+                markers(&t),
+                vec!["session started (s1)".to_string()],
+                "{quiet:?} is not a refusal"
+            );
+        }
+    }
+
+    /// **Slice TN1.** Codex states WHY a turn failed in an `error`
+    /// notification that eave journals verbatim under `System`; the line
+    /// below is the real one from 2026-09-02, cut to its shape. Before
+    /// this the transcript said only `turn completed with error`.
+    #[test]
+    fn a_codex_error_notification_says_its_reason_in_the_transcript() {
+        let raw = r#"{"method":"error","params":{"error":{"message":"{\n  \"type\": \"error\",\n  \"error\": {\n    \"type\": \"invalid_request_error\",\n    \"code\": \"unsupported_value\",\n    \"message\": \"Unsupported value: 'max' is not supported with the 'gpt-5.5' model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.\",\n    \"param\": \"reasoning.effort\"\n  },\n  \"status\": 400\n}","codexErrorInfo":"other","additionalDetails":null},"willRetry":false,"threadId":"t1","turnId":"u1"}}"#;
+        let mut t = Transcript::new();
+        t.apply(
+            1,
+            &[
+                rec(
+                    1,
+                    JournalEvent::Provider {
+                        event: SessionEvent::System {
+                            subtype: "error".into(),
+                            raw: raw.into(),
+                        },
+                    },
+                ),
+                rec(
+                    2,
+                    JournalEvent::Provider {
+                        event: SessionEvent::TurnCompleted {
+                            subtype: "failed".into(),
+                            is_error: true,
+                        },
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        let markers: Vec<String> = t
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Marker { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            vec![
+                concat!(
+                    "the CLI reported an error: Unsupported value: 'max' is not supported ",
+                    "with the 'gpt-5.5' model. Supported values are: 'none', 'low', ",
+                    "'medium', 'high', and 'xhigh'."
+                )
+                .to_string(),
+                "turn completed with error".to_string(),
+            ]
+        );
+        // A plain string message is kept as it is; a frame of another
+        // shape says nothing.
+        assert_eq!(
+            provider_error_text(r#"{"method":"error","params":{"error":{"message":"boom"}}}"#)
+                .as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            provider_error_text(r#"{"method":"error","params":{}}"#),
+            None
+        );
+    }
+
     /// **Slice AR2.** The inventory is derived by replay like every other
     /// fact here, and that is what saves it a channel of its own.
     ///
@@ -1227,6 +1403,7 @@ mod tests {
     fn the_inventory_is_replayed_and_the_latest_init_wins() {
         let init = |names: &[&str]| JournalEvent::Provider {
             event: SessionEvent::Init {
+                fast_lane: None,
                 session_id: "s1".into(),
                 permission_mode: Some("default".into()),
                 slash_commands: names.iter().map(|n| (*n).to_string()).collect(),

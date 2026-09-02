@@ -967,6 +967,7 @@ impl Reader {
     /// subject.
     async fn announce(&self, session_id: String, permission_mode: Option<String>) {
         self.emit(SessionEvent::Init {
+            fast_lane: None,
             session_id,
             permission_mode,
             // Empty is the honest answer, not a placeholder: this provider

@@ -588,6 +588,7 @@ impl CursorProto {
         }
         self.announced = true;
         vec![SessionEvent::Init {
+            fast_lane: None,
             session_id,
             permission_mode: Some(mode.unwrap_or("acp").to_string()),
             slash_commands: Vec::new(),

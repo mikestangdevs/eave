@@ -164,6 +164,33 @@ pub struct ToolDiff {
     pub new_text: String,
 }
 
+/// What a CLI said about its fast lane when it started (Slice TN1). The
+/// words are the CLI's, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastLane {
+    /// `on` or `off`, as stated.
+    pub state: String,
+    /// Why it is off, when the CLI says why (`extra_usage_disabled`,
+    /// `sdk_opt_in_required`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+impl FastLane {
+    /// The CLI was asked for the lane and said no. `sdk_opt_in_required`
+    /// is what a Claude that was NOT asked answers in headless mode, so it
+    /// is not a refusal of anything — it is the default's shape.
+    pub fn refused(&self) -> Option<&str> {
+        if self.state == "on" {
+            return None;
+        }
+        match self.disabled_reason.as_deref() {
+            None | Some("sdk_opt_in_required") => None,
+            Some(reason) => Some(reason),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -199,6 +226,17 @@ pub enum SessionEvent {
         /// has to ask the disk.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         slash_commands: Vec<String>,
+        /// The CLI's own answer about its fast lane (Slice TN1). Claude
+        /// Code 2.1.258 states it on `system/init` as `fast_mode_state`
+        /// (`on` / `off`) with a `fast_mode_disabled_reason` when off —
+        /// measured 2026-09-02: with nothing asked the reason is
+        /// `sdk_opt_in_required`; with eave's `--settings
+        /// '{"fastMode":true}'` it became `extra_usage_disabled` on this
+        /// plan, which is the CLI refusing what the operator asked for.
+        /// `None` = the CLI said nothing (every other provider, an older
+        /// Claude, or a journal written before this field).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_lane: Option<FastLane>,
     },
     /// Incremental assistant text (from partial-message stream events).
     TextDelta { text: String },

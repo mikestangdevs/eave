@@ -833,6 +833,7 @@ impl GrokProto {
         };
         let mode = if yolo { GROK_MODE_YOLO } else { GROK_MODE_ASKS };
         let mut out = vec![SessionEvent::Init {
+            fast_lane: None,
             session_id,
             permission_mode: Some(mode.to_string()),
             // Empty is the honest answer, not a placeholder: this
@@ -851,6 +852,7 @@ impl GrokProto {
         let mut out = Vec::new();
         if let Some(session_id) = self.session_id.clone() {
             out.push(SessionEvent::Init {
+                fast_lane: None,
                 session_id,
                 permission_mode: None,
                 // Empty is the honest answer, not a placeholder: this

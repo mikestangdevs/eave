@@ -987,6 +987,7 @@ impl CodexProtocol {
         // posture sets it.
         self.thread_id = Some(id.clone());
         let init = SessionEvent::Init {
+            fast_lane: None,
             session_id: id.clone(),
             permission_mode: Some(mode.clone()),
             // Empty is the honest answer, not a placeholder: this

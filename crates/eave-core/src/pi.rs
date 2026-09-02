@@ -1129,6 +1129,7 @@ impl PiStream {
             )];
         };
         vec![SessionEvent::Init {
+            fast_lane: None,
             session_id,
             permission_mode: Some(GATE_POSTURE.into()),
             // Empty is the honest answer, not a placeholder: this
@@ -1439,6 +1440,7 @@ mod tests {
         assert_eq!(
             events,
             vec![SessionEvent::Init {
+                fast_lane: None,
                 session_id: "eave-abc-123".into(),
                 permission_mode: Some("eave-gate".into()),
                 // Empty is the honest answer, not a placeholder: this

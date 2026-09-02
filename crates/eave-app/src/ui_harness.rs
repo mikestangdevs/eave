@@ -11930,6 +11930,7 @@ fn init_record(seq: u64, slash_commands: &[&str]) -> eave_core::journal::Record 
         ts_ms: seq * 10,
         event: eave_core::journal::JournalEvent::Provider {
             event: eave_core::events::SessionEvent::Init {
+                fast_lane: None,
                 session_id: "aaaa1111".into(),
                 permission_mode: Some("default".into()),
                 slash_commands: slash_commands.iter().map(|s| (*s).to_string()).collect(),

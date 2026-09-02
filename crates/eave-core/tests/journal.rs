@@ -124,6 +124,7 @@ fn journal_round_trips_records() {
     let mut w = JournalWriter::create(&path, &header).unwrap();
     let written = vec![
         w.append(provider(SessionEvent::Init {
+            fast_lane: None,
             session_id: "s1".into(),
             permission_mode: Some("default".into()),
             slash_commands: Vec::new(),
@@ -369,6 +370,7 @@ fn crash_tail_repair_settles_open_turn_as_interrupted() {
     let path = root.join("journal.jsonl");
     let mut w = JournalWriter::create(&path, &test_header("s1")).unwrap();
     w.append(provider(SessionEvent::Init {
+        fast_lane: None,
         session_id: "s1".into(),
         permission_mode: Some("default".into()),
         slash_commands: Vec::new(),
@@ -1109,6 +1111,7 @@ fn an_init_carries_its_command_inventory_through_the_journal_and_an_old_one_stil
     let path = dir.join("journal.jsonl");
     let mut w = JournalWriter::create(&path, &test_header("s1")).unwrap();
     w.append(provider(SessionEvent::Init {
+        fast_lane: None,
         session_id: "s1".into(),
         permission_mode: Some("default".into()),
         slash_commands: vec!["context".into(), "craft-skills:seams".into()],
@@ -1136,6 +1139,7 @@ fn an_init_carries_its_command_inventory_through_the_journal_and_an_old_one_stil
         seq: 1,
         ts_ms: 1,
         event: provider(SessionEvent::Init {
+            fast_lane: None,
             session_id: "s1".into(),
             permission_mode: Some("default".into()),
             slash_commands: Vec::new(),
