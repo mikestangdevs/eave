@@ -729,7 +729,7 @@ fn note_url(tab_id: &str, url: &str) -> bool {
 /// The initiator of a top-level navigation, for
 /// [`super::nav_policy::decide`] — `None` on a tab's very first load, which
 /// the policy treats as cross-site.
-fn last_url(tab_id: &str) -> Option<String> {
+pub(super) fn last_url(tab_id: &str) -> Option<String> {
     LAST_URL.with(|u| u.borrow().get(tab_id).cloned())
 }
 
@@ -1065,26 +1065,42 @@ pub(super) fn probe_click(tab_id: &str) {
     let Ok(spec) = std::env::var("EAVE_WEB_PROBE_CLICK") else {
         return;
     };
-    // `x,y` is a whole click; `x,y,hold` presses and does not release.
+    // `x,y` is a whole click; `x,y,hold` presses and does not release;
+    // `x,y,right` is a left click followed by a right one.
     //
-    // Both are needed and neither is the obvious default for the other. A
-    // `<button onclick=…>` fires on the UP, so a held press does nothing at
-    // all; a `<select>` opens on the DOWN and the matching up closes it
-    // again, so a whole click leaves nothing on screen to photograph. The
-    // full click is the default because it is what a person does.
+    // The first two are needed and neither is the obvious default for the
+    // other. A `<button onclick=…>` fires on the UP, so a held press does
+    // nothing at all; a `<select>` opens on the DOWN and the matching up
+    // closes it again, so a whole click leaves nothing on screen to
+    // photograph. The full click is the default because it is what a
+    // person does.
+    //
+    // **`right` sends BOTH buttons, and that is stated rather than
+    // hidden** — slice D20 needs a context menu over a *marked
+    // misspelling*, and Chromium marks one in a field that has been
+    // focused. A person arrives at that field having clicked or tabbed
+    // into it; a probe has no hover and no history, so the left click is
+    // how it gets there. It proves less than a real right-click for the
+    // same reason the whole instrument does (no gpui hit-testing, no
+    // window-to-page conversion) and exactly enough for this: that
+    // Chromium fills `misspelled_word` and eave carries it out.
     let mut parts = spec.split(',');
     let (Some(x), Some(y)) = (parts.next(), parts.next()) else {
-        eprintln!("eave: EAVE_WEB_PROBE_CLICK wants `x,y` or `x,y,hold`, got {spec:?}");
+        eprintln!(
+            "eave: EAVE_WEB_PROBE_CLICK wants `x,y`, `x,y,hold` or `x,y,right`, got {spec:?}"
+        );
         return;
     };
-    let hold = parts.next().map(str::trim) == Some("hold");
+    let third = parts.next().map(str::trim);
+    let hold = third == Some("hold");
+    let right = third == Some("right");
     let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) else {
         eprintln!("eave: EAVE_WEB_PROBE_CLICK wants two numbers, got {spec:?}");
         return;
     };
     let at = gpui::point(gpui::px(x), gpui::px(y));
     let m = gpui::Modifiers::default();
-    eprintln!("[web] probe click at {x},{y} in {tab_id} (hold={hold})");
+    eprintln!("[web] probe click at {x},{y} in {tab_id} (hold={hold} right={right})");
     with_browser(tab_id, |b| {
         // Focus first, for the same reason `page.rs` does it on a real
         // click: a page that has never been focused receives no input.
@@ -1092,6 +1108,10 @@ pub(super) fn probe_click(tab_id: &str) {
         super::input::mouse_button(b, at, &m, MouseButtonType::LEFT, false, 1);
         if !hold {
             super::input::mouse_button(b, at, &m, MouseButtonType::LEFT, true, 1);
+        }
+        if right {
+            super::input::mouse_button(b, at, &m, MouseButtonType::RIGHT, false, 1);
+            super::input::mouse_button(b, at, &m, MouseButtonType::RIGHT, true, 1);
         }
     });
     super::host::note_activity();
@@ -2288,6 +2308,32 @@ wrap_load_handler! {
             LOADED.with(|l| {
                 l.borrow_mut().insert(self.tab_id.clone());
             });
+            // A7/C7: if eave took this tab's browser away while it was
+            // scrolled, put the page back where it was. `take` answers
+            // only for the address the offset belongs to and only once,
+            // so an ordinary load, a reload and a history walk all get
+            // nothing from here — those are Chromium's to restore, and it
+            // restores them from the navigation entry, which is better
+            // than anything this process could reconstruct.
+            //
+            // `execute_java_script` rather than `cdp_evaluate`: nothing
+            // needs to come back, and a CDP round trip on a browser that
+            // has only just been re-created is the one shape with a
+            // measured hazard behind it (see `web/peek.rs` on the
+            // creation gap).
+            let here = CefString::from(&frame.url()).to_string();
+            if let Some((x, y)) = super::scroll::take(&self.tab_id, &here) {
+                if trace() {
+                    eprintln!("[web] restoring scroll {x},{y} on {}", self.tab_id);
+                }
+                frame.execute_java_script(
+                    Some(&CefString::from(
+                        super::scroll::restore_script(x, y).as_str(),
+                    )),
+                    None,
+                    0,
+                );
+            }
             // E9's instrument. `EAVE_CDP_EVAL=<expr>` drives this page once
             // per load and prints its own answer; a no-op with the var
             // unset, which is every ordinary run.

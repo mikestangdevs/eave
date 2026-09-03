@@ -825,6 +825,23 @@ wrap_render_handler! {
             super::host::note_chrome_change();
         }
 
+        /// Chromium moved the page's scroll offset — 06-browser A7.
+        ///
+        /// The row asked for "scroll position known to chrome" and this is
+        /// the whole of it: the callback existed and nothing filled it, so
+        /// eave's only idea of where a page stood was the pixels. What
+        /// reads it is [`super::scroll`], which puts the position back
+        /// after eave has taken a browser away to reclaim memory.
+        ///
+        /// **No `note_chrome_change` here**, unlike the selection and the
+        /// context menu two callbacks up. Those change chrome-visible
+        /// state on a still page and have to ask for the frame that draws
+        /// them; a scroll has already repainted the page by definition,
+        /// and asking again would be a second frame per scrolled pixel.
+        fn on_scroll_offset_changed(&self, _browser: Option<&mut Browser>, x: f64, y: f64) {
+            super::scroll::note(&self.tab_id, x, y);
+        }
+
         /// **A drag began inside the page** — 06-browser A5.
         ///
         /// Returning 1 takes the drag over. Returning 0 (the trait default)

@@ -208,6 +208,10 @@ pub fn forget(tab_id: &str) {
     SEEN.with(|s| {
         s.borrow_mut().remove(tab_id);
     });
+    // Where it was scrolled goes with it. A tab that is gone cannot be
+    // revived, so an armed restore could only ever fire on whatever tab id
+    // came next.
+    super::scroll::forget(tab_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +350,17 @@ pub fn tick() {
         if traced() {
             eprintln!("[web] evicting idle tab {id}");
         }
+        // **The one place a scroll restore is armed.** Here, and not in
+        // `close_browser_for`, because that is the funnel every close goes
+        // through — a tab the operator closed would arm a restore for a
+        // tab that is never coming back. And here rather than at load-end,
+        // because the invariant is that eave puts back only what eave took
+        // away; every other navigation's scroll position is Chromium's own
+        // and it does it better. See `scroll`'s module note.
+        //
+        // Outside the borrows above, like the close itself: this reads
+        // `LAST_URL` and this module's own cells.
+        super::scroll::note_evicted(&id, super::tabs::last_url(&id).as_deref());
         super::tabs::close_browser_for(&id);
     }
 }

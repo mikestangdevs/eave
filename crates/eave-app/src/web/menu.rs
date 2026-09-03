@@ -108,11 +108,27 @@ cef::wrap_context_menu_handler! {
 
             if super::host::traced() {
                 eprintln!(
-                    "[web] context menu at ({}, {}) link={:?} selection={:?}",
+                    "[web] context menu at ({}, {}) link={:?} selection={:?} \
+                     editable={} spellcheck={} misspelled={:?}",
                     menu.x,
                     menu.y,
                     menu.link_url.is_some(),
-                    menu.selection.is_some()
+                    menu.selection.is_some(),
+                    menu.editable,
+                    // **The two that separate a missed click from a dead
+                    // feature**, and the reason they are traced together.
+                    // A right-click inside a `<textarea>` of `teh` reads
+                    // `editable=true spellcheck=false misspelled=None` on
+                    // this framework (2026-09-03): the click found the
+                    // field, and Chromium's checker is not running — CEF
+                    // 151 ships no renderer-side spellchecker at all, in
+                    // the official binary or in this tree's codecs build.
+                    // Without both flags on this line the same reading is
+                    // indistinguishable from a probe that missed by ten
+                    // pixels, which is how D20 stayed "cost M" in the
+                    // audit for a week. See the BR5 report.
+                    params.is_spell_check_enabled() == 1,
+                    string_of(params.misspelled_word())
                 );
             }
 

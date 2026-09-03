@@ -126,6 +126,10 @@ pub mod ime;
 /// What the page has selected, as the chrome knows it (06-browser A4).
 /// Ungated for `ime`'s reason — it is a map and the rules for updating it.
 pub mod selection;
+/// Where the page is scrolled, and putting it back after an eviction
+/// (06-browser A7, and half of C7). Ungated for `selection`'s reason — it
+/// is two maps, a threshold and one generated line of JavaScript.
+pub mod scroll;
 /// Drag & drop as the chrome and the page share it (06-browser A5).
 /// Ungated for `selection`'s reason — it is a map and the rules for
 /// updating it. The four `drag_target_*` calls and `start_dragging` are

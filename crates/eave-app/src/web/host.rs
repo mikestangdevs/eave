@@ -759,18 +759,35 @@ wrap_app! {
             );
             // WebAuthn's API is removed from the renderer separately
             // (`WebAuth` is a BLINK runtime feature, not a base::Feature).
-            // Not the crash — but the platform authenticator genuinely
-            // cannot work here: it needs the
-            // `.org.chromium.Chromium.webauthn` keychain-access-group
-            // entitlement, which an unsigned bundle cannot carry, so
-            // Chromium logs "Touch ID authenticator unavailable" and the
-            // passkey prompt can only fail. With the API absent, sites
-            // fall back to passwords, which work. Revisit when bundles
-            // are signed with the entitlement.
-            command_line.append_switch_with_value(
-                Some(&CefString::from("disable-blink-features")),
-                Some(&CefString::from("WebAuth")),
-            );
+            // Not the crash — but the platform authenticator cannot work
+            // here: it needs the `.org.chromium.Chromium.webauthn`
+            // keychain-access-group entitlement, which an unsigned bundle
+            // cannot carry, so Chromium logs "Touch ID authenticator
+            // unavailable" and the passkey prompt can only fail. With the
+            // API absent, sites fall back to passwords, which work — a
+            // present `PublicKeyCredential` that always fails is worse
+            // than an absent one, because it is what sites branch on.
+            //
+            // **`EAVE_WEB_ENABLE_WEBAUTHN=1` puts the API back, for
+            // measuring and nothing else.** The note this replaces said
+            // "revisit when bundles are signed" and gave nobody a way to
+            // revisit: answering it meant editing this line and building
+            // 379 MB, so for a fortnight the passkey row read
+            // "signing-gated" on an argument rather than a reading. The
+            // switch is off by default, is never set by the product, and
+            // exists so that the day there is a Developer ID certificate
+            // the question takes one launch instead of one build. What it
+            // cannot do is make passkeys work: CEF's public API has no
+            // WebAuthn surface at all, so an embedder cannot hand
+            // Chromium the keychain access group the mac authenticator is
+            // configured from — signing is necessary and, on this
+            // evidence, not sufficient. See the BR5 report.
+            if std::env::var_os("EAVE_WEB_ENABLE_WEBAUTHN").is_none() {
+                command_line.append_switch_with_value(
+                    Some(&CefString::from("disable-blink-features")),
+                    Some(&CefString::from("WebAuth")),
+                );
+            }
         }
     }
 }
