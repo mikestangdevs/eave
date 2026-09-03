@@ -132,6 +132,13 @@ pub fn note_snapshot(snapshot: &TabsSnapshot) {
     LAST.with(|l| *l.borrow_mut() = Some(snapshot.clone()));
 }
 
+/// The last strip we were handed, for anything else that has to run
+/// between snapshots (the notification and audible shims do — see
+/// `web::tick_shims`).
+pub fn last_snapshot() -> Option<TabsSnapshot> {
+    LAST.with(|l| l.borrow().clone())
+}
+
 /// A browser exists for this tab again. Clears the evicted mark: whatever
 /// this tab is now, it is resident.
 pub fn note_created(tab_id: &str) {

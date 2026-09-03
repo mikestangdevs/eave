@@ -1,8 +1,16 @@
 # CEF with proprietary codecs — pin 151.3.18
 
-Drop-in replacement for the Spotify `minimal` tarball named in
-`dist/cef/pin.env`. Same CEF commit, same Chromium tag, same crate
-(`151.6.0+151.3.18`). Different GN args, so a different SHA1.
+**2026-08-29: GATE met.** Artefact at `~/.local/share/cef-codecs`
+(SHA1 `5e0a810c384cbdf9eb8fc96b9fdf3b985d4a205d`). Live H.264 PASS,
+VP9 still plays, `pin.env` SHA1 written, `check-cef-pin.sh --strict`
+consistent with `CEF_PATH=$HOME/.local/share/cef-codecs`. **Do not
+start another Chromium checkout.** Report:
+`docs/reports/stage-br1-codecs.md`.
+
+Drop-in replacement for the Spotify `minimal` tarball that used to be
+named in `dist/cef/pin.env` (`8245a003…`, `proprietary_codecs=false`).
+Same CEF commit, same Chromium tag, same crate (`151.6.0+151.3.18`).
+Different GN args, so a different SHA1.
 
 This is build infrastructure. It does not change `crates/eave-app/src/web/`.
 

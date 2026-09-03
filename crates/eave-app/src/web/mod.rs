@@ -151,6 +151,8 @@ mod favicon;
 #[cfg(feature = "web")]
 mod find;
 #[cfg(feature = "web")]
+mod cdm;
+#[cfg(feature = "web")]
 mod host;
 #[cfg(feature = "web")]
 mod input;
@@ -204,6 +206,8 @@ pub use ask::{any_pending, certificate_explanation, masked, pending, Answer, Ask
 pub use dialogs::answer;
 #[cfg(feature = "web")]
 pub use host::{initialize, install_nsapp, request_quit, shutdown, start_pump};
+#[cfg(feature = "web")]
+pub use pdf::scheme_app;
 #[cfg(feature = "web")]
 pub use page::{page_element, page_focus_handle, set_keyboard_page, set_live_divider};
 #[cfg(feature = "web")]
@@ -618,8 +622,9 @@ pub fn favicon_image(tab_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
 }
 
 /// The favicon for any url, by host — for surfaces that have an address
-/// but no tab. The rail's pinned bookmark grid (Slice T1b) is the caller.
-/// Sized for the 16 logical bookmark mark (32 device on 2×).
+/// but no tab. The rail's pinned bookmark grid and the links inside an
+/// open folder are the callers. Sized for the 16 logical bookmark mark
+/// (32 device on 2×).
 pub fn favicon_for_url(url: &str) -> Option<std::sync::Arc<gpui::Image>> {
     #[cfg(test)]
     {
@@ -1373,6 +1378,32 @@ pub fn drive_notifications(snapshot: &eave_wire::TabsSnapshot) {
     // they came for — a second timer would only add a way for one to starve
     // the other.
     audible::drive(snapshot);
+}
+
+/// The same turn, from the **pump**, between paints.
+///
+/// The render pass is the wrong clock on its own: gpui paints on input and
+/// on animation, and a page that calls `requestPermission()` or
+/// `new Notification()` while the operator's hands are still is an event
+/// nobody reads. Measured 2026-09-03 — a page asked 600 ms after load and
+/// its promise hung until a synthetic click made a frame; the toast timer
+/// has the same shape (a toast outlived `TOAST_MS` until something else
+/// repainted). E3's eviction clock learnt this first and reads the pump;
+/// this reads the snapshot E3 cached for the same reason.
+///
+/// A change to what is on screen asks for a frame through the chrome-dirty
+/// flag the page pipeline already uses, so the pump does not paint by
+/// itself and an idle window stays idle (N4).
+#[cfg(feature = "web")]
+pub(super) fn tick_shims() {
+    let Some(snapshot) = evict::last_snapshot() else {
+        return;
+    };
+    let before = notify::live();
+    drive_notifications(&snapshot);
+    if notify::live() != before {
+        host::note_chrome_change();
+    }
 }
 
 /// C4 — whether this tab is making a noise.

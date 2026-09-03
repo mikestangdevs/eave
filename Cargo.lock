@@ -1652,6 +1652,7 @@ name = "eave-app"
 version = "0.1.0"
 dependencies = [
  "bezel",
+ "block2 0.6.2",
  "cef",
  "core-foundation 0.10.1",
  "core-video",
@@ -1664,8 +1665,10 @@ dependencies = [
  "image",
  "libc",
  "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
  "objc2-io-surface",
  "objc2-metal 0.3.2",
+ "objc2-user-notifications",
  "serde",
  "serde_json",
  "tokio",

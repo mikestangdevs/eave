@@ -2503,7 +2503,10 @@ fn persist_finished(d: &Download) {
                 file_name: d.file_name.clone(),
                 path: d.path.clone(),
                 bytes: d.received,
-                ts_ms: 0,
+                // When it finished — the panel's "when". Was a literal 0,
+                // so every restored row read as the epoch (walked
+                // 2026-09-03).
+                ts_ms: super::host::now_ms(),
             });
             let _ = log.flush();
         }
@@ -2652,10 +2655,16 @@ wrap_download_handler! {
                     },
                 )
             });
-            if let Some(callback) = callback {
-                callback.cont(Some(&CefString::from(&*target.to_string_lossy())), 0);
+            // CEF's contract (walked 2026-09-03, `download_manager_delegate_impl.cc:446`
+            // logs an ERROR otherwise): return true when the callback was
+            // executed here, false when it is held for later.
+            match callback {
+                Some(callback) => {
+                    callback.cont(Some(&CefString::from(&*target.to_string_lossy())), 0);
+                    1
+                }
+                None => 0,
             }
-            0
         }
 
         /// Progress, completion and cancellation.
@@ -2679,11 +2688,33 @@ wrap_download_handler! {
                     c.borrow_mut().insert(id, callback.clone());
                 });
             }
+            let path = CefString::from(&item.full_path()).to_string();
+            // `suggested_file_name` is only filled on the item CEF hands to
+            // `on_before_download`; on updates it is empty, and the journal
+            // wrote `"file_name":""` for every finished download (walked
+            // 2026-09-03). The name is what `on_before_download` stored, or
+            // the path's own last segment.
+            let file_name = {
+                let suggested = CefString::from(&item.suggested_file_name()).to_string();
+                if !suggested.is_empty() {
+                    suggested
+                } else {
+                    DOWNLOADS
+                        .with(|d| d.borrow().get(&id).map(|p| p.file_name.clone()))
+                        .filter(|n| !n.is_empty())
+                        .or_else(|| {
+                            std::path::Path::new(&path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                        })
+                        .unwrap_or_default()
+                }
+            };
             let next = Download {
                 id,
                 url: CefString::from(&item.url()).to_string(),
-                file_name: CefString::from(&item.suggested_file_name()).to_string(),
-                path: CefString::from(&item.full_path()).to_string(),
+                file_name,
+                path,
                 received: item.received_bytes(),
                 total: item.total_bytes(),
                 percent: item.percent_complete(),

@@ -139,7 +139,10 @@ fn serve(url: &str) -> (String, Vec<u8>) {
                 None => ("text/plain".into(), b"could not fetch pdf".to_vec()),
             }
         }
-        _ => ("text/html; charset=utf-8".into(), VIEWER.as_bytes().to_vec()),
+        // MIME must be the bare type. `text/html; charset=utf-8` in
+        // CefResponse::SetMimeType is not HTML to Chromium — the viewer
+        // was served as a source listing (live walk 2026-08-29).
+        _ => ("text/html".into(), VIEWER.as_bytes().to_vec()),
     }
 }
 
@@ -167,13 +170,6 @@ wrap_scheme_handler_factory! {
 
 /// Register `eave:` and the factory. Call AFTER `CefInitialize`.
 pub fn register() {
-    let opts = (SchemeOptions::STANDARD.get_raw()
-        | SchemeOptions::SECURE.get_raw()
-        | SchemeOptions::CORS_ENABLED.get_raw()
-        | SchemeOptions::FETCH_ENABLED.get_raw()
-        | SchemeOptions::CSP_BYPASSING.get_raw()) as i32;
-    // The registrar half already ran in `on_register_custom_schemes`.
-    let _ = opts;
     let mut factory = PdfSchemeFactory::new();
     register_scheme_handler_factory(
         Some(&CefString::from("eave")),
@@ -182,13 +178,36 @@ pub fn register() {
     );
 }
 
-/// Options for `on_register_custom_schemes` — must match [`register`].
+/// Options for `on_register_custom_schemes` — must match the factory.
 pub fn scheme_options() -> i32 {
     (SchemeOptions::STANDARD.get_raw()
         | SchemeOptions::SECURE.get_raw()
         | SchemeOptions::CORS_ENABLED.get_raw()
         | SchemeOptions::FETCH_ENABLED.get_raw()
         | SchemeOptions::CSP_BYPASSING.get_raw()) as i32
+}
+
+// CefApp for subprocess CefExecuteProcess.
+//
+// Chromium's network service is a helper. Custom schemes are unknown to
+// it unless OnRegisterCustomSchemes runs in that process. Passing None
+// for the helper's CefApp produced eave://pdf navigations that died in
+// network.mojom.NetworkContext (VALIDATION_ERROR_DESERIALIZATION_FAILED)
+// after a correct rewrite — a blank tab. The browser process already
+// registers via EaveCefApp; the helper must too.
+wrap_app! {
+    struct SchemeApp {}
+
+    impl App {
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            let Some(registrar) = registrar else { return };
+            registrar.add_custom_scheme(Some(&CefString::from("eave")), scheme_options());
+        }
+    }
+}
+
+pub fn scheme_app() -> App {
+    SchemeApp::new()
 }
 
 #[cfg(test)]
@@ -198,7 +217,7 @@ mod tests {
     #[test]
     fn the_viewer_html_is_a_page() {
         let (mime, body) = serve("eave://pdf/view?u=https%3A%2F%2Fx.test%2Fa.pdf");
-        assert!(mime.starts_with("text/html"));
+        assert_eq!(mime, "text/html");
         let s = String::from_utf8_lossy(&body);
         assert!(s.contains("pdf.min.mjs"));
         assert!(s.contains("getDocument"));

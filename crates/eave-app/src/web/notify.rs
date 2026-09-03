@@ -213,8 +213,15 @@ pub fn permission_call(state: &str) -> (&'static str, Value) {
 ///
 /// Steps 4 and 5 carry the same source, which is why the shim guards
 /// against installing itself twice.
+#[cfg(test)]
 pub fn install_calls() -> Vec<(&'static str, Value)> {
-    let source = shim_source();
+    install_calls_with(&[])
+}
+
+/// [`install_calls`] with the decided origins baked into the shim, so a
+/// page reads the right `Notification.permission` from its first line.
+pub fn install_calls_with(states: &[(String, &'static str)]) -> Vec<(&'static str, Value)> {
+    let source = shim_source_with(states);
     vec![
         ("Runtime.enable", json!({})),
         ("Page.enable", json!({})),
@@ -229,14 +236,36 @@ pub fn install_calls() -> Vec<(&'static str, Value)> {
 /// Deliberately an ordinary function on the global rather than anything
 /// hidden. It cannot be hidden — see the module docs — so pretending
 /// otherwise would only mislead whoever reads this next.
+#[cfg(test)]
 pub fn shim_source() -> String {
+    shim_source_with(&[])
+}
+
+/// The shim with `Notification.permission` seeded per origin.
+///
+/// **Why the state is baked in and not pushed.** The new-document script
+/// runs before the page's first line; eave's push (`permission_call`)
+/// arrives on a later pump, after the load. A page that reads
+/// `Notification.permission` while it boots — Slack, Gmail, every "enable
+/// notifications" nudge — saw `default` for an origin the operator had
+/// granted, and never posted (measured 2026-09-03: `perm=default shim=true`
+/// on a granted origin, `granted` only after `requestPermission()`). The
+/// map is keyed by `location.origin`, which spells an origin exactly as
+/// eave's store does (`scheme://host[:port]`), and it is re-baked whenever
+/// the store changes — see `install_where_needed`.
+pub fn shim_source_with(states: &[(String, &'static str)]) -> String {
+    let states: serde_json::Map<String, Value> = states
+        .iter()
+        .map(|(origin, state)| (origin.clone(), Value::from(*state)))
+        .collect();
     // `{{` / `}}` are format escapes; this is a `format!` so the two names
     // stay in one place rather than being spelled again in JS.
     format!(
         r#"(function(){{
   if (globalThis.{ACK}) return;
   var pending = new Map();
-  var permission = "default";
+  var STATES = {STATES};
+  var permission = STATES[location.origin] || "default";
   var asks = new Map();
   var next = 1;
   function post(msg) {{
@@ -306,7 +335,26 @@ pub fn shim_source() -> String {
 }})()"#,
         ACK = ACK,
         BINDING = BINDING,
+        STATES = Value::Object(states),
     )
+}
+
+/// Every origin with a notification answer, in the shim's three words.
+fn notification_states() -> Vec<(String, &'static str)> {
+    use eave_core::browser::permissions::{Decision, PermissionKind};
+    super::permissions::grants()
+        .into_iter()
+        .filter(|g| g.permission == PermissionKind::Notifications)
+        .map(|g| {
+            (
+                g.origin,
+                match g.decision {
+                    Decision::Allow => "granted",
+                    Decision::Deny => "denied",
+                },
+            )
+        })
+        .collect()
 }
 
 /// How long a toast stays up before eave takes it down.
@@ -423,7 +471,22 @@ pub fn origin_of(url: &str) -> Option<String> {
 /// `now` is passed rather than read so a test can move time without
 /// sleeping.
 pub fn drive(snapshot: &eave_wire::TabsSnapshot, now: std::time::Instant) {
-    install_where_needed(snapshot);
+    #[cfg(feature = "web")]
+    let has_browser = |id: &str| super::tabs::with_browser(id, |_| ()).is_some();
+    #[cfg(not(feature = "web"))]
+    let has_browser = |_: &str| true;
+    drive_with(snapshot, now, &has_browser);
+}
+
+/// [`drive`] with the one fact it reads from Chromium passed in: whether a
+/// tab has a CEF browser yet. The feature-off build has no browser to ask
+/// and answers `true`; a test answers whatever it is testing.
+pub(crate) fn drive_with(
+    snapshot: &eave_wire::TabsSnapshot,
+    now: std::time::Instant,
+    has_browser: &dyn Fn(&str) -> bool,
+) {
+    install_where_needed(snapshot, has_browser);
     handle_events(snapshot);
     answer_asks();
     expire(now);
@@ -471,7 +534,7 @@ fn answer_asks() {
 /// binding were installed on that browser, which they were. Re-installing
 /// on navigation is therefore belt-and-braces, and cheap, and it is what
 /// makes the first page of a session work as well as the second.
-fn install_where_needed(snapshot: &eave_wire::TabsSnapshot) {
+fn install_where_needed(snapshot: &eave_wire::TabsSnapshot, has_browser: &dyn Fn(&str) -> bool) {
     for tab in &snapshot.tabs {
         if tab.content != eave_wire::TabContent::Page {
             continue;
@@ -479,20 +542,37 @@ fn install_where_needed(snapshot: &eave_wire::TabsSnapshot) {
         let Some(url) = tab.url.as_deref() else {
             continue;
         };
-        if origin_of(url).is_none() {
+        let Some(origin) = origin_of(url) else {
             continue;
-        }
+        };
         let id = tab.id.to_string();
-        let fresh = INSTALLED.with(|i| i.borrow().get(&id).map(String::as_str) != Some(url));
+        // Keyed by URL AND the permission store's generation: an answer
+        // given anywhere re-bakes every tab's new-document script, so the
+        // next document each tab loads starts with the current state.
+        let key = format!("{url}\n{}", super::permissions::generation());
+        let fresh = INSTALLED.with(|i| i.borrow().get(&id) != Some(&key));
         if !fresh {
             continue;
         }
+        // A tab can be in the snapshot a frame before its CEF browser
+        // exists. Marking it installed then is a shim that never lands:
+        // `cdp_call` answers NotSent, and a later drive sees the same URL
+        // and skips. Observed live 2026-08-29 — `tab_open` mid-session,
+        // title `no-shim` / `perm=denied`. Wait until there is a browser.
+        // Pinned by `a_tab_whose_browser_is_not_up_yet_is_not_marked_installed`.
+        if !has_browser(&id) {
+            continue;
+        }
         INSTALLED.with(|i| {
-            i.borrow_mut().insert(id.clone(), url.to_string());
+            i.borrow_mut().insert(id.clone(), key);
         });
-        for (method, params) in install_calls() {
+        for (method, params) in install_calls_with(&notification_states()) {
             super::cdp_call(&id, method, &params);
         }
+        // The document that is already open got the baked state only if
+        // this is its first install; a re-bake reaches it by push.
+        let (method, params) = permission_call(permission_state(&origin));
+        super::cdp_call(&id, method, &params);
     }
 }
 
@@ -604,15 +684,30 @@ fn show(tab_id: &str, origin: &str, request: Request) {
             seq,
             tab_id: tab_id.to_string(),
             origin: origin.to_string(),
-            title: request.title,
-            body: request.body,
-            tag: request.tag,
+            title: request.title.clone(),
+            body: request.body.clone(),
+            tag: request.tag.clone(),
             shown: std::time::Instant::now(),
         });
         while l.len() > TOAST_MAX {
             l.remove(0);
         }
     });
+    // In-app toast is the honest display (G2). macOS Notification Center
+    // is the same payload, additionally, so a granted site reaches the
+    // system banner. Failure there must not withhold Shown — the toast
+    // already did the job.
+    #[cfg(all(feature = "web", target_os = "macos"))]
+    macos::post(
+        origin,
+        &request.title,
+        &request.body,
+        if request.tag.is_empty() {
+            format!("eave:{tab_id}:{seq}")
+        } else {
+            format!("eave:tag:{}", request.tag)
+        },
+    );
     // Only now, and only because it is on screen. This line is the slice.
     let (method, params) = ack_call(seq, Ack::Shown);
     super::cdp_call(tab_id, method, &params);
@@ -650,6 +745,238 @@ pub fn permission_state(origin: &str) -> &'static str {
     }
 }
 
+/// macOS Notification Center. The in-app toast is independent and stays.
+///
+/// Tahoe 26 dropped `NSUserNotification` for real: `deliverNotification:`
+/// returns, the class still exists, and usernoted never records the app
+/// (measured 2026-08-29 — zero `ncprefs` hits, no banner, no list row).
+/// The live API is `UNUserNotificationCenter`. That one needs three things
+/// this module cannot fake:
+///
+/// 1. A **bundle signature** with a bound Info.plist (`codesign -s -` is
+///    enough; the linker's `adhoc,linker-signed` identifier is a random
+///    cargo hash and `Info.plist=not bound`). Developer ID is not required.
+/// 2. Launch through LaunchServices (`open` / Dock / double-click), from a
+///    location macOS treats as an app — `~/Applications` works, `/tmp`
+///    returns `UNErrorDomain` code 1 *Notifications are not allowed for
+///    this application* without a prompt.
+/// 3. A delegate that answers `willPresentNotification:` with Banner|List,
+///    or the banner is swallowed while eave is frontmost.
+///
+/// Authorization is asked for on the first post and **never waited for**:
+/// every post goes to `addNotificationRequest` at once. Measured
+/// 2026-08-29: Tahoe answers the ask with `UNErrorDomain` code 1 /
+/// `authorizationStatus` Denied for an unsigned bundle even with Allow on
+/// in System Settings, and the add still completes with `err=nil`; a queue
+/// held until `granted=true` would swallow every post on such a machine.
+/// (GPUI posts the same way.) A refusal here does not withhold
+/// [`Ack::Shown`] — the toast already did that job.
+#[cfg(all(feature = "web", target_os = "macos"))]
+mod macos {
+    use std::sync::{Mutex, OnceLock};
+
+    use block2::RcBlock;
+    use objc2::rc::Retained;
+    use objc2::runtime::{Bool, ProtocolObject};
+    use objc2::{define_class, msg_send, AnyThread};
+    use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
+        UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationSound,
+        UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    };
+
+    /// One notification's payload, as it goes to Notification Center.
+    struct Payload {
+        origin: String,
+        title: String,
+        body: String,
+        id: String,
+    }
+
+    /// Where the one authorization ask stands. `Granted` and `Denied` are
+    /// both terminal for the process — the difference is recorded for the
+    /// trace, and because a later reader will want to know which it was.
+    enum Auth {
+        Idle,
+        Asking,
+        Granted,
+        Denied,
+    }
+
+    /// `Retained<UNUserNotificationCenter>` is neither Send nor Sync in objc2
+    /// 0.6. The objects are process-singletons used from the main thread and
+    /// from Apple's authorization callback; the wrapper is the same leak the
+    /// NSUserNotification delegate used.
+    struct SendCenter(Retained<UNUserNotificationCenter>);
+    unsafe impl Send for SendCenter {}
+    unsafe impl Sync for SendCenter {}
+
+    struct SendDelegate(#[allow(dead_code)] Retained<EaveNcDelegate>);
+    unsafe impl Send for SendDelegate {}
+    unsafe impl Sync for SendDelegate {}
+
+    struct State {
+        /// Strong ref: the center's `delegate` property is weak.
+        _delegate: SendDelegate,
+        center: SendCenter,
+        auth: Mutex<Auth>,
+    }
+
+    fn traced() -> bool {
+        std::env::var_os("EAVE_WEB_TRACE").is_some()
+    }
+
+    fn state() -> Option<&'static State> {
+        static STATE: OnceLock<State> = OnceLock::new();
+        if NSBundle::mainBundle().bundleIdentifier().is_none() {
+            return None;
+        }
+        Some(STATE.get_or_init(|| {
+            let center = UNUserNotificationCenter::currentNotificationCenter();
+            let delegate = EaveNcDelegate::new();
+            center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            State {
+                _delegate: SendDelegate(delegate),
+                center: SendCenter(center),
+                auth: Mutex::new(Auth::Idle),
+            }
+        }))
+    }
+
+    pub(super) fn post(origin: &str, title: &str, body: &str, id: String) {
+        let Some(bundle) = NSBundle::mainBundle().bundleIdentifier() else {
+            if traced() {
+                eprintln!("[web] nc skip: no bundle id");
+            }
+            return;
+        };
+        if traced() {
+            eprintln!("[web] nc post bundle={bundle} id={id}");
+        }
+        let Some(state) = state() else {
+            return;
+        };
+        let payload = Payload {
+            origin: origin.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            id,
+        };
+        // Ask once so a notDetermined app gets the system prompt. Do not
+        // wait for the answer — see the module doc for the measurement
+        // that rules a queue out.
+        {
+            let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*auth, Auth::Idle) {
+                *auth = Auth::Asking;
+                drop(auth);
+                request_authorization(state);
+            }
+        }
+        deliver(&state.center.0, &payload);
+    }
+
+    fn request_authorization(state: &'static State) {
+        let completion = RcBlock::new(move |granted: Bool, error: *mut NSError| {
+            if let Some(error) = unsafe { error.as_ref() } {
+                eprintln!(
+                    "[web] nc UN auth error domain={} code={} {}",
+                    error.domain(),
+                    error.code(),
+                    error.localizedDescription()
+                );
+            }
+            if traced() {
+                eprintln!("[web] nc UN auth granted={}", granted.as_bool());
+            }
+            let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
+            *auth = if granted.as_bool() {
+                Auth::Granted
+            } else if error.is_null() {
+                // The person clicked Don't Allow. Do not ask again this
+                // process. A later launch re-reads the system's answer.
+                Auth::Denied
+            } else {
+                // System refusal (unsigned /tmp copy, LaunchServices
+                // pointing at a sibling bundle, …) is not a user denial.
+                // Stay Idle so a later post can retry after the identity
+                // is right.
+                Auth::Idle
+            };
+        });
+        state
+            .center
+            .0
+            .requestAuthorizationWithOptions_completionHandler(
+                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+                &completion,
+            );
+    }
+
+    fn deliver(center: &UNUserNotificationCenter, pending: &Payload) {
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(&pending.title));
+        if !pending.body.is_empty() {
+            content.setBody(&NSString::from_str(&pending.body));
+        }
+        if !pending.origin.is_empty() {
+            content.setSubtitle(&NSString::from_str(&pending.origin));
+        }
+        content.setSound(Some(&UNNotificationSound::defaultSound()));
+        let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+            &NSString::from_str(&pending.id),
+            &content,
+            None,
+        );
+        let id = pending.id.clone();
+        let completion = RcBlock::new(move |error: *mut NSError| {
+            if let Some(error) = unsafe { error.as_ref() } {
+                eprintln!(
+                    "[web] nc UN add error domain={} code={} {} id={id}",
+                    error.domain(),
+                    error.code(),
+                    error.localizedDescription()
+                );
+            } else if traced() {
+                eprintln!("[web] nc UN delivered id={id}");
+            }
+        });
+        center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[ivars = ()]
+        struct EaveNcDelegate;
+
+        unsafe impl NSObjectProtocol for EaveNcDelegate {}
+
+        unsafe impl UNUserNotificationCenterDelegate for EaveNcDelegate {
+            #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+            fn will_present(
+                &self,
+                _center: &UNUserNotificationCenter,
+                _notification: &UNNotification,
+                completion_handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
+            ) {
+                completion_handler.call((
+                    UNNotificationPresentationOptions::Banner
+                        | UNNotificationPresentationOptions::List
+                        | UNNotificationPresentationOptions::Sound,
+                ));
+            }
+        }
+    );
+
+    impl EaveNcDelegate {
+        fn new() -> Retained<Self> {
+            let this = Self::alloc().set_ivars(());
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,11 +1009,24 @@ mod tests {
     /// starts from nothing. **Origins are per-test on purpose**: the
     /// permission mirror is process-global, not thread-local, and two tests
     /// sharing an origin would hand each other grants.
-    fn reset() {
+    /// The loop tests run as if every tab's browser exists — the
+    /// feature-off `drive` says so anyway, and under `--features web`
+    /// there is no Chromium in a unit test to say it. The one test about
+    /// a browser that is NOT up yet calls `drive_with` itself.
+    fn drive(snapshot: &eave_wire::TabsSnapshot, now: std::time::Instant) {
+        drive_with(snapshot, now, &|_| true);
+    }
+
+    /// Also takes the permission mirror's test gate for the rest of the
+    /// test: `grant` writes the process-wide mirror, and `permissions`'
+    /// own tests reset it under this lock.
+    fn reset() -> std::sync::MutexGuard<'static, ()> {
+        let gate = super::super::permissions::mirror_gate();
         LIVE.with(|l| l.borrow_mut().clear());
         INSTALLED.with(|i| i.borrow_mut().clear());
         let _ = super::super::cdp::drain_events();
         let _ = super::super::take_cdp_calls_for_test();
+        gate
     }
 
     fn snapshot(tab: &str, url: &str) -> eave_wire::TabsSnapshot {
@@ -729,9 +1069,95 @@ mod tests {
         super::super::take_cdp_calls_for_test()
     }
 
+    /// The 2026-08-29 live defect: a `tab_open` snapshot arrives a frame
+    /// before the tab's CEF browser exists. Marking the shim installed on
+    /// that frame is a shim that never lands — `cdp_call` has nothing to
+    /// send to, and the next drive sees the same URL and skips. The page
+    /// then reads `perm=denied` with no shim for the rest of its life.
+    #[test]
+    fn a_tab_whose_browser_is_not_up_yet_is_not_marked_installed() {
+        let _serial = reset();
+        let snap = snapshot("t-early", "https://early.example/app");
+        let now = std::time::Instant::now();
+
+        drive_with(&snap, now, &|_| false);
+        assert!(
+            calls().is_empty(),
+            "nothing to install on: no browser, so no CDP calls"
+        );
+        assert!(
+            !INSTALLED.with(|i| i.borrow().contains_key("t-early")),
+            "a tab with no browser was marked installed — the shim would never land"
+        );
+
+        // The browser comes up; the SAME URL now installs.
+        drive_with(&snap, now, &|_| true);
+        let methods: Vec<String> = calls().into_iter().map(|(_, m, _)| m).collect();
+        assert!(
+            !methods.is_empty() && INSTALLED.with(|i| i.borrow().contains_key("t-early")),
+            "once the browser exists the shim installs: {methods:?}"
+        );
+    }
+
+    /// A page reads `Notification.permission` while it boots. The shim's
+    /// new-document script must already know the answer — a push after
+    /// the load is too late for the page's first line.
+    #[test]
+    fn a_granted_origin_reads_granted_from_the_first_line() {
+        let _serial = reset();
+        let origin = "https://first-line.example";
+        grant(origin);
+        let snap = snapshot("t-first", "https://first-line.example/app");
+        drive(&snap, std::time::Instant::now());
+        let script = calls()
+            .into_iter()
+            .find(|(_, m, _)| m == "Page.addScriptToEvaluateOnNewDocument")
+            .map(|(_, _, p)| p)
+            .expect("the shim is installed for future documents");
+        assert!(
+            script.contains(r#"\"https://first-line.example\":\"granted\""#),
+            "the new-document script does not carry the origin's grant: {script}"
+        );
+    }
+
+    /// An answer given later re-bakes the shim: the next document that
+    /// tab loads starts from the new state, and the open one is pushed.
+    #[test]
+    fn a_new_answer_re_bakes_the_shim() {
+        let _serial = reset();
+        let origin = "https://rebake.example";
+        let snap = snapshot("t-rebake", "https://rebake.example/app");
+        // The permission mirror is process-global and the suite runs in
+        // parallel, so another test's answer can land between these two
+        // drives; the "nothing re-sent" half holds only when none did.
+        let gen = super::super::permissions::generation();
+        drive(&snap, std::time::Instant::now());
+        let _ = calls();
+        drive(&snap, std::time::Instant::now());
+        if gen == super::super::permissions::generation() {
+            assert!(calls().is_empty(), "nothing changed, nothing re-sent");
+        } else {
+            let _ = calls();
+        }
+
+        grant(origin);
+        drive(&snap, std::time::Instant::now());
+        let sent = calls();
+        let script = sent
+            .iter()
+            .find(|(_, m, _)| m == "Page.addScriptToEvaluateOnNewDocument")
+            .map(|(_, _, p)| p.clone())
+            .expect("the answer re-installs the shim");
+        assert!(script.contains(r#"\"https://rebake.example\":\"granted\""#), "{script}");
+        assert!(
+            sent.iter().any(|(_, m, p)| m == "Runtime.evaluate" && p.contains(r#"\"permission\",\"granted\""#)),
+            "the open document is told by push: {sent:?}"
+        );
+    }
+
     #[test]
     fn a_granted_notification_goes_up_and_only_then_is_acked() {
-        reset();
+        let _serial = reset();
         let origin = "https://granted.example";
         grant(origin);
         let snap = snapshot("t1", "https://granted.example/app");
@@ -760,7 +1186,7 @@ mod tests {
     /// The G2 defect, as a test of the whole loop rather than of the shim.
     #[test]
     fn an_ungranted_notification_is_blocked_and_never_goes_up() {
-        reset();
+        let _serial = reset();
         let snap = snapshot("t2", "https://ungranted.example/app");
         let now = std::time::Instant::now();
         drive(&snap, now);
@@ -788,7 +1214,7 @@ mod tests {
     /// it, because they all seed the grant directly.
     #[test]
     fn asking_for_permission_raises_eaves_own_prompt() {
-        reset();
+        let _serial = reset();
         super::super::ask::take("t-ask");
         let snap = snapshot("t-ask", "https://unanswered.example/app");
         let now = std::time::Instant::now();
@@ -817,7 +1243,7 @@ mod tests {
     /// that very origin was still on screen behind it.
     #[test]
     fn an_origin_eave_cannot_name_yet_is_default_not_denied() {
-        reset();
+        let _serial = reset();
         super::super::ask::take("t-noorigin");
         // A page tab with no URL yet — exactly the boot-race shape.
         let mut snap = snapshot("t-noorigin", "https://x.example/");
@@ -842,7 +1268,7 @@ mod tests {
     /// An answered origin is not asked again — G1's rule, through this path.
     #[test]
     fn an_origin_that_already_answered_is_not_prompted_again() {
-        reset();
+        let _serial = reset();
         super::super::ask::take("t-ask2");
         let origin = "https://already.example";
         grant(origin);
@@ -866,7 +1292,7 @@ mod tests {
     /// Once the prompt is gone the page is told, whichever way it went.
     #[test]
     fn the_page_hears_the_answer_once_the_prompt_closes() {
-        reset();
+        let _serial = reset();
         super::super::ask::take("t-ask3");
         let snap = snapshot("t-ask3", "https://waiting.example/app");
         let now = std::time::Instant::now();
@@ -892,7 +1318,7 @@ mod tests {
     /// The security property, exercised through the real path.
     #[test]
     fn a_page_cannot_forge_the_origin_it_notifies_as() {
-        reset();
+        let _serial = reset();
         grant("https://real.example");
         let snap = snapshot("t3", "https://real.example/app");
         let now = std::time::Instant::now();
@@ -915,7 +1341,7 @@ mod tests {
 
     #[test]
     fn a_page_with_no_origin_eave_can_name_cannot_notify() {
-        reset();
+        let _serial = reset();
         // `about:blank`, `file:` and a data URL have no origin a person
         // could act on, so the card would have nothing true to put on its
         // first line.
@@ -931,7 +1357,7 @@ mod tests {
 
     #[test]
     fn a_second_notification_with_the_same_tag_replaces_the_first() {
-        reset();
+        let _serial = reset();
         grant("https://tagged.example");
         let snap = snapshot("t4", "https://tagged.example/app");
         let now = std::time::Instant::now();
@@ -954,7 +1380,7 @@ mod tests {
 
     #[test]
     fn a_page_cannot_park_notifications_on_the_corner_for_ever() {
-        reset();
+        let _serial = reset();
         grant("https://loud.example");
         let snap = snapshot("t5", "https://loud.example/app");
         let now = std::time::Instant::now();
@@ -971,7 +1397,7 @@ mod tests {
 
     #[test]
     fn a_toast_comes_down_by_itself_and_the_page_is_told() {
-        reset();
+        let _serial = reset();
         grant("https://timed.example");
         let snap = snapshot("t6", "https://timed.example/app");
         let now = std::time::Instant::now();
@@ -992,15 +1418,23 @@ mod tests {
 
     #[test]
     fn the_shim_is_installed_once_per_document_not_once_per_frame() {
-        reset();
+        let _serial = reset();
         let snap = snapshot("t7", "https://once.example/app");
         let now = std::time::Instant::now();
+        // The permission mirror is process-global and the suite runs in
+        // parallel: an answer landing in another test re-bakes the shim
+        // (by design), so the quiet frames are asserted only when none did.
+        let gen = super::super::permissions::generation();
         drive(&snap, now);
         let first = calls().len();
         assert!(first >= install_calls().len(), "the first frame installs");
         drive(&snap, now);
         drive(&snap, now);
-        assert_eq!(calls().len(), 0, "later frames must not re-send install");
+        if gen == super::super::permissions::generation() {
+            assert_eq!(calls().len(), 0, "later frames must not re-send install");
+        } else {
+            let _ = calls();
+        }
 
         // ...but a new document does need it again.
         let moved = snapshot("t7", "https://once.example/other");
@@ -1010,7 +1444,7 @@ mod tests {
 
     #[test]
     fn a_tab_that_goes_away_takes_its_toasts_with_it() {
-        reset();
+        let _serial = reset();
         grant("https://closing.example");
         let snap = snapshot("t8", "https://closing.example/app");
         let now = std::time::Instant::now();

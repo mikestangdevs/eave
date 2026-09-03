@@ -63,6 +63,8 @@
     <string>A website you are visiting is asking to use the microphone.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
     <string>A website you are visiting is asking for your location.</string>
+    <key>NSUserNotificationsUsageDescription</key>
+    <string>A website you are visiting wants to send notifications.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>

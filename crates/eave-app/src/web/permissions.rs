@@ -30,7 +30,7 @@
 //! a map and the decision is a pure function of it, so both live here and
 //! the gated caller in `dialogs.rs` is a handful of lines.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 pub use eave_wire::{Grant, PermissionDecision, PermissionKind, Permissions, Verdict};
@@ -47,6 +47,7 @@ pub fn install(grants: Vec<Grant>) {
     if let Ok(mut m) = mirror().write() {
         *m = Permissions::from_grants(grants);
     }
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     // G28: Chromium keeps its own copy and this snapshot has just made
     // eave's disagree with it. The reconciliation cannot happen here —
     // see `NEEDS_REPLAY`.
@@ -243,6 +244,18 @@ pub fn note_answer(origin: &str, kinds: &[PermissionKind], decision: PermissionD
             ts_ms: 0,
         });
     }
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Bumped on every change to the mirror — a snapshot from the engine or an
+/// answer given here. Anything that bakes the mirror's contents into
+/// something long-lived (the notification shim bakes the decided origins
+/// into its new-document script) keys on this so the next pass re-bakes.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Which version of the mirror the caller is looking at.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
 }
 
 /// Everything the mirror holds, origin-ordered. For a surface that lists
@@ -318,6 +331,20 @@ fn reset() {
     NEEDS_REPLAY.store(false, Ordering::Release);
 }
 
+/// The one lock every test that reads or writes the mirror must hold.
+///
+/// The mirror is process-wide by design (see the module docs) and the
+/// suite runs in parallel, so a test in ANOTHER module that grants an
+/// origin and then asks about it races this module's `reset()`. That was
+/// a real flake: under `--features web` two notification tests lost their
+/// grant between two shows (2026-09-03). Poisoning is tolerated, because a
+/// panicking test must not take the rest of the suite with it.
+#[cfg(test)]
+pub(crate) fn mirror_gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,8 +354,7 @@ mod tests {
     /// other's, which is a flake that only appears under `--test-threads`
     /// above one — the worst kind to debug.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let g = GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let g = mirror_gate();
         reset();
         g
     }

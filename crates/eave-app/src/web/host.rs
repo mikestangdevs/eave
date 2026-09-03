@@ -465,6 +465,13 @@ fn pump_cef() {
     // Same reason as the favicons: it creates a browser, which does not
     // belong on a worker thread or inside a CEF callback.
     super::tabs::run_queued_docks();
+    // The notification and audible shims read their CDP events here too,
+    // not only on paint — see `web::tick_shims`.
+    super::tick_shims();
+    // Widevine's first update check, once Chromium has registered its
+    // components — which is AFTER `CefInitialize` returns (0 registered
+    // at that instant, measured 2026-09-03). See `cdm.rs`.
+    super::cdm::poll();
     // Anything Chromium queued while we were inside raised no request, so
     // ask for one more pass. This is what keeps the chain alive; without it
     // the loop runs on the heartbeat alone with work outstanding.
@@ -681,6 +688,29 @@ wrap_app! {
                     format!("http://127.0.0.1:{DEVTOOLS_PORT}").as_str(),
                 )),
             );
+            // ── The keychain prompt, and the switch that skips it ──
+            //
+            // Chromium encrypts cookies with a key it keeps in the login
+            // keychain under "Chromium Safe Storage", and the keychain
+            // item's ACL names the app by its code signature. An ad-hoc
+            // signature is a per-build cdhash, so EVERY rebuilt bundle is a
+            // new app to the keychain, and the first page load raises the
+            // system's "eave wants to use your confidential information"
+            // sheet. Until it is answered the network context has no key
+            // and no navigation starts — the pane stays blank with the URL
+            // in the address field (2026-09-03, measured: renderer up, no
+            // request at the server, `process_requirement.cc` -67030 in
+            // chrome_debug.log). Synthetic clicks do not reach the sheet.
+            //
+            // `EAVE_WEB_MOCK_KEYCHAIN=1` passes Chromium's own
+            // `--use-mock-keychain` (what cefclient and Chromium's tests
+            // use): a fixed key, cookies at rest are NOT protected by the
+            // keychain. It exists for unattended walks on throwaway data
+            // dirs, is off by default, and is not a product setting — a
+            // signed release has one stable identity and is asked once.
+            if std::env::var_os("EAVE_WEB_MOCK_KEYCHAIN").is_some() {
+                command_line.append_switch(Some(&CefString::from("use-mock-keychain")));
+            }
             // ── The Google sign-in crash, and what it actually was ──
             //
             // Loading any accounts.google.com `signin/challenge/*` page
@@ -854,6 +884,7 @@ pub fn initialize(data_dir: &std::path::Path) -> bool {
     } else {
         super::pdf::register();
         super::tabs::restore_downloads(data_dir);
+        super::cdm::arm();
     }
     // **The app object must outlive `initialize`.** It is what vends the
     // browser-process handler, and that handler is the only thing CEF calls

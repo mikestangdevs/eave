@@ -22,6 +22,15 @@ fn main() {
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
 
     let args = cef::args::Args::new();
-    let ret = cef::execute_process(Some(args.as_main_args()), None, std::ptr::null_mut());
+    // Must be Some: Chromium's network/renderer helpers will not know the
+    // `eave:` scheme unless OnRegisterCustomSchemes runs in THIS process.
+    // None here made `eave://pdf` die in NetworkContext after a correct
+    // rewrite (blank PDF tab). See `web/pdf.rs` `scheme_app`.
+    let mut app = eave_app::web::scheme_app();
+    let ret = cef::execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    );
     std::process::exit(ret.max(0));
 }
