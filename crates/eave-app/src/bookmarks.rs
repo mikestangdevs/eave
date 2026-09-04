@@ -228,6 +228,48 @@ pub fn folder_search_hit(item: &BarItem, needle: &str) -> bool {
             .is_some_and(|u| u.to_ascii_lowercase().contains(&n))
 }
 
+/// Whether the store already holds this url's SITE — one bookmark per
+/// host, anywhere in the tree. A second Gmail pin is a duplicate, not a
+/// second bookmark: the grid is a set of places, not a history, and two
+/// tiles with the same mark say nothing the first did not. Keyed on the
+/// same host the omnibox and the active ring use (`www.` stripped, port
+/// and credentials off), so `youtube.com/watch?v=…` and `www.youtube.com`
+/// are one site; `mail.google.com` and `drive.google.com` are two.
+pub fn site_taken(snapshot: &BookmarksSnapshot, url: &str) -> bool {
+    let host = crate::omnibox::engine_host(url);
+    if host.is_empty() {
+        return false;
+    }
+    all_links(snapshot)
+        .iter()
+        .filter_map(|i| i.url.as_deref())
+        .any(|u| crate::omnibox::engine_host(u) == host)
+}
+
+/// How many pins sit on each row of the grid, for `n` pins and at most
+/// `per_row` across.
+///
+/// Rows are as few as `per_row` allows and then as EVEN as they can be,
+/// so a fourth pin is `2 + 2` and a fifth `3 + 2` — never `3 + 1`, which
+/// would stretch one pin across the whole rail under three thirds. The
+/// cells share a row's width equally ([`BOOKMARK_TILE`] is only the
+/// height), so one pin is the full width, two are halves, three are
+/// thirds: the tile says how many neighbours it has.
+///
+/// [`BOOKMARK_TILE`]: crate::theme::BOOKMARK_TILE
+pub fn row_sizes(n: usize, per_row: usize) -> Vec<usize> {
+    let per_row = per_row.max(1);
+    if n == 0 {
+        return Vec::new();
+    }
+    let rows = n.div_ceil(per_row);
+    let base = n / rows;
+    let extra = n % rows;
+    (0..rows)
+        .map(|r| if r < extra { base + 1 } else { base })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +429,34 @@ mod tests {
         assert!(items[0].is_folder());
         assert_eq!(items[0].children, 0);
         assert!(children_of(&empty, "f").is_empty());
+    }
+
+    /// One pin is the whole row, and past three the rows stay even.
+    #[test]
+    fn rows_fill_to_three_and_then_split_evenly() {
+        assert_eq!(row_sizes(0, 3), Vec::<usize>::new());
+        assert_eq!(row_sizes(1, 3), vec![1]);
+        assert_eq!(row_sizes(2, 3), vec![2]);
+        assert_eq!(row_sizes(3, 3), vec![3]);
+        assert_eq!(row_sizes(4, 3), vec![2, 2]);
+        assert_eq!(row_sizes(5, 3), vec![3, 2]);
+        assert_eq!(row_sizes(6, 3), vec![3, 3]);
+        assert_eq!(row_sizes(7, 3), vec![3, 2, 2]);
+        assert_eq!(row_sizes(8, 3), vec![3, 3, 2]);
+        assert_eq!(row_sizes(10, 3), vec![3, 3, 2, 2]);
+        assert!(row_sizes(50, 3).iter().all(|&r| r >= 2 && r <= 3));
+    }
+
+    /// One pin per site, folders included; a different path or a `www.`
+    /// is the same site, a different host is not.
+    #[test]
+    fn a_site_is_taken_by_any_pin_on_its_host() {
+        let t = tree();
+        assert!(site_taken(&t, "https://github.com/eave/eave/issues"));
+        assert!(site_taken(&t, "https://www.github.com/"));
+        assert!(site_taken(&t, "https://deep.test/other"), "a nested pin does not count");
+        assert!(!site_taken(&t, "https://gist.github.com/"));
+        assert!(!site_taken(&t, "https://example.com/"));
+        assert!(!site_taken(&t, ""));
     }
 }

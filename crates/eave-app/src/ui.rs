@@ -7409,6 +7409,10 @@ struct Shell {
     /// entry, and eave does not go and fetch one — see
     /// [`crate::session_title`].
     title_proposals: RefCell<HashMap<String, String>>,
+    /// The empty bookmarks zone's "drag to add" card was closed. An
+    /// operator fact, kept in `frame.json`, so the card does not come back
+    /// every launch; the dashed drop well stays either way.
+    bookmarks_hint_dismissed: bool,
     /// Folder ids that existed when New Folder was asked. The next
     /// snapshot that contains a folder not in this set is the one we
     /// open for naming. `None` = not waiting.
@@ -8269,6 +8273,57 @@ fn put_derived_titles(doc: &mut serde_json::Value, titles: &HashMap<String, Stri
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
     doc[DERIVED_TITLES_KEY] = serde_json::Value::Object(map);
+}
+
+/// The `frame.json` key saying the empty bookmarks zone's hint card was
+/// closed. A bool, not a timestamp: the card has one state to remember.
+const BOOKMARKS_HINT_KEY: &str = "bookmarks_hint_dismissed";
+
+/// Whether the hint card was closed on an earlier run. Unreadable,
+/// missing or malformed all mean no — the card shows again, which is the
+/// cheaper mistake.
+fn load_bookmarks_hint_dismissed() -> bool {
+    let Some(path) = frame_prefs_path() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    bookmarks_hint_dismissed_from(&v)
+}
+
+/// The pure half of [`load_bookmarks_hint_dismissed`].
+fn bookmarks_hint_dismissed_from(doc: &serde_json::Value) -> bool {
+    doc.get(BOOKMARKS_HINT_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Write the flag back, keeping every other key.
+fn save_bookmarks_hint_dismissed(dismissed: bool) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    doc[BOOKMARKS_HINT_KEY] = serde_json::Value::Bool(dismissed);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!(
+                    "eave: cannot save the bookmarks hint state to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise the bookmarks hint state: {e}"),
+    }
 }
 
 /// The `frame.json` key holding each window's split arrangements (Slice
@@ -15610,23 +15665,29 @@ impl Shell {
         // CELL — a zone made of cells takes its action in the shape of a
         // cell. Folders are made from the Folders header, not from here.
         //
-        // Squares are a fixed size. `flex_1` used to stretch them with the
-        // rail (60 at rest, ~92 at the ceiling) so a wider sidebar made
-        // bigger bookmarks. Now only the column count moves: two when the
-        // rail is too thin for three squares, three once they fit, never
-        // four. Leftover width stays empty on the right.
+        // A tile's HEIGHT is fixed and its WIDTH is its share of the
+        // row: one pin spans the rail, two are halves, three are thirds,
+        // and never more than three across — past that the rows split as
+        // evenly as they can (`bookmarks::row_sizes`). The operator's
+        // reference (Arc) stretches the same way. A wider rail widens the
+        // tiles; it never adds a column.
         //
-        // The trailing `+` pins the page you are looking at. When the
-        // grid is empty the `+` lives on the dashed tile in the
-        // illustration instead of sitting alone in the void.
+        // No trailing `+`. A bookmark is made by DRAGGING a tab or an
+        // address onto the zone — the empty state says so on a card, and
+        // after the first drop the operator knows the gesture, so the
+        // populated grid is pins and nothing else (the whole well still
+        // takes a drop past the last cell).
         if items.is_empty() {
             return Some(self.bookmarks_empty(cx));
         }
-        let cols = theme::bookmark_columns(self.rail_w);
-        let mut cells: Vec<Option<bookmarks::BarItem>> = items.iter().cloned().map(Some).collect();
-        cells.push(None); // the pin ghost closes the grid
-        let rows: Vec<Vec<Option<bookmarks::BarItem>>> =
-            cells.chunks(cols).map(|c| c.to_vec()).collect();
+        let mut rows: Vec<Vec<bookmarks::BarItem>> = Vec::new();
+        let mut rest = items.as_slice();
+        for n in bookmarks::row_sizes(items.len(), theme::BOOKMARK_COLS_MAX) {
+            let (row, tail) = rest.split_at(n);
+            rows.push(row.to_vec());
+            rest = tail;
+        }
+        let mut index = 0usize;
 
         Some(
             div()
@@ -15649,23 +15710,21 @@ impl Shell {
                         .flex_col()
                         .gap(px(theme::BOOKMARK_GRID_GAP))
                         .group("bookmark-drop")
-                        .children(rows.into_iter().enumerate().map(|(r, row)| {
+                        .children(rows.into_iter().map(|row| {
                             let mut lane = div()
                                 .w_full()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(px(theme::BOOKMARK_GRID_GAP));
-                            for (c, slot) in row.iter().enumerate() {
-                                lane = lane.child(match slot {
-                                    Some(item) => self.bookmark_tile(
-                                        item,
-                                        r * cols + c,
-                                        active_host.as_deref(),
-                                        cx,
-                                    ),
-                                    None => self.bookmark_new_cell(cx),
-                                });
+                            for item in row.iter() {
+                                lane = lane.child(self.bookmark_tile(
+                                    item,
+                                    index,
+                                    active_host.as_deref(),
+                                    cx,
+                                ));
+                                index += 1;
                             }
                             lane
                         }))
@@ -15674,7 +15733,7 @@ impl Shell {
                         .can_drop(|value, _, _| bookmark_can_drop(value))
                         .drag_over::<AddressDrag>(|style, _, _, _| bookmark_drop_well(style, true))
                         .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                            this.add_bookmark(None, None, drag, cx)
+                            this.add_bookmark(None, None, drag, cx);
                         }))
                         .drag_over::<TabDrag>(|style, drag, _, _| {
                             bookmark_drop_well(style, drag.files_as_bookmark())
@@ -15687,16 +15746,128 @@ impl Shell {
         )
     }
 
-    /// The empty bookmark grid: overlapping ghost squares and a dashed
-    /// `+` slot, with a short caption. A lone `+` and `"no bookmarks"`
-    /// read as a failed load; this is the same idea as a real pin, just
-    /// waiting.
+    /// The empty bookmarks zone: the dashed drop well wearing a hint
+    /// card — a star badge, `Drag to add bookmarks`, one line of why, and
+    /// a close control. No `+`: the gesture IS the affordance, and the
+    /// card teaches it once. Closed, the well stays as a slim dashed slot
+    /// so a drop still has somewhere to land.
     fn bookmarks_empty(&self, cx: &Context<Self>) -> AnyElement {
-        let tile = theme::BOOKMARK_EMPTY_TILE;
-        let dx = theme::BOOKMARK_EMPTY_STEP_X;
-        let dy = theme::BOOKMARK_EMPTY_STEP_Y;
-        let stack_w = tile + dx * 2.0;
-        let stack_h = tile + dy * 2.0;
+        let dismissed = self.bookmarks_hint_dismissed;
+        let well = div()
+            .id("bookmarks-drop")
+            .debug_selector(|| "bookmarks-drop".into())
+            .relative()
+            .w_full()
+            .rounded(px(theme::BOOKMARK_TILE_RADIUS))
+            .border_1()
+            .border_dashed()
+            // The footer's colourless frost, not a tint: the card is a
+            // zone of the rail like the footer is, and the accent is spent
+            // on the star alone. The rim is a neutral dash — the drop
+            // affordance — that lights on drag like the populated well's.
+            .border_color(if dismissed {
+                theme::wash_rest()
+            } else {
+                theme::border_strong()
+            })
+            .bg(if dismissed {
+                gpui::transparent_black()
+            } else {
+                theme::footer_plate()
+            })
+            .flex()
+            .flex_col()
+            .items_center()
+            .group("bookmark-drop")
+            .can_drop(|value, _, _| bookmark_can_drop(value))
+            .drag_over::<AddressDrag>(|style, _, _, _| bookmark_drop_well(style, true))
+            .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
+                this.add_bookmark(None, None, drag, cx);
+            }))
+            .drag_over::<TabDrag>(|style, drag, _, _| {
+                bookmark_drop_well(style, drag.files_as_bookmark())
+            })
+            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                this.drop_tab_as_bookmark(None, None, drag, cx)
+            }));
+
+        let well = if dismissed {
+            well.py(px(theme::SPACE_2)).px(px(theme::SPACE_3)).child(
+                div()
+                    .debug_selector(|| "bookmarks-drop-slot".into())
+                    .text_center()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child("Drop a tab here to bookmark it"),
+            )
+        } else {
+            well.pt(px(theme::SPACE_3))
+                .pb(px(theme::SPACE_4))
+                .px(px(theme::SPACE_3))
+                .gap(px(theme::SPACE_2))
+                .child(
+                    div()
+                        .id("bookmarks-hint-dismiss")
+                        .debug_selector(|| "bookmarks-hint-dismiss".into())
+                        .absolute()
+                        .top(px(theme::SPACE_2))
+                        .right(px(theme::SPACE_2))
+                        .size(px(theme::ICON_SM))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(theme::RADIUS_CHIP))
+                        .hover_fade("bookmarks-hint-dismiss", theme::wash_rest(), theme::overlay())
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_bookmarks_hint(cx)))
+                        .child(icons::tagged_icon(
+                            icons::CLOSE,
+                            theme::ICON_SM,
+                            theme::text_secondary(),
+                            "bookmarks-hint-dismiss-glyph",
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "bookmarks-hint".into())
+                        .size(px(theme::BOOKMARK_HINT_BADGE))
+                        .rounded_full()
+                        // Colourless, like the rest of the card: the same
+                        // ink the footer's glyphs wear, on the rail's own
+                        // overlay rung.
+                        .bg(theme::overlay_strong())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icons::tagged_icon(
+                            icons::STAR_BOLD,
+                            theme::BOOKMARK_HINT_STAR,
+                            theme::text_secondary(),
+                            "bookmarks-hint-glyph",
+                        )),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_center()
+                        .text_size(px(theme::LABEL_SIZE))
+                        .line_height(px(theme::LABEL_LINE))
+                        .font_weight(theme::WEIGHT_STRONG)
+                        .text_color(theme::text())
+                        .child("Drag to add bookmarks"),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_center()
+                        .text_size(px(theme::MICRO_SIZE))
+                        .line_height(px(theme::MICRO_LINE))
+                        .text_color(theme::text_secondary())
+                        .child("Bookmarks keep your most used sites and apps close"),
+                )
+        };
+
         div()
             .debug_selector(|| "bookmarks-grid".into())
             .id("bookmarks-grid")
@@ -15704,208 +15875,19 @@ impl Shell {
             .flex_none()
             .px(px(theme::RAIL_GUTTER))
             .pb(px(theme::RAIL_ZONE_GAP))
-            .child(
-                div()
-                    .id("bookmarks-drop")
-                    .debug_selector(|| "bookmarks-drop".into())
-                    .w_full()
-                    .rounded(px(theme::BOOKMARK_TILE_RADIUS))
-                    .border_1()
-                    .border_dashed()
-                    .border_color(theme::wash_rest())
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(theme::SPACE_2))
-                    .group("bookmark-drop")
-                    .can_drop(|value, _, _| bookmark_can_drop(value))
-                    .drag_over::<AddressDrag>(|style, _, _, _| bookmark_drop_well(style, true))
-                    .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                        this.add_bookmark(None, None, drag, cx)
-                    }))
-                    .drag_over::<TabDrag>(|style, drag, _, _| {
-                        bookmark_drop_well(style, drag.files_as_bookmark())
-                    })
-                    .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
-                        this.drop_tab_as_bookmark(None, None, drag, cx)
-                    }))
-                    .child(
-                        div()
-                            .debug_selector(|| "bookmarks-empty".into())
-                            .relative()
-                            .w(px(stack_w))
-                            .h(px(stack_h))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.))
-                                    .top(px(dy))
-                                    .child(Self::bookmark_empty_ghost(0.72, 0.48, 0.60, false)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(dx))
-                                    .top(px(0.))
-                                    .child(Self::bookmark_empty_ghost(0.64, 0.80, 0.44, true)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(dx * 2.0))
-                                    .top(px(dy))
-                                    .child(self.bookmark_empty_add(cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(px(theme::SPACE_1))
-                            .child(
-                                div()
-                                    .text_center()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::BOOKMARK_EMPTY_SIZE))
-                                    .line_height(px(theme::BOOKMARK_EMPTY_LINE))
-                                    .text_color(theme::text_secondary())
-                                    .child("Save sites you open all the time"),
-                            )
-                            .child(
-                                div()
-                                    .text_center()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::BOOKMARK_EMPTY_SIZE))
-                                    .line_height(px(theme::BOOKMARK_EMPTY_LINE))
-                                    .text_color(theme::text_tertiary())
-                                    .child("Drop a tab here or click +"),
-                            ),
-                    ),
-            )
+            .child(well)
             .into_any_element()
     }
 
-    /// A ghost square with scribble lines — a pin that is not one yet.
-    /// Only the middle tile is opaque. The back tile stays a wash; the
-    /// dashed `+` is a separate layer on top.
-    fn bookmark_empty_ghost(a: f32, b: f32, c: f32, filled: bool) -> AnyElement {
-        let tile = theme::BOOKMARK_EMPTY_TILE;
-        div()
-            .size(px(tile))
-            .rounded(px(theme::BOOKMARK_TILE_RADIUS))
-            .bg(if filled {
-                theme::bookmark_empty_front()
-            } else {
-                theme::overlay()
-            })
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .gap(px(theme::SPACE_1))
-            .px(px(theme::SPACE_2))
-            .child(Self::bookmark_empty_scribble(a))
-            .child(Self::bookmark_empty_scribble(b))
-            .child(Self::bookmark_empty_scribble(c))
-            .into_any_element()
-    }
-
-    fn bookmark_empty_scribble(frac: f32) -> AnyElement {
-        div()
-            .w(relative(frac))
-            .h(px(theme::HAIRLINE + 1.0))
-            .rounded_full()
-            .bg(theme::border_strong())
-            .into_any_element()
-    }
-
-    /// The dashed `+` on the empty stack — same verb as the populated
-    /// grid's trailing cell.
-    ///
-    /// Rest fill is [`theme::chip_plate`], not a wash: this tile overlaps
-    /// the opaque middle ghost, and a transparent rest lets that fill
-    /// show through so the `+` reads as the solid one.
-    fn bookmark_empty_add(&self, cx: &Context<Self>) -> AnyElement {
-        let tile = theme::BOOKMARK_EMPTY_TILE;
-        div()
-            .id("bookmark-new")
-            .debug_selector(|| "bookmark-new".into())
-            .size(px(tile))
-            .rounded(px(theme::BOOKMARK_TILE_RADIUS))
-            .border_1()
-            .border_dashed()
-            .border_color(theme::border_strong())
-            .hover_fade("bookmark-new", theme::chip_plate(), theme::overlay_strong())
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| this.pin_active_page(cx)))
-            .can_drop(|value, _, _| bookmark_can_drop(value))
-            .group_drag_over::<AddressDrag>("bookmark-drop", |style| {
-                style.bg(theme::overlay_strongest())
-            })
-            .group_drag_over::<TabDrag>("bookmark-drop", |style| {
-                style.bg(theme::overlay_strongest())
-            })
-            .drag_over::<AddressDrag>(|style, _, _, _| bookmark_drop_slot(style, true))
-            .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                this.add_bookmark(None, None, drag, cx)
-            }))
-            .drag_over::<TabDrag>(|style, drag, _, _| {
-                bookmark_drop_slot(style, drag.files_as_bookmark())
-            })
-            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
-                this.drop_tab_as_bookmark(None, None, drag, cx)
-            }))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(icons::tagged_icon(
-                icons::ADD_CIRCLE,
-                theme::BOOKMARK_TILE_MARK,
-                theme::text_tertiary(),
-                "bookmark-new-glyph",
-            ))
-            .into_any_element()
-    }
-
-    /// The grid's trailing GHOST cell — pins the page you are looking at.
-    ///
-    /// Repair 2: no fill and no mark plate, and a `+` rather than a folder
-    /// glyph, so an affordance never wears the silhouette of the content it
-    /// creates. Folders are made from the Folders header, not from here.
-    fn bookmark_new_cell(&self, cx: &Context<Self>) -> AnyElement {
-        div()
-            .id("bookmark-new")
-            .debug_selector(|| "bookmark-new".into())
-            .flex_none()
-            .size(px(theme::BOOKMARK_TILE))
-            .rounded(px(theme::BOOKMARK_TILE_RADIUS))
-            .border_1()
-            .border_color(theme::border())
-            .hover_fade("bookmark-new", theme::wash_rest(), theme::overlay())
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| this.pin_active_page(cx)))
-            .can_drop(|value, _, _| bookmark_can_drop(value))
-            .drag_over::<AddressDrag>(|style, _, _, _| bookmark_drop_slot(style, true))
-            .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                this.add_bookmark(None, None, drag, cx)
-            }))
-            .drag_over::<TabDrag>(|style, drag, _, _| {
-                bookmark_drop_slot(style, drag.files_as_bookmark())
-            })
-            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
-                this.drop_tab_as_bookmark(None, None, drag, cx)
-            }))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(icons::tagged_icon(
-                icons::ADD_CIRCLE,
-                theme::BOOKMARK_TILE_MARK,
-                theme::text_tertiary(),
-                "bookmark-new-glyph",
-            ))
-            .into_any_element()
+    /// The hint card's close control. Remembered across launches; the
+    /// drop well it sat on stays.
+    fn dismiss_bookmarks_hint(&mut self, cx: &mut Context<Self>) {
+        if self.bookmarks_hint_dismissed {
+            return;
+        }
+        self.bookmarks_hint_dismissed = true;
+        save_bookmarks_hint_dismissed(true);
+        cx.notify();
     }
 
     /// One pinned bookmark: a site mark on a tile, with no label.
@@ -15980,8 +15962,11 @@ impl Shell {
         div()
             .id(SharedString::from(format!("bookmark-tile-{id}")))
             .debug_selector(move || format!("bookmark-tile-{sel}"))
-            .flex_none()
-            .size(px(theme::BOOKMARK_TILE))
+            // Width is the row's to share (`flex_1`, and `min_w(0)` so a
+            // wide favicon cannot refuse to shrink); height is the cell.
+            .flex_1()
+            .min_w(px(0.))
+            .h(px(theme::BOOKMARK_TILE))
             .rounded(px(theme::BOOKMARK_TILE_RADIUS))
             // A tile is a FILLED control, so it rests on a real fill and
             // climbs one rung on hover — `wash_rest` is transparent black
@@ -16112,7 +16097,7 @@ impl Shell {
                 this.move_bookmark(drag.id.clone(), None, index, cx)
             }))
             .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                this.add_bookmark(None, Some(index), drag, cx)
+                this.add_bookmark(None, Some(index), drag, cx);
             }))
             .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
                 this.drop_tab_as_bookmark(None, Some(index), drag, cx)
@@ -17613,7 +17598,7 @@ impl Shell {
                                 this.move_bookmark(drag.id.clone(), Some(drop_id.clone()), 0, cx)
                             }))
                             .on_drop(cx.listener(move |this, drag: &AddressDrag, _, cx| {
-                                this.add_bookmark(Some(add_id.clone()), None, drag, cx)
+                                this.add_bookmark(Some(add_id.clone()), None, drag, cx);
                             }))
                             .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
                                 this.drop_tab_as_bookmark(Some(add_tab.clone()), None, drag, cx)
@@ -18106,7 +18091,15 @@ impl Shell {
         index: Option<usize>,
         drag: &AddressDrag,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        // One bookmark per site (`bookmarks::site_taken`): a second drop
+        // of a host the store already holds is refused HERE, before the
+        // wire, so nothing is filed and — for a dragged tab — nothing is
+        // closed. The three doors (address drop, tab drop, the tab menu's
+        // Pin) all come through this function.
+        if bookmarks::site_taken(&self.bookmarks.read(cx).snapshot, &drag.url) {
+            return false;
+        }
         let _ = self
             .commands
             .send(Command::Browser(BrowserCmd::BookmarkAdd {
@@ -18116,6 +18109,7 @@ impl Shell {
                 url: Some(drag.url.clone()),
             }));
         cx.notify();
+        true
     }
 
     /// File a dragged tab on the bookmarks grid, or into a folder.
@@ -18144,40 +18138,9 @@ impl Shell {
         let title = (!drag.title.is_empty() && drag.title != strip::NEW_TAB_LABEL)
             .then(|| drag.title.clone());
         let tab_id = drag.id.clone();
-        self.add_bookmark(parent, index, &AddressDrag { url, title }, cx);
-        self.close_tab(&tab_id, cx);
-    }
-
-    /// Pin the page in front of you onto the bookmark grid.
-    ///
-    /// Same verb as the tab menu's Pin. No-ops on a session tab or a blank
-    /// page — there is nothing to pin. Folders are not made here.
-    ///
-    /// Moves the tab, the way dropping it on the grid does: the page is
-    /// on the grid now.
-    fn pin_active_page(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.strip_snapshot(cx);
-        if !strip::active_is_page(&snapshot) {
-            return;
+        if self.add_bookmark(parent, index, &AddressDrag { url, title }, cx) {
+            self.close_tab(&tab_id, cx);
         }
-        let Some(id) = snapshot.active.clone() else {
-            return;
-        };
-        let Some(url) = self.tab_url(&id, cx) else {
-            return;
-        };
-        if crate::omnibox::engine_host(&url).is_empty() {
-            return;
-        }
-        let _ = self
-            .commands
-            .send(Command::Browser(BrowserCmd::BookmarkAdd {
-                parent: None,
-                index: None,
-                title: None,
-                url: Some(url),
-            }));
-        self.close_tab(&id, cx);
     }
 
     /// A top-level folder, from the Folders header `+` or its menu.
@@ -25156,15 +25119,10 @@ impl Shell {
             TabMenuAction::ReopenClosed => self.reopen_closed_tab(cx),
             TabMenuAction::Pin => {
                 if let Some(url) = self.tab_url(&tab_id, cx) {
-                    let _ = self
-                        .commands
-                        .send(Command::Browser(BrowserCmd::BookmarkAdd {
-                            parent: None,
-                            index: None,
-                            title: None,
-                            url: Some(url),
-                        }));
-                    self.close_tab(&tab_id, cx);
+                    let drag = AddressDrag { url, title: None };
+                    if self.add_bookmark(None, None, &drag, cx) {
+                        self.close_tab(&tab_id, cx);
+                    }
                 }
             }
             TabMenuAction::OpenInNewTab => {
@@ -30107,6 +30065,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // run come back with it, so a restart does not
                         // turn a work queue back into `untitled` ×N.
                         title_proposals: RefCell::new(load_derived_titles()),
+                        bookmarks_hint_dismissed: load_bookmarks_hint_dismissed(),
                         diff_tool: None,
                         // Read once, here, rather than per frame: the file is
                         // the launch value and the shell is the live one from

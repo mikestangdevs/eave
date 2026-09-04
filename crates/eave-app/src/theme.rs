@@ -910,19 +910,6 @@ pub fn overlay_strongest() -> Hsla {
     ink(0.20)
 }
 
-/// Opaque plate for the front tile of the empty-bookmark stack.
-///
-/// [`overlay`] is α 0.08, so two overlapping ghosts show through each
-/// other. This is the composite of [`overlay_strongest`] over black,
-/// baked opaque, so the middle card reads as a filled tile.
-pub fn bookmark_empty_front() -> Hsla {
-    if is_light() {
-        grey(0xe4)
-    } else {
-        grey(0x2e)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Elevation — separates layers, never decorates. On a dark canvas the
 // mechanism is SURFACE LUMINANCE: each layer steps lighter, and its
@@ -2635,9 +2622,10 @@ pub const RAIL_MARK: f32 = 16.0;
 /// plate.
 pub const BOOKMARK_TILE_MARK: f32 = 16.0;
 
-/// A tile's corner. Roughly a quarter of the tile, matching the reference
-/// frame's squircle.
-pub const BOOKMARK_TILE_RADIUS: f32 = 12.0;
+/// A tile's corner, and the hint card's. Was 12 (a quarter of the tile,
+/// the reference frame's squircle); the operator asked for "a few px
+/// less round" against the stretched tiles, live.
+pub const BOOKMARK_TILE_RADIUS: f32 = 8.0;
 
 /// How far a folder's children sit in from the folder row (Slice T1b).
 ///
@@ -2695,65 +2683,33 @@ pub fn rail_rule_h() -> f32 {
 /// label to announce them.
 pub const RAIL_ROW_GAP: f32 = 2.0;
 
-/// One pinned-bookmark cell.
+/// One pinned-bookmark cell's HEIGHT.
 ///
-/// A **fixed square**. It does not grow with the rail: dragging the seam
-/// changes how many sit on a row ([`bookmark_columns`]), never the cell.
-/// D4's 60 filled three `flex_1` columns of the resting rail and became a
-/// ~92 px rectangle at [`RAIL_W_MAX`] — that stretch is the thing this
-/// number exists to stop.
-///
-/// 44 is `UNIT * 11`. Content width is `rail_w − 2 * RAIL_GUTTER`. Three
-/// squares plus two [`BOOKMARK_GRID_GAP`]s need `3 * 44 + 20` = **152**.
-/// At [`RAIL_W_MIN`] that is 156 ≥ 152, so three from the floor up. 48
-/// needed 164 and wrapped the third tile (and the `+`) onto a second
-/// row at the width the operator was actually using.
+/// Its width is not a number: a tile takes an equal share of its row
+/// (`flex_1`), so one pin is the rail's width, two are halves and three
+/// are thirds ([`crate::bookmarks::row_sizes`]) — the operator's
+/// reference stretches the same way. The height is what stays put, so a
+/// wider rail makes wider tiles and never taller ones, and the grid's
+/// rows keep the rail's rhythm. 44 is `UNIT * 11`, the width the fixed
+/// square had when three of them plus two [`BOOKMARK_GRID_GAP`]s were
+/// what [`RAIL_W_MIN`] was sized to hold.
 pub const BOOKMARK_TILE: f32 = 44.0;
 
-/// Empty-grid illustration tile. Two units smaller than a real pin so
-/// three overlapping squares fit the rail without looking like the
-/// populated grid.
-pub const BOOKMARK_EMPTY_TILE: f32 = BOOKMARK_TILE - SPACE_2;
-
-/// Horizontal step between overlapping empty tiles. [`SPACE_4`] so they
-/// overlap by half a tile (`36 − 16` = 20 of shared width).
-pub const BOOKMARK_EMPTY_STEP_X: f32 = SPACE_4;
-
-/// Vertical step between overlapping empty tiles.
-pub const BOOKMARK_EMPTY_STEP_Y: f32 = SPACE_2;
+/// The hint card's star badge: a small colourless disc on the card's
+/// frost, no pigment anywhere on the card. 18 with a 10 px star — the
+/// first cut's 28/16 was "WAY too big" (operator, live), and 20/12 still
+/// "a tiny bit" large.
+pub const BOOKMARK_HINT_BADGE: f32 = 18.0;
+pub const BOOKMARK_HINT_STAR: f32 = 10.0;
 
 /// The gap between grid cells (Slice D4 names 10 px).
 pub const BOOKMARK_GRID_GAP: f32 = 10.0;
 
-/// Fewest bookmark squares on a row. Kept as a floor for a rail that
-/// somehow lands under [`RAIL_W_MIN`]; at every legal width three fit.
-pub const BOOKMARK_COLS_MIN: usize = 2;
-
-/// Most bookmark squares on a row. A fourth would fit at [`RAIL_W_MAX`]
-/// (`4 * 44 + 30` = 206 ≤ 296) and is refused: leftover width stays empty
-/// rather than minting a fourth column or stretching the square.
+/// Most bookmark tiles on a row. A fourth is refused: the rows split
+/// evenly instead ([`crate::bookmarks::row_sizes`]), because a tile that
+/// is a quarter of a 180 px rail is a 37 px slot with a 16 px mark lost
+/// in it.
 pub const BOOKMARK_COLS_MAX: usize = 3;
-
-/// Empty-grid copy. 9/12 so "Save sites you open all the time" holds
-/// one line at [`RAIL_W_MIN`] (156 px of content). 10 px still wrapped.
-pub const BOOKMARK_EMPTY_SIZE: f32 = 9.0;
-pub const BOOKMARK_EMPTY_LINE: f32 = 12.0;
-
-/// How many bookmark squares one rail row holds at `rail_w`.
-///
-/// Three once three fixed squares fit in the content width, two only if
-/// they do not (below the drag floor). Never four. Pass the shell's live
-/// rail width, not [`RAIL_W`].
-pub fn bookmark_columns(rail_w: f32) -> usize {
-    let content = rail_w - 2.0 * RAIL_GUTTER;
-    let three = (BOOKMARK_COLS_MAX as f32) * BOOKMARK_TILE
-        + ((BOOKMARK_COLS_MAX - 1) as f32) * BOOKMARK_GRID_GAP;
-    if content >= three {
-        BOOKMARK_COLS_MAX
-    } else {
-        BOOKMARK_COLS_MIN
-    }
-}
 
 /// A ghost row's height — the same as any other rail row, because it IS a
 /// row. That is the whole mechanic: an action shaped like the thing it acts
@@ -4211,7 +4167,6 @@ mod tests {
             ("overlay", overlay()),
             ("overlay_strong", overlay_strong()),
             ("overlay_strongest", overlay_strongest()),
-            ("bookmark_empty_front", bookmark_empty_front()),
             ("wash_raised", wash_raised()),
             ("border", border()),
             ("border_strong", border_strong()),

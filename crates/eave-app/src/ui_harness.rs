@@ -5471,7 +5471,7 @@ fn covered_affordance(vcx: &mut VisualTestContext, menu: Bounds<Pixels>) -> Boun
     const CANDIDATES: &[&str] = &[
         "rail-aaaa1111",
         "rail-bbbb2222",
-        "bookmark-new",
+        "bookmark-tile-rs",
         "project-new",
         "new-session",
     ];
@@ -5502,6 +5502,19 @@ fn open_menu(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContex
         session("dddd4444"),
     ]);
     vcx.run_until_parked();
+    // Two pinned bookmarks, so the grid at the top of the rail holds a
+    // tile in its SECOND column — the first sits left of the menu — that
+    // SENDS when clicked. The empty zone's hint card does not (its close
+    // control only flips a flag), and it was the `+` cell, gone since the
+    // card, that used to sit under the menu.
+    push_bookmarks(
+        &h,
+        vcx,
+        &[
+            ("gh", 0, None, Some("https://github.com/")),
+            ("rs", 0, None, Some("https://docs.rs/")),
+        ],
+    );
     let _ = h.drain();
 
     click(vcx, "overlay-demo");
@@ -16313,6 +16326,176 @@ fn no_bookmarks_bar_is_drawn_over_a_page(cx: &mut TestAppContext) {
         !shown(vcx, "bookmarks-bar"),
         "the bar is over the page again"
     );
+}
+
+/// The empty bookmarks zone is a hint card on the dashed drop well — a
+/// star badge, "Drag to add bookmarks", a close control — and NO `+`.
+/// The gesture is the affordance; the card teaches it once.
+#[gpui::test]
+fn an_empty_bookmarks_zone_is_a_drag_hint_and_not_a_plus(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[]);
+    assert!(shown(vcx, "bookmarks-drop"), "no drop well in the empty zone");
+    assert!(shown(vcx, "bookmarks-hint"), "the empty zone drew no hint card");
+    assert!(
+        shown(vcx, "bookmarks-hint-dismiss"),
+        "the hint card cannot be closed"
+    );
+    assert!(
+        !shown(vcx, "bookmark-new"),
+        "a `+` is back on the empty zone — the drag is the affordance"
+    );
+    let well = vcx.debug_bounds("bookmarks-drop").expect("the well");
+    let badge = vcx.debug_bounds("bookmarks-hint").expect("the badge");
+    let close = vcx.debug_bounds("bookmarks-hint-dismiss").expect("the close");
+    assert!(
+        badge.origin.x > well.origin.x && badge.origin.x + badge.size.width < close.origin.x,
+        "the badge is not centred left of the close: well {well:?} badge {badge:?} close {close:?}"
+    );
+}
+
+/// Closing the hint card leaves the DROP WELL — a slim dashed slot — so a
+/// drop still has somewhere to land; only the lesson goes.
+#[gpui::test]
+fn closing_the_bookmarks_hint_keeps_the_drop_well(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[]);
+    let tall = vcx.debug_bounds("bookmarks-drop").expect("the well").size.height;
+    click(vcx, "bookmarks-hint-dismiss");
+    assert!(!shown(vcx, "bookmarks-hint"), "the card did not close");
+    assert!(shown(vcx, "bookmarks-drop"), "closing the card took the drop well with it");
+    assert!(shown(vcx, "bookmarks-drop-slot"), "the closed well says nothing");
+    let slim = vcx.debug_bounds("bookmarks-drop").expect("the well").size.height;
+    assert!(slim < tall, "the closed well is no smaller: {slim:?} vs {tall:?}");
+}
+
+/// A tile's width is its share of the row: one pin spans the well, two
+/// are halves, three are thirds, and a fourth splits the grid into two
+/// even rows rather than trailing alone under three thirds. Height never
+/// moves.
+#[gpui::test]
+fn bookmark_tiles_share_their_row_up_to_three_across(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    let urls = [
+        ("b1", "https://one.example/"),
+        ("b2", "https://two.example/"),
+        ("b3", "https://three.example/"),
+        ("b4", "https://four.example/"),
+    ];
+    let mut heights = Vec::new();
+    for n in 1..=4 {
+        let pins: Vec<_> = urls[..n]
+            .iter()
+            .map(|(id, url)| (*id, 0usize, None, Some(*url)))
+            .collect();
+        push_bookmarks(&h, vcx, &pins);
+        let well = vcx.debug_bounds("bookmarks-drop").expect("the well");
+        let tiles: Vec<_> = urls[..n]
+            .iter()
+            .map(|(id, _)| {
+                let sel: &'static str = Box::leak(format!("bookmark-tile-{id}").into_boxed_str());
+                vcx.debug_bounds(sel).unwrap_or_else(|| panic!("no tile {id} with {n} pins"))
+            })
+            .collect();
+        let across = match n {
+            4 => 2,
+            n => n,
+        };
+        // The well's content is its width less the 1 px rim each side.
+        let content = f32::from(well.size.width) - 2.0;
+        let share = (content - theme::BOOKMARK_GRID_GAP * (across as f32 - 1.0)) / across as f32;
+        for t in &tiles {
+            let w = f32::from(t.size.width);
+            assert!(
+                (w - share).abs() <= 3.0,
+                "with {n} pins a tile is {w} wide, not a {across}-way share {share} of {content}"
+            );
+            heights.push(t.size.height);
+        }
+        let rows: std::collections::BTreeSet<i32> =
+            tiles.iter().map(|t| f32::from(t.origin.y).round() as i32).collect();
+        assert_eq!(
+            rows.len(),
+            if n == 4 { 2 } else { 1 },
+            "{n} pins sat on {} rows",
+            rows.len()
+        );
+    }
+    assert!(
+        heights.windows(2).all(|w| w[0] == w[1]),
+        "a tile's height moved with the count: {heights:?}"
+    );
+}
+
+/// One bookmark per site. A second drop of a host the grid already
+/// holds sends nothing, and a dragged TAB of that host stays open — the
+/// refusal happens before the close, or the page would just vanish.
+#[gpui::test]
+fn a_site_already_on_the_grid_is_not_bookmarked_twice(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            session_tab("aaaa1111"),
+            visited_tab("p1", "https://www.github.com/eave/eave/pulls"),
+            visited_tab("p2", "https://docs.rs/"),
+        ],
+        Some("p1"),
+    );
+    let _ = h.drain();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            let dup = AddressDrag {
+                url: "https://github.com/eave/eave".into(),
+                title: None,
+            };
+            assert!(!shell.add_bookmark(None, None, &dup, cx), "a second github pin was taken");
+            let tab = TabDrag {
+                id: "p1".into(),
+                url: Some("https://www.github.com/eave/eave/pulls".into()),
+                title: "pulls".into(),
+            };
+            shell.drop_tab_as_bookmark(None, None, &tab, cx);
+            let fresh = AddressDrag {
+                url: "https://docs.rs/".into(),
+                title: None,
+            };
+            assert!(shell.add_bookmark(None, None, &fresh, cx), "a new site was refused");
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    let adds: Vec<String> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::Browser(BrowserCmd::BookmarkAdd { url, .. }) => url.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(adds, vec!["https://docs.rs/".to_string()], "sent: {cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| matches!(c, Command::Browser(BrowserCmd::Close(_)))),
+        "the refused tab was closed anyway: {cmds:?}"
+    );
+}
+
+/// Once a bookmark is on the grid there is no `+` cell after it — one
+/// drag taught the gesture. The well past the last tile still takes a drop.
+#[gpui::test]
+fn a_populated_grid_has_no_plus_cell(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    push_bookmarks(&h, vcx, &[("gh", 0, None, Some("https://github.com/"))]);
+    assert!(shown(vcx, "bookmark-tile-gh"), "the tile is missing");
+    assert!(!shown(vcx, "bookmark-new"), "a `+` cell trails the pins");
+    assert!(!shown(vcx, "bookmarks-hint"), "the hint card is over a populated grid");
+    assert!(shown(vcx, "bookmarks-drop"), "the populated grid lost its drop well");
 }
 
 /// Slice T1 follow-up — a bookmark can be taken **off** the bar.
