@@ -45,6 +45,17 @@ pub fn install_fact_sink(tx: tokio::sync::mpsc::UnboundedSender<Fact>) {
 }
 
 fn report(tab_id: &str, fact: PageFact) {
+    // Slice C2. A popup browser has no strip row and the engine has never
+    // heard of its id, so every one of these facts is about nothing: a
+    // `Committed` would push a back/forward entry and a **history visit**
+    // onto a tab that does not exist, which is the typeahead inflation
+    // `on_address_change`'s dedup was written to stop, arriving by another
+    // door. The sheet reads the popup's address out of `popups` instead.
+    // The net is here rather than at the three call sites so anything
+    // added later inherits it.
+    if super::popups::is_popup_id(tab_id) {
+        return;
+    }
     if let Some(tx) = SINK.get() {
         let _ = tx.send((tab_id.to_string(), fact));
     }
@@ -1013,6 +1024,22 @@ pub fn drive(snapshot: &TabsSnapshot) {
                 set_visibility(&id, true);
                 continue;
             }
+        } else if super::popups::is_popup_id(&id) {
+            // A popup has no strip row either, and its life is its
+            // OPENER TAB's — the sheet is drawn over that tab and cannot
+            // outlive it. Visibility follows the opener for the same
+            // reason: a popup on a background tab is off screen, and a
+            // browser never told `was_hidden` renders at full rate for
+            // ever.
+            if let Some(popup) = super::popups::by_id(&id) {
+                if snapshot.tabs.iter().any(|t| t.id == popup.opener) {
+                    set_visibility(&id, is_on_screen(&popup.opener));
+                    continue;
+                }
+                super::popups::forget(&id);
+            }
+            // Otherwise it was displaced by a second popup on the same
+            // tab, or closed from the sheet: unwanted, and closed below.
         } else if snapshot.tabs.iter().any(|t| t.id == id) {
             continue;
         }
@@ -1358,6 +1385,129 @@ fn create(tab_id: &str, url: Option<&str>, incognito: bool) {
         None,
         ctx.as_mut(),
     );
+}
+
+/// Ask the engine for a tab holding a popup's address — the sheet's ⧉.
+///
+/// A REQUEST, like every other tab open from this module: the engine owns
+/// the strip. `activate` is true because promoting is a deliberate act by
+/// the person, not something a page asked for, and the private state
+/// follows the OPENER — a promotion out of a private tab that landed in
+/// the ordinary profile would be answering a request for privacy with a
+/// silent no, which is `tab_disposition`'s ruling one surface over.
+pub fn open_tab_for_popup(opener: &str, url: String) {
+    request(PageRequest::OpenTab {
+        url,
+        opener: opener.to_string(),
+        activate: true,
+        incognito: tab_is_incognito(opener),
+    });
+}
+
+/// Take the popup CEF is about to create and make it eave's — Slice C2.
+///
+/// Answers `on_before_popup`: **0 to let CEF proceed**, 1 to cancel.
+///
+/// Everything CEF needs is filled in here and nowhere else, because a
+/// popup allowed with a half-filled `WindowInfo` is the exact failure the
+/// tab arm's doc comment describes: a live page with no render handler
+/// that can never be seen. If CEF passes no slot to fill — it always does,
+/// but the signature says `Option` — the popup is refused rather than
+/// allowed on a hope.
+///
+/// The browser is **not created here**: CEF creates it after this returns,
+/// and `on_after_created` files it in `BROWSERS` under `popup:<n>` like
+/// any other. That is the whole difference between this and [`create`],
+/// and it is the difference that keeps the opener's handle live.
+fn adopt_popup(
+    opener: &str,
+    url: &str,
+    window_info: Option<&mut WindowInfo>,
+    client: Option<&mut Option<Client>>,
+    settings: Option<&mut BrowserSettings>,
+) -> i32 {
+    let (Some(window_info), Some(client), Some(settings)) = (window_info, client, settings) else {
+        if trace() {
+            eprintln!("[web] popup refused: CEF passed no window_info/client/settings");
+        }
+        return 1;
+    };
+
+    let id = super::popups::mint_id();
+    // A popup opened FROM a popup belongs to the tab underneath both —
+    // see `popups::root_opener`. The overlay stays where the person is
+    // looking instead of stacking modals.
+    let opener_tab = super::popups::root_opener(opener);
+
+    // **The well is the opener page's own view**, which is the one place
+    // its size is knowable from in here. Seeded before the browser exists
+    // because `PageRenderHandler` answers `GetViewRect` out of it, so
+    // without this the first frames arrive at `View::default`'s 800×600
+    // and are scaled into the overlay for a beat. The overlay publishes
+    // the real geometry on its first layout, like every other page.
+    // **The scale is the opener's** — a popup opens on the display its
+    // opener is on, by construction — and the origin is left at zero
+    // because the element owns it (it is what page-space input is
+    // measured from).
+    let well = super::osr::view(&opener_tab);
+    let (page_w, page_h) = super::popups::page_size(well.width as f32, well.height as f32);
+    let scale = well.scale;
+    super::osr::set_view(
+        &id,
+        super::osr::View {
+            width: page_w as i32,
+            height: page_h as i32,
+            scale,
+            origin_x: 0.,
+            origin_y: 0.,
+        },
+    );
+
+    *window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
+    window_info.shared_texture_enabled = 1;
+    window_info.bounds = Rect {
+        x: 0,
+        y: 0,
+        width: page_w as i32,
+        height: page_h as i32,
+    };
+    *client = Some(PageClient::new(id.clone()));
+    settings.windowless_frame_rate = FRAME_RATE;
+    settings.background_color = PAGE_BACKGROUND;
+
+    // CEF gives a popup its opener's request context, so a popup from a
+    // private tab is already private. This is the bookkeeping that makes
+    // eave agree with it — `tab_is_incognito` is what the rest of the
+    // module asks, and a popup missing from the set would be drawn as an
+    // ordinary page and would take the ordinary profile's context on any
+    // path that re-created it.
+    if tab_is_incognito(&opener_tab) {
+        INCOGNITO_TABS.with(|s| {
+            s.borrow_mut().insert(id.clone());
+        });
+    }
+
+    let displaced = super::popups::note_opened(super::popups::Popup {
+        id: id.clone(),
+        opener: opener_tab.clone(),
+        url: url.to_string(),
+    });
+    if displaced.is_some() {
+        // One sheet per tab, so this one replaced another that is still a
+        // live browser. It is **not closed on this stack**: CEF is
+        // mid-creation for the new popup, and `close_browser_for`
+        // re-enters `on_before_close` — the module's one rule. The
+        // registry no longer wants it, so `drive`'s reaper closes it on
+        // the next pass, which is the same path a departed tab takes.
+        super::evict::request_redrive();
+    }
+
+    if trace() {
+        eprintln!(
+            "[web] adopting popup {id} for {opener_tab} page={page_w}x{page_h} url={url:?}"
+        );
+    }
+    0
 }
 
 /// Copy the page's current selection to the system clipboard.
@@ -2089,18 +2239,36 @@ wrap_life_span_handler! {
     impl LifeSpanHandler {
         /// `target="_blank"`, `window.open`, and middle-click.
         ///
-        /// **Returning 1 cancels Chromium's popup and is the only correct
-        /// answer here.** Letting CEF proceed asks it to create a browser
-        /// with a `WindowInfo` we did not fill in — under off-screen
-        /// rendering that is a browser with no render handler and no
-        /// window, i.e. a page that exists and can never be seen. Before
-        /// this, every `target="_blank"` link in eave was a dead link: the
-        /// click was consumed, nothing opened, and nothing said why.
+        /// **Two answers, and which is right depends on whether the page
+        /// asked for a WINDOW or for somewhere to put a document.**
         ///
-        /// So the popup is refused and re-asked as an eave tab. That is a
-        /// REQUEST and not a report — `PageRequest` rather than `PageFact`
-        /// — because opening a tab is the engine's decision and the page
+        /// *Somewhere to put a document* — a `target="_blank"` link, a
+        /// ⌘-click, a plain `window.open(url)` — is a tab, and Chromium's
+        /// popup is cancelled by returning 1. Letting CEF proceed with a
+        /// `WindowInfo` nobody filled in asks it, under off-screen
+        /// rendering, for a browser with no render handler and no window:
+        /// a page that exists and can never be seen. Before this arm was
+        /// written every `target="_blank"` link in eave was a dead link —
+        /// the click consumed, nothing opened, nothing saying why. The
+        /// popup is refused and re-asked as an eave tab, which is a
+        /// REQUEST and not a report (`PageRequest` rather than `PageFact`)
+        /// because opening a tab is the engine's decision and the page
         /// engine is a client like any other (module docs).
+        ///
+        /// *A window* — any script's `window.open`, and any open with no
+        /// address at all — is **ADOPTED** instead (Slice C2): the
+        /// `WindowInfo` is
+        /// filled in windowless, a `PageClient` of eave's goes in the
+        /// client slot, and returning 0 has CEF create the browser and
+        /// hand it back down the ordinary OSR pipeline as `popup:<n>`.
+        /// **Cancelling that one is precisely what `window.open()`
+        /// returning `null` means**, so `var w = window.open(); w.location
+        /// = …` — the shape every OAuth and payment flow is written in —
+        /// died on a TypeError with nothing on screen to say so. The
+        /// handle exists only if CEF makes the browser here, on this
+        /// stack: asking the engine for a tab is a socket round trip that
+        /// lands long after the script has run. `web/popups.rs` holds the
+        /// rest of the reasoning.
         ///
         /// The dispositions are not all the same thing. A background tab
         /// (⌘-click) must not steal focus; `SAVE_TO_DISK` is a download and
@@ -2124,16 +2292,34 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
             let url = target_url.map(|u| u.to_string()).unwrap_or_default();
+            // **`is_popup` is Chromium's own line between a window and a
+            // tab**, and it is the only part of `PopupFeatures` this build
+            // still fills in — the geometry beside it is measured zero on
+            // every popup (see `popups::page_size`). The whole struct is
+            // traced below rather than summarised, because that zeroing is
+            // the kind of thing that changes under a CEF bump and would
+            // otherwise be re-derived from scratch.
+            let wants_window = _popup_features.is_some_and(|f| f.is_popup != 0)
+                || matches!(target_disposition, WindowOpenDisposition::NEW_POPUP);
             if trace() {
-                eprintln!("[web] on_before_popup {target_disposition:?} url={url:?}");
+                eprintln!(
+                    "[web] on_before_popup {target_disposition:?} url={url:?} \
+                     window={wants_window} features={_popup_features:?}"
+                );
             }
-            if url.is_empty() {
-                // `window.open()` with no url — a page about to write into
-                // the new window through the returned handle. eave has
-                // nowhere to put that handle, so refusing is the honest
-                // answer; opening a blank tab that never receives its
-                // content would be worse.
-                return 1;
+            // A window, or an open with no address yet. The second is the
+            // handle-first shape and it has to be adopted whatever
+            // disposition it arrived with — the page is holding a handle
+            // it is about to navigate, and there is nothing else eave can
+            // hand it.
+            if wants_window || super::popups::is_blank(&url) {
+                return adopt_popup(
+                    &self.tab_id,
+                    &url,
+                    _window_info,
+                    _client,
+                    _settings,
+                );
             }
             let Some((activate, incognito)) =
                 tab_disposition(target_disposition, tab_is_incognito(&self.tab_id))
@@ -2192,6 +2378,11 @@ wrap_life_span_handler! {
             super::osr::forget(&self.tab_id);
             super::page::forget_resize_state(&self.tab_id);
             forget_chrome(&self.tab_id);
+            // Slice C2. A popup's page can close itself — `window.close()`
+            // on a browser CEF made for us needs no `do_close` arm, it
+            // arrives straight here — and the sheet must go with it. This
+            // is also the path the ✕ takes, one step later.
+            super::popups::forget(&self.tab_id);
             // A held dialog callback is a stopped renderer. This browser is
             // going away and so is the page that would have been unblocked,
             // but the callback is still answered rather than dropped —
@@ -3343,6 +3534,16 @@ wrap_display_handler! {
                 eprintln!("[web] on_address_change {url:?}");
             }
             if !note_url(&self.tab_id, &url) {
+                return;
+            }
+            // Slice C2: a popup is not a tab and the engine has never
+            // heard of it, so its address is filed here and NOT sent down
+            // the fact sink — a `Committed` for an id with no strip row is
+            // a fact about nothing. Nothing draws this address (the
+            // overlay is all page); the expand and split controls are what
+            // read it, and both open exactly where the popup got to.
+            if super::popups::is_popup_id(&self.tab_id) {
+                super::popups::note_url(&self.tab_id, &url);
                 return;
             }
             report(&self.tab_id, PageFact::Committed { url, title: None });

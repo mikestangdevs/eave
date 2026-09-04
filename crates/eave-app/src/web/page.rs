@@ -879,11 +879,20 @@ impl Element for PageSurface {
         //
         // Bottom corners match the card; the header owns the top of the
         // card so the page's top edge is square against it.
+        //
+        // **A popup's page is the exception, and it is the whole card**
+        // (Slice C2): the overlay has no header over it, so a square top
+        // edge would be two sharp corners inside a rounded frame — the
+        // one place the page's own rectangle would show through the card
+        // it is supposed to be.
+        let radius = px(theme::RADIUS_PANEL);
+        let square = px(0.);
+        let all_four = super::popups::is_popup_id(&self.tab_id);
         let corners = Corners {
-            top_left: px(0.),
-            top_right: px(0.),
-            bottom_right: px(theme::RADIUS_PANEL),
-            bottom_left: px(theme::RADIUS_PANEL),
+            top_left: if all_four { radius } else { square },
+            top_right: if all_four { radius } else { square },
+            bottom_right: radius,
+            bottom_left: radius,
         };
         let want_w = f32::from(bounds.size.width);
         let want_h = f32::from(bounds.size.height);

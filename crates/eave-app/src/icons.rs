@@ -203,6 +203,14 @@ Line {
     // Slice TN1 — the composer's fast-lane toggle. Not a Solar file: drawn
     // to the same 24-grid / 1.5 stroke so it sits beside them.
     BOLT => "bolt.svg",
+    /// Slice C2 — "put this beside the page it came from". Not a Solar
+    /// file either: it is `sidebar-minimalistic`'s own outline with the
+    /// divider moved to the CENTRE, drawn on the same grid at the same
+    /// stroke. A moved line rather than a new drawing because the two
+    /// glyphs mean neighbouring things, and because reusing the sidebar's
+    /// own glyph for a split would be the vocabulary collision
+    /// `STATUS_MODIFIED` names.
+    SPLIT_PANES => "split-panes.svg",
 }
 
 // eave's own. The family has no VCS status set, and these are the only P3
@@ -498,10 +506,13 @@ mod tests {
         // arcs replaced by an X at the same 1.5 stroke and round caps.
         // BOLT (Slice TN1) is the composer's fast-lane toggle, drawn the
         // same way — Solar's own bolt was not among the vendored files.
-        assert_eq!(of(Class::Line).count(), 61, "the Line family");
+        // SPLIT_PANES (Slice C2) is `sidebar-minimalistic` with its
+        // divider moved to the centre, which is the same drawing on the
+        // same grid rather than a new one.
+        assert_eq!(of(Class::Line).count(), 62, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 72);
+        assert_eq!(REGISTRY.len(), 73);
     }
 
     /// Every registered path is a file that exists on disk under exactly

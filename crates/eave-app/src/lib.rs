@@ -60,6 +60,11 @@ pub mod model_picker;
 /// Composer chrome helpers (placeholders, send/stop, context meter).
 mod composer;
 
+/// The sheet a page's popup window is drawn in (06-browser C2). Beside
+/// `composer`, and for its reason: the pieces that can be named without a
+/// `Shell`, kept out of `ui.rs`.
+mod popup_sheet;
+
 /// The overlay layer (Slice P1): the anchored popover surface, the
 /// `Popup` state machine and the menu-row primitive. Private for the same
 /// reason as `loaders` and `motion` — it renders, and it has no product

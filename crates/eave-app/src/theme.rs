@@ -960,6 +960,52 @@ pub fn edge_modal() -> Hsla {
     ink(0.20)
 }
 
+/// The dim behind a modal that sits over a LIVE page — Slice C2.
+///
+/// **A dark ink, and that is the whole point of it existing.**
+/// `page_dialog` reached for [`overlay_strongest`] first and dimmed
+/// nothing: that token is `ink(0.20)`, a 20% *light* wash, so over a web
+/// page it frosted rather than darkened, and the operator called it
+/// unnecessary on sight (2026-08-25). Its note ends "if a dim ever comes
+/// back … it needs a dark ink". This is that ink, and it is the same in
+/// both appearances because what it does is take light OUT of whatever is
+/// beneath it — a page eave did not draw and cannot predict.
+pub fn scrim() -> Hsla {
+    hsla(0.0, 0.0, 0.0, 0.38)
+}
+
+/// A control standing ON the scrim — the popup overlay's gutter buttons.
+///
+/// **The same in both appearances, for [`scrim`]'s reason.** What these
+/// sit on is not one of eave's surfaces, it is eave's own dim over
+/// somebody else's page, and that dim is dark whichever way the theme is
+/// set. A disc that went pale in light mode would be a pale disc on a
+/// dark ground with a pale glyph in it.
+pub fn scrim_control() -> Hsla {
+    hsla(0.0, 0.0, 0.10, 0.62)
+}
+
+/// The glyph on [`scrim_control`]. Near-white, and deliberately brighter
+/// than [`text`] — that ink is `#e2e2e2`, tuned to sit on a surface
+/// without glaring, and on a dark disc over a dimmed page it reads grey.
+pub fn ink_on_scrim() -> Hsla {
+    hsla(0.0, 0.0, 0.97, 1.0)
+}
+
+/// The shadow under a control that has RISEN — `motion::hover_lift`'s
+/// ramp, at hover progress `t`.
+///
+/// Everything scales with `t`, offset and blur included, so at rest there
+/// is no shadow at all rather than a zero-alpha one: a shadow that exists
+/// with alpha 0 still costs a layer, and a control at rest should cost
+/// what a control at rest costs.
+pub fn shadow_lift(t: f32) -> Vec<BoxShadow> {
+    if t <= 0.0 {
+        return Vec::new();
+    }
+    vec![BoxShadow::new(px(0.0), px(3.0 * t), shadow_ink(0.45 * t)).blur_radius(px(8.0 * t))]
+}
+
 fn shadow_ink(alpha: f32) -> Hsla {
     hsla(0.0, 0.0, 0.0, alpha)
 }

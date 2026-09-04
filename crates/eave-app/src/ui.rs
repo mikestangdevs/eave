@@ -10928,6 +10928,12 @@ impl Shell {
         )
     }
 
+    /// The popup overlay on the active tab, if one is up — Slice C2.
+    fn active_popup(&self, cx: &App) -> Option<crate::web::popups::Popup> {
+        let snapshot = self.strip_snapshot(cx);
+        crate::web::popups::open_for(snapshot.active.as_deref()?)
+    }
+
     /// What the ACTIVE page tab is stopped on, if anything.
     ///
     /// Only the active tab's. A background tab can be stopped on an
@@ -10939,7 +10945,16 @@ impl Shell {
         // TAB is that tab's — see above, one scope wider (Slice W1).
         let snapshot = self.strip_snapshot(cx);
         let active = snapshot.active.as_deref()?;
-        crate::web::pending(active)
+        // Slice C2: a POPUP's page raises dialogs too, and they are keyed
+        // by the popup's own id — which is not a tab and would never be
+        // asked about here. A `confirm()` inside an OAuth sheet would then
+        // hang that renderer for ever with nothing on screen. The popup's
+        // ask wins over the tab's because the sheet is the surface on top;
+        // answering routes by `Pending::tab_id`, so both go back to the
+        // right browser with no other change.
+        crate::web::popups::open_for(active)
+            .and_then(|popup| crate::web::pending(&popup.id))
+            .or_else(|| crate::web::pending(active))
     }
 
     /// The keyboard, while a page dialog is up.
@@ -11174,6 +11189,18 @@ impl Shell {
         if let Some(pending) = self.page_ask(cx) {
             self.dialog_key(ks, &pending, cx);
             return;
+        }
+        // Slice C2. Escape dismisses a popup sheet, after the dialog arm
+        // above and before everything else — the same place in the ladder
+        // the sheet occupies on screen. It is NOT consumed: the popup's
+        // page has already had the key through its own listener, so a
+        // login form that closes its own menu on Escape still does.
+        if ks.key.as_str() == "escape" {
+            if let Some(popup) = self.active_popup(cx) {
+                crate::web::close_popup(&popup.id);
+                cx.notify();
+                return;
+            }
         }
         if self.omnibox_open() {
             self.omnibox_key(ks, cx);
@@ -11774,6 +11801,15 @@ impl Shell {
         // back to the page, and typing in the DevTools console would land
         // in the document being inspected.
         let page_surface: Option<String> = page_tab.map(|id| {
+            // Slice C2: a popup sheet is modal over its opener, so while
+            // one is up the keyboard is the popup's — typing a password
+            // into the page behind a login sheet is the failure this
+            // prevents, and the scrim already says which of the two live
+            // pages is being answered. Ahead of the DevTools branch
+            // because a dock belongs to the page underneath the sheet.
+            if let Some(popup) = crate::web::popups::open_for(id) {
+                return popup.id;
+            }
             let dock = crate::web::devtools_id(id);
             let dock_focused = crate::web::devtools_open(id)
                 && crate::web::page_focus_handle(&dock, cx)
@@ -12467,6 +12503,51 @@ impl Shell {
         if self.splits != before {
             self.persist_splits();
         }
+    }
+
+    /// Slice C2: the popup's split control asked for a tab that did not
+    /// exist yet. Runs from the tabs observer beside `prune_splits`,
+    /// because that is where a tab arriving is noticed, and the pairing
+    /// itself is the ordinary one — the same `Split::pair` a drop makes.
+    ///
+    /// **The new tab goes on the RIGHT**, beside the page that opened it:
+    /// the opener keeps the position it already had on screen, so nothing
+    /// the operator was reading moves out from under them.
+    fn settle_popup_split(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        if snapshot.tabs.is_empty() {
+            return;
+        }
+        let tabs: Vec<(String, Option<String>, Option<String>)> = snapshot
+            .tabs
+            .iter()
+            .map(|t| {
+                (
+                    t.id.to_string(),
+                    t.url.clone(),
+                    t.pending.as_ref().map(|p| p.url.clone()),
+                )
+            })
+            .collect();
+        let Some((opener, opened)) = crate::web::popups::split_ready(&tabs) else {
+            return;
+        };
+        // A fifth pane is refused on every door (SP1), and this is one.
+        if self
+            .split_of(&opener)
+            .is_some_and(|ix| self.splits[ix].is_full())
+        {
+            return;
+        }
+        match self.split_of(&opener) {
+            Some(ix) => {
+                let at = self.splits[ix].position(&opener).unwrap_or(0) + 1;
+                self.splits[ix].insert(at, opened.clone());
+            }
+            None => self.splits.push(Split::pair(opener, opened.clone())),
+        }
+        self.persist_splits();
+        self.activate_tab(&opened, cx);
     }
 
     fn persist_splits(&self) {
@@ -26837,6 +26918,22 @@ impl Render for Shell {
         // because the floating-surface rule below wants every overlay's
         // relationship to the page decided in one place. See `page_dialog`
         // for why this one is deliberately drawn OVER a page.
+        // Slice C2's sheet, over the page that opened it. Computed here
+        // with the other floating surfaces, and it answers the rule below
+        // the same way `page_dialog` does: **shown over a page, because it
+        // is about that page** — a popup belongs to the document that
+        // asked for it and is drawn nowhere else.
+        let popup_el = strip_snapshot
+            .active
+            .as_deref()
+            .filter(|_| frame.active_is_page())
+            .and_then(|id| {
+                // Where the well starts. The rail is the only thing to the
+                // left of it, and a collapsed rail is not mounted at all.
+                let rail_shown = !self.sessions.read(cx).collapsed && !fullscreen;
+                let left = if rail_shown { self.rail_w } else { 0. };
+                crate::popup_sheet::element(id, left, cx)
+            });
         let page_dialog_el = self.page_dialog(cx);
         // Computed beside `page_dialog_el` because the floating-surface
         // rule below wants every overlay's relationship to the page decided
@@ -28133,7 +28230,26 @@ impl Render for Shell {
                                                 // page behind it is STOPPED on
                                                 // this question and nothing else
                                                 // on screen would say so.
-                                                .children(page_dialog_el)
+                                                // Slice C2's overlay is
+                                                // NOT here — it mounts at
+                                                // the ROOT, so its dim
+                                                // reaches the address row
+                                                // and the window's own
+                                                // edges rather than
+                                                // stopping at the well.
+                                                // `deferred`, so a page
+                                                // dialog still lands on
+                                                // top of it: a popup's
+                                                // page can raise a
+                                                // `confirm()`, and a card
+                                                // holding a stopped
+                                                // renderer must never be
+                                                // painted under anything.
+                                                .children(
+                                                    page_dialog_el.map(|el| {
+                                                        gpui::deferred(el).into_any_element()
+                                                    }),
+                                                )
                                                 // G2. Over the page and
                                                 // only over a page: it is
                                                 // ABOUT the page that
@@ -28338,6 +28454,15 @@ impl Render for Shell {
             // else — `deferred` fixes paint order, but layout stays where
             // it is written, and the transcript is a virtualized list that
             // caches row heights. See `overlay::menu_layer`.
+            // Slice C2. Root-mounted for the reason the menus below give,
+            // plus one of its own: **the overlay is measured against the
+            // WINDOW, not the well.** Inside the well its dim stopped at
+            // the content card's edges, which left the address row and the
+            // window's own margins undimmed and made the overlay read as a
+            // panel inside a page rather than as a document over the whole
+            // app. Before the menus, so a menu opened on the popup's page
+            // is still the thing on top.
+            .children(popup_el)
             .children(demo_trigger)
             .children(demo_layer)
             // After `demo_layer` so that if both are ever mounted at once
@@ -29882,6 +30007,10 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     cx.observe(&composer, |_, _, cx| cx.notify()).detach();
                     cx.observe(&web_tabs, |shell, _, cx| {
                         shell.prune_splits(cx);
+                        // Slice C2, same observer and the same reason: a
+                        // tab arriving is a tabs fact, and the popup's
+                        // split control is waiting for exactly one.
+                        shell.settle_popup_split(cx);
                         cx.notify();
                     })
                     .detach();

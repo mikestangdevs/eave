@@ -22391,3 +22391,215 @@ fn selecting_a_rail_row_brings_its_chat_forward(cx: &mut TestAppContext) {
          have stayed in the well: {cmds:?}"
     );
 }
+
+// ── Slice C2: the popup sheet ────────────────────────────────────────────
+//
+// The sheet is reachable feature-off for `raise_ask`'s reason: the popup
+// registry is the ungated half of `web/popups.rs`, so the surface can be
+// driven here without a framework. What CANNOT be driven here is the
+// popup's PAGE — `page_element` needs a browser — so these pin the card,
+// the header and the two ways out, and the walk is what proves a page
+// arrives inside it.
+
+/// File a popup on a page tab and let the shell draw it. Modelled on
+/// `raise_ask`, including the second `strip_tabs`: the popup is filed
+/// outside gpui's world, so nothing has invalidated the window yet.
+#[track_caller]
+fn open_popup(h: &Harness, vcx: &mut VisualTestContext, tab: &str, url: &str) {
+    let page = || page_tab(tab, Some("https://opener.test/"), Some("The opener"));
+    strip_tabs(h, vcx, vec![page()], Some(tab));
+    crate::web::popups::note_opened(crate::web::popups::Popup {
+        id: format!("popup:{tab}"),
+        opener: tab.to_string(),
+        url: url.to_string(),
+    });
+    strip_tabs(h, vcx, vec![page()], Some(tab));
+    vcx.run_until_parked();
+}
+
+/// The handle-first shape, which is the whole reason this slice exists:
+/// `window.open('')` has committed nowhere yet. It draws, it draws no
+/// chrome of its own, and it offers neither way out — both of those open
+/// its current address, and it has none.
+#[gpui::test]
+fn a_popup_that_has_been_nowhere_draws_a_page_and_no_chrome(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_popup(&h, vcx, "p1", "");
+    assert!(shown(vcx, "popup-card"), "the overlay did not render");
+    // **No address anywhere on it**, before or after it commits: the
+    // overlay is all page. The url becomes visible the moment it is
+    // expanded or split, because then it is an ordinary tab with an
+    // ordinary pane header over it.
+    assert!(
+        !shown(vcx, "popup-origin") && !shown(vcx, "popup-header"),
+        "the overlay grew chrome of its own"
+    );
+    assert!(
+        !shown(vcx, "popup-expand") && !shown(vcx, "popup-split"),
+        "a popup that has committed nowhere offered a promotion to nothing"
+    );
+    crate::web::close_popup("popup:p1");
+}
+
+/// **The overlay takes the well, and that is the point of it.** The card
+/// is nearly the whole scrim — the dimmed page is an edge, not a frame —
+/// and the gutter beside it is what the scrim's remaining width is spent
+/// on. A regression to a dialog-sized card fails here.
+#[gpui::test]
+fn the_popup_takes_the_well_and_leaves_a_gutter(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_popup(&h, vcx, "p1", "https://accounts.test/signin");
+    let scrim = vcx.debug_bounds("popup-scrim").expect("no scrim");
+    let card = vcx.debug_bounds("popup-card").expect("no card");
+    let controls = vcx.debug_bounds("popup-controls").expect("no controls");
+    // The overlay takes what is to the RIGHT of where it starts — the
+    // dim spans the window, the card spans the well — so the claim is
+    // measured from the card's own left edge rather than from the
+    // scrim's, which begins behind the rail.
+    let room = f32::from(scrim.size.width) - f32::from(card.origin.x - scrim.origin.x);
+    assert!(
+        f32::from(card.size.width) > room * 0.7,
+        "the card {:?} is not taking the {room}px it starts in — this is \
+         the dialog-sized popup the operator refused",
+        card.size,
+    );
+    // **The dim reaches the address row**, which is what mounting at the
+    // root buys and what mounting in the well could not do.
+    if let Some(header) = vcx.debug_bounds("pane-header") {
+        assert!(
+            scrim.origin.y <= header.origin.y,
+            "the scrim starts at {:?}, below the address row at {:?} — it \
+             is back inside the well",
+            scrim.origin.y,
+            header.origin.y
+        );
+    }
+    assert!(
+        scrim.size.width > card.size.width && scrim.size.height > card.size.height,
+        "the scrim {:?} does not extend past the card {:?} — it cannot be \
+         catching the clicks around it",
+        scrim.size,
+        card.size
+    );
+    // The controls stand OUTSIDE the card, never over the page.
+    assert!(
+        controls.origin.x >= card.origin.x + card.size.width,
+        "the controls {:?} overlap the card {:?} — a button drawn on a \
+         page is a button the page can hide something behind",
+        controls.origin,
+        card.origin
+    );
+    crate::web::close_popup("popup:p1");
+}
+
+/// A committed popup can be taken out of the overlay, both ways.
+#[gpui::test]
+fn a_committed_popup_offers_both_ways_out(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_popup(&h, vcx, "p1", "http://login.test/");
+    assert!(
+        shown(vcx, "popup-expand"),
+        "a popup with somewhere to go offered no promotion"
+    );
+    assert!(
+        shown(vcx, "popup-split"),
+        "a popup with somewhere to go could not be put beside its opener"
+    );
+    crate::web::close_popup("popup:p1");
+}
+
+/// The ✕ takes the sheet down. The page behind it is untouched — a popup
+/// is not a navigation.
+#[gpui::test]
+fn the_close_control_takes_the_sheet_down(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_popup(&h, vcx, "p1", "https://accounts.test/signin");
+    assert!(shown(vcx, "popup-card"));
+    click(vcx, "popup-close");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "popup-card"), "the sheet stayed up");
+    assert_eq!(crate::web::popups::open_for("p1"), None);
+}
+
+/// Escape dismisses it, the way it dismisses every other modal surface in
+/// the shell.
+#[gpui::test]
+fn escape_dismisses_a_popup(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_popup(&h, vcx, "p1", "https://accounts.test/signin");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "popup-card"), "escape did not close the sheet");
+}
+
+/// A popup belongs to ONE tab. Switching away must take the sheet with it
+/// — a modal drawn over a page it is not about is the floating-surface
+/// rule's own failure, and this one would be drawn over somebody else's
+/// bank.
+#[gpui::test]
+fn a_popup_is_not_drawn_over_another_tab(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_popup(&h, vcx, "p1", "https://accounts.test/signin");
+    assert!(shown(vcx, "popup-card"));
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://opener.test/"), Some("The opener")),
+            page_tab("p2", Some("https://elsewhere.test/"), Some("Elsewhere")),
+        ],
+        Some("p2"),
+    );
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "popup-card"),
+        "the sheet followed the operator onto another tab"
+    );
+    crate::web::close_popup("popup:p1");
+}
+
+/// The gutter's split control finishes in two halves and the second one
+/// lands in the tabs observer, so this drives both: ask, then let the tab
+/// the engine minted appear.
+///
+/// Feature-off there is no engine to mint it, which is the point of
+/// splitting the intent from the pairing — the pairing is ours and is
+/// asserted here; the ask is one `PageRequest` and `web` owns it.
+#[gpui::test]
+fn the_split_control_puts_the_popup_beside_the_page_that_opened_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_popup(&h, vcx, "p1", "https://accounts.test/signin");
+    // The ask, as `web::split_popup` files it. (Feature-off it cannot
+    // read the snapshot for itself, so the known set is named here — the
+    // property under test is the pairing, not where the list came from.)
+    crate::web::popups::request_split(
+        "p1",
+        "https://accounts.test/signin",
+        vec!["p1".to_string()],
+    );
+    crate::web::close_popup("popup:p1");
+    // The engine answers with a tab, still on its pending navigation.
+    let mut opened = page_tab("p2", None, None);
+    opened.pending = Some(eave_wire::PendingNav {
+        url: "https://accounts.test/signin".into(),
+        seq: 0,
+        delta: None,
+    });
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://opener.test/"), Some("The opener")),
+            opened,
+        ],
+        Some("p1"),
+    );
+    vcx.run_until_parked();
+    let splits = h
+        .window
+        .update(vcx, |shell, _, _| shell.splits.clone())
+        .unwrap();
+    assert_eq!(splits.len(), 1, "the popup did not land in a split: {splits:?}");
+    // The opener keeps its side: nothing the operator was reading moves.
+    assert_eq!(splits[0].panes, ["p1", "p2"]);
+}

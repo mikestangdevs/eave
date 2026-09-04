@@ -130,6 +130,12 @@ pub mod selection;
 /// (06-browser A7, and half of C7). Ungated for `selection`'s reason — it
 /// is two maps, a threshold and one generated line of JavaScript.
 pub mod scroll;
+/// Real popup windows — the `window.open` an OAuth flow uses (06-browser
+/// C2). Ungated for `selection`'s reason: the namespace, the registry, the
+/// overlay's geometry and the split intent are arithmetic and a map. The
+/// CEF half — adopting the browser CEF was about to create rather than
+/// cancelling it — is in `tabs.rs`.
+pub mod popups;
 /// Drag & drop as the chrome and the page share it (06-browser A5).
 /// Ungated for `selection`'s reason — it is a map and the rules for
 /// updating it. The four `drag_target_*` calls and `start_dragging` are
@@ -219,6 +225,77 @@ pub use tabs::{
     chrome, downloads, drive, install_fact_sink, install_request_sink, is_on_screen,
     print_to_pdf, set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
 };
+
+/// Close a popup and take its sheet down (C2) — the ✕, and Escape.
+///
+/// **The registry is cleared first, then the browser is closed.** The
+/// order is deliberate: `on_before_close` clears it too, so this is
+/// belt-and-braces for the one case that matters — a sheet whose browser
+/// has already gone (a crashed renderer, a close that raced the paint)
+/// would otherwise be a card the ✕ could not dismiss.
+#[cfg(feature = "web")]
+pub fn close_popup(popup_id: &str) {
+    popups::forget(popup_id);
+    tabs::close_browser_for(popup_id);
+}
+
+/// No page engine, so there is no popup to close.
+#[cfg(not(feature = "web"))]
+pub fn close_popup(popup_id: &str) {
+    popups::forget(popup_id);
+}
+
+/// Open a popup's current address in a real tab and dismiss the sheet.
+///
+/// See [`popups::promote_url`] for why this is a navigation rather than a
+/// hand-off, and why a popup that has committed nowhere cannot be
+/// promoted at all.
+#[cfg(feature = "web")]
+pub fn promote_popup(popup_id: &str) {
+    let Some(popup) = popups::by_id(popup_id) else {
+        return;
+    };
+    let Some(url) = popups::promote_url(&popup) else {
+        return;
+    };
+    tabs::open_tab_for_popup(&popup.opener, url);
+    close_popup(popup_id);
+}
+
+/// No page engine, so there is nothing to promote.
+#[cfg(not(feature = "web"))]
+pub fn promote_popup(_popup_id: &str) {}
+
+/// Open a popup's address in a tab and ask for it to be put BESIDE the
+/// page that opened it — the gutter's split control.
+///
+/// Two halves in two places, because the tab does not exist yet: this
+/// asks the engine for it and files the intent, and the shell pairs them
+/// when the tab arrives (`popups::split_ready`, settled in the tabs
+/// observer). The tab ids that exist at the moment of the ask are what
+/// the new one is recognised against, and they are read from the
+/// snapshot the eviction clock already keeps — the shell would have to
+/// hand them down four layers otherwise, for a fact this side already
+/// holds.
+#[cfg(feature = "web")]
+pub fn split_popup(popup_id: &str) {
+    let Some(popup) = popups::by_id(popup_id) else {
+        return;
+    };
+    let Some(url) = popups::promote_url(&popup) else {
+        return;
+    };
+    let known = evict::last_snapshot()
+        .map(|s| s.tabs.iter().map(|t| t.id.to_string()).collect())
+        .unwrap_or_default();
+    popups::request_split(&popup.opener, &url, known);
+    tabs::open_tab_for_popup(&popup.opener, url);
+    close_popup(popup_id);
+}
+
+/// No page engine, so there is no popup to put anywhere.
+#[cfg(not(feature = "web"))]
+pub fn split_popup(_popup_id: &str) {}
 
 /// Clear Chromium's own copy of an origin's permission answers (G1).
 ///

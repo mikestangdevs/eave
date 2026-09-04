@@ -1179,6 +1179,51 @@ where
     }
 }
 
+/// `.hover_lift(key, rise, shadow)` — the control RISES under the pointer
+/// instead of changing colour.
+///
+/// Same bargain as [`HoverFade`], and the same one-call shape for the same
+/// reason: the offset and the listener are useless apart, so there is no
+/// way to write one without the other. It rides `hover_t` like every other
+/// hover affordance here, which is what keeps it off gpui's `.hover(|s|
+/// ..)` — that snaps whole on the frame the pointer enters, and the shell
+/// has an inventory rule against it.
+///
+/// **The rise is spent on BOTH margins**, up on top and down on the
+/// bottom, so the control moves without its neighbours moving: a lift that
+/// changed the box's height would walk the rest of the column down the
+/// screen every time the pointer crossed it.
+///
+/// The shadow is passed in rather than chosen here — ink belongs to
+/// `theme`, and this module knows about time, not colour.
+pub trait HoverLift: Sized {
+    fn hover_lift(
+        self,
+        key: impl Into<String>,
+        rise: f32,
+        shadow: impl Fn(f32) -> Vec<gpui::BoxShadow>,
+    ) -> Self;
+}
+
+impl<E> HoverLift for E
+where
+    E: Styled + StatefulInteractiveElement,
+{
+    fn hover_lift(
+        self,
+        key: impl Into<String>,
+        rise: f32,
+        shadow: impl Fn(f32) -> Vec<gpui::BoxShadow>,
+    ) -> Self {
+        let key = key.into();
+        let t = hover_t(&key);
+        self.mt(gpui::px(-rise * t))
+            .mb(gpui::px(rise * t))
+            .shadow(shadow(t))
+            .on_hover(hover_listener(key))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
