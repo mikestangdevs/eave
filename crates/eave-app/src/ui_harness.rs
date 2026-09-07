@@ -23582,3 +23582,80 @@ fn a_closed_cards_placement_is_pruned_but_an_empty_snapshot_prunes_nothing(cx: &
     vcx.run_until_parked();
     assert!(placed(&h, vcx, "aaaa1111").is_none(), "the closed card's placement went with it");
 }
+
+/// **A click on open ground spawns a card THERE.** The ground is the only
+/// thing under the pointer that owns no other gesture, so a plain click on
+/// it can mean the obvious thing; the engine mints the id, so the
+/// placement is written when the tab arrives.
+#[gpui::test]
+fn a_click_on_open_ground_opens_a_card_where_it_was_clicked(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let _ = h.drain();
+    // A point on the plane that no card covers: to the right of the only
+    // card, which is one column wide at the left gutter.
+    let card = vcx.debug_bounds("column-aaaa1111").expect("column-aaaa1111");
+    let strip = vcx.debug_bounds("column-strip").expect("column-strip");
+    let ground = point(
+        card.origin.x + card.size.width + px(40.),
+        strip.origin.y + px(200.),
+    );
+    assert!(
+        ground.x < strip.origin.x + strip.size.width,
+        "precondition: the ground point is inside the plane"
+    );
+    vcx.simulate_mouse_down(ground, MouseButton::Left, Modifiers::none());
+    vcx.simulate_mouse_up(ground, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        h.drain().iter().any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
+        "a click on the ground asks the engine for a tab"
+    );
+
+    // The engine answers, and the card lands where the click was — not at
+    // the end of the grid.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![session_tab("aaaa1111"), page_tab("p9", None, None)],
+        Some("p9"),
+    );
+    vcx.run_until_parked();
+    let placed = placed(&h, vcx, "p9").expect("the new card was placed at the click");
+    assert!(
+        placed.x > card.origin.x.into(),
+        "it landed to the right of the card that was there: {placed:?}"
+    );
+}
+
+/// **Every card is mounted at every zoom.** Nothing empties itself because
+/// the plane moved: the 2026-09-07 ruling, *"everything should always be
+/// rendered in view at all times."*
+#[gpui::test]
+fn every_card_stays_drawn_however_far_the_plane_is_panned(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222"), session("cccc3333")],
+        "aaaa1111",
+    );
+    enter_canvas(&h, vcx);
+    for stem in ["aaaa1111", "bbbb2222", "cccc3333"] {
+        assert!(shown(vcx, sel(format!("column-body-{stem}"))), "{stem} at rest");
+    }
+    // Pan far away and zoom out: still drawn, all of them.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.canvas_pan.set((4000.0, 4000.0));
+            shell.canvas_shown_pan.set((4000.0, 4000.0));
+            shell.canvas_zoom.set(crate::canvas::ZOOM_MIN);
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    for stem in ["aaaa1111", "bbbb2222", "cccc3333"] {
+        assert!(shown(vcx, sel(format!("column-body-{stem}"))), "{stem} zoomed out");
+    }
+}

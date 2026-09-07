@@ -69,12 +69,6 @@ pub const ZOOM_MAX: f32 = 2.0;
 /// One press of ⌘+ / ⌘−, as a ratio — zoom is multiplicative, so the
 /// steps feel even at both ends.
 pub const ZOOM_STEP: f32 = 1.2;
-/// Below this the cards draw their HEAD only. A page composited into a
-/// 200 px box is unreadable and still costs a full renderer, and a
-/// transcript at that size is a grey smear: zoomed out you are looking
-/// for WHICH card, not reading one.
-pub const ZOOM_OVERVIEW: f32 = 0.72;
-
 /// The ground's dot lattice, in canvas points. Ruled on in the same run:
 /// *"there is no canvas dotted background. its just a black void."* The
 /// dots are what make a pan legible — without them the plane moves and
@@ -253,14 +247,18 @@ pub fn content_bounds(rects: &[CardRect], view_w: f32, view_h: f32) -> CardRect 
     b.inflate(GUTTER)
 }
 
-/// How far past its content the plane may be panned: a FULL viewport in
-/// each direction, on every axis, whether or not that axis has content to
-/// scroll. Ruled on 2026-09-07 — *"a canvas is free form"* — and the dot
-/// lattice is what makes it safe: with the ground drawn, a pan into empty
-/// space is legibly a pan, where over a black void it was just a card
-/// that had gone missing. ⌘0 and `tidy` are the ways home.
-fn overscroll(view: f32) -> f32 {
-    view.max(GUTTER)
+/// How much of the content must stay on screen, on each axis. **The plane
+/// roams freely and still cannot be lost.**
+///
+/// A viewport of overscroll (the first answer to *"a canvas is free
+/// form"*) let every card leave the screen: content shorter than the
+/// window, panned by a whole window, is entirely outside it, and the
+/// operator is then looking at an empty lattice with no way to tell which
+/// way home is. Bounding the OVERLAP instead keeps both properties — you
+/// can push the content into any corner, and a corner is as far as it
+/// goes.
+fn keep_on_screen(view: f32) -> f32 {
+    (view / 3.0).clamp(GUTTER, 240.0)
 }
 
 /// Hold the pan inside the content plus its overscroll. When the content
@@ -272,12 +270,17 @@ pub fn clamp_pan(pan_x: f32, pan_y: f32, content: &CardRect, view_w: f32, view_h
         if !pan.is_finite() {
             return lo;
         }
-        let slack = overscroll(view);
-        // An axis with nothing to scroll still roams by the overscroll —
-        // that is the free-form ruling. The far end is whichever is
-        // greater: the content's end, or its origin.
-        let far = (lo + size - view).max(lo);
-        pan.clamp(lo - slack, far + slack)
+        // Every axis roams — including one whose content is narrower than
+        // the window, which is what *"full screen is fixed to up and down
+        // scroll"* was about. What bounds it is the OVERLAP: the viewport
+        // and the content must always share this much.
+        let keep = keep_on_screen(view).min(size);
+        // The viewport's left edge may reach the content's right edge less
+        // `keep`; its right edge must stay past the content's left edge
+        // plus `keep`.
+        let hi = lo + size - keep;
+        let lo_ = lo + keep - view;
+        pan.clamp(lo_.min(hi), hi.max(lo_))
     };
     (
         axis(pan_x, content.x, content.w, view_w),
@@ -291,7 +294,9 @@ pub fn visible(rects: &[CardRect], pan_x: f32, pan_y: f32, view_w: f32, view_h: 
     if view_w <= 0.0 || view_h <= 0.0 {
         return Vec::new();
     }
-    let view = CardRect::new(pan_x, pan_y, view_w, view_h);
+    // Inflated by a card: a page that stops compositing the moment its
+    // card touches the viewport's edge blinks white as you pan past it.
+    let view = CardRect::new(pan_x, pan_y, view_w, view_h).inflate(CARD_W);
     rects
         .iter()
         .enumerate()
@@ -300,21 +305,19 @@ pub fn visible(rects: &[CardRect], pan_x: f32, pan_y: f32, view_w: f32, view_h: 
         .collect()
 }
 
-/// The cards that are laid out and painted: the visible ones, plus
-/// anything within one card of the viewport, so a pan of less than a card
-/// reveals content that is already mounted rather than a slot filling in.
-/// CL1's `mounted_range` in two dimensions.
-pub fn mounted(rects: &[CardRect], pan_x: f32, pan_y: f32, view_w: f32, view_h: f32) -> Vec<usize> {
-    if view_w <= 0.0 || view_h <= 0.0 {
-        return Vec::new();
-    }
-    let view = CardRect::new(pan_x, pan_y, view_w, view_h).inflate(CARD_W);
-    rects
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.intersects(&view))
-        .map(|(i, _)| i)
-        .collect()
+/// The cards that are laid out and painted: **all of them**.
+///
+/// Ruled on 2026-09-07: *"windows are disapearing when i zoom in and not
+/// rendering when i zoom out. everything should always be rendered in
+/// view at all times."* CL1 virtualized because a STRIP is unbounded in
+/// one direction and its columns are viewport-sized — mounting them all
+/// was a real cost. A plane's cards are small and the operator arranges
+/// them to be looked at together; a card that empties itself because the
+/// zoom moved it a little outside a margin is the plane lying about what
+/// is on it. The `pan`/`view` arguments are kept so the signature still
+/// says what it is about, and so a future budget has somewhere to go.
+pub fn mounted(rects: &[CardRect], _pan_x: f32, _pan_y: f32, _view_w: f32, _view_h: f32) -> Vec<usize> {
+    (0..rects.len()).collect()
 }
 
 /// The card under a canvas point, topmost first. Later cards paint over
@@ -349,6 +352,34 @@ pub fn pan_into_view(
         axis(pan_x, rect.x, rect.w, view_w),
         axis(pan_y, rect.y, rect.h, view_h),
     )
+}
+
+/// What a wheel delta does to the plane, in WINDOW points: the pan, or
+/// nothing because the gesture belongs to a card.
+///
+/// **The rule is CLICKED IN, not hovered** — ruled on 2026-09-07: *"when i
+/// hover over a window (not clicked in) i cant move the canvas. i can only
+/// go side to side. i dont think hover should affect canvas movement."*
+/// CL1's rule (a card owns the vertical wherever the pointer sits) is
+/// right for a STRIP, where every column is a page you are reading. On a
+/// plane the pointer is over a card most of the time simply because cards
+/// cover the plane, and a gesture whose meaning changes under the cursor
+/// cannot be aimed.
+///
+/// So the plane takes both axes everywhere except over the ONE card the
+/// operator clicked into, which keeps its own vertical scroll because it
+/// holds the transcript and the composer. Selection is a deliberate act;
+/// hovering is not.
+pub fn wheel_pan(dx: f32, dy: f32, over_selected: bool) -> Option<(f32, f32)> {
+    if dx == 0.0 && dy == 0.0 {
+        return None;
+    }
+    if over_selected {
+        // The selected card's own scroll owns the vertical; a
+        // horizontal-dominant delta still walks the plane.
+        return crate::columns::strip_delta(dx, dy).map(|d| (d, 0.0));
+    }
+    Some((-dx, -dy))
 }
 
 /// Which part of a card a press at this canvas point has taken hold of.
@@ -636,8 +667,10 @@ mod tests {
         }
     }
 
+    /// The plane's reach on an axis that HAS somewhere to go: the far end
+    /// is the content's end, less the overlap the clamp keeps on screen.
     #[test]
-    fn the_pan_is_held_inside_the_content_plus_a_viewport() {
+    fn the_pan_reaches_the_content_and_keeps_a_grip_on_it() {
         let rects = vec![
             CardRect::new(0.0, 0.0, 600.0, 400.0),
             CardRect::new(3000.0, 2000.0, 600.0, 400.0),
@@ -647,13 +680,16 @@ mod tests {
         assert_eq!(b.x, -GUTTER);
         assert_eq!(b.right(), 3600.0 + GUTTER);
         assert!(b.w > vw && b.h > vh, "precondition: both axes can move");
-        // Far past the right edge: the content's end, plus a viewport.
+        // Far past the right: the viewport's LEFT edge reaches the
+        // content's right edge, less what stays on screen.
         let (px, _) = clamp_pan(99999.0, 0.0, &b, vw, vh);
-        assert_eq!(px, b.x + b.w - vw + vw);
-        // Far past the left: the content's origin, less a viewport.
+        assert_eq!(px, b.x + b.w - keep_on_screen(vw));
+        assert!(CardRect::new(px, 0.0, vw, vh).intersects(&b), "still holding on");
+        // Far past the left: the viewport's RIGHT edge stays past the
+        // content's left edge by the same amount.
         let (px, py) = clamp_pan(-99999.0, -99999.0, &b, vw, vh);
-        assert_eq!(px, b.x - vw);
-        assert_eq!(py, b.y - vh);
+        assert_eq!(px, b.x + keep_on_screen(vw) - vw);
+        assert_eq!(py, b.y + keep_on_screen(vh) - vh);
         // NaN reads as the origin rather than poisoning the plane.
         let (px, py) = clamp_pan(f32::NAN, f32::NAN, &b, vw, vh);
         assert_eq!((px, py), (b.x, b.y));
@@ -661,27 +697,40 @@ mod tests {
 
     /// Content smaller than the window does not slide about: the axis
     /// pins to the content's origin, give or take the overscroll.
-    /// **Every axis roams** — the 2026-09-07 ruling, *"a canvas is free
-    /// form"*, after a first cut that PINNED an axis with no content to
-    /// scroll and produced *"full screen is fixed to up and down scroll i
-    /// cant move around at all"*: a wide window makes the content
-    /// narrower than the viewport, and the pin then forbade the whole x
-    /// axis. A viewport of overscroll in every direction, always; the dot
-    /// lattice is what keeps that legible, and ⌘0 is the way home.
+    /// **Every axis roams, and the content can never be lost.** Two
+    /// rulings met at once. *"full screen is fixed to up and down scroll i
+    /// cant move around at all"* — an earlier cut PINNED an axis whose
+    /// content was narrower than the window, which on a wide window is the
+    /// whole x axis. And the answer to that, a whole viewport of
+    /// overscroll, let every card leave the screen: panned by a window,
+    /// content shorter than the window is entirely outside it, and the
+    /// operator is looking at an empty lattice. What is bounded is the
+    /// OVERLAP.
     #[test]
-    fn every_axis_roams_by_a_viewport_even_with_nothing_to_scroll() {
+    fn every_axis_roams_but_the_content_never_leaves_the_screen() {
         let rects = vec![CardRect::new(0.0, 0.0, 400.0, 300.0)];
         let (vw, vh) = (2000.0, 1400.0);
         let b = content_bounds(&rects, vw, vh);
         assert!(b.w < vw && b.h < vh, "precondition: smaller than the window");
-        let (px, py) = clamp_pan(-5000.0, -5000.0, &b, vw, vh);
-        assert_eq!(px, b.x - vw, "a viewport left of the content");
-        assert_eq!(py, b.y - vh, "and a viewport above it");
-        let (px, py) = clamp_pan(5000.0, 5000.0, &b, vw, vh);
-        assert_eq!(px, b.x + vw, "a viewport right of it");
-        assert_eq!(py, b.y + vh);
-        // A small nudge is taken verbatim: the plane is not sticky.
+        // Pushed as far as it goes in each direction, the content and the
+        // viewport still meet.
+        for (ax, ay) in [(-9e9, -9e9), (9e9, 9e9), (9e9, -9e9)] {
+            let (px, py) = clamp_pan(ax, ay, &b, vw, vh);
+            let view = CardRect::new(px, py, vw, vh);
+            assert!(view.intersects(&b), "lost the content at ({ax}, {ay}): {view:?} vs {b:?}");
+        }
+        // It really does roam: a wide window's x axis is not pinned.
+        let far = clamp_pan(9e9, 0.0, &b, vw, vh).0;
+        assert!(far > b.x + 100.0, "x roams: {far}");
+        // A small nudge is taken verbatim — the plane is not sticky.
         assert_eq!(clamp_pan(7.0, -3.0, &b, vw, vh), (7.0, -3.0));
+        // And a TALL canvas keeps its ordinary scroll range.
+        let tall = vec![CardRect::new(0.0, 0.0, 400.0, 9000.0)];
+        let b = content_bounds(&tall, vw, vh);
+        let (_, py) = clamp_pan(9e9, 9e9, &b, vw, vh);
+        assert!(py > 9000.0 - vh, "the far end reaches the content's end: {py}");
+        let view = CardRect::new(0.0, py, vw, vh);
+        assert!(view.intersects(&b));
     }
 
     #[test]
@@ -691,14 +740,17 @@ mod tests {
             CardRect::new(1200.0, 0.0, 500.0, 400.0), // one card to the right
             CardRect::new(9000.0, 0.0, 500.0, 400.0), // far away
         ];
+        // Visible is the viewport plus a card, so a page does not blink
+        // white as its card touches the edge.
         let v = visible(&rects, 0.0, 0.0, 1000.0, 700.0);
-        assert_eq!(v, vec![0]);
-        let m = mounted(&rects, 0.0, 0.0, 1000.0, 700.0);
-        assert_eq!(m, vec![0, 1], "the neighbour is mounted, the far one is not");
-        // No viewport yet: nothing at all, and no panic.
+        assert_eq!(v, vec![0, 1]);
+        assert!(!v.contains(&2), "the far one does not composite");
+        // **Everything is mounted, always** — the 2026-09-07 ruling.
+        assert_eq!(mounted(&rects, 0.0, 0.0, 1000.0, 700.0), vec![0, 1, 2]);
+        assert_eq!(mounted(&rects, 9e9, 9e9, 1000.0, 700.0), vec![0, 1, 2]);
+        // No viewport yet: nothing composites, and no panic.
         assert!(visible(&rects, 0.0, 0.0, 0.0, 0.0).is_empty());
-        assert!(mounted(&rects, 0.0, 0.0, 0.0, 0.0).is_empty());
-        assert_eq!(span(&m), 0..2);
+        assert_eq!(span(&v), 0..2);
         assert_eq!(span(&[]), 0..0);
     }
 
@@ -713,6 +765,29 @@ mod tests {
         assert_eq!(hit(&rects, 20.0, 20.0), Some(0));
         assert_eq!(hit(&rects, -5.0, 20.0), None);
         assert_eq!(hit(&[], 0.0, 0.0), None);
+    }
+
+    /// **Hover does not decide whose gesture it is** — the 2026-09-07
+    /// ruling. Only the card the operator has clicked INTO keeps the
+    /// vertical; everywhere else, including over other cards, the plane
+    /// takes both axes.
+    #[test]
+    fn only_the_card_you_clicked_into_keeps_the_wheel() {
+        // Over the ground, or over a card that is merely hovered: the
+        // plane moves on both axes.
+        for over_selected in [false] {
+            assert_eq!(wheel_pan(0.0, -30.0, over_selected), Some((0.0, 30.0)));
+            assert_eq!(wheel_pan(-12.0, -30.0, over_selected), Some((12.0, 30.0)));
+            assert_eq!(wheel_pan(-40.0, 2.0, over_selected), Some((40.0, -2.0)));
+        }
+        // Over the SELECTED card the vertical is the card's, and only a
+        // horizontal-dominant delta reaches the plane.
+        assert_eq!(wheel_pan(0.0, -30.0, true), None, "the card scrolls itself");
+        assert_eq!(wheel_pan(-12.0, -30.0, true), None, "vertical-dominant is the card's");
+        assert_eq!(wheel_pan(-40.0, 2.0, true), Some((40.0, 0.0)), "x still walks the plane");
+        // Nothing is nothing, either way.
+        assert_eq!(wheel_pan(0.0, 0.0, false), None);
+        assert_eq!(wheel_pan(0.0, 0.0, true), None);
     }
 
     #[test]

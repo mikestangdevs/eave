@@ -135,6 +135,24 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Save as PDF…", crate::ui::PrintPage),
             ],
         },
+        // **Slice CV1 — the plane's zoom, on the menu bar.** Not a
+        // duplicate of the key bindings: a macOS menu key equivalent is
+        // handled by AppKit ahead of the responder chain, and the shell's
+        // `on_action` chain is NOT reached while a text field has focus —
+        // which on the canvas is most of the time, because the selected
+        // card holds the composer. Measured 2026-09-07: ⌘T (a menu item)
+        // fired and ⌘0 (bindings only) did not.
+        Menu {
+            name: "View".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("Zoom In", crate::ui::ZoomIn),
+                MenuItem::action("Zoom Out", crate::ui::ZoomOut),
+                MenuItem::action("Actual Size", crate::ui::ZoomReset),
+                MenuItem::separator(),
+                MenuItem::action("Tidy Canvas", crate::ui::TidyCanvas),
+            ],
+        },
         Menu {
             name: "Window".into(),
             disabled: false,
@@ -164,10 +182,14 @@ mod tests {
     fn the_bar_names_only_what_eave_has() {
         let m = menus();
         let names: Vec<&str> = m.iter().map(|x| x.name.as_ref()).collect();
-        assert_eq!(names, vec!["eave", "File", "Window"]);
+        // View arrived with Slice CV1: the canvas's zoom has to be on the
+        // bar, because a menu key equivalent is handled ahead of the
+        // responder chain and the shell's `on_action` chain is not reached
+        // while a text field has focus.
+        assert_eq!(names, vec!["eave", "File", "View", "Window"]);
 
         let app_items = m[0].items.len();
-        let window_items = m[2].items.len();
+        let window_items = m[3].items.len();
         assert!(app_items >= 5, "the app menu lost items: {app_items}");
         assert!(
             window_items >= 3,
