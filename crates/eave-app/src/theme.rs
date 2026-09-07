@@ -716,6 +716,15 @@ fn wash_raised() -> Hsla {
 pub fn canvas() -> Hsla {
     glass_canvas()
 }
+/// **Slice CV1 — the canvas plane's dot lattice.** The quietest mark the
+/// ground can carry: it exists to make a pan legible, and the moment it
+/// is legible as a PATTERN it is decoration on every window. One step
+/// above the ground and no more — `border()`'s ink at a third of its
+/// weight, which is why it is a neutral and is listed as one.
+pub fn canvas_dot() -> Hsla {
+    let base = if is_light() { grey(0x00) } else { grey(0xff) };
+    base.opacity(if is_light() { 0.10 } else { 0.07 })
+}
 /// Raised blocks: user directive blocks, pills, cards.
 ///
 /// **The only rung of the old five-rung ladder that anything paints.**
@@ -4171,6 +4180,7 @@ mod tests {
             ("border", border()),
             ("border_strong", border_strong()),
             ("edge_modal", edge_modal()),
+            ("canvas_dot", canvas_dot()),
         ] {
             let c: Rgba = c.into();
             assert_eq!(

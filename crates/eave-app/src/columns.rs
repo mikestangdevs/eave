@@ -296,7 +296,7 @@ pub fn merge_order(
 pub const LAYOUT_KEY: &str = "layout";
 
 /// What `frame.json` remembers of a window's layout.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutPrefs {
     pub mode: LayoutMode,
     /// The strip's scroll, in content pixels. Restored verbatim: the
@@ -310,6 +310,22 @@ pub struct LayoutPrefs {
     /// only once the operator has moved something.
     pub pan_x: f32,
     pub pan_y: f32,
+    /// Slice CV1 — the plane's zoom. 1.0 is one canvas point per window
+    /// point, which is why this record needs a hand-written `Default`:
+    /// the derived one would open every window at zoom 0.
+    pub zoom: f32,
+}
+
+impl Default for LayoutPrefs {
+    fn default() -> Self {
+        Self {
+            mode: LayoutMode::default(),
+            scroll: 0.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            zoom: 1.0,
+        }
+    }
 }
 
 /// The pure half of the layout load: this window's entry under
@@ -340,7 +356,13 @@ pub fn layout_from(doc: &serde_json::Value, window: &str) -> LayoutPrefs {
             .filter(|x| x.is_finite())
             .unwrap_or(0.0)
     };
-    LayoutPrefs { mode, scroll, pan_x: pan("pan_x"), pan_y: pan("pan_y") }
+    let zoom = entry
+        .get("zoom")
+        .and_then(|v| v.as_f64())
+        .map(|x| x as f32)
+        .filter(|x| x.is_finite() && *x > 0.0)
+        .unwrap_or(1.0);
+    LayoutPrefs { mode, scroll, pan_x: pan("pan_x"), pan_y: pan("pan_y"), zoom }
 }
 
 /// The pure half of the layout save: this window's entry written, every
@@ -365,6 +387,7 @@ pub fn put_layout(doc: &mut serde_json::Value, window: &str, prefs: LayoutPrefs)
             "scroll": prefs.scroll,
             "pan_x": prefs.pan_x,
             "pan_y": prefs.pan_y,
+            "zoom": prefs.zoom,
         }),
     );
 }
@@ -533,6 +556,7 @@ mod tests {
             // negative — the plane has no left end the way the strip has.
             pan_x: -240.0,
             pan_y: 96.0,
+            zoom: 1.5,
         };
         put_layout(&mut doc, "primary", prefs);
         assert_eq!(layout_from(&doc, "primary"), prefs);
@@ -541,8 +565,7 @@ mod tests {
             LayoutPrefs {
                 mode: LayoutMode::Columns,
                 scroll: 12.0,
-                pan_x: 0.0,
-                pan_y: 0.0,
+                ..Default::default()
             }
         );
         assert_eq!(doc["rail_groups_collapsed"], serde_json::json!(["/a"]));
@@ -557,8 +580,7 @@ mod tests {
             LayoutPrefs {
                 mode: LayoutMode::Columns,
                 scroll: 0.0,
-                pan_x: 0.0,
-                pan_y: 0.0,
+                ..Default::default()
             }
         );
         assert_eq!(

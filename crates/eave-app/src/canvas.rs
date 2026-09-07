@@ -57,10 +57,30 @@ pub const CARD_H_MAX: f32 = 4000.0;
 /// nobody has touched fills the well exactly the way the strip did.
 pub const GRID_H_MIN: f32 = 360.0;
 pub const GRID_H_MAX: f32 = 900.0;
-/// A dropped card lands on this lattice, so cards placed by hand still
-/// line up with each other and with the grid. Small enough that the drag
-/// reads as free.
-pub const SNAP: f32 = 12.0;
+/// A card's default height. **Not the viewport** — walked 2026-09-07 and
+/// ruled on: *"a canvas is free form. not rigid."* Cards a whole window
+/// tall are a stack of screens, not a canvas; a fixed, comfortable card
+/// is what makes the plane read as a plane the moment it opens.
+pub const CARD_H: f32 = 460.0;
+
+/// The plane's zoom. 1.0 is one canvas point per window point.
+pub const ZOOM_MIN: f32 = 0.3;
+pub const ZOOM_MAX: f32 = 2.0;
+/// One press of ⌘+ / ⌘−, as a ratio — zoom is multiplicative, so the
+/// steps feel even at both ends.
+pub const ZOOM_STEP: f32 = 1.2;
+/// Below this the cards draw their HEAD only. A page composited into a
+/// 200 px box is unreadable and still costs a full renderer, and a
+/// transcript at that size is a grey smear: zoomed out you are looking
+/// for WHICH card, not reading one.
+pub const ZOOM_OVERVIEW: f32 = 0.72;
+
+/// The ground's dot lattice, in canvas points. Ruled on in the same run:
+/// *"there is no canvas dotted background. its just a black void."* The
+/// dots are what make a pan legible — without them the plane moves and
+/// nothing on screen says so.
+pub const DOT_SPACING: f32 = 28.0;
+pub const DOT_SIZE: f32 = 2.0;
 /// How wide the resize band inside a card's right and bottom edges is.
 pub const GRIP_BAND: f32 = 7.0;
 /// How long a programmatic pan (tidy, a selection coming into view)
@@ -150,17 +170,25 @@ pub fn grid_cols(view_w: f32) -> usize {
     ((usable / per).floor() as i64).max(1) as usize
 }
 
-/// A grid card's height: the viewport, less the margins, within bounds.
+/// A grid card's height: [`CARD_H`], or the viewport if that is shorter.
+///
+/// **It is NOT the viewport height.** The first cut made a card a whole
+/// window tall — CL1's strip, carried over — and the walk of 2026-09-07
+/// ruled on what that produces: *"a canvas is free form. not rigid."* A
+/// row per screen is a stack, and the plane only reads as a plane when
+/// more than one card is in front of you.
 pub fn grid_h(view_h: f32) -> f32 {
     if !view_h.is_finite() || view_h <= 0.0 {
-        return GRID_H_MIN;
+        return CARD_H;
     }
-    (view_h - 2.0 * GUTTER).clamp(GRID_H_MIN, GRID_H_MAX)
+    CARD_H.min(view_h - 2.0 * GUTTER).max(CARD_H_MIN)
 }
 
-/// Where the `ix`th untouched card sits. Row-major, wrapping at
-/// [`grid_cols`] — so one row at a wide window is CL1's strip, and a
-/// narrow window wraps into a grid that scrolls down.
+/// Where the `ix`th untouched card sits, of `n` untouched cards in all.
+/// Row-major, wrapping at [`grid_cols`] — so one row at a wide window is
+/// CL1's strip, and a narrow window wraps into a grid that scrolls down.
+/// `n` is taken because the ROW HEIGHT depends on whether the grid wraps;
+/// see [`grid_h`].
 pub fn grid_slot(ix: usize, view_w: f32, view_h: f32) -> CardRect {
     let cols = grid_cols(view_w);
     let h = grid_h(view_h);
@@ -225,11 +253,14 @@ pub fn content_bounds(rects: &[CardRect], view_w: f32, view_h: f32) -> CardRect 
     b.inflate(GUTTER)
 }
 
-/// How far past its content the plane may be panned: half a viewport in
-/// each direction. Enough to drag a card into open space and to see that
-/// you have reached the edge; never enough to lose the content entirely.
+/// How far past its content the plane may be panned: a FULL viewport in
+/// each direction, on every axis, whether or not that axis has content to
+/// scroll. Ruled on 2026-09-07 — *"a canvas is free form"* — and the dot
+/// lattice is what makes it safe: with the ground drawn, a pan into empty
+/// space is legibly a pan, where over a black void it was just a card
+/// that had gone missing. ⌘0 and `tidy` are the ways home.
 fn overscroll(view: f32) -> f32 {
-    (view / 2.0).max(GUTTER)
+    view.max(GUTTER)
 }
 
 /// Hold the pan inside the content plus its overscroll. When the content
@@ -242,12 +273,11 @@ pub fn clamp_pan(pan_x: f32, pan_y: f32, content: &CardRect, view_w: f32, view_h
             return lo;
         }
         let slack = overscroll(view);
-        if size <= view {
-            // Smaller than the window: the content's origin, less the
-            // slack that centres nothing and surprises no one.
-            return pan.clamp(lo - slack, lo + slack);
-        }
-        pan.clamp(lo - slack, lo + size - view + slack)
+        // An axis with nothing to scroll still roams by the overscroll —
+        // that is the free-form ruling. The far end is whichever is
+        // greater: the content's end, or its origin.
+        let far = (lo + size - view).max(lo);
+        pan.clamp(lo - slack, far + slack)
     };
     (
         axis(pan_x, content.x, content.w, view_w),
@@ -351,25 +381,61 @@ pub fn grip_at(rect: &CardRect, x: f32, y: f32) -> Option<Grip> {
     }
 }
 
-/// Snap a value to the lattice. Applied on DROP, never during the drag:
-/// a card that jumps between lattice points under the pointer does not
-/// read as being carried.
-pub fn snap_to(v: f32) -> f32 {
-    (v / SNAP).round() * SNAP
+pub fn clamp_zoom(z: f32) -> f32 {
+    if !z.is_finite() {
+        return 1.0;
+    }
+    z.clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
-/// Where a card under the pointer sits MID-drag: exactly where the hand
-/// put it. Unsnapped, because a card that jumps between lattice points
-/// while it is being carried does not read as being carried.
-pub fn moved_free(start: &CardRect, dx: f32, dy: f32) -> CardRect {
+/// One step of the zoom, in or out.
+pub fn zoom_step(zoom: f32, delta: i32) -> f32 {
+    let z = if delta > 0 { zoom * ZOOM_STEP } else { zoom / ZOOM_STEP };
+    clamp_zoom(z)
+}
+
+/// The canvas point under a VIEWPORT point at this pan and zoom.
+pub fn to_canvas(pan_x: f32, pan_y: f32, zoom: f32, vx: f32, vy: f32) -> (f32, f32) {
+    let z = clamp_zoom(zoom);
+    (pan_x + vx / z, pan_y + vy / z)
+}
+
+/// The pan that keeps the canvas point under `(vx, vy)` fixed while the
+/// zoom changes — so zooming with the pointer over a card holds that card
+/// still, which is the only zoom that can be aimed.
+pub fn zoom_about(
+    pan_x: f32,
+    pan_y: f32,
+    from: f32,
+    to: f32,
+    vx: f32,
+    vy: f32,
+) -> (f32, f32) {
+    let (cx_, cy_) = to_canvas(pan_x, pan_y, from, vx, vy);
+    let to = clamp_zoom(to);
+    (cx_ - vx / to, cy_ - vy / to)
+}
+
+/// The part of the plane a viewport covers, in CANVAS points — which is
+/// the window's size divided by the zoom. Everything that reasons about
+/// what is on screen goes through here, so the zoom is applied once.
+pub fn viewport(pan_x: f32, pan_y: f32, view_w: f32, view_h: f32, zoom: f32) -> CardRect {
+    let z = clamp_zoom(zoom);
+    CardRect::new(pan_x, pan_y, (view_w / z).max(0.0), (view_h / z).max(0.0))
+}
+
+/// Where a card under the pointer sits, and where it lands: the same
+/// answer. **There is no drop lattice** — ruled on 2026-09-07, *"a canvas
+/// is free form. not rigid."* A 12 px snap was imperceptible while the
+/// card was moving and still meant a card could not be put exactly where
+/// it was let go, which is the one thing a canvas promises.
+pub fn moved(start: &CardRect, dx: f32, dy: f32) -> CardRect {
     CardRect::new(start.x + dx, start.y + dy, start.w, start.h)
 }
 
-/// Where a moved card lands: the origin the pointer put it at, snapped.
-/// The size is untouched — a move is a move.
-pub fn moved(start: &CardRect, dx: f32, dy: f32) -> CardRect {
-    let r = moved_free(start, dx, dy);
-    CardRect::new(snap_to(r.x), snap_to(r.y), r.w, r.h)
+/// Kept as the name the drag path uses while a card is in hand.
+pub fn moved_free(start: &CardRect, dx: f32, dy: f32) -> CardRect {
+    moved(start, dx, dy)
 }
 
 /// A card's size MID-resize: the grip's axes only, clamped to the size
@@ -387,19 +453,10 @@ pub fn resized_free(start: &CardRect, grip: Grip, dx: f32, dy: f32) -> CardRect 
     CardRect::new(start.x, start.y, w, h)
 }
 
-/// Where a resized card lands: the same axes, snapped to the lattice and
-/// THEN clamped — that order, so a card dragged past its floor stops
-/// exactly at the floor rather than at the first lattice point above it.
+/// Where a resized card lands — the same as under the hand, for
+/// [`moved`]'s reason. Clamped to the size bounds and nothing else.
 pub fn resized(start: &CardRect, grip: Grip, dx: f32, dy: f32) -> CardRect {
-    let w = match grip {
-        Grip::Right | Grip::Corner => snap_to(start.w + dx).clamp(CARD_W_MIN, CARD_W_MAX),
-        Grip::Bottom => start.w,
-    };
-    let h = match grip {
-        Grip::Bottom | Grip::Corner => snap_to(start.h + dy).clamp(CARD_H_MIN, CARD_H_MAX),
-        Grip::Right => start.h,
-    };
-    CardRect::new(start.x, start.y, w, h)
+    resized_free(start, grip, dx, dy)
 }
 
 /// The `frame.json` key holding each window's hand placements. Separate
@@ -525,6 +582,17 @@ mod tests {
         assert_eq!(rects[2].x, rects[0].x, "and started a new row at the left");
         assert_eq!(rects[3].y, rects[2].y, "the second row holds two as well");
         assert!(rects[4].y > rects[2].y, "five cards over two columns make three rows");
+        // **A card is a CARD, not a screen** — the 2026-09-07 ruling,
+        // *"a canvas is free form. not rigid."* The first cut made a grid
+        // row a whole viewport tall, which put exactly one card in front
+        // of the operator and read as a stack rather than a plane.
+        let view_h = 800.0;
+        assert_eq!(grid_h(view_h), CARD_H);
+        assert!(CARD_H < view_h - 2.0 * GUTTER, "and it is smaller than the window");
+        let rects = layout(&order, &placed, view_w, view_h);
+        assert!(rects[2].y < view_h, "the second row starts on screen: {rects:?}");
+        // A window shorter than a card shrinks it rather than clipping it.
+        assert_eq!(grid_h(300.0), CARD_H_MIN.max(300.0 - 2.0 * GUTTER));
         // A window too narrow for even one card still shows one.
         assert_eq!(grid_cols(10.0), 1);
         assert_eq!(grid_cols(0.0), 1);
@@ -569,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pan_is_held_inside_the_content_plus_half_a_viewport() {
+    fn the_pan_is_held_inside_the_content_plus_a_viewport() {
         let rects = vec![
             CardRect::new(0.0, 0.0, 600.0, 400.0),
             CardRect::new(3000.0, 2000.0, 600.0, 400.0),
@@ -578,13 +646,14 @@ mod tests {
         let b = content_bounds(&rects, vw, vh);
         assert_eq!(b.x, -GUTTER);
         assert_eq!(b.right(), 3600.0 + GUTTER);
-        // Far past the right edge: clamped to content end + half a view.
+        assert!(b.w > vw && b.h > vh, "precondition: both axes can move");
+        // Far past the right edge: the content's end, plus a viewport.
         let (px, _) = clamp_pan(99999.0, 0.0, &b, vw, vh);
-        assert_eq!(px, b.x + b.w - vw + vw / 2.0);
-        // Far past the left: content origin less half a view.
+        assert_eq!(px, b.x + b.w - vw + vw);
+        // Far past the left: the content's origin, less a viewport.
         let (px, py) = clamp_pan(-99999.0, -99999.0, &b, vw, vh);
-        assert_eq!(px, b.x - vw / 2.0);
-        assert_eq!(py, b.y - vh / 2.0);
+        assert_eq!(px, b.x - vw);
+        assert_eq!(py, b.y - vh);
         // NaN reads as the origin rather than poisoning the plane.
         let (px, py) = clamp_pan(f32::NAN, f32::NAN, &b, vw, vh);
         assert_eq!((px, py), (b.x, b.y));
@@ -592,15 +661,27 @@ mod tests {
 
     /// Content smaller than the window does not slide about: the axis
     /// pins to the content's origin, give or take the overscroll.
+    /// **Every axis roams** — the 2026-09-07 ruling, *"a canvas is free
+    /// form"*, after a first cut that PINNED an axis with no content to
+    /// scroll and produced *"full screen is fixed to up and down scroll i
+    /// cant move around at all"*: a wide window makes the content
+    /// narrower than the viewport, and the pin then forbade the whole x
+    /// axis. A viewport of overscroll in every direction, always; the dot
+    /// lattice is what keeps that legible, and ⌘0 is the way home.
     #[test]
-    fn a_canvas_smaller_than_its_window_stays_put() {
+    fn every_axis_roams_by_a_viewport_even_with_nothing_to_scroll() {
         let rects = vec![CardRect::new(0.0, 0.0, 400.0, 300.0)];
         let (vw, vh) = (2000.0, 1400.0);
         let b = content_bounds(&rects, vw, vh);
-        assert!(b.w < vw && b.h < vh);
+        assert!(b.w < vw && b.h < vh, "precondition: smaller than the window");
+        let (px, py) = clamp_pan(-5000.0, -5000.0, &b, vw, vh);
+        assert_eq!(px, b.x - vw, "a viewport left of the content");
+        assert_eq!(py, b.y - vh, "and a viewport above it");
         let (px, py) = clamp_pan(5000.0, 5000.0, &b, vw, vh);
-        assert_eq!(px, b.x + vw / 2.0);
-        assert_eq!(py, b.y + vh / 2.0);
+        assert_eq!(px, b.x + vw, "a viewport right of it");
+        assert_eq!(py, b.y + vh);
+        // A small nudge is taken verbatim: the plane is not sticky.
+        assert_eq!(clamp_pan(7.0, -3.0, &b, vw, vh), (7.0, -3.0));
     }
 
     #[test]
@@ -648,15 +729,45 @@ mod tests {
         assert_eq!(grip_at(&r, r.right() + 3.0, r.y + 200.0), Some(Grip::Right));
     }
 
+    /// **Free form, not rigid** — the 2026-09-07 ruling. A card lands
+    /// EXACTLY where it was let go: no lattice, and the same answer under
+    /// the hand as on the drop, so the card never jumps when released.
     #[test]
-    fn a_move_snaps_on_drop_and_keeps_the_size() {
+    fn a_move_lands_exactly_where_it_was_let_go() {
         let r = CardRect::new(100.0, 100.0, 500.0, 400.0);
         let m = moved(&r, 37.0, -5.0);
-        assert_eq!(m.w, 500.0);
-        assert_eq!(m.h, 400.0);
-        assert_eq!(m.x % SNAP, 0.0);
-        assert_eq!(m.y % SNAP, 0.0);
-        assert!((m.x - 137.0).abs() <= SNAP / 2.0);
+        assert_eq!((m.x, m.y), (137.0, 95.0), "no lattice");
+        assert_eq!((m.w, m.h), (500.0, 400.0), "a move is a move");
+        assert_eq!(moved_free(&r, 37.0, -5.0), m, "the drop does not move it again");
+        let g = resized(&r, Grip::Corner, 13.0, 7.0);
+        assert_eq!((g.w, g.h), (513.0, 407.0));
+        assert_eq!(resized_free(&r, Grip::Corner, 13.0, 7.0), g);
+    }
+
+    /// The zoom is multiplicative, bounded, and holds the point under the
+    /// pointer still — the only zoom that can be aimed.
+    #[test]
+    fn the_zoom_steps_evenly_and_holds_the_point_under_the_pointer() {
+        assert_eq!(clamp_zoom(f32::NAN), 1.0);
+        assert_eq!(clamp_zoom(99.0), ZOOM_MAX);
+        assert_eq!(clamp_zoom(0.0), ZOOM_MIN);
+        assert_eq!(zoom_step(1.0, 1), ZOOM_STEP);
+        assert!(zoom_step(ZOOM_MAX, 1) == ZOOM_MAX, "clamps at the top");
+        assert!(zoom_step(ZOOM_MIN, -1) == ZOOM_MIN, "and at the bottom");
+        // The canvas point under the pointer before and after a zoom is
+        // the same point.
+        let (pan, focus) = ((120.0f32, 40.0f32), (300.0f32, 220.0f32));
+        let before = to_canvas(pan.0, pan.1, 1.0, focus.0, focus.1);
+        let to = zoom_step(1.0, 1);
+        let next = zoom_about(pan.0, pan.1, 1.0, to, focus.0, focus.1);
+        let after = to_canvas(next.0, next.1, to, focus.0, focus.1);
+        assert!((before.0 - after.0).abs() < 0.01, "{before:?} vs {after:?}");
+        assert!((before.1 - after.1).abs() < 0.01);
+        // A zoomed-in window covers LESS of the plane.
+        let vp = viewport(0.0, 0.0, 1000.0, 800.0, 2.0);
+        assert_eq!((vp.w, vp.h), (500.0, 400.0));
+        let vp = viewport(0.0, 0.0, 1000.0, 800.0, 0.5);
+        assert_eq!((vp.w, vp.h), (2000.0, 1600.0));
     }
 
     #[test]

@@ -23453,10 +23453,9 @@ fn a_card_carried_by_its_header_stays_where_it_was_dropped(cx: &mut TestAppConte
     let after = placed(&h, vcx, "aaaa1111").expect("the drag wrote a placement");
     assert_eq!(after.w, before_a.w, "a move is a move: the size is untouched");
     assert_eq!(after.h, before_a.h);
-    assert!((after.x - (before_a.x + 120.0)).abs() <= crate::canvas::SNAP);
-    assert!((after.y - (before_a.y + 60.0)).abs() <= crate::canvas::SNAP);
-    assert_eq!(after.x % crate::canvas::SNAP, 0.0, "the landing snapped: {after:?}");
-    assert_eq!(after.y % crate::canvas::SNAP, 0.0);
+    // EXACTLY where it was let go — free form, not a lattice.
+    assert_eq!(after.x, before_a.x + 120.0, "{after:?}");
+    assert_eq!(after.y, before_a.y + 60.0);
     // The card that was NOT carried keeps its slot — but it closes up,
     // because the grid indexes only the unplaced cards.
     assert!(placed(&h, vcx, "bbbb2222").is_none(), "the neighbour was not placed");

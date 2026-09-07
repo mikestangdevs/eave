@@ -6726,6 +6726,8 @@ struct ColumnsPaint {
     /// the mounted cards are not an interval.
     vis: Vec<usize>,
     mnt: Vec<usize>,
+    /// The plane's zoom this frame. 1.0 under Columns and Focus.
+    zoom: f32,
 }
 
 impl ColumnsPaint {
@@ -6743,10 +6745,23 @@ impl ColumnsPaint {
     /// The cards inside the viewport proper — where pages composite.
     fn visible_ixs(&self) -> Vec<usize> {
         if self.canvas {
+            // **Nothing composites in the overview.** A page rendered into
+            // a 200 px box is unreadable and still costs a whole renderer;
+            // zoomed out you are looking for WHICH card, not reading one.
+            // This is also most of what makes a zoomed-out pan instant.
+            if self.overview() {
+                return Vec::new();
+            }
             self.vis.clone()
         } else {
             self.visible.clone().collect()
         }
+    }
+
+    /// Whether the plane is zoomed far enough out that cards draw their
+    /// head only.
+    fn overview(&self) -> bool {
+        self.canvas && self.zoom < crate::canvas::ZOOM_OVERVIEW
     }
 
     fn rect(&self, ix: usize) -> crate::canvas::CardRect {
@@ -6985,23 +7000,33 @@ impl Element for ColumnWheel {
             // it would make every card unreadable.
             if canvas {
                 let origin = hitbox.bounds.origin;
-                let over_card = shell
-                    .update(cx, |this, _| this.canvas_card_at(ev.position, origin))
-                    .unwrap_or(None)
-                    .is_some();
+                let at = (
+                    f32::from(ev.position.x - origin.x),
+                    f32::from(ev.position.y - origin.y),
+                );
                 let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
-                let pan = if over_card {
-                    columns::strip_delta(dx, dy).map(|d| (d, 0.0))
-                } else if dx != 0.0 || dy != 0.0 {
-                    Some((-dx, -dy))
-                } else {
-                    None
-                };
-                let Some((px_, py_)) = pan else {
+                // ⌘-wheel is the pinch: it zooms ABOUT THE POINTER, so
+                // whatever is under the finger stays under it.
+                if ev.modifiers.platform || ev.modifiers.control {
+                    if dy == 0.0 {
+                        return;
+                    }
+                    let _ = shell.update(cx, |this, cx| {
+                        this.zoom_canvas_by(if dy > 0.0 { 1 } else { -1 }, Some(at), cx)
+                    });
+                    cx.stop_propagation();
                     return;
-                };
-                let _ = shell.update(cx, |this, cx| this.wheel_canvas(px_, py_, cx));
-                cx.stop_propagation();
+                }
+                // ONE entity update for the whole event — the hit test and
+                // the pan together. Two `shell.update`s per wheel event is
+                // two notifies and two repaints, and the operator felt it:
+                // *"moving around the canvas is kinda delayed."*
+                let moved = shell
+                    .update(cx, |this, cx| this.wheel_canvas(dx, dy, at, cx))
+                    .unwrap_or(false);
+                if moved {
+                    cx.stop_propagation();
+                }
                 return;
             }
             let Some(d) = columns::strip_delta(f32::from(delta.x), f32::from(delta.y)) else {
@@ -7948,6 +7973,9 @@ struct Shell {
     /// The plane's pan, target and drawn — `columns_scroll`'s pair, in
     /// two dimensions, glided by the same clock for the same reason.
     canvas_pan: Cell<(f32, f32)>,
+    /// The plane's zoom, 1.0 being one canvas point per window point.
+    /// Saved with the pan.
+    canvas_zoom: Cell<f32>,
     canvas_shown_pan: Cell<(f32, f32)>,
     canvas_glide: Cell<Option<(Instant, (f32, f32), (f32, f32))>>,
     /// The plane's viewport at the last paint, for the handlers'
@@ -7963,7 +7991,9 @@ struct Shell {
     /// The column feeds (app-wide; see [`ColumnFeeds`]).
     columns: Entity<ColumnFeeds>,
     /// Debounce for the scroll's save: a wheel burst is one decision.
+    /// `armed` is what keeps that ONE task rather than one per event.
     layout_save_gen: Cell<u64>,
+    layout_save_armed: Cell<bool>,
     /// The DevTools dock's share of its page well. One ratio for the app,
     /// not one per tab — the dock is a workbench the operator sizes once,
     /// which is how Chrome treats it too. Clamped like [`Split::ratio`].
@@ -13486,6 +13516,7 @@ impl Shell {
                 scroll: self.columns_scroll.get(),
                 pan_x,
                 pan_y,
+                zoom: self.canvas_zoom.get(),
             },
         );
         self.columns_scroll_dirty.set(false);
@@ -13513,14 +13544,25 @@ impl Shell {
     fn schedule_layout_save(&self, cx: &mut Context<Self>) {
         let gen = self.layout_save_gen.get() + 1;
         self.layout_save_gen.set(gen);
+        // **Armed ONCE per burst, not once per event.** A trackpad pan is
+        // sixty wheel events a second and the first cut spawned a task and
+        // a 300 ms timer for every one of them, to have all but the last
+        // no-op on the generation check. The operator felt the difference:
+        // *"moving around the canvas is kinda delayed … i should feel
+        // complete, instant control."* The generation still decides WHICH
+        // write wins; this decides how many tasks exist to lose.
+        if self.layout_save_armed.get() {
+            return;
+        }
+        self.layout_save_armed.set(true);
         cx.spawn(async move |view, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(300))
                 .await;
             let _ = view.update(cx, |this, _| {
-                if this.layout_save_gen.get() == gen {
-                    this.persist_layout();
-                }
+                this.layout_save_armed.set(false);
+                let _ = gen;
+                this.persist_layout();
             });
         })
         .detach();
@@ -13544,23 +13586,93 @@ impl Shell {
     /// selection the way the strip's centre rule does — on a plane there
     /// is no single card under the middle, and a pan that kept changing
     /// which card owns the composer would be unusable.
-    fn wheel_canvas(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
-        if self.canvas_drag.is_some() {
-            return;
+    fn wheel_canvas(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        at_view: (f32, f32),
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.canvas_drag.is_some() || (dx == 0.0 && dy == 0.0) {
+            return false;
         }
         let (view_w, view_h) = self.canvas_view.get();
         if view_w <= 0.0 || view_h <= 0.0 {
-            return;
+            return false;
         }
+        let zoom = crate::canvas::clamp_zoom(self.canvas_zoom.get());
+        let pan = self.canvas_pan.get();
+        // Whose gesture is it? Over the GROUND the plane takes both axes —
+        // that is the roaming pan. Over a CARD it is CL1's rule, unchanged:
+        // horizontal-dominant moves the plane's x, and a vertical delta
+        // belongs to the card, whose transcript or page has its own scroll.
+        let over_card = {
+            let (cx_, cy_) = crate::canvas::to_canvas(pan.0, pan.1, zoom, at_view.0, at_view.1);
+            crate::canvas::hit(&self.canvas_rects.borrow(), cx_, cy_).is_some()
+        };
+        let (mx, my) = if over_card {
+            match columns::strip_delta(dx, dy) {
+                Some(d) => (d, 0.0),
+                None => return false,
+            }
+        } else {
+            (-dx, -dy)
+        };
+        // The deltas are WINDOW points and the pan is in CANVAS points.
+        let (mx, my) = (mx / zoom, my / zoom);
+        let (cw, ch) = {
+            let vp = crate::canvas::viewport(0.0, 0.0, view_w, view_h, zoom);
+            (vp.w, vp.h)
+        };
         let bounds = {
             let rects = self.canvas_rects.borrow();
-            crate::canvas::content_bounds(&rects, view_w, view_h)
+            crate::canvas::content_bounds(&rects, cw, ch)
         };
-        let at = self.canvas_pan.get();
-        let next = crate::canvas::clamp_pan(at.0 + dx, at.1 + dy, &bounds, view_w, view_h);
-        if next == at {
+        let next = crate::canvas::clamp_pan(pan.0 + mx, pan.1 + my, &bounds, cw, ch);
+        if next == pan {
+            return false;
+        }
+        // Both at once and no glide: the trackpad IS the animation, and
+        // anything else is the lag the operator felt.
+        self.canvas_pan.set(next);
+        self.canvas_shown_pan.set(next);
+        self.canvas_glide.set(None);
+        self.columns_scroll_dirty.set(true);
+        self.schedule_layout_save(cx);
+        cx.notify();
+        true
+    }
+
+    /// **Slice CV1 — the zoom.** One step in or out, about a viewport
+    /// point when there is one (the pointer, for a pinch) and about the
+    /// viewport's centre otherwise (⌘+ / ⌘−). `delta == 0` is ⌘0: home,
+    /// which is zoom 1 and the plane's origin.
+    fn zoom_canvas_by(
+        &mut self,
+        delta: i32,
+        at_view: Option<(f32, f32)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (view_w, view_h) = self.canvas_view.get();
+        let from = crate::canvas::clamp_zoom(self.canvas_zoom.get());
+        if delta == 0 {
+            self.canvas_zoom.set(1.0);
+            self.canvas_pan.set((0.0, 0.0));
+            self.canvas_shown_pan.set((0.0, 0.0));
+            self.canvas_glide.set(None);
+            self.columns_scroll_dirty.set(true);
+            self.persist_layout();
+            cx.notify();
             return;
         }
+        let to = crate::canvas::zoom_step(from, delta);
+        if to == from {
+            return;
+        }
+        let (fx, fy) = at_view.unwrap_or((view_w / 2.0, view_h / 2.0));
+        let pan = self.canvas_pan.get();
+        let next = crate::canvas::zoom_about(pan.0, pan.1, from, to, fx, fy);
+        self.canvas_zoom.set(to);
         self.canvas_pan.set(next);
         self.canvas_shown_pan.set(next);
         self.canvas_glide.set(None);
@@ -13741,6 +13853,7 @@ impl Shell {
             view_h: 0.0,
             vis: Vec::new(),
             mnt: Vec::new(),
+            zoom: 1.0,
         }
     }
 
@@ -13792,12 +13905,18 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> ColumnsPaint {
         self.canvas_view.set((view_w, view_h));
-        let rects = crate::canvas::layout(&order, &self.canvas_placed.borrow(), view_w, view_h);
-        let bounds = crate::canvas::content_bounds(&rects, view_w, view_h);
+        let zoom = crate::canvas::clamp_zoom(self.canvas_zoom.get());
+        // Everything below reasons in CANVAS points, so the zoom is
+        // applied once, here: the window covers less of the plane when it
+        // is zoomed in and more when it is zoomed out.
+        let vp = crate::canvas::viewport(0.0, 0.0, view_w, view_h, zoom);
+        let (cw, ch) = (vp.w, vp.h);
+        let rects = crate::canvas::layout(&order, &self.canvas_placed.borrow(), cw, ch);
+        let bounds = crate::canvas::content_bounds(&rects, cw, ch);
         let dragging = self.canvas_drag.is_some();
         let mut pan = self.canvas_pan.get();
         if !dragging && view_w > 0.0 && view_h > 0.0 {
-            pan = crate::canvas::clamp_pan(pan.0, pan.1, &bounds, view_w, view_h);
+            pan = crate::canvas::clamp_pan(pan.0, pan.1, &bounds, cw, ch);
             let mut been = self.columns_scrolled_to.borrow_mut();
             let mut asked = self.columns_asked.borrow_mut();
             if asked.is_some() && *asked == selected_col {
@@ -13809,8 +13928,8 @@ impl Shell {
                 *asked = None;
                 if *been != selected_col {
                     if let Some(r) = selected.map(|ix| rects[ix]) {
-                        let want = crate::canvas::pan_into_view(pan.0, pan.1, &r, view_w, view_h);
-                        pan = crate::canvas::clamp_pan(want.0, want.1, &bounds, view_w, view_h);
+                        let want = crate::canvas::pan_into_view(pan.0, pan.1, &r, cw, ch);
+                        pan = crate::canvas::clamp_pan(want.0, want.1, &bounds, cw, ch);
                     }
                     *been = selected_col.clone();
                 }
@@ -13856,12 +13975,12 @@ impl Shell {
         }
         self.canvas_shown_pan.set(shown);
         *self.canvas_rects.borrow_mut() = rects.clone();
-        let vis = crate::canvas::visible(&rects, shown.0, shown.1, view_w, view_h);
+        let vis = crate::canvas::visible(&rects, shown.0, shown.1, cw, ch);
         // Mounted at BOTH ends of a glide, so the cards sliding in are
         // already laid out rather than empty slots filling in — CL1's
         // rule, in two dimensions.
-        let mut mnt = crate::canvas::mounted(&rects, shown.0, shown.1, view_w, view_h);
-        for ix in crate::canvas::mounted(&rects, pan.0, pan.1, view_w, view_h) {
+        let mut mnt = crate::canvas::mounted(&rects, shown.0, shown.1, cw, ch);
+        for ix in crate::canvas::mounted(&rects, pan.0, pan.1, cw, ch) {
             if !mnt.contains(&ix) {
                 mnt.push(ix);
             }
@@ -13895,6 +14014,7 @@ impl Shell {
             view_h,
             vis,
             mnt,
+            zoom,
         }
     }
 
@@ -13986,8 +14106,14 @@ impl Shell {
             }
             let (view_w, view_h) = self.canvas_view.get();
             let pan = self.canvas_shown_pan.get();
-            let x = f32::from(window.mouse_position().x) - rail - theme::CARD_GUTTER + pan.0;
-            let y = f32::from(window.mouse_position().y) - theme::CARD_GUTTER + pan.1;
+            let zoom = self.canvas_zoom.get();
+            let (x, y) = crate::canvas::to_canvas(
+                pan.0,
+                pan.1,
+                zoom,
+                f32::from(window.mouse_position().x) - rail - theme::CARD_GUTTER,
+                f32::from(window.mouse_position().y) - theme::CARD_GUTTER,
+            );
             let size = self
                 .canvas_placed
                 .borrow()
@@ -13997,12 +14123,7 @@ impl Shell {
             // The pointer takes the card by its header, so the drop point
             // is the card's TOP-LEFT and not its centre — the same place
             // the hand was holding.
-            let landed = crate::canvas::CardRect::new(
-                crate::canvas::snap_to(x),
-                crate::canvas::snap_to(y),
-                size.w,
-                size.h,
-            );
+            let landed = crate::canvas::CardRect::new(x, y, size.w, size.h);
             self.canvas_placed.borrow_mut().insert(stem, landed);
             self.canvas_placed_dirty.set(true);
             self.persist_layout();
@@ -14042,7 +14163,84 @@ impl Shell {
             .flex_row()
             .items_center()
             .child(self.rail_toggle(cx))
-            .children(self.layout.is_canvas().then(|| self.tidy_control(cx)))
+
+            .into_any_element()
+    }
+
+    /// The plane's floating controls: the zoom, and `tidy`. Bottom-right,
+    /// out of the cards' way, over the ground.
+    fn canvas_hud(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "canvas-hud".into())
+            .absolute()
+            .right(px(theme::SPACE_3))
+            .bottom(px(theme::SPACE_3))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .px(px(theme::SPACE_1))
+            .h(px(theme::ICON_TOGGLE + theme::SPACE_1))
+            .rounded(px(theme::RADIUS_CHIP))
+            .bg(theme::overlay_strong())
+            .border_1()
+            .border_color(theme::border())
+            .child(self.zoom_control(cx))
+            .child(self.tidy_control(cx))
+            .into_any_element()
+    }
+
+    /// **Slice CV1 — the zoom control.** − / the level / + . Discoverable,
+    /// because ⌘-scroll and ⌘± are gestures nobody is told about; the
+    /// level itself is the ⌘0 button, which is the way home.
+    fn zoom_control(&self, cx: &Context<Self>) -> AnyElement {
+        let pct = (self.canvas_zoom.get() * 100.0).round() as i32;
+        let step = |name: &'static str, glyph: &'static str, delta: i32| {
+            div()
+                .id(SharedString::from(name))
+                .debug_selector(move || name.into())
+                .flex_none()
+                .size(px(theme::ICON_TOGGLE))
+                .rounded(px(theme::RADIUS_SELECT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .hover_fade(name, theme::wash_rest(), theme::overlay())
+                .cursor_pointer()
+                .text_size(px(theme::LABEL_SIZE))
+                .text_color(theme::text_secondary())
+                .on_click(cx.listener(move |this, _, _, cx| this.zoom_canvas_by(delta, None, cx)))
+                .child(glyph)
+        };
+        div()
+            .debug_selector(|| "canvas-zoom".into())
+            .ml_auto()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .child(step("canvas-zoom-out", "−", -1))
+            .child(
+                div()
+                    .id("canvas-zoom-reset")
+                    .debug_selector(|| "canvas-zoom-reset".into())
+                    .px(px(theme::SPACE_1))
+                    .h(px(theme::ICON_TOGGLE))
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .min_w(px(40.))
+                    .hover_fade("canvas-zoom-reset", theme::wash_rest(), theme::overlay())
+                    .cursor_pointer()
+                    .text_size(px(theme::MICRO_SIZE))
+                    .line_height(px(theme::MICRO_LINE))
+                    .text_color(theme::text_tertiary())
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_canvas_by(0, None, cx)))
+                    .child(format!("{pct}%")),
+            )
+            .child(step("canvas-zoom-in", "+", 1))
             .into_any_element()
     }
 
@@ -14053,8 +14251,8 @@ impl Shell {
         div()
             .id("canvas-tidy")
             .debug_selector(|| "canvas-tidy".into())
-            .ml_auto()
             .flex_none()
+            .ml(px(theme::SPACE_2))
             .h(px(theme::ICON_TOGGLE))
             .px(px(theme::SPACE_2))
             .rounded(px(theme::RADIUS_SELECT))
@@ -14130,6 +14328,74 @@ impl Shell {
             // The window's own ground between the plates: the gutter IS
             // the separation, so it has to show as a gap.
             .bg(theme::canvas())
+            // **Slice CV1 — the ground is a LATTICE, not a void.** Ruled
+            // on 2026-09-07: *"there is no canvas dotted background. its
+            // just a black void."* The dots are the only thing that makes
+            // a pan legible — a plane moving under cards with nothing
+            // behind them reads as the cards moving for no reason. They
+            // travel with the pan and scale with the zoom, which is what
+            // makes them the ground rather than a texture on the window.
+            .when(geo.canvas, |d| {
+                let (pan, z) = (geo.shown_pan, geo.zoom);
+                // The cards' boxes in WINDOW points. The ground stops at a
+                // card's edge: the plate is a wash, not paint, so a dot
+                // drawn under one shows straight through it and every card
+                // body comes out textured (seen on the first run).
+                let cards: Vec<crate::canvas::CardRect> = geo
+                    .rects
+                    .iter()
+                    .map(|r| {
+                        crate::canvas::CardRect::new(
+                            (r.x - pan.0) * z,
+                            (r.y - pan.1) * z,
+                            r.w * z,
+                            r.h * z,
+                        )
+                    })
+                    .collect();
+                d.child(
+                    gpui::canvas(|_, _, _| {}, move |bounds, _, window, _| {
+                        let step = crate::canvas::DOT_SPACING * z;
+                        if step < 8.0 {
+                            // Denser than this the lattice is a haze that
+                            // costs a quad every 8 px; below it, no ground.
+                            return;
+                        }
+                        let size = px(crate::canvas::DOT_SIZE);
+                        let ink = theme::canvas_dot();
+                        // The first dot at or after the viewport's left
+                        // edge: the lattice is the PLANE's, so it is
+                        // anchored to canvas 0 and not to the window.
+                        let start = |pan: f32| -> f32 {
+                            let off = (-pan * z).rem_euclid(step);
+                            off - step
+                        };
+                        let (x0, y0) = (start(pan.0), start(pan.1));
+                        let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                        let mut y = y0;
+                        while y < h {
+                            let mut x = x0;
+                            while x < w {
+                                if cards.iter().any(|c| c.contains(x, y)) {
+                                    x += step;
+                                    continue;
+                                }
+                                window.paint_quad(gpui::fill(
+                                    Bounds {
+                                        origin: bounds.origin + point(px(x), px(y)),
+                                        size: gpui::size(size, size),
+                                    },
+                                    ink,
+                                ));
+                                x += step;
+                            }
+                            y += step;
+                        }
+                    })
+                    .absolute()
+                    .inset_0(),
+                )
+            })
             .drag_over::<TabDrag>(|style, _, _, _| style.bg(theme::overlay()))
             .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
                 this.drop_on_columns(drag, window, cx);
@@ -14172,6 +14438,11 @@ impl Shell {
                     )
                 }
             })
+            // **Slice CV1 — the plane's own controls.** On the PLANE and
+            // not on `columns_bar`, because that bar is drawn only while
+            // the rail is shut and the zoom has to be reachable with the
+            // rail open — the same reason ⌥⌘G exists for `tidy`.
+            .when(geo.canvas, |d| d.child(self.canvas_hud(cx)))
             .when(n == 0, |d| {
                 d.child(
                     div()
@@ -14243,11 +14514,12 @@ impl Shell {
             // rect less the pan DRAWN this frame, so a glide moves every
             // card together and a drag moves one against the rest.
             .when(geo.canvas, |d| {
+                let z = geo.zoom;
                 d.absolute()
-                    .left(px(rect.x - geo.shown_pan.0))
-                    .top(px(rect.y - geo.shown_pan.1))
-                    .w(px(rect.w))
-                    .h(px(rect.h))
+                    .left(px((rect.x - geo.shown_pan.0) * z))
+                    .top(px((rect.y - geo.shown_pan.1) * z))
+                    .w(px(rect.w * z))
+                    .h(px(rect.h * z))
             })
             .flex()
             .flex_col()
@@ -14285,7 +14557,13 @@ impl Shell {
         // (*"we dont need the extra top bar at the top of the card"*)
         // holds on the plane too.
         .children(geo.canvas.then(|| self.card_grab_strip(&stem, rect, cx)))
-        .child(self.column_body(col, is_sel, chrome, rail_collapsed, pulse, cx))
+        .map(|d| {
+            if geo.overview() {
+                d.child(self.card_overview(col, cx))
+            } else {
+                d.child(self.column_body(col, is_sel, chrome, rail_collapsed, pulse, cx))
+            }
+        })
         // The grips go in LAST, so they are above the body — a page fills
         // its card and would otherwise take the edge.
         .children(
@@ -14295,6 +14573,46 @@ impl Shell {
                 .flatten(),
         )
         .into_any_element()
+    }
+
+    /// **Slice CV1 — a card in the overview.** Zoomed past
+    /// [`crate::canvas::ZOOM_OVERVIEW`] a card draws its NAME and nothing
+    /// else: no transcript, no page, no composer. That is what the zoom
+    /// is for — finding which card, not reading one — and it is also what
+    /// makes a zoomed-out pan cost nothing.
+    fn card_overview(&self, col: &ColumnId, cx: &mut Context<Self>) -> AnyElement {
+        let stem = col.stem();
+        let name = match col {
+            ColumnId::Diff(root) => {
+                let leaf = root.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("/");
+                format!("changes · {leaf}")
+            }
+            ColumnId::Tab(id) => self
+                .strip_snapshot(cx)
+                .tabs
+                .iter()
+                .find(|t| &t.id == id)
+                .and_then(|t| t.title.clone())
+                .unwrap_or_else(|| "New Chat".into()),
+        };
+        div()
+            .debug_selector({
+                let stem = stem.clone();
+                move || format!("card-overview-{stem}")
+            })
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .p(px(theme::SPACE_3))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .items_center()
+            .overflow_hidden()
+            .text_size(px(theme::BODY_SIZE))
+            .text_color(theme::text_secondary())
+            .child(name)
+            .into_any_element()
     }
 
     /// **Slice CV1 — the move handle.** A full-width band across the top
@@ -14415,7 +14733,11 @@ impl Shell {
         let Some(drag) = self.canvas_drag.as_mut() else {
             return;
         };
-        let (dx, dy) = (f32::from(at.x) - drag.grab.0, f32::from(at.y) - drag.grab.1);
+        let z = crate::canvas::clamp_zoom(self.canvas_zoom.get());
+        let (dx, dy) = (
+            (f32::from(at.x) - drag.grab.0) / z,
+            (f32::from(at.y) - drag.grab.1) / z,
+        );
         // A threshold, so a click that wobbles by a pixel is still a click
         // and does not write a placement.
         if !drag.moved && dx.abs().max(dy.abs()) < 3.0 {
@@ -14467,6 +14789,8 @@ impl Shell {
     fn tidy_canvas(&mut self, cx: &mut Context<Self>) {
         crate::canvas::tidy(&mut self.canvas_placed.borrow_mut());
         self.canvas_pan.set((0.0, 0.0));
+        self.canvas_shown_pan.set((0.0, 0.0));
+        self.canvas_zoom.set(1.0);
         self.canvas_placed_dirty.set(true);
         self.persist_layout();
         cx.notify();
@@ -25976,6 +26300,14 @@ impl Shell {
 
     /// ⌘+ / ⌘- / ⌘0. `delta` of 0 is the reset.
     fn zoom(&mut self, delta: i32, cx: &mut Context<Self>) {
+        // Slice CV1: on the plane these chords are the PLANE's. A page
+        // card still zooms its own content the way it always did — from
+        // Focus, one ⛶ away — and giving the chord two meanings in one
+        // view would make neither aimable.
+        if self.layout.is_canvas() {
+            self.zoom_canvas_by(delta, None, cx);
+            return;
+        }
         let Some(tab) = self.active_page(cx) else {
             return;
         };
@@ -32497,6 +32829,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         canvas_placed: RefCell::new(canvas_placed),
                         canvas_placed_dirty: Cell::new(false),
                         canvas_pan: Cell::new((layout_prefs.pan_x, layout_prefs.pan_y)),
+                        canvas_zoom: Cell::new(crate::canvas::clamp_zoom(layout_prefs.zoom)),
                         canvas_shown_pan: Cell::new((layout_prefs.pan_x, layout_prefs.pan_y)),
                         canvas_glide: Cell::new(None),
                         canvas_view: Cell::new((0.0, 0.0)),
@@ -32504,6 +32837,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         canvas_drag: None,
                         columns: columns.clone(),
                         layout_save_gen: Cell::new(0),
+                        layout_save_armed: Cell::new(false),
                         devtools_ratio: DEVTOOLS_RATIO,
                         devtools_drag: None,
                         files_scroll: ScrollHandle::new(),
