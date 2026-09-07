@@ -65,6 +65,22 @@ fn boot(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext) {
     // in the suite would silently be a no-op. Production never hits this:
     // the flag is read once at bootstrap and never changes.
     motion::reset_for_test();
+    // **Slice CV1 — the fixture states the layout it measures.** The
+    // product's default is the CANVAS (`LayoutMode::default`), and almost
+    // every test in this file was written against the FOCUS well: it
+    // measures a transcript, a composer, a tool row, a menu — things the
+    // well holds and the plane hands to a card. Pinning the fixture to
+    // Focus is one stated assumption in one place, instead of 166 silent
+    // ones spread through the file, and it is the same move
+    // `set_reduce_motion` above makes for the same reason. The tests that
+    // are about a layout name theirs: `enter_columns` for the strip,
+    // `enter_canvas` for the plane, and the default itself is pinned by
+    // `a_fresh_window_opens_on_the_plane`.
+    window
+        .update(cx, |shell, _, _| {
+            shell.layout = crate::columns::LayoutMode::Focus;
+        })
+        .unwrap();
     let vcx = VisualTestContext::from_window(window.into(), cx).into_mut();
     // And force one draw through it, because `run_until_parked` only draws a
     // dirty window and `bootstrap`'s own first frame is now behind us. Every
@@ -22827,10 +22843,36 @@ fn six_sessions(h: &Harness, vcx: &mut VisualTestContext) -> Vec<String> {
     ids
 }
 
-/// The segmented control is at the top of the content area in BOTH
-/// layouts, and the toggle swaps the well for the strip and back.
+/// Enter the STRIP deliberately. CL1's tests below are about the strip's
+/// own arithmetic — its pitch, its scroll, its reorder — and since CV1
+/// the minimize glyph opens the PLANE, so they name the mode rather than
+/// going through a door that now leads somewhere else.
+#[track_caller]
+fn enter_columns(h: &Harness, vcx: &mut VisualTestContext) {
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.set_layout(crate::columns::LayoutMode::Columns, cx)
+        })
+        .unwrap();
+    vcx.run_until_parked();
+}
+
+/// Enter the PLANE deliberately, for the tests below that are about it.
+#[track_caller]
+fn enter_canvas(h: &Harness, vcx: &mut VisualTestContext) {
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.set_layout(crate::columns::LayoutMode::Canvas, cx)
+        })
+        .unwrap();
+    vcx.run_until_parked();
+}
+
+/// **Slice CV1 — the door.** The minimize glyph on Focus's header opens
+/// the CANVAS, and a card's ⛶ comes back. The glyph is the whole mode
+/// control in this direction; there is no bar and no picker.
 #[gpui::test]
-fn the_layout_bar_toggles_between_focus_and_columns(cx: &mut TestAppContext) {
+fn the_minimize_glyph_opens_the_canvas_and_a_cards_maximize_returns(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
     assert!(shown(vcx, "layout-minimize"), "Focus's header carries the minimize glyph");
@@ -22839,9 +22881,13 @@ fn the_layout_bar_toggles_between_focus_and_columns(cx: &mut TestAppContext) {
 
     click(vcx, "layout-minimize");
     vcx.run_until_parked();
-    assert!(shown(vcx, "column-strip"), "Columns replaces the well with the strip");
+    assert!(
+        h.window.read_with(vcx, |shell, _| shell.layout.is_canvas()).unwrap(),
+        "the glyph opens the plane, not the strip"
+    );
+    assert!(shown(vcx, "column-strip"), "the plane replaces the well");
     assert!(!shown(vcx, "content-well"));
-    assert!(shown(vcx, "column-aaaa1111"), "every open row is a column");
+    assert!(shown(vcx, "column-aaaa1111"), "every open row is a card");
     assert!(shown(vcx, "column-bbbb2222"));
     // The selected chat's column is the well's own chrome: the composer
     // lives in it, and only in it.
@@ -22851,8 +22897,8 @@ fn the_layout_bar_toggles_between_focus_and_columns(cx: &mut TestAppContext) {
         within_x(composer, a),
         "the composer must sit in the selected column: composer {composer:?}, column {a:?}"
     );
-    // No mode control in Columns but a column's ⛶: the way back.
-    assert!(!shown(vcx, "layout-minimize"), "the strip draws no minimize");
+    // No mode control on the plane but a card's ⛶: the way back.
+    assert!(!shown(vcx, "layout-minimize"), "the plane draws no minimize");
     click(vcx, "column-max-aaaa1111");
     vcx.run_until_parked();
     assert!(shown(vcx, "content-well"), "Focus is lossless: the well comes back");
@@ -22884,8 +22930,7 @@ fn every_open_row_is_a_column_in_sidebar_order_even_under_a_collapsed_task(cx: &
         ],
         Some("aaaa1111"),
     );
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
 
     let x = |vcx: &mut VisualTestContext, sel: &'static str| {
         vcx.debug_bounds(sel)
@@ -22956,8 +23001,7 @@ fn every_open_row_is_a_column_in_sidebar_order_even_under_a_collapsed_task(cx: &
 fn selection_and_scroll_are_one_fact_in_both_directions(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     let ids = six_sessions(&h, vcx);
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
     let strip = strip_bounds(vcx);
     let last = format!("column-{}", ids[5]);
     let last_col = vcx.debug_bounds(sel(last.clone())).expect("last column");
@@ -23075,8 +23119,7 @@ fn selection_and_scroll_are_one_fact_in_both_directions(cx: &mut TestAppContext)
 fn only_the_viewport_and_its_neighbours_are_mounted(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let ids = six_sessions(&h, vcx);
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
     let strip = strip_bounds(vcx);
     let view_w = f32::from(strip.size.width);
     let mounted = crate::columns::mounted_range(0.0, view_w, ids.len());
@@ -23113,8 +23156,7 @@ fn a_column_feed_shows_another_sessions_transcript_and_never_the_shells(cx: &mut
     let (mut h, vcx) = boot(cx);
     rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
     let _ = h.drain();
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
     let subs: Vec<String> = h
         .drain()
         .into_iter()
@@ -23180,8 +23222,7 @@ fn a_column_feed_shows_another_sessions_transcript_and_never_the_shells(cx: &mut
 fn maximize_enters_focus_on_the_row_and_the_toggle_returns_to_the_same_scroll(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
     let ids = six_sessions(&h, vcx);
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
     let tabs: Vec<TabInfo> = ids.iter().map(|id| session_tab(id)).collect();
     h.plumbing.push_feed(FeedEvent::Session { id: ids[4].clone() });
     strip_tabs(&h, vcx, tabs, Some(&ids[4]));
@@ -23201,8 +23242,7 @@ fn maximize_enters_focus_on_the_row_and_the_toggle_returns_to_the_same_scroll(cx
         "⛶ selects that row"
     );
 
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
     let back = h
         .window
         .read_with(vcx, |shell, _| shell.columns_scroll.get())
@@ -23220,8 +23260,7 @@ fn the_bracket_chords_step_one_column_and_clamp(cx: &mut TestAppContext) {
         vec![session("aaaa1111"), session("bbbb2222"), session("cccc3333")],
         "aaaa1111",
     );
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
     let _ = h.drain();
     vcx.simulate_keystrokes("cmd-shift-]");
     vcx.run_until_parked();
@@ -23268,8 +23307,7 @@ fn dropping_a_page_on_the_strip_is_a_reorder_not_a_split(cx: &mut TestAppContext
         ],
         Some("p1"),
     );
-    click(vcx, "layout-minimize");
-    vcx.run_until_parked();
+    enter_columns(&h, vcx);
     let _ = h.drain();
     let from = vcx.debug_bounds("tab-p3").expect("tab-p3");
     let c1 = vcx.debug_bounds("column-p1").expect("column-p1");
@@ -23293,4 +23331,255 @@ fn dropping_a_page_on_the_strip_is_a_reorder_not_a_split(cx: &mut TestAppContext
         "a page dropped in the first gap moves before p2: {cmds:?}"
     );
     assert!(!shown(vcx, "split-well"), "a strip drop is never a split");
+}
+
+// ── Slice CV1 — the canvas ───────────────────────────────────────────
+//
+// The plane is the product's layout as of 2026-09-07. These pin the four
+// things the operator asked for — no window constraints, a grid that
+// scrolls forever, free placement, and drag and resize — plus the
+// continuity claim that makes the pivot cheap: an untouched plane is
+// CL1's strip.
+//
+// Geometry note: the harness window is narrow, so `canvas::grid_cols` is
+// 1 here and the grid runs DOWN. That is the wrap under test, not a
+// limitation of it.
+
+/// The card's rect the shell is actually laying out — the placement if
+/// the operator has made one, the grid slot if not.
+#[track_caller]
+fn card_rect(h: &Harness, vcx: &mut VisualTestContext, stem: &str) -> crate::canvas::CardRect {
+    h.window
+        .read_with(vcx, |shell, _| {
+            let rects = shell.canvas_rects.borrow();
+            let ix = shell
+                .column_walk
+                .borrow()
+                .iter()
+                .position(|c| c.stem() == stem);
+            ix.and_then(|i| rects.get(i).copied())
+        })
+        .unwrap()
+        .unwrap_or_else(|| panic!("no card for {stem}"))
+}
+
+/// What the operator has placed by hand.
+#[track_caller]
+fn placed(h: &Harness, vcx: &mut VisualTestContext, stem: &str) -> Option<crate::canvas::CardRect> {
+    h.window
+        .read_with(vcx, |shell, _| shell.canvas_placed.borrow().get(stem).copied())
+        .unwrap()
+}
+
+/// Carry an element by a grab point to a window position: press, a
+/// nudge past the drag threshold, the move, the release. The same shape
+/// `dropping_a_page_on_the_strip_is_a_reorder_not_a_split` uses, because
+/// gpui starts a drag on the first move and not on the press.
+#[track_caller]
+fn carry(vcx: &mut VisualTestContext, grab: &'static str, to: Point<Pixels>) {
+    let from = vcx.debug_bounds(grab).unwrap_or_else(|| panic!("{grab}")).center();
+    vcx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+    let mut nudge = from;
+    nudge.x += px(8.);
+    nudge.y += px(8.);
+    vcx.simulate_mouse_move(nudge, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+}
+
+/// **The default is the plane.** A window with nothing saved opens on the
+/// canvas — the pivot of 2026-09-07, stated where a reader will find it.
+/// The harness fixture pins itself to Focus (see `boot`), so this asks
+/// the mode's own default rather than a booted shell's.
+#[gpui::test]
+fn a_fresh_window_opens_on_the_plane(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    assert!(crate::columns::LayoutMode::default().is_canvas());
+    // A frame.json with no entry for this window reads as the default.
+    let prefs = crate::columns::layout_from(&serde_json::json!({}), "primary");
+    assert!(prefs.mode.is_canvas(), "an unsaved window opens on the plane");
+    // And the fixture's own override is what keeps the rest of the file
+    // measuring the well — stated, not silent.
+    assert!(h.window.read_with(vcx, |s, _| s.layout).unwrap() == crate::columns::LayoutMode::Focus);
+}
+
+/// **An untouched plane is the strip.** Every open row gets a card, in
+/// the sidebar's order, one column wide — and where the window is too
+/// narrow for two across, the grid WRAPS and runs down. That is the
+/// "scrollable forever grid": no card count, no end stop.
+#[gpui::test]
+fn an_untouched_plane_lays_the_cards_out_in_a_grid_that_wraps(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222"), session("cccc3333")],
+        "aaaa1111",
+    );
+    enter_canvas(&h, vcx);
+    let a = card_rect(&h, vcx, "aaaa1111");
+    let b = card_rect(&h, vcx, "bbbb2222");
+    let c = card_rect(&h, vcx, "cccc3333");
+    assert_eq!(a.w, crate::canvas::CARD_W, "a card is a column wide");
+    assert_eq!(a.w, columns::COLUMN_W, "and that width is CL1's, unchanged");
+    // This window fits one across, so the grid runs down and the pitch is
+    // exact — nothing overlaps and nothing leaves a hole.
+    assert_eq!(crate::canvas::grid_cols(a.w + 2.0 * crate::canvas::GUTTER), 1);
+    assert_eq!(b.x, a.x, "the second card wrapped under the first");
+    assert_eq!(b.y - a.y, a.h + crate::canvas::GUTTER, "one card and one gutter");
+    assert_eq!(c.y - b.y, b.h + crate::canvas::GUTTER);
+    // Nothing has been placed by hand, so nothing is saved.
+    assert!(placed(&h, vcx, "aaaa1111").is_none());
+}
+
+/// **A card dragged by its header stays where it was dropped** — and
+/// only that card moves. The landing is snapped to the lattice, which is
+/// what keeps hand-placed cards lined up with each other.
+#[gpui::test]
+fn a_card_carried_by_its_header_stays_where_it_was_dropped(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let before_a = card_rect(&h, vcx, "aaaa1111");
+    let before_b = card_rect(&h, vcx, "bbbb2222");
+    let grab = vcx.debug_bounds("card-grab-aaaa1111").expect("card-grab-aaaa1111");
+    let start = grab.center();
+
+    carry(vcx, "card-grab-aaaa1111", point(start.x + px(120.), start.y + px(60.)));
+
+    let after = placed(&h, vcx, "aaaa1111").expect("the drag wrote a placement");
+    assert_eq!(after.w, before_a.w, "a move is a move: the size is untouched");
+    assert_eq!(after.h, before_a.h);
+    assert!((after.x - (before_a.x + 120.0)).abs() <= crate::canvas::SNAP);
+    assert!((after.y - (before_a.y + 60.0)).abs() <= crate::canvas::SNAP);
+    assert_eq!(after.x % crate::canvas::SNAP, 0.0, "the landing snapped: {after:?}");
+    assert_eq!(after.y % crate::canvas::SNAP, 0.0);
+    // The card that was NOT carried keeps its slot — but it closes up,
+    // because the grid indexes only the unplaced cards.
+    assert!(placed(&h, vcx, "bbbb2222").is_none(), "the neighbour was not placed");
+    assert_eq!(
+        card_rect(&h, vcx, "bbbb2222").y,
+        before_a.y,
+        "the grid closed up behind the card that left it"
+    );
+    assert_ne!(before_b.y, before_a.y, "precondition: b was below a");
+}
+
+/// **A press that does not move is still a click.** The threshold is what
+/// keeps a card's header clickable, and nothing is written for it.
+#[gpui::test]
+fn a_press_on_a_card_header_that_does_not_move_places_nothing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let at = vcx.debug_bounds("card-grab-bbbb2222").expect("card-grab").center();
+    vcx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+    vcx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(placed(&h, vcx, "bbbb2222").is_none(), "a click is not a placement");
+}
+
+/// **The corner resizes and the origin does not move.** A card is
+/// anchored at its top-left, which is what makes the gesture aimable; the
+/// floor is a floor.
+#[gpui::test]
+fn a_cards_corner_resizes_it_without_moving_its_origin(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let before = card_rect(&h, vcx, "aaaa1111");
+    let grip = vcx.debug_bounds("card-grip-corner-aaaa1111").expect("corner grip");
+    let from = grip.center();
+
+    carry(vcx, "card-grip-corner-aaaa1111", point(from.x - px(180.), from.y - px(120.)));
+
+    let after = placed(&h, vcx, "aaaa1111").expect("the resize wrote a placement");
+    assert_eq!(after.x, before.x, "the origin never moves");
+    assert_eq!(after.y, before.y);
+    assert!(after.w < before.w, "the corner took the width: {after:?}");
+    assert!(after.w >= crate::canvas::CARD_W_MIN, "and stopped at the floor");
+    assert!(after.h <= before.h);
+    assert!(after.h >= crate::canvas::CARD_H_MIN);
+}
+
+/// **`tidy` is the one way back.** Every card into the grid, the pan
+/// home, and the placements CLEARED rather than frozen — so the next
+/// window width reflows instead of keeping yesterday's columns.
+#[gpui::test]
+fn tidy_puts_every_card_back_in_the_grid(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let home = card_rect(&h, vcx, "aaaa1111");
+    let at = vcx.debug_bounds("card-grab-aaaa1111").expect("grab").center();
+    carry(vcx, "card-grab-aaaa1111", point(at.x + px(96.), at.y + px(96.)));
+    assert!(placed(&h, vcx, "aaaa1111").is_some(), "precondition: it was placed");
+
+    h.window
+        .update(vcx, |shell, _, cx| shell.tidy_canvas(cx))
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(placed(&h, vcx, "aaaa1111").is_none(), "tidy clears, it does not freeze");
+    assert_eq!(card_rect(&h, vcx, "aaaa1111"), home, "and the card is back in its slot");
+    assert_eq!(
+        h.window.read_with(vcx, |s, _| s.canvas_pan.get()).unwrap(),
+        (0.0, 0.0),
+        "the pan came home too"
+    );
+}
+
+/// **A placement survives the trip through Focus**, the way CL1's scroll
+/// does: ⛶ into the well, the minimize glyph back, and the card is where
+/// it was left. Lossless both ways.
+#[gpui::test]
+fn a_placement_survives_a_round_trip_through_focus(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    // The FIRST card, deliberately: this window fits one across, so the
+    // second is below the fold, and `debug_bounds` reports content
+    // coordinates and cannot see clipping (AG2 #10's documented limit) —
+    // a press aimed at it would land outside the window and run no
+    // handler, and the test would pass having driven nothing.
+    let at = vcx.debug_bounds("card-grab-aaaa1111").expect("grab").center();
+    carry(vcx, "card-grab-aaaa1111", point(at.x + px(48.), at.y + px(72.)));
+    let left = placed(&h, vcx, "aaaa1111").expect("placed");
+
+    click(vcx, "column-max-aaaa1111");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "content-well"), "⛶ is the way into the well");
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    assert_eq!(placed(&h, vcx, "aaaa1111"), Some(left), "the card kept its place");
+}
+
+/// **A closed tab takes its placement with it**, so `frame.json` does not
+/// collect an entry per tab that ever existed. Pruned in the tabs
+/// observer against a NON-EMPTY snapshot — an empty one is the boot
+/// shape, `prune_splits`'s rule and its reason.
+#[gpui::test]
+fn a_closed_cards_placement_is_pruned_but_an_empty_snapshot_prunes_nothing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    // The first card, for `a_placement_survives_a_round_trip_through_focus`'s
+    // reason: the second is below the fold here.
+    let at = vcx.debug_bounds("card-grab-aaaa1111").expect("grab").center();
+    carry(vcx, "card-grab-aaaa1111", point(at.x + px(48.), at.y + px(48.)));
+    assert!(placed(&h, vcx, "aaaa1111").is_some());
+
+    // The boot shape first: an empty snapshot must erase nothing.
+    strip_tabs(&h, vcx, vec![], None);
+    vcx.run_until_parked();
+    assert!(
+        placed(&h, vcx, "aaaa1111").is_some(),
+        "an empty snapshot is the boot shape, not a close"
+    );
+    // Now a is really gone.
+    strip_tabs(&h, vcx, vec![session_tab("bbbb2222")], Some("bbbb2222"));
+    vcx.run_until_parked();
+    assert!(placed(&h, vcx, "aaaa1111").is_none(), "the closed card's placement went with it");
 }

@@ -98,6 +98,12 @@ pub mod strip;
 /// every rule the strip lives by is decidable without a window.
 pub mod columns;
 
+/// Slice CV1 — Canvas mode's pure half: a card's rect on an unbounded
+/// plane, the grid the untouched ones flow into, the pan clamp, the
+/// hit and grip tests, and the `frame.json` placement map. Pure for the
+/// same reason `columns` is — every rule is decidable without a window.
+pub mod canvas;
+
 /// The bookmarks bar's model half (Slice T1): B1's flat, depth-first
 /// `BookmarksSnapshot` read as a bar of top-level chips and the runs of
 /// children each folder opens. Public for the same reason `strip` is.

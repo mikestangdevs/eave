@@ -41,17 +41,23 @@ use std::ops::Range;
 /// [`LAYOUT_KEY`], like the rail's collapse state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LayoutMode {
-    /// One well, the selected row — the layout eave has always had.
-    #[default]
+    /// One well, the selected row — the layout eave had until CV1. Kept,
+    /// reachable from any card's ⛶, and no longer the default: the
+    /// operator's pivot of 2026-09-07 made the plane the product and this
+    /// the room you go into to concentrate on one thing.
     Focus,
-    /// The horizontal strip of columns.
+    /// The horizontal strip of columns: every card a column wide, one
+    /// row, one axis. Kept, and no longer the door anything opens —
+    /// [`LayoutMode::Canvas`] is the strip with both constraints lifted,
+    /// and an untouched canvas at a wide window IS this. Reachable only
+    /// from a `frame.json` that already names it.
     Columns,
-    /// **Reserved, never rendered.** The third slot the slice asked for:
-    /// a future mode lands as a rename of this variant, not a new enum.
-    /// `from_key` never produces it and the segmented control never
-    /// offers it; a value that somehow held it draws as Focus.
-    #[allow(dead_code)]
-    Reserved,
+    /// Slice CV1 — the plane. Cards carry their own rect, the grid flows
+    /// and wraps, and the view pans on both axes. This is the third slot
+    /// CL1 reserved, taken as a rename exactly as its note said it would
+    /// be, rather than as a new enum. **The default, and the product.**
+    #[default]
+    Canvas,
 }
 
 impl LayoutMode {
@@ -60,22 +66,39 @@ impl LayoutMode {
         match self {
             LayoutMode::Focus => "focus",
             LayoutMode::Columns => "columns",
-            LayoutMode::Reserved => "reserved",
+            LayoutMode::Canvas => "canvas",
         }
     }
 
-    /// The mode a `frame.json` key names. Anything unknown — including
-    /// the reserved slot, which no build has ever written — is Focus.
+    /// The mode a `frame.json` key names. Anything unknown is the
+    /// DEFAULT, not Focus by name — so the answer follows the product
+    /// when the default moves, which is the whole point of a default.
+    /// `"reserved"`, the key CL1 never wrote, lands there too.
     pub fn from_key(key: &str) -> Self {
         match key {
+            "focus" => LayoutMode::Focus,
             "columns" => LayoutMode::Columns,
-            _ => LayoutMode::Focus,
+            "canvas" => LayoutMode::Canvas,
+            _ => LayoutMode::default(),
         }
     }
 
-    /// Whether the well draws the strip. The reserved slot draws Focus.
+    /// Whether the well draws the fixed strip.
     pub fn is_columns(self) -> bool {
         matches!(self, LayoutMode::Columns)
+    }
+
+    /// Whether the well draws the plane.
+    pub fn is_canvas(self) -> bool {
+        matches!(self, LayoutMode::Canvas)
+    }
+
+    /// Whether the well lays out CARDS at all — the strip or the plane,
+    /// as opposed to Focus's single row. Every call site that used to ask
+    /// `is_columns` about *the well's shape* asks this instead; the ones
+    /// that ask about the strip's own arithmetic still ask `is_columns`.
+    pub fn lays_out_cards(self) -> bool {
+        matches!(self, LayoutMode::Columns | LayoutMode::Canvas)
     }
 }
 
@@ -281,6 +304,12 @@ pub struct LayoutPrefs {
     /// centre-selects rule it is the one that had the selected column in
     /// view.
     pub scroll: f32,
+    /// Slice CV1 — the plane's pan, in canvas points. Kept here beside
+    /// the scroll rather than with the placements because it is one small
+    /// `Copy` pair that every window has, where a placement map exists
+    /// only once the operator has moved something.
+    pub pan_x: f32,
+    pub pan_y: f32,
 }
 
 /// The pure half of the layout load: this window's entry under
@@ -301,7 +330,17 @@ pub fn layout_from(doc: &serde_json::Value, window: &str) -> LayoutPrefs {
         .map(|x| x as f32)
         .filter(|x| x.is_finite() && *x >= 0.0)
         .unwrap_or(0.0);
-    LayoutPrefs { mode, scroll }
+    // The pan may be negative — the plane has no origin corner the way
+    // the strip has a left end — so it is filtered for finiteness only.
+    let pan = |k: &str| {
+        entry
+            .get(k)
+            .and_then(|v| v.as_f64())
+            .map(|x| x as f32)
+            .filter(|x| x.is_finite())
+            .unwrap_or(0.0)
+    };
+    LayoutPrefs { mode, scroll, pan_x: pan("pan_x"), pan_y: pan("pan_y") }
 }
 
 /// The pure half of the layout save: this window's entry written, every
@@ -324,6 +363,8 @@ pub fn put_layout(doc: &mut serde_json::Value, window: &str, prefs: LayoutPrefs)
         serde_json::json!({
             "mode": prefs.mode.key(),
             "scroll": prefs.scroll,
+            "pan_x": prefs.pan_x,
+            "pan_y": prefs.pan_y,
         }),
     );
 }
@@ -333,12 +374,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_third_slot_is_reserved_and_never_read_back() {
+    fn the_third_slot_became_the_canvas_and_the_unknown_key_is_the_default() {
         assert_eq!(LayoutMode::from_key("focus"), LayoutMode::Focus);
         assert_eq!(LayoutMode::from_key("columns"), LayoutMode::Columns);
-        assert_eq!(LayoutMode::from_key("reserved"), LayoutMode::Focus);
-        assert_eq!(LayoutMode::from_key("anything"), LayoutMode::Focus);
-        assert!(!LayoutMode::Reserved.is_columns());
+        assert_eq!(LayoutMode::from_key("canvas"), LayoutMode::Canvas);
+        // The key CL1 reserved and never wrote, and anything else, read
+        // as the DEFAULT rather than as Focus by name.
+        assert_eq!(LayoutMode::from_key("reserved"), LayoutMode::default());
+        assert_eq!(LayoutMode::from_key("anything"), LayoutMode::default());
+        // Each mode round-trips through its own key.
+        for m in [LayoutMode::Focus, LayoutMode::Columns, LayoutMode::Canvas] {
+            assert_eq!(LayoutMode::from_key(m.key()), m, "{m:?} did not round-trip");
+        }
+        // The strip and the plane are separate answers; both lay out cards.
+        assert!(LayoutMode::Columns.is_columns() && !LayoutMode::Columns.is_canvas());
+        assert!(LayoutMode::Canvas.is_canvas() && !LayoutMode::Canvas.is_columns());
+        assert!(LayoutMode::Canvas.lays_out_cards() && LayoutMode::Columns.lays_out_cards());
+        assert!(!LayoutMode::Focus.lays_out_cards());
     }
 
     #[test]
@@ -477,6 +529,10 @@ mod tests {
         let prefs = LayoutPrefs {
             mode: LayoutMode::Columns,
             scroll: 1144.5,
+            // CV1: the plane's pan rides in the same entry, and may be
+            // negative — the plane has no left end the way the strip has.
+            pan_x: -240.0,
+            pan_y: 96.0,
         };
         put_layout(&mut doc, "primary", prefs);
         assert_eq!(layout_from(&doc, "primary"), prefs);
@@ -484,7 +540,9 @@ mod tests {
             layout_from(&doc, "other-window"),
             LayoutPrefs {
                 mode: LayoutMode::Columns,
-                scroll: 12.0
+                scroll: 12.0,
+                pan_x: 0.0,
+                pan_y: 0.0,
             }
         );
         assert_eq!(doc["rail_groups_collapsed"], serde_json::json!(["/a"]));
@@ -498,7 +556,9 @@ mod tests {
             layout_from(&bad, "w"),
             LayoutPrefs {
                 mode: LayoutMode::Columns,
-                scroll: 0.0
+                scroll: 0.0,
+                pan_x: 0.0,
+                pan_y: 0.0,
             }
         );
         assert_eq!(

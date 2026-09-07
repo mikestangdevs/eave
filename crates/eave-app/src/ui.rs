@@ -135,6 +135,12 @@ actions!(
         /// [`crate::columns::step`].
         ColumnPrev,
         ColumnNext,
+        /// Slice CV1 — ⌥⌘G: every card back into the grid. A keystroke
+        /// as well as the plane's own control, because that control is
+        /// on the bar the well only draws while the RAIL IS SHUT, and
+        /// the one way back from a rearranged plane has to be reachable
+        /// with the rail open too.
+        TidyCanvas,
         /// Slice C5 — ⌘W. Closes the active TAB, and the WINDOW when there
         /// is no tab to close.
         CloseTab,
@@ -6701,6 +6707,88 @@ struct ColumnsPaint {
     visible: std::ops::Range<usize>,
     /// Visible ±1: what is laid out and painted.
     mounted: std::ops::Range<usize>,
+    /// **Slice CV1 — the plane.** False under Columns, and then every
+    /// field below is unread: one paint record for both card layouts, so
+    /// the card body, the chrome hand-off and the controls are written
+    /// once and the difference is only where a card is put.
+    canvas: bool,
+    /// Each card's rect in canvas points, parallel to `order`.
+    rects: Vec<crate::canvas::CardRect>,
+    /// The pan target, and where the plane is DRAWN this frame. The
+    /// paint uses `shown_pan`; `pan` and `view_h` are the record of what
+    /// was decided, read by the harness.
+    #[allow(dead_code)]
+    pan: (f32, f32),
+    shown_pan: (f32, f32),
+    #[allow(dead_code)]
+    view_h: f32,
+    /// The canvas's own visible / mounted sets. Not ranges: on a plane
+    /// the mounted cards are not an interval.
+    vis: Vec<usize>,
+    mnt: Vec<usize>,
+}
+
+impl ColumnsPaint {
+    /// Whether card `ix` is laid out and painted this frame — the strip's
+    /// range or the plane's set, asked once so no call site has to know
+    /// which layout it is in.
+    fn is_mounted(&self, ix: usize) -> bool {
+        if self.canvas {
+            self.mnt.contains(&ix)
+        } else {
+            self.mounted.contains(&ix)
+        }
+    }
+
+    /// The cards inside the viewport proper — where pages composite.
+    fn visible_ixs(&self) -> Vec<usize> {
+        if self.canvas {
+            self.vis.clone()
+        } else {
+            self.visible.clone().collect()
+        }
+    }
+
+    fn rect(&self, ix: usize) -> crate::canvas::CardRect {
+        self.rects.get(ix).copied().unwrap_or(crate::canvas::CardRect::new(
+            0.0,
+            0.0,
+            crate::canvas::CARD_W,
+            crate::canvas::GRID_H_MIN,
+        ))
+    }
+}
+
+/// Slice CV1 — a card move or resize in flight. The geometry lives on the
+/// shell rather than in the drag payload, the bargain [`SplitDrag`]
+/// keeps.
+#[derive(Clone, Debug)]
+struct CanvasDrag {
+    /// The card, by [`ColumnId::stem`] — not its index, which reflows.
+    stem: String,
+    /// `None` is a move; `Some` is that grip's resize.
+    grip: Option<crate::canvas::Grip>,
+    /// Where the pointer took hold, in WINDOW points, and the card's rect
+    /// at that moment. The delta is window-space and so needs no pan: a
+    /// pan under a live drag would move the card with it, which is what
+    /// a hand holding a card should do.
+    grab: (f32, f32),
+    start: crate::canvas::CardRect,
+    /// Whether the pointer has moved far enough to be a drag. Until it
+    /// has, nothing is written — so a click on a header is still a click.
+    moved: bool,
+}
+
+/// Payload type for a card drag. Same shape and the same reason as
+/// [`SplitResize`]: a separate type so the two `on_drag_move` listeners
+/// can never hear each other's drags.
+#[derive(Clone, Copy, Debug)]
+struct CardDrag;
+
+impl Render for CardDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
 }
 
 /// Slice CL1 — the well's own chrome, handed to the strip so the
@@ -6829,6 +6917,8 @@ struct ColumnWheel {
     shell: gpui::WeakEntity<Shell>,
     can_left: bool,
     can_right: bool,
+    /// Slice CV1 — the plane, whose rule is different (see `paint`).
+    canvas: bool,
 }
 
 impl Element for ColumnWheel {
@@ -6880,11 +6970,40 @@ impl Element for ColumnWheel {
         let hitbox = hitbox.clone();
         let shell = self.shell.clone();
         let (can_left, can_right) = (self.can_left, self.can_right);
+        let canvas = self.canvas;
         window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
             if phase != DispatchPhase::Capture || !hitbox.is_hovered(window) {
                 return;
             }
             let delta = ev.delta.pixel_delta(window.line_height());
+            // **Slice CV1 — the plane's gesture rule.** Over the GROUND
+            // (a gutter, open space) the wheel pans on both axes: that is
+            // what makes the grid scroll forever. Over a CARD it is
+            // CL1's rule unchanged — a horizontal-dominant delta pans the
+            // plane's x, and a vertical one belongs to the card, because
+            // a transcript and a page have their own scroll and stealing
+            // it would make every card unreadable.
+            if canvas {
+                let origin = hitbox.bounds.origin;
+                let over_card = shell
+                    .update(cx, |this, _| this.canvas_card_at(ev.position, origin))
+                    .unwrap_or(None)
+                    .is_some();
+                let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+                let pan = if over_card {
+                    columns::strip_delta(dx, dy).map(|d| (d, 0.0))
+                } else if dx != 0.0 || dy != 0.0 {
+                    Some((-dx, -dy))
+                } else {
+                    None
+                };
+                let Some((px_, py_)) = pan else {
+                    return;
+                };
+                let _ = shell.update(cx, |this, cx| this.wheel_canvas(px_, py_, cx));
+                cx.stop_propagation();
+                return;
+            }
             let Some(d) = columns::strip_delta(f32::from(delta.x), f32::from(delta.y)) else {
                 return;
             };
@@ -7819,6 +7938,28 @@ struct Shell {
     /// changes mid-flight restarts it from wherever the strip is.
     columns_shown: Cell<f32>,
     columns_glide: Cell<Option<(Instant, f32, f32)>>,
+    /// **Slice CV1 — what the operator has placed by hand**, by
+    /// [`ColumnId::stem`]. A card with no entry is laid out by the grid
+    /// EVERY frame, so opening a tab reflows the untouched cards and
+    /// leaves the placed ones alone; see `crate::canvas`. A `RefCell`
+    /// for the reason `columns_scrolled_to` is one: the paint reads it.
+    canvas_placed: RefCell<crate::canvas::Placements>,
+    canvas_placed_dirty: Cell<bool>,
+    /// The plane's pan, target and drawn — `columns_scroll`'s pair, in
+    /// two dimensions, glided by the same clock for the same reason.
+    canvas_pan: Cell<(f32, f32)>,
+    canvas_shown_pan: Cell<(f32, f32)>,
+    canvas_glide: Cell<Option<(Instant, (f32, f32), (f32, f32))>>,
+    /// The plane's viewport at the last paint, for the handlers'
+    /// arithmetic. `(0, 0)` until the first paint, like `columns_view_w`.
+    canvas_view: Cell<(f32, f32)>,
+    /// Each card's rect at the last paint, parallel to that paint's
+    /// order. What the wheel and the drop hit-test against — they run
+    /// outside the paint and cannot re-derive the layout without the
+    /// snapshot the paint had.
+    canvas_rects: RefCell<Vec<crate::canvas::CardRect>>,
+    /// The card move or resize in progress, or `None`.
+    canvas_drag: Option<CanvasDrag>,
     /// The column feeds (app-wide; see [`ColumnFeeds`]).
     columns: Entity<ColumnFeeds>,
     /// Debounce for the scroll's save: a wheel burst is one decision.
@@ -8994,6 +9135,43 @@ fn load_layout(window: &str) -> LayoutPrefs {
         return LayoutPrefs::default();
     };
     columns::layout_from(&v, window)
+}
+
+/// Slice CV1 — this window's hand placements out of `frame.json`, or
+/// none. Separate from the mode for the reason `canvas::CANVAS_KEY`
+/// gives: a map that only exists once the operator has moved something.
+fn load_canvas(window: &str) -> crate::canvas::Placements {
+    let Some(path) = frame_prefs_path() else {
+        return Default::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Default::default();
+    };
+    crate::canvas::cards_from(&v, window)
+}
+
+/// Write them back, the same merged read-modify-write.
+fn save_canvas(window: &str, placed: &crate::canvas::Placements) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    crate::canvas::put_cards(&mut doc, window, placed);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!("eave: cannot save canvas to {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise canvas: {e}"),
+    }
 }
 
 /// Write this window's layout back — the same merged read-modify-write
@@ -13270,7 +13448,7 @@ impl Shell {
             return;
         }
         self.layout = mode;
-        if !mode.is_columns() {
+        if !mode.lays_out_cards() {
             let key = self.window_key.clone();
             self.columns
                 .update(cx, |feeds, cx| feeds.set_wants(&key, HashSet::new(), cx));
@@ -13300,21 +13478,28 @@ impl Shell {
     }
 
     fn persist_layout(&self) {
+        let (pan_x, pan_y) = self.canvas_pan.get();
         save_layout(
             &self.window_key,
             LayoutPrefs {
                 mode: self.layout,
                 scroll: self.columns_scroll.get(),
+                pan_x,
+                pan_y,
             },
         );
         self.columns_scroll_dirty.set(false);
+        if self.canvas_placed_dirty.get() {
+            save_canvas(&self.window_key, &self.canvas_placed.borrow());
+            self.canvas_placed_dirty.set(false);
+        }
     }
 
     /// A scroll the PAINT moved (a selection came into view) is written
     /// from the observers, never from the paint — the same bargain every
     /// paint-written field on this shell keeps.
     fn flush_layout_save(&self) {
-        if self.columns_scroll_dirty.get() {
+        if self.columns_scroll_dirty.get() || self.canvas_placed_dirty.get() {
             self.persist_layout();
         }
     }
@@ -13341,8 +13526,69 @@ impl Shell {
         .detach();
     }
 
+    /// The card under a WINDOW point, given the plane's origin in window
+    /// coordinates — what the wheel asks to decide whose gesture it is.
+    fn canvas_card_at(
+        &self,
+        at: Point<Pixels>,
+        origin: Point<Pixels>,
+    ) -> Option<usize> {
+        let (px_, py_) = (f32::from(at.x - origin.x), f32::from(at.y - origin.y));
+        let pan = self.canvas_shown_pan.get();
+        crate::canvas::hit(&self.canvas_rects.borrow(), px_ + pan.0, py_ + pan.1)
+    }
+
+    /// **Slice CV1 — the plane's wheel.** Both axes at once, clamped to
+    /// the content, written to the target AND the drawn pan: the
+    /// trackpad is the animation, CL1's rule. It does NOT re-derive the
+    /// selection the way the strip's centre rule does — on a plane there
+    /// is no single card under the middle, and a pan that kept changing
+    /// which card owns the composer would be unusable.
+    fn wheel_canvas(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        if self.canvas_drag.is_some() {
+            return;
+        }
+        let (view_w, view_h) = self.canvas_view.get();
+        if view_w <= 0.0 || view_h <= 0.0 {
+            return;
+        }
+        let bounds = {
+            let rects = self.canvas_rects.borrow();
+            crate::canvas::content_bounds(&rects, view_w, view_h)
+        };
+        let at = self.canvas_pan.get();
+        let next = crate::canvas::clamp_pan(at.0 + dx, at.1 + dy, &bounds, view_w, view_h);
+        if next == at {
+            return;
+        }
+        self.canvas_pan.set(next);
+        self.canvas_shown_pan.set(next);
+        self.canvas_glide.set(None);
+        self.columns_scroll_dirty.set(true);
+        self.schedule_layout_save(cx);
+        cx.notify();
+    }
+
     /// Drop the feeds of sessions no tab holds any more (tabs observer).
     /// Not against an empty strip — the boot shape, `prune_splits`'s rule.
+    /// Slice CV1 — and the hand placements with them: same tabs fact,
+    /// same observer, so `frame.json` does not collect an entry per tab
+    /// that ever existed.
+    fn prune_canvas_placements(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        if snapshot.tabs.is_empty() {
+            // The boot shape — `prune_splits`'s rule, for its reason: an
+            // empty snapshot would erase every placement on launch.
+            return;
+        }
+        let order = self.column_order(&snapshot, cx);
+        let before = self.canvas_placed.borrow().len();
+        crate::canvas::prune(&mut self.canvas_placed.borrow_mut(), &order);
+        if self.canvas_placed.borrow().len() != before {
+            self.canvas_placed_dirty.set(true);
+        }
+    }
+
     fn prune_column_feeds(&mut self, cx: &mut Context<Self>) {
         let every = self.web_tabs.read(cx).snapshot.clone();
         if every.tabs.is_empty() {
@@ -13384,6 +13630,22 @@ impl Shell {
             (f32::from(window.viewport_size().width) - rail - 2.0 * theme::CARD_GUTTER).max(0.0);
         self.columns_view_w.set(view_w);
         let n = order.len();
+        if self.layout.is_canvas() {
+            let view_h = (f32::from(window.viewport_size().height)
+                - 2.0 * theme::CARD_GUTTER)
+                .max(0.0);
+            return self.canvas_geometry(
+                order,
+                selected_col,
+                selected,
+                rail,
+                view_w,
+                view_h,
+                snapshot,
+                window,
+                cx,
+            );
+        }
         let mut scroll = columns::clamp_scroll(self.columns_scroll.get(), n, view_w);
         // **The edge.** The strip moves when the SELECTION changes and not
         // otherwise. A selection the wheel itself made is `asked`: it is
@@ -13459,16 +13721,7 @@ impl Shell {
         // The feeds: every mounted chat column's session, the selected one
         // included — it is double-subscribed on purpose, so the column it
         // leaves is already warm when the selection moves on.
-        let wants: HashSet<String> = mounted
-            .clone()
-            .filter_map(|ix| order[ix].tab())
-            .filter_map(|t| {
-                snapshot.tabs.iter().find(|x| x.id == t).and_then(|x| match &x.content {
-                    eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
-                    eave_wire::TabContent::Page => None,
-                })
-            })
-            .collect();
+        let wants = Self::feed_wants(&order, mounted.clone(), snapshot);
         let key = self.window_key.clone();
         self.columns
             .update(cx, |feeds, cx| feeds.set_wants(&key, wants, cx));
@@ -13481,6 +13734,167 @@ impl Shell {
             rail,
             visible,
             mounted,
+            canvas: false,
+            rects: Vec::new(),
+            pan: (0.0, 0.0),
+            shown_pan: (0.0, 0.0),
+            view_h: 0.0,
+            vis: Vec::new(),
+            mnt: Vec::new(),
+        }
+    }
+
+    /// The sessions the mounted cards want feeds for. The selected card's
+    /// session is in here too — double-subscribed on purpose, so the card
+    /// the selection leaves is already warm. Shared by both card layouts.
+    fn feed_wants(
+        order: &[ColumnId],
+        mounted: impl Iterator<Item = usize>,
+        snapshot: &eave_wire::TabsSnapshot,
+    ) -> HashSet<String> {
+        mounted
+            .filter_map(|ix| order.get(ix).and_then(|c| c.tab()))
+            .filter_map(|t| {
+                snapshot.tabs.iter().find(|x| x.id == t).and_then(|x| match &x.content {
+                    eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
+                    eave_wire::TabContent::Page => None,
+                })
+            })
+            .collect()
+    }
+
+    /// **Slice CV1 — the plane's geometry.** `columns_geometry`'s job on
+    /// two axes: place every card, hold the pan inside the content, glide
+    /// a move the operator did not make, and decide what is mounted.
+    ///
+    /// The edge is CL1's, unchanged and for its reason: the plane moves
+    /// when the SELECTION changes and not otherwise, the move is the
+    /// MINIMAL one that shows the card whole (`canvas::pan_into_view`),
+    /// and a selection the gesture itself made is `columns_asked` — held,
+    /// so the paint between the ask and the engine's answer cannot drag
+    /// the old selection back into view.
+    ///
+    /// **A drag in flight freezes all of it.** While `canvas_drag` is
+    /// live the pan is not clamped, not glided and not re-derived from
+    /// the selection: the card under the hand would otherwise be chased
+    /// by the plane it is being dragged across.
+    #[allow(clippy::too_many_arguments)]
+    fn canvas_geometry(
+        &self,
+        order: Vec<ColumnId>,
+        selected_col: Option<ColumnId>,
+        selected: Option<usize>,
+        rail: f32,
+        view_w: f32,
+        view_h: f32,
+        snapshot: &eave_wire::TabsSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ColumnsPaint {
+        self.canvas_view.set((view_w, view_h));
+        let rects = crate::canvas::layout(&order, &self.canvas_placed.borrow(), view_w, view_h);
+        let bounds = crate::canvas::content_bounds(&rects, view_w, view_h);
+        let dragging = self.canvas_drag.is_some();
+        let mut pan = self.canvas_pan.get();
+        if !dragging && view_w > 0.0 && view_h > 0.0 {
+            pan = crate::canvas::clamp_pan(pan.0, pan.1, &bounds, view_w, view_h);
+            let mut been = self.columns_scrolled_to.borrow_mut();
+            let mut asked = self.columns_asked.borrow_mut();
+            if asked.is_some() && *asked == selected_col {
+                *asked = None;
+                *been = selected_col.clone();
+            } else if asked.is_some() && *been == selected_col {
+                // Pending: hold.
+            } else {
+                *asked = None;
+                if *been != selected_col {
+                    if let Some(r) = selected.map(|ix| rects[ix]) {
+                        let want = crate::canvas::pan_into_view(pan.0, pan.1, &r, view_w, view_h);
+                        pan = crate::canvas::clamp_pan(want.0, want.1, &bounds, view_w, view_h);
+                    }
+                    *been = selected_col.clone();
+                }
+            }
+        }
+        if pan != self.canvas_pan.get() {
+            self.canvas_pan.set(pan);
+            self.columns_scroll_dirty.set(true);
+            self.schedule_layout_save(cx);
+        }
+        // The glide, on the scroll glide's own clock and curve. A gesture
+        // writes both at once — the trackpad is the animation — and a
+        // drag never glides at all.
+        let mut shown = self.canvas_shown_pan.get();
+        let far = (shown.0 - pan.0).abs().max((shown.1 - pan.1).abs());
+        if dragging || cx.reduce_motion() || far < 0.5 {
+            shown = pan;
+            self.canvas_glide.set(None);
+        } else {
+            let now = cx.background_executor().now();
+            let (started, from, to) = match self.canvas_glide.get() {
+                Some(g) if g.2 == pan => g,
+                _ => {
+                    let g = (now, shown, pan);
+                    self.canvas_glide.set(Some(g));
+                    g
+                }
+            };
+            let t = (now.duration_since(started).as_secs_f32() * 1000.0
+                / crate::canvas::PAN_GLIDE_MS as f32)
+                .clamp(0.0, 1.0);
+            let e = motion::EASE_IN_OUT.eval(t);
+            shown = (from.0 + (to.0 - from.0) * e, from.1 + (to.1 - from.1) * e);
+            if t >= 1.0 {
+                shown = pan;
+                self.canvas_glide.set(None);
+            } else {
+                let entity = self.transcript.clone();
+                window.on_next_frame(move |_, cx| {
+                    entity.update(cx, |_, cx| cx.notify());
+                });
+            }
+        }
+        self.canvas_shown_pan.set(shown);
+        *self.canvas_rects.borrow_mut() = rects.clone();
+        let vis = crate::canvas::visible(&rects, shown.0, shown.1, view_w, view_h);
+        // Mounted at BOTH ends of a glide, so the cards sliding in are
+        // already laid out rather than empty slots filling in — CL1's
+        // rule, in two dimensions.
+        let mut mnt = crate::canvas::mounted(&rects, shown.0, shown.1, view_w, view_h);
+        for ix in crate::canvas::mounted(&rects, pan.0, pan.1, view_w, view_h) {
+            if !mnt.contains(&ix) {
+                mnt.push(ix);
+            }
+        }
+        // The selected card is always mounted: it holds the ONE composer
+        // and the ONE transcript, and a selection panned off the plane
+        // that dropped its composer would lose what is being typed.
+        if let Some(ix) = selected {
+            if !mnt.contains(&ix) {
+                mnt.push(ix);
+            }
+        }
+        mnt.sort_unstable();
+        let key = self.window_key.clone();
+        let wants = Self::feed_wants(&order, mnt.iter().copied(), snapshot);
+        self.columns
+            .update(cx, |feeds, cx| feeds.set_wants(&key, wants, cx));
+        ColumnsPaint {
+            order,
+            selected,
+            scroll: 0.0,
+            shown: 0.0,
+            view_w,
+            rail,
+            visible: 0..0,
+            mounted: 0..0,
+            canvas: true,
+            rects,
+            pan,
+            shown_pan: shown,
+            view_h,
+            vis,
+            mnt,
         }
     }
 
@@ -13489,8 +13903,8 @@ impl Shell {
     /// page column scrolled out keeps its browser and stops producing
     /// frames (`was_hidden`), and E3's clock sees it as off screen.
     fn columns_shown_pages(geo: &ColumnsPaint, snapshot: &eave_wire::TabsSnapshot) -> Vec<String> {
-        geo.visible
-            .clone()
+        geo.visible_ixs()
+            .into_iter()
             .filter_map(|ix| geo.order[ix].tab().map(str::to_string))
             .filter(|id| {
                 snapshot
@@ -13553,15 +13967,51 @@ impl Shell {
             .tabs
             .iter()
             .any(|t| t.id == drag.id && t.content == eave_wire::TabContent::Page);
-        if !is_page {
-            return;
-        }
         let order = self.column_order(&snapshot, cx);
         let rail = if self.sessions.read(cx).collapsed {
             0.0
         } else {
             self.rail_w
         };
+        // **Slice CV1 — on the plane a drop is a PLACEMENT, not a
+        // reorder.** The strip has one axis and an order, so a drop there
+        // can only mean "put it between these two"; the plane has neither,
+        // so it means what it looks like: the card goes where it was
+        // dropped. Chats land too — the strip refuses them because a
+        // chat's place is the rail's order, and on a plane it is not.
+        if self.layout.is_canvas() {
+            let stem = ColumnId::Tab(drag.id.clone()).stem();
+            if !order.iter().any(|c| c.stem() == stem) {
+                return;
+            }
+            let (view_w, view_h) = self.canvas_view.get();
+            let pan = self.canvas_shown_pan.get();
+            let x = f32::from(window.mouse_position().x) - rail - theme::CARD_GUTTER + pan.0;
+            let y = f32::from(window.mouse_position().y) - theme::CARD_GUTTER + pan.1;
+            let size = self
+                .canvas_placed
+                .borrow()
+                .get(&stem)
+                .copied()
+                .unwrap_or_else(|| crate::canvas::grid_slot(0, view_w, view_h));
+            // The pointer takes the card by its header, so the drop point
+            // is the card's TOP-LEFT and not its centre — the same place
+            // the hand was holding.
+            let landed = crate::canvas::CardRect::new(
+                crate::canvas::snap_to(x),
+                crate::canvas::snap_to(y),
+                size.w,
+                size.h,
+            );
+            self.canvas_placed.borrow_mut().insert(stem, landed);
+            self.canvas_placed_dirty.set(true);
+            self.persist_layout();
+            cx.notify();
+            return;
+        }
+        if !is_page {
+            return;
+        }
         let x = f32::from(window.mouse_position().x) - rail - theme::CARD_GUTTER
             + self.columns_scroll.get();
         let gap = ((x / columns::COLUMN_PITCH).round().max(0.0) as usize).min(order.len());
@@ -13592,14 +14042,46 @@ impl Shell {
             .flex_row()
             .items_center()
             .child(self.rail_toggle(cx))
+            .children(self.layout.is_canvas().then(|| self.tidy_control(cx)))
             .into_any_element()
     }
 
-    /// The way from Focus back to the strip: a minimize glyph at the right
-    /// of the well's header, the inverse of a column's ⛶ (the operator's
-    /// ruling on the fourth run: *"get rid of the focus/column button …
-    /// when we full screen we need to add a minimize as well on the right
-    /// side"*). The two glyphs ARE the mode control now.
+    /// **Slice CV1 — `tidy`.** The one way back from a plane the operator
+    /// has rearranged: every card into the grid, the pan home. Explicit,
+    /// and never automatic, because it discards work.
+    fn tidy_control(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id("canvas-tidy")
+            .debug_selector(|| "canvas-tidy".into())
+            .ml_auto()
+            .flex_none()
+            .h(px(theme::ICON_TOGGLE))
+            .px(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_SELECT))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .hover_fade("canvas-tidy", theme::wash_rest(), theme::overlay())
+            .cursor_pointer()
+            .text_size(px(theme::MICRO_SIZE))
+            .line_height(px(theme::MICRO_LINE))
+            .text_color(theme::text_secondary())
+            .on_click(cx.listener(|this, _, _, cx| this.tidy_canvas(cx)))
+            .child("tidy")
+            .into_any_element()
+    }
+
+    /// The way from Focus back out: a minimize glyph at the right of the
+    /// well's header, the inverse of a card's ⛶ (the operator's ruling on
+    /// CL1's fourth run: *"get rid of the focus/column button … when we
+    /// full screen we need to add a minimize as well on the right
+    /// side"*). The two glyphs ARE the mode control.
+    ///
+    /// **Slice CV1: it opens the CANVAS, not the strip.** The plane is
+    /// the product's layout now, and an untouched plane at a wide window
+    /// is the strip — so this is the same door, onto a room with its
+    /// walls taken out. [`LayoutMode::Columns`] is kept and is reachable
+    /// only from a `frame.json` that already names it.
     fn layout_minimize(&self, cx: &Context<Self>) -> AnyElement {
         div()
             .id("layout-minimize")
@@ -13612,12 +14094,15 @@ impl Shell {
             .justify_center()
             .hover_fade("layout-minimize", theme::wash_rest(), theme::overlay())
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| this.set_layout(LayoutMode::Columns, cx)))
+            .on_click(cx.listener(|this, _, _, cx| this.set_layout(LayoutMode::Canvas, cx)))
             .child(icons::icon(icons::MINIMIZE_ARROWS, 12.0, theme::text_secondary()))
             .into_any_element()
     }
 
-    /// The strip: every open row's frame side by side, in sidebar order.
+    /// The strip, or the plane: every open row's frame, in sidebar order.
+    /// One renderer for both, because the only difference is where a card
+    /// is put — under Columns the flex row offset by the scroll, under
+    /// Canvas each card absolutely placed at its own rect less the pan.
     fn render_columns_well(
         &self,
         geo: &ColumnsPaint,
@@ -13649,18 +14134,44 @@ impl Shell {
             .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
                 this.drop_on_columns(drag, window, cx);
             }))
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(px(-geo.shown))
-                    .w(px(columns::total_width(n)))
-                    .flex()
-                    .flex_row()
-                    .gap(px(columns::COLUMN_GUTTER))
-                    .children(cols),
-            )
+            // CV1 — a card in hand. The move is tracked on the WELL, not
+            // on the card, so the pointer may leave the card it is
+            // carrying; the same reason `split-well` hears its handle's
+            // drag rather than the handle hearing itself.
+            .when(geo.canvas, |d| {
+                d.on_drag_move(cx.listener(
+                    |this, e: &DragMoveEvent<CardDrag>, _window, cx| {
+                        this.drag_card_to(e.event.position, cx);
+                    },
+                ))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                        this.end_card_drag(cx);
+                    }),
+                )
+            })
+            .map(|d| {
+                if geo.canvas {
+                    // On the plane the cards ARE the children: each one
+                    // places itself, so there is no row to offset and no
+                    // total width.
+                    d.children(cols)
+                } else {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(-geo.shown))
+                            .w(px(columns::total_width(n)))
+                            .flex()
+                            .flex_row()
+                            .gap(px(columns::COLUMN_GUTTER))
+                            .children(cols),
+                    )
+                }
+            })
             .when(n == 0, |d| {
                 d.child(
                     div()
@@ -13680,6 +14191,7 @@ impl Shell {
             shell: cx.entity().downgrade(),
             can_left: geo.scroll > 0.5,
             can_right: geo.scroll < max - 0.5,
+            canvas: geo.canvas,
         };
         div()
             .debug_selector(|| "columns-well".into())
@@ -13697,9 +14209,12 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One column: a fixed-width slot, filled only inside the ±1 mount
-    /// window. An unmounted slot keeps its width and draws nothing, so the
-    /// strip's length and every neighbour's position are exact.
+    /// One card. Under Columns a fixed-width slot in the strip's flex
+    /// row; under Canvas (CV1) the SAME card, absolutely placed at its
+    /// rect less the pan, plus a grab strip and two resize grips. Filled
+    /// only inside the mount window — an unmounted slot keeps its box and
+    /// draws nothing, so the strip's length and every neighbour's
+    /// position are exact.
     #[allow(clippy::too_many_arguments)]
     fn column_el(
         &self,
@@ -13713,16 +14228,27 @@ impl Shell {
     ) -> AnyElement {
         let stem = col.stem();
         let is_sel = geo.selected == Some(ix);
-        let mounted = geo.mounted.contains(&ix);
+        let mounted = geo.is_mounted(ix);
+        let rect = geo.rect(ix);
         let slot = div()
             .id(SharedString::from(format!("column-{stem}")))
             .debug_selector({
                 let stem = stem.clone();
                 move || format!("column-{stem}")
             })
-            .flex_none()
-            .w(px(columns::COLUMN_W))
-            .h_full()
+            .when(!geo.canvas, |d| {
+                d.flex_none().w(px(columns::COLUMN_W)).h_full()
+            })
+            // CV1: the plane places the card itself. `left`/`top` are the
+            // rect less the pan DRAWN this frame, so a glide moves every
+            // card together and a drag moves one against the rest.
+            .when(geo.canvas, |d| {
+                d.absolute()
+                    .left(px(rect.x - geo.shown_pan.0))
+                    .top(px(rect.y - geo.shown_pan.1))
+                    .w(px(rect.w))
+                    .h(px(rect.h))
+            })
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -13752,8 +14278,198 @@ impl Shell {
                 }),
             )
         })
+        // CV1: the grab strip goes in FIRST so the row's own header — the
+        // address pill, ⛶, × — paints over it and keeps its own hits.
+        // What is left over is the header's inert width, and that is the
+        // handle. No new title bar: the operator's second-run ruling
+        // (*"we dont need the extra top bar at the top of the card"*)
+        // holds on the plane too.
+        .children(geo.canvas.then(|| self.card_grab_strip(&stem, rect, cx)))
         .child(self.column_body(col, is_sel, chrome, rail_collapsed, pulse, cx))
+        // The grips go in LAST, so they are above the body — a page fills
+        // its card and would otherwise take the edge.
+        .children(
+            geo.canvas
+                .then(|| self.card_grips(&stem, rect, cx))
+                .into_iter()
+                .flatten(),
+        )
         .into_any_element()
+    }
+
+    /// **Slice CV1 — the move handle.** A full-width band across the top
+    /// of a card, under its header. `on_drag` is what makes the gesture
+    /// survive the pointer leaving the card, which is the whole point of
+    /// a move; the same idiom [`Shell::split_handle`] uses, and a
+    /// separate payload type so the two listeners cannot hear each other.
+    fn card_grab_strip(
+        &self,
+        stem: &str,
+        rect: crate::canvas::CardRect,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = format!("card-grab-{stem}");
+        let owner = stem.to_string();
+        div()
+            .id(SharedString::from(id.clone()))
+            .debug_selector(move || id.clone())
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(theme::PANE_HEADER_H))
+            .cursor_grab()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    this.begin_card_drag(&owner, None, rect, e.position, cx);
+                }),
+            )
+            .on_drag(CardDrag, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| CardDrag)
+            })
+            .into_any_element()
+    }
+
+    /// **Slice CV1 — the two resize grips and the corner.** Right, bottom
+    /// and bottom-right only: a card is anchored at its top-left, so a
+    /// left or top grip would move it as well, and a gesture that both
+    /// moves and resizes is one nobody can aim (`canvas::grip_at` states
+    /// the same rule for the arithmetic).
+    fn card_grips(
+        &self,
+        stem: &str,
+        rect: crate::canvas::CardRect,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        use crate::canvas::Grip;
+        let band = px(crate::canvas::GRIP_BAND);
+        [Grip::Right, Grip::Bottom, Grip::Corner]
+            .into_iter()
+            .map(|grip| {
+                let name = match grip {
+                    Grip::Right => "right",
+                    Grip::Bottom => "bottom",
+                    Grip::Corner => "corner",
+                };
+                let id = format!("card-grip-{name}-{stem}");
+                let owner = stem.to_string();
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .debug_selector(move || id.clone())
+                    .absolute()
+                    .occlude()
+                    .map(|d| match grip {
+                        Grip::Right => d.top_0().bottom(band).right_0().w(band).cursor_col_resize(),
+                        Grip::Bottom => d.left_0().right(band).bottom_0().h(band).cursor_row_resize(),
+                        Grip::Corner => d
+                            .right_0()
+                            .bottom_0()
+                            .w(band)
+                            .h(band)
+                            .cursor_nwse_resize(),
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            this.begin_card_drag(&owner, Some(grip), rect, e.position, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_drag(CardDrag, |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| CardDrag)
+                    })
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// A press on a grab strip or a grip. Nothing is written yet — the
+    /// first MOVE past the threshold is what makes it a drag, so a click
+    /// on a card's header is still a click.
+    fn begin_card_drag(
+        &mut self,
+        stem: &str,
+        grip: Option<crate::canvas::Grip>,
+        start: crate::canvas::CardRect,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.canvas_drag = Some(CanvasDrag {
+            stem: stem.to_string(),
+            grip,
+            grab: (f32::from(at.x), f32::from(at.y)),
+            start,
+            moved: false,
+        });
+        cx.notify();
+    }
+
+    /// The pointer moving with a card in hand. The delta is WINDOW-space
+    /// and needs no pan: the plane is held still for the length of a drag
+    /// (`canvas_geometry`), so window and canvas move together and the
+    /// card stays under the finger.
+    fn drag_card_to(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.canvas_drag.as_mut() else {
+            return;
+        };
+        let (dx, dy) = (f32::from(at.x) - drag.grab.0, f32::from(at.y) - drag.grab.1);
+        // A threshold, so a click that wobbles by a pixel is still a click
+        // and does not write a placement.
+        if !drag.moved && dx.abs().max(dy.abs()) < 3.0 {
+            return;
+        }
+        drag.moved = true;
+        let next = match drag.grip {
+            None => crate::canvas::moved_free(&drag.start, dx, dy),
+            Some(g) => crate::canvas::resized_free(&drag.start, g, dx, dy),
+        };
+        let stem = drag.stem.clone();
+        self.canvas_placed.borrow_mut().insert(stem, next);
+        cx.notify();
+    }
+
+    /// The card let go: the landing is snapped, and only now is anything
+    /// saved. A press that never moved writes nothing at all.
+    fn end_card_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.canvas_drag.take() else {
+            return;
+        };
+        if !drag.moved {
+            cx.notify();
+            return;
+        }
+        let live = self.canvas_placed.borrow().get(&drag.stem).copied();
+        if let Some(live) = live {
+            let (dx, dy) = (live.x - drag.start.x, live.y - drag.start.y);
+            let landed = match drag.grip {
+                None => crate::canvas::moved(&drag.start, dx, dy),
+                Some(g) => crate::canvas::resized(
+                    &drag.start,
+                    g,
+                    live.w - drag.start.w,
+                    live.h - drag.start.h,
+                ),
+            };
+            self.canvas_placed.borrow_mut().insert(drag.stem.clone(), landed);
+        }
+        self.canvas_placed_dirty.set(true);
+        self.persist_layout();
+        cx.notify();
+    }
+
+    /// ⌥⌘G, and the plane's own control: every card back into the grid.
+    /// Clears the placements rather than writing each card's slot into
+    /// them, so the next window resize reflows instead of freezing
+    /// yesterday's columns (`canvas::tidy`).
+    fn tidy_canvas(&mut self, cx: &mut Context<Self>) {
+        crate::canvas::tidy(&mut self.canvas_placed.borrow_mut());
+        self.canvas_pan.set((0.0, 0.0));
+        self.canvas_placed_dirty.set(true);
+        self.persist_layout();
+        cx.notify();
     }
 
     /// ⛶ and × for one column, appended to the row's own header (the
@@ -28331,7 +29047,7 @@ impl Render for Shell {
         // `set_shown_pages`: a page composites only inside the viewport.
         let columns_geo = self
             .layout
-            .is_columns()
+            .lays_out_cards()
             .then(|| self.columns_geometry(&frame, &strip_snapshot, window, cx));
 
         let shown_pages: Vec<String> = {
@@ -29493,6 +30209,11 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.cycle_tab(false, cx)))
             .on_action(cx.listener(|this, _: &ColumnPrev, _, cx| this.step_column(false, cx)))
             .on_action(cx.listener(|this, _: &ColumnNext, _, cx| this.step_column(true, cx)))
+            .on_action(cx.listener(|this, _: &TidyCanvas, _, cx| {
+                if this.layout.is_canvas() {
+                    this.tidy_canvas(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go(-1, cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
             .on_action(cx.listener(|this, _: &ReloadTab, _, cx| this.reload(cx)))
@@ -30616,6 +31337,8 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // strip's columns (and, in Focus, the same sidebar order).
         KeyBinding::new("cmd-shift-[", ColumnPrev, None),
         KeyBinding::new("cmd-shift-]", ColumnNext, None),
+        // CV1. ⌥⌘G — "grid". Not ⌘G, which is find-next everywhere.
+        KeyBinding::new("alt-cmd-g", TidyCanvas, None),
         // ⌘W — **the only binding on this chord**, replacing Slice Y's
         // `app_menus::CloseWindow`.
         //
@@ -31465,6 +32188,8 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
     } = cx.global::<ShellDeps>().clone();
     // Slice CL1: the layout comes back with the splits.
     let layout_prefs = load_layout(&window_key);
+    // Slice CV1 — the hand placements, read once beside the mode.
+    let canvas_placed = load_canvas(&window_key);
     let placement = new_window_placement(cx);
     let handle = cx
         .open_window(
@@ -31648,6 +32373,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // Slice CL1: same rule, same reason — and the
                         // strip's paint-moved scroll is written here.
                         shell.prune_column_feeds(cx);
+                        shell.prune_canvas_placements(cx);
                         shell.flush_layout_save();
                         cx.notify();
                     })
@@ -31768,6 +32494,14 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         columns_view_w: Cell::new(0.0),
                         columns_shown: Cell::new(layout_prefs.scroll),
                         columns_glide: Cell::new(None),
+                        canvas_placed: RefCell::new(canvas_placed),
+                        canvas_placed_dirty: Cell::new(false),
+                        canvas_pan: Cell::new((layout_prefs.pan_x, layout_prefs.pan_y)),
+                        canvas_shown_pan: Cell::new((layout_prefs.pan_x, layout_prefs.pan_y)),
+                        canvas_glide: Cell::new(None),
+                        canvas_view: Cell::new((0.0, 0.0)),
+                        canvas_rects: RefCell::new(Vec::new()),
+                        canvas_drag: None,
                         columns: columns.clone(),
                         layout_save_gen: Cell::new(0),
                         devtools_ratio: DEVTOOLS_RATIO,
