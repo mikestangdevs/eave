@@ -92,6 +92,12 @@ pub mod omnibox;
 /// behaviour worth asserting lives.
 pub mod strip;
 
+/// Slice CL1 — Columns mode's pure half: the layout mode, the strip's
+/// geometry (viewport, centre, into-view, ±1 mounting), the order merge
+/// and the `frame.json` layout entry. Public for the reason `strip` is:
+/// every rule the strip lives by is decidable without a window.
+pub mod columns;
+
 /// The bookmarks bar's model half (Slice T1): B1's flat, depth-first
 /// `BookmarksSnapshot` read as a bar of top-level chips and the runs of
 /// children each folder opens. Public for the same reason `strip` is.

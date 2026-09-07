@@ -154,6 +154,8 @@ Line {
     DOCUMENT_ADD => "document-add.svg",
     DOCUMENT => "document.svg",
     EXPAND_ARROWS => "expand-arrows.svg",
+    /// CL1 — the inverse of `EXPAND_ARROWS`: a maximized column back to the strip.
+    MINIMIZE_ARROWS => "minimize-arrows.svg",
     FOLD_VERTICAL => "fold-vertical.svg",
     FOLDER_WITH_FILES => "folder-with-files.svg",
     FOLDER => "folder.svg",
@@ -509,10 +511,12 @@ mod tests {
         // SPLIT_PANES (Slice C2) is `sidebar-minimalistic` with its
         // divider moved to the centre, which is the same drawing on the
         // same grid rather than a new one.
-        assert_eq!(of(Class::Line).count(), 62, "the Line family");
+        // MINIMIZE_ARROWS (Slice CL1) is `expand-arrows` with the heads
+        // turned inward — the way back from a maximized column.
+        assert_eq!(of(Class::Line).count(), 63, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 73);
+        assert_eq!(REGISTRY.len(), 74);
     }
 
     /// Every registered path is a file that exists on disk under exactly

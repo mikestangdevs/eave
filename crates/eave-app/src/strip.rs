@@ -245,6 +245,13 @@ impl StripItem {
 /// precisely so this fallback is a decision made here rather than a lie
 /// made upstream.
 fn page_label(tab: &TabInfo) -> (String, bool) {
+    // A tab that has been nowhere is a NEW CHAT, whatever CEF committed
+    // for it — and CEF titles a blank page "about:blank", so this comes
+    // BEFORE the title (CL1, operator: *"lets stop calling it about:blank
+    // and just have it be new chat"*). Same predicate the launcher uses.
+    if is_blank_page(tab) {
+        return (NEW_TAB_LABEL.to_string(), true);
+    }
     if let Some(t) = tab.title.as_deref().filter(|t| !t.trim().is_empty()) {
         return (t.to_string(), false);
     }
@@ -253,7 +260,8 @@ fn page_label(tab: &TabInfo) -> (String, bool) {
         if !typed.is_empty() {
             return (typed, false);
         }
-        // `about:blank` has no typing form, and it IS where the tab is.
+        // `about:blank` with a history behind it has no typing form, and
+        // it IS where the tab is.
         return (url.to_string(), false);
     }
     (NEW_TAB_LABEL.to_string(), true)
@@ -623,16 +631,19 @@ pub fn active_is_blank_page(snapshot: &TabsSnapshot) -> bool {
     let Some(active) = snapshot.active.as_deref() else {
         return false;
     };
-    snapshot.tabs.iter().any(|t| {
-        t.id == active
-            && matches!(t.content, TabContent::Page)
-            && t.pending.is_none()
-            && match t.url.as_deref() {
-                None => t.history_len == 0,
-                Some("about:blank") => t.history_len <= 1,
-                Some(_) => false,
-            }
-    })
+    snapshot.tabs.iter().any(|t| t.id == active && is_blank_page(t))
+}
+
+/// Whether ONE page tab has never been anywhere — the rule above, asked
+/// about any tab (CL1 asks it per column; the label asks it per row).
+pub fn is_blank_page(t: &TabInfo) -> bool {
+    matches!(t.content, TabContent::Page)
+        && t.pending.is_none()
+        && match t.url.as_deref() {
+            None => t.history_len == 0,
+            Some("about:blank") => t.history_len <= 1,
+            Some(_) => false,
+        }
 }
 
 /// Where a tab sits: which group holds it, and its index inside that
@@ -849,7 +860,14 @@ mod tests {
                 page("a", Some("https://www.github.com/eave"), Some("eave")),
                 page("b", Some("https://www.github.com/eave"), None),
                 page("c", None, None),
-                page("d", Some("about:blank"), None),
+                // CEF titles a blank page "about:blank"; still a New Chat.
+                page("d", Some("about:blank"), Some("about:blank")),
+                // Navigated BACK onto about:blank: two entries, not blank.
+                {
+                    let mut e = page("e", Some("about:blank"), None);
+                    e.history_len = 2;
+                    e
+                },
             ],
             Some("a"),
         );
@@ -866,6 +884,9 @@ mod tests {
             vec![
                 ("eave", false),
                 ("github.com/eave", false),
+                (NEW_TAB_LABEL, true),
+                // CEF's committed about:blank with one entry is still a
+                // tab that has been nowhere: a New Chat (CL1's ruling).
                 (NEW_TAB_LABEL, true),
                 ("about:blank", false),
             ]

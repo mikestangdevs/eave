@@ -22786,3 +22786,511 @@ fn the_split_control_puts_the_popup_beside_the_page_that_opened_it(cx: &mut Test
     // The opener keeps its side: nothing the operator was reading moves.
     assert_eq!(splits[0].panes, ["p1", "p2"]);
 }
+// ── Slice CL1 — Columns mode ─────────────────────────────────────────
+
+/// A selector built at runtime, for the `&'static str` the harness
+/// helpers take. Leaked on purpose: a test process is short.
+fn sel(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Let the strip's glide land (`columns::STRIP_GLIDE_MS`): the clock,
+/// then a frame to draw the settled position. `run_until_parked` alone
+/// does not help — the glide is a clock, not a task (the `settle` rule).
+fn settle_strip(vcx: &mut VisualTestContext) {
+    settle(vcx);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+}
+
+/// The strip's box, for the geometry assertions below.
+fn strip_bounds(vcx: &mut VisualTestContext) -> Bounds<Pixels> {
+    vcx.debug_bounds("column-strip").expect("column-strip")
+}
+
+/// Whether `inner` sits entirely inside `outer` on the x axis — "in view"
+/// for a column, since the strip clips horizontally and `debug_bounds`
+/// cannot see clipping (the AG2 #10 finding).
+fn within_x(inner: Bounds<Pixels>, outer: Bounds<Pixels>) -> bool {
+    inner.origin.x >= outer.origin.x
+        && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + px(0.5)
+}
+
+/// Six plain sessions, every one with a tab, the first selected.
+fn six_sessions(h: &Harness, vcx: &mut VisualTestContext) -> Vec<String> {
+    let ids: Vec<String> = ["aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555", "ffff6666"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let infos: Vec<SessionInfo> = ids.iter().map(|id| session(id)).collect();
+    rail_and_strip(h, vcx, infos, &ids[0]);
+    ids
+}
+
+/// The segmented control is at the top of the content area in BOTH
+/// layouts, and the toggle swaps the well for the strip and back.
+#[gpui::test]
+fn the_layout_bar_toggles_between_focus_and_columns(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    assert!(shown(vcx, "layout-minimize"), "Focus's header carries the minimize glyph");
+    assert!(shown(vcx, "content-well"), "Focus is the well as built");
+    assert!(!shown(vcx, "column-strip"));
+
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "column-strip"), "Columns replaces the well with the strip");
+    assert!(!shown(vcx, "content-well"));
+    assert!(shown(vcx, "column-aaaa1111"), "every open row is a column");
+    assert!(shown(vcx, "column-bbbb2222"));
+    // The selected chat's column is the well's own chrome: the composer
+    // lives in it, and only in it.
+    let composer = vcx.debug_bounds("composer-card").expect("composer-card");
+    let a = vcx.debug_bounds("column-aaaa1111").expect("column-aaaa1111");
+    assert!(
+        within_x(composer, a),
+        "the composer must sit in the selected column: composer {composer:?}, column {a:?}"
+    );
+    // No mode control in Columns but a column's ⛶: the way back.
+    assert!(!shown(vcx, "layout-minimize"), "the strip draws no minimize");
+    click(vcx, "column-max-aaaa1111");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "content-well"), "Focus is lossless: the well comes back");
+    assert!(!shown(vcx, "column-strip"));
+}
+
+/// **Every OPEN row gets a column, in sidebar order, collapsed or not.**
+/// PAGES first, then each task's chats, its `changes` row and its docked
+/// pages; a collapsed task's rows are still open and keep their columns;
+/// a closed tab loses its column.
+#[gpui::test]
+fn every_open_row_is_a_column_in_sidebar_order_even_under_a_collapsed_task(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.checkout_root = Some("/w/eave".into());
+    let mut b = session("bbbb2222");
+    b.checkout_root = Some("/w/eave".into());
+    let mut z = session("cccc3333");
+    z.checkout_root = Some("/w/zed".into());
+    rail_with_selected(&h, vcx, vec![a, b, z], "aaaa1111");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            session_tab("aaaa1111"),
+            session_tab("bbbb2222"),
+            session_tab("cccc3333"),
+        ],
+        Some("aaaa1111"),
+    );
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+
+    let x = |vcx: &mut VisualTestContext, sel: &'static str| {
+        vcx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} has no column"))
+            .origin
+            .x
+    };
+    let p1 = x(vcx, "column-p1");
+    let ca = x(vcx, "column-aaaa1111");
+    let cb = x(vcx, "column-bbbb2222");
+    let de = x(vcx, "column-diff-/w/eave");
+    let cz = x(vcx, "column-cccc3333");
+    let dz = x(vcx, "column-diff-/w/zed");
+    assert!(
+        p1 < ca && ca < cb && cb < de && de < cz && cz < dz,
+        "column order must be the sidebar's: p1={p1:?} a={ca:?} b={cb:?} diff-eave={de:?} z={cz:?} diff-zed={dz:?}"
+    );
+    // The selected session's task diff draws its scan once its column is
+    // mounted (select b, the row beside it); the other task's states why
+    // it cannot — the files subscription is the selection's.
+    h.plumbing.push_feed(FeedEvent::Session { id: "bbbb2222".into() });
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            session_tab("aaaa1111"),
+            session_tab("bbbb2222"),
+            session_tab("cccc3333"),
+        ],
+        Some("bbbb2222"),
+    );
+    settle_strip(vcx);
+    assert!(shown(vcx, "diff-tool"), "the selected task's changes column draws the files face");
+    assert!(
+        shown(vcx, "column-diff-/w/zed") && !shown(vcx, "column-body-diff-/w/zed")
+            || shown(vcx, "column-note-diff-/w/zed"),
+        "the other task's changes column is an empty slot or states it cannot scan"
+    );
+
+    // Collapse the /w/eave project. Its rows leave the rail and KEEP
+    // their columns: open ≠ visible.
+    click(vcx, "rail-group-/w/eave");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "rail-bbbb2222"), "the collapse must hide the row (precondition)");
+    assert!(shown(vcx, "column-bbbb2222"), "a collapsed task's chat is still open and keeps its column");
+    assert!(shown(vcx, "column-diff-/w/eave"), "a collapsed task's changes row keeps its column");
+
+    // Close b: its column goes.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            session_tab("aaaa1111"),
+            session_tab("cccc3333"),
+        ],
+        Some("aaaa1111"),
+    );
+    assert!(!shown(vcx, "column-bbbb2222"), "a closed tab has no column");
+    assert!(shown(vcx, "column-cccc3333"));
+}
+
+/// Selecting a row scrolls its column into view — minimally — and an
+/// operator scroll selects the column under the centre. One selection,
+/// both directions.
+#[gpui::test]
+fn selection_and_scroll_are_one_fact_in_both_directions(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let ids = six_sessions(&h, vcx);
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    let strip = strip_bounds(vcx);
+    let last = format!("column-{}", ids[5]);
+    let last_col = vcx.debug_bounds(sel(last.clone())).expect("last column");
+    assert!(
+        !within_x(last_col, strip),
+        "precondition: six columns of 560 px do not fit a {:?} px strip",
+        strip.size.width
+    );
+    let _ = h.drain();
+
+    // Select the last row, the way the rail does.
+    let tabs: Vec<TabInfo> = ids.iter().map(|id| session_tab(id)).collect();
+    h.plumbing.push_feed(FeedEvent::Session { id: ids[5].clone() });
+    strip_tabs(&h, vcx, tabs.clone(), Some(&ids[5]));
+    // Mid-glide the column is still on its way — and mounted already.
+    assert!(
+        shown(vcx, sel(format!("column-body-{}", ids[5]))),
+        "the destination column is mounted before the glide lands"
+    );
+    settle_strip(vcx);
+    let last_col = vcx.debug_bounds(sel(last.clone())).expect("last column");
+    assert!(
+        within_x(last_col, strip),
+        "selecting the last row must scroll its column into view: {last_col:?} in {strip:?}"
+    );
+    let scroll_after_select = h
+        .window
+        .read_with(vcx, |shell, _| shell.columns_scroll.get())
+        .unwrap();
+    assert!(scroll_after_select > 0.0);
+    // Minimal: the first column is now off the left, the last one's right
+    // edge meets the strip's.
+    let right_gap = (strip.origin.x + strip.size.width) - (last_col.origin.x + last_col.size.width);
+    assert!(
+        right_gap.abs() < px(1.0),
+        "the move must be the least that shows the column whole (gap {right_gap:?})"
+    );
+    // A repaint does not move it again (the edge), and nothing got
+    // selected by the move (no re-derivation from a selection-driven scroll).
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let again = h
+        .window
+        .read_with(vcx, |shell, _| shell.columns_scroll.get())
+        .unwrap();
+    assert_eq!(again, scroll_after_select, "the paint must not keep scrolling");
+    // The one `Select` allowed is the strip reconcile's own ask for the
+    // row that was just activated (C5's edge) — never another column's.
+    let drained = h.drain();
+    assert!(
+        !drained
+            .iter()
+            .any(|c| matches!(c, Command::Select(id) if id != &ids[5])),
+        "a selection-driven scroll must not itself select: {drained:?}"
+    );
+
+    // The other direction: a horizontal wheel over a chat column's HEAD
+    // (never a page surface) walks the strip back to the start, and the
+    // column under the centre becomes the selection.
+    // Over the column's address row — no page surface there — though
+    // the capture-phase wheel takes the gesture over a page too.
+    let head = {
+        let mut b = vcx
+            .debug_bounds(sel(format!("column-{}", ids[5])))
+            .expect("column slot");
+        b.size.height = px(40.);
+        b
+    };
+    vcx.simulate_event(gpui::ScrollWheelEvent {
+        position: head.center(),
+        delta: gpui::ScrollDelta::Pixels(point(px(4000.), px(3.))),
+        modifiers: Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    let scroll = h
+        .window
+        .read_with(vcx, |shell, _| shell.columns_scroll.get())
+        .unwrap();
+    assert_eq!(scroll, 0.0, "a horizontal wheel must scroll the strip (clamped at 0)");
+    let asked: Vec<String> = h
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::Select(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![ids[0].clone()],
+        "scrolling to the start must select the column under the centre, once"
+    );
+
+    // A vertical-dominant wheel with a little drift is a transcript
+    // scroll, not a strip scroll.
+    vcx.simulate_event(gpui::ScrollWheelEvent {
+        position: head.center(),
+        delta: gpui::ScrollDelta::Pixels(point(px(-3.), px(-40.))),
+        modifiers: Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    let scroll = h
+        .window
+        .read_with(vcx, |shell, _| shell.columns_scroll.get())
+        .unwrap();
+    assert_eq!(scroll, 0.0, "a vertical-dominant gesture must not walk the strip");
+}
+
+/// Only the columns in the viewport and one either side are laid out;
+/// the rest are empty slots that keep their width, so every neighbour's
+/// position is exact.
+#[gpui::test]
+fn only_the_viewport_and_its_neighbours_are_mounted(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let ids = six_sessions(&h, vcx);
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    let strip = strip_bounds(vcx);
+    let view_w = f32::from(strip.size.width);
+    let mounted = crate::columns::mounted_range(0.0, view_w, ids.len());
+    assert!(
+        mounted.end < ids.len(),
+        "precondition: a {view_w} px strip must not mount all six columns"
+    );
+    for (ix, id) in ids.iter().enumerate() {
+        let slot = format!("column-{id}");
+        let body = format!("column-body-{id}");
+        assert!(shown(vcx, sel(slot.clone())), "every column has a slot ({slot})");
+        let has_body = shown(vcx, sel(body.clone()));
+        assert_eq!(
+            has_body,
+            mounted.contains(&ix),
+            "column {ix} mounted={has_body}, expected {}",
+            mounted.contains(&ix)
+        );
+    }
+    let first = vcx.debug_bounds(sel(format!("column-{}", ids[0]))).unwrap();
+    let last = vcx.debug_bounds(sel(format!("column-{}", ids[5]))).unwrap();
+    assert_eq!(
+        f32::from(last.origin.x - first.origin.x),
+        crate::columns::column_left(5),
+        "an unmounted slot keeps its width"
+    );
+}
+
+/// A mounted chat column that is not the selection shows ITS session's
+/// transcript through a column feed, folded separately from the shell's
+/// transcript; the feeds are asked for and released with the layout.
+#[gpui::test]
+fn a_column_feed_shows_another_sessions_transcript_and_never_the_shells(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    let _ = h.drain();
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    let subs: Vec<String> = h
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::ColumnSubscribe(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        subs,
+        vec!["aaaa1111".to_string(), "bbbb2222".to_string()],
+        "every mounted chat column asks for its feed (the selected one too)"
+    );
+    assert!(shown(vcx, "column-feed-bbbb2222"), "the unselected chat column draws its feed");
+    assert!(
+        shown(vcx, "column-note-bbbb2222"),
+        "an empty feed says so"
+    );
+    h.plumbing.push_feed(FeedEvent::ColumnRecords {
+        id: "bbbb2222".into(),
+        epoch: 1,
+        records: vec![user_record(1, "hello from b")],
+    });
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "column-note-bbbb2222"),
+        "a fed column has rows and drops its note"
+    );
+    let (shell_rows, feed_rows) = h
+        .window
+        .read_with(vcx, |shell, cx| {
+            let shell_rows = shell.transcript.read(cx).display.len();
+            let feed_rows = shell
+                .columns
+                .read(cx)
+                .feed("bbbb2222")
+                .map(|f| f.read(cx).display.len())
+                .unwrap_or(0);
+            (shell_rows, feed_rows)
+        })
+        .unwrap();
+    assert_eq!(shell_rows, 0, "b's frames must never fold into the shell's transcript");
+    assert!(feed_rows > 0, "b's frames fold into b's feed");
+
+    // Back to Focus releases every feed.
+    click(vcx, "column-max-aaaa1111");
+    vcx.run_until_parked();
+    let mut released: Vec<String> = h
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::ColumnUnsubscribe(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    released.sort();
+    assert_eq!(released, vec!["aaaa1111".to_string(), "bbbb2222".to_string()]);
+}
+
+/// ⛶ enters Focus on that row; the toggle returns to Columns at the
+/// same scroll. Lossless both ways.
+#[gpui::test]
+fn maximize_enters_focus_on_the_row_and_the_toggle_returns_to_the_same_scroll(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let ids = six_sessions(&h, vcx);
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    let tabs: Vec<TabInfo> = ids.iter().map(|id| session_tab(id)).collect();
+    h.plumbing.push_feed(FeedEvent::Session { id: ids[4].clone() });
+    strip_tabs(&h, vcx, tabs, Some(&ids[4]));
+    settle_strip(vcx);
+    let scroll = h
+        .window
+        .read_with(vcx, |shell, _| shell.columns_scroll.get())
+        .unwrap();
+    assert!(scroll > 0.0, "precondition: the fifth column needed a scroll");
+    let _ = h.drain();
+
+    click(vcx, sel(format!("column-max-{}", ids[4])));
+    vcx.run_until_parked();
+    assert!(shown(vcx, "content-well"), "⛶ switches to Focus");
+    assert!(
+        h.drain().iter().any(|c| matches!(c, Command::Select(id) if id == &ids[4])),
+        "⛶ selects that row"
+    );
+
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    let back = h
+        .window
+        .read_with(vcx, |shell, _| shell.columns_scroll.get())
+        .unwrap();
+    assert_eq!(back, scroll, "returning to Columns lands at the same scroll");
+}
+
+/// ⌘⇧] / ⌘⇧[ step one column along the sidebar order and clamp at the ends.
+#[gpui::test]
+fn the_bracket_chords_step_one_column_and_clamp(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_and_strip(
+        &h,
+        vcx,
+        vec![session("aaaa1111"), session("bbbb2222"), session("cccc3333")],
+        "aaaa1111",
+    );
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-shift-]");
+    vcx.run_until_parked();
+    let asked: Vec<String> = h
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::Select(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked, vec!["bbbb2222".to_string()], "⌘⇧] asks for the next column");
+    vcx.simulate_keystrokes("cmd-shift-[");
+    vcx.run_until_parked();
+    assert!(
+        !h.drain().iter().any(|c| matches!(c, Command::Select(_))),
+        "⌘⇧[ at the first column clamps"
+    );
+    // And in Focus the same chord walks the same order.
+    click(vcx, "column-max-aaaa1111");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    vcx.simulate_keystrokes("cmd-shift-]");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().iter().any(|c| matches!(c, Command::Select(id) if id == "bbbb2222")),
+        "the chord means the same thing in Focus"
+    );
+}
+
+/// Dragging a PAGE row from the sidebar onto the strip reorders it — the
+/// engine's `TabMove`, never a split — and a chat dropped there does
+/// nothing, because a chat's place is the rail's order.
+#[gpui::test]
+fn dropping_a_page_on_the_strip_is_a_reorder_not_a_split(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ],
+        Some("p1"),
+    );
+    click(vcx, "layout-minimize");
+    vcx.run_until_parked();
+    let _ = h.drain();
+    let from = vcx.debug_bounds("tab-p3").expect("tab-p3");
+    let c1 = vcx.debug_bounds("column-p1").expect("column-p1");
+    let c2 = vcx.debug_bounds("column-p2").expect("column-p2");
+    // The gap between the first and second columns.
+    let gap = point((c1.origin.x + c1.size.width + c2.origin.x) / 2.0, c1.center().y);
+    vcx.simulate_mouse_down(from.center(), MouseButton::Left, Modifiers::none());
+    let mut mid = from.center();
+    mid.y += px(8.);
+    vcx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_mouse_move(gap, Some(MouseButton::Left), Modifiers::none());
+    vcx.simulate_mouse_up(gap, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    let cmds = h.drain();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Command::Browser(BrowserCmd::MoveTab { tab_id, group: None, index: 1 }) if tab_id == "p3"
+        )),
+        "a page dropped in the first gap moves before p2: {cmds:?}"
+    );
+    assert!(!shown(vcx, "split-well"), "a strip drop is never a split");
+}

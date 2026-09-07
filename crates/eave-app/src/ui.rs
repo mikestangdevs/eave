@@ -51,6 +51,7 @@ use crate::access::{self, RuntimeMode};
 use crate::tuning_ui;
 use crate::attach::{self, StagedFile};
 use crate::bookmarks;
+use crate::columns::{self, ColumnId, LayoutMode, LayoutPrefs};
 use crate::composer;
 use crate::display::{DisplayList, RowId};
 use crate::edge_fade::edge_faded;
@@ -128,6 +129,12 @@ actions!(
         /// Slice C5 — ctrl-tab / ctrl-shift-tab.
         NextTab,
         PrevTab,
+        /// Slice CL1 — ⌘⇧[ / ⌘⇧]: one column along the strip. In Focus the
+        /// same step walks the sidebar order, so the chord means one
+        /// thing in both layouts. Clamps, never wraps — see
+        /// [`crate::columns::step`].
+        ColumnPrev,
+        ColumnNext,
         /// Slice C5 — ⌘W. Closes the active TAB, and the WINDOW when there
         /// is no tab to close.
         CloseTab,
@@ -265,6 +272,19 @@ enum FeedEvent {
         epoch: u64,
         records: Vec<eave_core::journal::Record>,
     },
+    /// Slice CL1 — a column subscription's frames. Tagged with the
+    /// session and routed to that session's column feed
+    /// ([`ColumnFeeds`]), never to the shell's transcript: the two are
+    /// different subscriptions to the same journal and must not fold
+    /// into one state.
+    ColumnReset {
+        id: String,
+    },
+    ColumnRecords {
+        id: String,
+        epoch: u64,
+        records: Vec<eave_core::journal::Record>,
+    },
 }
 
 /// One drained attention burst; last frame wins (the overlay is a current-
@@ -353,6 +373,14 @@ enum Command {
     /// Rail row click: subscribe this session instead (cursorless — the
     /// UI holds no projection for it; full replay, never merge).
     Select(String),
+    /// Slice CL1 — open a SECOND, read-only subscription to a session so
+    /// a column can show its transcript while another session is
+    /// selected. The selected session's own subscription is untouched;
+    /// these ride beside it, one task each, and are released by
+    /// `ColumnUnsubscribe`. Serviced in both loops: a column strip is on
+    /// screen at the launcher too.
+    ColumnSubscribe(String),
+    ColumnUnsubscribe(String),
     /// Rail "+ new": go to the launcher (Slice Q2). This used to open a
     /// session immediately with the engine's defaults; it now deselects
     /// and lets you choose an agent, which is the whole point of having a
@@ -587,6 +615,14 @@ enum BrowserCmd {
     BookmarkMove {
         bookmark_id: String,
         parent: Option<String>,
+        index: usize,
+    },
+    /// Slice CL1 — a drop on the column strip is a REORDER of the sidebar
+    /// (ID2b′ spec §5's `TabMove`), never a split. `group: None` is the
+    /// top level (PAGES); an index is among that container's slots.
+    MoveTab {
+        tab_id: String,
+        group: Option<String>,
         index: usize,
     },
     BookmarkRename {
@@ -876,6 +912,19 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 })
                 .await;
         }
+        BrowserCmd::MoveTab {
+            tab_id,
+            group,
+            index,
+        } => {
+            let _ = client
+                .browser_do(eave_wire::Request::TabMove {
+                    tab_id,
+                    group,
+                    index,
+                })
+                .await;
+        }
         BrowserCmd::BookmarkRename { bookmark_id, title } => {
             let _ = client
                 .browser_do(eave_wire::Request::BookmarkRename { bookmark_id, title })
@@ -1067,6 +1116,10 @@ async fn feed_loop(
     // both labels, because it is an operator preference — it must survive
     // a session switch and a reconnect, not be reset by them.
     let mut files_scope = FileScope::WorkingTree;
+    // Slice CL1: the sessions whose column feeds the UI wants open. Above
+    // both labels like `files_scope`, and for the same reason: a
+    // reconnect must reopen them, not forget them.
+    let mut column_wants: HashSet<String> = HashSet::new();
     'conn: loop {
         plumbing.push_conn(if attempt == 0 {
             ConnEvent::Connecting
@@ -1370,6 +1423,19 @@ async fn feed_loop(
         plumbing.push_conn(ConnEvent::Connected {
             engine_pid: client.engine.pid,
         });
+        // Slice CL1: the column feeds, one task each, reopened on every
+        // connection from what the UI last asked for. No cursor: a
+        // reopen is a full replay, exactly as the shell's own switch is,
+        // and the column's `ColumnReset` folds it.
+        let mut column_subs: HashMap<String, ColumnSub> = HashMap::new();
+        for sid in column_wants.iter() {
+            match column_subscribe(&client, &plumbing, sid).await {
+                Some(sub) => {
+                    column_subs.insert(sid.clone(), sub);
+                }
+                None => continue 'conn,
+            }
+        }
 
         'session: loop {
             // Validate the held selection against the engine's set; a
@@ -1487,6 +1553,26 @@ async fn feed_loop(
                                 at_launcher = false;
                                 selected = Some(id);
                                 continue 'session;
+                            }
+                            // Slice CL1. Serviced HERE as well as in the
+                            // session loop, Rename's rule: the strip is
+                            // on screen at the launcher too.
+                            Some(Command::ColumnSubscribe(sid)) => {
+                                column_wants.insert(sid.clone());
+                                if !column_subs.contains_key(&sid) {
+                                    match column_subscribe(&client, &plumbing, &sid).await {
+                                        Some(sub) => {
+                                            column_subs.insert(sid, sub);
+                                        }
+                                        None => continue 'conn,
+                                    }
+                                }
+                            }
+                            Some(Command::ColumnUnsubscribe(sid)) => {
+                                column_wants.remove(&sid);
+                                if let Some(sub) = column_subs.remove(&sid) {
+                                    column_release(&client, sub).await;
+                                }
                             }
                             // Already here.
                             Some(Command::NewSession) => {}
@@ -1905,6 +1991,24 @@ async fn feed_loop(
                         // (`Shell::launch_at_boot`); `+ new` is the way in,
                         // and it is the arm directly above.
                         Some(Command::Launch { .. }) => {}
+                        // Slice CL1 — see the launcher loop's arms.
+                        Some(Command::ColumnSubscribe(sid)) => {
+                            column_wants.insert(sid.clone());
+                            if !column_subs.contains_key(&sid) {
+                                match column_subscribe(&client, &plumbing, &sid).await {
+                                    Some(sub) => {
+                                        column_subs.insert(sid, sub);
+                                    }
+                                    None => break StreamEnd::Conn,
+                                }
+                            }
+                        }
+                        Some(Command::ColumnUnsubscribe(sid)) => {
+                            column_wants.remove(&sid);
+                            if let Some(sub) = column_subs.remove(&sid) {
+                                column_release(&client, sub).await;
+                            }
+                        }
                         None => break StreamEnd::Quit, // UI gone
                     },
                 }
@@ -1928,6 +2032,53 @@ async fn feed_loop(
             }
         }
     }
+}
+
+/// Slice CL1 — one column feed: the subscription's request id (for
+/// `unsubscribe`) and the task forwarding its frames to the feed queue.
+struct ColumnSub {
+    sub_id: u64,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Open a column feed on `sid`. `None` = the transport is gone (the
+/// caller reconnects). The task ends when the engine closes the stream
+/// or [`column_release`] aborts it; either way the column's last state
+/// stands until the next `ColumnReset`.
+async fn column_subscribe(client: &Arc<Client>, plumbing: &Plumbing, sid: &str) -> Option<ColumnSub> {
+    let (sub_id, mut rx) = client.subscribe_with_id(sid, None).await.ok()?;
+    let plumbing = plumbing.clone();
+    let task = tokio::spawn(async move {
+        while let Some(item) = rx.recv().await {
+            match item {
+                SubscriptionItem::Reset { session_id, .. } => {
+                    plumbing.push_feed(FeedEvent::ColumnReset { id: session_id });
+                }
+                SubscriptionItem::Events {
+                    session_id,
+                    epoch,
+                    records,
+                } => {
+                    plumbing.push_feed(FeedEvent::ColumnRecords {
+                        id: session_id,
+                        epoch,
+                        records,
+                    });
+                }
+                // Attention rides the shell's own subscription; a column
+                // is a read-only view and raises nothing.
+                _ => {}
+            }
+        }
+    });
+    Some(ColumnSub { sub_id, task })
+}
+
+/// Close a column feed engine-side (Slice I1's rule: a dropped receiver
+/// alone leaves the engine streaming into nothing).
+async fn column_release(client: &Arc<Client>, sub: ColumnSub) {
+    sub.task.abort();
+    let _ = client.unsubscribe(sub.sub_id).await;
 }
 
 /// Replay feed: drive the UI from a captured wire fixture instead of a
@@ -5592,6 +5743,142 @@ items={count} rows={} frames={} ops={}",
     }
 }
 
+/// Slice CL1 — **the read-only transcripts behind the column strip.**
+///
+/// One [`TranscriptState`] per session a mounted column shows, fed by
+/// its own engine subscription (`Command::ColumnSubscribe`) and folded
+/// through the same `apply_records` the shell's transcript uses, so a
+/// column's rows, folds, veil and scroll anchor are decided by exactly
+/// the code that decides them in the well — including `assert_scroll`,
+/// which therefore runs PER COLUMN. What a column feed does NOT carry:
+/// the composer, the approval buttons' command channel, the rewind and
+/// restore mailboxes, the turn rail. Those are the selected session's,
+/// and the selected column renders the shell's transcript, not a feed.
+///
+/// App-wide (one entity, in `ShellDeps`) rather than per shell: a
+/// session's column in two windows is one subscription, and the strip's
+/// wants are unioned across windows before the engine is asked. The
+/// entities OUTLIVE their subscriptions: a column scrolled past the ±1
+/// mount window is unsubscribed (it does no work) but keeps its
+/// `ListState`, so scrolling back finds the list where it was and the
+/// reopen's replay lands on it. Pruned in the tabs observer against the
+/// sessions that still have a tab anywhere.
+struct ColumnFeeds {
+    feeds: HashMap<String, Entity<TranscriptState>>,
+    /// What each window's mounted columns want, by window key.
+    wants: HashMap<eave_wire::WindowId, HashSet<String>>,
+    /// What the engine has been asked for — the union of `wants` as of
+    /// the last reconcile. The edge: the loop is told about CHANGES.
+    subscribed: HashSet<String>,
+    commands: tokio_mpsc::UnboundedSender<Command>,
+}
+
+impl ColumnFeeds {
+    fn new(commands: tokio_mpsc::UnboundedSender<Command>) -> Self {
+        Self {
+            feeds: HashMap::new(),
+            wants: HashMap::new(),
+            subscribed: HashSet::new(),
+            commands,
+        }
+    }
+
+    fn feed(&self, session_id: &str) -> Option<Entity<TranscriptState>> {
+        self.feeds.get(session_id).cloned()
+    }
+
+    /// A window states the sessions its mounted columns show. Nothing
+    /// is sent unless the union across windows changed.
+    fn set_wants(&mut self, window: &str, wanted: HashSet<String>, cx: &mut Context<Self>) {
+        let before = self.wants.get(window).cloned().unwrap_or_default();
+        if before == wanted {
+            return;
+        }
+        if wanted.is_empty() {
+            self.wants.remove(window);
+        } else {
+            self.wants.insert(window.to_string(), wanted);
+        }
+        self.reconcile(cx);
+    }
+
+    fn reconcile(&mut self, cx: &mut Context<Self>) {
+        let union: HashSet<String> = self.wants.values().flatten().cloned().collect();
+        let mut opened: Vec<String> = union.difference(&self.subscribed).cloned().collect();
+        let mut closed: Vec<String> = self.subscribed.difference(&union).cloned().collect();
+        // Deterministic order for the harness's drained commands.
+        opened.sort();
+        closed.sort();
+        for sid in opened {
+            self.feeds.entry(sid.clone()).or_insert_with(|| {
+                cx.new(|_| {
+                    let mut t = TranscriptState::new();
+                    t.session_id = Some(sid.clone());
+                    t
+                })
+            });
+            let _ = self.commands.send(Command::ColumnSubscribe(sid));
+        }
+        for sid in closed {
+            let _ = self.commands.send(Command::ColumnUnsubscribe(sid));
+        }
+        self.subscribed = union;
+    }
+
+    /// Drop the feeds of sessions no tab holds any more. A subscribed
+    /// feed is never dropped here — its window will stop wanting it on
+    /// the next paint, which is the release that reaches the engine.
+    fn prune(&mut self, live: &HashSet<String>) {
+        let subscribed = &self.subscribed;
+        self.feeds
+            .retain(|sid, _| live.contains(sid) || subscribed.contains(sid));
+    }
+
+    /// Fold a burst of column frames, each into its own session's feed.
+    /// A frame for a session with no feed is a straggler from a released
+    /// subscription and is dropped, the same rule the shell's transcript
+    /// applies to frames tagged with another session.
+    fn fold(&mut self, events: Vec<FeedEvent>, cx: &mut Context<Self>) {
+        for ev in events {
+            match ev {
+                FeedEvent::ColumnReset { id } => {
+                    if let Some(feed) = self.feeds.get(&id) {
+                        feed.update(cx, |state, cx| {
+                            state.reset();
+                            state.scroll = ScrollMode::Follow;
+                            state.assert_scroll();
+                            cx.notify();
+                        });
+                    }
+                }
+                FeedEvent::ColumnRecords { id, epoch, records } => {
+                    let Some(feed) = self.feeds.get(&id).cloned() else {
+                        continue;
+                    };
+                    let healed = feed.update(cx, |state, cx| {
+                        state.session_id = Some(id.clone());
+                        state.rows_session = Some(id.clone());
+                        let ok = state.apply_records(epoch, &records).is_ok();
+                        if !ok {
+                            // Out of sequence: the same heal the shell's
+                            // transcript performs — drop local state and
+                            // ask for the stream again.
+                            state.reset();
+                        }
+                        cx.notify();
+                        ok
+                    });
+                    if !healed {
+                        let _ = self.commands.send(Command::ColumnUnsubscribe(id.clone()));
+                        let _ = self.commands.send(Command::ColumnSubscribe(id));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// One follow-up the operator wrote while the agent could not take it.
 ///
 /// **Slice AG1 #7.** Before this, `send_current` wrote every message
@@ -6394,6 +6681,227 @@ impl Split {
         self.shares[ix] = a;
         self.shares[ix + 1] = total - a;
         true
+    }
+}
+
+/// Slice CL1 — the strip's geometry for one frame, decided once in
+/// `Shell::columns_geometry` and read by `set_shown_pages` and the paint.
+struct ColumnsPaint {
+    order: Vec<ColumnId>,
+    /// The selected column's index in `order`, if its row has a column.
+    selected: Option<usize>,
+    /// The target — what is persisted and what the edge reasons about.
+    scroll: f32,
+    /// Where the row is drawn this frame (mid-glide it trails `scroll`).
+    shown: f32,
+    view_w: f32,
+    #[allow(dead_code)]
+    rail: f32,
+    /// Columns intersecting the viewport: where pages composite.
+    visible: std::ops::Range<usize>,
+    /// Visible ±1: what is laid out and painted.
+    mounted: std::ops::Range<usize>,
+}
+
+/// Slice CL1 — the well's own chrome, handed to the strip so the
+/// SELECTED column can mount exactly what the well would have: one
+/// transcript, one composer, one launcher. Every field is taken at most
+/// once, because only one column is selected.
+struct WellChrome {
+    transcript_el: Option<AnyElement>,
+    composer: Option<AnyElement>,
+    notice: Option<AnyElement>,
+    trailer: Option<AnyElement>,
+    slash: Option<AnyElement>,
+    empty_state: Option<EmptyState>,
+    launcher_el: Option<AnyElement>,
+    omnibox_el: Option<AnyElement>,
+    page_dialog_el: Option<AnyElement>,
+    toast_el: Option<AnyElement>,
+}
+
+
+/// What an UNSELECTED blank tab's column shows: the new-chat cluster's
+/// look — the logo and a resting plate with the composer's own words —
+/// without the composer, which is the selected column's. A click on the
+/// column selects it and the real launcher takes over (`column_el`).
+fn blank_column_cluster() -> AnyElement {
+    div()
+        .debug_selector(|| "column-new-chat".into())
+        .absolute()
+        .inset_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACE_6))
+        .child(empty_logo())
+        .child(
+            div()
+                .w_full()
+                .max_w(px(theme::CONTENT_MAX_W))
+                .px(px(theme::GUTTER))
+                .child(
+                    div()
+                        .w_full()
+                        .min_h(px(theme::BAR_HEIGHT))
+                        .px(px(theme::SPACE_3))
+                        .py(px(theme::SPACE_2))
+                        .rounded(px(composer::CARD_RADIUS))
+                        .border_1()
+                        .border_color(theme::bar_hairline())
+                        .bg(theme::bar_glass())
+                        .text_size(px(theme::BODY_SIZE))
+                        .text_color(theme::text_tertiary())
+                        .child(composer::PLACEHOLDER_EMPTY),
+                ),
+        )
+        .into_any_element()
+}
+
+/// A centred one-line note in a column body, wearing `column-note-<stem>`.
+fn column_note(text: &'static str, selector: String) -> AnyElement {
+    div()
+        .debug_selector(move || selector.clone())
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(theme::BODY_SIZE))
+        .text_color(theme::text_secondary())
+        .child(text)
+        .into_any_element()
+}
+
+/// Where a page dropped into gap `gap` of the strip goes, as the engine's
+/// `TabMove` names it: the container and index of the first page column
+/// at or after the gap (the dragged page lands BEFORE it), or the end of
+/// the top level when there is none. The engine detaches then places, so
+/// a neighbour the dragged page currently precedes in the same container
+/// is one slot nearer once it has moved.
+fn column_move_target(
+    order: &[ColumnId],
+    gap: usize,
+    snapshot: &eave_wire::TabsSnapshot,
+    dragged: &str,
+) -> Option<(Option<String>, usize)> {
+    let is_page = |id: &str| {
+        snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == id && t.content == eave_wire::TabContent::Page)
+    };
+    let neighbour = order
+        .iter()
+        .skip(gap)
+        .filter_map(ColumnId::tab)
+        .find(|id| *id != dragged && is_page(id));
+    let Some(neighbour) = neighbour else {
+        let top = snapshot
+            .order
+            .iter()
+            .filter(|slot| !matches!(slot, eave_wire::Slot::Tab { id } if id == dragged))
+            .count();
+        return Some((None, top));
+    };
+    let (group, ix) = strip::tab_slot(snapshot, neighbour)?;
+    let (own_group, own_ix) = strip::tab_slot(snapshot, dragged)?;
+    let ix = if own_group == group && own_ix < ix {
+        ix - 1
+    } else {
+        ix
+    };
+    Some((group, ix))
+}
+
+/// Slice CL1 — the strip's wheel, taken in the CAPTURE phase.
+///
+/// A page surface stops every wheel in the bubble phase (it is the page's
+/// scroll, or BR3's swipe-back), which on the first run made the strip
+/// unscrollable over the very columns that fill it. This element sits
+/// around the strip and hears the wheel FIRST: a horizontal-dominant
+/// delta the strip can spend moves the strip and goes no further; a
+/// delta at the strip's end, or a vertical one, falls through to whatever
+/// is under the pointer. So swipe-back still works — at the ends.
+struct ColumnWheel {
+    child: AnyElement,
+    shell: gpui::WeakEntity<Shell>,
+    can_left: bool,
+    can_right: bool,
+}
+
+impl Element for ColumnWheel {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Hitbox {
+        self.child.prepaint(window, cx);
+        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Hitbox,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+        let hitbox = hitbox.clone();
+        let shell = self.shell.clone();
+        let (can_left, can_right) = (self.can_left, self.can_right);
+        window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+            if phase != DispatchPhase::Capture || !hitbox.is_hovered(window) {
+                return;
+            }
+            let delta = ev.delta.pixel_delta(window.line_height());
+            let Some(d) = columns::strip_delta(f32::from(delta.x), f32::from(delta.y)) else {
+                return;
+            };
+            if (d > 0.0 && !can_right) || (d < 0.0 && !can_left) {
+                return;
+            }
+            let _ = shell.update(cx, |this, cx| this.wheel_columns(ev, window, cx));
+            cx.stop_propagation();
+        });
+    }
+}
+
+impl IntoElement for ColumnWheel {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
 
@@ -7275,6 +7783,46 @@ struct Shell {
     splits: Vec<Split>,
     /// The split-divider drag in progress, or `None`.
     split_drag: Option<SplitDrag>,
+    /// **Slice CL1 — the content area's layout.** Focus is the well as
+    /// built; Columns is the strip. Per window, saved in `frame.json`
+    /// under [`crate::columns::LAYOUT_KEY`] like the rail's collapse.
+    layout: crate::columns::LayoutMode,
+    /// The strip's scroll, in content pixels. A `Cell` because the PAINT
+    /// moves it to bring a newly selected column into view (the edge
+    /// below), under `&self` — the reason `tab_scrolled_to` is a
+    /// `RefCell`. The operator's wheel and the chords move it from
+    /// handlers. Saved with the mode; the paint only marks it dirty and
+    /// the observers write.
+    columns_scroll: Cell<f32>,
+    columns_scroll_dirty: Cell<bool>,
+    /// Which column the strip has already scrolled into view — the same
+    /// EDGE `tab_scrolled_to` keeps: the strip moves when the SELECTION
+    /// changes and not otherwise, so an operator scroll is never fought.
+    /// Deliberately left standing across a mode switch: back in Columns
+    /// with the same selection, the strip is where it was (lossless).
+    columns_scrolled_to: RefCell<Option<crate::columns::ColumnId>>,
+    /// The column the WHEEL selected, until the engine confirms it — the
+    /// paint holds the strip still meanwhile. See `columns_geometry`.
+    columns_asked: RefCell<Option<crate::columns::ColumnId>>,
+    /// Every open content row in sidebar order — INCLUDING the rows a
+    /// collapsed task or project hides — written by the rail's paint on
+    /// every pass beside `spine_walk`. What the strip's order is merged
+    /// from; see [`crate::columns::merge_order`].
+    column_walk: RefCell<Vec<crate::columns::ColumnId>>,
+    /// The strip's width at the last paint, for the wheel handler's
+    /// centre arithmetic. 0 until the first paint.
+    columns_view_w: Cell<f32>,
+    /// Where the strip is DRAWN this frame. Equal to `columns_scroll` at
+    /// rest; behind it while a programmatic move glides (260 ms,
+    /// `EASE_IN_OUT`). A wheel moves both at once — the trackpad is the
+    /// animation. The glide is `(started, from, to)`; a target that
+    /// changes mid-flight restarts it from wherever the strip is.
+    columns_shown: Cell<f32>,
+    columns_glide: Cell<Option<(Instant, f32, f32)>>,
+    /// The column feeds (app-wide; see [`ColumnFeeds`]).
+    columns: Entity<ColumnFeeds>,
+    /// Debounce for the scroll's save: a wheel burst is one decision.
+    layout_save_gen: Cell<u64>,
     /// The DevTools dock's share of its page well. One ratio for the app,
     /// not one per tab — the dock is a workbench the operator sizes once,
     /// which is how Chrome treats it too. Clamped like [`Split::ratio`].
@@ -8430,6 +8978,43 @@ fn save_splits(window: &str, splits: &[Split]) {
             }
         }
         Err(e) => eprintln!("eave: cannot serialise splits: {e}"),
+    }
+}
+
+/// Slice CL1 — this window's layout (mode and strip scroll) from
+/// `frame.json`, or the defaults.
+fn load_layout(window: &str) -> LayoutPrefs {
+    let Some(path) = frame_prefs_path() else {
+        return LayoutPrefs::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return LayoutPrefs::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return LayoutPrefs::default();
+    };
+    columns::layout_from(&v, window)
+}
+
+/// Write this window's layout back — the same merged read-modify-write
+/// `save_splits` does, keeping every other key and window.
+fn save_layout(window: &str, prefs: LayoutPrefs) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    columns::put_layout(&mut doc, window, prefs);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!("eave: cannot save layout to {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise layout: {e}"),
     }
 }
 
@@ -12478,6 +13063,13 @@ impl Shell {
     /// closing it is not a statement about tabs. That is also why ⌘W's
     /// fallback can close it safely on an empty strip.
     fn release_tabs_on_close(&self, cx: &mut App) {
+        // Slice CL1: a closing window's column feeds go with it — the
+        // union across windows is what the engine is asked for.
+        {
+            let key = self.window_key.clone();
+            self.columns
+                .update(cx, |feeds, cx| feeds.set_wants(&key, HashSet::new(), cx));
+        }
         if self.window_key == eave_wire::PRIMARY_WINDOW {
             return;
         }
@@ -12607,6 +13199,920 @@ impl Shell {
 
     fn persist_splits(&self) {
         save_splits(&self.window_key, &self.splits);
+    }
+
+    // ── Slice CL1 — Columns mode ──────────────────────────────────────
+
+    /// The strip's order: the sidebar's, as the rail's paint recorded it
+    /// (collapsed children included — open ≠ visible), merged with what
+    /// is live NOW. See [`columns::merge_order`].
+    fn column_order(&self, snapshot: &eave_wire::TabsSnapshot, cx: &App) -> Vec<ColumnId> {
+        let live_tabs = strip::cycle_order(snapshot);
+        // A task's `changes` row exists while a chat of that checkout is
+        // on the rail (`task_tool_rows`), so its column does too.
+        let live_roots: HashSet<String> = self
+            .sessions
+            .read(cx)
+            .sessions
+            .iter()
+            .filter(|s| !s.archived)
+            .filter_map(|s| s.checkout_root.clone())
+            .collect();
+        columns::merge_order(&self.column_walk.borrow(), &live_tabs, &live_roots)
+    }
+
+    /// The ONE selection, as a column: the frame's tool. A chat whose tab
+    /// the reconcile has not minted yet has no column yet either.
+    fn selected_column(&self, frame: &Frame, snapshot: &eave_wire::TabsSnapshot) -> Option<ColumnId> {
+        match &frame.view {
+            FrameView::Task {
+                tool: Tool::Diff { root },
+                ..
+            } => Some(ColumnId::Diff(root.clone())),
+            FrameView::Task {
+                tool: Tool::Chat { session_id },
+                ..
+            } => strip::tab_for_session(snapshot, session_id).map(ColumnId::Tab),
+            FrameView::Task {
+                tool: Tool::Page { tab },
+                ..
+            }
+            | FrameView::Browse { tab: Some(tab) } => Some(ColumnId::Tab(tab.clone())),
+            FrameView::Browse { tab: None } | FrameView::Empty => None,
+        }
+    }
+
+    /// Select a column — everything the sidebar row's click does, so the
+    /// strip and the rail cannot disagree about what selecting means.
+    fn activate_column(&mut self, col: &ColumnId, cx: &mut Context<Self>) {
+        match col {
+            ColumnId::Tab(id) => {
+                let snapshot = self.strip_snapshot(cx);
+                let session = snapshot.tabs.iter().find(|t| &t.id == id).and_then(|t| match &t.content {
+                    eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
+                    eave_wire::TabContent::Page => None,
+                });
+                match session {
+                    Some(sid) => self.select_session(&sid, cx),
+                    None => self.activate_tab(id, cx),
+                }
+            }
+            ColumnId::Diff(root) => self.show_diff_tool(root.clone(), cx),
+        }
+    }
+
+    /// The segmented control's click. Leaving Columns releases the
+    /// strip's feeds — the well shows one session — and keeps the scroll,
+    /// which is what makes the round trip lossless: back in Columns with
+    /// the same selection, the strip is exactly where it was.
+    fn set_layout(&mut self, mode: LayoutMode, cx: &mut Context<Self>) {
+        if self.layout == mode {
+            return;
+        }
+        self.layout = mode;
+        if !mode.is_columns() {
+            let key = self.window_key.clone();
+            self.columns
+                .update(cx, |feeds, cx| feeds.set_wants(&key, HashSet::new(), cx));
+        }
+        self.persist_layout();
+        cx.notify();
+    }
+
+    /// ⛶ on a column: that row, in Focus.
+    fn maximize_column(&mut self, col: &ColumnId, cx: &mut Context<Self>) {
+        self.activate_column(col, cx);
+        self.set_layout(LayoutMode::Focus, cx);
+    }
+
+    /// ⌘⇧[ / ⌘⇧] — one column along, in either layout. Clamps.
+    fn step_column(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let frame = self.frame_for(&snapshot, None, cx);
+        let order = self.column_order(&snapshot, cx);
+        let at = self
+            .selected_column(&frame, &snapshot)
+            .and_then(|c| order.iter().position(|o| *o == c));
+        if let Some(ix) = columns::step(order.len(), at, forward) {
+            let col = order[ix].clone();
+            self.activate_column(&col, cx);
+        }
+    }
+
+    fn persist_layout(&self) {
+        save_layout(
+            &self.window_key,
+            LayoutPrefs {
+                mode: self.layout,
+                scroll: self.columns_scroll.get(),
+            },
+        );
+        self.columns_scroll_dirty.set(false);
+    }
+
+    /// A scroll the PAINT moved (a selection came into view) is written
+    /// from the observers, never from the paint — the same bargain every
+    /// paint-written field on this shell keeps.
+    fn flush_layout_save(&self) {
+        if self.columns_scroll_dirty.get() {
+            self.persist_layout();
+        }
+    }
+
+    /// A wheel burst is one decision: saved once it has settled. `&self`,
+    /// because the paint arms it too (`columns_geometry`) — a deferred
+    /// task is not a write from the render path; the write lands 300 ms
+    /// later, on its own turn. **WALKED 2026-09-02:** the first cut left a
+    /// paint-moved scroll for the observers to write, and nothing fired —
+    /// `frame.json` still said 0 with the strip at its far end.
+    fn schedule_layout_save(&self, cx: &mut Context<Self>) {
+        let gen = self.layout_save_gen.get() + 1;
+        self.layout_save_gen.set(gen);
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let _ = view.update(cx, |this, _| {
+                if this.layout_save_gen.get() == gen {
+                    this.persist_layout();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Drop the feeds of sessions no tab holds any more (tabs observer).
+    /// Not against an empty strip — the boot shape, `prune_splits`'s rule.
+    fn prune_column_feeds(&mut self, cx: &mut Context<Self>) {
+        let every = self.web_tabs.read(cx).snapshot.clone();
+        if every.tabs.is_empty() {
+            return;
+        }
+        let live: HashSet<String> = every
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.content {
+                eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
+                eave_wire::TabContent::Page => None,
+            })
+            .collect();
+        self.columns.update(cx, |feeds, _| feeds.prune(&live));
+    }
+
+    /// The strip's geometry for this frame, and the two edges the paint
+    /// owns: the selection's column comes into view, and the mounted
+    /// columns' feeds are asked for. Read once per frame, before
+    /// `set_shown_pages`, so a page composites only inside the viewport.
+    fn columns_geometry(
+        &self,
+        frame: &Frame,
+        snapshot: &eave_wire::TabsSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ColumnsPaint {
+        let order = self.column_order(snapshot, cx);
+        let selected_col = self.selected_column(frame, snapshot);
+        let selected = selected_col
+            .as_ref()
+            .and_then(|c| order.iter().position(|o| o == c));
+        let rail = if self.sessions.read(cx).collapsed {
+            0.0
+        } else {
+            self.rail_w
+        };
+        let view_w =
+            (f32::from(window.viewport_size().width) - rail - 2.0 * theme::CARD_GUTTER).max(0.0);
+        self.columns_view_w.set(view_w);
+        let n = order.len();
+        let mut scroll = columns::clamp_scroll(self.columns_scroll.get(), n, view_w);
+        // **The edge.** The strip moves when the SELECTION changes and not
+        // otherwise. A selection the wheel itself made is `asked`: it is
+        // already under the centre, and the paint between the ask and
+        // the engine's answer must not drag the OLD selection back into
+        // view. A selection made anywhere else moves the strip the least
+        // that shows it whole.
+        if view_w > 0.0 {
+            let mut been = self.columns_scrolled_to.borrow_mut();
+            let mut asked = self.columns_asked.borrow_mut();
+            if asked.is_some() && *asked == selected_col {
+                *asked = None;
+                *been = selected_col.clone();
+            } else if asked.is_some() && *been == selected_col {
+                // Pending: hold.
+            } else {
+                *asked = None;
+                if *been != selected_col {
+                    if let Some(ix) = selected {
+                        scroll = columns::scroll_into_view(scroll, ix, view_w, n);
+                    }
+                    *been = selected_col.clone();
+                }
+            }
+        }
+        if scroll != self.columns_scroll.get() {
+            self.columns_scroll.set(scroll);
+            self.columns_scroll_dirty.set(true);
+            self.schedule_layout_save(cx);
+        }
+        // **The glide.** A programmatic move (a selection coming into
+        // view, a chord) is drawn over `STRIP_GLIDE_MS` on the scroll
+        // glide's own curve; the wheel writes `columns_shown` itself and
+        // never glides. The clock is the executor's (motion's rule), and
+        // frames are asked for one at a time while in flight.
+        let mut shown = self.columns_shown.get();
+        if cx.reduce_motion() || (shown - scroll).abs() < 0.5 {
+            shown = scroll;
+            self.columns_glide.set(None);
+        } else {
+            let now = cx.background_executor().now();
+            let (started, from, to) = match self.columns_glide.get() {
+                Some(g) if g.2 == scroll => g,
+                _ => {
+                    let g = (now, shown, scroll);
+                    self.columns_glide.set(Some(g));
+                    g
+                }
+            };
+            let t = (now.duration_since(started).as_secs_f32() * 1000.0
+                / columns::STRIP_GLIDE_MS as f32)
+                .clamp(0.0, 1.0);
+            shown = from + (to - from) * motion::EASE_IN_OUT.eval(t);
+            if t >= 1.0 {
+                shown = scroll;
+                self.columns_glide.set(None);
+            } else {
+                let entity = self.transcript.clone();
+                window.on_next_frame(move |_, cx| {
+                    entity.update(cx, |_, cx| cx.notify());
+                });
+            }
+        }
+        self.columns_shown.set(shown);
+        let visible = columns::visible_range(shown, view_w, n);
+        // Mounted at BOTH ends of a glide, so the columns sliding in are
+        // already laid out rather than empty slots filling in.
+        let mounted = {
+            let a = columns::mounted_range(shown, view_w, n);
+            let b = columns::mounted_range(scroll, view_w, n);
+            a.start.min(b.start)..a.end.max(b.end)
+        };
+        // The feeds: every mounted chat column's session, the selected one
+        // included — it is double-subscribed on purpose, so the column it
+        // leaves is already warm when the selection moves on.
+        let wants: HashSet<String> = mounted
+            .clone()
+            .filter_map(|ix| order[ix].tab())
+            .filter_map(|t| {
+                snapshot.tabs.iter().find(|x| x.id == t).and_then(|x| match &x.content {
+                    eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
+                    eave_wire::TabContent::Page => None,
+                })
+            })
+            .collect();
+        let key = self.window_key.clone();
+        self.columns
+            .update(cx, |feeds, cx| feeds.set_wants(&key, wants, cx));
+        ColumnsPaint {
+            order,
+            selected,
+            scroll,
+            shown,
+            view_w,
+            rail,
+            visible,
+            mounted,
+        }
+    }
+
+    /// The page tabs compositing this frame under Columns: the columns
+    /// inside the viewport proper, never the ±1 mounted neighbours. A
+    /// page column scrolled out keeps its browser and stops producing
+    /// frames (`was_hidden`), and E3's clock sees it as off screen.
+    fn columns_shown_pages(geo: &ColumnsPaint, snapshot: &eave_wire::TabsSnapshot) -> Vec<String> {
+        geo.visible
+            .clone()
+            .filter_map(|ix| geo.order[ix].tab().map(str::to_string))
+            .filter(|id| {
+                snapshot
+                    .tabs
+                    .iter()
+                    .any(|t| &t.id == id && t.content == eave_wire::TabContent::Page)
+            })
+            .collect()
+    }
+
+    /// The horizontal gesture over the strip. **The rule, stated once,
+    /// and REVISED by the operator's first run** (*"it's not scrollable at
+    /// all"*): the strip takes every horizontal-dominant wheel over it,
+    /// pages included — [`ColumnWheel`] listens in the CAPTURE phase, ahead
+    /// of `page_element`'s bubble handler, and stops propagation when it
+    /// moves. The page gets the gesture back only at the strip's ends,
+    /// where the strip cannot move: that is where BR3's swipe-back still
+    /// fires. A vertical-dominant gesture is never the strip's
+    /// (`columns::strip_delta`). The column under the centre becomes the
+    /// selection: the other direction of the one bidirectional rule.
+    fn wheel_columns(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        let delta = ev.delta.pixel_delta(window.line_height());
+        let Some(d) = columns::strip_delta(f32::from(delta.x), f32::from(delta.y)) else {
+            return;
+        };
+        let snapshot = self.strip_snapshot(cx);
+        let frame = self.frame_for(&snapshot, None, cx);
+        let order = self.column_order(&snapshot, cx);
+        let n = order.len();
+        let view_w = self.columns_view_w.get();
+        let scroll = columns::clamp_scroll(self.columns_scroll.get() + d, n, view_w);
+        if scroll == self.columns_scroll.get() {
+            return;
+        }
+        self.columns_scroll.set(scroll);
+        // The trackpad IS the animation: drawn where the finger put it.
+        self.columns_shown.set(scroll);
+        self.columns_glide.set(None);
+        if let Some(ix) = columns::centered(scroll, view_w, n) {
+            let col = order[ix].clone();
+            let sel = self.selected_column(&frame, &snapshot);
+            if sel.as_ref() != Some(&col) {
+                *self.columns_asked.borrow_mut() = Some(col.clone());
+                self.activate_column(&col, cx);
+            }
+        }
+        self.schedule_layout_save(cx);
+        cx.notify();
+    }
+
+    /// A drop on the strip is a REORDER of the sidebar — never a split.
+    /// Only a PAGE moves (ID2b′ spec §5): a chat's place in the sidebar is
+    /// the rail's order, not the engine's, and a drop that changed nothing
+    /// would be a lie. The gap under the pointer names the neighbour the
+    /// page lands before; past the last column it goes to the end of
+    /// PAGES.
+    fn drop_on_columns(&mut self, drag: &TabDrag, window: &Window, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        let is_page = snapshot
+            .tabs
+            .iter()
+            .any(|t| t.id == drag.id && t.content == eave_wire::TabContent::Page);
+        if !is_page {
+            return;
+        }
+        let order = self.column_order(&snapshot, cx);
+        let rail = if self.sessions.read(cx).collapsed {
+            0.0
+        } else {
+            self.rail_w
+        };
+        let x = f32::from(window.mouse_position().x) - rail - theme::CARD_GUTTER
+            + self.columns_scroll.get();
+        let gap = ((x / columns::COLUMN_PITCH).round().max(0.0) as usize).min(order.len());
+        let Some((group, index)) = column_move_target(&order, gap, &snapshot, &drag.id) else {
+            return;
+        };
+        let _ = self.commands.send(Command::Browser(BrowserCmd::MoveTab {
+            tab_id: drag.id.clone(),
+            group,
+            index,
+        }));
+        cx.notify();
+    }
+
+    /// The strip's top bar — drawn ONLY while the rail is shut, to carry
+    /// the rail toggle: the pane header that carries it in Focus is per
+    /// column here, and a control that reopens the rail must not be drawn
+    /// N times. With the rail open there is no bar at all.
+    fn columns_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "columns-bar".into())
+            .w_full()
+            .flex_none()
+            .h(px(theme::PANE_HEADER_H))
+            .pl(px(theme::TRAFFIC_CLEARANCE - theme::CARD_GUTTER))
+            .pr(px(theme::SPACE_3))
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(self.rail_toggle(cx))
+            .into_any_element()
+    }
+
+    /// The way from Focus back to the strip: a minimize glyph at the right
+    /// of the well's header, the inverse of a column's ⛶ (the operator's
+    /// ruling on the fourth run: *"get rid of the focus/column button …
+    /// when we full screen we need to add a minimize as well on the right
+    /// side"*). The two glyphs ARE the mode control now.
+    fn layout_minimize(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id("layout-minimize")
+            .debug_selector(|| "layout-minimize".into())
+            .flex_none()
+            .size(px(theme::ICON_TOGGLE))
+            .rounded(px(theme::RADIUS_SELECT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover_fade("layout-minimize", theme::wash_rest(), theme::overlay())
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.set_layout(LayoutMode::Columns, cx)))
+            .child(icons::icon(icons::MINIMIZE_ARROWS, 12.0, theme::text_secondary()))
+            .into_any_element()
+    }
+
+    /// The strip: every open row's frame side by side, in sidebar order.
+    fn render_columns_well(
+        &self,
+        geo: &ColumnsPaint,
+        mut chrome: WellChrome,
+        rail_collapsed: bool,
+        pulse: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let n = geo.order.len();
+        let cols: Vec<AnyElement> = geo
+            .order
+            .iter()
+            .enumerate()
+            .map(|(ix, col)| self.column_el(ix, col, geo, &mut chrome, rail_collapsed, pulse, cx))
+            .collect();
+        let max = columns::max_scroll(n, geo.view_w);
+        let strip = div()
+            .id("column-strip")
+            .debug_selector(|| "column-strip".into())
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
+            .relative()
+            .overflow_hidden()
+            // The window's own ground between the plates: the gutter IS
+            // the separation, so it has to show as a gap.
+            .bg(theme::canvas())
+            .drag_over::<TabDrag>(|style, _, _, _| style.bg(theme::overlay()))
+            .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                this.drop_on_columns(drag, window, cx);
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(-geo.shown))
+                    .w(px(columns::total_width(n)))
+                    .flex()
+                    .flex_row()
+                    .gap(px(columns::COLUMN_GUTTER))
+                    .children(cols),
+            )
+            .when(n == 0, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "columns-empty".into())
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(theme::BODY_SIZE))
+                        .text_color(theme::text_secondary())
+                        .child("nothing open — ⌘T opens a chat"),
+                )
+            });
+        let wheel = ColumnWheel {
+            child: strip.into_any_element(),
+            shell: cx.entity().downgrade(),
+            can_left: geo.scroll > 0.5,
+            can_right: geo.scroll < max - 0.5,
+        };
+        div()
+            .debug_selector(|| "columns-well".into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            // The card is BARE under Columns (its rim would run across the
+            // gutters), so the region carries its own ground and its own
+            // rounding against the window glass here.
+            .rounded(px(theme::RADIUS_PANEL))
+            .bg(theme::canvas())
+            .children(rail_collapsed.then(|| self.columns_bar(cx)))
+            .child(wheel)
+            .into_any_element()
+    }
+
+    /// One column: a fixed-width slot, filled only inside the ±1 mount
+    /// window. An unmounted slot keeps its width and draws nothing, so the
+    /// strip's length and every neighbour's position are exact.
+    #[allow(clippy::too_many_arguments)]
+    fn column_el(
+        &self,
+        ix: usize,
+        col: &ColumnId,
+        geo: &ColumnsPaint,
+        chrome: &mut WellChrome,
+        rail_collapsed: bool,
+        pulse: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let stem = col.stem();
+        let is_sel = geo.selected == Some(ix);
+        let mounted = geo.mounted.contains(&ix);
+        let slot = div()
+            .id(SharedString::from(format!("column-{stem}")))
+            .debug_selector({
+                let stem = stem.clone();
+                move || format!("column-{stem}")
+            })
+            .flex_none()
+            .w(px(columns::COLUMN_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_PANEL))
+            // A plate per column — the card's own plate and hairline —
+            // over the strip's canvas ground, so the gutters read as gaps.
+            // The hairline is what draws the rounded corner: the plate's
+            // fill is nearly the ground's value and a page paints over the
+            // clip, so without the stroke a column has no visible edge at
+            // all (tried on the sixth run and refused: *"you removed the
+            // curved edge and the window serperation is non existent"*).
+            // **No selection ring** (the operator's ruling on the first
+            // run: *"no border highlight"*): the selection is the rail's
+            // lit row and the composer's presence, not a coloured edge.
+            .bg(theme::content_plate())
+            .border_1()
+            .border_color(theme::card_border());
+        if !mounted {
+            return slot.into_any_element();
+        }
+        let activate = col.clone();
+        slot.when(!is_sel, |d| {
+            d.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.activate_column(&activate, cx);
+                }),
+            )
+        })
+        .child(self.column_body(col, is_sel, chrome, rail_collapsed, pulse, cx))
+        .into_any_element()
+    }
+
+    /// ⛶ and × for one column, appended to the row's own header (the
+    /// address bar, the crumb) — the operator's ruling on the second run:
+    /// *"we dont need the extra top bar at the top of the card instead we
+    /// can add the close icon and expand icon to the url bar we already
+    /// have."* A `changes` row has no × (it is not a tab).
+    fn column_controls(&self, col: &ColumnId, cx: &mut Context<Self>) -> AnyElement {
+        let stem = col.stem();
+        let closable = col.tab().is_some();
+        let max_col = col.clone();
+        let close_col = col.clone();
+        let max_sel = format!("column-max-{stem}");
+        let close_sel = format!("column-close-{stem}");
+        div()
+            .debug_selector({
+                let stem = stem.clone();
+                move || format!("column-controls-{stem}")
+            })
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .child(
+                div()
+                    .id(SharedString::from(max_sel.clone()))
+                    .debug_selector({
+                        let s = max_sel.clone();
+                        move || s.clone()
+                    })
+                    .flex_none()
+                    .size(px(theme::ICON_TOGGLE))
+                    .rounded(px(theme::RADIUS_SELECT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover_fade(max_sel.clone(), theme::wash_rest(), theme::overlay())
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.maximize_column(&max_col, cx);
+                    }))
+                    .child(icons::icon(icons::EXPAND_ARROWS, 12.0, theme::text_secondary())),
+            )
+            .when(closable, |d| {
+                d.child(
+                    div()
+                        .id(SharedString::from(close_sel.clone()))
+                        .debug_selector({
+                            let s = close_sel.clone();
+                            move || s.clone()
+                        })
+                        .flex_none()
+                        .size(px(theme::ICON_TOGGLE))
+                        .rounded(px(theme::RADIUS_SELECT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover_fade(close_sel.clone(), theme::wash_rest(), theme::overlay())
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(id) = close_col.tab() {
+                                this.close_tab(id, cx);
+                            }
+                        }))
+                        .child(icons::icon(icons::CLOSE, 12.0, theme::text_secondary())),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The row's frame, unchanged: a page under its own address header, a
+    /// chat's transcript over its composer, a task's diff view. The
+    /// SELECTED column takes the well's own chrome (the shell's transcript,
+    /// the composer, the notice, the palette, the launcher on a blank
+    /// tab); any other chat column draws its column feed read-only, and
+    /// a click on it selects it — one composer, one caret, one selection.
+    fn column_body(
+        &self,
+        col: &ColumnId,
+        is_sel: bool,
+        chrome: &mut WellChrome,
+        rail_collapsed: bool,
+        pulse: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let stem = col.stem();
+        let snapshot = self.strip_snapshot(cx);
+        let body = div()
+            .debug_selector({
+                let stem = stem.clone();
+                move || format!("column-body-{stem}")
+            })
+            .flex_1()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .relative()
+            .overflow_hidden();
+        match col {
+            ColumnId::Diff(root) => {
+                // The files subscription is the SELECTED session's (ID2b′:
+                // per session by construction), so a diff column can draw
+                // its scan only while the selection is in that checkout.
+                let in_root = self
+                    .transcript
+                    .read(cx)
+                    .session_id
+                    .as_deref()
+                    .and_then(|sid| {
+                        self.sessions
+                            .read(cx)
+                            .sessions
+                            .iter()
+                            .find(|s| s.session_id == sid)
+                            .and_then(|s| s.checkout_root.clone())
+                    })
+                    .as_deref()
+                    == Some(root.as_str());
+                let crumb = div()
+                    .flex_none()
+                    .w_full()
+                    .h(px(theme::PANE_HEADER_H))
+                    .px(px(theme::SPACE_3))
+                    .flex()
+                    .items_center()
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .text_color(theme::text_secondary())
+                    .gap(px(theme::SPACE_2))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(SharedString::from(format!(
+                                "changes · {}",
+                                std::path::Path::new(root)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| root.clone())
+                            ))),
+                    )
+                    .child(self.column_controls(col, cx));
+                let inner = if in_root {
+                    self.diff_tool_el(pulse, cx)
+                } else {
+                    column_note(
+                        "select this task to scan its changes",
+                        format!("column-note-{stem}"),
+                    )
+                };
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(crumb)
+                    .child(body.child(inner))
+                    .into_any_element()
+            }
+            ColumnId::Tab(id) => {
+                let frame = self.frame_for(&snapshot, Some(id), cx);
+                // The row's own header — address bar or crumb — with ⛶
+                // and × on its right; no files toggle in a column (the
+                // rail is right there).
+                let header = (!crate::web::page_fullscreen(id)).then(|| {
+                    let controls = self.column_controls(col, cx);
+                    self.pane_header(
+                        cx,
+                        rail_collapsed,
+                        Some(id),
+                        false,
+                        false,
+                        "pane-header-column",
+                        pulse,
+                        Some(controls),
+                    )
+                });
+                let inner: AnyElement = if frame.active_is_page() {
+                    // A tab that has been nowhere is a New Chat in EVERY
+                    // column, selected or not (CL1, operator: *"about
+                    // blank shows blank until i scroll over it"*): the
+                    // selected one hosts the launcher, any other draws
+                    // the cluster's look — no page surface, which for a
+                    // dark-scheme `about:blank` was a black plate.
+                    let blank = snapshot
+                        .tabs
+                        .iter()
+                        .find(|t| &t.id == id)
+                        .is_some_and(strip::is_blank_page);
+                    let page_el = if blank {
+                        None
+                    } else {
+                        crate::web::page_element(id, cx)
+                            .map(|el| self.devtools_dock(id, el, cx))
+                            .map(|el| self.with_page_tooltip(id, el, "column"))
+                    };
+                    let find_here = self.find_here(cx).is_some_and(|t| t == *id);
+                    let find = if find_here { self.find_bar(cx) } else { None };
+                    let absence: Option<&'static str> = if blank || page_el.is_some() {
+                        None
+                    } else if crate::web::available() {
+                        Some(PAGE_STARTING)
+                    } else {
+                        Some(PAGE_NO_ENGINE)
+                    };
+                    body.children(page_el)
+                        .children(find)
+                        .children(self.page_status_bubble(id))
+                        .children(absence.map(|note| {
+                            div()
+                                .debug_selector(|| "page-absence".into())
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(theme::BODY_SIZE))
+                                .text_color(theme::text_secondary())
+                                .child(note)
+                        }))
+                        .when(is_sel, |d| {
+                            d.children(chrome.page_dialog_el.take())
+                                .children(chrome.toast_el.take())
+                                .children(chrome.launcher_el.take().filter(|_| blank))
+                                .children(chrome.omnibox_el.take())
+                        })
+                        .when(blank && !is_sel, |d| d.child(blank_column_cluster()))
+                        .into_any_element()
+                } else if is_sel {
+                    // The well's own chrome, placed here instead of in the
+                    // well: empty vs docked is a placement of ONE composer,
+                    // exactly as `render` does it.
+                    match chrome.empty_state.take() {
+                        Some(e) => body
+                            .flex()
+                            .flex_col()
+                            .child(Self::transcript_empty_view(
+                                e,
+                                chrome.notice.take(),
+                                chrome.trailer.take(),
+                                chrome.slash.take(),
+                                chrome
+                                    .composer
+                                    .take()
+                                    .unwrap_or_else(|| div().into_any_element()),
+                            ))
+                            .into_any_element(),
+                        None => body
+                            .children(chrome.transcript_el.take().map(|el| {
+                                div()
+                                    .size_full()
+                                    .pt(px(theme::LOG_TOP_PAD))
+                                    .child(el)
+                                    .into_any_element()
+                            }))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .pb(px(theme::SPACE_3))
+                                    .flex()
+                                    .flex_col()
+                                    .children(self.conn_panel(cx))
+                                    .children(chrome.notice.take())
+                                    .children(chrome.trailer.take())
+                                    .children(chrome.slash.take())
+                                    .children(chrome.composer.take()),
+                            )
+                            .children(chrome.omnibox_el.take())
+                            .into_any_element(),
+                    }
+                } else {
+                    // A read-only view of another session: its column feed.
+                    let sid = snapshot.tabs.iter().find(|t| &t.id == id).and_then(|t| match &t.content {
+                        eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
+                        eave_wire::TabContent::Page => None,
+                    });
+                    let feed = sid.as_deref().and_then(|s| self.columns.read(cx).feed(s));
+                    match (sid, feed) {
+                        (Some(sid), Some(feed)) => {
+                            let list_state = feed.read(cx).list.clone();
+                            let entity = feed.clone();
+                            let empty = feed.read(cx).display.is_empty();
+                            let fresh = self
+                                .sessions
+                                .read(cx)
+                                .sessions
+                                .iter()
+                                .find(|s| s.session_id == sid)
+                                .is_some_and(|s| s.last_seq == 0);
+                            body.child(
+                                div()
+                                    .debug_selector(move || format!("column-feed-{sid}"))
+                                    .size_full()
+                                    .pt(px(theme::LOG_TOP_PAD))
+                                    .child(
+                                        list(list_state, move |ix, _window, cx| {
+                                            entity.read_with(cx, |state, _| {
+                                                Shell::render_row(state, ix, pulse)
+                                            })
+                                        })
+                                        .size_full(),
+                                    ),
+                            )
+                            .when(empty, |d| {
+                                d.child(column_note(
+                                    if fresh {
+                                        "new session — nothing sent yet"
+                                    } else {
+                                        "opening…"
+                                    },
+                                    format!("column-note-{stem}"),
+                                ))
+                            })
+                            .child(
+                                // The composer's place, stated: one field
+                                // in the window, and it is the selected
+                                // column's. A click here selects this one.
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .p(px(theme::SPACE_3))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .px(px(theme::SPACE_3))
+                                            .py(px(theme::SPACE_2))
+                                            .rounded(px(composer::CARD_RADIUS))
+                                            .border_1()
+                                            .border_color(theme::bar_hairline())
+                                            .bg(theme::bar_glass())
+                                            .text_size(px(theme::DETAIL_SIZE))
+                                            .text_color(theme::text_tertiary())
+                                            .child("click to reply here"),
+                                    ),
+                            )
+                            .into_any_element()
+                        }
+                        _ => body
+                            .child(column_note("opening…", format!("column-note-{stem}")))
+                            .into_any_element(),
+                    }
+                };
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .children(header)
+                    .child(inner)
+                    .into_any_element()
+            }
+        }
     }
 
     /// Put `dragged` beside `host` in the well.
@@ -13409,10 +14915,14 @@ impl Shell {
     fn open_omnibox(&mut self, cx: &mut Context<Self>) {
         self.folder_search = None;
         let snapshot = self.strip_snapshot(cx);
+        // A blank tab seeds NOTHING (CL1's ruling: *"it shouldnt
+        // automatically say about:blank. there should be no text"*): the
+        // field opens empty, and the first character is the address.
         let text = snapshot
             .active
             .as_deref()
             .and_then(|a| snapshot.tabs.iter().find(|t| t.id == a))
+            .filter(|t| !strip::is_blank_page(t))
             .and_then(|t| t.url.clone())
             .unwrap_or_default();
         let seeded = !text.is_empty();
@@ -13979,12 +15489,18 @@ impl Shell {
             return None;
         }
         Some(
+            // The dropdown: its own plate under the pill, a gap between.
             div()
                 .id("omnibox-menu")
                 .debug_selector(|| "omnibox-menu".into())
                 .w_full()
-                .border_t_1()
-                .border_color(theme::border())
+                .mt(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_PANEL))
+                .border_1()
+                .border_color(theme::border_strong())
+                .bg(theme::menu_glass())
+                .shadow(theme::shadow_panel())
+                .overflow_hidden()
                 .flex()
                 .flex_col()
                 .children(row_els)
@@ -14613,6 +16129,7 @@ impl Shell {
                     show_files,
                     header_tag,
                     phase,
+                    None,
                 )
             }))
             .child(
@@ -14661,7 +16178,12 @@ impl Shell {
         show_files: bool,
         tag: &'static str,
         _phase: Option<f32>,
+        trailing: Option<AnyElement>,
     ) -> gpui::Div {
+        // Slice CL1: a column's ⛶ and ×, on THIS row (the header is a
+        // column of the row and its rule, so a caller cannot append to
+        // the row from outside). Taken by whichever arm draws.
+        let mut trailing = trailing;
         let snapshot = self.strip_snapshot(cx);
         let wanted = for_tab.or(snapshot.active.as_deref());
         let active = wanted.and_then(|a| snapshot.tabs.iter().find(|t| t.id == a));
@@ -14716,11 +16238,14 @@ impl Shell {
                 let back = tab.can_go_back;
                 let fwd = tab.can_go_forward;
                 let has_url = tab.url.is_some();
-                let address = tab
-                    .url
-                    .as_deref()
-                    .map(eave_wire::typing_form)
-                    .filter(|t| !t.is_empty());
+                let address = if strip::is_blank_page(tab) {
+                    None
+                } else {
+                    tab.url
+                        .as_deref()
+                        .map(eave_wire::typing_form)
+                        .filter(|t| !t.is_empty())
+                };
                 let tab_id = tab.id.clone();
                 let back_tag = if tag == "pane-header" {
                     "nav-back".to_string()
@@ -14741,9 +16266,18 @@ impl Shell {
                     cx,
                 ))
                 .child(self.nav_arrow(fwd_tag, icons::ALT_ARROW_RIGHT, fwd, 1, tab_id.clone(), cx))
-                .child(
+                .child({
+                    // Keyed by tab past the main header, like the arrows:
+                    // one key across N column headers lit every reload
+                    // button when one was hovered (CL1's second run).
+                    let reload_key = if tag == "pane-header" {
+                        "nav-reload".to_string()
+                    } else {
+                        format!("nav-reload-{tab_id}")
+                    };
+                    let fade_key = reload_key.clone();
                     div()
-                        .id("nav-reload")
+                        .id(SharedString::from(reload_key))
                         .debug_selector(|| "nav-reload".into())
                         .flex_none()
                         .size(px(theme::ICON_TOGGLE))
@@ -14751,7 +16285,7 @@ impl Shell {
                         .when(has_url, |d| {
                             let reload_id = tab_id.clone();
                             d.cursor_pointer()
-                                .hover_fade("nav-reload", theme::wash_rest(), theme::overlay())
+                                .hover_fade(fade_key, theme::wash_rest(), theme::overlay())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.reload_tab(&reload_id, cx)
                                 }))
@@ -14768,8 +16302,8 @@ impl Shell {
                                 theme::text_disabled()
                             },
                             "nav-reload-glyph",
-                        )),
-                )
+                        ))
+                })
                 .child({
                     // The address. At rest it states where the page is.
                     // Clicking it (or ⌘L) opens ONE card on this field:
@@ -14806,8 +16340,17 @@ impl Shell {
                     // Do not skip on reduce_motion — attempts 3–5 painted
                     // without that gate, and 6–8 vanished after it went in.
                     let load = page_load_overlay(&tab.id, loading, now);
+                    // Keyed by tab past the main header (CL1's second
+                    // run: *"when i highlight a url all url bars
+                    // highlight"* — one hover key, N headers).
+                    let address_key = if tag == "pane-header" {
+                        "pane-address".to_string()
+                    } else {
+                        format!("pane-address-{}", tab.id)
+                    };
+                    let address_fade = address_key.clone();
                     div()
-                        .id("pane-address")
+                        .id(SharedString::from(address_key))
                         .debug_selector(|| "pane-address".into())
                         .flex_1()
                         .min_w(px(0.))
@@ -14822,7 +16365,7 @@ impl Shell {
                             d.px(px(theme::SPACE_3))
                                 .rounded(px(theme::RADIUS_PANEL))
                                 .hover_fade(
-                                    "pane-address",
+                                    address_fade,
                                     theme::wash_rest(),
                                     theme::overlay_strongest(),
                                 )
@@ -14885,12 +16428,25 @@ impl Shell {
                                     // address, and says so in the register
                                     // every other empty state in this shell
                                     // uses: lower case, one clause, the fact.
+                                    // A tab that has been nowhere is a New
+                                    // Chat — the rail's word for it too
+                                    // (CL1's ruling; the pill is where a
+                                    // search makes it a page).
                                     .child(SharedString::from(
-                                        address.unwrap_or_else(|| "no address yet".to_string()),
+                                        address.unwrap_or_else(|| strip::NEW_TAB_LABEL.to_string()),
                                     )),
                             )
                         })
                         .when(has_edit, |d| {
+                            // **Inline, not a card** (CL1's ruling: *"no
+                            // more popups on the url bar. i should be able
+                            // to start typing inside of it and a drop down
+                            // recommendations should come from it"*). The
+                            // field takes the pill's own box and look; the
+                            // suggestions hang beneath it as a dropdown.
+                            // Still `deferred` + one hitbox for both, so the
+                            // list hangs over the page and a click on a row
+                            // is still inside.
                             d.child(deferred(
                                 div()
                                     .id("omnibox-card")
@@ -14900,12 +16456,6 @@ impl Shell {
                                     .left_0()
                                     .right_0()
                                     .occlude()
-                                    .rounded(px(theme::RADIUS_PANEL))
-                                    .border_1()
-                                    .border_color(theme::border_strong())
-                                    .bg(theme::menu_glass())
-                                    .shadow(theme::shadow_panel())
-                                    .overflow_hidden()
                                     .flex()
                                     .flex_col()
                                     // Field and list share this hitbox, so a
@@ -14924,6 +16474,8 @@ impl Shell {
                                             .w_full()
                                             .h(px(theme::ADDRESS_H))
                                             .px(px(theme::SPACE_3))
+                                            .rounded(px(theme::RADIUS_PANEL))
+                                            .bg(theme::overlay_strongest())
                                             .flex()
                                             .flex_row()
                                             .items_center()
@@ -14963,6 +16515,7 @@ impl Shell {
                         }),
                 )
                 .children(self.downloads_control(cx))
+                .children(trailing.take())
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── a session: the breadcrumb ────────────────────────────────
@@ -15009,6 +16562,7 @@ impl Shell {
                         .text_color(theme::text_tertiary())
                         .child(SharedString::from(m))
                 }))
+                .children(trailing.take())
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── the diff tool: what it is, and the files face toggle ──────
@@ -15031,6 +16585,7 @@ impl Shell {
                         .child("changes"),
                 )
                 .child(div().flex_1())
+                .children(trailing.take())
                 .when(show_files, |d| d.child(self.files_toggle(cx))),
             // ── nothing open: the line still exists ───────────────────────
             //
@@ -15040,6 +16595,7 @@ impl Shell {
             // positioned against that edge.
             _ => row
                 .child(div().flex_1())
+                .children(trailing.take())
                 .when(show_files, |d| d.child(self.files_toggle(cx))),
         };
         // The card paints one `content_plate` behind this strip AND the
@@ -19813,6 +21369,11 @@ impl Shell {
         // that skipped them would make them unreachable by keyboard while
         // the fold hid them from the mouse). See [`Shell::spine_order`].
         let mut spine: Vec<String> = strip::loose_pages(&snapshot);
+        // Slice CL1 — the column strip's order, recorded beside the
+        // spine: the same rows in the same order, plus each task's
+        // `changes` row, and INCLUDING what a collapsed header hides —
+        // a collapsed task's tools are open, just not on the rail.
+        let mut cols: Vec<ColumnId> = spine.iter().cloned().map(ColumnId::Tab).collect();
         // The task whose rows are being emitted, and its chats so far —
         // flushed as its tool rows when the next header arrives or the
         // list ends. Read from the ROWS' own `checkout_root`, never from
@@ -19822,11 +21383,18 @@ impl Shell {
         let mut cur_hidden = false;
         let flush = |rows: &mut Vec<AnyElement>,
                          spine: &mut Vec<String>,
+                         cols: &mut Vec<ColumnId>,
                          cur_task: &mut Option<String>,
                          cur_chats: &mut Vec<&SessionInfo>,
                          cur_hidden: bool| {
             if let Some(root) = cur_task.take() {
+                // The `changes` row exists while the task has a chat
+                // (`task_tool_rows`), hidden or not.
+                if !cur_chats.is_empty() {
+                    cols.push(ColumnId::Diff(root.clone()));
+                }
                 for id in self.docked_pages(&root, &by_id, &snapshot) {
+                    cols.push(ColumnId::Tab(id.clone()));
                     spine.push(id);
                 }
                 if !cur_hidden {
@@ -19847,7 +21415,7 @@ impl Shell {
         for entry in &entries {
             match entry {
                 RailEntry::Header(g) => {
-                    flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
+                    flush(&mut rows, &mut spine, &mut cols, &mut cur_task, &mut cur_chats, cur_hidden);
                     group_shut = shut_groups.contains(&g.root);
                     task_shut = false;
                     under_task = false;
@@ -19860,7 +21428,7 @@ impl Shell {
                     rows.push(self.rail_group_header(g.clone(), ink, group_shut, lit, cx));
                 }
                 RailEntry::Task(g) => {
-                    flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
+                    flush(&mut rows, &mut spine, &mut cols, &mut cur_task, &mut cur_chats, cur_hidden);
                     task_shut = shut_groups.contains(&g.root);
                     under_task = true;
                     group_root = Some(g.root.clone());
@@ -19878,12 +21446,13 @@ impl Shell {
                     // under its chats.
                     if let Some(root) = info.checkout_root.as_deref() {
                         if cur_task.as_deref() != Some(root) {
-                            flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
+                            flush(&mut rows, &mut spine, &mut cols, &mut cur_task, &mut cur_chats, cur_hidden);
                             cur_task = Some(root.to_string());
                         }
                         cur_chats.push(info);
                     }
                     if let Some(t) = strip::tab_for_session(&snapshot, &info.session_id) {
+                        cols.push(ColumnId::Tab(t.clone()));
                         spine.push(t);
                     }
                     if !group_shut && !task_shut {
@@ -19906,9 +21475,10 @@ impl Shell {
                 }
             }
         }
-        flush(&mut rows, &mut spine, &mut cur_task, &mut cur_chats, cur_hidden);
+        flush(&mut rows, &mut spine, &mut cols, &mut cur_task, &mut cur_chats, cur_hidden);
         // Written on EVERY pass, for the reason `rail_walk` gives below.
         *self.spine_walk.borrow_mut() = spine;
+        *self.column_walk.borrow_mut() = cols;
         // No empty-state copy under Sessions. Add is the header `+`.
         // If every session is archived, the archived toggle below is the
         // reason the list is empty — restating it is noise.
@@ -26757,6 +28327,12 @@ impl Render for Shell {
         // "is the well a page" below is a read of this; the pane header
         // and a split pane ask the same function about their own tab.
         let frame = self.frame_for(&strip_snapshot, None, cx);
+        // Slice CL1 — the strip's geometry, decided once and before
+        // `set_shown_pages`: a page composites only inside the viewport.
+        let columns_geo = self
+            .layout
+            .is_columns()
+            .then(|| self.columns_geometry(&frame, &strip_snapshot, window, cx));
 
         let shown_pages: Vec<String> = {
             let mut ids = Vec::new();
@@ -26769,7 +28345,11 @@ impl Render for Shell {
                     ids.push(id.to_string());
                 }
             };
-            if let Some(s) = self.showing_split(&strip_snapshot) {
+            if let Some(geo) = columns_geo.as_ref() {
+                for id in Self::columns_shown_pages(geo, &strip_snapshot) {
+                    push_page(&id);
+                }
+            } else if let Some(s) = self.showing_split(&strip_snapshot) {
                 for id in &s.panes {
                     push_page(id);
                 }
@@ -27717,6 +29297,8 @@ impl Render for Shell {
         let theme_popup_layer = self.theme_popup_layer(cx);
         let import_popup_layer = self.import_popup_layer(window, cx);
         let find_bar = self.find_bar(cx);
+        // Slice CL1 — Focus's way back to the strip, on the well's header.
+        let layout_minimize = self.layout_minimize(cx);
         // Slice Q2, built here for the same reason: the launcher and its
         // model menu both need `self` and `cx`, and the element chain
         // below has neither to spare.
@@ -27909,6 +29491,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0, cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(true, cx)))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.cycle_tab(false, cx)))
+            .on_action(cx.listener(|this, _: &ColumnPrev, _, cx| this.step_column(false, cx)))
+            .on_action(cx.listener(|this, _: &ColumnNext, _, cx| this.step_column(true, cx)))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go(-1, cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
             .on_action(cx.listener(|this, _: &ReloadTab, _, cx| this.reload(cx)))
@@ -28048,8 +29632,42 @@ impl Render for Shell {
                             .min_w(px(0.))
                             .min_h(px(0.))
                             .p(px(if fullscreen { 0.0 } else { theme::CARD_GUTTER }))
-                            .child(content_card({
-                                if let Some(split) = showing_split.as_ref() {
+                            .child({
+                                // Slice CL1 — the strip takes the card when
+                                // Columns is on and a row is selected. At the
+                                // launcher with nothing selected the well
+                                // stays the launcher: there is no row to lay
+                                // out and the launcher IS the rest state.
+                                //
+                                // And it takes it BARE: the card's rim is a
+                                // rectangle around the whole region, so over a
+                                // strip of plates it runs straight across every
+                                // gutter and welds the columns to each other.
+                                // Each column carries its own plate and rim.
+                                let columns_now = columns_geo
+                                    .as_ref()
+                                    .filter(|_| !(show_launcher && !blank_page));
+                                let bare = columns_now.is_some();
+                                let inner = if let Some(geo) = columns_now {
+                                    self.render_columns_well(
+                                        geo,
+                                        WellChrome {
+                                            transcript_el: Some(transcript_el.into_any_element()),
+                                            composer: composer.take().map(|c| c.into_any_element()),
+                                            notice,
+                                            trailer,
+                                            slash: slash_layer,
+                                            empty_state,
+                                            launcher_el,
+                                            omnibox_el,
+                                            page_dialog_el,
+                                            toast_el,
+                                        },
+                                        rail_collapsed,
+                                        pulse,
+                                        cx,
+                                    )
+                                } else if let Some(split) = showing_split.as_ref() {
                                     self.render_split_well(
                                         split,
                                         rail_collapsed,
@@ -28122,6 +29740,7 @@ impl Render for Shell {
                                             true,
                                             "pane-header",
                                             pulse,
+                                            Some(layout_minimize),
                                         ))
                                         .child(
                                             // Stage H glass: the list's viewport runs
@@ -28404,8 +30023,13 @@ impl Render for Shell {
                                         )
                                         .when(!well_taken, |d| d.child(self.footer(cx)))
                                         .into_any_element()
+                                };
+                                if bare {
+                                    bare_card(inner)
+                                } else {
+                                    content_card(inner)
                                 }
-                            })),
+                            }),
                     ),
             )
             // Slice P1: the overlay layer mounts at the ROOT and nowhere
@@ -28579,11 +30203,30 @@ impl IntoElement for Frost {
 
 struct ContentCard {
     child: AnyElement,
+    /// Paint the plate and the rim, or hand the region over bare.
+    ///
+    /// Columns (CL1) is the one bare caller. The card's rim is a rectangle
+    /// around the WHOLE region, so under a strip of plates its top and
+    /// bottom edges run straight across every gutter and weld the columns
+    /// together — the operator's sixth-run ruling, *"the tiny line
+    /// connecting each window to each other."* In Columns each column
+    /// carries its own plate and rim and the gutter is the window's ground,
+    /// so the card has nothing left to draw.
+    framed: bool,
 }
 
 fn content_card(child: impl IntoElement) -> ContentCard {
     ContentCard {
         child: child.into_any_element(),
+        framed: true,
+    }
+}
+
+/// The card region with no plate and no rim — see `ContentCard::framed`.
+fn bare_card(child: impl IntoElement) -> ContentCard {
+    ContentCard {
+        child: child.into_any_element(),
+        framed: false,
     }
 }
 
@@ -28631,6 +30274,10 @@ impl Element for ContentCard {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if !self.framed {
+            self.child.paint(window, cx);
+            return;
+        }
         let radii = Corners::all(px(theme::RADIUS_PANEL));
         window.paint_quad(gpui::fill(bounds, theme::content_plate()).corner_radii(radii));
         self.child.paint(window, cx);
@@ -28965,6 +30612,10 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         // terminal emulator on this machine agree on.
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        // Slice CL1 — the brackets browsers spend on tabs step the
+        // strip's columns (and, in Focus, the same sidebar order).
+        KeyBinding::new("cmd-shift-[", ColumnPrev, None),
+        KeyBinding::new("cmd-shift-]", ColumnNext, None),
         // ⌘W — **the only binding on this chord**, replacing Slice Y's
         // `app_menus::CloseWindow`.
         //
@@ -29211,6 +30862,9 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         t
     });
 
+    // Slice CL1: the column feeds, app-wide, beside the one transcript.
+    let columns = cx.new(|_| ColumnFeeds::new(cmd_tx.clone()));
+
     // Steady elapsed reporting (build directive): while a notice
     // stands, re-render the badge once a second so its elapsed text
     // moves. Costs one entity read per second when idle.
@@ -29257,6 +30911,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let web_tabs = web_tabs.clone();
         let bookmarks = bookmarks.clone();
         let typeahead = typeahead.clone();
+        let columns = columns.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
                 let conn_events: Vec<ConnEvent> = queues.conn.lock().unwrap().drain(..).collect();
@@ -29403,6 +31058,16 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     });
                 }
                 let feed_events: Vec<FeedEvent> = queues.feed.lock().unwrap().drain(..).collect();
+                // Slice CL1: column frames go to the column feeds and
+                // NEVER into the shell's transcript — two subscriptions
+                // to one journal are two states.
+                let (column_events, feed_events): (Vec<FeedEvent>, Vec<FeedEvent>) =
+                    feed_events.into_iter().partition(|ev| {
+                        matches!(ev, FeedEvent::ColumnReset { .. } | FeedEvent::ColumnRecords { .. })
+                    });
+                if !column_events.is_empty() {
+                    columns.update(cx, |feeds, cx| feeds.fold(column_events, cx));
+                }
                 if !feed_events.is_empty() {
                     let cmd_tx = cmd_tx.clone();
                     let mut switched = false;
@@ -29446,6 +31111,10 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                                         state.reset();
                                     }
                                 }
+                                // Slice CL1: partitioned out above and
+                                // folded into the column feeds; never
+                                // into this transcript.
+                                FeedEvent::ColumnReset { .. } | FeedEvent::ColumnRecords { .. } => {}
                                 FeedEvent::Records { id, epoch, records } => {
                                     if state.session_id.as_deref() != Some(id.as_str()) {
                                         continue;
@@ -29527,6 +31196,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         sessions,
         files,
         transcript,
+        columns,
         web_tabs,
         bookmarks,
         typeahead,
@@ -29569,6 +31239,8 @@ struct ShellDeps {
     sessions: Entity<SessionsState>,
     files: Entity<FilesState>,
     transcript: Entity<TranscriptState>,
+    /// Slice CL1 — see [`ColumnFeeds`].
+    columns: Entity<ColumnFeeds>,
     web_tabs: Entity<WebTabsState>,
     bookmarks: Entity<BookmarksState>,
     typeahead: Entity<TypeaheadState>,
@@ -29784,12 +31456,15 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
         sessions,
         files,
         transcript,
+        columns,
         web_tabs,
         bookmarks,
         typeahead,
         cmd_tx,
         perf_10k,
     } = cx.global::<ShellDeps>().clone();
+    // Slice CL1: the layout comes back with the splits.
+    let layout_prefs = load_layout(&window_key);
     let placement = new_window_placement(cx);
     let handle = cx
         .open_window(
@@ -29959,6 +31634,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // settling an unannounced turn — so both settle
                         // paths reach the queue through this one line.
                         shell.release_queued(cx);
+                        shell.flush_layout_save();
                         cx.notify();
                     })
                     .detach();
@@ -29969,9 +31645,17 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // tab arriving is a tabs fact, and the popup's
                         // split control is waiting for exactly one.
                         shell.settle_popup_split(cx);
+                        // Slice CL1: same rule, same reason — and the
+                        // strip's paint-moved scroll is written here.
+                        shell.prune_column_feeds(cx);
+                        shell.flush_layout_save();
                         cx.notify();
                     })
                     .detach();
+                    // Slice CL1: a column feed folding a frame is a reason
+                    // to paint — the feeds are not `Render` and nothing
+                    // else observes them.
+                    cx.observe(&columns, |_, _, cx| cx.notify()).detach();
                     cx.observe(&bookmarks, |shell, _, cx| {
                         shell.arm_pending_folder_rename(cx);
                         cx.notify();
@@ -30075,6 +31759,17 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_drag: None,
                         splits: load_splits(&window_key),
                         split_drag: None,
+                        layout: layout_prefs.mode,
+                        columns_scroll: Cell::new(layout_prefs.scroll),
+                        columns_scroll_dirty: Cell::new(false),
+                        columns_scrolled_to: RefCell::new(None),
+                        columns_asked: RefCell::new(None),
+                        column_walk: RefCell::new(Vec::new()),
+                        columns_view_w: Cell::new(0.0),
+                        columns_shown: Cell::new(layout_prefs.scroll),
+                        columns_glide: Cell::new(None),
+                        columns: columns.clone(),
+                        layout_save_gen: Cell::new(0),
                         devtools_ratio: DEVTOOLS_RATIO,
                         devtools_drag: None,
                         files_scroll: ScrollHandle::new(),
