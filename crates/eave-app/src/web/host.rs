@@ -472,6 +472,12 @@ fn pump_cef() {
     // components — which is AFTER `CefInitialize` returns (0 registered
     // at that instant, measured 2026-09-03). See `cdm.rs`.
     super::cdm::poll();
+    // C6. eave can never be TOLD a page has stopped answering — its own
+    // DevTools client suppresses Chromium's report — so it asks, here,
+    // because a hung renderer produces no frames and no callbacks and the
+    // pump is the only thing still running near it. See
+    // `tabs::poll_unresponsive`.
+    super::tabs::poll_unresponsive();
     // Anything Chromium queued while we were inside raised no request, so
     // ask for one more pass. This is what keeps the chain alive; without it
     // the loop runs on the heartbeat alone with work outstanding.

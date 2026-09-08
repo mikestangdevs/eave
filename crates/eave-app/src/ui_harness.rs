@@ -23858,3 +23858,192 @@ fn every_card_stays_drawn_however_far_the_plane_is_panned(cx: &mut TestAppContex
         assert!(shown(vcx, sel(format!("column-body-{stem}"))), "{stem} zoomed out");
     }
 }
+
+// ---------------------------------------------------------------------------
+// C6 — a page whose renderer has stopped answering
+// ---------------------------------------------------------------------------
+
+/// Put a page tab up and tell the chrome its renderer has stopped
+/// answering, which is what `tabs::poll_unresponsive` does on the other
+/// side of the feature gate when Chromium's flag flips. The model is
+/// ungated, so the whole surface is drivable here — only the browser to
+/// ask is missing.
+fn hang_page(h: &Harness, vcx: &mut VisualTestContext, tab: &str, now_ms: u64) {
+    crate::web::hung::note_unresponsive(tab, now_ms);
+    strip_tabs(
+        h,
+        vcx,
+        vec![page_tab(tab, Some("https://slow.test/"), Some("A slow page"))],
+        Some(tab),
+    );
+    vcx.run_until_parked();
+}
+
+/// The whole of C6 in one property: **a page that has stopped answering
+/// says so, over itself, with a way out.** Before this slice the same
+/// state drew nothing whatsoever, for ever.
+#[gpui::test]
+fn a_page_that_stops_answering_says_so_over_itself(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::hung::forget("p1");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://slow.test/"), Some("A slow page"))],
+        Some("p1"),
+    );
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "page-hung"),
+        "an ordinary page was accused of hanging"
+    );
+
+    hang_page(&h, vcx, "p1", eave_core::journal::now_ms());
+    assert!(shown(vcx, "page-hung"), "the notice did not render");
+    assert!(
+        shown(vcx, "page-hung-end"),
+        "the notice offered no way out of the page"
+    );
+    crate::web::hung::forget("p1");
+}
+
+/// **The notice withdraws itself when the page recovers**, which is the
+/// one place this deliberately parts company with the session notice above
+/// (`the_badge_ladder_states_only_what_deserves_attention` pins that one
+/// never withdrawing). The axis is evidence, and it is written out in
+/// `web::hung`: a session is called unresponsive by inference, a page by
+/// Chromium's own decision — and the same flag answers the other way the
+/// moment the renderer comes back.
+#[gpui::test]
+fn a_page_that_recovers_takes_its_own_notice_down(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::hung::forget("p1");
+    hang_page(&h, vcx, "p1", eave_core::journal::now_ms());
+    assert!(shown(vcx, "page-hung"));
+
+    crate::web::hung::note_responsive("p1");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://slow.test/"), Some("A slow page"))],
+        Some("p1"),
+    );
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "page-hung"),
+        "the notice outlived the hang it was about"
+    );
+}
+
+/// Nothing reloads a page but a person. Advancing the clock drives the
+/// elapsed — the same move the session notice's test makes — and proves
+/// the notice neither withdraws nor escalates on its own.
+#[gpui::test]
+fn a_hung_page_is_never_ended_automatically(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::hung::forget("p1");
+    hang_page(&h, vcx, "p1", eave_core::journal::now_ms());
+
+    vcx.executor().advance_clock(Duration::from_secs(120));
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "page-hung"),
+        "the notice withdrew itself on a page that never recovered"
+    );
+    assert!(
+        shown(vcx, "page-hung-end"),
+        "the way out was withdrawn while the page was still hung"
+    );
+    crate::web::hung::forget("p1");
+}
+
+/// The button reloads the page. Feature-off there is no browser to close,
+/// so what this pins is the half that is eave's: the operator's act clears
+/// the state and the notice goes with it, rather than sitting there after
+/// its own button has been pressed. **The two halves used to disagree
+/// about exactly this** — the gated one returned before clearing when it
+/// had no callback to spend — which is what this caught.
+#[gpui::test]
+fn ending_a_hung_page_takes_the_notice_with_it(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::hung::forget("p1");
+    hang_page(&h, vcx, "p1", eave_core::journal::now_ms());
+    assert!(shown(vcx, "page-hung"));
+
+    click(vcx, "page-hung-end");
+    vcx.run_until_parked();
+    assert!(
+        crate::web::hung::hung_for("p1", eave_core::journal::now_ms()).is_none(),
+        "the page is still filed as hung after the operator ended it"
+    );
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://slow.test/"), Some("A slow page"))],
+        Some("p1"),
+    );
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "page-hung"), "the notice survived its own button");
+}
+
+/// **A page renders in two places and floating chrome that goes in one is
+/// absent from the other.** `page_dialog` is mounted only in the unsplit
+/// path and is invisible in a split to this day; this test is why C6 is a
+/// helper rather than a second copy of one.
+#[gpui::test]
+fn a_hung_pane_in_a_split_says_so_too(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    crate::web::hung::forget("p1");
+    crate::web::hung::forget("p2");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", true, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    h.drain();
+    assert!(shown(vcx, "split-well"), "the split did not form");
+    assert!(!shown(vcx, "page-hung"));
+
+    crate::web::hung::note_unresponsive("p2", eave_core::journal::now_ms());
+    h.window.update(vcx, |_, _, cx| cx.notify()).unwrap();
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "page-hung"),
+        "a hung pane in a split drew nothing — the notice is in one path only"
+    );
+    crate::web::hung::forget("p2");
+}
+
+/// A tab going away takes its hang with it. A reused id inheriting one
+/// would draw a danger panel over a page that is perfectly well, and
+/// nothing on screen would explain it.
+#[gpui::test]
+fn a_closed_tab_does_not_hand_its_hang_to_the_next_one(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    crate::web::hung::forget("p1");
+    hang_page(&h, vcx, "p1", eave_core::journal::now_ms());
+    assert!(shown(vcx, "page-hung"));
+
+    crate::web::forget_page("p1");
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://fresh.test/"), Some("Fresh"))],
+        Some("p1"),
+    );
+    vcx.run_until_parked();
+    assert!(
+        !shown(vcx, "page-hung"),
+        "a reused tab id inherited the last page's hang"
+    );
+}

@@ -2953,6 +2953,24 @@ pub fn menu_glass() -> Hsla {
     c.opacity(MENU_GLASS_ALPHA)
 }
 
+/// [`menu_glass`]'s tint with **no transparency at all** — the material
+/// for eave's own statement drawn over somebody else's page (C6's
+/// unresponsive notice).
+///
+/// Every other glass in this file is tuned against a ground eave controls,
+/// where 0.92 is a deliberate hint of what is behind. A page is not that
+/// ground: it can be white, it can be black, and it can put a 48 px
+/// headline exactly where the notice's first line goes. **Measured, not
+/// argued** — at `MENU_GLASS_ALPHA` over the C6 probe page the page's own
+/// heading read straight through the panel, and 8% of a white page under
+/// eave's chrome text is enough to make it look broken.
+///
+/// A notice about a page must not borrow that page's pixels. Opaque is
+/// the correctness requirement here, not a preference.
+pub fn notice_plate() -> Hsla {
+    rgb(if is_light() { 0xffffff } else { 0x282828 }).into()
+}
+
 /// The popover's rounding. Between `RADIUS_BUTTON` (7) and
 /// `RADIUS_PANEL` (10): a menu is a small floating card, not a pane.
 pub const RADIUS_MENU: f32 = 8.0;

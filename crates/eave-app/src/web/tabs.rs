@@ -3412,6 +3412,12 @@ wrap_request_handler! {
             if trace() {
                 eprintln!("[web] render process terminated for {}: {reason}", self.tab_id);
             }
+            // C6: whatever this renderer was, it is not unresponsive any
+            // more — it is gone. Dropped before the report, so no paint
+            // between here and the next render can put a "waiting for this
+            // page" notice over a page that has stopped existing. This is
+            // also the landing point of the operator's own `end page`.
+            super::hung::forget(&self.tab_id);
             // Drop the stale frame FIRST, so nothing can repaint the corpse
             // between the report and the next render.
             super::osr::forget(&self.tab_id);
@@ -3437,6 +3443,137 @@ wrap_request_handler! {
             );
         }
     }
+}
+
+thread_local! {
+    /// What `is_render_process_unresponsive` last answered per tab, so a
+    /// flip either way is noticed exactly once.
+    static HANG_SEEN: std::cell::RefCell<HashMap<String, bool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// **C6's producer: ASK, because eave can never be told.**
+///
+/// Chromium has a callback for this — `OnRenderProcessUnresponsive` — and
+/// it is unreachable in eave for a reason that is eave's own doing.
+/// `WebContentsImpl::RendererUnresponsive` opens with
+/// `ShouldIgnoreUnresponsiveRenderer()`, whose last line is
+///
+/// ```text
+/// return DevToolsAgentHost::IsDebuggerAttached(this);
+/// ```
+///
+/// — "ignore unresponsive renderers if the debugger is attached to them,
+/// since the unresponsiveness might be a result of the renderer sitting on
+/// a breakpoint". **eave attaches a DevTools client to every page it
+/// opens** and always has: E9's channel is what carries the notification
+/// shim, the audible shim, the selection reads and BR6's scroll restore.
+/// So every eave page looks, to Chromium, like a page with a debugger on
+/// it, and every hang report about one is dropped before CEF sees it.
+///
+/// **Measured, and confirmed on a control** (see
+/// `docs/reports/stage-c6-unresponsive-pages.md`): the handler never fires
+/// in eave; `IsRenderProcessUnresponsive` flips true in the same run;
+/// Chrome shows "Page Unresponsive" for the same page, and Chrome with
+/// DevTools open does not.
+///
+/// The poll is the way round it, and it reads the *same fact* rather than
+/// an approximation of it: `is_render_process_unresponsive` returns
+/// `RenderWidgetHostImpl::is_unresponsive_`, set on the first line of
+/// `RendererIsUnresponsive` — one statement earlier than the delegate hop
+/// that gets suppressed. Same threshold, same decision, same instant.
+///
+/// On the pump, because a hung renderer produces no frames and no
+/// callbacks: the pump is the only thing in the process still running
+/// anywhere near it. Traced on CHANGE only — a line per pump would bury
+/// the answer in its own noise.
+pub(super) fn poll_unresponsive() {
+    // Cloned out of the map first: `is_render_process_unresponsive` is a
+    // call into CEF, and this module's one rule is that no borrow is held
+    // across one.
+    let browsers: Vec<(String, Browser)> =
+        BROWSERS.with(|b| b.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    let mut changed_any = false;
+    for (tab_id, browser) in browsers {
+        let Some(host) = browser.host() else { continue };
+        let now = host.is_render_process_unresponsive() != 0;
+        // **A first sight is not a change.** Reported as one, the first
+        // poll of every healthy browser printed `responsive again` about a
+        // renderer that had never stopped answering — a trace line that
+        // says something untrue about every page eave opens is worse than
+        // no trace at all. `None` and `Some(false)` are both "nothing was
+        // wrong"; only a flip is news.
+        let before = HANG_SEEN.with(|p| p.borrow_mut().insert(tab_id.clone(), now));
+        if before.unwrap_or(false) == now {
+            continue;
+        }
+        if trace() {
+            eprintln!("[web] renderer {} for {tab_id}", if now { "unresponsive" } else { "responsive again" });
+        }
+        // The model is told in the same shape the callback would have used,
+        // so nothing downstream knows which producer it has.
+        let noted = if now {
+            super::hung::note_unresponsive(&tab_id, super::host::now_ms())
+        } else {
+            super::hung::note_responsive(&tab_id)
+        };
+        changed_any |= noted;
+    }
+    if changed_any {
+        super::host::note_chrome_change();
+    }
+}
+
+/// A tab's browser is going away — forget what the poll last saw, or a
+/// reused id inherits the answer given about somebody else's renderer.
+pub(super) fn forget_hang_poll(tab_id: &str) {
+    HANG_SEEN.with(|p| {
+        p.borrow_mut().remove(tab_id);
+    });
+}
+
+/// **End a hung page (C6)** — the notice's one button, at the operator's
+/// word and never otherwise.
+///
+/// **Not `Terminate()`.** That verb lives on the callback eave cannot
+/// receive (see [`poll_unresponsive`]), so the handle Chrome's "Exit Page"
+/// uses is not available here. What eave has instead is the funnel every
+/// other close goes through, and it turns out to be the better verb: the
+/// browser is force-closed and the tab stays on the strip, so the next
+/// `drive` re-creates it at the same address — the eviction path, which is
+/// already built and already walked. Chrome's Exit Page leaves you on an
+/// error page; this gives the page back.
+///
+/// A no-op for a tab that is not hung, or that recovered while the pointer
+/// was on its way to the button. That is not an error: it is the good
+/// outcome, and the notice will already have gone.
+pub fn end_hung_page(tab_id: &str) {
+    if super::hung::hung_for(tab_id, super::host::now_ms()).is_none() {
+        return;
+    }
+    if trace() {
+        eprintln!("[web] ending hung page {tab_id} at the operator's request");
+    }
+    // eave's own record first, so the notice goes now rather than when
+    // Chromium gets round to tearing the renderer down: the operator has
+    // decided, and a danger panel that lingers after its own button has
+    // been pressed reads as a control that did not work.
+    super::hung::forget(tab_id);
+    forget_hang_poll(tab_id);
+    close_browser_for(tab_id);
+    // **And ask for the reconcile, because nothing else will.** `drive`
+    // re-creates a browser for a tab that has none, but it runs on a
+    // SNAPSHOT, and closing this browser changes no tab in the strip — the
+    // tab is still there, still active, still at the same address — so no
+    // snapshot follows and the well would sit empty until the operator
+    // touched something. That is what the walk found: the close landed,
+    // the renderer died, and the page never came back.
+    //
+    // Eviction does not hit this because an evicted tab is re-created by
+    // the ACTIVATION that brings the operator back to it. There is no such
+    // event here: they never left.
+    super::evict::request_redrive();
+    super::host::request_pump();
 }
 
 /// Why a renderer died, in words an operator can act on.

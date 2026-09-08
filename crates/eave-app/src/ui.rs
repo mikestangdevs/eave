@@ -17169,6 +17169,174 @@ impl Shell {
         wrapper.into_any_element()
     }
 
+    /// **C6 — the page has stopped answering, drawn over that page.**
+    ///
+    /// # Why this is over a page at all
+    /// The floating-surface rule in `render` demands every overlay answer
+    /// "suppressed, or shown over a page?", and this one has
+    /// `page_dialog`'s warrant in its strongest form: **a surface may sit
+    /// over a page only if it is ABOUT the page**, and there is no other
+    /// page this could be about. Suppressing it leaves the operator
+    /// looking at a document that has quietly stopped being a document,
+    /// with nothing anywhere saying so — which is precisely the state C6
+    /// exists to end.
+    ///
+    /// # A notice, not a dialog
+    /// It sits at the top of the well rather than in the middle of it, it
+    /// takes no scrim, and it has one button. That shape is the argument:
+    /// the page underneath is frozen but its last frame is still the thing
+    /// the operator was reading, and covering it would take away the only
+    /// context for the decision. Nobody is being asked a question here —
+    /// see [`crate::web::hung`] on why waiting needs no button, and why
+    /// this notice may withdraw itself when the session notice it is
+    /// modelled on may not.
+    ///
+    /// The button is `reload page`, not Chrome's `Exit Page`: the verb
+    /// eave has is the eviction funnel, and it gives the page back rather
+    /// than leaving an error in its place. See
+    /// [`crate::web::end_hung_page`].
+    ///
+    /// # Called from BOTH page paths
+    /// A page renders in two places (`split_pane` when split, `render`'s
+    /// own branch when not) and floating chrome that goes in one of them
+    /// is absent from the other. This is a helper for that reason, and a
+    /// pane in a split gets the notice its neighbour gets.
+    fn hung_notice(&self, tab_id: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let held = crate::web::hung::hung_for(tab_id, eave_core::journal::now_ms())?;
+        let tab = tab_id.to_string();
+        Some(
+            div()
+                .debug_selector(|| "page-hung".into())
+                .absolute()
+                .top(px(theme::SPACE_3))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .px(px(theme::SPACE_3))
+                .child(
+                    div()
+                        .debug_selector(|| "page-hung-panel".into())
+                        // The page behind it cannot take a click while it
+                        // is hung, but it can the instant it recovers —
+                        // and a button that stops working the moment the
+                        // thing it is about gets better is worse than no
+                        // button. `page_dialog`'s reason, one layer down.
+                        .occlude()
+                        .max_w(px(HUNG_NOTICE_W))
+                        .rounded(px(theme::RADIUS_PANEL))
+                        .border_1()
+                        .border_color(theme::danger_ring())
+                        // **`menu_glass`, not `danger_plate_glass`** — and
+                        // the walk is what settled it. The danger plate is
+                        // the SESSION notice's material, tuned to sit on
+                        // eave's own near-black ground; over a white page
+                        // its 0.72 let the page's own headline read
+                        // straight through the panel. `menu_glass` is the
+                        // over-a-page material (0.92, derived from text
+                        // bleed) that `page_dialog` and the popup card
+                        // already use — except that even 0.92 was not
+                        // enough over a page with a 48 px headline under
+                        // it, so this is `notice_plate`, the same tint
+                        // with no transparency at all. The ring stays
+                        // `danger_ring`, so what says danger is the edge
+                        // and the dot rather than a tint that would have
+                        // to occlude to be read.
+                        .bg(theme::notice_plate())
+                        .shadow(theme::shadow_modal())
+                        .px(px(theme::SPACE_3))
+                        .py(px(theme::SPACE_2))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_size(px(theme::DETAIL_SIZE))
+                        .line_height(px(theme::DETAIL_LINE))
+                        .text_color(theme::text_secondary())
+                        // The same dot-and-elapsed heading the SESSION
+                        // notice uses for the same word, deliberately: an
+                        // operator should not have to learn twice what
+                        // "unresponsive" looks like in this app.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .size(px(theme::STATE_DOT))
+                                        .rounded_full()
+                                        .bg(theme::danger()),
+                                )
+                                .child(
+                                    div()
+                                        .font_weight(theme::WEIGHT_LABEL)
+                                        .text_color(theme::text())
+                                        .child(SharedString::from(format!(
+                                            "this page is not responding · {}",
+                                            fmt_elapsed(held)
+                                        ))),
+                                ),
+                        )
+                        .child(SharedString::from(crate::web::hung::EVIDENCE))
+                        // The button and its note are STACKED, not side
+                        // by side. Side by side is what `kill_affordance`
+                        // does and it is right there, where the note is
+                        // four words; here the note is a sentence, and in
+                        // a row it ran straight out past the panel's own
+                        // edge — a flex row does not wrap, and `max_w` on
+                        // the parent does not make it.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .items_start()
+                                .pt_1()
+                                .child(
+                                    div()
+                                        .px(px(theme::SPACE_3))
+                                        .py(px(theme::SPACE_1))
+                                        .rounded(px(theme::RADIUS_SELECT))
+                                        .border_1()
+                                        .border_color(theme::danger_ring())
+                                        .text_size(px(theme::DETAIL_SIZE))
+                                        .font_weight(theme::WEIGHT_LABEL)
+                                        .text_color(theme::danger())
+                                        .id("page-hung-end")
+                                        .debug_selector(|| "page-hung-end".into())
+                                        // `kill_affordance`'s blend, for
+                                        // its reason: the resting fill is
+                                        // already a danger wash, so the
+                                        // hover step is more of the same
+                                        // pigment rather than the neutral
+                                        // overlay an unfilled control uses.
+                                        .hover_fade(
+                                            "page-hung-end",
+                                            theme::danger_wash_strong(),
+                                            theme::danger_wash_hover(),
+                                        )
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |_, _, window, _| {
+                                            crate::web::end_hung_page(&tab);
+                                            window.refresh();
+                                        }))
+                                        .child("reload page"),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_size(px(theme::SMALL_SIZE))
+                                        .text_color(theme::text_tertiary())
+                                        .child(crate::web::hung::NOTHING_AUTOMATIC),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// D11 — the link under the pointer, bottom-left of the page.
     ///
     /// **Deliberately not interactive**: no `.id()`, no listeners, so
@@ -17328,6 +17496,8 @@ impl Shell {
                     .children(page_el)
                     .children(find)
                     .children(self.page_status_bubble(tab_id))
+                    // C6, in both page paths — see `hung_notice`.
+                    .children(self.hung_notice(tab_id, cx))
                     .children(absence.map(|note| {
                         div()
                             .debug_selector(|| "page-absence".into())
@@ -29150,6 +29320,13 @@ const OMNIBOX_HINT: &str = "Search or enter address";
 /// A statement about THIS tab, in a build that can render pages. It is the
 /// gap between activating a tab and CEF's first frame, which is short and
 /// is not nothing — `browser_host_create_browser` is asynchronous.
+/// How wide C6's unresponsive notice is allowed to get.
+///
+/// A cap rather than a width: the notice is two short lines and a button,
+/// and letting it span a 1600 px well would draw the eye across the whole
+/// screen to read a sentence that fits in a third of it.
+const HUNG_NOTICE_W: f32 = 460.;
+
 const PAGE_STARTING: &str = "starting the page…";
 
 /// What the well says under a page tab in a build with no page engine.
@@ -29667,6 +29844,16 @@ impl Render for Shell {
                 let left = if rail_shown { self.rail_w } else { 0. };
                 crate::popup_sheet::element(id, left, cx)
             });
+        // C6. Computed with the other floating surfaces because the rule
+        // below wants every overlay's relationship to the page decided in
+        // one place, and this one answers it the way `page_dialog` does:
+        // shown over a page, because there is no other page it could be
+        // about. The split path calls `hung_notice` itself, per pane.
+        let hung_el = strip_snapshot
+            .active
+            .as_deref()
+            .filter(|_| frame.active_is_page())
+            .and_then(|id| self.hung_notice(id, cx));
         let page_dialog_el = self.page_dialog(cx);
         // Computed beside `page_dialog_el` because the floating-surface
         // rule below wants every overlay's relationship to the page decided
@@ -31027,6 +31214,16 @@ impl Render for Shell {
                                                         gpui::deferred(el).into_any_element()
                                                     }),
                                                 )
+                                                // C6 — the page has
+                                                // stopped answering. Under
+                                                // the dialog on purpose:
+                                                // a `confirm()` raised
+                                                // before the hang is a
+                                                // renderer stopped on a
+                                                // question, and that card
+                                                // must never be painted
+                                                // under anything.
+                                                .children(hung_el)
                                                 // G2. Over the page and
                                                 // only over a page: it is
                                                 // ABOUT the page that
@@ -32075,7 +32272,15 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let transcript = transcript.clone();
         cx.spawn(async move |cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
-            if sessions.read_with(cx, |s, _| s.notice_standing()) {
+            // Slice C6: a hung PAGE's notice needs this second for a
+            // reason of its own, and a sharper one. A quiet session at
+            // least has an engine sending frames; a hung renderer sends
+            // nothing at all — no paint, no CEF callback, no script — so
+            // this heartbeat is the ONLY thing in the process that can
+            // move its elapsed. Asked through `sessions` because that is
+            // the entity this loop already holds and a notify on it
+            // re-renders the whole shell; the fact itself is the page's.
+            if sessions.read_with(cx, |s, _| s.notice_standing()) || crate::web::hung::any() {
                 sessions.update(cx, |_, cx| cx.notify());
             }
             // Slice N3: the working trailer's elapsed has to move too,

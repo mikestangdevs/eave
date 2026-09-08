@@ -136,6 +136,13 @@ pub mod scroll;
 /// CEF half — adopting the browser CEF was about to create rather than
 /// cancelling it — is in `tabs.rs`.
 pub mod popups;
+/// A page whose renderer has stopped answering (06-browser C6). Ungated
+/// for `popups`'s reason: it is a map, a subtraction and the notice's
+/// words. The CEF half is `tabs::poll_unresponsive` and
+/// `tabs::end_hung_page` — a poll rather than a handler, because
+/// `OnRenderProcessUnresponsive` is unreachable in eave; see this module
+/// for the whole of why.
+pub mod hung;
 /// Drag & drop as the chrome and the page share it (06-browser A5).
 /// Ungated for `selection`'s reason — it is a map and the rules for
 /// updating it. The four `drag_target_*` calls and `start_dragging` are
@@ -225,6 +232,26 @@ pub use tabs::{
     chrome, downloads, drive, install_fact_sink, install_request_sink, is_on_screen,
     print_to_pdf, set_shown_pages, web_memory, Download, Fact, PageChrome, PageRequest,
 };
+
+/// **End a hung page (C6)** — the notice's one button, and nothing else
+/// in eave calls it.
+///
+/// Only ever the operator's act. Nothing here times out, escalates or
+/// decides on their behalf: the whole point of the notice is to tell
+/// somebody which situation they are in and then let them choose, and a
+/// browser that quietly killed pages that were merely slow would be worse
+/// than one that said nothing.
+#[cfg(feature = "web")]
+pub fn end_hung_page(tab_id: &str) {
+    tabs::end_hung_page(tab_id);
+}
+
+/// No page engine, so there is no renderer to end. The state is still
+/// dropped, because the ungated half is what the default suite drives.
+#[cfg(not(feature = "web"))]
+pub fn end_hung_page(tab_id: &str) {
+    hung::forget(tab_id);
+}
 
 /// Close a popup and take its sheet down (C2) — the ✕, and Escape.
 ///
@@ -871,6 +898,14 @@ pub(crate) fn forget_page(tab_id: &str) {
     #[cfg(feature = "web")]
     input::abort_out_for(tab_id);
     drag::forget_tab(tab_id);
+    // C6. Ungated for `cdp::forget_tab`'s reason: a tab goes away in both
+    // feature states, and a cleanup only the `web` build ran would be one
+    // the default suite could never see fail. A stale entry here would put
+    // an "unresponsive" panel over a reused tab id that is perfectly well.
+    hung::forget(tab_id);
+    // And what the poll last saw about it — see `tabs::poll_unresponsive`.
+    #[cfg(feature = "web")]
+    tabs::forget_hang_poll(tab_id);
     FINDS.with(|f| {
         f.borrow_mut().remove(tab_id);
     });

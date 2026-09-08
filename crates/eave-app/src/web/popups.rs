@@ -31,17 +31,25 @@
 //! aesthetic preference about windows.
 //!
 //! # Where it is drawn
-//! A modal sheet over the opener's page: the size the page asked for, an
-//! origin, a close, and a scrim that swallows clicks. eave is one window
-//! and a page may not make it grow another (the C3 ruling, unchanged) —
-//! but a popup is not really a request for a *window*, it is a request for
-//! a **surface with a live handle that the page can close**, and a sheet
-//! is all of that. It is also what an OAuth popup already behaves like:
-//! you finish it or you cancel it, and the opener waits.
+//! A near-full overlay over the opener's page — Arc's peek, not a dialog.
+//! eave is one window and a page may not make it grow another (the C3
+//! ruling, unchanged) — but a popup is not really a request for a
+//! *window*, it is a request for a **surface with a live handle that the
+//! page can close**, and an overlay is all of that. It is also what an
+//! OAuth popup already behaves like: you finish it or you cancel it, and
+//! the opener waits.
+//!
+//! **A modal sheet was built first and refused on sight**, and the reason
+//! is kept because it is the design's whole argument: a dialog-sized card
+//! centred on the requested geometry treats a popup as a QUESTION, and a
+//! popup is a PAGE — a consent screen or a payment form is a document
+//! somebody has to read and work in. See `crate::popup_sheet`, which is
+//! the surface; nothing on it states an address, and the size the page
+//! asked for is not used at all (see [`page_size`]).
 //!
 //! # This module is the DECISION half and it is ungated
 //! Same bargain as [`super::ask`] and [`super::scroll`]: the geometry, the
-//! registry and the header's words are arithmetic and maps, so the
+//! registry and the split intent are arithmetic and maps, so the
 //! feature-off suite drives all of them. The CEF half — creating the
 //! browser, closing it — is four call sites in `tabs.rs`.
 //!
