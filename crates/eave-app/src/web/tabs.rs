@@ -1451,7 +1451,14 @@ fn adopt_popup(
     // measured from).
     let well = super::osr::view(&opener_tab);
     let (page_w, page_h) = super::popups::page_size(well.width as f32, well.height as f32);
-    let scale = well.scale;
+    // The opener's DISPLAY scale, with its card zoom taken back out: the
+    // overlay is drawn 1:1 even when the page that asked for it is a
+    // miniature on the plane.
+    let scale = if well.zoom > 0. {
+        well.scale / well.zoom
+    } else {
+        well.scale
+    };
     super::osr::set_view(
         &id,
         super::osr::View {
@@ -1460,6 +1467,9 @@ fn adopt_popup(
             scale,
             origin_x: 0.,
             origin_y: 0.,
+            // A popup is a root-mounted overlay, never a card on the
+            // plane, so it is drawn at 1:1 whatever the canvas is doing.
+            zoom: 1.0,
         },
     );
 

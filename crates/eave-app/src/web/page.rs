@@ -104,9 +104,19 @@ pub fn set_keyboard_page(tab_id: Option<&str>) {
 /// The element publishes its own origin at paint, so this subtraction is
 /// the whole conversion — there is no title-bar offset to guess at, and
 /// guessing one cost the spike a capture run.
+///
+/// **CV1 added the divide, and it is the input half of a zoomed card.** A
+/// card drawn at 40% is 224 window pixels wide and is still a 560-pixel
+/// page; a click 100 px in from its left edge is at page x 250, not 100.
+/// Without this every pointer event on a zoomed card lands short of where
+/// it was aimed, by exactly the factor the card is drawn at.
 fn to_page(tab_id: &str, at: Point<Pixels>) -> Point<Pixels> {
     let v = osr::view(tab_id);
-    gpui::point(at.x - gpui::px(v.origin_x), at.y - gpui::px(v.origin_y))
+    let z = v.zoom_or_one();
+    gpui::point(
+        (at.x - gpui::px(v.origin_x)) / z,
+        (at.y - gpui::px(v.origin_y)) / z,
+    )
 }
 
 fn apply_in_step(
@@ -532,7 +542,7 @@ thread_local! {
 /// the before and the after are the same instrument on the same binary.
 /// The only difference is what those frames LOOKED like: scaled, or drawn
 /// at one device pixel per device pixel and clipped.
-fn note_fit(tab_id: &str, fits: bool, fw: f32, fh: f32, want_w: f32, want_h: f32) {
+fn note_fit(tab_id: &str, fits: bool, fw: f32, fh: f32, want_w: f32, want_h: f32, scale: f32) {
     if !super::host::traced() {
         return;
     }
@@ -544,17 +554,26 @@ fn note_fit(tab_id: &str, fits: bool, fw: f32, fh: f32, want_w: f32, want_h: f32
         if fits {
             if entry.0 > 0 {
                 eprintln!(
-                    "[web] resize settled at {want_w:.0}x{want_h:.0} after {} stale frame(s), {} ms",
+                    "[web] {tab_id}: resize settled at {want_w:.0}x{want_h:.0} after {} stale frame(s), {} ms",
                     entry.0,
                     entry.1.elapsed().as_millis()
                 );
                 entry.0 = 0;
             }
         } else {
+            // Print at the start of a run and then every 120 frames, so a
+            // run that NEVER settles is visible. A once-only line reads
+            // exactly like a transient that resolved.
             if entry.0 == 0 {
                 entry.1 = std::time::Instant::now();
+            }
+            if entry.0 % 120 == 0 {
                 eprintln!(
-                    "[web] resize wants {want_w:.0}x{want_h:.0}, frame is {fw:.0}x{fh:.0}"
+                    "[web] {tab_id}: resize wants {want_w:.0}x{want_h:.0} @{scale:.2} \
+                     ({:.0}x{:.0} device), frame is {fw:.0}x{fh:.0}, stale {}",
+                    want_w * scale,
+                    want_h * scale,
+                    entry.0,
                 );
             }
             entry.0 += 1;
@@ -632,10 +651,11 @@ fn live_divider() -> bool {
 const RESIZE_SETTLE_PAINTS: u32 = 8;
 
 thread_local! {
-    /// Per surface: the last size it was asked to paint at, and how many
-    /// paints have happened since that size last changed.
-    static LAST_ASK: std::cell::RefCell<std::collections::HashMap<String, ((f32, f32), u32)>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Per surface: the last size and device scale it was asked to paint
+    /// at, and how many paints have happened since either last changed.
+    static LAST_ASK: std::cell::RefCell<
+        std::collections::HashMap<String, ((f32, f32, f32), u32)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// True while this surface's size is still moving.
@@ -655,13 +675,25 @@ thread_local! {
 /// [`RESIZE_SETTLE_PAINTS`] we stop stretching and fall back to E1's
 /// honest 1:1-and-clipped, rather than leaving a page visibly scaled for
 /// ever because a frame never arrived.
-fn size_is_moving(tab_id: &str, want_w: f32, want_h: f32) -> bool {
+fn size_is_moving(tab_id: &str, want_w: f32, want_h: f32, scale: f32) -> bool {
     LAST_ASK.with(|m| {
         let mut m = m.borrow_mut();
-        let entry = m.entry(tab_id.to_string()).or_insert(((want_w, want_h), 0));
+        let entry = m
+            .entry(tab_id.to_string())
+            .or_insert(((want_w, want_h, scale), 0));
         let (last, since) = entry;
-        if (last.0 - want_w).abs() >= 0.5 || (last.1 - want_h).abs() >= 0.5 {
-            *last = (want_w, want_h);
+        // **The scale counts as a size change, and CV1 is why.** Zooming a
+        // card leaves the logical view alone and moves only the density,
+        // so a scale-only test would call the surface settled while every
+        // frame in flight is still a picture at the old density — and the
+        // stale-frame path would clip it instead of scaling it, which
+        // makes a zoom flash the page at the wrong size. A rescale is a
+        // resize of the buffer; treat it as one.
+        if (last.0 - want_w).abs() >= 0.5
+            || (last.1 - want_h).abs() >= 0.5
+            || (last.2 - scale).abs() >= 0.001
+        {
+            *last = (want_w, want_h, scale);
             *since = 0;
             return true;
         }
@@ -696,6 +728,52 @@ pub fn set_live_divider(on: bool) {
 #[cfg(test)]
 pub(super) fn live_divider_for_test() -> bool {
     live_divider()
+}
+
+/// What CEF is told about an element box of `box_w`×`box_h`, painted at
+/// `zoom` window pixels per element pixel on a display whose backing factor
+/// is `display`.
+///
+/// Returns the **logical** page size, the device scale factor, and the
+/// guarded zoom — in that order, because that is the order they are needed.
+///
+/// **The logical size is the box itself, and that is the fix.** The element
+/// is measured in the card's own coordinates, which do not move when the
+/// zoom does — so the page is laid out at 560×460 whatever the plane is
+/// zoomed to, and the zoom is spent on the device scale factor instead.
+/// Chromium rasterises the same layout at `display × zoom` density, exactly
+/// as it would for a retina display. Before this, the card was told it *was*
+/// 224 pixels wide at 40% and reflowed into a phone width with desktop type
+/// still in it — the operator's word for it was corruption.
+///
+/// **Zooming OUT does not touch Chromium at all, and that is deliberate.**
+/// The obvious density is `display × zoom`, and it was built and measured
+/// first: below 1.0 Chromium simply does not follow. Traced — asked for
+/// 558×410 at 1.00, it kept answering with a 1012×744 buffer, stale for
+/// hundreds of consecutive frames and never settling, which on screen is
+/// the page drawn at twice its size and clipped to the card. So the ask is
+/// floored at the display's own factor: zoomed out, the page keeps
+/// rendering at full density and the GPU samples it down into a smaller
+/// box, which is a supersampled miniature and if anything *cleaner* than a
+/// small raster would be. Zoomed IN past 100% the ask does rise with the
+/// zoom, because there magnifying a texture is the thing that would look
+/// soft.
+///
+/// It also makes the whole 50–100% band free: the view never changes, so
+/// Chromium is never asked to re-render and there is no settling to wait
+/// for while the plane is being zoomed. **With `canvas::ZOOM_MAX` at actual
+/// size that band is the whole plane**, so today a page card's density is
+/// simply constant and CEF never hears about the zoom at all. The
+/// magnification branch is kept, dormant, because it is the correct rule
+/// and not a workaround: if the ceiling ever rises, the density has to rise
+/// with it or a magnified card is a stretched texture.
+///
+/// The identity that keeps a card sharp is `logical × ask == the buffer`,
+/// and gpui paints that buffer into `box × display × zoom` on screen —
+/// equal at and above 100%, an integer downsample below it.
+fn card_view(box_w: f32, box_h: f32, display: f32, zoom: f32) -> (f32, f32, f32, f32) {
+    let z = if zoom > 0.01 && zoom.is_finite() { zoom } else { 1. };
+    (box_w, box_h, display * z.max(1.0), z)
 }
 
 struct PageSurface {
@@ -794,13 +872,43 @@ impl Element for PageSurface {
         // space and element space become the same space, so there is no
         // offset to guess at. (A guessed 28 pt title-bar offset cost the
         // spike a capture run.)
-        let scale = window.scale_factor();
+        //
+        // **CV1: the zoom moves the RASTER, never the layout.** A card on
+        // the canvas is drawn at `zoom` window pixels per page pixel, and
+        // the naive thing — telling CEF the size it is drawn at — is what
+        // the operator saw and called corruption: at 40% a 560×460 card
+        // became a 224×184 viewport, so the page re-laid-out into a phone
+        // width with the same 13 px type in it. A miniature is not a
+        // narrower page.
+        //
+        // So the logical size is the card's size **at 100%** and never
+        // changes with the zoom, and the zoom goes into the device scale
+        // factor instead. Chromium then rasterises the *same layout* at
+        // `display × zoom` density — which is exactly what it already does
+        // for a retina display, and the reason `ViewChange::Rescaled`
+        // exists. The buffer that comes back is `bounds` worth of device
+        // pixels, so `paint_surface` draws it one for one and the card is
+        // a sharp miniature rather than a resampled one.
+        // `dev_scale` is what CEF is ASKED for; what gpui paints at is
+        // `window.scale_factor()`, and below 100% they are deliberately
+        // different — see `card_view`.
+        let (logical_w, logical_h, dev_scale, zoom) = card_view(
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            window.display_scale_factor(),
+            window.element_scale(),
+        );
         let view = osr::View {
-            width: f32::from(bounds.size.width).round() as i32,
-            height: f32::from(bounds.size.height).round() as i32,
-            scale,
-            origin_x: f32::from(bounds.origin.x),
-            origin_y: f32::from(bounds.origin.y),
+            width: logical_w.round() as i32,
+            height: logical_h.round() as i32,
+            scale: dev_scale,
+            // **In WINDOW space**, because this is what input is measured
+            // from and a pointer arrives in the window's coordinates. The
+            // element's own bounds are in the card's space, so this is the
+            // one place the scale is spent on the way out.
+            origin_x: f32::from(bounds.origin.x) * zoom,
+            origin_y: f32::from(bounds.origin.y) * zoom,
+            zoom,
         };
         let change = osr::set_view(&self.tab_id, view);
         if change != osr::ViewChange::Same {
@@ -894,16 +1002,33 @@ impl Element for PageSurface {
             bottom_right: radius,
             bottom_left: radius,
         };
-        let want_w = f32::from(bounds.size.width);
-        let want_h = f32::from(bounds.size.height);
+        // **In PAGE pixels, not window pixels.** Everything below compares
+        // a frame against what was asked for, and what was asked for is the
+        // logical view — so on a zoomed card these do not move when the
+        // zoom does. What moves is `dev_scale`, and `size_is_moving` reads
+        // that too.
+        let want_w = logical_w;
+        let want_h = logical_h;
+        // **Measured in DEVICE pixels, and a logical half-pixel was not
+        // good enough.** The buffer Chromium hands back is a whole number
+        // of device pixels; dividing it by a device scale that is not 1 or
+        // 2 lands on a logical size that is a fraction out, and a
+        // half-pixel test then calls a perfectly good frame stale forever.
+        // Traced on the canvas: `wants 554x294, frame is 555x294` for 644
+        // consecutive frames over 44 seconds, pumping Chromium twice a
+        // paint and painting the clipped fallback the whole time. Two
+        // device pixels is the tolerance because both sides round.
+        let dev_want_w = want_w * dev_scale;
+        let dev_want_h = want_h * dev_scale;
         let fit_of = |frame: &osr::Frame| {
-            let (fw, fh) = frame.logical(scale);
-            let fits = (fw - want_w).abs() < 0.5 && (fh - want_h).abs() < 0.5;
+            let (fw, fh) = frame.logical(dev_scale);
+            let fits = (frame.src_width as f32 - dev_want_w).abs() <= 2.0
+                && (frame.src_height as f32 - dev_want_h).abs() <= 2.0;
             (fw, fh, fits)
         };
         // Asked once per paint, and it MUTATES the counter, so it must not
         // be called again inside this frame.
-        let moving = size_is_moving(&self.tab_id, want_w, want_h);
+        let moving = size_is_moving(&self.tab_id, want_w, want_h, dev_scale);
         let mut frame = osr::frame(&self.tab_id);
         if let Some(ref f) = frame {
             let (fw, fh, mut fits) = fit_of(f);
@@ -929,14 +1054,14 @@ impl Element for PageSurface {
                     if let Some(ref f) = frame {
                         let next = fit_of(f);
                         fits = next.2;
-                        note_fit(&self.tab_id, fits, next.0, next.1, want_w, want_h);
+                        note_fit(&self.tab_id, fits, next.0, next.1, want_w, want_h, dev_scale);
                         if fits {
                             break;
                         }
                     }
                 }
             } else {
-                note_fit(&self.tab_id, fits, fw, fh, want_w, want_h);
+                note_fit(&self.tab_id, fits, fw, fh, want_w, want_h, dev_scale);
             }
             if let Some(frame) = frame {
                 let (fw, fh, fits) = fit_of(&frame);
@@ -953,12 +1078,28 @@ impl Element for PageSurface {
                 let ratio = |a: f32, b: f32| if a > b { a / b.max(1.0) } else { b / a.max(1.0) };
                 let modest =
                     ratio(fw, want_w) <= MAX_STRETCH && ratio(fh, want_h) <= MAX_STRETCH;
+                // **On a zoomed card a stale frame is the wrong
+                // RESOLUTION, never the wrong picture — so scale it.**
+                // E1's rule is right where it was written: during a window
+                // resize the LAYOUT is changing under you, and a scaled
+                // frame lies about where the text went. On the canvas the
+                // layout is pinned to the card's own size and only the
+                // density moves, so every frame this tab produces is a
+                // rendering of the same page and scaling one is exactly
+                // what a zoom is. The clipped fallback here is what the
+                // operator photographed at 81%: the page in the top-left
+                // half of its card with black around it.
+                let pinned_layout = zoom != 1.0;
                 if fits
                     || stretch_for_measurement()
+                    || (pinned_layout && modest)
                     || ((live_divider() || moving) && modest)
                 {
                     window.paint_surface_with_corners(bounds, frame.buffer, corners);
                 } else {
+                    // `fw`/`fh` are page pixels and so is the element's
+                    // box, so the stale frame is anchored top-left at its
+                    // own size and the element scale does the rest.
                     let at = Bounds {
                         origin: bounds.origin,
                         size: size(px(fw), px(fh)),
@@ -990,6 +1131,9 @@ impl Element for PageSurface {
         // round a widget that Chromium already drew its own shadow and
         // border into.
         if let Some((buffer, rect)) = osr::popup(&self.tab_id) {
+            // The rect is in the page's own coordinates and so is the
+            // element's box, so this is the same arithmetic it always was
+            // and the element scale carries it onto the screen.
             let at = Bounds {
                 origin: gpui::point(bounds.origin.x + px(rect.x), bounds.origin.y + px(rect.y)),
                 size: gpui::size(px(rect.width), px(rect.height)),
@@ -1157,7 +1301,14 @@ impl gpui::InputHandler for PageInput {
         let view = osr::view(&self.tab_id);
         let boxes = super::ime::bounds(&self.tab_id);
         let rect = super::ime::pick_rect(&boxes, &range_utf16)?;
-        let win = super::ime::to_window(&rect, view.origin_x, view.origin_y);
+        // **In the ELEMENT's space, not the window's**, because gpui puts
+        // an input handler's answers back into window coordinates itself
+        // (`PlatformInputHandler`'s scale). `View::origin` is stored in
+        // window coordinates — it is what raw pointer events are measured
+        // from, and those take no such path — so it is the origin that has
+        // to come back here, not the rect.
+        let z = view.zoom_or_one();
+        let win = super::ime::to_window(&rect, view.origin_x / z, view.origin_y / z);
         Some(Bounds {
             origin: gpui::point(px(win.x), px(win.y)),
             size: gpui::size(px(win.width), px(win.height)),
@@ -1179,8 +1330,10 @@ impl gpui::InputHandler for PageInput {
     /// The element's own box, so macOS has something to fall back to.
     fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
         let v = osr::view(&self.tab_id);
+        // Element space, for the same reason as `bounds_for_range`.
+        let z = v.zoom_or_one();
         Some(Bounds {
-            origin: gpui::point(px(v.origin_x), px(v.origin_y)),
+            origin: gpui::point(px(v.origin_x / z), px(v.origin_y / z)),
             size: gpui::size(px(v.width as f32), px(v.height as f32)),
         })
     }
@@ -1195,5 +1348,119 @@ impl gpui::InputHandler for PageInput {
     /// on a Latin layout, where no input source is claiming the keys.
     fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         true
+    }
+}
+
+/// CV2's zoom arithmetic. The behaviour it guards lives behind CEF and a
+/// live display, so these pin the identities the paint depends on.
+#[cfg(test)]
+mod card_view_tests {
+    use super::card_view;
+
+    /// At and above 100% the buffer exactly fills the space on screen, so
+    /// the card is drawn one buffer pixel per screen pixel.
+    #[test]
+    fn a_magnified_card_is_rendered_at_its_drawn_size() {
+        for display in [1.0_f32, 2.0] {
+            for zoom in [1.0_f32, 1.4, 2.0] {
+                let (box_w, box_h) = (560.0, 460.0);
+                let (lw, lh, dev, _) = card_view(box_w, box_h, display, zoom);
+                assert!(
+                    (lw * dev - box_w * display * zoom).abs() < 0.01,
+                    "width: {lw} x {dev} at zoom {zoom} on a {display}x display"
+                );
+                assert!((lh * dev - box_h * display * zoom).abs() < 0.01, "height at {zoom}");
+            }
+        }
+    }
+
+    /// Below 100% the ask stops moving. That is what keeps Chromium out of
+    /// the zoom entirely — and it is not a compromise, it is a buffer with
+    /// more pixels than the box it lands in.
+    #[test]
+    fn a_shrunken_card_keeps_asking_for_full_density() {
+        for display in [1.0_f32, 2.0] {
+            for zoom in [0.5_f32, 0.7, 0.99] {
+                let (_, _, dev, _) = card_view(560.0, 460.0, display, zoom);
+                assert_eq!(dev, display, "at zoom {zoom} on a {display}x display");
+            }
+        }
+    }
+
+    /// And the buffer is never SMALLER than the space it has to fill —
+    /// which is the whole difference between a miniature and a blur.
+    #[test]
+    fn the_buffer_is_never_short_of_the_space_it_lands_in() {
+        for display in [1.0_f32, 2.0] {
+            for zoom in [0.5_f32, 0.8, 1.0, 1.6, 2.0] {
+                let (lw, _, dev, _) = card_view(560.0, 460.0, display, zoom);
+                assert!(
+                    lw * dev >= 560.0 * display * zoom - 0.01,
+                    "short at zoom {zoom} on a {display}x display"
+                );
+            }
+        }
+    }
+
+    /// **The layout must not move when the zoom does.** This is the whole
+    /// operator complaint: a card drawn small used to be told it *was*
+    /// small, so the page reflowed into a phone width with desktop type
+    /// still in it. The element is measured in the card's own coordinates,
+    /// which the zoom does not touch — so the logical size CEF is given is
+    /// the box, whatever the plane is doing.
+    #[test]
+    fn the_page_is_laid_out_at_the_cards_own_size_whatever_the_zoom() {
+        for zoom in [0.5_f32, 0.8, 1.0, 2.0] {
+            let (lw, lh, _, _) = card_view(560.0, 460.0, 2.0, zoom);
+            assert_eq!((lw, lh), (560.0, 460.0), "logical size moved at {zoom}");
+        }
+    }
+
+    /// Only the DENSITY moves, and only upward.
+    #[test]
+    fn the_zoom_is_spent_on_the_device_scale_and_nowhere_else() {
+        for zoom in [1.0_f32, 1.5, 2.0] {
+            let (.., dev, _) = card_view(560.0, 460.0, 2.0, zoom);
+            assert!((dev - 2.0 * zoom).abs() < 1e-6, "at {zoom}");
+        }
+    }
+
+    /// The well, a split pane and a popup overlay are never inside a scaled
+    /// subtree, and for them nothing may have changed at all.
+    #[test]
+    fn an_unzoomed_surface_is_told_exactly_what_it_was_before() {
+        let (lw, lh, dev, z) = card_view(1200.0, 800.0, 2.0, 1.0);
+        assert_eq!((lw, lh, dev, z), (1200.0, 800.0, 2.0, 1.0));
+    }
+
+    /// A zoom of zero would divide a pointer coordinate by zero and put
+    /// every click at infinity. A garbage value is 1:1, never a crash.
+    #[test]
+    fn a_zoom_of_zero_is_refused_rather_than_divided_by() {
+        for bad in [0.0_f32, -3.0, f32::NAN, f32::INFINITY] {
+            let (lw, _, dev, z) = card_view(560.0, 460.0, 2.0, bad);
+            assert_eq!((lw, dev, z), (560.0, 2.0, 1.0), "for {bad}");
+        }
+    }
+
+    /// Input is the other half, and it is the one thing that still crosses
+    /// between the two spaces. The element publishes its origin multiplied
+    /// into WINDOW coordinates and `to_page` divides the pointer by the
+    /// same zoom, so a point a third of the way across the drawn card is a
+    /// third of the way across the page it is a picture of.
+    #[test]
+    fn a_point_lands_at_the_same_fraction_of_the_page_it_does_of_the_card() {
+        let element_origin = 120.0_f32;
+        for zoom in [0.5_f32, 1.0, 2.0] {
+            let (lw, ..) = card_view(560.0, 460.0, 2.0, zoom);
+            let published = element_origin * zoom;
+            // A third of the way across the card as DRAWN.
+            let at = published + 560.0 * zoom / 3.0;
+            let page_x = (at - published) / zoom;
+            assert!(
+                (page_x - lw / 3.0).abs() < 0.01,
+                "zoom {zoom}: {page_x} is not a third of {lw}"
+            );
+        }
     }
 }

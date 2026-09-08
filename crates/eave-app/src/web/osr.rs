@@ -299,12 +299,29 @@ pub enum ViewChange {
 pub struct View {
     /// Logical size, which is what CEF is told. Device pixels are this times
     /// `scale`.
+    ///
+    /// **On the canvas this is the card's own size at 100%, not the size it
+    /// is drawn at** — see [`View::zoom`].
     pub width: i32,
     pub height: i32,
+    /// Device pixels per logical page pixel: the display's backing scale
+    /// times the canvas zoom. Chromium rasterises the same layout at this
+    /// density, which is what makes a zoomed-out card a sharp miniature
+    /// rather than a resampled one.
     pub scale: f32,
     /// Window-space origin of the element, in logical pixels.
     pub origin_x: f32,
     pub origin_y: f32,
+    /// How many window pixels one page pixel is drawn at — CV1's canvas
+    /// zoom, and 1.0 everywhere else.
+    ///
+    /// **Kept beside the scale rather than folded into it because the two
+    /// answer different questions.** `scale` is what CEF is told and it
+    /// governs rasterisation; `zoom` is ours and it governs *geometry* —
+    /// every conversion between page space and window space multiplies or
+    /// divides by it. Folding them would make a retina display change
+    /// where a click lands.
+    pub zoom: f32,
 }
 
 impl Default for View {
@@ -315,7 +332,16 @@ impl Default for View {
             scale: 2.0,
             origin_x: 0.,
             origin_y: 0.,
+            zoom: 1.0,
         }
+    }
+}
+
+impl View {
+    /// The zoom, guarded. A default-constructed or garbage view must not
+    /// divide a pointer coordinate by zero.
+    pub fn zoom_or_one(&self) -> f32 {
+        if self.zoom > 0.01 { self.zoom } else { 1. }
     }
 }
 
@@ -330,7 +356,7 @@ pub fn set_view(tab_id: &str, next: View) -> ViewChange {
         let mut v = v.borrow_mut();
         let previous = v.insert(tab_id.to_string(), next);
         match previous {
-            Some(p) if p.scale != next.scale => ViewChange::Rescaled,
+            Some(p) if p.scale != next.scale || p.zoom != next.zoom => ViewChange::Rescaled,
             Some(p) if p.width != next.width || p.height != next.height => ViewChange::Resized,
             Some(_) => ViewChange::Same,
             // First layout. The browser was created at whatever

@@ -721,6 +721,53 @@ pub fn canvas() -> Hsla {
 /// is legible as a PATTERN it is decoration on every window. One step
 /// above the ground and no more — `border()`'s ink at a third of its
 /// weight, which is why it is a neutral and is listed as one.
+/// A card's plate ON THE PLANE — the ordinary content wash, flattened.
+///
+/// **Opaque, and overlap is why.** Everywhere else a card sits alone on the
+/// window and its 25% wash is the glass look: the ground, and through it the
+/// blurred desktop, read faintly through the plate. On the canvas cards are
+/// allowed to overlap — CV1 ruled that nothing resolves collisions — and a
+/// translucent card does not overlap, it BLENDS: the page of the card behind
+/// shows straight through the card in front, which the operator photographed
+/// as a ghost band of text lying across a neighbour.
+///
+/// So the same colour, composited once here instead of once per frame by the
+/// GPU. Over empty ground it is the plate it always was, to within the
+/// desktop's own contribution; over another card it occludes, which is what
+/// makes a stack read as a stack. A card on a plane is an object, not a pane
+/// of glass.
+pub fn canvas_card_plate() -> Hsla {
+    flatten_over_canvas(wash_content())
+}
+
+/// The plane's HUD plate — the zoom control and `tidy`.
+///
+/// Opaque for the same reason a card is, one step further out: the HUD
+/// floats over whatever the plane has under it, and `overlay_strong` over a
+/// white page card is a wash with nothing behind it. The controls have to
+/// stay readable over a card as well as over the ground.
+pub fn canvas_hud_plate() -> Hsla {
+    flatten_over_canvas(overlay_strong())
+}
+
+/// `top` composited onto the plane's ground, opaque.
+///
+/// The ground's own alpha is spent against the blurred desktop, which is
+/// not a colour this side can know; its tint at full strength is the
+/// closest stand-in, and it is within a value or two of what the desktop
+/// contributes in either appearance.
+fn flatten_over_canvas(top: Hsla) -> Hsla {
+    let base: gpui::Rgba = glass_canvas().into();
+    let top: gpui::Rgba = top.into();
+    let mix = |t: f32, b: f32| top.a * t + (1.0 - top.a) * b;
+    gpui::Hsla::from(gpui::Rgba {
+        r: mix(top.r, base.r),
+        g: mix(top.g, base.g),
+        b: mix(top.b, base.b),
+        a: 1.0,
+    })
+}
+
 pub fn canvas_dot() -> Hsla {
     let base = if is_light() { grey(0x00) } else { grey(0xff) };
     base.opacity(if is_light() { 0.10 } else { 0.07 })
@@ -4181,6 +4228,8 @@ mod tests {
             ("border_strong", border_strong()),
             ("edge_modal", edge_modal()),
             ("canvas_dot", canvas_dot()),
+            ("canvas_card_plate", canvas_card_plate()),
+            ("canvas_hud_plate", canvas_hud_plate()),
         ] {
             let c: Rgba = c.into();
             assert_eq!(

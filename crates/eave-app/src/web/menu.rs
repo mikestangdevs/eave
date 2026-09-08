@@ -95,10 +95,14 @@ cef::wrap_context_menu_handler! {
             // Page space -> window space, using the origin the element
             // published at its last paint. See the module note.
             let view = super::osr::view(&self.tab_id);
+            // Page pixels scale by the card's zoom before the origin is
+            // added; a menu opened on a card drawn at 40% belongs where
+            // the pointer is, not at 40% of the way there.
+            let z = if view.zoom > 0. { view.zoom } else { 1. };
             let menu = PageMenu {
                 tab_id: self.tab_id.clone(),
-                x: params.xcoord() as f32 + view.origin_x,
-                y: params.ycoord() as f32 + view.origin_y,
+                x: params.xcoord() as f32 * z + view.origin_x,
+                y: params.ycoord() as f32 * z + view.origin_y,
                 page_x: params.xcoord(),
                 page_y: params.ycoord(),
                 link_url: string_of(params.link_url()),

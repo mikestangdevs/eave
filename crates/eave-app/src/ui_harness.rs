@@ -23363,6 +23363,86 @@ fn card_rect(h: &Harness, vcx: &mut VisualTestContext, stem: &str) -> crate::can
         .unwrap_or_else(|| panic!("no card for {stem}"))
 }
 
+/// Put the plane at a zoom, the way the View menu does.
+#[track_caller]
+fn zoom_plane(h: &Harness, vcx: &mut VisualTestContext, to: f32) {
+    h.window
+        .update(vcx, |shell, _, cx| shell.zoom_canvas_to(to, None, cx))
+        .unwrap();
+    vcx.run_until_parked();
+    let got = h.window.read_with(vcx, |s, _| s.canvas_zoom.get()).unwrap();
+    assert!(
+        (crate::canvas::clamp_zoom(got) - crate::canvas::clamp_zoom(to)).abs() < 1e-3,
+        "asked for {to}, plane is at {got}"
+    );
+}
+
+/// The point in WINDOW coordinates that lands on the centre of an element
+/// inside a scaled card.
+///
+/// **`debug_bounds` reports an element's own bounds and the harness clicks
+/// in window coordinates, and on a zoomed plane those are two spaces.** A
+/// press aimed at a raw `debug_bounds` centre lands at `1/scale` of the way
+/// there, misses the card entirely, and the test goes green having run no
+/// handler — the same shape as AG2 #10's clipping trap, one space over.
+#[track_caller]
+fn at_drawn(h: &Harness, vcx: &mut VisualTestContext, selector: &str) -> Point<Pixels> {
+    let b = vcx
+        .debug_bounds(sel(selector.to_string()))
+        .unwrap_or_else(|| panic!("no element for {selector}"));
+    let s = crate::canvas::card_scale(h.window.read_with(vcx, |sh, _| sh.canvas_zoom.get()).unwrap());
+    let c = b.center();
+    point(px(f32::from(c.x) * s), px(f32::from(c.y) * s))
+}
+
+/// Carry an element from where it is DRAWN by a window-space delta.
+#[track_caller]
+fn carry_drawn(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    grab: &str,
+    dx: f32,
+    dy: f32,
+) {
+    let from = at_drawn(h, vcx, grab);
+    let to = point(from.x + px(dx), from.y + px(dy));
+    vcx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+    let mut nudge = from;
+    nudge.x += px(8.);
+    nudge.y += px(8.);
+    vcx.simulate_mouse_move(nudge, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+}
+
+/// Where a card is actually DRAWN, in window points.
+///
+/// `debug_bounds` reports an element's own bounds, and on the plane those
+/// are in the card's coordinates — the scale is applied when the primitive
+/// enters the scene, which is downstream of anything a test can read. So
+/// the conversion is spelled out here rather than assumed: what lands on
+/// screen is the bounds times the plane's scale.
+#[track_caller]
+fn drawn(
+    h: &Harness,
+    vcx: &mut VisualTestContext,
+    stem: &str,
+) -> (f32, f32, f32, f32) {
+    let b = vcx
+        .debug_bounds(sel(format!("column-{stem}")))
+        .unwrap_or_else(|| panic!("no card element for {stem}"));
+    let s = crate::canvas::card_scale(h.window.read_with(vcx, |sh, _| sh.canvas_zoom.get()).unwrap());
+    (
+        f32::from(b.origin.x) * s,
+        f32::from(b.origin.y) * s,
+        f32::from(b.size.width) * s,
+        f32::from(b.size.height) * s,
+    )
+}
+
 /// What the operator has placed by hand.
 #[track_caller]
 fn placed(h: &Harness, vcx: &mut VisualTestContext, stem: &str) -> Option<crate::canvas::CardRect> {
@@ -23627,6 +23707,125 @@ fn a_click_on_open_ground_opens_a_card_where_it_was_clicked(cx: &mut TestAppCont
         placed.x > card.origin.x.into(),
         "it landed to the right of the card that was there: {placed:?}"
     );
+}
+
+/// **CV2 — the operator's overlap ruling, end to end.** *"when i zoom out
+/// everything bundles together. everything should keep its place. not
+/// change around and over lap."*
+///
+/// The first cut let the cards stop shrinking at a floor while their
+/// POSITIONS kept scaling, and at 30% against a 50% floor every card was
+/// drawn two thirds larger than the space left for it. There is one scale
+/// now, and this is what says so: the gap between two neighbours, measured
+/// where it lands on screen, is the gutter scaled by the same number the
+/// cards are.
+#[gpui::test]
+fn cards_keep_their_gutter_at_every_zoom(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    for z in [crate::canvas::ZOOM_MIN, 0.6, 0.75, 0.9, crate::canvas::ZOOM_MAX] {
+        zoom_plane(&h, vcx, z);
+        let s = crate::canvas::card_scale(z);
+        let a = drawn(&h, vcx, "aaaa1111");
+        let b = drawn(&h, vcx, "bbbb2222");
+        // This window fits one across, so b is under a.
+        let gap = b.1 - (a.1 + a.3);
+        assert!(
+            (gap - crate::canvas::GUTTER * s).abs() < 1.0,
+            "at zoom {z} the gap is {gap}, wanted {}",
+            crate::canvas::GUTTER * s
+        );
+        assert!(gap > 0.0, "cards overlapped at zoom {z}");
+        assert!(
+            (a.2 - crate::canvas::CARD_W * s).abs() < 1.0,
+            "a card is drawn at the plane's scale: {a:?} at zoom {z}"
+        );
+    }
+}
+
+/// **A card is LAID OUT at its own size however far the plane is zoomed.**
+/// That is the whole of CV2: the contents are measured, wrapped and
+/// line-broken as they would be at 100%, and only the painting of them is
+/// smaller. CV1 scaled the box and left the contents to re-flow inside it,
+/// which the operator called corruption.
+#[gpui::test]
+fn a_cards_layout_does_not_move_when_the_plane_zooms(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let at_100 = vcx.debug_bounds("column-aaaa1111").expect("card").size;
+    for z in [crate::canvas::ZOOM_MIN, 0.7, 0.9, crate::canvas::ZOOM_MAX] {
+        zoom_plane(&h, vcx, z);
+        let laid_out = vcx.debug_bounds("column-aaaa1111").expect("card").size;
+        assert_eq!(laid_out, at_100, "the card was re-laid-out at zoom {z}");
+    }
+}
+
+/// **A drag on a zoomed plane follows the pointer.** A card carried N
+/// window points moves N points on screen, whatever the zoom — which
+/// means the placement moves `N / scale` in canvas points. Get the divide
+/// wrong and the card slides out from under the hand.
+#[gpui::test]
+fn a_card_carried_on_a_zoomed_plane_lands_under_the_pointer(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    zoom_plane(&h, vcx, crate::canvas::ZOOM_MIN);
+    let s = crate::canvas::card_scale(crate::canvas::ZOOM_MIN);
+    let before = card_rect(&h, vcx, "aaaa1111");
+
+    // 120 x 60 WINDOW points, which is what the pointer travels; the
+    // placement should move by `120 / s` canvas points, so the card stays
+    // under the hand.
+    carry_drawn(&h, vcx, "card-grab-aaaa1111", 120.0, 60.0);
+
+    let after = placed(&h, vcx, "aaaa1111").expect("the drag wrote a placement");
+    assert!((after.x - (before.x + 120.0 / s)).abs() < 1.0, "{after:?} from {before:?}");
+    assert!((after.y - (before.y + 60.0 / s)).abs() < 1.0);
+    assert_eq!(after.w, before.w, "a move is a move");
+    assert_eq!(after.h, before.h);
+}
+
+/// The same for a resize: the corner tracks the pointer at any zoom, and
+/// the origin still does not move.
+#[gpui::test]
+fn a_corner_dragged_on_a_zoomed_plane_tracks_the_pointer(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    zoom_plane(&h, vcx, crate::canvas::ZOOM_MIN);
+    let s = crate::canvas::card_scale(crate::canvas::ZOOM_MIN);
+    let before = card_rect(&h, vcx, "aaaa1111");
+
+    carry_drawn(&h, vcx, "card-grip-corner-aaaa1111", -100.0, -60.0);
+
+    let after = placed(&h, vcx, "aaaa1111").expect("the resize wrote a placement");
+    assert_eq!(after.x, before.x, "the origin never moves");
+    assert_eq!(after.y, before.y);
+    assert!((after.w - (before.w - 100.0 / s)).abs() < 1.0, "{after:?} from {before:?}");
+    assert!(after.w >= crate::canvas::CARD_W_MIN);
+}
+
+/// **A grip stays the same size on screen.** Everything else on a card is
+/// content and belongs at the card's scale; a grip is a target, and one
+/// scaled to three and a half points at the floor is not one the pointer
+/// can find. *"Seamless dragging and resizing"* is the ask this protects.
+#[gpui::test]
+fn a_resize_grip_is_the_same_width_at_every_zoom(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    for z in [crate::canvas::ZOOM_MIN, 1.0, crate::canvas::ZOOM_MAX] {
+        zoom_plane(&h, vcx, z);
+        let s = crate::canvas::card_scale(z);
+        let grip = vcx.debug_bounds("card-grip-right-aaaa1111").expect("right grip");
+        let on_screen = f32::from(grip.size.width) * s;
+        assert!(
+            (on_screen - crate::canvas::GRIP_BAND).abs() < 0.5,
+            "at zoom {z} the grip draws {on_screen} points wide"
+        );
+    }
 }
 
 /// **Every card is mounted at every zoom.** Nothing empties itself because

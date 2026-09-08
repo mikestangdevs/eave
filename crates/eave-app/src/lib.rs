@@ -104,6 +104,12 @@ pub mod columns;
 /// same reason `columns` is — every rule is decidable without a window.
 pub mod canvas;
 
+/// Slice CV2 — the element that paints a card at a scale, so a zoomed-out
+/// plane shows miniatures of its cards rather than the same content
+/// crushed into smaller boxes. Not pure: it is one element, and it exists
+/// because gpui has no transform of its own.
+mod scaled;
+
 /// The bookmarks bar's model half (Slice T1): B1's flat, depth-first
 /// `BookmarksSnapshot` read as a bar of top-level chips and the runs of
 /// children each folder opens. Public for the same reason `strip` is.

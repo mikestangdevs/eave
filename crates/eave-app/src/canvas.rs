@@ -64,8 +64,35 @@ pub const GRID_H_MAX: f32 = 900.0;
 pub const CARD_H: f32 = 460.0;
 
 /// The plane's zoom. 1.0 is one canvas point per window point.
-pub const ZOOM_MIN: f32 = 0.3;
-pub const ZOOM_MAX: f32 = 2.0;
+///
+/// **`ZOOM_MIN` is the operator's floor, and it binds the WHOLE plane.**
+/// Ruled on 2026-09-07: *"we need to define a certain minimum so we dont
+/// corrupt all the screens"*, and then, when the first cut let the cards
+/// stop shrinking while their positions kept gathering, *"when i zoom out
+/// everything bundles together. everything should keep its place. not
+/// change around and over lap."*
+///
+/// That second ruling is what fixes the number here rather than adding a
+/// second one. A card's size and its distance from its neighbour have to
+/// scale by the SAME factor or the arrangement is not preserved — cards
+/// that stop shrinking while the gaps keep closing will collide, and it is
+/// arithmetic, not tuning: at the old 0.3 against a 0.5 floor every card
+/// was drawn two thirds larger than the space left for it. So there is one
+/// scale for the plane, the floor is where zooming out stops, and the
+/// layout the operator arranged survives every zoom in it.
+///
+/// **`ZOOM_MAX` is 1.0, and that is a ceiling on purpose too.** Ruled on
+/// the same day, after the floor: *"why dont we just make a level to where
+/// the user cant zoom in anymore. mitigates all of the stress and
+/// tinkering."* Actual size is the only non-arbitrary place to stop — a
+/// card at 100% is the card, the same one Focus shows — and stopping there
+/// deletes a whole class of states rather than tuning them: nothing is ever
+/// magnified, so no card is ever bigger than it really is, no texture is
+/// ever stretched past its own pixels, and a page's density is a constant
+/// (see `page::card_view`). The plane's whole range is one screen's worth
+/// of card, seen from further away or from right up close.
+pub const ZOOM_MIN: f32 = 0.5;
+pub const ZOOM_MAX: f32 = 1.0;
 /// One press of ⌘+ / ⌘−, as a ratio — zoom is multiplicative, so the
 /// steps feel even at both ends.
 pub const ZOOM_STEP: f32 = 1.2;
@@ -235,6 +262,61 @@ pub fn tidy(placed: &mut Placements) {
 /// The plane's extent: everything placed, plus the plane's own margin.
 /// Empty gives a viewport-sized box at the origin so the pan clamp has
 /// something to work with on an empty canvas.
+/// Nudge a pan until at least one card is actually on screen.
+///
+/// **[`clamp_pan`] bounds the viewport against the content's BOUNDING BOX,
+/// and a bounding box is not the content.** Four cards at the corners of a
+/// wide arrangement make a box whose middle is empty, and the clamp is
+/// happy for the window to sit in that middle — legally overlapping the
+/// box, showing nothing. It is worst zoomed in, where the viewport covers
+/// least plane: the operator's ⌘+ walk ended on a screen of bare lattice
+/// with every card still open. A per-axis clamp cannot express "something
+/// is visible", because that is a two-dimensional fact.
+///
+/// So: if no card overlaps, move to the nearest pan where the nearest card
+/// does. Nearest by the correction it costs, so the plane travels the
+/// shortest distance that makes it honest — never to a card's centre,
+/// which would throw away a deliberate pan.
+///
+/// A no-op whenever anything is already in view, which is nearly always,
+/// and a no-op with no cards at all.
+pub fn keep_a_card_in_view(
+    pan_x: f32,
+    pan_y: f32,
+    rects: &[CardRect],
+    view_w: f32,
+    view_h: f32,
+) -> (f32, f32) {
+    if rects.is_empty() || !pan_x.is_finite() || !pan_y.is_finite() {
+        return (pan_x, pan_y);
+    }
+    // The pan interval on one axis for which `r` keeps `keep` of itself
+    // inside the viewport. Both ends, so a card wider than the window and
+    // one narrower than it are the same arithmetic.
+    let span = |lo: f32, size: f32, view: f32| -> (f32, f32) {
+        let keep = keep_on_screen(view).min(size);
+        let a = lo + keep - view;
+        let b = lo + size - keep;
+        (a.min(b), a.max(b))
+    };
+    let mut best: Option<((f32, f32), f32)> = None;
+    for r in rects {
+        let (ax, bx) = span(r.x, r.w, view_w);
+        let (ay, by) = span(r.y, r.h, view_h);
+        let px = pan_x.clamp(ax, bx);
+        let py = pan_y.clamp(ay, by);
+        // Already good enough for this card: nothing to do at all.
+        if px == pan_x && py == pan_y {
+            return (pan_x, pan_y);
+        }
+        let cost = (px - pan_x).abs().max((py - pan_y).abs());
+        if best.is_none_or(|(_, c)| cost < c) {
+            best = Some(((px, py), cost));
+        }
+    }
+    best.map(|(p, _)| p).unwrap_or((pan_x, pan_y))
+}
+
 pub fn content_bounds(rects: &[CardRect], view_w: f32, view_h: f32) -> CardRect {
     let mut it = rects.iter();
     let Some(first) = it.next() else {
@@ -416,7 +498,10 @@ pub fn clamp_zoom(z: f32) -> f32 {
     if !z.is_finite() {
         return 1.0;
     }
-    z.clamp(ZOOM_MIN, ZOOM_MAX)
+    // Quantised as well as clamped, so the plane has exactly ONE scale and
+    // every consumer of it agrees to the last bit. See `SCALE_STEPS`.
+    let z = z.clamp(ZOOM_MIN, ZOOM_MAX);
+    (z * SCALE_STEPS).round() / SCALE_STEPS
 }
 
 /// One step of the zoom, in or out.
@@ -826,7 +911,14 @@ mod tests {
         assert_eq!(clamp_zoom(f32::NAN), 1.0);
         assert_eq!(clamp_zoom(99.0), ZOOM_MAX);
         assert_eq!(clamp_zoom(0.0), ZOOM_MIN);
-        assert_eq!(zoom_step(1.0, 1), ZOOM_STEP);
+        // A step up from a middling zoom is a real step, within a lattice
+        // point: `clamp_zoom` quantises so the plane has exactly one scale
+        // (see `SCALE_STEPS`), and a multiplicative step never lands on the
+        // lattice twice running.
+        let mid = clamp_zoom(0.6);
+        assert!((zoom_step(mid, 1) - mid * ZOOM_STEP).abs() <= 1.0 / 64.0);
+        // And from actual size there is nowhere further in.
+        assert_eq!(zoom_step(ZOOM_MAX, 1), ZOOM_MAX, "1.0 is the ceiling");
         assert!(zoom_step(ZOOM_MAX, 1) == ZOOM_MAX, "clamps at the top");
         assert!(zoom_step(ZOOM_MIN, -1) == ZOOM_MIN, "and at the bottom");
         // The canvas point under the pointer before and after a zoom is
@@ -838,10 +930,13 @@ mod tests {
         let after = to_canvas(next.0, next.1, to, focus.0, focus.1);
         assert!((before.0 - after.0).abs() < 0.01, "{before:?} vs {after:?}");
         assert!((before.1 - after.1).abs() < 0.01);
-        // A zoomed-in window covers LESS of the plane.
-        let vp = viewport(0.0, 0.0, 1000.0, 800.0, 2.0);
-        assert_eq!((vp.w, vp.h), (500.0, 400.0));
-        let vp = viewport(0.0, 0.0, 1000.0, 800.0, 0.5);
+        // A zoomed-OUT window covers more of the plane, and at actual size
+        // one window point is one canvas point. (`viewport` clamps, so the
+        // zooms here are inside the plane's own range — a test that fed it
+        // 2.0 was asserting a state the operator cannot reach.)
+        let vp = viewport(0.0, 0.0, 1000.0, 800.0, ZOOM_MAX);
+        assert_eq!((vp.w, vp.h), (1000.0, 800.0));
+        let vp = viewport(0.0, 0.0, 1000.0, 800.0, ZOOM_MIN);
         assert_eq!((vp.w, vp.h), (2000.0, 1600.0));
     }
 
@@ -933,5 +1028,182 @@ mod tests {
         prune(&mut placed, &[ColumnId::Diff("/repo".into())]);
         assert_eq!(placed.len(), 1);
         assert!(placed.contains_key("diff-/repo"));
+    }
+}
+
+/// How many distinct scales the plane has — every zoom is a multiple of
+/// `1/64`.
+///
+/// **Quantised because a glyph is rasterised per scale.** Every card's text
+/// is re-rendered at `font_size × display × scale`, and gpui's sprite atlas
+/// keys on that number: a continuous pinch through a hundred distinct
+/// scales in a second would mint a fresh set of glyphs for each and thrash
+/// the atlas. Steps of 1.5% are below the threshold where a size change is
+/// visible in motion, and they bound the atlas at about ninety variants
+/// across the whole range.
+const SCALE_STEPS: f32 = 64.0;
+
+/// How big a card is drawn, given the plane's zoom.
+///
+/// **The same number the positions use, and that is the point** — see
+/// [`ZOOM_MIN`]. It exists as a named function rather than a bare `zoom` so
+/// that the paint, the ground's lattice and the drag arithmetic are all
+/// visibly asking one question, and so a future divergence has somewhere to
+/// live besides four call sites that have to be found.
+pub fn card_scale(zoom: f32) -> f32 {
+    if !zoom.is_finite() || zoom <= 0. {
+        return 1.0;
+    }
+    clamp_zoom(zoom)
+}
+
+#[cfg(test)]
+mod card_scale_tests {
+    use super::{ZOOM_MAX, ZOOM_MIN, card_scale, clamp_zoom};
+
+    /// The whole of the operator's second ruling in one assertion: what a
+    /// card is drawn at and what its position is scaled by are one number,
+    /// so two cards a gutter apart are a scaled gutter apart at every zoom
+    /// and can never collide.
+    #[test]
+    fn a_cards_size_and_its_place_scale_by_the_same_number() {
+        let mut z = ZOOM_MIN;
+        while z <= ZOOM_MAX {
+            assert_eq!(card_scale(z), clamp_zoom(z), "at {z}");
+            z += 0.01;
+        }
+    }
+
+    /// Two cards laid out side by side stay side by side: the gap between
+    /// their drawn edges is the gutter, scaled, and never negative.
+    #[test]
+    fn neighbouring_cards_keep_their_gutter_at_every_zoom() {
+        let pitch = super::CARD_W + super::GUTTER;
+        let mut z = ZOOM_MIN;
+        while z <= ZOOM_MAX {
+            let s = card_scale(z);
+            let gap = pitch * s - super::CARD_W * s;
+            assert!(
+                (gap - super::GUTTER * s).abs() < 0.001 && gap > 0.,
+                "gap {gap} at zoom {z}"
+            );
+            z += 0.01;
+        }
+    }
+
+    /// Both ends stop, and the ceiling is ACTUAL SIZE — nothing on the
+    /// plane is ever drawn bigger than it is.
+    #[test]
+    fn both_ends_of_the_zoom_stop() {
+        assert_eq!(card_scale(0.1), ZOOM_MIN);
+        assert_eq!(card_scale(ZOOM_MIN), ZOOM_MIN);
+        assert_eq!(card_scale(9.0), ZOOM_MAX);
+        assert_eq!(ZOOM_MAX, 1.0, "the ceiling is actual size, not a taste");
+        assert!(ZOOM_MIN < ZOOM_MAX);
+    }
+
+    /// Neighbouring zooms must not produce a visible jump, and the number
+    /// of distinct scales must stay small enough that the glyph atlas can
+    /// hold them.
+    #[test]
+    fn the_steps_are_fine_enough_to_glide_and_few_enough_to_cache() {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut z = ZOOM_MIN;
+        while z <= ZOOM_MAX {
+            seen.insert((card_scale(z) * 1000.0).round() as i64);
+            z += 0.001;
+        }
+        assert!(seen.len() <= 128, "{} distinct scales", seen.len());
+        assert!(seen.len() > 8, "a ladder this short is not a zoom");
+        for pair in seen.iter().copied().collect::<Vec<_>>().windows(2) {
+            assert!(pair[1] - pair[0] <= 32, "a {} thousandth jump", pair[1] - pair[0]);
+        }
+    }
+
+    #[test]
+    fn a_garbage_zoom_draws_a_card_at_its_own_size() {
+        assert_eq!(card_scale(0.0), 1.0);
+        assert_eq!(card_scale(-2.0), 1.0);
+        assert_eq!(card_scale(f32::NAN), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod keep_in_view_tests {
+    use super::{CARD_H, CARD_W, CardRect, keep_a_card_in_view};
+
+    /// The ordinary case, and it must cost nothing: a card is on screen, so
+    /// the pan is returned untouched — never re-centred, never nudged.
+    #[test]
+    fn a_pan_with_a_card_in_view_is_left_exactly_alone() {
+        let cards = [CardRect::new(0.0, 0.0, CARD_W, CARD_H)];
+        for pan in [(0.0_f32, 0.0_f32), (100.0, 60.0), (-80.0, -40.0)] {
+            assert_eq!(
+                keep_a_card_in_view(pan.0, pan.1, &cards, 1000.0, 700.0),
+                pan,
+                "at {pan:?}"
+            );
+        }
+    }
+
+    /// **The hole in the bounding box.** Four cards at the corners of a wide
+    /// arrangement: the union covers the middle and `clamp_pan` is happy to
+    /// sit there, with nothing on screen. This is the case that sent the
+    /// zoom walk to a blank plane.
+    #[test]
+    fn a_pan_into_the_empty_middle_is_pulled_to_the_nearest_card() {
+        let far = 6000.0;
+        let cards = [
+            CardRect::new(0.0, 0.0, CARD_W, CARD_H),
+            CardRect::new(far, 0.0, CARD_W, CARD_H),
+            CardRect::new(0.0, far, CARD_W, CARD_H),
+            CardRect::new(far, far, CARD_W, CARD_H),
+        ];
+        let (view_w, view_h) = (1000.0_f32, 700.0_f32);
+        let middle = (far / 2.0, far / 2.0);
+        let got = keep_a_card_in_view(middle.0, middle.1, &cards, view_w, view_h);
+        assert_ne!(got, middle, "the empty middle was accepted");
+        let view = CardRect::new(got.0, got.1, view_w, view_h);
+        assert!(
+            cards.iter().any(|c| overlaps(c, &view)),
+            "moved to {got:?} and still shows nothing"
+        );
+    }
+
+    /// It moves as little as it can: from the empty middle the answer is the
+    /// nearest corner's card, not the first in the list and not the origin.
+    #[test]
+    fn it_travels_the_shortest_distance_that_makes_it_honest() {
+        let far = 6000.0;
+        let cards = [
+            CardRect::new(0.0, 0.0, CARD_W, CARD_H),
+            CardRect::new(far, far, CARD_W, CARD_H),
+        ];
+        // Just past halfway, so the far card is the nearer one.
+        let from = (far * 0.6, far * 0.6);
+        let got = keep_a_card_in_view(from.0, from.1, &cards, 1000.0, 700.0);
+        assert!(got.0 > far * 0.5 && got.1 > far * 0.5, "went the wrong way: {got:?}");
+    }
+
+    /// A card larger than the window and one smaller than it are the same
+    /// arithmetic — neither may be pushed off.
+    #[test]
+    fn a_card_bigger_than_the_window_still_holds_the_pan() {
+        let cards = [CardRect::new(0.0, 0.0, 4000.0, 3000.0)];
+        let got = keep_a_card_in_view(20000.0, 20000.0, &cards, 1000.0, 700.0);
+        let view = CardRect::new(got.0, got.1, 1000.0, 700.0);
+        assert!(overlaps(&cards[0], &view), "{got:?}");
+    }
+
+    #[test]
+    fn an_empty_plane_and_a_garbage_pan_are_both_left_alone() {
+        assert_eq!(keep_a_card_in_view(50.0, 50.0, &[], 1000.0, 700.0), (50.0, 50.0));
+        let cards = [CardRect::new(0.0, 0.0, CARD_W, CARD_H)];
+        let (x, y) = keep_a_card_in_view(f32::NAN, 0.0, &cards, 1000.0, 700.0);
+        assert!(x.is_nan() && y == 0.0);
+    }
+
+    fn overlaps(a: &CardRect, b: &CardRect) -> bool {
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
     }
 }

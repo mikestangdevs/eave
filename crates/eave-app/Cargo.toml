@@ -148,14 +148,29 @@ objc2-user-notifications = { version = "0.3", default-features = false, optional
 #           content mask and z-order untouched — which is the whole
 #           point, because it means BackdropBlur sees the page.
 #           (Was spike/gpui-bgra-surface.patch; the patch file retired.)
-#   7910388 clip PaintSurface to corner_radii (SDF). Local `eave-line`
-#           on `spike/zed-fork`; the 8521fc1 checkout carries it until
-#           the pin is bumped. Without it the page's square corners
-#           overpaint the card radius.
+#   [ours — the pin bumped for CV2, 2026-09-07]
+#   ebc1f9b PaintSurface carries corner radii. This is the commit the note
+#           here USED to promise: "local `eave-line` on `spike/zed-fork`;
+#           the 8521fc1 checkout carries it until the pin is bumped."
+#           It was carried for months as five MODIFIED FILES inside
+#           `~/.cargo/git/checkouts` — a state the comment recorded and
+#           nothing enforced, where one cargo cache clean deletes a
+#           shipped feature with no error and no trace. Bumped, so the
+#           tree now builds from a commit that exists.
+#   2149d94 paint an element tree at a scale (`Window::with_element_scale`).
+#           CV2: the canvas draws a card at its own size and paints it
+#           smaller, so a zoomed-out card is a miniature rather than the
+#           same content reflowed into a smaller box. Composed out of two
+#           things gpui already did — element offset at prepaint, scale
+#           factor at paint — so no transform primitive was added. Three
+#           places had to learn there are two spaces now: `layout_bounds`
+#           reads taffy at the DISPLAY factor, a content mask carries the
+#           scale it was pushed at, and `Hitbox` carries its scale so the
+#           hit test divides the pointer instead.
 # `runtime_shaders` avoids a build-time Metal toolchain dependency;
 # `font-kit` is the macOS text system.
-gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27" }
-gpui_platform = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
+gpui = { git = "https://github.com/mikestangdevs/zed", rev = "2149d943d54272ee1feb22d47779dc7de6e4c558" }
+gpui_platform = { git = "https://github.com/mikestangdevs/zed", rev = "2149d943d54272ee1feb22d47779dc7de6e4c558", features = [
     "font-kit",
     "runtime_shaders",
 ] }
@@ -206,7 +221,7 @@ libc = "0.2"
 # `cargo build` once without. `.debug_selector()` calls compile to a
 # no-op in production builds (gpui elements/div.rs cfg gate).
 [dev-dependencies]
-gpui = { git = "https://github.com/mikestangdevs/zed", rev = "8521fc1477eb6f625dba32af7124a210b0bdfe27", features = [
+gpui = { git = "https://github.com/mikestangdevs/zed", rev = "2149d943d54272ee1feb22d47779dc7de6e4c558", features = [
     "test-support",
 ] }
 # Slice P3: the icon-parse test uses the SAME parser gpui uses at runtime,

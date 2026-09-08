@@ -13535,7 +13535,9 @@ impl Shell {
                 scroll: self.columns_scroll.get(),
                 pan_x,
                 pan_y,
-                zoom: self.canvas_zoom.get(),
+                // Clamped and quantised on the way in, so `geo.zoom` is
+                // the ONE number the whole paint agrees on.
+                zoom: crate::canvas::clamp_zoom(self.canvas_zoom.get()),
             },
         );
         self.columns_scroll_dirty.set(false);
@@ -13670,7 +13672,7 @@ impl Shell {
         let rail = if self.sessions.read(cx).collapsed { 0.0 } else { self.rail_w };
         let _ = window;
         let pan = self.canvas_shown_pan.get();
-        let zoom = self.canvas_zoom.get();
+        let zoom = crate::canvas::clamp_zoom(self.canvas_zoom.get());
         let (x, y) = crate::canvas::to_canvas(
             pan.0,
             pan.1,
@@ -14004,12 +14006,26 @@ impl Shell {
         // is zoomed in and more when it is zoomed out.
         let vp = crate::canvas::viewport(0.0, 0.0, view_w, view_h, zoom);
         let (cw, ch) = (vp.w, vp.h);
-        let rects = crate::canvas::layout(&order, &self.canvas_placed.borrow(), cw, ch);
+        // **The grid is measured in WINDOW points, not canvas points, and
+        // the difference is the zoom.** An unplaced card's slot comes from
+        // how much room there is; asked in canvas units that room doubles
+        // when you zoom out, so the grid would re-flow every time the plane
+        // scaled — a card would change shape and its neighbours would move,
+        // which is exactly what *"everything should keep its place. not
+        // change around"* rules out. The window's size is a fact about the
+        // window; the zoom is a fact about the view of the plane.
+        //
+        // The pan clamp below is the opposite case and keeps `cw`/`ch`: how
+        // much PLANE the window covers really does change with the zoom.
+        let rects = crate::canvas::layout(&order, &self.canvas_placed.borrow(), view_w, view_h);
         let bounds = crate::canvas::content_bounds(&rects, cw, ch);
         let dragging = self.canvas_drag.is_some();
         let mut pan = self.canvas_pan.get();
         if !dragging && view_w > 0.0 && view_h > 0.0 {
             pan = crate::canvas::clamp_pan(pan.0, pan.1, &bounds, cw, ch);
+            // A legal pan is not the same as a useful one — the clamp above
+            // bounds against the bounding box, which has holes in it.
+            pan = crate::canvas::keep_a_card_in_view(pan.0, pan.1, &rects, cw, ch);
             let mut been = self.columns_scrolled_to.borrow_mut();
             let mut asked = self.columns_asked.borrow_mut();
             if asked.is_some() && *asked == selected_col {
@@ -14023,6 +14039,7 @@ impl Shell {
                     if let Some(r) = selected.map(|ix| rects[ix]) {
                         let want = crate::canvas::pan_into_view(pan.0, pan.1, &r, cw, ch);
                         pan = crate::canvas::clamp_pan(want.0, want.1, &bounds, cw, ch);
+                        pan = crate::canvas::keep_a_card_in_view(pan.0, pan.1, &rects, cw, ch);
                     }
                     *been = selected_col.clone();
                 }
@@ -14200,7 +14217,7 @@ impl Shell {
             }
             let (view_w, view_h) = self.canvas_view.get();
             let pan = self.canvas_shown_pan.get();
-            let zoom = self.canvas_zoom.get();
+            let zoom = crate::canvas::clamp_zoom(self.canvas_zoom.get());
             let (x, y) = crate::canvas::to_canvas(
                 pan.0,
                 pan.1,
@@ -14276,7 +14293,8 @@ impl Shell {
             .px(px(theme::SPACE_1))
             .h(px(theme::ICON_TOGGLE + theme::SPACE_1))
             .rounded(px(theme::RADIUS_CHIP))
-            .bg(theme::overlay_strong())
+            // Opaque: the HUD floats over cards as well as over ground.
+            .bg(theme::canvas_hud_plate())
             .border_1()
             .border_color(theme::border())
             .child(self.zoom_control(cx))
@@ -14288,8 +14306,14 @@ impl Shell {
     /// because ⌘-scroll and ⌘± are gestures nobody is told about; the
     /// level itself is the ⌘0 button, which is the way home.
     fn zoom_control(&self, cx: &Context<Self>) -> AnyElement {
-        let pct = (self.canvas_zoom.get() * 100.0).round() as i32;
-        let step = |name: &'static str, glyph: &'static str, delta: i32| {
+        let now = crate::canvas::clamp_zoom(self.canvas_zoom.get());
+        let pct = (now * 100.0).round() as i32;
+        // **A control that cannot do anything says so.** CV2's floor is
+        // where zooming out stops — the whole plane holds, cards and
+        // spacing together — and a `−` that stays lit at the floor is the
+        // HUD claiming there is more plane to see. Same at the ceiling.
+        // Still drawn, so the pair does not shuffle sideways at the ends.
+        let step = |name: &'static str, glyph: &'static str, delta: i32, live: bool| {
             div()
                 .id(SharedString::from(name))
                 .debug_selector(move || name.into())
@@ -14299,11 +14323,21 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .hover_fade(name, theme::wash_rest(), theme::overlay())
-                .cursor_pointer()
                 .text_size(px(theme::LABEL_SIZE))
-                .text_color(theme::text_secondary())
-                .on_click(cx.listener(move |this, _, _, cx| this.zoom_canvas_by(delta, None, cx)))
+                .map(|d| {
+                    if live {
+                        d.hover_fade(name, theme::wash_rest(), theme::overlay())
+                            .cursor_pointer()
+                            .text_color(theme::text_secondary())
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.zoom_canvas_by(delta, None, cx)
+                                }),
+                            )
+                    } else {
+                        d.text_color(theme::text_disabled())
+                    }
+                })
                 .child(glyph)
         };
         div()
@@ -14314,7 +14348,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(theme::SPACE_1))
-            .child(step("canvas-zoom-out", "−", -1))
+            .child(step("canvas-zoom-out", "−", -1, now > crate::canvas::ZOOM_MIN))
             .child(
                 div()
                     .id("canvas-zoom-reset")
@@ -14334,7 +14368,7 @@ impl Shell {
                     .on_click(cx.listener(|this, _, _, cx| this.zoom_canvas_by(0, None, cx)))
                     .child(format!("{pct}%")),
             )
-            .child(step("canvas-zoom-in", "+", 1))
+            .child(step("canvas-zoom-in", "+", 1, now < crate::canvas::ZOOM_MAX))
             .into_any_element()
     }
 
@@ -14430,7 +14464,7 @@ impl Shell {
             // travel with the pan and scale with the zoom, which is what
             // makes them the ground rather than a texture on the window.
             .when(geo.canvas, |d| {
-                let (pan, z) = (geo.shown_pan, geo.zoom);
+                let (pan, z) = (geo.shown_pan, crate::canvas::card_scale(geo.zoom));
                 // The cards' boxes in WINDOW points. The ground stops at a
                 // card's edge: the plate is a wash, not paint, so a dot
                 // drawn under one shows straight through it and every card
@@ -14607,6 +14641,27 @@ impl Shell {
         let is_sel = geo.selected == Some(ix);
         let mounted = geo.is_mounted(ix);
         let rect = geo.rect(ix);
+        // **CV2: the card is LAID OUT at its own size and PAINTED at
+        // `card_scale`.** Nothing inside it knows about the zoom — the
+        // header, the transcript, the composer, the page and every icon in
+        // them are measured exactly as they would be at 100%, and the
+        // `scaled` wrapper at the end of this function is what makes the
+        // result smaller. That is the difference between a miniature and
+        // the crushed reflow CV1 drew.
+        //
+        // The card's place is in CANVAS points and the wrapper multiplies
+        // it — one scale for the position and the size, which is what keeps
+        // a gutter a gutter at every zoom (`canvas::ZOOM_MIN` carries the
+        // ruling that made that non-negotiable).
+        let card_s = crate::canvas::card_scale(geo.zoom);
+        let local = if geo.canvas {
+            gpui::point(
+                px(rect.x - geo.shown_pan.0),
+                px(rect.y - geo.shown_pan.1),
+            )
+        } else {
+            gpui::point(px(0.), px(0.))
+        };
         let slot = div()
             .id(SharedString::from(format!("column-{stem}")))
             .debug_selector({
@@ -14620,12 +14675,11 @@ impl Shell {
             // rect less the pan DRAWN this frame, so a glide moves every
             // card together and a drag moves one against the rest.
             .when(geo.canvas, |d| {
-                let z = geo.zoom;
                 d.absolute()
-                    .left(px((rect.x - geo.shown_pan.0) * z))
-                    .top(px((rect.y - geo.shown_pan.1) * z))
-                    .w(px(rect.w * z))
-                    .h(px(rect.h * z))
+                    .left(local.x)
+                    .top(local.y)
+                    .w(px(rect.w))
+                    .h(px(rect.h))
             })
             .flex()
             .flex_col()
@@ -14641,14 +14695,27 @@ impl Shell {
             // **No selection ring** (the operator's ruling on the first
             // run: *"no border highlight"*): the selection is the rail's
             // lit row and the composer's presence, not a coloured edge.
-            .bg(theme::content_plate())
+            .map(|d| {
+                // On the plane a card must OCCLUDE, not blend — see
+                // `theme::canvas_card_plate`.
+                d.bg(if geo.canvas {
+                    theme::canvas_card_plate()
+                } else {
+                    theme::content_plate()
+                })
+            })
             .border_1()
             .border_color(theme::card_border());
         if !mounted {
-            return slot.into_any_element();
+            let empty = slot.into_any_element();
+            return if geo.canvas {
+                crate::scaled::scaled(card_s, local, empty).into_any_element()
+            } else {
+                empty
+            };
         }
         let activate = col.clone();
-        slot.when(!is_sel, |d| {
+        let card = slot.when(!is_sel, |d| {
             d.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -14674,11 +14741,17 @@ impl Shell {
         // its card and would otherwise take the edge.
         .children(
             geo.canvas
-                .then(|| self.card_grips(&stem, rect, cx))
+                .then(|| self.card_grips(&stem, rect, card_s, cx))
                 .into_iter()
                 .flatten(),
         )
-        .into_any_element()
+        .into_any_element();
+        if !geo.canvas {
+            return card;
+        }
+        // **This one wrapper is the whole of CV2.** Everything above was
+        // built in the card's own units and knows nothing about the zoom.
+        crate::scaled::scaled(card_s, local, card).into_any_element()
     }
 
     /// **Slice CV1 — the move handle.** A full-width band across the top
@@ -14725,10 +14798,18 @@ impl Shell {
         &self,
         stem: &str,
         rect: crate::canvas::CardRect,
+        card_s: f32,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         use crate::canvas::Grip;
-        let band = px(crate::canvas::GRIP_BAND);
+        // **The one thing on a card that does NOT scale, and it is not an
+        // inconsistency.** Everything else here is content and belongs at
+        // the card's size; a grip is a TARGET. Scaled with the card it is
+        // three and a half points wide at the floor, which is under half
+        // the width the pointer needs, and *"seamless dragging and
+        // resizing"* was the ask that started this layout. Divided by the
+        // scale in card units, it draws the same width at every zoom.
+        let band = px(crate::canvas::GRIP_BAND / card_s.max(0.01));
         [Grip::Right, Grip::Bottom, Grip::Corner]
             .into_iter()
             .map(|grip| {
@@ -14799,14 +14880,14 @@ impl Shell {
         let Some(drag) = self.canvas_drag.as_mut() else {
             return;
         };
-        let z = crate::canvas::clamp_zoom(self.canvas_zoom.get());
-        let (dx, dy) = (
-            (f32::from(at.x) - drag.grab.0) / z,
-            (f32::from(at.y) - drag.grab.1) / z,
-        );
+        let z = crate::canvas::card_scale(self.canvas_zoom.get());
+        let (raw_x, raw_y) = (f32::from(at.x) - drag.grab.0, f32::from(at.y) - drag.grab.1);
+        let (dx, dy) = (raw_x / z, raw_y / z);
         // A threshold, so a click that wobbles by a pixel is still a click
-        // and does not write a placement.
-        if !drag.moved && dx.abs().max(dy.abs()) < 3.0 {
+        // and does not write a placement. Measured in WINDOW pixels: three
+        // points of wobble is three points of wobble whatever the plane is
+        // zoomed to.
+        if !drag.moved && raw_x.abs().max(raw_y.abs()) < 3.0 {
             return;
         }
         drag.moved = true;
