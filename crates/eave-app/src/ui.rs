@@ -6612,6 +6612,32 @@ struct Split {
 /// still fit (0.8 of the well); a fifth is refused, not squeezed.
 const SPLIT_MAX: usize = 4;
 
+/// A split pane's 1 px rim.
+///
+/// **The unfocused rim is what draws the corner, so it may not be
+/// transparent.** Ruled on 2026-09-10: *"all the open windows should have
+/// rounded corners now they dont unless clicked on."*
+///
+/// It was `transparent_black()` for every pane but the focused one, and
+/// the consequence is the one CL1 already wrote down about columns: the
+/// plate's fill sits within a value or two of the ground and **a page
+/// paints over the rounded clip**, so the stroke IS the edge. No stroke,
+/// no corner — and a pane grew its corners back only when you clicked it,
+/// which reads as the corner being a selection state.
+///
+/// Two rims, both real: [`theme::card_border`] at rest — the same resting
+/// edge a canvas card wears — and [`theme::pane_focus_ring`], three times
+/// its strength, for the one with the keyboard. Focus is a *step* in the
+/// same neutral, which is why it can be read as focus rather than as
+/// structure.
+fn pane_rim(is_focused: bool) -> gpui::Hsla {
+    if is_focused {
+        theme::pane_focus_ring()
+    } else {
+        theme::card_border()
+    }
+}
+
 /// Which edge of a pane a tab was dropped against.
 ///
 /// **A drop names an axis as well as a side.** Ruled on 2026-09-10:
@@ -17557,11 +17583,7 @@ impl Shell {
             // another WasResized. Same reason the rail's selection rim
             // is an inset shadow rather than a border.
             .border_1()
-            .border_color(if is_focused {
-                theme::pane_focus_ring()
-            } else {
-                gpui::transparent_black()
-            })
+            .border_color(pane_rim(is_focused))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -17682,14 +17704,16 @@ impl Shell {
         // window separated by a 4 pt seam, and the seams disappeared into
         // them.
         //
-        // `rail_plate` is the sidebar's own, and it is an `ink` — a
-        // translucent wash over whatever it is laid on, not an opaque
-        // fill. That is the half the ruling insists on: the card's edge
-        // and its radius still show THROUGH the header, so a pane's top
-        // corners stay drawn instead of being painted over.
+        // **The first cut used `rail_plate` directly and did not fix it**
+        // — *"the white background is still there."* That token is a
+        // translucent ink, so inside a pane it composited over the CARD's
+        // near-white plate and landed on 239 where the sidebar sits at
+        // 233. The material was right and its GROUND was wrong;
+        // `pane_header_plate` resolves it against the same glass the rail
+        // is laid on. See that token.
         let row = div()
             .size_full()
-            .bg(theme::rail_plate())
+            .bg(theme::pane_header_plate())
             .pl(px(lead))
             .pr(px(theme::SPACE_3))
             .flex()
@@ -35031,6 +35055,26 @@ mod tests {
     /// Slice SP1: a window's splits round-trip through `frame.json`, keep
     /// their neighbours and the other windows' entries, and a malformed
     /// entry costs only itself.
+    /// **Every pane draws a corner, not just the focused one.** Ruled on
+    /// 2026-09-10: *"all the open windows should have rounded corners now
+    /// they dont unless clicked on."*
+    ///
+    /// This is asserted here rather than in the harness because
+    /// `debug_bounds` reports geometry and NEVER colour — the defect this
+    /// guards passed every geometry test in the file, twice over, in CL1
+    /// and again here.
+    #[test]
+    fn an_unfocused_pane_still_has_a_rim_to_draw_its_corner_with() {
+        let rest = pane_rim(false);
+        assert!(rest.a > 0.0, "a transparent rim draws no corner: {rest:?}");
+        let focused = pane_rim(true);
+        assert!(focused.a > rest.a, "focus must be a STEP in the rim, not its arrival");
+        // And it is a step in the same neutral — a focused pane is not a
+        // different KIND of edge, which is what the accent made it.
+        assert_eq!(rest.s, 0.0, "the resting rim took on chroma");
+        assert_eq!(focused.s, 0.0, "the focus rim took on chroma");
+    }
+
     /// **A drop names an axis as well as a side.** Ruled on 2026-09-10:
     /// *"i should be able to grab edges and put the above/below other
     /// tabs."*

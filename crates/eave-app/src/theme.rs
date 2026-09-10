@@ -750,6 +750,32 @@ pub fn canvas_hud_plate() -> Hsla {
     flatten_over_canvas(overlay_strong())
 }
 
+/// The pane header's plate — **the sidebar's surface, resolved**.
+///
+/// Ruled on 2026-09-10, twice. First: *"we need to remove the colored
+/// background and have it match the sidebar. the translucent styling of
+/// it is needed so tabs edges arent swallowed."* Then, when the header
+/// was simply given [`rail_plate`] and still came out pale: *"the white
+/// background is still there. it should be gone."*
+///
+/// **The material was already right; its GROUND was wrong.** `rail_plate`
+/// is an `ink` — a translucent wash — so what it renders as depends on
+/// what is under it. Down the side of the window it composites over the
+/// window's glass and measures 233/255 in light mode. Inside a pane it
+/// was compositing over the CARD's plate, which is very nearly white, and
+/// measured 239. Same token, different ground, and the card's white was
+/// what kept showing through.
+///
+/// So it is flattened onto the glass here, exactly as
+/// [`canvas_card_plate`] is and for the same reason CV2 gave: a surface
+/// that must read as ONE known colour cannot be left to blend with
+/// whatever it happens to be laid over. The translucency the ruling asks
+/// for is kept where it does the work — the pane's rim and its corner
+/// radius are drawn by the border, not painted over by this.
+pub fn pane_header_plate() -> Hsla {
+    flatten_over_canvas(rail_plate())
+}
+
 /// `top` composited onto the plane's ground, opaque.
 ///
 /// The ground's own alpha is spent against the blurred desktop, which is
@@ -4283,6 +4309,7 @@ mod tests {
             ("canvas_dot", canvas_dot()),
             ("canvas_card_plate", canvas_card_plate()),
             ("canvas_hud_plate", canvas_hud_plate()),
+            ("pane_header_plate", pane_header_plate()),
         ] {
             let c: Rgba = c.into();
             assert_eq!(
