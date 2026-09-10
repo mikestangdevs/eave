@@ -17669,8 +17669,27 @@ impl Shell {
             theme::SPACE_3
         };
 
+        // **The header is CHROME, so it wears the chrome surface.** Ruled
+        // on 2026-09-10: *"at the top of the screen, splits are not
+        // viewable becuase of color. we need to remove the colored
+        // background and have it match the sidebar. the translucent
+        // styling of it is needed so tabs edges arent swallowed."*
+        //
+        // It used to set nothing and inherit the CARD's plate, so the top
+        // of every pane was the content surface — measured in light mode
+        // at 251/255 against the rail's 233. One pane got away with it;
+        // four in a split put four near-white bands across the top of the
+        // window separated by a 4 pt seam, and the seams disappeared into
+        // them.
+        //
+        // `rail_plate` is the sidebar's own, and it is an `ink` — a
+        // translucent wash over whatever it is laid on, not an opaque
+        // fill. That is the half the ruling insists on: the card's edge
+        // and its radius still show THROUGH the header, so a pane's top
+        // corners stay drawn instead of being painted over.
         let row = div()
             .size_full()
+            .bg(theme::rail_plate())
             .pl(px(lead))
             .pr(px(theme::SPACE_3))
             .flex()
