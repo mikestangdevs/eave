@@ -29854,6 +29854,9 @@ impl Render for Shell {
             .layout
             .lays_out_cards()
             .then(|| self.columns_geometry(&frame, &strip_snapshot, window, cx));
+        // Read here, where the snapshot is: the well's card decides
+        // `framed` far below, inside a closure that has neither.
+        let split_now = self.showing_split(&strip_snapshot).is_some();
 
         let shown_pages: Vec<String> = {
             let mut ids = Vec::new();
@@ -31183,7 +31186,34 @@ impl Render for Shell {
                                 let columns_now = columns_geo
                                     .as_ref()
                                     .filter(|_| !(show_launcher && !blank_page));
-                                let bare = columns_now.is_some();
+                                // **A split well is bare too, and that is the
+                                // last layer of the 2026-09-10 colour
+                                // ruling** — *"we need to get rid of this
+                                // final bit of color … its like there is
+                                // one more layer you keep missing."*
+                                //
+                                // `ContentCard` fills its WHOLE region with
+                                // `content_plate` before the child paints.
+                                // Under a split that plate is not the
+                                // pane's surface, it is the surface BEHIND
+                                // every pane — and a pane's page does not
+                                // cover its header, so the plate showed
+                                // through as a band across the top of each
+                                // one. Emptying the header (`pane_header`
+                                // paints nothing now) could not reach it,
+                                // because it was never the header painting.
+                                //
+                                // The argument is CL1's, already written on
+                                // `ContentCard::framed` for Columns and
+                                // true here for the same reasons: each pane
+                                // carries its own rim (`pane_rim`) and the
+                                // seam between panes is the window's
+                                // ground, so the card has nothing left to
+                                // draw. Its rim is the worse half — a
+                                // rectangle around the whole region, whose
+                                // edges run straight across every seam and
+                                // weld the panes into one sheet.
+                                let bare = columns_now.is_some() || split_now;
                                 let inner = if let Some(geo) = columns_now {
                                     self.render_columns_well(
                                         geo,
