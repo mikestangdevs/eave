@@ -13680,6 +13680,28 @@ impl Shell {
             f32::from(at.x) - rail - theme::CARD_GUTTER,
             f32::from(at.y) - theme::CARD_GUTTER,
         );
+        // **Is this ground at all?** Ruled on 2026-09-10: *"when i click in
+        // a window (a browser tab or code tab) it just keeps opening a new
+        // code tab."*
+        //
+        // The listener that calls this sits on the WELL, and the note above
+        // it used to claim that over a card it never runs, because the
+        // card's own `on_mouse_down` and its controls sit above it. **That
+        // is not what a bubble-phase listener does** — a child handling a
+        // press does not stop the parent hearing it, and the card's
+        // activate listener is only attached `when(!is_sel)`, so on the
+        // SELECTED card there was no listener there at all. Every press on
+        // a card opened a tab.
+        //
+        // It was always wrong and CV3 is what made it constant: cards are
+        // the size of the well now, so nearly every press lands on one.
+        // The fix is the question asked outright, against the same
+        // `canvas_rects` the wheel and the drop already hit-test — geometry
+        // this function can check itself, rather than a bet on the order
+        // gpui delivers listeners in.
+        if self.canvas_rects.borrow().iter().any(|r| r.contains(x, y)) {
+            return;
+        }
         // The pointer is the card's TOP-LEFT, the same place a drag holds
         // it, so the card appears under the hand and not around it.
         self.canvas_spawn_at.set(Some((x, y)));
@@ -14543,9 +14565,13 @@ impl Shell {
                 // **A click on open ground spawns a card there** — ruled
                 // on 2026-09-07. The ground is the only thing under the
                 // pointer that owns no other gesture, so a plain click on
-                // it can mean the obvious thing. Over a CARD this listener
-                // never runs: the card's own `on_mouse_down` (activate)
-                // and its controls sit above it.
+                // it can mean the obvious thing.
+                //
+                // This listener DOES run over a card — it is on the well
+                // and a card handling a press does not stop the well
+                // hearing it. `click_canvas_ground` asks whether the point
+                // is on a card and returns if it is; see the note there,
+                // and the 2026-09-10 ruling it carries.
                 d.on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, e: &MouseDownEvent, window, cx| {

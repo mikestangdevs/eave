@@ -23723,6 +23723,54 @@ fn a_click_on_open_ground_opens_a_card_where_it_was_clicked(cx: &mut TestAppCont
     );
 }
 
+/// **A press ON a card is not a press on the ground.** Ruled on
+/// 2026-09-10: *"when i click in a window (a browser tab or code tab) it
+/// just keeps opening a new code tab. that should not happen."*
+///
+/// The spawn listener lives on the WELL, and the note above it used to
+/// claim a card's own listeners kept it from running — they do not, a
+/// bubble-phase listener still reaches the parent, and the card's activate
+/// listener is only attached while it is UNSELECTED, so the selected card
+/// had none at all. CV3 made it constant rather than causing it: a card is
+/// the size of the well now, so almost every press is on one.
+///
+/// This drives the two cases that differ, because they differed in the
+/// bug: the SELECTED card (no activate listener beneath the press) and an
+/// unselected one.
+#[gpui::test]
+fn a_press_on_a_card_does_not_open_a_tab(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111"), session("bbbb2222")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let _ = h.drain();
+    for stem in ["aaaa1111", "bbbb2222"] {
+        let card = drawn(&h, vcx, stem);
+        // Well inside the card, clear of its grips and its header.
+        let at = point(px(card.0 + card.2 * 0.5), px(card.1 + card.3 * 0.5));
+        vcx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        vcx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        vcx.run_until_parked();
+        assert!(
+            !h.drain().iter().any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
+            "a press on card {stem} asked the engine for a tab"
+        );
+    }
+    // And the ground still spawns, so the guard has not simply killed the
+    // gesture — the plane at the floor has room beside the grid.
+    zoom_plane(&h, vcx, crate::canvas::ZOOM_MIN);
+    let a = drawn(&h, vcx, "aaaa1111");
+    let strip = vcx.debug_bounds("column-strip").expect("column-strip");
+    let ground = point(px(a.0 + a.2 + 40.), strip.origin.y + px(200.));
+    assert!(ground.x < strip.origin.x + strip.size.width, "precondition: ground is on screen");
+    vcx.simulate_mouse_down(ground, MouseButton::Left, Modifiers::none());
+    vcx.simulate_mouse_up(ground, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        h.drain().iter().any(|c| matches!(c, Command::Browser(BrowserCmd::NewTab { .. }))),
+        "the ground stopped spawning"
+    );
+}
+
 /// **CV2 — the operator's overlap ruling, end to end.** *"when i zoom out
 /// everything bundles together. everything should keep its place. not
 /// change around and over lap."*

@@ -1916,9 +1916,17 @@ pub const TRAFFIC_D: f32 = 12.0;
 pub const RAIL_GRID_TOP: f32 = TRAFFIC_Y + TRAFFIC_D + SPACE_3;
 
 /// Uniform air between the window surface and the content card: top,
-/// right, bottom, and the gap between the rail and the card. 8 px is
-/// [`SPACE_2`].
-pub const CARD_GUTTER: f32 = SPACE_2;
+/// right, bottom, and the gap between the rail and the card.
+///
+/// **Halved to [`SPACE_1`] on 2026-09-10** — *"i need the application
+/// border to be skinner. (boarder around a screen)"*, measured off a live
+/// window at 16 device px and traced here rather than to the plane's own
+/// margin, which was not what was on screen (that window was in Focus).
+/// It is the app's whole outer frame, so one step down the spacing scale
+/// takes it everywhere at once and the modes cannot drift apart. Bounded
+/// below by the fact that it also separates the rail from the card: at 0
+/// the two plates weld and the rail stops reading as its own surface.
+pub const CARD_GUTTER: f32 = SPACE_1;
 
 /// The reading column: outer gutter + centered cap (waku: 20 / 720).
 pub const GUTTER: f32 = 20.0;
