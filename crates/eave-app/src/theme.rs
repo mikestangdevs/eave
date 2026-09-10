@@ -1388,8 +1388,22 @@ pub fn accent() -> Hsla {
 /// location and stays on [`selection_rim`]; clicking a pane is an
 /// action, so the ring is the accent's. Always laid out (transparent
 /// when the pane is not focused) so focusing cannot shift the well.
+/// The band around the split pane that has the keyboard.
+///
+/// **Neutral, not the accent.** Ruled on 2026-09-10: *"window borders
+/// should not be purple. they should be a clear band in light and dark
+/// mode."* It was `accent()`, so the focused pane wore a violet rim — the
+/// one ink in the app with real chroma, spent on a fact that is not about
+/// colour. The rule the rest of the theme keeps is that **surfaces carry
+/// the brand and inks never do**, and a 1 px rim is an ink.
+///
+/// [`ink`] is achromatic and flips with the appearance — dark ink on a
+/// light ground, light ink on a dark one — so one number is a clear band
+/// in both modes without a second token or a light-mode branch. 0.28 is
+/// three times [`card_border`]'s resting rim, which is what makes it read
+/// as *this pane* rather than as every pane's edge.
 pub fn pane_focus_ring() -> Hsla {
-    accent()
+    ink(0.28)
 }
 /// The armed send button under the pointer — **Tailwind violet-300**,
 /// `oklch(0.811 0.111 293.571)`, one step up the same ramp.
@@ -2351,6 +2365,19 @@ pub const SPLIT_RATIO_MIN: f32 = 0.20;
 /// centred on it gives 4 either side — [`RAIL_CARD_BLEED`]'s reasoning
 /// (a mark must bleed past the thing it marks) applied to a hit box.
 pub const RAIL_HANDLE_W: f32 = 8.0;
+
+/// The divider between two split panes — the gap you see and the target
+/// you grab, which are the same element.
+///
+/// **Halved from [`RAIL_HANDLE_W`] on 2026-09-10** — *"our gab split
+/// inbetween windows needs to be thinner. its too thick right now."* The
+/// split gap had been borrowing the RAIL's seam handle, which is a
+/// different problem: that one straddles a hairline between two surfaces
+/// that meet, where this one IS the space between two panes and reads as
+/// the frame around each. It follows [`CARD_GUTTER`] instead, which moved
+/// the same day and for the same reason, so the air inside the well and
+/// the air around it are one number.
+pub const SPLIT_HANDLE_W: f32 = CARD_GUTTER;
 
 /// **The collapsed rail is a SPINE, never nothing (Slice D1).**
 ///

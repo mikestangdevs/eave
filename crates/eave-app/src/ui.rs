@@ -6612,12 +6612,68 @@ struct Split {
 /// still fit (0.8 of the well); a fifth is refused, not squeezed.
 const SPLIT_MAX: usize = 4;
 
+/// Which edge of a pane a tab was dropped against.
+///
+/// **A drop names an axis as well as a side.** Ruled on 2026-09-10:
+/// *"i should be able to grab edges and put the above/below other
+/// tabs."* `Split` has carried `vertical` since SP1 — it is persisted in
+/// `frame.json`, the well lays a vertical split out with `flex_col`, and
+/// the divider already takes a row-resize cursor — but **nothing ever set
+/// it to `true`**, so above-and-below was a shape the product could
+/// describe, store and draw and never make. This is the missing verb, and
+/// it is a drop target rather than a new control because the operator
+/// asked to *grab an edge*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DropEdge {
+    /// Does the dropped tab land AFTER the host in the pane order?
+    fn after(self) -> bool {
+        matches!(self, DropEdge::Right | DropEdge::Bottom)
+    }
+
+    /// Is the split this drop makes stacked rather than side by side?
+    fn vertical(self) -> bool {
+        matches!(self, DropEdge::Top | DropEdge::Bottom)
+    }
+}
+
+/// The edge a pointer at `(x_frac, y_frac)` of a box is nearest.
+///
+/// Four triangular zones meeting at the centre: the pointer's distance to
+/// the nearest vertical edge is measured against its distance to the
+/// nearest horizontal one, **each as a fraction of its own axis**, so the
+/// zones do not skew when the well is much wider than it is tall — which
+/// is the ordinary case here and would otherwise make top and bottom
+/// almost unreachable.
+///
+/// Ties go to the horizontal, which is the arrangement the product had
+/// before this existed.
+fn drop_edge(x_frac: f32, y_frac: f32) -> DropEdge {
+    let x = if x_frac.is_finite() { x_frac.clamp(0.0, 1.0) } else { 0.5 };
+    let y = if y_frac.is_finite() { y_frac.clamp(0.0, 1.0) } else { 0.5 };
+    let dx = x.min(1.0 - x);
+    let dy = y.min(1.0 - y);
+    if dy < dx {
+        if y < 0.5 { DropEdge::Top } else { DropEdge::Bottom }
+    } else if x < 0.5 {
+        DropEdge::Left
+    } else {
+        DropEdge::Right
+    }
+}
+
 impl Split {
-    fn pair(left: String, right: String) -> Self {
+    fn pair(left: String, right: String, vertical: bool) -> Self {
         Self {
             panes: vec![left, right],
             shares: vec![0.5, 0.5],
-            vertical: false,
+            vertical,
         }
     }
 
@@ -13418,7 +13474,9 @@ impl Shell {
                 let at = self.splits[ix].position(&opener).unwrap_or(0) + 1;
                 self.splits[ix].insert(at, opened.clone());
             }
-            None => self.splits.push(Split::pair(opener, opened.clone())),
+            // C2's "split BESIDE the opener" — side by side by name, so
+            // it says so rather than inheriting a default.
+            None => self.splits.push(Split::pair(opener, opened.clone(), false)),
         }
         self.persist_splits();
         self.activate_tab(&opened, cx);
@@ -15344,13 +15402,8 @@ impl Shell {
     /// the drop rather than squeezing a fifth pane in. A split holds at
     /// most one session tab: this shell has one transcript subscription,
     /// and a second session pane would be a caption over an empty log.
-    fn split_tabs(
-        &mut self,
-        dragged: &str,
-        host: &str,
-        dragged_on_right: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn split_tabs(&mut self, dragged: &str, host: &str, edge: DropEdge, cx: &mut Context<Self>) {
+        let dragged_on_right = edge.after();
         if dragged == host {
             return;
         }
@@ -15391,6 +15444,13 @@ impl Shell {
                 let at =
                     self.splits[ix].position(host).unwrap_or(0) + usize::from(dragged_on_right);
                 self.splits[ix].insert(at, dragged.to_string());
+                // **A split has ONE axis, so the drop names it.** Joining
+                // a side-by-side split from its top edge turns the whole
+                // arrangement into a stack rather than growing a grid:
+                // `Split` holds a single `vertical` and a nested model is
+                // a different slice. The rule is at least predictable —
+                // the edge you drop against is the axis you get.
+                self.splits[ix].vertical = edge.vertical();
             }
             None => {
                 let (left, right) = if dragged_on_right {
@@ -15398,7 +15458,7 @@ impl Shell {
                 } else {
                     (dragged.to_string(), host.to_string())
                 };
-                self.splits.push(Split::pair(left, right));
+                self.splits.push(Split::pair(left, right, edge.vertical()));
             }
         }
         self.persist_splits();
@@ -15409,15 +15469,15 @@ impl Shell {
     /// showing at that edge (the outermost pane of the split on screen,
     /// or the active tab when the well is single), so the dropped tab
     /// lands where the pointer let go of it.
-    fn drop_tab_on_well(&mut self, dragged: &str, on_right: bool, cx: &mut Context<Self>) {
+    fn drop_tab_on_well(&mut self, dragged: &str, edge: DropEdge, cx: &mut Context<Self>) {
         let snapshot = self.strip_snapshot(cx);
         let host = if let Some(s) = self.showing_split(&snapshot) {
-            let edge = if on_right {
+            let outermost = if edge.after() {
                 s.panes.last()
             } else {
                 s.panes.first()
             };
-            match edge {
+            match outermost {
                 Some(id) => id.clone(),
                 None => return,
             }
@@ -15427,19 +15487,27 @@ impl Shell {
                 _ => return,
             }
         };
-        self.split_tabs(dragged, &host, on_right, cx);
+        self.split_tabs(dragged, &host, edge, cx);
     }
 
-    fn well_drop_is_right(&self, window: &Window, cx: &App) -> bool {
-        let x = f32::from(window.mouse_position().x);
+    /// Which edge of the WELL the pointer let go over. See [`drop_edge`].
+    fn well_drop_edge(&self, window: &Window, cx: &App) -> DropEdge {
         let rail = if self.sessions.read(cx).collapsed {
             0.0
         } else {
             self.rail_w
         };
         let well_left = rail + theme::CARD_GUTTER;
-        let well_w = f32::from(window.viewport_size().width) - well_left - theme::CARD_GUTTER;
-        x > well_left + well_w.max(1.0) * 0.5
+        let well_w =
+            (f32::from(window.viewport_size().width) - well_left - theme::CARD_GUTTER).max(1.0);
+        let well_top = theme::CARD_GUTTER;
+        let well_h =
+            (f32::from(window.viewport_size().height) - 2.0 * theme::CARD_GUTTER).max(1.0);
+        let at = window.mouse_position();
+        drop_edge(
+            (f32::from(at.x) - well_left) / well_w,
+            (f32::from(at.y) - well_top) / well_h,
+        )
     }
 
     /// Close a tab, and say where the strip should land.
@@ -16878,8 +16946,8 @@ impl Shell {
                 }),
             )
             .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
-                let on_right = this.well_drop_is_right(window, cx);
-                this.drop_tab_on_well(&drag.id, on_right, cx);
+                let edge = this.well_drop_edge(window, cx);
+                this.drop_tab_on_well(&drag.id, edge, cx);
             }))
             .children(children)
             .into_any_element()
@@ -16892,10 +16960,10 @@ impl Shell {
             .debug_selector(move || format!("split-handle-{ix}"))
             .flex_none()
             .when(vertical, |d| {
-                d.h(px(theme::RAIL_HANDLE_W)).w_full().cursor_row_resize()
+                d.h(px(theme::SPLIT_HANDLE_W)).w_full().cursor_row_resize()
             })
             .when(!vertical, |d| {
-                d.w(px(theme::RAIL_HANDLE_W)).h_full().cursor_col_resize()
+                d.w(px(theme::SPLIT_HANDLE_W)).h_full().cursor_col_resize()
             })
             .occlude()
             .on_mouse_down(
@@ -17500,9 +17568,18 @@ impl Shell {
                     this.activate_tab(&activate, cx);
                 }),
             )
-            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+            .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
                 cx.stop_propagation();
-                this.split_tabs(&drag.id, &drop_id, on_right, cx);
+                // The pane's own left/right is kept — it is more precise
+                // than the well's for a reorder inside a split — and the
+                // well is asked only for the AXIS, which no per-pane
+                // fraction can answer.
+                let edge = match this.well_drop_edge(window, cx) {
+                    vert @ (DropEdge::Top | DropEdge::Bottom) => vert,
+                    _ if on_right => DropEdge::Right,
+                    _ => DropEdge::Left,
+                };
+                this.split_tabs(&drag.id, &drop_id, edge, cx);
             }))
             // D10 — the pane's own header goes with the rest of the chrome.
             // Read per TAB rather than from a flag passed down, because
@@ -21489,7 +21566,7 @@ impl Shell {
                 let target = id.clone();
                 move |this, drag: &TabDrag, _, cx| {
                     cx.stop_propagation();
-                    this.split_tabs(&drag.id, &target, true, cx);
+                    this.split_tabs(&drag.id, &target, DropEdge::Right, cx);
                 }
             }))
             .flex()
@@ -28116,7 +28193,7 @@ impl Shell {
             }
             TabMenuAction::AddSplit => {
                 if let Some(partner) = self.split_partner_for(&tab_id, cx) {
-                    self.split_tabs(&partner, &tab_id, true, cx);
+                    self.split_tabs(&partner, &tab_id, DropEdge::Right, cx);
                 }
             }
             TabMenuAction::Duplicate => {
@@ -31143,8 +31220,8 @@ impl Render for Shell {
                                         .flex()
                                         .flex_col()
                                         .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
-                                            let on_right = this.well_drop_is_right(window, cx);
-                                            this.drop_tab_on_well(&drag.id, on_right, cx);
+                                            let edge = this.well_drop_edge(window, cx);
+                                            this.drop_tab_on_well(&drag.id, edge, cx);
                                         }))
                                         .drag_over::<TabDrag>(|style, _, _, _| {
                                             style.bg(theme::overlay())
@@ -34935,16 +35012,51 @@ mod tests {
     /// Slice SP1: a window's splits round-trip through `frame.json`, keep
     /// their neighbours and the other windows' entries, and a malformed
     /// entry costs only itself.
+    /// **A drop names an axis as well as a side.** Ruled on 2026-09-10:
+    /// *"i should be able to grab edges and put the above/below other
+    /// tabs."*
+    #[test]
+    fn a_drop_takes_the_edge_it_is_nearest() {
+        use DropEdge::*;
+        // The four edges, each from well inside its own zone.
+        assert_eq!(drop_edge(0.02, 0.5), Left);
+        assert_eq!(drop_edge(0.98, 0.5), Right);
+        assert_eq!(drop_edge(0.5, 0.02), Top);
+        assert_eq!(drop_edge(0.5, 0.98), Bottom);
+        // **Measured per axis, not in pixels.** The well is habitually
+        // much wider than it is tall, and a distance compared in raw
+        // fractions of the SAME unit would put the top and bottom zones
+        // out of reach on a wide window. A point a tenth of the way down
+        // is nearer the top than a point a fifth of the way in is to the
+        // left, whatever the aspect.
+        assert_eq!(drop_edge(0.2, 0.1), Top);
+        assert_eq!(drop_edge(0.1, 0.2), Left);
+        // Ties go to the horizontal, which is what the product did before
+        // the vertical existed.
+        assert_eq!(drop_edge(0.25, 0.25), Left);
+        assert_eq!(drop_edge(0.75, 0.75), Right);
+        assert_eq!(drop_edge(0.5, 0.5), Right, "the exact centre still resolves");
+        // Nothing here may panic or wander outside the four.
+        for (x, y) in [(f32::NAN, 0.5), (0.5, f32::NAN), (-9.0, 40.0), (2.0, -3.0)] {
+            let _: DropEdge = drop_edge(x, y);
+        }
+        // And the two questions the rest of the code asks of an edge.
+        assert!(Right.after() && Bottom.after());
+        assert!(!Left.after() && !Top.after());
+        assert!(Top.vertical() && Bottom.vertical());
+        assert!(!Left.vertical() && !Right.vertical());
+    }
+
     #[test]
     fn splits_round_trip_through_frame_json_and_keep_their_neighbours() {
         let mut doc = serde_json::json!({
             "rail_w": 228.0,
             SPLITS_KEY: { "other-window": [{"panes": ["x", "y"]}] },
         });
-        let mut three = Split::pair("a".into(), "b".into());
+        let mut three = Split::pair("a".into(), "b".into(), false);
         three.insert(2, "c".into());
         three.set_share(0, 0.4);
-        let mut pair = Split::pair("d".into(), "e".into());
+        let mut pair = Split::pair("d".into(), "e".into(), false);
         pair.vertical = true;
         let splits = vec![three.clone(), pair.clone()];
         put_splits(&mut doc, "primary", &splits);
@@ -34997,7 +35109,7 @@ mod tests {
     /// pair's sum and the floor, and the cap is the cap.
     #[test]
     fn a_split_shares_its_well_and_stops_at_four() {
-        let mut s = Split::pair("a".into(), "b".into());
+        let mut s = Split::pair("a".into(), "b".into(), false);
         assert!(s.set_share(0, 0.7));
         assert_eq!(s.shares, [0.7, 0.3]);
         assert!(!s.set_share(0, 0.701), "a hair's move must not repaint");

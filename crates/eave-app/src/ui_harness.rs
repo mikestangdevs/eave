@@ -11555,7 +11555,7 @@ fn a_tab_shows_a_realistic_session_name(cx: &mut TestAppContext) {
             Some("aaaa1111"),
         );
         h.window
-            .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", true, cx))
+            .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", crate::ui::DropEdge::Right, cx))
             .unwrap();
         vcx.run_until_parked();
     };
@@ -11789,7 +11789,7 @@ fn a_tab_wears_the_providers_mark_on_the_same_plate_a_row_does(cx: &mut TestAppC
             Some("aaaa1111"),
         );
         h.window
-            .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", true, cx))
+            .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", crate::ui::DropEdge::Right, cx))
             .unwrap();
         vcx.run_until_parked();
         assert!(shown(vcx, "tab-chip-aaaa1111"), "tab-chip-aaaa1111 did not render");
@@ -13291,7 +13291,7 @@ fn eviction_never_recedes_a_session_tab(cx: &mut TestAppContext) {
         Some("aaaa1111"),
     );
     h.window
-        .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", true, cx))
+        .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", crate::ui::DropEdge::Right, cx))
         .unwrap();
     vcx.run_until_parked();
 
@@ -14236,7 +14236,7 @@ fn a_session_tab_never_grows_a_speaker(cx: &mut TestAppContext) {
         Some("aaaa1111"),
     );
     h.window
-        .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", true, cx))
+        .update(vcx, |shell, _, cx| shell.split_tabs("p1", "aaaa1111", crate::ui::DropEdge::Right, cx))
         .unwrap();
     crate::web::set_audible_for_test("aaaa1111", true);
     crate::web::set_tab_muted("aaaa1111", true);
@@ -18245,7 +18245,7 @@ fn dropping_a_tab_on_another_tab_splits_the_well(cx: &mut TestAppContext) {
 
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18269,7 +18269,7 @@ fn dropping_a_tab_on_itself_does_not_split(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p1", "p1", true, cx);
+            shell.split_tabs("p1", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18293,7 +18293,7 @@ fn two_session_tabs_do_not_split(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("s2", "s1", true, cx);
+            shell.split_tabs("s2", "s1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18325,7 +18325,7 @@ fn clicking_a_third_tab_shows_it_alone_and_keeps_the_split(cx: &mut TestAppConte
     strip_tabs(&h, vcx, tabs(), Some("p1"));
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18380,13 +18380,62 @@ fn dropping_a_tab_on_the_well_splits_with_the_page_in_front(cx: &mut TestAppCont
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.drop_tab_on_well("p2", true, cx);
+            shell.drop_tab_on_well("p2", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
     assert!(shown(vcx, "split-well"), "well drop did not split");
     assert!(shown(vcx, "split-pane-left"));
     assert!(shown(vcx, "split-pane-right"));
+}
+
+/// **A drop against the BOTTOM edge stacks the panes.** Ruled on
+/// 2026-09-10: *"i should be able to grab edges and put the above/below
+/// other tabs."*
+///
+/// `Split::vertical` has been persisted, laid out (`flex_col`) and given
+/// its own row-resize cursor since SP1, and nothing ever set it — the
+/// arrangement existed everywhere except in the operator's hands. This
+/// drives the verb that was missing, and it asserts the LAYOUT flag
+/// rather than a pixel, because a geometry assertion here would pass on a
+/// split that merely happened to be narrow.
+#[gpui::test]
+fn a_drop_on_the_bottom_edge_stacks_the_panes(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ],
+        Some("p1"),
+    );
+    let axis = |h: &Harness, vcx: &mut VisualTestContext| {
+        h.window
+            .read_with(vcx, |shell, _| shell.splits.first().map(|s| s.vertical))
+            .unwrap()
+    };
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p2", crate::ui::DropEdge::Bottom, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"), "the bottom edge did not split at all");
+    assert_eq!(axis(&h, vcx), Some(true), "the split is still side by side");
+    // **A split has one axis, so a later drop re-names it.** Joining a
+    // stack from its right edge lays the whole thing out side by side —
+    // the alternative is a nested grid, which `Split` cannot describe.
+    // Predictability is the claim: you get the axis of the edge you used.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p3", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(axis(&h, vcx), Some(false), "the right edge should lay them side by side");
 }
 
 /// The actual gesture: mouse-down on one tab, move past gpui's 2px drag
@@ -18444,7 +18493,7 @@ fn split_tabs_sit_side_by_side_on_the_rail(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18487,7 +18536,7 @@ fn both_split_panes_take_a_share_of_the_well(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18517,7 +18566,7 @@ fn clicking_a_split_pane_focuses_it_without_leaving(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18551,7 +18600,7 @@ fn clicking_a_chip_in_the_combined_row_keeps_the_split(cx: &mut TestAppContext) 
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18626,7 +18675,7 @@ fn a_right_click_on_a_split_tab_opens_the_split_menu(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18679,7 +18728,7 @@ fn separate_all_tabs_leaves_the_split(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18708,7 +18757,7 @@ fn convert_to_vertical_split_turns_the_handle(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
@@ -18777,8 +18826,8 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
     strip_tabs(&h, vcx, tabs(), Some("p1"));
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
-            shell.split_tabs("p3", "p2", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("p3", "p2", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     strip_tabs(&h, vcx, tabs(), Some("p3"));
@@ -18797,7 +18846,7 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
     // Dropped on the FIRST pane's left: the new pane leads.
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p4", "p1", false, cx);
+            shell.split_tabs("p4", "p1", crate::ui::DropEdge::Left, cx);
         })
         .unwrap();
     strip_tabs(&h, vcx, tabs(), Some("p4"));
@@ -18826,8 +18875,8 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
     // The fifth is refused, on every door: the drop, the well, the menu.
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p5", "p2", true, cx);
-            shell.drop_tab_on_well("p5", true, cx);
+            shell.split_tabs("p5", "p2", crate::ui::DropEdge::Right, cx);
+            shell.drop_tab_on_well("p5", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     strip_tabs(&h, vcx, tabs(), Some("p4"));
@@ -18876,8 +18925,8 @@ fn two_splits_keep_apart_and_a_tab_is_in_one_at_a_time(cx: &mut TestAppContext) 
     strip_tabs(&h, vcx, tabs(), Some("p1"));
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
-            shell.split_tabs("p4", "p3", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("p4", "p3", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     strip_tabs(&h, vcx, tabs(), Some("p4"));
@@ -18907,7 +18956,7 @@ fn two_splits_keep_apart_and_a_tab_is_in_one_at_a_time(cx: &mut TestAppContext) 
     // p2 moves to the second split: the first is a tab again.
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p4", true, cx);
+            shell.split_tabs("p2", "p4", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     strip_tabs(&h, vcx, tabs(), Some("p2"));
@@ -18941,8 +18990,8 @@ fn closing_or_losing_a_pane_shrinks_the_split(cx: &mut TestAppContext) {
     strip_tabs(&h, vcx, tabs(&["p1", "p2", "p3", "p4"]), Some("p1"));
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
-            shell.split_tabs("p3", "p2", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("p3", "p2", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     strip_tabs(&h, vcx, tabs(&["p1", "p2", "p3", "p4"]), Some("p3"));
@@ -18988,7 +19037,7 @@ fn closing_or_losing_a_pane_shrinks_the_split(cx: &mut TestAppContext) {
     // the engine has answered, and the saved splits must survive it.
     strip_tabs(&h, vcx, tabs(&["p1", "p4"]), Some("p1"));
     h.window
-        .update(vcx, |shell, _, cx| shell.split_tabs("p4", "p1", true, cx))
+        .update(vcx, |shell, _, cx| shell.split_tabs("p4", "p1", crate::ui::DropEdge::Right, cx))
         .unwrap();
     strip_tabs(&h, vcx, Vec::new(), None);
     let splits = h
@@ -19016,9 +19065,9 @@ fn a_split_holds_one_session_and_refuses_a_second(cx: &mut TestAppContext) {
     strip_tabs(&h, vcx, tabs(), Some("p1"));
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
-            shell.split_tabs("s1", "p2", true, cx);
-            shell.split_tabs("s2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("s1", "p2", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("s2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     strip_tabs(&h, vcx, tabs(), Some("s1"));
@@ -24070,7 +24119,7 @@ fn a_hung_pane_in_a_split_says_so_too(cx: &mut TestAppContext) {
     );
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p2", "p1", true, cx);
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
         })
         .unwrap();
     vcx.run_until_parked();
