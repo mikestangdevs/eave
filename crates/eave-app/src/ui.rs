@@ -17691,29 +17691,25 @@ impl Shell {
             theme::SPACE_3
         };
 
-        // **The header is CHROME, so it wears the chrome surface.** Ruled
-        // on 2026-09-10: *"at the top of the screen, splits are not
-        // viewable becuase of color. we need to remove the colored
-        // background and have it match the sidebar. the translucent
-        // styling of it is needed so tabs edges arent swallowed."*
+        // **The header paints NO background, and that is the ruling.**
+        // 2026-09-10: *"the background just needs to have no color …
+        // it should be like the sidebar. alpha 0 makes it see through."*
         //
-        // It used to set nothing and inherit the CARD's plate, so the top
-        // of every pane was the content surface — measured in light mode
-        // at 251/255 against the rail's 233. One pane got away with it;
-        // four in a split put four near-white bands across the top of the
-        // window separated by a 4 pt seam, and the seams disappeared into
-        // them.
+        // I took two wrong swings at this first, and both were the same
+        // mistake — reaching for a better COLOUR when the ask was for no
+        // colour at all. `rail_plate` landed the band on 239 where the
+        // sidebar sits at 233; a resolved `pane_header_plate` landed it on
+        // 238. Both invisible, because the number was never the problem:
+        // an opaque band is an opaque band. With the surfaces see-through
+        // the header was the one thing in the window still painting a
+        // plate, which is exactly what the operator's capture shows.
         //
-        // **The first cut used `rail_plate` directly and did not fix it**
-        // — *"the white background is still there."* That token is a
-        // translucent ink, so inside a pane it composited over the CARD's
-        // near-white plate and landed on 239 where the sidebar sits at
-        // 233. The material was right and its GROUND was wrong;
-        // `pane_header_plate` resolves it against the same glass the rail
-        // is laid on. See that token.
+        // So it sets nothing. What is behind a pane's header is the pane,
+        // and the rim (`pane_rim`) is what draws the edge and the corner —
+        // it always was, which is why taking the fill away costs the
+        // header no definition.
         let row = div()
             .size_full()
-            .bg(theme::pane_header_plate())
             .pl(px(lead))
             .pr(px(theme::SPACE_3))
             .flex()
