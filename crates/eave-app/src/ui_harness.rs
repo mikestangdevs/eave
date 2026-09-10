@@ -23337,13 +23337,13 @@ fn dropping_a_page_on_the_strip_is_a_reorder_not_a_split(cx: &mut TestAppContext
 //
 // The plane is the product's layout as of 2026-09-07. These pin the four
 // things the operator asked for — no window constraints, a grid that
-// scrolls forever, free placement, and drag and resize — plus the
-// continuity claim that makes the pivot cheap: an untouched plane is
-// CL1's strip.
+// scrolls forever, free placement, and drag and resize.
 //
-// Geometry note: the harness window is narrow, so `canvas::grid_cols` is
-// 1 here and the grid runs DOWN. That is the wrap under test, not a
-// limitation of it.
+// Geometry note: since 2026-09-10 a card is the size of the WELL
+// (`canvas::card_default`) and the grid is measured against the plane's
+// widest view, so `grid_cols` is four-ish at any window size the harness
+// opens — the cards run ACROSS, and the tests derive the well's size back
+// out of the first card rather than assuming a window.
 
 /// The card's rect the shell is actually laying out — the placement if
 /// the operator has made one, the grid slot if not.
@@ -23503,14 +23503,22 @@ fn an_untouched_plane_lays_the_cards_out_in_a_grid_that_wraps(cx: &mut TestAppCo
     let a = card_rect(&h, vcx, "aaaa1111");
     let b = card_rect(&h, vcx, "bbbb2222");
     let c = card_rect(&h, vcx, "cccc3333");
-    assert_eq!(a.w, crate::canvas::CARD_W, "a card is a column wide");
-    assert_eq!(a.w, columns::COLUMN_W, "and that width is CL1's, unchanged");
-    // This window fits one across, so the grid runs down and the pitch is
-    // exact — nothing overlaps and nothing leaves a hole.
-    assert_eq!(crate::canvas::grid_cols(a.w + 2.0 * crate::canvas::GUTTER), 1);
-    assert_eq!(b.x, a.x, "the second card wrapped under the first");
-    assert_eq!(b.y - a.y, a.h + crate::canvas::GUTTER, "one card and one gutter");
-    assert_eq!(c.y - b.y, b.h + crate::canvas::GUTTER);
+    // A card is the well, inset by the plane's margin — so the well's own
+    // size falls back out of the first card's rect, and the whole grid can
+    // be checked against `grid_slot` without the test knowing what window
+    // the harness opened.
+    let vw = a.w + 2.0 * crate::canvas::GUTTER;
+    let vh = a.h + 2.0 * crate::canvas::GUTTER;
+    assert_eq!(a, crate::canvas::grid_slot(0, vw, vh), "the first card is the well");
+    assert_eq!(b, crate::canvas::grid_slot(1, vw, vh));
+    assert_eq!(c, crate::canvas::grid_slot(2, vw, vh));
+    // And the grid still flows, even though a card is now a whole window
+    // wide: the row is measured against the plane at the zoom floor.
+    let cols = crate::canvas::grid_cols(vw, vh);
+    assert!(cols > 1, "a window-sized card must still make a row: {cols}");
+    assert_eq!(b.y, a.y, "the second card is beside the first, not under it");
+    assert_eq!(b.x - a.x, a.w + crate::canvas::GUTTER, "one card and one gutter");
+    assert_eq!(c.x - b.x, b.w + crate::canvas::GUTTER);
     // Nothing has been placed by hand, so nothing is saved.
     assert!(placed(&h, vcx, "aaaa1111").is_none());
 }
@@ -23540,11 +23548,11 @@ fn a_card_carried_by_its_header_stays_where_it_was_dropped(cx: &mut TestAppConte
     // because the grid indexes only the unplaced cards.
     assert!(placed(&h, vcx, "bbbb2222").is_none(), "the neighbour was not placed");
     assert_eq!(
-        card_rect(&h, vcx, "bbbb2222").y,
-        before_a.y,
+        card_rect(&h, vcx, "bbbb2222").x,
+        before_a.x,
         "the grid closed up behind the card that left it"
     );
-    assert_ne!(before_b.y, before_a.y, "precondition: b was below a");
+    assert_ne!(before_b.x, before_a.x, "precondition: b was beside a");
 }
 
 /// **A press that does not move is still a click.** The threshold is what
@@ -23673,14 +23681,20 @@ fn a_click_on_open_ground_opens_a_card_where_it_was_clicked(cx: &mut TestAppCont
     rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     enter_canvas(&h, vcx);
     let _ = h.drain();
-    // A point on the plane that no card covers: to the right of the only
-    // card, which is one column wide at the left gutter.
-    let card = vcx.debug_bounds("column-aaaa1111").expect("column-aaaa1111");
+    // **Zoom out to find open ground at all.** Since a card is the size of
+    // the well (`canvas::card_default`), at actual size the first card
+    // fills the window and the only ground on screen is the 12 pt margin
+    // around it. Zooming out is how an operator reaches the plane too —
+    // that is what an overview is for — so the fixture does what the hand
+    // would do rather than clicking a gutter.
+    zoom_plane(&h, vcx, crate::canvas::ZOOM_MIN);
+    // **`drawn`, not `debug_bounds`** — on a zoomed plane a card's element
+    // bounds are its own, unscaled, and a window point derived from them
+    // is `1/scale` of the way to where the card actually is. The same trap
+    // CV2 wrote `at_drawn` for, one gesture over.
+    let card = drawn(&h, vcx, "aaaa1111");
     let strip = vcx.debug_bounds("column-strip").expect("column-strip");
-    let ground = point(
-        card.origin.x + card.size.width + px(40.),
-        strip.origin.y + px(200.),
-    );
+    let ground = point(px(card.0 + card.2 + 40.), strip.origin.y + px(200.));
     assert!(
         ground.x < strip.origin.x + strip.size.width,
         "precondition: the ground point is inside the plane"
@@ -23704,7 +23718,7 @@ fn a_click_on_open_ground_opens_a_card_where_it_was_clicked(cx: &mut TestAppCont
     vcx.run_until_parked();
     let placed = placed(&h, vcx, "p9").expect("the new card was placed at the click");
     assert!(
-        placed.x > card.origin.x.into(),
+        placed.x > card.0,
         "it landed to the right of the card that was there: {placed:?}"
     );
 }
@@ -23729,16 +23743,18 @@ fn cards_keep_their_gutter_at_every_zoom(cx: &mut TestAppContext) {
         let s = crate::canvas::card_scale(z);
         let a = drawn(&h, vcx, "aaaa1111");
         let b = drawn(&h, vcx, "bbbb2222");
-        // This window fits one across, so b is under a.
-        let gap = b.1 - (a.1 + a.3);
+        // Cards are the well's width and the grid runs across, so b is
+        // beside a and the gutter is the horizontal gap.
+        let gap = b.0 - (a.0 + a.2);
         assert!(
             (gap - crate::canvas::GUTTER * s).abs() < 1.0,
             "at zoom {z} the gap is {gap}, wanted {}",
             crate::canvas::GUTTER * s
         );
         assert!(gap > 0.0, "cards overlapped at zoom {z}");
+        let laid_out = card_rect(&h, vcx, "aaaa1111").w;
         assert!(
-            (a.2 - crate::canvas::CARD_W * s).abs() < 1.0,
+            (a.2 - laid_out * s).abs() < 1.0,
             "a card is drawn at the plane's scale: {a:?} at zoom {z}"
         );
     }

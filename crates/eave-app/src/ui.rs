@@ -13775,11 +13775,16 @@ impl Shell {
                 // Only when exactly one card arrived: two at once cannot
                 // both be the one that was clicked for.
                 if fresh.len() == 1 && !known.is_empty() {
-                    let size = crate::canvas::grid_slot(0, 0.0, 0.0);
-                    self.canvas_placed.borrow_mut().insert(
-                        fresh[0].clone(),
-                        crate::canvas::CardRect::new(x, y, size.w, size.h),
-                    );
+                    // The well last painted — a card spawned by clicking
+                    // the ground opens at the same size as any other, and
+                    // `canvas::card_default` needs the viewport to say
+                    // what that is. This runs in the tabs observer, which
+                    // has no paint in hand; the cell is what carries it.
+                    let (vw, vh) = self.canvas_view.get();
+                    let (w, h) = crate::canvas::card_default(vw, vh);
+                    self.canvas_placed
+                        .borrow_mut()
+                        .insert(fresh[0].clone(), crate::canvas::CardRect::new(x, y, w, h));
                     self.canvas_placed_dirty.set(true);
                 }
                 if !fresh.is_empty() {
@@ -14225,16 +14230,18 @@ impl Shell {
                 f32::from(window.mouse_position().x) - rail - theme::CARD_GUTTER,
                 f32::from(window.mouse_position().y) - theme::CARD_GUTTER,
             );
-            let size = self
+            // The card keeps whatever size it already had; one that has
+            // never been placed takes the default, which is the well.
+            let (drop_w, drop_h) = self
                 .canvas_placed
                 .borrow()
                 .get(&stem)
-                .copied()
-                .unwrap_or_else(|| crate::canvas::grid_slot(0, view_w, view_h));
+                .map(|r| (r.w, r.h))
+                .unwrap_or_else(|| crate::canvas::card_default(view_w, view_h));
             // The pointer takes the card by its header, so the drop point
             // is the card's TOP-LEFT and not its centre — the same place
             // the hand was holding.
-            let landed = crate::canvas::CardRect::new(x, y, size.w, size.h);
+            let landed = crate::canvas::CardRect::new(x, y, drop_w, drop_h);
             self.canvas_placed.borrow_mut().insert(stem, landed);
             self.canvas_placed_dirty.set(true);
             self.persist_layout();

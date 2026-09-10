@@ -39,8 +39,10 @@ use std::ops::Range;
 
 use crate::columns::{ColumnId, COLUMN_GUTTER, COLUMN_W};
 
-/// A card's default width — CL1's column width, so an untouched canvas
-/// is the strip.
+/// A card's default size when the well's size is not known — the only
+/// place CL1's column width still decides anything. **Every live path
+/// asks [`card_default`] instead**, and the difference is the whole of
+/// the 2026-09-10 ruling: see that function.
 pub const CARD_W: f32 = COLUMN_W;
 /// The gap the grid leaves between cards, and the plane's own margin.
 pub const GUTTER: f32 = COLUMN_GUTTER;
@@ -53,14 +55,12 @@ pub const CARD_H_MIN: f32 = 200.0;
 /// how you get a full-well view of one.
 pub const CARD_W_MAX: f32 = 4000.0;
 pub const CARD_H_MAX: f32 = 4000.0;
-/// A grid card is one viewport tall, within these bounds — so a canvas
-/// nobody has touched fills the well exactly the way the strip did.
+/// The fallback height a card gets where no viewport is in hand at all
+/// (see `ColumnsPaint::rect`, which needs an answer before the first
+/// paint has measured anything).
 pub const GRID_H_MIN: f32 = 360.0;
-pub const GRID_H_MAX: f32 = 900.0;
-/// A card's default height. **Not the viewport** — walked 2026-09-07 and
-/// ruled on: *"a canvas is free form. not rigid."* Cards a whole window
-/// tall are a stack of screens, not a canvas; a fixed, comfortable card
-/// is what makes the plane read as a plane the moment it opens.
+/// The height half of the same fallback. See [`CARD_W`] and
+/// [`card_default`].
 pub const CARD_H: f32 = 460.0;
 
 /// The plane's zoom. 1.0 is one canvas point per window point.
@@ -91,11 +91,41 @@ pub const CARD_H: f32 = 460.0;
 /// ever stretched past its own pixels, and a page's density is a constant
 /// (see `page::card_view`). The plane's whole range is one screen's worth
 /// of card, seen from further away or from right up close.
-pub const ZOOM_MIN: f32 = 0.5;
+///
+/// **The floor moved from 0.5 to 0.21875 on 2026-09-10, and it moved
+/// because [`card_default`] did.** The two numbers only mean anything
+/// together: what the operator sees at the bottom of the range is a card
+/// drawn at `default × ZOOM_MIN`, and that product is what an overview
+/// is. It was 560 × 0.5 = 280 pt; a window-sized card against the old
+/// floor would have drawn at 640 and shown a quarter as many cards in the
+/// same well — the cards would have got bigger and the overview emptier,
+/// which is not a trade anyone asked for. 1280 × 0.21875 ≈ 280 pt keeps
+/// the overview exactly where it was.
+///
+/// **What no longer binds the floor is the thing it was first written
+/// for.** 0.5 was set when zooming out could still corrupt a layout
+/// (*"we need to define a certain minimum so we dont corrupt all the
+/// screens"*); CV2 ended that — a card is laid out at its own size and
+/// painted at the plane's scale, so there is no zoom at which anything
+/// reflows. The floor is now a question of how much plane is worth
+/// showing at once, and nothing else.
+///
+/// It sits ON the `SCALE_STEPS` lattice (14/64) on purpose: `clamp_zoom`
+/// quantises, and a floor between two steps is a floor the plane can
+/// never actually reach.
+pub const ZOOM_MIN: f32 = 0.218_75;
 pub const ZOOM_MAX: f32 = 1.0;
 /// One press of ⌘+ / ⌘−, as a ratio — zoom is multiplicative, so the
 /// steps feel even at both ends.
-pub const ZOOM_STEP: f32 = 1.2;
+///
+/// **Widened with the floor on 2026-09-10.** The step and the range are
+/// one setting: what the operator feels is how many presses cross the
+/// plane, and 1.2 crossed the old 2× range in about four. Against the new
+/// 4.57× range the same constant would take nine, so reaching the
+/// overview from actual size would be a drum roll. 1.35 crosses it in
+/// five. The wheel and the trackpad pinch are continuous and never felt
+/// this number either way.
+pub const ZOOM_STEP: f32 = 1.35;
 /// The ground's dot lattice, in canvas points. Ruled on in the same run:
 /// *"there is no canvas dotted background. its just a black void."* The
 /// dots are what make a pan legible — without them the plane moves and
@@ -179,46 +209,88 @@ impl CardRect {
 /// with no entry is placed by the grid; see the module note.
 pub type Placements = HashMap<String, CardRect>;
 
-/// How many cards the grid puts in a row at this viewport width. At
-/// least one, always — a window narrower than a card still shows it,
-/// clipped, rather than showing nothing.
-pub fn grid_cols(view_w: f32) -> usize {
+/// **A card's default size is the well it opened in.**
+///
+/// Ruled on 2026-09-10: *"tabs are very mis sized. they are too skinny.
+/// web browsers especially we need to figure this out."* The browser is
+/// what makes that a defect rather than a preference. [`CARD_W`] was
+/// CL1's `COLUMN_W`, taken wholesale so an untouched canvas would still
+/// read as the old strip — and a column is a good measure for a
+/// transcript, but it was never a browser window. At 560 × 460 a page
+/// card's viewport is **558 × 410 CSS pixels**: under every desktop
+/// breakpoint in use, so every responsive site on the plane was being
+/// served its PHONE layout, and 410 tall is shorter than a phone held
+/// sideways. No amount of zooming fixes that, because the page had
+/// already reflowed by the time the plane scaled it.
+///
+/// So a card opens at the size of the window it opened in — whatever
+/// eave has, the page gets. *"i think it should be fixed to window and
+/// resizeable."* **The second half carries as much as the first**: the
+/// reference canvas is a spread of cards at a dozen different sizes, and
+/// an arrangement like that is something the operator BUILDS by pulling
+/// cards down from a sane default. It is not something a default can be,
+/// and a default that guessed at it would be wrong for every card it
+/// guessed for.
+///
+/// **Only reachable because of CV2.** Under CV1 a window-sized card was
+/// unusable: zooming out shrank the box and left the type size alone. Now
+/// the card is laid out at its own size and painted at the plane's scale,
+/// so far out it is a legible miniature. The floor moved in the same
+/// ruling and for the same reason — see [`ZOOM_MIN`].
+pub fn card_default(view_w: f32, view_h: f32) -> (f32, f32) {
+    let w = if view_w.is_finite() && view_w > 0.0 {
+        view_w - 2.0 * GUTTER
+    } else {
+        CARD_W
+    };
+    let h = if view_h.is_finite() && view_h > 0.0 {
+        view_h - 2.0 * GUTTER
+    } else {
+        CARD_H
+    };
+    (
+        w.clamp(CARD_W_MIN, CARD_W_MAX),
+        h.clamp(CARD_H_MIN, CARD_H_MAX),
+    )
+}
+
+/// How many cards the grid puts in a row.
+///
+/// **Measured against the plane's WIDEST view, not against the window.**
+/// A card is the size of the well now, so asking how many fit in the well
+/// answers "one" — and an untouched canvas would be a single vertical
+/// stack with the whole plane beside it empty. What the grid has to fill
+/// is the room the plane can actually show, and that is the window
+/// divided by [`ZOOM_MIN`]: zoomed all the way out, the grid fills the
+/// screen instead of running off the bottom of it.
+///
+/// It is still a number that holds still. It moves with the window and
+/// with the floor and with nothing else — in particular NOT with the
+/// current zoom, which is the bug CV2 fixed: asked in canvas units the
+/// room doubles as you zoom out, so the grid re-flowed under every wheel
+/// click. Dividing by a constant cannot do that.
+pub fn grid_cols(view_w: f32, view_h: f32) -> usize {
     if !view_w.is_finite() || view_w <= 0.0 {
         return 1;
     }
-    let usable = view_w - GUTTER;
-    let per = CARD_W + GUTTER;
-    ((usable / per).floor() as i64).max(1) as usize
+    let (cw, _) = card_default(view_w, view_h);
+    let usable = view_w / ZOOM_MIN - GUTTER;
+    ((usable / (cw + GUTTER)).floor() as i64).max(1) as usize
 }
 
-/// A grid card's height: [`CARD_H`], or the viewport if that is shorter.
-///
-/// **It is NOT the viewport height.** The first cut made a card a whole
-/// window tall — CL1's strip, carried over — and the walk of 2026-09-07
-/// ruled on what that produces: *"a canvas is free form. not rigid."* A
-/// row per screen is a stack, and the plane only reads as a plane when
-/// more than one card is in front of you.
-pub fn grid_h(view_h: f32) -> f32 {
-    if !view_h.is_finite() || view_h <= 0.0 {
-        return CARD_H;
-    }
-    CARD_H.min(view_h - 2.0 * GUTTER).max(CARD_H_MIN)
-}
-
-/// Where the `ix`th untouched card sits, of `n` untouched cards in all.
-/// Row-major, wrapping at [`grid_cols`] — so one row at a wide window is
-/// CL1's strip, and a narrow window wraps into a grid that scrolls down.
-/// `n` is taken because the ROW HEIGHT depends on whether the grid wraps;
-/// see [`grid_h`].
+/// Where the `ix`th untouched card sits. Row-major, wrapping at
+/// [`grid_cols`], every card at [`card_default`] — so an untouched canvas
+/// is a grid of window-sized cards that you zoom out to take in whole,
+/// and zoom in to work one of.
 pub fn grid_slot(ix: usize, view_w: f32, view_h: f32) -> CardRect {
-    let cols = grid_cols(view_w);
-    let h = grid_h(view_h);
+    let cols = grid_cols(view_w, view_h);
+    let (w, h) = card_default(view_w, view_h);
     let col = ix % cols;
     let row = ix / cols;
     CardRect::new(
-        GUTTER + col as f32 * (CARD_W + GUTTER),
+        GUTTER + col as f32 * (w + GUTTER),
         GUTTER + row as f32 * (h + GUTTER),
-        CARD_W,
+        w,
         h,
     )
 }
@@ -665,54 +737,99 @@ mod tests {
         ColumnId::Tab(id.into())
     }
 
-    /// The continuity claim the whole slice rests on: a canvas nobody has
-    /// touched, at a window wide enough for the strip, IS the strip —
-    /// same width, same pitch, same order.
+    /// **A card is the window it opened in.** The 2026-09-10 ruling, and
+    /// the assertion that replaces CV1's continuity claim: an untouched
+    /// canvas used to be CL1's strip, card for card, because `CARD_W` was
+    /// `COLUMN_W`. It is not any more, and that is the point — a column
+    /// was never a browser window, and at 560 wide a page card was being
+    /// served the phone layout. See [`card_default`].
     #[test]
-    fn an_untouched_canvas_at_a_wide_window_is_the_strip() {
+    fn an_untouched_card_is_the_size_of_the_well() {
         let order = vec![tab("a"), tab("b"), tab("c")];
         let placed = Placements::new();
-        // Three columns' worth of width, so nothing wraps.
-        let view_w = 3.0 * (CARD_W + GUTTER) + GUTTER;
-        let rects = layout(&order, &placed, view_w, 800.0);
-        assert_eq!(grid_cols(view_w), 3);
+        let (view_w, view_h) = (1512.0, 982.0);
+        let rects = layout(&order, &placed, view_w, view_h);
         for (i, r) in rects.iter().enumerate() {
-            assert_eq!(r.w, CARD_W, "card {i} is a column wide");
-            assert_eq!(r.y, GUTTER, "one row: {r:?}");
-            assert_eq!(r.x, GUTTER + i as f32 * (CARD_W + GUTTER));
+            assert_eq!(r.w, view_w - 2.0 * GUTTER, "card {i} is the well's width");
+            assert_eq!(r.h, view_h - 2.0 * GUTTER, "card {i} is the well's height");
         }
-        // The pitch is CL1's.
-        assert_eq!(rects[1].x - rects[0].x, crate::columns::COLUMN_PITCH);
+        // Placed at the margin, the first card fills the well exactly —
+        // which is what makes "the card is the window" true on screen and
+        // not only in the arithmetic.
+        assert_eq!(rects[0].x, GUTTER);
+        assert_eq!(rects[0].y, GUTTER);
+        assert_eq!(rects[0].x + rects[0].w + GUTTER, view_w);
+        assert_eq!(rects[0].y + rects[0].h + GUTTER, view_h);
+        // And the page inside it clears the desktop breakpoints, which is
+        // the whole reason the size moved. 48 pt of address header, 1 pt
+        // of border each side.
+        let page_w = rects[0].w - 2.0;
+        assert!(page_w >= 1024.0, "a page card is a desktop viewport, not a phone: {page_w}");
+    }
+
+    /// The grid is measured against the plane's WIDEST view, so an
+    /// untouched canvas is a grid and not a single stack of window-sized
+    /// cards with empty plane beside it.
+    #[test]
+    fn the_grid_fills_the_plane_at_the_zoom_floor() {
+        let (view_w, view_h) = (1512.0, 982.0);
+        let cols = grid_cols(view_w, view_h);
+        assert!(cols > 1, "a window-sized card must still flow into a row: {cols}");
+        // What is on screen at the floor: the row's full width, drawn.
+        let (cw, _) = card_default(view_w, view_h);
+        let row_w = GUTTER + cols as f32 * (cw + GUTTER);
+        assert!(
+            row_w * ZOOM_MIN <= view_w + cw * ZOOM_MIN,
+            "the row fits the well at the floor, within one card: {row_w}"
+        );
+        // It does not move with the zoom — that is CV2's re-flow bug, one
+        // space over. It moves with the window and the floor and nothing
+        // else.
+        assert_eq!(grid_cols(view_w, view_h), cols);
+        assert_eq!(grid_cols(view_w, view_h * 2.0), cols, "and not with the height");
     }
 
     #[test]
     fn a_narrow_window_wraps_the_grid_and_it_scrolls_down() {
         let order: Vec<ColumnId> = (0..5).map(|i| tab(&format!("t{i}"))).collect();
         let placed = Placements::new();
-        // Room for two across.
-        let view_w = 2.0 * (CARD_W + GUTTER) + GUTTER;
-        assert_eq!(grid_cols(view_w), 2);
-        let rects = layout(&order, &placed, view_w, 800.0);
-        assert_eq!(rects[0].y, rects[1].y, "first row");
-        assert!(rects[2].y > rects[0].y, "the third card wrapped");
-        assert_eq!(rects[2].x, rects[0].x, "and started a new row at the left");
-        assert_eq!(rects[3].y, rects[2].y, "the second row holds two as well");
-        assert!(rects[4].y > rects[2].y, "five cards over two columns make three rows");
-        // **A card is a CARD, not a screen** — the 2026-09-07 ruling,
-        // *"a canvas is free form. not rigid."* The first cut made a grid
-        // row a whole viewport tall, which put exactly one card in front
-        // of the operator and read as a stack rather than a plane.
-        let view_h = 800.0;
-        assert_eq!(grid_h(view_h), CARD_H);
-        assert!(CARD_H < view_h - 2.0 * GUTTER, "and it is smaller than the window");
+        let (view_w, view_h) = (1512.0, 982.0);
+        let cols = grid_cols(view_w, view_h);
+        assert_eq!(cols, 4, "the floor is 14/64, so the plane is ~4.5 wells wide");
         let rects = layout(&order, &placed, view_w, view_h);
-        assert!(rects[2].y < view_h, "the second row starts on screen: {rects:?}");
-        // A window shorter than a card shrinks it rather than clipping it.
-        assert_eq!(grid_h(300.0), CARD_H_MIN.max(300.0 - 2.0 * GUTTER));
-        // A window too narrow for even one card still shows one.
-        assert_eq!(grid_cols(10.0), 1);
-        assert_eq!(grid_cols(0.0), 1);
-        assert_eq!(grid_cols(f32::NAN), 1);
+        assert_eq!(rects[0].y, rects[1].y, "first row");
+        assert_eq!(rects[3].y, rects[0].y, "four across");
+        assert!(rects[4].y > rects[0].y, "the fifth card wrapped");
+        assert_eq!(rects[4].x, rects[0].x, "and started a new row at the left");
+        // A window too small for a card still gets one, at the floor size
+        // rather than nothing.
+        assert_eq!(grid_cols(10.0, 10.0), 1);
+        assert_eq!(grid_cols(0.0, 0.0), 1);
+        assert_eq!(grid_cols(f32::NAN, f32::NAN), 1);
+        assert_eq!(card_default(10.0, 10.0), (CARD_W_MIN, CARD_H_MIN));
+        assert_eq!(card_default(0.0, 0.0), (CARD_W, CARD_H), "no viewport: the fallback");
+        assert_eq!(
+            card_default(f32::NAN, f32::INFINITY),
+            (CARD_W, CARD_H),
+            "a viewport that is not a number is no viewport at all"
+        );
+    }
+
+    /// The floor and the default are one setting, and this is the sum
+    /// they have to keep: what a card is DRAWN at when the plane is all
+    /// the way out. It was 280 pt before either number moved.
+    #[test]
+    fn the_overview_is_the_same_size_it_was() {
+        let (view_w, view_h) = (1512.0, 982.0);
+        let (cw, _) = card_default(view_w, view_h);
+        let drawn = cw * clamp_zoom(ZOOM_MIN);
+        assert!(
+            (drawn - 280.0).abs() < 60.0,
+            "a card at the floor draws at about what it always did: {drawn}"
+        );
+        // The floor sits ON the quantisation lattice — a floor between two
+        // steps is one the plane can never reach.
+        assert_eq!(clamp_zoom(ZOOM_MIN), ZOOM_MIN);
     }
 
     /// Moving a card out of the grid closes the gap behind it — the rest
@@ -720,17 +837,19 @@ mod tests {
     #[test]
     fn the_grid_closes_up_behind_a_card_the_operator_moved() {
         let order = vec![tab("a"), tab("b"), tab("c")];
-        let view_w = 3.0 * (CARD_W + GUTTER) + GUTTER;
+        let (view_w, view_h) = (1512.0, 982.0);
+        let (cw, _) = card_default(view_w, view_h);
+        let second = GUTTER + cw + GUTTER;
         let mut placed = Placements::new();
-        placed.insert("b".into(), CardRect::new(2000.0, 1400.0, CARD_W, 400.0));
-        let rects = layout(&order, &placed, view_w, 800.0);
+        placed.insert("b".into(), CardRect::new(2000.0, 1400.0, cw, 400.0));
+        let rects = layout(&order, &placed, view_w, view_h);
         assert_eq!(rects[1].x, 2000.0, "b is where it was left");
         assert_eq!(rects[0].x, GUTTER, "a keeps the first slot");
-        assert_eq!(rects[2].x, GUTTER + CARD_W + GUTTER, "c moved up into the second");
+        assert_eq!(rects[2].x, second, "c moved up into the second");
         // And tidy is the way back.
         tidy(&mut placed);
-        let rects = layout(&order, &placed, view_w, 800.0);
-        assert_eq!(rects[1].x, GUTTER + CARD_W + GUTTER);
+        let rects = layout(&order, &placed, view_w, view_h);
+        assert_eq!(rects[1].x, second);
         assert!(placed.is_empty(), "tidy clears rather than writing slots");
     }
 
@@ -937,7 +1056,10 @@ mod tests {
         let vp = viewport(0.0, 0.0, 1000.0, 800.0, ZOOM_MAX);
         assert_eq!((vp.w, vp.h), (1000.0, 800.0));
         let vp = viewport(0.0, 0.0, 1000.0, 800.0, ZOOM_MIN);
-        assert_eq!((vp.w, vp.h), (2000.0, 1600.0));
+        assert_eq!((vp.w, vp.h), (1000.0 / ZOOM_MIN, 800.0 / ZOOM_MIN));
+        // The floor is what says how much plane an overview covers, and
+        // since 2026-09-10 that is about four and a half windows across.
+        assert!(vp.w > 4.0 * 1000.0, "the plane at the floor: {vp:?}");
     }
 
     #[test]
