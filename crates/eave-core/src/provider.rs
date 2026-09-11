@@ -469,7 +469,7 @@ impl ProgramResolution {
 /// telling an operator two different stories about the same absence.
 fn not_installed_sentence(bin: &str, provider_id: &str, places_searched: usize) -> String {
     format!(
-        "the {bin:?} CLI is not installed on this machine — eave looked in {places_searched} \
+        "the {bin:?} CLI is not installed on this machine — Eave looked in {places_searched} \
          place(s) including PATH; install it, or set {} to point at it",
         program_override_var(provider_id),
     )
@@ -674,10 +674,10 @@ impl Availability {
                 Some(not_installed_sentence(bin, provider_id, searched.len()))
             }
             Availability::PostureUnproven { reason } => Some(format!(
-                "eave will not run {provider_id} unsupervised: {reason}"
+                "Eave will not run {provider_id} unsupervised: {reason}"
             )),
-            Availability::NoAdapter => Some(format!("eave has no adapter for {provider_id} yet")),
-            Availability::Unknown => Some(format!("eave does not know a provider {provider_id:?}")),
+            Availability::NoAdapter => Some(format!("Eave has no adapter for {provider_id} yet")),
+            Availability::Unknown => Some(format!("Eave does not know a provider {provider_id:?}")),
         }
     }
 }

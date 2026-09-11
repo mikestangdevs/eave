@@ -360,12 +360,12 @@ fn mode_refusal(mode: Option<&str>) -> Option<SessionEvent> {
             mode: m.clone(),
             reason: format!(
                 "Hermes is running in ACP session mode {m:?}, which auto-allows file edits \
-                 instead of asking; eave refuses to supervise a session it cannot review"
+                 instead of asking; Eave refuses to supervise a session it cannot review"
             ),
         }),
         ModeVerdict::Unstated => Some(SessionEvent::PostureRefused {
             mode: "unstated".into(),
-            reason: "Hermes did not state an ACP session mode, so eave cannot prove it will \
+            reason: "Hermes did not state an ACP session mode, so Eave cannot prove it will \
                      ask before it writes"
                 .into(),
         }),
@@ -456,8 +456,8 @@ pub async fn preflight(
         let verdict = match probe.await {
             Ok(verdict) => verdict,
             Err(err) => Preflight::Refused(format!(
-                "eave could not complete the Hermes approval probe ({err}); a posture that \
-                 cannot be checked is not a posture eave will run under"
+                "Eave could not complete the Hermes approval probe ({err}); a posture that \
+                 cannot be checked is not a posture Eave will run under"
             )),
         };
         if refusal.is_none() {
@@ -487,9 +487,9 @@ async fn probe_canary(
         Ok(out) => out,
         Err(err) => {
             return Preflight::Refused(format!(
-                "eave could not run `hermes approvals test` to prove Hermes would ask \
+                "Eave could not run `hermes approvals test` to prove Hermes would ask \
                  before running a dangerous command ({err}); a posture that cannot be \
-                 checked is not a posture eave will run under"
+                 checked is not a posture Eave will run under"
             ));
         }
     };
@@ -501,12 +501,12 @@ async fn probe_canary(
         Some(VERDICT_ASK) => Preflight::Asks,
         Some(other) => Preflight::Refused(format!(
             "Hermes answers {other:?} for {canary:?} under terminal backend {env_type:?} — \
-             it would run that without asking eave. A bypass is active (approvals.mode: \
-             off, a command_allowlist entry, or an isolating terminal backend); eave will \
+             it would run that without asking Eave. A bypass is active (approvals.mode: \
+             off, a command_allowlist entry, or an isolating terminal backend); Eave will \
              not supervise a session it cannot review"
         )),
         None => Preflight::Refused(format!(
-            "`hermes approvals test` gave no verdict for {canary:?}, so eave cannot prove \
+            "`hermes approvals test` gave no verdict for {canary:?}, so Eave cannot prove \
              Hermes would ask before running a dangerous command"
         )),
     }
@@ -654,7 +654,7 @@ async fn stale_sweep(shared: Arc<Shared>, tx: mpsc::Sender<SessionEvent>) {
                     request_id: id,
                     reason: format!(
                         "Hermes stops waiting for an answer after {HERMES_APPROVAL_TIMEOUT_SECS}s \
-                         and denies on its own; eave can no longer deliver a decision for this \
+                         and denies on its own; Eave can no longer deliver a decision for this \
                          question"
                     ),
                 })
@@ -698,7 +698,7 @@ impl Reader {
         // send that blocks for the lifetime of the process is worse than a
         // send that fails, and much worse than one that says why.
         self.shared.ready.settle_if_pending(
-            "the Hermes process ended before it could open an ACP session, so eave has \
+            "the Hermes process ended before it could open an ACP session, so Eave has \
              nothing to send a prompt to",
         );
     }
@@ -778,7 +778,7 @@ impl Reader {
                 if let Some(err) = v.get("error") {
                     return self
                         .refuse(format!(
-                            "Hermes refused the ACP handshake ({err}), so eave cannot \
+                            "Hermes refused the ACP handshake ({err}), so Eave cannot \
                              establish a session it is able to review"
                         ))
                         .await;
@@ -889,7 +889,7 @@ impl Reader {
             return self
                 .refuse(format!(
                     "Hermes could not open an ACP session ({err}), so there is nothing for \
-                     eave to supervise"
+                     Eave to supervise"
                 ))
                 .await;
         }
@@ -934,15 +934,15 @@ impl Reader {
         let probe = match self.preflight.lock().await.take() {
             Some(task) => task.await.unwrap_or_else(|err| {
                 Preflight::Refused(format!(
-                    "eave could not complete the Hermes approval probe ({err}); a posture \
-                     that cannot be checked is not a posture eave will run under"
+                    "Eave could not complete the Hermes approval probe ({err}); a posture \
+                     that cannot be checked is not a posture Eave will run under"
                 ))
             }),
             // Only reachable if Hermes answered `session/new` twice, which
             // would itself be a protocol violation — refuse rather than
             // treat a second unverified session as already proven.
             None => Preflight::Refused(
-                "Hermes opened a second ACP session on one connection; eave cannot vouch \
+                "Hermes opened a second ACP session on one connection; Eave cannot vouch \
                  for a posture it has not checked"
                     .into(),
             ),
@@ -1043,7 +1043,7 @@ impl crate::provider::AgentAdapter for HermesSession {
                      `hermes acp`, whose parser has no such flag, and the ACP adapter's \
                      `set_config_option` stores the value on the session and nothing reads it \
                      back (acp_adapter/server.py, 2026-09-02). Setting it would mean writing the \
-                     operator's config file, which eave does not do.",
+                     operator's config file, which Eave does not do.",
         },
         speed: crate::tuning::SpeedSupport::None {
             reason: "no fast lane on this CLI (2026-09-02).",
@@ -1139,7 +1139,7 @@ impl AgentSession for HermesSession {
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "Hermes did not offer the {wanted:?} option for this permission \
-                         request, so eave cannot deliver that decision without guessing"
+                         request, so Eave cannot deliver that decision without guessing"
                     ),
                 )));
             }

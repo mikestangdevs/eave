@@ -112,7 +112,7 @@ settings = {
 }
 if os.path.exists(icns):
     settings["icon"] = icns
-dmgbuild.build_dmg(filename=os.environ["DMG"], volume_name="eave", settings=settings)
+dmgbuild.build_dmg(filename=os.environ["DMG"], volume_name="Eave", settings=settings)
 PY
 
 if $NOTARIZE; then

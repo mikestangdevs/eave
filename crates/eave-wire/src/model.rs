@@ -822,7 +822,7 @@ impl Transcript {
             ),
             SessionEvent::DialogRefused { dialog, .. } => self.push_row(Row::Marker {
                 text: format!(
-                    "the agent asked a {dialog} question; eave cannot present dialogs yet \
+                    "the agent asked a {dialog} question; Eave cannot present dialogs yet \
                      and told it so"
                 ),
             }),

@@ -459,7 +459,7 @@ impl PiSession {
             // the refusal instead of the deadline.
             if *posture_tx.borrow() == Posture::Pending {
                 let _ = posture_tx.send(Posture::Refused(format!(
-                    "the Pi CLI exited before it could prove eave's approval gate was \
+                    "the Pi CLI exited before it could prove Eave's approval gate was \
                      installed, so no tool call it might have made could have been \
                      reviewed; stderr: {}",
                     stderr_tail.trim()
@@ -515,7 +515,7 @@ impl PiSession {
             Ok(Ok(())) => Ok(()),
             Ok(Err(reason)) => Err(refusal(reason)),
             Err(_) => Err(refusal(format!(
-                "the Pi CLI did not answer eave's posture handshake within {:?}; eave will not \
+                "the Pi CLI did not answer Eave's posture handshake within {:?}; Eave will not \
                  send work to an agent it cannot prove will ask before it writes",
                 HANDSHAKE_WINDOW
             ))),
@@ -549,15 +549,15 @@ impl crate::provider::AgentAdapter for PiSession {
 
     const POSTURE: crate::provider::PostureProof = crate::provider::PostureProof::Verified {
         evidence: "pi.rs: Pi has NO permission system of its own — Slice AX measured a bare \
-                   `pi --mode rpc` executing a shell write with zero approval traffic. eave \
+                   `pi --mode rpc` executing a shell write with zero approval traffic. Eave \
                    INSTALLS one: a TypeScript gate on Pi's `tool_call` hook, written \
                    content-addressed to temp and loaded with -e, and the session refuses to send \
                    any prompt unless `get_commands` proves the gate loaded FROM THE EXACT PATH \
-                   eave wrote (name alone would let another extension spoof it). \
+                   Eave wrote (name alone would let another extension spoof it). \
                    `await_posture` is fail-closed on all four paths: verified, refused, timeout, \
                    and channel-closed. KNOWN GAP: Pi's RPC has an ungated shell escape — \
                    `{\"type\":\"bash\"}` dispatches as `user_bash`, not `tool_call`, so the gate \
-                   cannot see it. eave never sends it.",
+                   cannot see it. Eave never sends it.",
     };
 
     const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
@@ -583,7 +583,7 @@ impl crate::provider::AgentAdapter for PiSession {
             evidence: "RPC `{type: set_model, provider, modelId}` — `modes/rpc/rpc-mode.js` \
                        0.84.2: looks the pair up in `modelRuntime.getAvailableSnapshot()`, \
                        answers `Model not found: provider/id` otherwise, then \
-                       `session.setModel(model)`. eave's Pi ids are `provider/id` and are \
+                       `session.setModel(model)`. Eave's Pi ids are `provider/id` and are \
                        split at the first `/` (2026-09-02).",
         },
     };
@@ -1136,7 +1136,7 @@ impl PiStream {
 
         if v.get("success").and_then(Value::as_bool) != Some(true) {
             return vec![gate_refusal(format!(
-                "the Pi CLI refused eave's `get_commands` probe ({}), so eave cannot prove its \
+                "the Pi CLI refused Eave's `get_commands` probe ({}), so Eave cannot prove its \
                  approval gate loaded",
                 v.get("error")
                     .and_then(Value::as_str)
@@ -1156,15 +1156,15 @@ impl PiStream {
             .unwrap_or(false);
         if !installed {
             return vec![gate_refusal(
-                "the Pi CLI did not load eave's approval gate extension. Pi has no permission \
+                "the Pi CLI did not load Eave's approval gate extension. Pi has no permission \
                  system of its own, so without the gate nothing would ask before it ran `bash`, \
-                 wrote a file or edited one; eave refuses to supervise a session it cannot \
+                 wrote a file or edited one; Eave refuses to supervise a session it cannot \
                  review",
             )];
         }
         let Some(session_id) = self.session_id.clone() else {
             return vec![gate_refusal(
-                "the Pi CLI proved eave's approval gate but never stated its session id, so the \
+                "the Pi CLI proved Eave's approval gate but never stated its session id, so the \
                  session has no resume cursor and could not be reopened",
             )];
         };

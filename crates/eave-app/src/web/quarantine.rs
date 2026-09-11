@@ -80,7 +80,7 @@ use std::path::Path;
 
 /// What eave calls itself in the attribute. Shows up in the Finder's
 /// "downloaded from" sheet, so it is a name a person should recognise.
-pub const AGENT: &str = "eave";
+pub const AGENT: &str = "Eave";
 
 /// Flags: what Chrome and Safari both write on this platform.
 ///
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn the_value_has_the_four_fields_gatekeeper_expects() {
         let v = value(0x61f1_7ed9);
-        assert_eq!(v, "0083;61f17ed9;eave;");
+        assert_eq!(v, "0083;61f17ed9;Eave;");
         let fields: Vec<&str> = v.split(';').collect();
         assert_eq!(fields.len(), 4, "{v}");
         assert_eq!(fields[0], "0083", "the flags Chrome and Safari both write");
@@ -190,7 +190,7 @@ mod tests {
             0x61f1_7ed9,
             "the timestamp is hex seconds, not decimal and not millis"
         );
-        assert_eq!(fields[2], "eave", "the name a person reads in the sheet");
+        assert_eq!(fields[2], "Eave", "the name a person reads in the sheet");
         assert!(
             fields[3].is_empty(),
             "a uuid here promises a database row eave does not write"
@@ -210,7 +210,7 @@ mod tests {
         assert!(mark(&path), "setxattr refused");
         let got = read(&path).expect("no quarantine attribute after marking");
         assert!(got.starts_with("0083;"), "{got}");
-        assert!(got.contains(";eave;"), "{got}");
+        assert!(got.contains(";Eave;"), "{got}");
         let _ = std::fs::remove_file(&path);
     }
 

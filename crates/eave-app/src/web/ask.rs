@@ -339,7 +339,7 @@ pub fn certificate_explanation(reason: &str) -> &'static str {
              misconfigured server — or a clock that is wrong."
         }
         "ERR_CERT_AUTHORITY_INVALID" | "ERR_CERT_SELF_SIGNED_LOCAL_NETWORK" => {
-            "Nobody eave trusts vouched for this certificate. Self-signed \
+            "Nobody Eave trusts vouched for this certificate. Self-signed \
              certificates look exactly like an interception."
         }
         "ERR_CERT_REVOKED" => {
@@ -359,7 +359,7 @@ pub fn certificate_explanation(reason: &str) -> &'static str {
              audited, which is required for a site like this one."
         }
         "ERR_CERT_UNABLE_TO_CHECK_REVOCATION" | "ERR_CERT_NO_REVOCATION_MECHANISM" => {
-            "eave could not check whether this certificate has been revoked."
+            "Eave could not check whether this certificate has been revoked."
         }
         "ERR_CERT_VALIDITY_TOO_LONG" => {
             "This certificate is valid for longer than the rules allow, which \
@@ -373,7 +373,7 @@ pub fn certificate_explanation(reason: &str) -> &'static str {
             "This name is not unique on the internet, so a certificate cannot \
              prove anything about it."
         }
-        _ => "eave could not verify this site's certificate.",
+        _ => "Eave could not verify this site's certificate.",
     }
 }
 

@@ -569,7 +569,7 @@ async fn a_dialog_request_gets_a_stated_refusal_not_silence() {
     );
     assert!(
         said.iter()
-            .any(|s| s.contains("eave cannot present request_user_dialog dialogs")),
+            .any(|s| s.contains("Eave cannot present request_user_dialog dialogs")),
         "and the operator must see it in the transcript; got {said:?}"
     );
 }

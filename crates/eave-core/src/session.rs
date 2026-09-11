@@ -149,7 +149,7 @@ pub fn rewind_support(provider: &str) -> crate::provider::RewindSupport {
     crate::provider::adapter(provider)
         .map(|a| a.rewind)
         .unwrap_or(crate::provider::RewindSupport::None {
-            reason: "eave has no adapter for this provider",
+            reason: "Eave has no adapter for this provider",
         })
 }
 

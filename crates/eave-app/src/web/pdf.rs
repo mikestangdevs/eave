@@ -35,7 +35,7 @@ const src = new URL(location.href).searchParams.get("u") || "";
 const file = "/file?u=" + encodeURIComponent(src);
 try {
   const pdf = await pdfjs.getDocument({ url: file }).promise;
-  document.title = (src.split("/").pop() || "PDF") + " — eave";
+  document.title = (src.split("/").pop() || "PDF") + " — Eave";
   const root = document.getElementById("pages");
   for (let n = 1; n <= pdf.numPages; n++) {
     const page = await pdf.getPage(n);

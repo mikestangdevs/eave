@@ -2442,8 +2442,8 @@ fn conn_silence(status: &ConnEvent) -> Option<String> {
     match status {
         ConnEvent::Failed { message } => Some(format!("no file list — {message}")),
         ConnEvent::Busy { holder_pid } => Some(match holder_pid {
-            Some(pid) => format!("no file list — another eave (pid {pid}) holds the engine"),
-            None => "no file list — another eave holds the engine".into(),
+            Some(pid) => format!("no file list — another Eave (pid {pid}) holds the engine"),
+            None => "no file list — another Eave holds the engine".into(),
         }),
         ConnEvent::Connecting | ConnEvent::Connected { .. } | ConnEvent::Reconnecting { .. } => {
             None
@@ -11342,7 +11342,7 @@ impl Shell {
                 vec![overlay::menu_row(
                     0,
                     &MenuItem::new(format!(
-                        "eave does not know where {provider} keeps its skills"
+                        "Eave does not know where {provider} keeps its skills"
                     ))
                     .disabled(),
                     false,
@@ -24852,9 +24852,9 @@ impl Shell {
         let message = match &self.conn.read(cx).status {
             ConnEvent::Busy { holder_pid } => match holder_pid {
                 Some(pid) => format!(
-                    "another eave instance holds this data dir (pid {pid}) — quit it or use a different --data-dir"
+                    "another Eave instance holds this data dir (pid {pid}) — quit it or use a different --data-dir"
                 ),
-                None => "another eave instance holds this data dir (holder unknown) — quit it or use a different --data-dir".into(),
+                None => "another Eave instance holds this data dir (holder unknown) — quit it or use a different --data-dir".into(),
             },
             ConnEvent::Failed { message } => message.clone(),
             _ => return None,
@@ -33938,7 +33938,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                 // 2026-08-19). theme.rs owns the tints this blur sits under.
                 window_background: WindowBackgroundAppearance::Blurred,
                 titlebar: Some(TitlebarOptions {
-                    title: Some("eave".into()),
+                    title: Some("Eave".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(theme::TRAFFIC_X), px(theme::TRAFFIC_Y))),
                 }),

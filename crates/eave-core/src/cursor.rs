@@ -145,8 +145,8 @@ impl CursorSession {
             return Err(SessionError::Spawn(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "agent flag {bad:?} would undo the permission posture eave spawns Cursor \
-                     under (`cursor-agent acp` with no --force/--yolo/--trust); eave will not \
+                    "agent flag {bad:?} would undo the permission posture Eave spawns Cursor \
+                     under (`cursor-agent acp` with no --force/--yolo/--trust); Eave will not \
                      run a session whose writes it cannot review"
                 ),
             )));
@@ -188,7 +188,7 @@ impl CursorSession {
                     }
                 }
                 reader_shared.ready.settle_if_pending(
-                    "the cursor-agent process ended before it opened an ACP session, so eave has \
+                    "the cursor-agent process ended before it opened an ACP session, so Eave has \
                      nothing to send a prompt to",
                 );
             },
@@ -533,7 +533,7 @@ impl CursorProto {
                     let reason = match resume_id {
                         Some(id) => format!(
                             "cursor-agent could not resume session {id:?}: {err}. Cursor issues \
-                             its own session ids at session/new; an id eave chose is not one of \
+                             its own session ids at session/new; an id Eave chose is not one of \
                              them."
                         ),
                         None => format!("cursor-agent could not open a session: {err}"),
@@ -574,7 +574,7 @@ impl CursorProto {
                 if let Some(refusal) = posture_refusal(mode.as_deref()) {
                     let reason = match &refusal {
                         SessionEvent::PostureRefused { reason, .. } => reason.clone(),
-                        _ => "cursor-agent opened in a posture eave will not supervise".into(),
+                        _ => "cursor-agent opened in a posture Eave will not supervise".into(),
                     };
                     events.push(refusal);
                     ready.refuse(reason);
@@ -650,7 +650,7 @@ impl CursorProto {
                     json!({
                         "outcome": {
                             "outcome": "skipped",
-                            "reason": "eave does not collect answers to Cursor questions"
+                            "reason": "Eave does not collect answers to Cursor questions"
                         }
                     }),
                 )],
@@ -766,7 +766,7 @@ fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
         ModeVerdict::Unproven(other) => Some(SessionEvent::PostureRefused {
             mode: other,
             reason: format!(
-                "this Cursor session reports permission posture {mode:?}, which eave cannot \
+                "this Cursor session reports permission posture {mode:?}, which Eave cannot \
                  prove asks before it writes"
             ),
         }),

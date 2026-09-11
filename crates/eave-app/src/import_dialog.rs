@@ -229,7 +229,7 @@ impl ImportDialog {
                 div()
                     .text_size(px(14.0))
                     .text_color(theme::text_secondary())
-                    .child("Choose what to bring across. Passwords stay where they are — eave has nowhere to put them yet."),
+                    .child("Choose what to bring across. Passwords stay where they are — Eave has nowhere to put them yet."),
             )
             .child(checkbox_row(
                 "import-bookmarks",

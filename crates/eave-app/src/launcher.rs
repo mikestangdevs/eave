@@ -305,14 +305,14 @@ pub fn model_source_note(p: &Provider) -> Option<String> {
             Some(format!("{} reports no models for this account.", p.name))
         }
         Freshness::Reported { .. } => None,
-        Freshness::Asking => Some(format!("eave's own list — asking {}…", p.name)),
-        Freshness::Silent => Some(format!("eave's own list — {} did not answer.", p.name)),
-        Freshness::Unaskable(why) => Some(format!("eave's own list — {why}")),
+        Freshness::Asking => Some(format!("Eave's own list — asking {}…", p.name)),
+        Freshness::Silent => Some(format!("Eave's own list — {} did not answer.", p.name)),
+        Freshness::Unaskable(why) => Some(format!("Eave's own list — {why}")),
         Freshness::Refused => Some(format!(
-            "eave's own list — eave will not spawn {} to ask.",
+            "Eave's own list — Eave will not spawn {} to ask.",
             p.name,
         )),
-        Freshness::Unasked => Some("eave's own list.".to_string()),
+        Freshness::Unasked => Some("Eave's own list.".to_string()),
     }
 }
 
@@ -657,7 +657,7 @@ mod tests {
         let claude = &PROVIDERS[0];
         let before = model_source_note(claude).expect("an unasked list is eave's own");
         assert!(
-            before.contains("eave's own list"),
+            before.contains("Eave's own list"),
             "a guess must be labelled a guess: {before:?}",
         );
         eave_core::capabilities::record("claude-code", vec!["sonnet".into()]);
@@ -672,7 +672,7 @@ mod tests {
         eave_core::capabilities::record("claude-code", vec![]);
         let none = model_source_note(claude).expect("no models is still worth stating");
         assert!(
-            !none.contains("eave's own list"),
+            !none.contains("Eave's own list"),
             "reporting zero models is the CLI's answer, not eave's guess: {none:?}",
         );
         eave_core::capabilities::forget();

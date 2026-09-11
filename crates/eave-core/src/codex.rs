@@ -181,9 +181,9 @@ impl CodexSession {
             return Err(SessionError::Spawn(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "agent flag {bad:?} would undo the permission posture eave spawns Codex \
+                    "agent flag {bad:?} would undo the permission posture Eave spawns Codex \
                      under (approval policy {WANT_APPROVAL_POLICY}, reviewer {WANT_REVIEWER}, \
-                     sandbox {WANT_SANDBOX_ARG}); eave will not run a session whose writes it \
+                     sandbox {WANT_SANDBOX_ARG}); Eave will not run a session whose writes it \
                      cannot review"
                 ),
             )));
@@ -355,7 +355,7 @@ impl CodexSession {
                         mode: "unstated".into(),
                         reason: format!(
                             "the Codex app-server exited before it opened a thread, so it \
-                             never stated the approval policy it was running under; eave will \
+                             never stated the approval policy it was running under; Eave will \
                              not report a session it could not review. Last stderr: {}",
                             cap_payload(stderr_tail.trim())
                         ),
@@ -459,13 +459,13 @@ impl crate::provider::AgentAdapter for CodexSession {
     };
 
     const REWIND: crate::provider::RewindSupport = crate::provider::RewindSupport::None {
-        reason: "Codex has a conversation rewind and eave has not been able to establish its \
+        reason: "Codex has a conversation rewind and Eave has not been able to establish its \
                  shape. `thread/revert` and a deprecated `thread/rollback` are both in the \
                  installed app-server (2026-08-31), and `ThreadRevertParams` takes two fields, \
                  but which two is not readable from the binary and there is no Codex auth on \
                  this machine to ask. A revert addresses a TURN COUNT, so a guessed field name \
                  does not fail loudly — it risks discarding the wrong number of turns. This is \
-                 the one row where eave knows support exists and still says no.",
+                 the one row where Eave knows support exists and still says no.",
     };
 
     const TUNING: crate::tuning::TuningSupport = crate::tuning::TuningSupport {
@@ -482,7 +482,7 @@ impl crate::provider::AgentAdapter for CodexSession {
             applies: crate::tuning::Applies::NextTurn,
             evidence: "`turn/start.serviceTier`; the same `model/list` names one tier on every \
                        gpt-5.5+ model: `{id: \"priority\", name: \"Fast\"}` (gpt-5.2 has none). \
-                       eave sends the id.",
+                       Eave sends the id.",
         },
         model: crate::tuning::ModelSupport::Switch {
             applies: crate::tuning::Applies::NextTurn,
@@ -840,7 +840,7 @@ fn initialize_frame() -> String {
         "id": ID_INITIALIZE,
         "method": "initialize",
         "params": {
-            "clientInfo": { "name": "eave", "title": "eave", "version": env!("CARGO_PKG_VERSION") },
+            "clientInfo": { "name": "eave", "title": "Eave", "version": env!("CARGO_PKG_VERSION") },
         },
     })
     .to_string()
@@ -934,7 +934,7 @@ impl CodexProtocol {
                 Some(e) => Step::from_event(SessionEvent::PostureRefused {
                     mode: "unknown".into(),
                     reason: format!(
-                        "the Codex app-server refused `initialize` ({}), so eave never got to \
+                        "the Codex app-server refused `initialize` ({}), so Eave never got to \
                          ask it for a reviewable approval policy and cannot prove it will ask \
                          before it writes",
                         compact(e)
@@ -948,7 +948,7 @@ impl CodexProtocol {
                     mode: "unknown".into(),
                     reason: format!(
                         "the Codex app-server could not open the thread ({}); with no thread \
-                         there is no stated approval policy, and eave does not run a session \
+                         there is no stated approval policy, and Eave does not run a session \
                          whose posture it cannot read",
                         compact(e)
                     ),
@@ -982,7 +982,7 @@ impl CodexProtocol {
         else {
             return Step::from_event(SessionEvent::PostureRefused {
                 mode: "unstated".into(),
-                reason: "the Codex app-server opened a thread without naming it, so eave has \
+                reason: "the Codex app-server opened a thread without naming it, so Eave has \
                          no resume cursor and no request it could correlate an approval with"
                     .into(),
             });
@@ -1051,7 +1051,7 @@ impl CodexProtocol {
                 replies: vec![error_reply(
                     &id,
                     &format!(
-                        "eave cannot present {method} to the operator. Do not retry it; say what \
+                        "Eave cannot present {method} to the operator. Do not retry it; say what \
                          you need in your reply text and the operator will answer there."
                     ),
                 )],
@@ -1274,7 +1274,7 @@ impl CodexProtocol {
                 if self.pending.remove(&key).is_some() {
                     Step::from_event(SessionEvent::ApprovalWithdrawn {
                         request_id: key,
-                        reason: "the Codex app-server resolved the request without eave".into(),
+                        reason: "the Codex app-server resolved the request without Eave".into(),
                     })
                 } else {
                     Step::default()
@@ -1516,7 +1516,7 @@ fn posture_refusal(
     let complaint = match (policy, reviewer, sandbox) {
         (Some(WANT_APPROVAL_POLICY), Some(WANT_REVIEWER), Some(WANT_SANDBOX_ECHO)) => return None,
         (p, _, _) if p != Some(WANT_APPROVAL_POLICY) => format!(
-            "its approval policy is {}, not {WANT_APPROVAL_POLICY:?} — eave asked for the \
+            "its approval policy is {}, not {WANT_APPROVAL_POLICY:?} — Eave asked for the \
              policy under which anything untrusted escalates to a human",
             quoted(p)
         ),
@@ -1527,15 +1527,15 @@ fn posture_refusal(
         ),
         (_, _, s) => format!(
             "its sandbox is {}, not {WANT_SANDBOX_ECHO:?} — under any wider sandbox the agent \
-             writes without an approval request, so eave would never see the writes",
+             writes without an approval request, so Eave would never see the writes",
             quoted(s)
         ),
     };
     Some(SessionEvent::PostureRefused {
         mode: mode.to_string(),
         reason: format!(
-            "the Codex app-server opened the thread in a posture eave will not supervise: \
-             {complaint}. eave refuses to run an agent whose writes it cannot review."
+            "the Codex app-server opened the thread in a posture Eave will not supervise: \
+             {complaint}. Eave refuses to run an agent whose writes it cannot review."
         ),
     })
 }
@@ -1712,7 +1712,7 @@ fn method_not_found(id: &Value, method: &str) -> String {
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": { "code": -32601, "message": format!("eave does not implement {method}") },
+        "error": { "code": -32601, "message": format!("Eave does not implement {method}") },
     })
     .to_string()
 }

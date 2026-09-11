@@ -1134,7 +1134,7 @@ impl GitState {
     pub fn remedy(&self) -> Option<String> {
         match self {
             GitState::Unanswered { gate: Some(_), .. } => Some(
-                "If eave has not been granted access, approve the prompt — or add it \
+                "If Eave has not been granted access, approve the prompt — or add it \
                  under System Settings › Privacy & Security › Files and Folders."
                     .into(),
             ),
@@ -2695,7 +2695,7 @@ mod tests {
         };
         let r = gated.remedy().expect("a gated folder has a remedy");
         assert!(
-            r.starts_with("If eave has not been granted access"),
+            r.starts_with("If Eave has not been granted access"),
             "{r:?}"
         );
         assert!(r.contains("System Settings"), "{r:?}");

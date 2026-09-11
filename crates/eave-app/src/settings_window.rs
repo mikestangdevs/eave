@@ -921,10 +921,10 @@ const SUPPLEMENT: [(&str, &str, &str); 4] = [
 /// unknown actions APPEAR rather than vanish.
 fn describe(action: &str) -> Option<(&'static str, &'static str)> {
     Some(match action {
-        "eave::Quit" => ("Application", "Quit eave"),
+        "eave::Quit" => ("Application", "Quit Eave"),
         "eave::FrictionLog" => ("Application", "Append to the friction log"),
         "eave_app::Minimize" => ("Application", "Minimize the window"),
-        "eave_app::Hide" => ("Application", "Hide eave"),
+        "eave_app::Hide" => ("Application", "Hide Eave"),
         "eave_settings::OpenSettings" => ("Application", "Settings"),
         "eave_theme::OpenThemeEditor" => ("Application", "Customize Theme"),
         "eave_import::OpenImportDialog" => ("Application", "Import from another browser"),
@@ -1196,7 +1196,7 @@ fn info_pane(theme: &Theme) -> Vec<gpui::AnyElement> {
     ];
     rows.extend(cef_rows(theme));
     vec![
-        section_heading(theme, "eave").into_any_element(),
+        section_heading(theme, "Eave").into_any_element(),
         card(theme, rows).into_any_element(),
     ]
 }

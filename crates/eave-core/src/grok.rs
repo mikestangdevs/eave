@@ -250,7 +250,7 @@ impl GrokSession {
                 // complete: the sender lives here, so settling it as a
                 // stated failure is the reader's last act.
                 reader_shared.ready.settle_if_pending(
-                    "the grok process ended before it opened an ACP session, so eave has \
+                    "the grok process ended before it opened an ACP session, so Eave has \
                      nothing to send a prompt to",
                 );
             },
@@ -344,7 +344,7 @@ impl crate::provider::AgentAdapter for GrokSession {
                    wire before the first tool call, and a session that reports `yolo: true` emits \
                    PostureRefused and is killed. Slice AV verified denial is not advisory — a \
                    denied write left the directory empty and the turn ended PermissionRejected. \
-                   Since Slice TN2 (2026-09-02) this is verify-AND-correct: eave spawns \
+                   Since Slice TN2 (2026-09-02) this is verify-AND-correct: Eave spawns \
                    `grok --permission-mode default agent … stdio`, measured to turn a machine's \
                    `permission_mode = \"always-approve\"` config into `yolo: false` on the wire, \
                    and the verification stays in front of the first tool call regardless.",
@@ -619,7 +619,7 @@ impl GrokProto {
                     let reason = match resume_id {
                         Some(id) => format!(
                             "grok could not resume session {id:?}: {err}. Grok issues its own \
-                             session ids at session/new; an id eave chose is not one of them."
+                             session ids at session/new; an id Eave chose is not one of them."
                         ),
                         None => format!("grok could not open a session: {err}"),
                     };
@@ -937,8 +937,8 @@ fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
         ModeVerdict::Unproven(other) if other == GROK_MODE_YOLO => {
             Some(SessionEvent::PostureRefused {
                 mode: GROK_MODE_YOLO.into(),
-                reason: "this Grok session auto-approves every tool call, so eave would never be \
-                         asked before it writes — and it does so DESPITE eave's own \
+                reason: "this Grok session auto-approves every tool call, so Eave would never be \
+                         asked before it writes — and it does so DESPITE Eave's own \
                          `--permission-mode default` on its argv, which is measured to \
                          override `[ui] permission_mode = \"always-approve\"` in \
                          ~/.grok/config.toml. Either this Grok no longer honours the flag or \
@@ -950,14 +950,14 @@ fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
         ModeVerdict::Unproven(other) => Some(SessionEvent::PostureRefused {
             mode: other.clone(),
             reason: format!(
-                "this Grok session reports permission posture {other:?}, which eave cannot prove \
+                "this Grok session reports permission posture {other:?}, which Eave cannot prove \
                  asks before it writes"
             ),
         }),
         ModeVerdict::Unstated => Some(SessionEvent::PostureRefused {
             mode: "unstated".into(),
             reason: "this Grok session started running tools without ever stating whether it \
-                     asks before it writes, so eave cannot prove its writes are reviewable"
+                     asks before it writes, so Eave cannot prove its writes are reviewable"
                 .into(),
         }),
     }

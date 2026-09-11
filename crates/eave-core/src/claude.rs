@@ -310,8 +310,8 @@ impl ClaudeCodeSession {
                     .send(SessionEvent::PostureRefused {
                         mode: "unknown".into(),
                         reason:
-                            "the agent CLI rejected --permission-prompt-tool, so eave cannot be \
-                             asked to approve anything; eave will not run a session that writes \
+                            "the agent CLI rejected --permission-prompt-tool, so Eave cannot be \
+                             asked to approve anything; Eave will not run a session that writes \
                              without review"
                                 .into(),
                     })
@@ -402,10 +402,10 @@ impl crate::provider::AgentAdapter for ClaudeCodeSession {
             applies: crate::tuning::Applies::NextSpawn,
             evidence: "2.1.258 carries the settings key `fastMode` and a headless \
                        disabled-reason `sdk_opt_in_required` (\"Fast mode is not available \
-                       in the Agent SDK\"), so eave opts in with `--settings \
+                       in the Agent SDK\"), so Eave opts in with `--settings \
                        '{\"fastMode\":true}'`. The opt-in path was read from the binary \
                        2026-09-02, NOT walked live: a paid-plan check (\"Fast mode requires \
-                       a paid subscription\") sits in front of it and eave cannot see \
+                       a paid subscription\") sits in front of it and Eave cannot see \
                        which answer this machine gets.",
         },
         model: crate::tuning::ModelSupport::Switch {
@@ -624,7 +624,7 @@ impl AgentSession for ClaudeCodeSession {
             // Not a refusal from Claude — a refusal by eave, because a
             // rewind has to name a message and this row never got a name.
             return Ok(RewindOutcome::Refused {
-                reason: "eave never saw an id for that message".into(),
+                reason: "Eave never saw an id for that message".into(),
             });
         };
         let request_id = format!(
@@ -781,12 +781,12 @@ fn posture_refusal(mode: Option<&str>) -> Option<SessionEvent> {
             mode: m.to_string(),
             reason: format!(
                 "the agent CLI is running in permission mode {m:?}, which never asks \
-                 before it writes; eave refuses to supervise a session it cannot review"
+                 before it writes; Eave refuses to supervise a session it cannot review"
             ),
         }),
         None => Some(SessionEvent::PostureRefused {
             mode: "unstated".into(),
-            reason: "the agent CLI did not state a permission mode, so eave cannot prove it \
+            reason: "the agent CLI did not state a permission mode, so Eave cannot prove it \
                      will ask before it writes"
                 .into(),
         }),
@@ -803,7 +803,7 @@ fn refusal_frame(request_id: &str, kind: &str) -> String {
             "subtype": "error",
             "request_id": request_id,
             "error": format!(
-                "eave cannot present {kind} dialogs to the operator yet. Do not retry this \
+                "Eave cannot present {kind} dialogs to the operator yet. Do not retry this \
                  tool; ask in your reply text instead and the operator will answer there."
             ),
         },

@@ -189,7 +189,7 @@ pub fn method_not_found_frame(rpc_id: &Value, method: &str) -> Value {
         "error": {
             "code": -32601,
             "message": format!(
-                "eave does not implement the ACP client method {method:?} and declared no \
+                "Eave does not implement the ACP client method {method:?} and declared no \
                  such capability at initialize; use your own tools, which are the ones the \
                  operator reviews."
             ),

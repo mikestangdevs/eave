@@ -243,7 +243,7 @@ pub fn parse_flags(input: &str) -> Result<Vec<String>, String> {
     let args: Vec<String> = input.split_whitespace().map(str::to_string).collect();
     if let Some(bad) = args.iter().find(|a| conflicts_with_eave_flags(a)) {
         return Err(format!(
-            "flag {bad:?} may not be a default — it would override the permission posture eave \
+            "flag {bad:?} may not be a default — it would override the permission posture Eave \
              verifies on every spawn"
         ));
     }
@@ -303,7 +303,7 @@ pub fn posture_fact(provider_id: &str, posture: &PostureProof) -> String {
             format!("asks before it writes — verified on every spawn ({evidence})")
         }
         PostureProof::Unproven { reason } => {
-            format!("eave will not run {provider_id} unsupervised: {reason}")
+            format!("Eave will not run {provider_id} unsupervised: {reason}")
         }
     }
 }
@@ -368,7 +368,7 @@ pub fn auth_sentence(auth: Option<&AuthStatus>) -> String {
         }) => format!("signed in via {m}"),
         Some(AuthStatus::SignedIn { .. }) => "signed in".to_string(),
         Some(AuthStatus::SignedOut) => format!(
-            "not signed in — run `{CLAUDE_SIGN_IN_COMMAND}` in a terminal. eave stores no \
+            "not signed in — run `{CLAUDE_SIGN_IN_COMMAND}` in a terminal. Eave stores no \
              credentials; auth belongs to the CLI."
         ),
         None => "could not read auth status — run `claude auth status` in a terminal to see \
@@ -987,7 +987,7 @@ fn defaults_rows(
             theme,
             match args.is_empty() {
                 true => SharedString::from(
-                    "Appended to new sessions of this agent, verbatim, after eave's own flags. \
+                    "Appended to new sessions of this agent, verbatim, after Eave's own flags. \
                      Split on whitespace — no shell quoting.",
                 ),
                 false => SharedString::from(format!(

@@ -907,9 +907,9 @@ impl Engine {
             other => {
                 let why = other
                     .why_not(&provider)
-                    .unwrap_or_else(|| format!("eave cannot run {provider}"));
+                    .unwrap_or_else(|| format!("Eave cannot run {provider}"));
                 return Err(format!(
-                    "{why}. eave refuses to run an agent whose writes it cannot review; it can \
+                    "{why}. Eave refuses to run an agent whose writes it cannot review; it can \
                      start: {}",
                     posture_verified_providers().join(", ")
                 ));
@@ -922,7 +922,7 @@ impl Engine {
         {
             return Err(format!(
                 "agent flag {bad:?} may not be set per session — it would override the permission \
-                 posture or the resume cursor that eave depends on"
+                 posture or the resume cursor that Eave depends on"
             ));
         }
         Ok(AgentConfig {
@@ -1409,7 +1409,7 @@ impl Engine {
         let provider_id = provider_of(&self.cfg, agent);
         let adapter = provider::adapter(provider_id).ok_or_else(|| {
             format!(
-                "no adapter for provider {provider_id:?} — eave can start: {}",
+                "no adapter for provider {provider_id:?} — Eave can start: {}",
                 posture_verified_providers().join(", ")
             )
         })?;
@@ -1577,7 +1577,7 @@ impl Engine {
             Decision::Allow => ApprovalDecision::Allow,
             Decision::Deny { message } => ApprovalDecision::Deny {
                 message: if message.trim().is_empty() {
-                    "The operator denied this action in eave.".to_string()
+                    "The operator denied this action in Eave.".to_string()
                 } else {
                     message.clone()
                 },
@@ -1752,7 +1752,7 @@ impl Engine {
         let mut live = handle.live.lock().await;
         let Some(l) = live.as_mut() else {
             return refused(
-                "this session is not running, and eave will not change files it cannot                  record having changed — send a message to reopen it first"
+                "this session is not running, and Eave will not change files it cannot                  record having changed — send a message to reopen it first"
                     .into(),
             );
         };
@@ -2127,7 +2127,7 @@ impl Engine {
             provider_of(&self.cfg, &s.header.agent).to_string()
         };
         let support = provider::tuning_support(&provider).ok_or_else(|| {
-            format!("eave has no adapter for {provider}, so there is nothing to tune")
+            format!("Eave has no adapter for {provider}, so there is nothing to tune")
         })?;
         support.check(&provider, &tuning)?;
         let mut meta = Meta::load(&handle.dir).map_err(|e| {
@@ -2229,7 +2229,7 @@ fn write_unclaimed_report(path: &Path, root: &Path, found: &[PathBuf]) {
         return;
     }
     let mut body = String::from(
-        "# Unclaimed eave worktrees\n\n         Directories under the worktrees root that no session in this data\n         dir claims — a crashed `isolate`, or a session dir removed by hand.\n         eave has NOT touched them and will not: it never deletes work it\n         cannot prove is owned and clean. Inspect them, and remove them\n         yourself when you are sure (`git worktree remove`, or `rm -rf` plus\n         `git worktree prune` in the base repo).\n\n         Rewritten on every engine start; deleted when the sweep comes back\n         empty, so this file is never a stale list.\n\n",
+        "# Unclaimed Eave worktrees\n\n         Directories under the worktrees root that no session in this data\n         dir claims — a crashed `isolate`, or a session dir removed by hand.\n         Eave has NOT touched them and will not: it never deletes work it\n         cannot prove is owned and clean. Inspect them, and remove them\n         yourself when you are sure (`git worktree remove`, or `rm -rf` plus\n         `git worktree prune` in the base repo).\n\n         Rewritten on every engine start; deleted when the sweep comes back\n         empty, so this file is never a stale list.\n\n",
     );
     body.push_str(&format!("worktrees root: {}\n\n", root.display()));
     for p in found {

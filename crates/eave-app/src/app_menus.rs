@@ -97,14 +97,14 @@ fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
 fn menus() -> Vec<Menu> {
     vec![
         Menu {
-            name: "eave".into(),
+            name: "Eave".into(),
             disabled: false,
             items: vec![
                 // Disabled rather than absent: an About item that opens
                 // nothing is a lie, and an app menu with no About at all
                 // reads as unfinished. Stating "there is one, it does
                 // nothing yet" is the honest middle.
-                MenuItem::action("About eave", About).disabled(true),
+                MenuItem::action("About Eave", About).disabled(true),
                 MenuItem::separator(),
                 // Where every macOS app keeps it, chord glyph derived from
                 // the ⌘, binding in `bootstrap`. Present because eave now
@@ -117,11 +117,11 @@ fn menus() -> Vec<Menu> {
                 ),
                 MenuItem::action("Customize Theme", crate::theme_editor::OpenThemeEditor),
                 MenuItem::separator(),
-                MenuItem::action("Hide eave", Hide),
+                MenuItem::action("Hide Eave", Hide),
                 MenuItem::action("Hide Others", HideOthers),
                 MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit eave", crate::ui::Quit),
+                MenuItem::action("Quit Eave", crate::ui::Quit),
             ],
         },
         Menu {
@@ -191,7 +191,7 @@ mod tests {
         // bar, because a menu key equivalent is handled ahead of the
         // responder chain and the shell's `on_action` chain is not reached
         // while a text field has focus.
-        assert_eq!(names, vec!["eave", "File", "View", "Window"]);
+        assert_eq!(names, vec!["Eave", "File", "View", "Window"]);
 
         let app_items = m[0].items.len();
         let window_items = m[3].items.len();
