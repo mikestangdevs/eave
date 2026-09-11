@@ -10313,6 +10313,41 @@ impl Shell {
     /// actually happens at.
     fn announce_finishes(&self, cx: &App) {
         let all = &self.sessions.read(cx).sessions;
+        // **`EAVE_NC_TRACE=<path>` writes this decision out, and it is a rig
+        // facility rather than debris.** A banner is invisible to every test
+        // in this repo and to anyone not sitting in front of the machine at
+        // the moment it fires, so when one does not appear there are five
+        // candidate reasons and no way to tell them apart. Two walks were
+        // lost to that before this existed and both were then solved by one
+        // line of it — `state=running` on a finished session (NT2), and
+        // `active=true` on a window that had never been focused.
+        //
+        // A FILE, not stderr: `open --stderr` captured nothing at all from a
+        // bundle here, and a 0-byte log reads exactly like a feature that
+        // stayed silent.
+        if let Some(p) = std::env::var_os("EAVE_NC_TRACE") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                let _ = writeln!(
+                    f,
+                    "observer active={} sessions={}",
+                    self.window_active.get(),
+                    all.len()
+                );
+                for s in all {
+                    let seen = self.rail_seen.borrow().get(&s.session_id).copied();
+                    let _ = writeln!(
+                        f,
+                        "  id={} state={} last_activity={:?} seen={:?} unseen={}",
+                        &s.session_id[..8.min(s.session_id.len())],
+                        s.state,
+                        s.last_activity_ms,
+                        seen,
+                        unseen_finish(s, seen)
+                    );
+                }
+            }
+        }
         let mut announced = self.announced.borrow_mut();
         // A session the engine has stopped reporting cannot finish again.
         // Pruned here for the same reason `rail_seen` is pruned in the
@@ -34498,12 +34533,25 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // finished while eave was closed is still unread.
                         rail_seen: RefCell::new(load_rail_seen()),
                         announced: RefCell::new(HashMap::new()),
-                        // Starts TRUE. A window is being opened, and the
-                        // inactive edge is what `observe_window_activation`
-                        // corrects — assuming the operator is absent at
-                        // launch would announce every session that had
-                        // already finished before eave started.
-                        window_active: Cell::new(true),
+                        // **ASKED, never assumed — and the walk is why.**
+                        //
+                        // This was `Cell::new(true)` on the reasoning that a
+                        // window being opened is a window being looked at,
+                        // with `observe_window_activation` to correct it.
+                        // That observer fires on a CHANGE, so a window that
+                        // opens behind something else and is never touched
+                        // never produces one: eave believed it had focus for
+                        // the life of the process and suppressed every
+                        // banner. Measured — a walk drove a session with
+                        // `CGEventPostToPid`, which delivers to a process
+                        // whether or not it is frontmost, so eave was never
+                        // activated, never deactivated, and said nothing
+                        // about a turn that had finished.
+                        //
+                        // A launch into the background is not exotic: `open`
+                        // while another app holds focus does it, and so does
+                        // restoring a session at login.
+                        window_active: Cell::new(window.is_window_active()),
                         // Slice ID2a: the names this client derived last
                         // run come back with it, so a restart does not
                         // turn a work queue back into `untitled` ×N.

@@ -76,9 +76,24 @@ fn boot(cx: &mut TestAppContext) -> (Harness, &'static mut VisualTestContext) {
     // are about a layout name theirs: `enter_columns` for the strip,
     // `enter_canvas` for the plane, and the default itself is pinned by
     // `a_fresh_window_opens_on_the_plane`.
+    // **Slice NT1 — and the fixture states its FOCUS the same way, for the
+    // same reason.** `Shell::window_active` is read from the real window at
+    // construction, and gpui's test window is not active then; nothing in a
+    // test ever fires an activation event to correct it, because there is no
+    // operator to alt-tab. So without this line every surface test would run
+    // as though eave were sitting behind somebody's editor — which flips
+    // `is_being_watched` and makes a session you are looking at report that
+    // you missed it. `a_session_you_are_looking_at_never_says_finished` is
+    // the test that caught it.
+    //
+    // Production does not need this: a window opened into the foreground
+    // gets its activation event and corrects itself, and one opened into the
+    // background correctly stays inactive. Only the harness has neither.
+    // The tests that are about being away name it themselves.
     window
         .update(cx, |shell, _, _| {
             shell.layout = crate::columns::LayoutMode::Focus;
+            shell.window_active.set(true);
         })
         .unwrap();
     let vcx = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -7733,6 +7748,43 @@ fn a_session_you_are_looking_at_never_says_finished(cx: &mut TestAppContext) {
     assert!(
         !shown(vcx, "badge-aaaa1111"),
         "the session open on screen claimed the operator had missed it"
+    );
+}
+
+/// **...but only while you are actually in front of it** (Slice NT1).
+///
+/// The mirror of the test above, and the defect a live walk found: `rail()`
+/// kept a SELECTED row's seen-mark current on every paint, including every
+/// paint while eave sat behind an editor. So the row you left open marked
+/// itself read from the background and could never be unseen — and that is
+/// the session an operator most wants back, the one they started and walked
+/// away from.
+///
+/// Selection is half the claim. The window's focus is the other half, and
+/// it is the same fact the OS banner turns on.
+#[gpui::test]
+fn a_selected_session_still_says_finished_when_the_window_is_not_yours(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut a = session("aaaa1111");
+    a.state = "running".into();
+    a.last_activity_ms = Some(100);
+    rail_with_selected(&h, vcx, vec![a.clone()], "aaaa1111");
+
+    // The operator alt-tabs away. The row stays selected; nobody is reading
+    // it. `boot` set this true — see its note — so a test about being away
+    // has to say so.
+    h.window
+        .update(vcx, |shell, _, _| shell.window_active.set(false))
+        .unwrap();
+
+    let mut done = a;
+    done.state = "done".into();
+    done.last_activity_ms = Some(200);
+    h.plumbing.push_rail(vec![done]);
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "badge-aaaa1111"),
+        "the row you left open finished behind your editor and said nothing"
     );
 }
 
