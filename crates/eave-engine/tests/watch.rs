@@ -470,25 +470,36 @@ async fn activity_is_stamped_by_state_changes_and_nothing_else() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
-    // Now the session streams hard with its state name unchanged. The
-    // stamp must not move a millisecond.
-    let before = c.list().await.expect("list");
-    let state_before = before
-        .iter()
-        .find(|s| s.session_id == "s1")
-        .unwrap()
-        .state
-        .clone();
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let after = c.list().await.expect("list");
-    let s1 = after.iter().find(|s| s.session_id == "s1").unwrap();
-    if s1.state == state_before {
-        assert_eq!(
-            s1.last_activity_ms,
-            Some(stamped),
-            "the activity stamp moved while the state did not — that makes \
-             the watch channel a report of transcript throughput"
-        );
+    // Now the session streams hard. The stamp must not move except where
+    // the state name does.
+    //
+    // **Slice NT2 made this test sample TIGHTLY, and the reason is a real
+    // blind spot rather than a new defect.** It used to read the state
+    // once, sleep 900 ms, read again, and assert only `if state ==
+    // state_before` — which cannot see a round trip. NT2 added the
+    // `running → idle` transition, so a turn closing and a new one opening
+    // inside that window moved the stamp twice and left both endpoints
+    // reading the same word. Comparing CONSECUTIVE samples states the
+    // invariant the doc above claims instead of a weaker one that happened
+    // to hold.
+    let _ = stamped;
+    let mut last: Option<(String, Option<u64>)> = None;
+    let end = Instant::now() + Duration::from_millis(900);
+    while Instant::now() < end {
+        let listed = c.list().await.expect("list");
+        let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
+        let now = (s1.state.clone(), s1.last_activity_ms);
+        if let Some(prev) = &last {
+            if now.1 != prev.1 {
+                assert_ne!(
+                    now.0, prev.0,
+                    "the activity stamp moved while the state did not — that makes \
+                     the watch channel a report of transcript throughput"
+                );
+            }
+        }
+        last = Some(now);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     // A terminal transition IS a state change, so it does stamp.

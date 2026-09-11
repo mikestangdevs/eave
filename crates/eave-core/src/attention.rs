@@ -53,6 +53,30 @@ pub enum WaitReason {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AttentionSnapshot {
     Running,
+    /// **The turn is over and the process is still alive** (Slice NT2).
+    ///
+    /// The CLI lingers on stdin between turns — `on_tick`'s own comment
+    /// says so and treats it as a reason to run no clock, which is right
+    /// about the clock and was wrong about the STATE. Without this variant
+    /// `reported_state` falls through to `self.state`, which is `running`
+    /// from the moment of spawn and is never written again while the
+    /// process lives. So a session that had finished its work reported
+    /// `running` indefinitely; AG1 #10 recorded that as a defect and could
+    /// not place it.
+    ///
+    /// What it cost is larger than a wrong word. `unseen_finish` refuses
+    /// `running`, so **AG2 #4's `finished` badge could only ever fire for
+    /// a session whose process had EXITED** — the one case where the
+    /// operator does not need telling. It is also why Slice NT1's OS
+    /// banner was built, tested green, and announced nothing.
+    ///
+    /// Deliberately NOT attention-worthy: `state_badge` returns `None`
+    /// here and `state_color` gives it the neutral dot, so the row says
+    /// `finished` only when the operator has not looked since. Nothing
+    /// about being idle is a thing to act on; not having SEEN it is.
+    Idle {
+        since_ms: u64,
+    },
     /// Alive and ambiguous. Escalating notice only; persists indefinitely;
     /// never a kill (spec 01).
     Quiet {
@@ -97,6 +121,7 @@ impl AttentionSnapshot {
     pub fn state_name(&self) -> &'static str {
         match self {
             AttentionSnapshot::Running => "running",
+            AttentionSnapshot::Idle { .. } => "idle",
             AttentionSnapshot::Quiet { .. } => "quiet",
             AttentionSnapshot::Unresponsive { .. } => "unresponsive",
             AttentionSnapshot::AwaitingApproval { .. } => "awaiting_approval",
@@ -237,11 +262,40 @@ impl Classifier {
             return None;
         }
         match self.state {
-            AttentionSnapshot::Quiet { .. } | AttentionSnapshot::Unresponsive { .. } => {
+            // `Idle` joins these two (Slice NT2): a session that finished
+            // its last turn is working again the moment one opens, and the
+            // rail has to stop saying otherwise on the same record that
+            // starts it — not on the next tick.
+            AttentionSnapshot::Quiet { .. }
+            | AttentionSnapshot::Unresponsive { .. }
+            | AttentionSnapshot::Idle { .. } => {
                 self.state = AttentionSnapshot::Running;
                 Some(self.state.clone())
             }
             _ => None,
+        }
+    }
+
+    /// No open turn, on a live process: the work is DONE and the CLI is
+    /// lingering on stdin (Slice NT2).
+    ///
+    /// Raised once, on the first tick after the turn closes, and cleared by
+    /// [`Classifier::activity`] when the next one opens. An open approval
+    /// holds it off for the same reason it holds off every other clock —
+    /// the session is parked on a person, which `AwaitingApproval` already
+    /// says better.
+    fn settle_idle(&mut self, now_ms: u64) -> Option<AttentionSnapshot> {
+        if !self.turn.approvals().is_empty() {
+            return None;
+        }
+        match self.state {
+            // Already said, or terminal. `Failed` outranks idle: a session
+            // that died is not resting.
+            AttentionSnapshot::Idle { .. } | AttentionSnapshot::Failed { .. } => None,
+            _ => {
+                self.state = AttentionSnapshot::Idle { since_ms: now_ms };
+                Some(self.state.clone())
+            }
         }
     }
 
@@ -315,7 +369,14 @@ impl Classifier {
         self.turn.settle(now_ms, self.th.quiet_after_ms);
         // Idle between turns is NORMAL — the CLI lingers on stdin after
         // turn_completed (claude-stream-notes.md). No open turn, no clock.
-        let open = self.turn.open()?;
+        //
+        // **No clock, but it is still a STATE** (Slice NT2). This used to
+        // be a bare `?`, which returned `None` and left the session
+        // reporting `running` for as long as the process lived — see
+        // `AttentionSnapshot::Idle` for what that cost.
+        let Some(open) = self.turn.open() else {
+            return self.settle_idle(now_ms);
+        };
         // Slice K: a pending human approval holds BOTH clocks (spec 01
         // §Attention clocks). This is the carve-out that keeps a session
         // held across someone's lunch break from being reported as
@@ -489,10 +550,22 @@ mod tests {
             1_000,
         );
         completed(&mut c, 2_000);
-        for t in (3_000..7_200_000).step_by(60_000) {
+        // **Slice NT2 changed what this test defends, so it was rewritten
+        // rather than deleted.** It asserted `None` on every tick, which
+        // conflated "no clock runs" with "there is nothing to say" — and
+        // the second of those was the defect: the session reported
+        // `running` for as long as the process lived. The first tick after
+        // the turn closes now says IDLE, once.
+        assert_eq!(
+            c.on_tick(3_000),
+            Some(AttentionSnapshot::Idle { since_ms: 3_000 }),
+            "a closed turn on a live process is idle, not running"
+        );
+        // The name's claim is the rest: two hours of silence, no clock.
+        for t in (63_000..7_200_000).step_by(60_000) {
             assert_eq!(c.on_tick(t), None, "tick at {t} must not classify");
         }
-        assert_eq!(c.snapshot(), AttentionSnapshot::Running);
+        assert_eq!(c.snapshot(), AttentionSnapshot::Idle { since_ms: 3_000 });
     }
 
     /// The recorder's extra/provider channels are unordered: a fast CLI's
@@ -508,7 +581,15 @@ mod tests {
         completed(&mut c, 20); // journaled first (channel race)
         delivered(&mut c, 30); // its own delivery confirmation lands late
         assert_eq!(c.open_turn(), None, "reordered pair must net to closed");
-        for t in (1_000..7_200_000).step_by(60_000) {
+        // Slice NT2: the reordered pair nets to CLOSED, and a closed turn
+        // on a live process is idle — said once, then silence. What this
+        // test guards is unchanged: the phantom-open-turn bug would show
+        // up as a `Quiet` escalation somewhere in the two hours below.
+        assert_eq!(
+            c.on_tick(1_000),
+            Some(AttentionSnapshot::Idle { since_ms: 1_000 })
+        );
+        for t in (61_000..7_200_000).step_by(60_000) {
             assert_eq!(c.on_tick(t), None, "tick at {t} must not classify");
         }
         // And the next real turn still opens/classifies normally.
@@ -877,13 +958,25 @@ mod tests {
             "agent-initiated work must open a turn"
         );
         assert_eq!(c.on_tick(1_000 + TH.quiet_after_ms - 1), None);
+        // **Slice NT2: the claim in the message below is the one that
+        // matters and it still holds — IDLE IS NOT A NOTICE.** It draws no
+        // panel over the transcript, carries no badge and takes the
+        // neutral dot; `Quiet` here would have been the escalation this
+        // test exists to refuse. The settle is what produces it.
         assert_eq!(
             c.on_tick(1_000 + TH.quiet_after_ms),
-            None,
+            Some(AttentionSnapshot::Idle {
+                since_ms: 1_000 + TH.quiet_after_ms
+            }),
             "an unpromised turn must settle, never escalate to a notice"
         );
         assert_eq!(c.open_turn(), None, "the unannounced turn never settled");
-        assert_eq!(c.snapshot(), AttentionSnapshot::Running);
+        assert_eq!(
+            c.snapshot(),
+            AttentionSnapshot::Idle {
+                since_ms: 1_000 + TH.quiet_after_ms
+            }
+        );
         // `unresponsive` is therefore unreachable from this turn shape: it
         // is only ever hardened out of quiet/idle, which this never enters.
         assert!(!c.wants_cpu_sampling());

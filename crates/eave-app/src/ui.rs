@@ -4025,6 +4025,23 @@ fn row_badge(info: &SessionInfo, unseen: bool) -> Option<String> {
 ///
 /// `last_activity_ms: None` means the state has not moved since the engine
 /// loaded the session, so there is nothing to have missed either.
+/// Is this row being WATCHED right now — so that its finish cannot be one
+/// the operator missed? (Slice NT1.)
+///
+/// **Selected is not the same as watched, and that distinction cost a
+/// walk.** AG2 #4 advanced a selected session's seen-mark on every paint,
+/// which is right while the operator is in front of eave and wrong the
+/// moment they are not: the row they left open kept marking itself read
+/// from behind their editor, so a session they launched and walked away
+/// from could never be unseen. That is the one they most want back.
+///
+/// Both halves, or neither. The window's focus is the same fact the OS
+/// banner turns on — when eave is in front of you the transcript IS the
+/// notification, and when it is not, it is not.
+fn is_being_watched(window_active: bool, selected: Option<&str>, id: &str) -> bool {
+    window_active && selected == Some(id)
+}
+
 fn unseen_finish(info: &SessionInfo, seen: Option<u64>) -> bool {
     if matches!(info.state.as_str(), "running" | "new" | "awaiting_approval") {
         return false;
@@ -22835,7 +22852,24 @@ impl Shell {
             let mut out = HashSet::new();
             for info in &all {
                 let mark = info.last_activity_ms.unwrap_or(0);
-                let looking = selected.as_deref() == Some(info.session_id.as_str());
+                // **Selected is not the same as being LOOKED AT, and Slice
+                // NT1's walk is what proved it.** This read `selected ==
+                // id` alone, so the row you had open kept its mark current
+                // on every paint — including every paint while eave sat
+                // behind an editor. A session launched and then walked away
+                // from could therefore never be unseen, which is the exact
+                // session an operator most wants to hear about: the walk
+                // ran one, watched it finish, and got nothing.
+                //
+                // The window's focus is the other half of the claim. It is
+                // the same rule the banner follows — when eave is in front
+                // of you the transcript IS the notification, and when it is
+                // not, it is not.
+                let looking = is_being_watched(
+                    self.window_active.get(),
+                    selected.as_deref(),
+                    &info.session_id,
+                );
                 match seen.get(&info.session_id) {
                     // First sight: baseline and say nothing.
                     None => {
@@ -25466,6 +25500,11 @@ impl Shell {
         };
         let inner: gpui::Div = match attention {
             AttentionSnapshot::Running => return None,
+            // Slice NT2. A finished session needs no notice over its own
+            // transcript — you are looking straight at the answer. The
+            // fact that it finished is the RAIL's to carry, and only for
+            // as long as the operator has not seen it.
+            AttentionSnapshot::Idle { .. } => return None,
             AttentionSnapshot::Quiet { since_ms, reason } => {
                 let held = now.saturating_sub(since_ms);
                 let what = match &reason {
@@ -36247,6 +36286,31 @@ mod tests {
         let got = rail_seen_from(&mixed);
         assert_eq!(got.len(), 1, "only the readable entry survives");
         assert_eq!(got["ok"], 7);
+    }
+
+    /// Slice NT1, and **this is the defect the live walk found** — the one
+    /// no test in this file could have, because it is about where the
+    /// operator's eyes are and the harness has none.
+    ///
+    /// A session was launched, the walk switched to another app, the turn
+    /// completed, and nothing happened. `frame.json` held the answer: the
+    /// row's seen-mark had been advanced PAST the finish, by `rail()`,
+    /// because the session was still the selected one and the old rule read
+    /// selection alone. eave was marking a row read from behind an editor.
+    #[test]
+    fn a_selected_session_is_not_being_watched_once_the_window_is_not() {
+        // In front of you, on the row: watched, so its finish is not news.
+        assert!(is_being_watched(true, Some("a"), "a"));
+        // The row is still selected and eave is behind your editor. This
+        // is the case the walk ran, and the case that must be news.
+        assert!(
+            !is_being_watched(false, Some("a"), "a"),
+            "a selected row kept marking itself read while eave was in the background"
+        );
+        // Neither half alone is enough.
+        assert!(!is_being_watched(true, Some("b"), "a"));
+        assert!(!is_being_watched(false, Some("b"), "a"));
+        assert!(!is_being_watched(true, None, "a"));
     }
 
     /// Slice NT1: a finish is announced to the OS **once**, and the guard

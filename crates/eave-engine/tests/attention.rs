@@ -260,7 +260,7 @@ async fn hang_busy_stays_quiet_never_unresponsive() {
 /// turn_completed the CLI lingers on stdin at zero CPU — that idleness is
 /// normal and classifies as nothing at all.
 #[tokio::test]
-async fn idle_between_turns_after_turn_completed_is_no_state() {
+async fn idle_between_turns_after_turn_completed_reports_idle_and_never_escalates() {
     let dir = scratch();
     let _engine = EngineProc::spawn(&dir, "linger", FAST);
     let (client, _sid, mut rx) = start(&dir).await;
@@ -287,16 +287,30 @@ async fn idle_between_turns_after_turn_completed_is_no_state() {
     }
 
     // 2 s of between-turns silence = 5× the quiet threshold and 6× the
-    // unresponsive window at these clocks. Nothing may classify.
+    // unresponsive window at these clocks. Nothing may ESCALATE.
+    //
+    // **Slice NT2 rewrote this test, and its old last line WAS the defect
+    // written down as an expectation**: `state == "running"` for a CLI
+    // that had finished its work and was lingering on stdin. AG1 #10
+    // recorded that as a defect it could not place; this assertion is
+    // where it was being held in place. `unseen_finish` refuses `running`,
+    // so while that line stood, the rail's `finished` badge could only
+    // ever fire for a session whose process had exited.
     let later = drain_attention(&mut rx, Duration::from_secs(2)).await;
     assert!(
-        !later
-            .iter()
-            .any(|a| !matches!(a, AttentionSnapshot::Running)),
-        "idle between turns must not classify: {later:?}"
+        !later.iter().any(|a| matches!(
+            a,
+            AttentionSnapshot::Quiet { .. }
+                | AttentionSnapshot::Unresponsive { .. }
+                | AttentionSnapshot::Failed { .. }
+        )),
+        "idle between turns must not escalate to a notice: {later:?}"
     );
     let info = client.list().await.expect("list").remove(0);
-    assert_eq!(info.state, "running", "lingering CLI stays plain running");
+    assert_eq!(
+        info.state, "idle",
+        "a lingering CLI with no open turn has finished, and must not report running"
+    );
 }
 
 /// A long legitimate tool call: far past QUIET_AFTER nothing fires (the
@@ -311,10 +325,16 @@ async fn outstanding_tool_suppresses_quiet_then_names_the_tool() {
     // 1.2 s = 3× the quiet threshold, well under the 2 s tool threshold —
     // the scaled shape of "an 8-minute tool call does not trip quiet".
     let early = drain_attention(&mut rx, Duration::from_millis(1200)).await;
+    // Slice NT2: `Idle` may appear in here — the fixture's turn closes and
+    // reopens — and it is not a classification. What this test refuses is
+    // an ESCALATION while a tool is legitimately outstanding.
     assert!(
-        !early
-            .iter()
-            .any(|a| !matches!(a, AttentionSnapshot::Running)),
+        !early.iter().any(|a| matches!(
+            a,
+            AttentionSnapshot::Quiet { .. }
+                | AttentionSnapshot::Unresponsive { .. }
+                | AttentionSnapshot::Failed { .. }
+        )),
         "tool under its threshold must not classify: {early:?}"
     );
 
