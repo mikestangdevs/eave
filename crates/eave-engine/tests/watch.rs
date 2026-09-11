@@ -482,25 +482,41 @@ async fn activity_is_stamped_by_state_changes_and_nothing_else() {
     // reading the same word. Comparing CONSECUTIVE samples states the
     // invariant the doc above claims instead of a weaker one that happened
     // to hold.
+    // **AND THE INVARIANT IS NOT PROVABLE BY SAMPLING**, which NT2's first
+    // rewrite of this had to learn twice. Comparing consecutive samples
+    // only narrowed the gap a `running → idle → running` round trip has to
+    // hide in; under parallel load it still hid there.
+    //
+    // So this counts instead of catching. The defect the test exists to
+    // refuse is the stamp tracking TRANSCRIPT THROUGHPUT — under it the
+    // stamp moves on essentially every record, which across ~45 samples of
+    // a hard-streaming session is dozens of changes. A handful is the
+    // legitimate traffic, turns closing and reopening. The two are orders
+    // of magnitude apart, and the threshold sits between them rather than
+    // pretending a sampler can see every edge.
     let _ = stamped;
-    let mut last: Option<(String, Option<u64>)> = None;
+    let mut last: Option<u64> = None;
+    let mut moves = 0usize;
+    let mut samples = 0usize;
     let end = Instant::now() + Duration::from_millis(900);
     while Instant::now() < end {
         let listed = c.list().await.expect("list");
         let s1 = listed.iter().find(|s| s.session_id == "s1").unwrap();
-        let now = (s1.state.clone(), s1.last_activity_ms);
-        if let Some(prev) = &last {
-            if now.1 != prev.1 {
-                assert_ne!(
-                    now.0, prev.0,
-                    "the activity stamp moved while the state did not — that makes \
-                     the watch channel a report of transcript throughput"
-                );
+        samples += 1;
+        if let (Some(prev), Some(now)) = (last, s1.last_activity_ms) {
+            if now != prev {
+                moves += 1;
             }
         }
-        last = Some(now);
+        last = s1.last_activity_ms;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        moves <= 6,
+        "the activity stamp moved {moves} times across {samples} samples of one \
+         streaming session — that makes the watch channel a report of transcript \
+         throughput rather than of state changes"
+    );
 
     // A terminal transition IS a state change, so it does stamp.
     c.kill("s1").await.expect("kill");
