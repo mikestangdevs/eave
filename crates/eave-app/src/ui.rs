@@ -141,6 +141,23 @@ actions!(
         /// the one way back from a rearranged plane has to be reachable
         /// with the rail open too.
         TidyCanvas,
+        /// **The View menu's two layouts, and why they are menu items.**
+        ///
+        /// Focus — the tiled well with rims, seams and docking — was
+        /// reachable from exactly one place: the ⛶ on a canvas card. The
+        /// canvas is `#[default]` since CV1, so an operator who never
+        /// pressed that glyph had never seen the well at all, and every
+        /// build of the DG1 walk was reporting a pane gesture on a
+        /// surface they were not looking at. That is the two-render-paths
+        /// trap with a third path added, and the cheapest end to it is a
+        /// named way into each one.
+        ///
+        /// Menu items, not bindings, for CV1's measured reason: the
+        /// shell's `on_action` chain is not reached while a text field
+        /// has focus, and on the canvas the selected card holds the
+        /// composer nearly always.
+        UsePanes,
+        UseCanvas,
         /// Slice C5 — ⌘W. Closes the active TAB, and the WINDOW when there
         /// is no tab to close.
         CloseTab,
@@ -6595,17 +6612,14 @@ impl Frame {
 /// operator's report was exact: *"when I combine two tabs and click off
 /// of them they separate."* A tab belongs to at most one split, and the
 /// shell keeps every split it has been given — see [`Shell::splits`].
+///
+/// **The arrangement is a TREE, and since 2026-09-11 it has to be.** It
+/// was a flat `Vec` of panes with one axis, and the operator's own
+/// acceptance scenario could not be *set up* in that model: it opens on
+/// `A | (B / C)`, a split inside a split. See [`crate::dock`].
 #[derive(Clone, Debug, PartialEq)]
 struct Split {
-    /// The panes in well order: left to right, or top to bottom.
-    panes: Vec<String>,
-    /// Each pane's share of the well, one per pane, summing to 1. A
-    /// divider drag keeps its two neighbours' sum and holds each above
-    /// [`theme::SPLIT_RATIO_MIN`].
-    shares: Vec<f32>,
-    /// Top/bottom rather than left/right. The menu's "Convert to Vertical
-    /// Split View" is this bit, not a second split type.
-    vertical: bool,
+    root: dock::Node,
 }
 
 /// The most panes one well holds. Four at [`theme::SPLIT_RATIO_MIN`] each
@@ -6641,164 +6655,125 @@ fn pane_rim(is_focused: bool) -> gpui::Hsla {
     }
 }
 
-/// The dashed rectangle showing the half a dropped tab would take.
+/// **One bright line saying exactly where the carried pane will land.**
 ///
-/// Ruled on 2026-09-10 with four shots of the reference doing it: *"and
-/// arrange able like so."* eave has decided the edge on drop since this
-/// morning and drew NOTHING while the tab was in the air, so arranging a
-/// well was a thing you found out about afterwards. It is dashed and not
-/// filled for the reason `bookmarks`' drop well is: a dashed edge reads
-/// as *a place for something*, a filled one reads as something already
-/// there.
-fn drop_hint(edge: DropEdge) -> AnyElement {
+/// Ruled on 2026-09-11, §9 of the operator's spec: *"render a single
+/// bright accent insertion line … Do NOT show several insertion
+/// indicators simultaneously."*
+///
+/// The first version of this was a dashed rectangle over the HALF the
+/// pane would take, and it was wrong in both directions at once: it read
+/// as a region rather than a seam, and after a drop against the
+/// workspace's own edge the half it drew was not the space the pane got.
+/// A line has one job and states one fact — *this is the seam your pane
+/// will be on the other side of* — which is the only thing the drop
+/// actually promises.
+///
+/// [`dock::indicator`] decides the rectangle, in well-local points, off
+/// the SAME geometry the drop reads. It is stronger than any rim on the
+/// screen (§15): the accent at full strength against rims that live in
+/// the neutral ink.
+fn insertion_line(r: dock::Rect) -> AnyElement {
     div()
-        .debug_selector(|| "well-drop-hint".into())
+        .debug_selector(|| "well-insert-line".into())
         .absolute()
-        .map(|d| match edge {
-            DropEdge::Left => d.top_0().bottom_0().left_0().w(gpui::relative(0.5)),
-            DropEdge::Right => d.top_0().bottom_0().right_0().w(gpui::relative(0.5)),
-            DropEdge::Top => d.left_0().right_0().top_0().h(gpui::relative(0.5)),
-            DropEdge::Bottom => d.left_0().right_0().bottom_0().h(gpui::relative(0.5)),
-        })
-        .rounded(px(theme::RADIUS_PANEL))
-        .border_2()
-        .border_dashed()
-        .border_color(theme::pane_focus_ring())
-        .bg(theme::overlay())
+        .left(px(r.x))
+        .top(px(r.y))
+        .w(px(r.w))
+        .h(px(r.h))
+        .rounded(px(theme::HAIRLINE))
+        .bg(theme::accent())
         .into_any_element()
 }
 
-/// Which edge of a pane a tab was dropped against.
+/// Which edge of a pane — or of the whole well — a drop is against.
 ///
-/// **A drop names an axis as well as a side.** Ruled on 2026-09-10:
-/// *"i should be able to grab edges and put the above/below other
-/// tabs."* `Split` has carried `vertical` since SP1 — it is persisted in
-/// `frame.json`, the well lays a vertical split out with `flex_col`, and
-/// the divider already takes a row-resize cursor — but **nothing ever set
-/// it to `true`**, so above-and-below was a shape the product could
-/// describe, store and draw and never make. This is the missing verb, and
-/// it is a drop target rather than a new control because the operator
-/// asked to *grab an edge*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DropEdge {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
+/// The type and the geometry both live in [`crate::dock`] now, because
+/// the preview and the drop have to read one arithmetic; this is the name
+/// the rest of the shell has always called it by.
+pub use crate::dock::DropEdge;
 
-impl DropEdge {
-    /// Does the dropped tab land AFTER the host in the pane order?
-    fn after(self) -> bool {
-        matches!(self, DropEdge::Right | DropEdge::Bottom)
-    }
-
-    /// Is the split this drop makes stacked rather than side by side?
-    fn vertical(self) -> bool {
-        matches!(self, DropEdge::Top | DropEdge::Bottom)
-    }
-}
-
-/// The edge a pointer at `(x_frac, y_frac)` of a box is nearest.
-///
-/// Four triangular zones meeting at the centre: the pointer's distance to
-/// the nearest vertical edge is measured against its distance to the
-/// nearest horizontal one, **each as a fraction of its own axis**, so the
-/// zones do not skew when the well is much wider than it is tall — which
-/// is the ordinary case here and would otherwise make top and bottom
-/// almost unreachable.
-///
-/// Ties go to the horizontal, which is the arrangement the product had
-/// before this existed.
-fn drop_edge(x_frac: f32, y_frac: f32) -> DropEdge {
-    let x = if x_frac.is_finite() { x_frac.clamp(0.0, 1.0) } else { 0.5 };
-    let y = if y_frac.is_finite() { y_frac.clamp(0.0, 1.0) } else { 0.5 };
-    let dx = x.min(1.0 - x);
-    let dy = y.min(1.0 - y);
-    if dy < dx {
-        if y < 0.5 { DropEdge::Top } else { DropEdge::Bottom }
-    } else if x < 0.5 {
-        DropEdge::Left
-    } else {
-        DropEdge::Right
-    }
-}
+use crate::dock;
 
 impl Split {
-    fn pair(left: String, right: String, vertical: bool) -> Self {
+    fn pair(first: String, second: String, vertical: bool) -> Self {
         Self {
-            panes: vec![left, right],
-            shares: vec![0.5, 0.5],
-            vertical,
+            root: dock::Node::pair(first, second, vertical),
         }
     }
 
+    fn of(root: dock::Node) -> Self {
+        let mut root = root;
+        root.tidy();
+        Self { root }
+    }
+
+    /// Every pane, in reading order: left to right, top to bottom. A
+    /// FUNCTION and not a field since the arrangement became a tree —
+    /// every caller that only wants to know *which tabs are in here* is
+    /// unaffected by the shape they are in.
+    fn panes(&self) -> Vec<String> {
+        self.root.leaves()
+    }
+
     fn contains(&self, id: &str) -> bool {
-        self.panes.iter().any(|p| p == id)
+        self.root.contains(id)
     }
 
     fn position(&self, id: &str) -> Option<usize> {
-        self.panes.iter().position(|p| p == id)
+        self.root.leaves().iter().position(|p| p == id)
     }
 
-    fn share_of(&self, id: &str) -> Option<f32> {
-        self.position(id)
-            .and_then(|ix| self.shares.get(ix).copied())
+    /// The ROOT's axis — the one bit the tab menu's "Convert to Vertical
+    /// Split View" flips. A nested branch keeps its own.
+    fn vertical(&self) -> bool {
+        self.root.vertical()
+    }
+
+    /// The menu's one bit: turn the OUTERMOST row into a column, or back.
+    /// A nested branch keeps its own axis — flipping the whole tree would
+    /// answer a different question than the one the menu item asks.
+    fn flip_axis(&mut self) {
+        if let dock::Node::Split { vertical, .. } = &mut self.root {
+            *vertical = !*vertical;
+        }
+    }
+
+    fn pane_count(&self) -> usize {
+        self.root.leaf_count()
     }
 
     /// A split of one pane is a tab. A split of more than [`SPLIT_MAX`]
     /// is one this build never made.
     fn is_viable(&self) -> bool {
-        (2..=SPLIT_MAX).contains(&self.panes.len()) && self.shares.len() == self.panes.len()
+        self.root.is_viable() && self.pane_count() <= SPLIT_MAX
     }
 
     fn is_full(&self) -> bool {
-        self.panes.len() >= SPLIT_MAX
+        self.pane_count() >= SPLIT_MAX
     }
 
-    /// Put `id` in at `at`. Every pane goes back to an equal share: the
-    /// operator asked for another pane, not for the old proportions
-    /// squeezed, and the divider is theirs from here.
-    fn insert(&mut self, at: usize, id: String) {
-        let at = at.min(self.panes.len());
-        self.panes.insert(at, id);
-        let n = self.panes.len() as f32;
-        self.shares = vec![1.0 / n; self.panes.len()];
-    }
-
-    /// Take `id` out. Its share goes to the pane before it (the first
-    /// pane's goes to the one after), so the others keep their
-    /// proportions and the well stays full.
+    /// Take `id` out. Its room goes to its siblings in proportion and a
+    /// branch left holding one pane collapses into it — see
+    /// [`dock::Node::remove`].
     fn remove(&mut self, id: &str) -> bool {
-        let Some(ix) = self.position(id) else {
-            return false;
-        };
-        self.panes.remove(ix);
-        let share = self.shares.remove(ix);
-        if let Some(to) = self.shares.get_mut(ix.saturating_sub(1)) {
-            *to += share;
+        let gone = self.root.remove(id);
+        if gone {
+            self.root.tidy();
         }
-        true
+        gone
     }
 
-    /// The divider after pane `ix`, dragged so that pane wants `share`.
-    /// The pair's sum is kept and each side held above the minimum;
-    /// returns whether anything moved enough to repaint.
-    fn set_share(&mut self, ix: usize, share: f32) -> bool {
-        if ix + 1 >= self.shares.len() {
-            return false;
-        }
-        let total = self.shares[ix] + self.shares[ix + 1];
-        if total < 2.0 * theme::SPLIT_RATIO_MIN {
-            return false;
-        }
-        let a = share.clamp(theme::SPLIT_RATIO_MIN, total - theme::SPLIT_RATIO_MIN);
-        if (a - self.shares[ix]).abs() < 0.002 {
-            return false;
-        }
-        self.shares[ix] = a;
-        self.shares[ix + 1] = total - a;
-        true
+    /// Where every pane sits inside `well`, and where every divider does.
+    /// The seam is [`theme::SPLIT_HANDLE_W`] — the gap and the target are
+    /// the same points of ground, which is what the operator's *"i still
+    /// cant grab edges"* was about.
+    fn rects(&self, well: dock::Rect) -> Vec<(String, dock::Rect)> {
+        self.root.rects(well, theme::SPLIT_HANDLE_W)
+    }
+
+    fn handles(&self, well: dock::Rect) -> Vec<dock::Handle> {
+        self.root.handles(well, theme::SPLIT_HANDLE_W)
     }
 }
 
@@ -7187,15 +7162,43 @@ fn pane_side(ix: usize, n: usize) -> &'static str {
     }
 }
 
+/// What one recursive pass of the arrangement is carrying: the chrome
+/// that belongs to the single session pane, and the reading-order counter
+/// that names each pane's side.
+struct SplitPaint {
+    total: usize,
+    order: usize,
+    session: Option<String>,
+    transcript_el: Option<AnyElement>,
+    composer: Option<AnyElement>,
+    rail_collapsed: bool,
+    phase: Option<f32>,
+}
+
 /// A split-divider drag in flight. Same shape as [`RailDrag`]: grab offset
 /// rather than snapping the seam to the cursor.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SplitDrag {
-    /// Which divider: the one after pane `handle`.
+    /// Which split, addressed from the root of the arrangement — two
+    /// dividers in different branches must never hear each other.
+    path: Vec<usize>,
+    /// Which divider inside it: the one after child `handle`.
     handle: usize,
-    grab_x: f32,
+    /// The split's axis, carried so the move listener reads the pointer on
+    /// the right one without re-walking the tree every frame.
+    vertical: bool,
+    /// Where along the axis the pointer took hold. A grab offset rather
+    /// than snapping the seam to the cursor, so the divider does not jump
+    /// on the first frame (§26: *"drag proxy starts without jumping"*,
+    /// and a divider has the same duty).
+    grab: f32,
     start_ratio: f32,
-    well_w: f32,
+    /// The parent's length along its own axis, minus its seams — the
+    /// denominator that turns a pointer delta into a share delta.
+    /// **Measured, not derived**: the arithmetic version of this counted
+    /// the seam at `RAIL_HANDLE_W` and assumed nothing sat above the
+    /// well.
+    extent: f32,
 }
 
 /// Payload type for the split divider. Carries nothing; geometry lives on
@@ -7214,6 +7217,21 @@ impl Render for SplitResize {
 /// eave's to open anywhere else. The divider makes it the operator's after
 /// that.
 const DEVTOOLS_RATIO: f32 = 1.0 / 3.0;
+
+/// The DevTools divider's drag, in flight.
+///
+/// Its own record rather than a borrowed [`SplitDrag`]: the dock is
+/// furniture of ONE pane and divides that pane's width, which has nothing
+/// to do with a path into the well's arrangement.
+#[derive(Clone, Copy, Debug)]
+struct DevtoolsDrag {
+    grab_x: f32,
+    start_ratio: f32,
+    /// The hosting pane's width less the divider — read off the painted
+    /// rect, which retires the arithmetic version's own note that it was
+    /// "an approximation only in where the clamp lands".
+    well_w: f32,
+}
 
 /// Payload type for the DevTools dock divider. Same shape as
 /// [`SplitResize`], separate type so the two `on_drag_move` listeners can
@@ -7255,16 +7273,52 @@ impl TabDrag {
     }
 }
 
+/// How thick the one insertion line is. §1: *"docking insertion
+/// indicator: approximately 2px"* — thicker than every rim on the screen,
+/// which is §15's whole point: the line that says what will happen must
+/// not read as another state of the pane it is next to.
+const INSERT_LINE: f32 = 2.0;
+
+/// The proxy's size. §6: *"approximately 160–200px wide … 100–130px
+/// high"* — a stand-in for a pane, not a copy of one.
+const PROXY_W: f32 = 176.0;
+const PROXY_H: f32 = 112.0;
+
 impl Render for TabDrag {
+    /// **What is under the pointer is a token, not the pane.**
+    ///
+    /// Ruled on 2026-09-11, §6: *"The proxy is NOT a full copy of the
+    /// browser. Do not render the webpage again."* It was a one-line text
+    /// pill, which said what was being carried and nothing about what was
+    /// going to happen to a region of the screen. A pane-shaped dashed
+    /// outline says both, costs one rectangle, and is the same dashed
+    /// vocabulary `bookmarks`' drop well uses: a dashed edge reads as *a
+    /// place for something*, a filled one as something already there.
+    ///
+    /// gpui draws this at the pointer with the grab offset it recorded,
+    /// every frame, with no interpolation — §6's *"no floaty spring
+    /// animation"* is had by not writing one.
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .w(px(PROXY_W))
+            .h(px(PROXY_H))
+            .rounded(px(theme::RADIUS_PANEL))
+            .border_1()
+            .border_dashed()
+            .border_color(theme::pane_rim_hover())
+            .bg(theme::overlay())
+            .flex()
+            .items_center()
+            .justify_center()
             .px(px(theme::SPACE_2))
-            .py(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_SELECT))
-            .bg(theme::overlay_strong())
-            .text_size(px(theme::DETAIL_SIZE))
-            .text_color(theme::text())
-            .child(SharedString::from(self.title.clone()))
+            .child(
+                div()
+                    .max_w_full()
+                    .truncate()
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .text_color(theme::text_secondary())
+                    .child(SharedString::from(self.title.clone())),
+            )
     }
 }
 
@@ -8053,15 +8107,28 @@ struct Shell {
     splits: Vec<Split>,
     /// The split-divider drag in progress, or `None`.
     split_drag: Option<SplitDrag>,
-    /// The pane a tab is being dragged over and the edge it would take —
-    /// the placement drawn BEFORE the drop, so arranging is something the
-    /// operator aims rather than something they find out about.
+    /// **Where the pane in the air would land, and the one fact the
+    /// insertion line draws.**
     ///
-    /// Ruled on 2026-09-10, with four shots of the reference doing it:
-    /// *"and arrange able like so."* Transient by construction — it is
-    /// written by `on_drag_move` and cleared by the drop, so nothing about
-    /// it is persisted and a drag that ends anywhere else leaves no mark.
-    tab_drop: Option<(String, DropEdge)>,
+    /// The placement is shown BEFORE the drop, so arranging is something
+    /// the operator aims rather than something they find out about —
+    /// ruled on 2026-09-10 with four shots of the reference doing it
+    /// (*"and arrange able like so"*), and specified in §9 the day after.
+    /// It carries the stickiness §10 asks for; see [`dock::resolve`].
+    ///
+    /// Transient by construction: written only by `track_dock` while a
+    /// drag is live, consumed by the drop, and cleared on `shell-root`'s
+    /// mouse-up for a carry that ended over nothing. Nothing about it is
+    /// persisted.
+    dock: Option<dock::Dock>,
+    /// The well's rectangle in window points, as last PAINTED.
+    ///
+    /// A `Cell` written from the paint and read by the listeners, never
+    /// notified on — the same shape `canvas_placed` uses, and for the same
+    /// reason: this is an observation of the frame, not a change to it,
+    /// and writing it through the entity would ask for a repaint from
+    /// inside one.
+    well_rect: std::rc::Rc<std::cell::Cell<Option<dock::Rect>>>,
     /// **Slice CL1 — the content area's layout.** Focus is the well as
     /// built; Columns is the strip. Per window, saved in `frame.json`
     /// under [`crate::columns::LAYOUT_KEY`] like the rail's collapse.
@@ -8145,7 +8212,7 @@ struct Shell {
     /// which is how Chrome treats it too. Clamped like [`Split::ratio`].
     devtools_ratio: f32,
     /// The dock-divider drag in progress, or `None`.
-    devtools_drag: Option<SplitDrag>,
+    devtools_drag: Option<DevtoolsDrag>,
     /// Slice AS — the session-tab strip's scroll offset.
     ///
     /// Unlike the two above, this one is *written* as well as read: the
@@ -9214,11 +9281,15 @@ fn load_splits(window: &str) -> Vec<Split> {
     splits_from(&v, window)
 }
 
-/// The pure half of [`load_splits`]. An entry is kept only when it is a
-/// split this build could have written: two to [`SPLIT_MAX`] distinct
-/// string ids, and shares that are one finite positive number per pane
-/// (anything else falls back to equal shares rather than failing the
-/// entry — the panes are the fact, the proportions are a preference).
+/// The pure half of [`load_splits`].
+///
+/// # Two shapes, on purpose
+/// An entry carries `tree` — the arrangement as it really is — AND the
+/// flat `panes`/`shares`/`vertical` this file has held since SP1. The
+/// flat fields are a **projection**, written so a build from before the
+/// tree can still open the window and show the panes in a row rather
+/// than losing the arrangement outright; `tree` wins whenever it reads
+/// back as a layout this build could have made.
 fn splits_from(doc: &serde_json::Value, window: &str) -> Vec<Split> {
     let Some(list) = doc
         .get(SPLITS_KEY)
@@ -9229,50 +9300,109 @@ fn splits_from(doc: &serde_json::Value, window: &str) -> Vec<Split> {
     };
     let mut out: Vec<Split> = Vec::new();
     for entry in list {
-        let Some(panes) = entry.get("panes").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        let panes: Vec<String> = panes
-            .iter()
-            .filter_map(|p| p.as_str())
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect();
-        let distinct = panes.iter().collect::<std::collections::HashSet<_>>().len() == panes.len();
-        if !(2..=SPLIT_MAX).contains(&panes.len()) || !distinct {
-            continue;
-        }
+        let split = entry
+            .get("tree")
+            .and_then(node_from_json)
+            .map(Split::of)
+            .filter(Split::is_viable)
+            .or_else(|| flat_split_from(entry));
+        let Some(split) = split else { continue };
         // A tab is in one split at a time, on disk as in memory.
-        if panes.iter().any(|p| out.iter().any(|s| s.contains(p))) {
+        if split.panes().iter().any(|p| out.iter().any(|s| s.contains(p))) {
             continue;
         }
-        let n = panes.len();
-        let shares: Vec<f32> = entry
-            .get("shares")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_f64())
-                    .map(|x| x as f32)
-                    .collect::<Vec<f32>>()
-            })
-            .filter(|v| v.len() == n && v.iter().all(|x| x.is_finite() && *x > 0.0))
-            .map(|v| {
-                let sum: f32 = v.iter().sum();
-                v.into_iter().map(|x| x / sum).collect()
-            })
-            .unwrap_or_else(|| vec![1.0 / n as f32; n]);
-        let vertical = entry
-            .get("vertical")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        out.push(Split {
-            panes,
-            shares,
-            vertical,
-        });
+        out.push(split);
     }
     out
+}
+
+/// The pre-tree entry: two to [`SPLIT_MAX`] distinct string ids in a row,
+/// and shares that are one finite positive number per pane (anything else
+/// falls back to equal shares rather than failing the entry — the panes
+/// are the fact, the proportions are a preference).
+fn flat_split_from(entry: &serde_json::Value) -> Option<Split> {
+    let panes: Vec<String> = entry
+        .get("panes")?
+        .as_array()?
+        .iter()
+        .filter_map(|p| p.as_str())
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    let distinct = panes.iter().collect::<std::collections::HashSet<_>>().len() == panes.len();
+    if !(2..=SPLIT_MAX).contains(&panes.len()) || !distinct {
+        return None;
+    }
+    let n = panes.len();
+    let shares: Vec<f32> = entry
+        .get("shares")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_f64())
+                .map(|x| x as f32)
+                .collect::<Vec<f32>>()
+        })
+        .filter(|v| v.len() == n && v.iter().all(|x| x.is_finite() && *x > 0.0))
+        .unwrap_or_else(|| vec![1.0 / n as f32; n]);
+    let vertical = entry
+        .get("vertical")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(Split::of(dock::Node::Split {
+        vertical,
+        kids: panes.into_iter().map(dock::Node::Leaf).collect(),
+        shares,
+    }))
+}
+
+/// A layout as JSON: a pane is its id, a row or column is
+/// `{"v": bool, "k": [..], "s": [..]}`. Short keys because this nests and
+/// the file is read by hand when a window opens wrong.
+fn node_to_json(node: &dock::Node) -> serde_json::Value {
+    match node {
+        dock::Node::Leaf(id) => serde_json::Value::String(id.clone()),
+        dock::Node::Split {
+            vertical,
+            kids,
+            shares,
+        } => serde_json::json!({
+            "v": vertical,
+            "k": kids.iter().map(node_to_json).collect::<Vec<_>>(),
+            "s": shares,
+        }),
+    }
+}
+
+fn node_from_json(v: &serde_json::Value) -> Option<dock::Node> {
+    if let Some(id) = v.as_str() {
+        return (!id.is_empty()).then(|| dock::Node::Leaf(id.to_string()));
+    }
+    let kids: Vec<dock::Node> = v
+        .get("k")?
+        .as_array()?
+        .iter()
+        .map(node_from_json)
+        .collect::<Option<_>>()?;
+    if kids.len() < 2 {
+        return None;
+    }
+    let shares: Vec<f32> = v
+        .get("s")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_f64())
+                .map(|x| x as f32)
+                .collect::<Vec<f32>>()
+        })
+        .filter(|s: &Vec<f32>| s.len() == kids.len() && s.iter().all(|x| x.is_finite() && *x > 0.0))
+        .unwrap_or_else(|| vec![1.0 / kids.len() as f32; kids.len()]);
+    Some(dock::Node::Split {
+        vertical: v.get("v").and_then(|b| b.as_bool()).unwrap_or(false),
+        kids,
+        shares,
+    })
 }
 
 /// Write this window's splits back, keeping every other key and every
@@ -9389,10 +9519,15 @@ fn put_splits(doc: &mut serde_json::Value, window: &str, splits: &[Split]) {
     let list: Vec<serde_json::Value> = splits
         .iter()
         .map(|s| {
+            // `tree` is the arrangement; the three flat keys beside it are
+            // the projection an older build reads. See `splits_from`.
+            let panes = s.panes();
+            let n = panes.len().max(1) as f32;
             serde_json::json!({
-                "panes": s.panes,
-                "shares": s.shares,
-                "vertical": s.vertical,
+                "tree": node_to_json(&s.root),
+                "panes": panes,
+                "shares": vec![1.0 / n; panes.len()],
+                "vertical": s.vertical(),
             })
         })
         .collect();
@@ -12160,8 +12295,19 @@ impl Shell {
         }
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // **Escape cancels a drag, ahead of everything.** §14 and §23:
+        // *"INVALID MOUSE UP / ESCAPE → remove proxy → remove insertion
+        // guide → leave workspace unchanged."* It is first because a pane
+        // in the air is the most modal state this window has — the
+        // pointer is carrying something and every other Escape in the
+        // ladder below would leave it carrying it. Cancelling costs
+        // nothing to undo because the source pane never left its place
+        // (§5), so there is no animation back to an origin.
+        if ks.key.as_str() == "escape" && self.cancel_drag(window, cx) {
+            return;
+        }
         // ── Slice C5 ──────────────────────────────────────────────────
         //
         // The omnibox owns the WHOLE keyboard while it is up, like the
@@ -13469,6 +13615,98 @@ impl Shell {
         self.splits.iter().find(|s| s.contains(active))
     }
 
+    /// [`Self::showing_split`] by index, for the verbs that mutate it.
+    fn showing_split_ix(&self, snapshot: &eave_wire::TabsSnapshot) -> Option<usize> {
+        let active = snapshot.active.as_deref()?;
+        self.splits.iter().position(|s| s.contains(active))
+    }
+
+    /// Every pane on screen and where it is, in window points.
+    ///
+    /// An UNSPLIT well is one pane filling the whole well, and saying so
+    /// here is what makes a drop on it work like a drop on any other
+    /// pane. `split_pane` renders only when the well is split — the trap
+    /// that has bitten this file twice — so an unsplit well has no rim,
+    /// no seam and no `on_drag_move` of its own, and every build of the
+    /// DG1 walk showed an operator testing on one tab absolutely nothing.
+    fn painted_panes(&self, cx: &App) -> (Option<dock::Rect>, Vec<(String, dock::Rect)>) {
+        let Some(well) = self.well_rect.get() else {
+            return (None, Vec::new());
+        };
+        let snapshot = self.strip_snapshot(cx);
+        let panes = match self.showing_split(&snapshot) {
+            Some(split) => split.rects(well),
+            None => snapshot
+                .active
+                .clone()
+                .map(|id| vec![(id, well)])
+                .unwrap_or_default(),
+        };
+        (Some(well), panes)
+    }
+
+    /// Where a pane let go at `(x, y)` would land — §16's order, with
+    /// §10's stickiness, off the geometry the paint actually used.
+    fn dock_at(&self, x: f32, y: f32, cx: &App) -> Option<dock::Dock> {
+        let (well, panes) = self.painted_panes(cx);
+        dock::resolve(&well?, &panes, x, y, self.dock.as_ref())
+    }
+
+    /// Re-decide the landing from the live pointer. Called from every
+    /// `on_drag_move` over the well; repaints only when the answer
+    /// changes, so a drag that crosses nothing costs one comparison a
+    /// frame (§20).
+    fn track_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // §19: `grab` before anything is held, `grabbing` for the length
+        // of the carry. gpui takes the drag's cursor from the SOURCE
+        // element's own style, which is the open hand the header rests
+        // on, so the closed one has to be asked for once the drag is
+        // live — and only once, because setting it refreshes the window.
+        if cx.active_drag_cursor_style() != Some(gpui::CursorStyle::ClosedHand) {
+            cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+        }
+        let at = window.mouse_position();
+        let next = self.dock_at(f32::from(at.x), f32::from(at.y), cx);
+        if next != self.dock {
+            self.dock = next;
+            cx.notify();
+        }
+    }
+
+    /// Let go. **The landing is the target the line was already drawing**
+    /// — read from `self.dock`, not recomputed — so the preview and the
+    /// drop cannot disagree by so much as a frame. Only a drop that
+    /// arrives with no tracked target at all (a drag begun outside the
+    /// well, say) asks the pointer.
+    fn drop_carried(&mut self, dragged: &str, window: &Window, cx: &mut Context<Self>) {
+        let at = window.mouse_position();
+        let target = self
+            .dock
+            .take()
+            .or_else(|| self.dock_at(f32::from(at.x), f32::from(at.y), cx))
+            .map(|d| d.target);
+        match target {
+            Some(dock::DockTarget::Pane { id, edge }) => self.split_tabs(dragged, &id, edge, cx),
+            Some(dock::DockTarget::Workspace { edge }) => self.drop_tab_on_well(dragged, edge, cx),
+            // §14: no valid target is a cancel, and cancelling is free
+            // because the arrangement was never touched.
+            None => cx.notify(),
+        }
+    }
+
+    /// **Escape, and every other way a drag ends without a drop.**
+    /// §14: *"leave workspace unchanged"* — which costs nothing here,
+    /// because the source pane never left its place (§5).
+    fn cancel_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let had_line = self.dock.take().is_some();
+        let had_drag = cx.stop_active_drag(window);
+        let had_resize = self.split_drag.take().is_some();
+        if had_line || had_drag || had_resize {
+            cx.notify();
+        }
+        had_line || had_drag || had_resize
+    }
+
     /// Whether `id` is a session tab in this window's strip.
     fn tab_is_session(snapshot: &eave_wire::TabsSnapshot, id: &str) -> bool {
         snapshot
@@ -13490,15 +13728,9 @@ impl Shell {
         }
         let before = self.splits.clone();
         for split in &mut self.splits {
-            let gone: Vec<String> = split
-                .panes
-                .iter()
-                .filter(|id| !snapshot.tabs.iter().any(|t| &t.id == *id))
-                .cloned()
-                .collect();
-            for id in gone {
-                split.remove(&id);
-            }
+            split
+                .root
+                .retain(&mut |id| snapshot.tabs.iter().any(|t| t.id == id));
         }
         self.splits.retain(Split::is_viable);
         if self.splits != before {
@@ -13542,8 +13774,10 @@ impl Shell {
         }
         match self.split_of(&opener) {
             Some(ix) => {
-                let at = self.splits[ix].position(&opener).unwrap_or(0) + 1;
-                self.splits[ix].insert(at, opened.clone());
+                self.splits[ix]
+                    .root
+                    .insert_beside(&opener, &opened, DropEdge::Right);
+                self.splits[ix].root.tidy();
             }
             // C2's "split BESIDE the opener" — side by side by name, so
             // it says so rather than inheriting a default.
@@ -14963,53 +15197,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// **A pane you can pick up.** Ruled on 2026-09-10, after three
-    /// rounds of tuning the edges: *"i still cant drage them or move then
-    /// around."*
-    ///
-    /// The missing piece was never the drop — `split_tabs` has reordered
-    /// a split's own panes since SP1 — it was that **nothing in the well
-    /// could START a drag.** A `TabDrag` only ever came from the rail, so
-    /// the panes could receive an arrangement and never make one. This
-    /// mints the SAME payload the rail mints, which is why every drop
-    /// door, every refusal and the dashed hint all work on it unchanged:
-    /// a pane drag is a tab drag whose source happens to be the well.
-    ///
-    /// A band across the pane's top, under its header, and CV1's idiom
-    /// exactly: it goes in FIRST so the header's own controls paint over
-    /// it and keep their hits, and what is left over — the header's inert
-    /// width — is the handle. No new title bar; the operator's ruling
-    /// against one holds here as it does on the plane.
-    fn pane_grab_strip(
-        &self,
-        tab_id: &str,
-        side: &'static str,
-        snapshot: &eave_wire::TabsSnapshot,
-        cx: &Context<Self>,
-    ) -> Option<AnyElement> {
-        // Through the SAME projection the rail drags from — the ghost has
-        // to read like the row it came from, and `StripTab::label` is
-        // where a chat's own name (ID2a) and a blank page's `New Chat`
-        // are decided. Reaching into `TabInfo::title` here would be a
-        // second naming path, which is how two tabs come to be called
-        // different things in one window.
-        let drag = TabDrag::of(self.strip_tabs_by_id(snapshot, cx).get(tab_id)?);
-        let id = format!("pane-grab-{side}");
-        Some(
-            div()
-                .id(SharedString::from(id.clone()))
-                .debug_selector(move || id.clone())
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(theme::PANE_HEADER_H))
-                .cursor_grab()
-                .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
-                .into_any_element(),
-        )
-    }
-
     /// **The card's frame: eight targets, lit together.** Ruled on
     /// 2026-09-10 — *"i still cant grab edges … we should expand the gaps
     /// again so all four sides highlight … and are moveable/grab able."*
@@ -15605,20 +15792,22 @@ impl Shell {
         }
     }
 
-    /// Put `dragged` beside `host` in the well.
+    /// Put `dragged` against `host`'s `edge`.
     ///
-    /// `dragged_on_right` is the drop: onto the right half of the well, or
-    /// onto a tab (the host stays left, the dragged tab opens to its right —
-    /// Arc's default). If the host is already in a split the dragged tab
-    /// joins it beside the host, up to [`SPLIT_MAX`]; a full split refuses
-    /// the drop rather than squeezing a fifth pane in. A split holds at
-    /// most one session tab: this shell has one transcript subscription,
-    /// and a second session pane would be a caption over an empty log.
+    /// If the host is already in an arrangement the dragged pane joins it
+    /// beside the host, up to [`SPLIT_MAX`]; a full split refuses the drop
+    /// rather than squeezing a fifth pane in. A split holds at most one
+    /// session tab: this shell has one transcript subscription, and a
+    /// second session pane would be a caption over an empty log.
+    ///
+    /// **The newcomer takes half of the host and nothing else moves** —
+    /// §17, and the reason [`dock::Node::insert_beside`] is written the
+    /// way it is. The old version put every pane back on an equal share,
+    /// so arranging one pane redivided the whole well.
     fn split_tabs(&mut self, dragged: &str, host: &str, edge: DropEdge, cx: &mut Context<Self>) {
-        // Any path that consumes a drop clears the dashed hint, so it
-        // cannot outlive the drag that drew it.
-        self.tab_drop = None;
-        let dragged_on_right = edge.after();
+        // Any path that consumes a drop clears the line, so it cannot
+        // outlive the drag that drew it.
+        self.dock = None;
         if dragged == host {
             return;
         }
@@ -15631,7 +15820,7 @@ impl Shell {
         if Self::tab_is_session(&snapshot, dragged) {
             let session_already = match host_split {
                 Some(ix) => self.splits[ix]
-                    .panes
+                    .panes()
                     .iter()
                     .any(|p| p != dragged && Self::tab_is_session(&snapshot, p)),
                 None => Self::tab_is_session(&snapshot, host),
@@ -15645,87 +15834,87 @@ impl Shell {
         {
             return;
         }
-        // One split at a time: leave the old one. A pair left with one
-        // pane is a tab again — unless it is the host's own split, where
-        // this is a reorder and the pane comes straight back.
+        // One arrangement at a time: leave the old one. A branch left with
+        // one pane collapses into that pane — unless it is the host's own,
+        // where this is a reorder and the pane comes straight back.
         if let Some(old) = self.split_of(dragged) {
             self.splits[old].remove(dragged);
             if Some(old) != host_split && !self.splits[old].is_viable() {
                 self.splits.remove(old);
             }
         }
+        // Re-asked, because the removal above may have dropped a split
+        // out of the list and moved this one.
         match self.split_of(host) {
             Some(ix) => {
-                let at =
-                    self.splits[ix].position(host).unwrap_or(0) + usize::from(dragged_on_right);
-                self.splits[ix].insert(at, dragged.to_string());
-                // **A split has ONE axis, so the drop names it.** Joining
-                // a side-by-side split from its top edge turns the whole
-                // arrangement into a stack rather than growing a grid:
-                // `Split` holds a single `vertical` and a nested model is
-                // a different slice. The rule is at least predictable —
-                // the edge you drop against is the axis you get.
-                self.splits[ix].vertical = edge.vertical();
+                self.splits[ix].root.insert_beside(host, dragged, edge);
+                self.splits[ix].root.tidy();
             }
             None => {
-                let (left, right) = if dragged_on_right {
+                let (first, second) = if edge.after() {
                     (host.to_string(), dragged.to_string())
                 } else {
                     (dragged.to_string(), host.to_string())
                 };
-                self.splits.push(Split::pair(left, right, edge.vertical()));
+                self.splits.push(Split::pair(first, second, edge.vertical()));
             }
         }
         self.persist_splits();
         self.activate_tab(dragged, cx);
     }
 
-    /// Drop a tab onto the content well. The host is the tab already
-    /// showing at that edge (the outermost pane of the split on screen,
-    /// or the active tab when the well is single), so the dropped tab
-    /// lands where the pointer let go of it.
+    /// Put `dragged` against the WELL's own `edge` — outside everything
+    /// already in it.
+    ///
+    /// **§8, and it is the half of docking a per-pane rule cannot
+    /// express.** In the operator's scenario `C` is dragged past `B` to
+    /// the far right: dropping it on `B`'s right edge would nest it
+    /// inside the right-hand stack, and what they asked for is a third
+    /// column beside `A` and `B`. The difference is not a tuning of the
+    /// zones, it is a different target, and [`dock::classify`] gives the
+    /// outer one precedence for exactly this reason.
     fn drop_tab_on_well(&mut self, dragged: &str, edge: DropEdge, cx: &mut Context<Self>) {
-        // Any path that consumes a drop clears the dashed hint, so it
-        // cannot outlive the drag that drew it.
-        self.tab_drop = None;
+        self.dock = None;
         let snapshot = self.strip_snapshot(cx);
-        let host = if let Some(s) = self.showing_split(&snapshot) {
-            let outermost = if edge.after() {
-                s.panes.last()
-            } else {
-                s.panes.first()
+        if !snapshot.tabs.iter().any(|t| t.id == dragged) {
+            return;
+        }
+        let Some(mut target) = self.showing_split_ix(&snapshot) else {
+            // One tab in the well: against the well's edge and against
+            // that tab's edge are the same arrangement, so there is one
+            // path and not two.
+            let Some(host) = snapshot.active.clone() else {
+                return;
             };
-            match outermost {
-                Some(id) => id.clone(),
-                None => return,
-            }
-        } else {
-            match snapshot.active.clone() {
-                Some(id) if id != dragged => id,
-                _ => return,
-            }
+            self.split_tabs(dragged, &host, edge, cx);
+            return;
         };
-        self.split_tabs(dragged, &host, edge, cx);
-    }
-
-    /// Which edge of the WELL the pointer let go over. See [`drop_edge`].
-    fn well_drop_edge(&self, window: &Window, cx: &App) -> DropEdge {
-        let rail = if self.sessions.read(cx).collapsed {
-            0.0
-        } else {
-            self.rail_w
-        };
-        let well_left = rail + theme::CARD_GUTTER;
-        let well_w =
-            (f32::from(window.viewport_size().width) - well_left - theme::CARD_GUTTER).max(1.0);
-        let well_top = theme::CARD_GUTTER;
-        let well_h =
-            (f32::from(window.viewport_size().height) - 2.0 * theme::CARD_GUTTER).max(1.0);
-        let at = window.mouse_position();
-        drop_edge(
-            (f32::from(at.x) - well_left) / well_w,
-            (f32::from(at.y) - well_top) / well_h,
-        )
+        if Self::tab_is_session(&snapshot, dragged)
+            && self.splits[target]
+                .panes()
+                .iter()
+                .any(|p| p != dragged && Self::tab_is_session(&snapshot, p))
+        {
+            return;
+        }
+        if !self.splits[target].contains(dragged) && self.splits[target].is_full() {
+            return;
+        }
+        if let Some(old) = self.split_of(dragged) {
+            self.splits[old].remove(dragged);
+            if old != target && !self.splits[old].is_viable() {
+                self.splits.remove(old);
+                if old < target {
+                    target -= 1;
+                }
+            }
+        }
+        self.splits[target]
+            .root
+            .insert_at_edge(dragged, edge, dock::EDGE_SHARE);
+        self.splits[target].root.tidy();
+        self.persist_splits();
+        self.activate_tab(dragged, cx);
     }
 
     /// Close a tab, and say where the strip should land.
@@ -15764,10 +15953,10 @@ impl Shell {
             let pos = self.splits[ix].position(tab_id).unwrap_or(0);
             self.splits[ix].remove(tab_id);
             if was_active {
-                let neighbour = self.splits[ix]
-                    .panes
+                let panes = self.splits[ix].panes();
+                let neighbour = panes
                     .get(pos.saturating_sub(1))
-                    .or_else(|| self.splits[ix].panes.first())
+                    .or_else(|| panes.first())
                     .cloned();
                 if let Some(other) = neighbour {
                     let _ = self
@@ -16241,7 +16430,7 @@ impl Shell {
         // moment you click the document.
         let session_id = strip::active_session(snapshot).or_else(|| {
             self.showing_split(snapshot).and_then(|s| {
-                s.panes.iter().find_map(|id| {
+                s.panes().iter().find_map(|id| {
                     snapshot.tabs.iter().find_map(|t| match &t.content {
                         eave_wire::TabContent::Session { session_id } if t.id == *id => {
                             Some(session_id.clone())
@@ -17094,46 +17283,40 @@ impl Shell {
         let snapshot = self.strip_snapshot(cx);
         // The one session pane, if any, takes the transcript and the
         // composer; `split_tabs` refuses a second.
-        let session_ix = split
-            .panes
-            .iter()
-            .position(|id| Self::tab_is_session(&snapshot, id));
-        let mut transcript_el = Some(transcript_el);
-        let mut composer = Some(composer);
-        let n = split.panes.len();
-        let mut children: Vec<AnyElement> = Vec::with_capacity(2 * n);
-        for (ix, id) in split.panes.iter().enumerate() {
-            if ix > 0 {
-                children.push(self.split_handle(split.vertical, ix - 1, cx));
-            }
-            let (tr, co) = if session_ix == Some(ix) {
-                (transcript_el.take(), composer.take())
-            } else {
-                (None, None)
-            };
-            children.push(self.split_pane(
-                id,
-                pane_side(ix, n),
-                split.shares.get(ix).copied().unwrap_or(1.0 / n as f32),
-                ix == 0,
-                ix + 1 == n,
-                rail_collapsed,
-                tr,
-                co,
-                phase,
-                cx,
-            ));
-        }
+        let session = split
+            .panes()
+            .into_iter()
+            .find(|id| Self::tab_is_session(&snapshot, id));
+        let mut paint = SplitPaint {
+            total: split.pane_count(),
+            order: 0,
+            session,
+            transcript_el: Some(transcript_el),
+            composer: Some(composer),
+            rail_collapsed,
+            phase,
+        };
+        let body = self.render_node(&split.root, &mut Vec::new(), &mut paint, cx);
+        // §9: ONE line, drawn over everything, from the geometry the drop
+        // reads. It lives at the well and not in a pane because a
+        // workspace-edge target belongs to no pane at all.
+        let line = self
+            .well_rect
+            .get()
+            .zip(self.dock.as_ref())
+            .and_then(|(well, d)| {
+                dock::indicator(&well, &split.rects(well), &d.target, INSERT_LINE)
+            })
+            .map(insertion_line);
         div()
             .debug_selector(|| "split-well".into())
+            .relative()
             .size_full()
             .overflow_hidden()
-            .flex()
-            .when(split.vertical, |d| d.flex_col())
-            .when(!split.vertical, |d| d.flex_row())
+            .child(self.well_probe())
             .on_drag_move(
                 cx.listener(|this, e: &DragMoveEvent<SplitResize>, _window, cx| {
-                    let Some(drag) = this.split_drag else {
+                    let Some(drag) = this.split_drag.clone() else {
                         return;
                     };
                     let Some(active) = this.strip_snapshot(cx).active else {
@@ -17142,119 +17325,285 @@ impl Shell {
                     let Some(ix) = this.split_of(&active) else {
                         return;
                     };
-                    let split = &mut this.splits[ix];
-                    let pos = if split.vertical {
+                    // 1:1 with the pointer, no easing and no smoothing —
+                    // §3. The delta is measured against the parent's own
+                    // extent, so a divider inside a nested branch moves
+                    // that branch and nothing else.
+                    let pos = if drag.vertical {
                         f32::from(e.event.position.y)
                     } else {
                         f32::from(e.event.position.x)
                     };
-                    let delta = (pos - drag.grab_x) / drag.well_w;
-                    if split.set_share(drag.handle, drag.start_ratio + delta) {
+                    let delta = (pos - drag.grab) / drag.extent;
+                    if this.splits[ix]
+                        .root
+                        .set_share(&drag.path, drag.handle, drag.start_ratio + delta)
+                    {
                         cx.notify();
                     }
                 }),
             )
+            // §11: the landing is recalculated continuously while the pane
+            // is in the air, and nothing else about the well changes.
+            .on_drag_move(cx.listener(|this, _: &DragMoveEvent<TabDrag>, window, cx| {
+                this.track_dock(window, cx);
+            }))
+            // Only the divider here. **The landing must NOT be cleared on
+            // this element**: a mouse-up listener and a drop listener on
+            // the same div run in registration order reversed, so this
+            // would fire BEFORE the drop and take away the target the
+            // drop is about to read. `shell-root` clears it instead.
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _window, cx| {
-                    if this.tab_drop.take().is_some() {
-                        cx.notify();
-                    }
                     if this.split_drag.take().is_some() {
                         this.persist_splits();
                         cx.notify();
                     }
                 }),
             )
+            // ONE drop door for the whole well. The target is geometry, not
+            // whichever element caught the payload, so there is nothing for
+            // a pane to answer that the well cannot.
             .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
-                let edge = this.well_drop_edge(window, cx);
-                this.drop_tab_on_well(&drag.id, edge, cx);
+                this.drop_carried(&drag.id, window, cx);
             }))
-            .children(children)
+            .child(body)
+            .children(line)
             .into_any_element()
     }
 
-    /// The divider after pane `ix`.
+    /// One node of the arrangement: a pane, or a row/column of them.
+    fn render_node(
+        &self,
+        node: &dock::Node,
+        path: &mut Vec<usize>,
+        paint: &mut SplitPaint,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match node {
+            dock::Node::Leaf(id) => {
+                let ix = paint.order;
+                paint.order += 1;
+                let is_session = paint.session.as_deref() == Some(id.as_str());
+                let (tr, co) = if is_session {
+                    (paint.transcript_el.take(), paint.composer.take())
+                } else {
+                    (None, None)
+                };
+                self.split_pane(
+                    id,
+                    pane_side(ix, paint.total),
+                    ix == 0,
+                    ix + 1 == paint.total,
+                    paint.rail_collapsed,
+                    tr,
+                    co,
+                    paint.phase,
+                    cx,
+                )
+            }
+            dock::Node::Split {
+                vertical,
+                kids,
+                shares,
+            } => {
+                let mut children: Vec<AnyElement> = Vec::with_capacity(2 * kids.len());
+                for (i, kid) in kids.iter().enumerate() {
+                    if i > 0 {
+                        children.push(self.split_handle(
+                            path,
+                            i - 1,
+                            *vertical,
+                            shares.get(i - 1).copied().unwrap_or(0.5),
+                            cx,
+                        ));
+                    }
+                    path.push(i);
+                    let el = self.render_node(kid, path, paint, cx);
+                    path.pop();
+                    children.push(
+                        div()
+                            // `flex_basis(0)` so the grow factors ARE the
+                            // sizes. With the default auto basis, a pane
+                            // whose CEF frame had not reflowed yet kept its
+                            // old content width and its neighbour ate the
+                            // leftover — the well moved, only one page did.
+                            .flex_basis(px(0.))
+                            .flex_grow(shares.get(i).copied().unwrap_or(1.0))
+                            .flex_shrink(1.)
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .flex()
+                            .child(el)
+                            .into_any_element(),
+                    );
+                }
+                div()
+                    .flex()
+                    .when(*vertical, |d| d.flex_col())
+                    .when(!*vertical, |d| d.flex_row())
+                    .size_full()
+                    .min_w(px(0.))
+                    .min_h(px(0.))
+                    .children(children)
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// **The well's rectangle, as PAINTED.**
     ///
-    /// **The seam is the gap AND the target, and since 2026-09-10 it says
-    /// so.** At four points it was neither — *"i still cant grab edges"* —
-    /// and at eight with nothing in it, it was slack. The handle keeps its
-    /// full width as the hit box and draws a hairline pill down the middle
-    /// of it under the pointer, so what lights is thinner than what
-    /// answers. `theme::SPLIT_HANDLE_W` carries the width's history.
-    fn split_handle(&self, vertical: bool, ix: usize, cx: &Context<Self>) -> AnyElement {
-        let group = SharedString::from(format!("split-seam-{ix}"));
+    /// Every docking answer is a function of this rect and the tree, so
+    /// getting it wrong is getting all of them wrong — and the arithmetic
+    /// version was wrong twice over: it counted a seam at
+    /// `theme::RAIL_HANDLE_W` instead of `theme::SPLIT_HANDLE_W`, and it
+    /// assumed the well began at `CARD_GUTTER` with nothing above it.
+    /// A zero-sized canvas laid over the well answers exactly, for free,
+    /// and cannot drift when the chrome around it changes.
+    ///
+    /// It writes a `Cell` and does not notify: this is an observation of
+    /// the frame being painted, and asking for a repaint from inside one
+    /// is how a paint loop starts.
+    fn well_probe(&self) -> AnyElement {
+        let cell = self.well_rect.clone();
+        gpui::canvas(
+            move |bounds, _, _| {
+                let r = dock::Rect::new(
+                    f32::from(bounds.origin.x),
+                    f32::from(bounds.origin.y),
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                );
+                if cell.get() != Some(r) {
+                    cell.set(Some(r));
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()
+    }
+
+    /// The divider after child `ix` of the split at `path`.
+    ///
+    /// **The seam you can SEE and the seam you can HIT are different
+    /// widths, and that is the point.** §3: *"visible divider: about
+    /// 1–2px, interactive hit area: about 8–12px … This prevents users
+    /// from having to precisely target a 1px line."* The element in the
+    /// layout is the gap — eight points of ground between two panes — and
+    /// the target inside it reaches [`SPLIT_GRAB_PAD`] further into each
+    /// neighbour, so the resize cursor arrives before the pointer has to
+    /// be centred on anything. What lights under the pointer is a hairline
+    /// pill down the middle, thinner than either.
+    fn split_handle(
+        &self,
+        path: &[usize],
+        ix: usize,
+        vertical: bool,
+        start_ratio: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let key = dock::Handle {
+            path: path.to_vec(),
+            ix,
+            vertical,
+            rect: dock::Rect::new(0.0, 0.0, 0.0, 0.0),
+            extent: 1.0,
+        }
+        .key();
+        let tag = format!("split-handle-{key}");
+        let group = SharedString::from(format!("split-seam-{key}"));
+        let path = path.to_vec();
         div()
-            .id(SharedString::from(format!("split-handle-{ix}")))
-            .debug_selector(move || format!("split-handle-{ix}"))
-            .group(group.clone())
             .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(vertical, |d| {
-                d.h(px(theme::SPLIT_HANDLE_W)).w_full().cursor_row_resize()
-            })
-            .when(!vertical, |d| {
-                d.w(px(theme::SPLIT_HANDLE_W)).h_full().cursor_col_resize()
-            })
-            .occlude()
+            .relative()
+            .when(vertical, |d| d.h(px(theme::SPLIT_HANDLE_W)).w_full())
+            .when(!vertical, |d| d.w(px(theme::SPLIT_HANDLE_W)).h_full())
             .child(
                 div()
-                    .rounded_full()
+                    .id(SharedString::from(tag.clone()))
+                    .debug_selector({
+                        let tag = tag.clone();
+                        move || tag.clone()
+                    })
+                    .group(group.clone())
+                    .absolute()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .map(|d| {
                         if vertical {
-                            d.h(px(theme::HAIRLINE * 2.0)).w_full()
+                            d.left_0()
+                                .right_0()
+                                .top(px(-theme::SPLIT_GRAB_PAD))
+                                .bottom(px(-theme::SPLIT_GRAB_PAD))
+                                .cursor_row_resize()
                         } else {
-                            d.w(px(theme::HAIRLINE * 2.0)).h_full()
+                            d.top_0()
+                                .bottom_0()
+                                .left(px(-theme::SPLIT_GRAB_PAD))
+                                .right(px(-theme::SPLIT_GRAB_PAD))
+                                .cursor_col_resize()
                         }
                     })
-                    .group_hover(group.clone(), |d| d.bg(theme::pane_rim_hover())),
+                    .occlude()
+                    .child(
+                        div()
+                            .rounded_full()
+                            .map(|d| {
+                                if vertical {
+                                    d.h(px(theme::HAIRLINE * 2.0)).w_full()
+                                } else {
+                                    d.w(px(theme::HAIRLINE * 2.0)).h_full()
+                                }
+                            })
+                            .group_hover(group.clone(), |d| d.bg(theme::pane_rim_hover())),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, _window, cx| {
+                            // §3: *"On pointer down: immediately begin
+                            // resize … remember the initial pane
+                            // geometry."* The extent is read off the rect
+                            // this frame was laid out with, so the share
+                            // arithmetic is measured against the parent
+                            // the divider is actually inside.
+                            let snapshot = this.strip_snapshot(cx);
+                            let Some(split) = this.showing_split(&snapshot) else {
+                                return;
+                            };
+                            let Some(well) = this.well_rect.get() else {
+                                return;
+                            };
+                            let Some(handle) = split
+                                .handles(well)
+                                .into_iter()
+                                .find(|h| h.path == path && h.ix == ix)
+                            else {
+                                return;
+                            };
+                            this.split_drag = Some(SplitDrag {
+                                path: path.clone(),
+                                handle: ix,
+                                vertical,
+                                grab: if vertical {
+                                    f32::from(e.position.y)
+                                } else {
+                                    f32::from(e.position.x)
+                                },
+                                start_ratio,
+                                extent: handle.extent.max(1.0),
+                            });
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_drag(SplitResize, |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| SplitResize)
+                    }),
             )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                    let snapshot = this.strip_snapshot(cx);
-                    let Some(s) = this.showing_split(&snapshot) else {
-                        return;
-                    };
-                    let (vertical, start_ratio, handles) = (
-                        s.vertical,
-                        s.shares.get(ix).copied().unwrap_or(0.5),
-                        s.panes.len().saturating_sub(1) as f32,
-                    );
-                    let rail = if this.sessions.read(cx).collapsed {
-                        0.0
-                    } else {
-                        this.rail_w
-                    };
-                    let well_w = if vertical {
-                        f32::from(window.viewport_size().height)
-                            - 2.0 * theme::CARD_GUTTER
-                            - handles * theme::RAIL_HANDLE_W
-                    } else {
-                        f32::from(window.viewport_size().width)
-                            - rail
-                            - 2.0 * theme::CARD_GUTTER
-                            - handles * theme::RAIL_HANDLE_W
-                    };
-                    this.split_drag = Some(SplitDrag {
-                        handle: ix,
-                        grab_x: if vertical {
-                            f32::from(e.position.y)
-                        } else {
-                            f32::from(e.position.x)
-                        },
-                        start_ratio,
-                        well_w: well_w.max(1.0),
-                    });
-                    cx.stop_propagation();
-                }),
-            )
-            .on_drag(SplitResize, |_, _, _, cx| {
-                cx.stop_propagation();
-                cx.new(|_| SplitResize)
-            })
             .into_any_element()
     }
 
@@ -17447,29 +17796,18 @@ impl Shell {
                 MouseButton::Left,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                     // The well here is the PAGE WELL this dock divides,
-                    // not the whole window: start from `split_handle`'s
-                    // arithmetic and take this pane's share of a
-                    // horizontal split. An approximation only in where
-                    // the clamp lands mid-drag; the ratio itself is
-                    // anchored to the grab, like every divider here.
-                    let rail = if this.sessions.read(cx).collapsed {
-                        0.0
-                    } else {
-                        this.rail_w
-                    };
-                    let mut well_w = f32::from(window.viewport_size().width)
-                        - rail
-                        - 2.0 * theme::CARD_GUTTER
+                    // not the whole window — this pane's own painted
+                    // rectangle, which is exactly what the frontend and
+                    // the page are sharing.
+                    let (well, panes) = this.painted_panes(cx);
+                    let well_w = panes
+                        .iter()
+                        .find(|(id, _)| id == &for_tab)
+                        .map(|(_, r)| r.w)
+                        .or_else(|| well.map(|w| w.w))
+                        .unwrap_or(f32::from(window.viewport_size().width))
                         - theme::RAIL_HANDLE_W;
-                    let snapshot = this.strip_snapshot(cx);
-                    if let Some(s) = this.showing_split(&snapshot) {
-                        if !s.vertical {
-                            well_w -= s.panes.len().saturating_sub(1) as f32 * theme::RAIL_HANDLE_W;
-                            well_w *= s.share_of(&for_tab).unwrap_or(1.0);
-                        }
-                    }
-                    this.devtools_drag = Some(SplitDrag {
-                        handle: 0,
+                    this.devtools_drag = Some(DevtoolsDrag {
                         grab_x: f32::from(e.position.x),
                         start_ratio: this.devtools_ratio,
                         well_w: well_w.max(1.0),
@@ -17738,7 +18076,6 @@ impl Shell {
         &self,
         tab_id: &str,
         side: &'static str,
-        ratio: f32,
         show_rail: bool,
         show_files: bool,
         rail_collapsed: bool,
@@ -17776,48 +18113,24 @@ impl Shell {
             _ => "pane-header-mid-2",
         };
         let activate = tab_id.to_string();
-        let drop_id = tab_id.to_string();
-        // A drop on any pane but the first opens to that pane's right;
-        // the first pane takes it on its left, so both edges are reachable.
-        let on_right = side != "left";
         let is_focused = snapshot.active.as_deref() == Some(tab_id);
-        // The pane's own drop edge, decided the same way the DROP decides
-        // it — one rule, so the dashed rectangle cannot promise a landing
-        // the drop does not honour.
-        let edge_of = move |this: &Self, window: &Window, cx: &App| match this
-            .well_drop_edge(window, cx)
-        {
-            vert @ (DropEdge::Top | DropEdge::Bottom) => vert,
-            _ if on_right => DropEdge::Right,
-            _ => DropEdge::Left,
-        };
-        let hint = self
-            .tab_drop
-            .as_ref()
-            .filter(|(host, _)| host == side)
-            .map(|(_, edge)| drop_hint(*edge));
-        let hint_side = side.to_string();
         div()
             .id(SharedString::from(format!("split-pane-{side}")))
             .debug_selector(move || format!("split-pane-{side}"))
             .relative()
             .flex()
             .flex_col()
-            // `flex_basis(0)` so the grow factors ARE the pane sizes.
-            // With the default auto basis, a pane whose CEF frame had not
-            // reflowed yet kept its old content width and the other pane
-            // ate the leftover — the well moved, only one page did.
-            .flex_basis(px(0.))
-            .flex_grow(ratio)
-            .flex_shrink(1.)
+            .size_full()
             .min_w(px(0.))
-            .h_full()
+            .min_h(px(0.))
             .overflow_hidden()
             .rounded(px(theme::RADIUS_PANEL))
             // Always a 1 px border, colour only changes: a ring that
             // appeared on focus would shrink the page by 2 px and fire
-            // another WasResized. Same reason the rail's selection rim
-            // is an inset shadow rather than a border.
+            // another WasResized — and §2 asks for exactly that, *"avoid
+            // changing the pane's dimensions … avoid causing any layout
+            // movement"*. Same reason the rail's selection rim is an inset
+            // shadow rather than a border.
             .border_1()
             // **The pane under the pointer says so, on all four sides.**
             // Ruled on 2026-09-10: *"all four sides highlight … and are
@@ -17825,7 +18138,9 @@ impl Shell {
             // already laid out moves, so nothing reflows and nothing is
             // covered — *"a clean sleek border not going into the
             // screen"*. The pane with the keyboard keeps the stronger ink:
-            // hover is the step below focus, not a competing one.
+            // §15 wants hover, focus and docking to read as three
+            // different states, and hover is the step below focus rather
+            // than a competing one.
             .hover_rim(
                 format!("pane-rim-{side}"),
                 pane_rim(is_focused),
@@ -17837,28 +18152,13 @@ impl Shell {
                     this.activate_tab(&activate, cx);
                 }),
             )
-            // **Where it will land, while it is still in the air.** The
-            // listener only fires while a `TabDrag` is over this pane, so
-            // it is both the signal and the position.
-            .on_drag_move(cx.listener(move |this, _: &DragMoveEvent<TabDrag>, window, cx| {
-                let next = Some((hint_side.clone(), edge_of(this, window, cx)));
-                if this.tab_drop != next {
-                    this.tab_drop = next;
-                    cx.notify();
-                }
+            // The well decides the landing and the well takes the drop —
+            // but a page element sits between them, and a pane that hears
+            // the move itself cannot be shadowed by one. Both call the
+            // same tracker, so hearing it twice costs a comparison.
+            .on_drag_move(cx.listener(|this, _: &DragMoveEvent<TabDrag>, window, cx| {
+                this.track_dock(window, cx);
             }))
-            .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
-                cx.stop_propagation();
-                // The pane's own left/right is kept — it is more precise
-                // than the well's for a reorder inside a split — and the
-                // well is asked only for the AXIS, which no per-pane
-                // fraction can answer.
-                let edge = edge_of(this, window, cx);
-                this.split_tabs(&drag.id, &drop_id, edge, cx);
-            }))
-            // The handle that makes a pane movable — see `pane_grab_strip`.
-            // FIRST, so the header below paints over it and keeps its hits.
-            .children(self.pane_grab_strip(tab_id, side, &snapshot, cx))
             // D10 — the pane's own header goes with the rest of the chrome.
             // Read per TAB rather than from a flag passed down, because
             // that is the honest scope: in a split it is the fullscreen
@@ -17907,7 +18207,6 @@ impl Shell {
                     }))
                     .children(composer),
             )
-            .children(hint)
             .into_any_element()
     }
 
@@ -17965,14 +18264,48 @@ impl Shell {
         // and the rim (`pane_rim`) is what draws the edge and the corner —
         // it always was, which is why taking the fill away costs the
         // header no definition.
+        // **This row is how a pane is picked up.** Ruled on 2026-09-11,
+        // §4: *"grab the pane using the appropriate pane/chrome area
+        // already provided by our UI … Do not make browser webpage
+        // content behave like a giant draggable surface."*
+        //
+        // The first attempt at this was an invisible strip laid under the
+        // header, and it did nothing at all — **the address field is
+        // `flex_1` and registers its own hitbox, so it covered the strip
+        // edge to edge**, which is why three rounds of the DG1 walk went
+        // into the LOOK of a gesture that had no reachable source. Putting
+        // the drag on the row itself inverts that: every control keeps its
+        // own hits because a child hitbox wins, and what is left over —
+        // the gaps, and the deliberate spacer beside the address — is the
+        // handle. gpui only mints the drag past its own movement
+        // threshold, so a click on the row is still a click.
+        //
+        // **Not on a canvas or column card.** Those headers already sit
+        // over CV1's move band, which carries a `CardDrag` and is painted
+        // FIRST so the header's controls keep their hits; a second drag
+        // source with its own hitbox on top of it takes the card's own
+        // gesture away, and three plane fixtures said so within the
+        // minute. A card on the plane is moved by placing it, a pane in
+        // the well is moved by docking it — different verbs, one header.
+        let grab = wanted
+            .filter(|_| !tag.ends_with("-column"))
+            .and_then(|id| Some(TabDrag::of(self.strip_tabs_by_id(&snapshot, cx).get(id)?)));
+        let grab_tag = tag.replace("pane-header", "pane-grab");
         let row = div()
+            .id(SharedString::from(tag))
             .size_full()
             .pl(px(lead))
             .pr(px(theme::SPACE_3))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(theme::SPACE_2));
+            .gap(px(theme::SPACE_2))
+            .when_some(grab, |d, drag| {
+                // §19: the region says `grab` before anything is held, and
+                // gpui paints `grabbing` for the length of the drag.
+                d.cursor_grab()
+                    .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
+            });
 
         // **The rail toggle lives HERE, not in the rail — and the test is
         // what found that out.** The first cut of this change put it in the
@@ -18115,7 +18448,12 @@ impl Shell {
                     div()
                         .id(SharedString::from(address_key))
                         .debug_selector(|| "pane-address".into())
-                        .flex_1()
+                        // Grow four times as fast as the grab region
+                        // beside it, and never below what the row's
+                        // `min_w` there leaves.
+                        .flex_grow(4.)
+                        .flex_shrink(1.)
+                        .flex_basis(px(0.))
                         .min_w(px(0.))
                         .h(px(theme::ADDRESS_H))
                         .relative()
@@ -18255,6 +18593,25 @@ impl Shell {
                             ))
                         })
                 })
+                // **The grab region, and it is deliberate furniture.**
+                // The address is `flex_1`, so without this the row's own
+                // drag would have nothing left to sit on but the eight
+                // points of gap between controls — which is how the first
+                // version of the pane drag came to be unreachable. See the
+                // note on `row`. It registers no listeners of its own: a
+                // child with no hitbox leaves the row's underneath it.
+                .child(
+                    div()
+                        .debug_selector({
+                            let t = grab_tag.clone();
+                            move || t
+                        })
+                        .flex_grow(1.)
+                        .flex_shrink(0.)
+                        .flex_basis(px(0.))
+                        .min_w(px(theme::PANE_GRAB_MIN))
+                        .h_full(),
+                )
                 // Zoom chip: only after ⌘+ / ⌘−, and only for a moment.
                 // A standing "90%" on a host Chromium already remembers
                 // is a decoration — the operator already knows, and the
@@ -20056,8 +20413,8 @@ impl Shell {
             // its pill, on screen or not). A split this list holds fewer
             // than two members of draws the tab as an ordinary row.
             if let Some(sx) = self.split_of(id) {
-                let members: Vec<&strip::StripTab> = self.splits[sx]
-                    .panes
+                let sx_panes = self.splits[sx].panes();
+                let members: Vec<&strip::StripTab> = sx_panes
                     .iter()
                     .filter_map(|p| by_id.get(p))
                     .collect();
@@ -27700,7 +28057,7 @@ impl Shell {
         }
         let target = match self.split_of(tab_id) {
             Some(ix) => TabMenuTarget::Split {
-                members: self.splits[ix].panes.clone(),
+                members: self.splits[ix].panes(),
             },
             _ => TabMenuTarget::Tab(tab_id.to_string()),
         };
@@ -28181,7 +28538,7 @@ impl Shell {
         let vertical = members
             .first()
             .and_then(|m| self.split_of(m))
-            .is_some_and(|ix| self.splits[ix].vertical);
+            .is_some_and(|ix| self.splits[ix].vertical());
         let convert = if vertical {
             "Convert to Horizontal Split View"
         } else {
@@ -28243,7 +28600,7 @@ impl Shell {
         let has_session = Self::tab_is_session(&snapshot, tab_id)
             || own.is_some_and(|ix| {
                 self.splits[ix]
-                    .panes
+                    .panes()
                     .iter()
                     .any(|p| Self::tab_is_session(&snapshot, p))
             });
@@ -28538,7 +28895,7 @@ impl Shell {
             TabMenuAction::AddTab => self.new_tab(cx),
             TabMenuAction::ConvertAxis => {
                 if let Some(ix) = self.split_of(&tab_id) {
-                    self.splits[ix].vertical = !self.splits[ix].vertical;
+                    self.splits[ix].flip_axis();
                     self.persist_splits();
                     cx.notify();
                 }
@@ -30131,8 +30488,8 @@ impl Render for Shell {
                     push_page(&id);
                 }
             } else if let Some(s) = self.showing_split(&strip_snapshot) {
-                for id in &s.panes {
-                    push_page(id);
+                for id in s.panes() {
+                    push_page(&id);
                 }
             } else if let Some(a) = strip_snapshot.active.as_deref() {
                 push_page(a);
@@ -31162,6 +31519,22 @@ impl Render for Shell {
             // all of them.
             .capture_key_down(cx.listener(Self::note_keystroke))
             .on_key_down(cx.listener(Self::on_key))
+            // **Where a landing that was never dropped goes to die.**
+            // §21: *"insertion indicator does not remain behind"*. The
+            // well's own drop consumes it and stops propagation, so this
+            // never sees a completed drop; what it does see is a release
+            // that ended a carry over nothing — outside the well, over
+            // the rail, anywhere — which no drop door hears at all. Last
+            // in the bubble order because it is the outermost element,
+            // which is exactly the position this needs.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.dock.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             // ── THE MOUSE'S OWN BACK AND FORWARD (G24) ────────────────
             //
             // The two extra buttons on almost every mouse sold. gpui has
@@ -31284,6 +31657,12 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.cycle_tab(false, cx)))
             .on_action(cx.listener(|this, _: &ColumnPrev, _, cx| this.step_column(false, cx)))
             .on_action(cx.listener(|this, _: &ColumnNext, _, cx| this.step_column(true, cx)))
+            .on_action(cx.listener(|this, _: &UsePanes, _, cx| {
+                this.set_layout(LayoutMode::Focus, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseCanvas, _, cx| {
+                this.set_layout(LayoutMode::Canvas, cx)
+            }))
             .on_action(cx.listener(|this, _: &TidyCanvas, _, cx| {
                 if this.layout.is_canvas() {
                     this.tidy_canvas(cx);
@@ -31543,14 +31922,42 @@ impl Render for Shell {
                                         .size_full()
                                         .overflow_hidden()
                                         .rounded(px(theme::RADIUS_PANEL))
+                                        .relative()
                                         .flex()
                                         .flex_col()
+                                        // **The unsplit well is a pane
+                                        // too.** `split_pane` renders only
+                                        // when the well is SPLIT — the
+                                        // two-render-paths trap this file
+                                        // has been bitten by twice — so
+                                        // with one tab open there was no
+                                        // rim, no seam, no tracking and no
+                                        // insertion line, and an operator
+                                        // testing on a single tab was shown
+                                        // nothing by any build of the DG1
+                                        // walk. The probe, the tracker and
+                                        // the line all belong here as well.
+                                        .child(self.well_probe())
+                                        .on_drag_move(cx.listener(
+                                            |this, _: &DragMoveEvent<TabDrag>, window, cx| {
+                                                this.track_dock(window, cx);
+                                            },
+                                        ))
                                         .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
-                                            let edge = this.well_drop_edge(window, cx);
-                                            this.drop_tab_on_well(&drag.id, edge, cx);
+                                            this.drop_carried(&drag.id, window, cx);
                                         }))
-                                        .drag_over::<TabDrag>(|style, _, _, _| {
-                                            style.bg(theme::overlay())
+                                        .children({
+                                            let (well, panes) = self.painted_panes(cx);
+                                            well.zip(self.dock.as_ref())
+                                                .and_then(|(w, d)| {
+                                                    dock::indicator(
+                                                        &w,
+                                                        &panes,
+                                                        &d.target,
+                                                        INSERT_LINE,
+                                                    )
+                                                })
+                                                .map(insertion_line)
                                         })
                                         // The one line that says what this region is, and
                                         // — for a page — where it is. See
@@ -33605,7 +34012,8 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_drag: None,
                         splits: load_splits(&window_key),
                         split_drag: None,
-                        tab_drop: None,
+                        dock: None,
+                        well_rect: Default::default(),
                         layout: layout_prefs.mode,
                         columns_scroll: Cell::new(layout_prefs.scroll),
                         columns_scroll_dirty: Cell::new(false),
@@ -35364,6 +35772,7 @@ mod tests {
     /// tabs."*
     #[test]
     fn a_drop_takes_the_edge_it_is_nearest() {
+        use dock::drop_edge;
         use DropEdge::*;
         // The four edges, each from well inside its own zone.
         assert_eq!(drop_edge(0.02, 0.5), Left);
@@ -35400,12 +35809,16 @@ mod tests {
             "rail_w": 228.0,
             SPLITS_KEY: { "other-window": [{"panes": ["x", "y"]}] },
         });
-        let mut three = Split::pair("a".into(), "b".into(), false);
-        three.insert(2, "c".into());
-        three.set_share(0, 0.4);
-        let mut pair = Split::pair("d".into(), "e".into(), false);
-        pair.vertical = true;
-        let splits = vec![three.clone(), pair.clone()];
+        // A | (B / C) — a grid, which is the shape the flat file format
+        // could not hold and the reason `tree` exists beside it.
+        let mut grid = Split::of(dock::Node::Split {
+            vertical: false,
+            kids: vec![dock::Node::leaf("a"), dock::Node::pair("b", "c", true)],
+            shares: vec![0.4, 0.6],
+        });
+        grid.root.set_share(&[], 0, 0.4);
+        let pair = Split::pair("d".into(), "e".into(), true);
+        let splits = vec![grid.clone(), pair.clone()];
         put_splits(&mut doc, "primary", &splits);
         assert_eq!(doc["rail_w"], 228.0, "a neighbour was dropped");
         assert_eq!(
@@ -35415,16 +35828,21 @@ mod tests {
         );
         let back = splits_from(&doc, "primary");
         assert_eq!(back.len(), 2);
-        assert_eq!(back[0].panes, three.panes);
-        assert!(!back[0].vertical);
-        assert!(back[1].vertical);
-        let sum: f32 = back[0].shares.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-4,
-            "shares came back as {:?}",
-            back[0].shares
+        assert_eq!(
+            back[0].root.sketch(),
+            "(a | (b / c))",
+            "the arrangement came back flattened"
         );
-        assert!((back[0].shares[0] - 0.4).abs() < 1e-4);
+        assert!(!back[0].vertical());
+        assert!(back[1].vertical());
+        assert_eq!(back[0].root.share_at(&[], 0), Some(0.4));
+
+        // **The flat keys beside `tree` are what an OLDER build reads.**
+        // Dropping them would make a downgrade lose every arrangement
+        // rather than see it as a row.
+        let entry = &doc[SPLITS_KEY]["primary"][0];
+        assert_eq!(entry["panes"], serde_json::json!(["a", "b", "c"]));
+        assert!(entry["shares"].as_array().is_some_and(|a| a.len() == 3));
 
         // No splits removes the window's entry rather than writing `[]`.
         put_splits(&mut doc, "primary", &[]);
@@ -35446,33 +35864,35 @@ mod tests {
         });
         let got = splits_from(&mixed, "w");
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].panes, ["p", "q"]);
-        assert_eq!(got[0].shares, [0.5, 0.5]);
+        assert_eq!(got[0].panes(), ["p", "q"]);
+        assert_eq!(got[0].root.share_at(&[], 0), Some(0.5));
         assert!(splits_from(&serde_json::json!({}), "w").is_empty());
+
+        // A `tree` that is not a layout falls back to the flat keys
+        // rather than failing the entry, and one that IS wins over them.
+        let odd = serde_json::json!({
+            SPLITS_KEY: { "w": [
+                {"tree": {"k": ["z"]}, "panes": ["m", "n"]},
+                {"tree": {"v": true, "k": ["s", "t"]}, "panes": ["WRONG", "ALSO"]},
+            ]}
+        });
+        let got = splits_from(&odd, "w");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].panes(), ["m", "n"]);
+        assert_eq!(got[1].panes(), ["s", "t"]);
+        assert!(got[1].vertical());
     }
 
-    /// Slice SP1: the pure arithmetic of a split. Inserting equalises,
-    /// removing hands the share to the pane before, a divider keeps its
-    /// pair's sum and the floor, and the cap is the cap.
+    /// Slice SP1, rewritten for the tree: the cap is the cap, the side
+    /// names are the reading order, and the menu's one bit flips the
+    /// OUTERMOST axis and leaves a nested branch alone.
     #[test]
     fn a_split_shares_its_well_and_stops_at_four() {
         let mut s = Split::pair("a".into(), "b".into(), false);
-        assert!(s.set_share(0, 0.7));
-        assert_eq!(s.shares, [0.7, 0.3]);
-        assert!(!s.set_share(0, 0.701), "a hair's move must not repaint");
-        assert!(s.set_share(0, 0.99), "clamped, but moved");
-        assert!((s.shares[0] - (1.0 - theme::SPLIT_RATIO_MIN)).abs() < 1e-6);
-        assert!(
-            !s.set_share(1, 0.5),
-            "there is no divider after the last pane"
-        );
-
-        s.insert(1, "c".into());
-        assert_eq!(s.panes, ["a", "c", "b"]);
-        assert_eq!(s.shares.len(), 3);
-        assert!(s.shares.iter().all(|x| (x - 1.0 / 3.0).abs() < 1e-6));
-        s.insert(9, "d".into());
-        assert_eq!(s.panes, ["a", "c", "b", "d"], "past the end is the end");
+        assert!(s.is_viable() && !s.is_full());
+        s.root.insert_beside("b", "c", DropEdge::Right);
+        s.root.insert_beside("c", "d", DropEdge::Right);
+        assert_eq!(s.panes(), ["a", "b", "c", "d"]);
         assert!(s.is_full() && s.is_viable());
         assert_eq!(pane_side(0, 4), "left");
         assert_eq!(pane_side(1, 4), "mid-1");
@@ -35480,25 +35900,25 @@ mod tests {
         assert_eq!(pane_side(3, 4), "right");
         assert_eq!(pane_side(1, 2), "right");
 
-        assert!(s.set_share(1, 0.4));
-        let (c, b) = (s.shares[1], s.shares[2]);
         assert!(s.remove("b"));
-        assert_eq!(s.panes, ["a", "c", "d"]);
-        assert!(
-            (s.shares[1] - (c + b)).abs() < 1e-6,
-            "the pane before absorbs"
-        );
-        assert!(s.remove("a"));
-        assert!(
-            (s.shares[0] - (c + b + 0.25)).abs() < 1e-6,
-            "the first pane's goes forward"
-        );
-        assert!(!s.remove("a"), "already gone");
+        assert_eq!(s.panes(), ["a", "c", "d"]);
+        assert!(!s.remove("b"), "already gone");
         assert!(s.is_viable());
         s.remove("c");
+        s.remove("d");
         assert!(!s.is_viable(), "one pane is a tab");
-        assert_eq!(s.share_of("d"), Some(s.shares[0]));
-        assert_eq!(s.share_of("a"), None);
+
+        // The menu's bit is the ROOT's, not the whole tree's.
+        let mut grid = Split::of(dock::Node::Split {
+            vertical: false,
+            kids: vec![dock::Node::leaf("a"), dock::Node::pair("b", "c", true)],
+            shares: vec![0.5, 0.5],
+        });
+        grid.flip_axis();
+        assert_eq!(grid.root.sketch(), "(a / (b / c))");
+        assert!(grid.vertical());
+        grid.flip_axis();
+        assert_eq!(grid.root.sketch(), "(a | (b / c))");
     }
 
     /// Slice AO: line two is the FOLDER, whole, and nothing else shares

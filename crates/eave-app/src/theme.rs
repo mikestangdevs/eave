@@ -2429,6 +2429,24 @@ pub const RAIL_HANDLE_W: f32 = 8.0;
 /// carrying something.
 pub const SPLIT_HANDLE_W: f32 = SPACE_2;
 
+/// How much further into each neighbouring pane the divider's TARGET
+/// reaches than the seam it draws.
+///
+/// §3 of the operator's spec: *"visible divider: about 1–2px,
+/// interactive hit area: about 8–12px … This prevents users from having
+/// to precisely target a 1px line."* The seam is
+/// [`SPLIT_HANDLE_W`]; two points either side of it make twelve, and the
+/// two points it takes from each pane were the pane's rounded rim
+/// already.
+pub const SPLIT_GRAB_PAD: f32 = 2.0;
+
+/// The least width a pane header keeps clear for picking the pane up.
+///
+/// §4 of the operator's spec asks for the grab to live in the chrome, and
+/// the chrome's one flexible control — the address — took every point of
+/// it. This is the floor under the region beside it.
+pub const PANE_GRAB_MIN: f32 = 48.0;
+
 /// **The collapsed rail is a SPINE, never nothing (Slice D1).**
 ///
 /// In the old frame the strip lived in the titlebar, so collapsing the rail

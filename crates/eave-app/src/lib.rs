@@ -104,6 +104,9 @@ pub mod columns;
 /// same reason `columns` is — every rule is decidable without a window.
 pub mod canvas;
 
+/// The well's layout tree and its docking geometry — see `dock`.
+pub mod dock;
+
 /// Slice CV2 — the element that paints a card at a scale, so a zoomed-out
 /// plane shows miniatures of its cards rather than the same content
 /// crushed into smaller boxes. Not pure: it is one element, and it exists

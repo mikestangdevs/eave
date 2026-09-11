@@ -17894,16 +17894,21 @@ fn letting_go_of_a_divider_stops_the_stretch(cx: &mut TestAppContext) {
     for grab in ["devtools", "split"] {
         h.window
             .update(vcx, |shell, _, cx| {
-                let drag = SplitDrag {
-                    handle: 0,
-                    grab_x: 400.,
-                    start_ratio: 0.5,
-                    well_w: 800.,
-                };
                 if grab == "devtools" {
-                    shell.devtools_drag = Some(drag);
+                    shell.devtools_drag = Some(DevtoolsDrag {
+                        grab_x: 400.,
+                        start_ratio: 0.5,
+                        well_w: 800.,
+                    });
                 } else {
-                    shell.split_drag = Some(drag);
+                    shell.split_drag = Some(SplitDrag {
+                        path: Vec::new(),
+                        handle: 0,
+                        vertical: false,
+                        grab: 400.,
+                        start_ratio: 0.5,
+                        extent: 800.,
+                    });
                 }
                 cx.notify();
             })
@@ -18354,7 +18359,7 @@ fn clicking_a_third_tab_shows_it_alone_and_keeps_the_split(cx: &mut TestAppConte
         .update(vcx, |shell, _, _| shell.splits.clone())
         .unwrap();
     assert_eq!(kept.len(), 1, "the split was dissolved: {kept:?}");
-    assert_eq!(kept[0].panes, ["p1", "p2"]);
+    assert_eq!(kept[0].panes(), ["p1", "p2"]);
 
     strip_tabs(&h, vcx, tabs(), Some("p2"));
     assert!(
@@ -18428,7 +18433,7 @@ fn a_pane_has_a_handle_and_reorders_when_it_lands(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let order = |h: &Harness, vcx: &mut VisualTestContext| {
         h.window
-            .read_with(vcx, |shell, _| shell.splits.first().map(|s| s.panes.clone()))
+            .read_with(vcx, |shell, _| shell.splits.first().map(|s| s.panes()))
             .unwrap()
     };
     assert_eq!(order(&h, vcx), Some(vec!["p1".into(), "p2".into()]));
@@ -18460,6 +18465,398 @@ fn a_pane_has_a_handle_and_reorders_when_it_lands(cx: &mut TestAppContext) {
         order(&h, vcx),
         Some(vec!["p2".into(), "p1".into()]),
         "a pane dropped on its neighbour's far edge did not change places with it"
+    );
+}
+
+/// **The regression that cost three rounds of the DG1 walk.**
+///
+/// The pane drag was built as an invisible strip laid under the header,
+/// and it did nothing at all — the address field is `flex_1`, registers
+/// its own hitbox, and covered that strip edge to edge, so every later
+/// round went into the LOOK of a gesture with no reachable source. The
+/// operator's report was the same sentence three times: *"i still cant
+/// drage them or move then around."*
+///
+/// What this asserts is the only thing that could have caught it without
+/// a live window: the grab region has real width and **does not overlap
+/// the address**. `debug_bounds` reports geometry and never occlusion,
+/// but two rectangles that do not intersect cannot occlude each other.
+#[gpui::test]
+fn the_grab_region_is_not_buried_under_the_address_field(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![page_tab("p1", Some("https://a.test/"), Some("A"))],
+        Some("p1"),
+    );
+    vcx.run_until_parked();
+    let grab = vcx
+        .debug_bounds("pane-grab")
+        .expect("the well's header has no region to pick the pane up by");
+    let address = vcx.debug_bounds("pane-address").expect("pane-address");
+    assert!(
+        f32::from(grab.size.width) >= crate::theme::PANE_GRAB_MIN - 1.0,
+        "the grab region collapsed to nothing: {grab:?}"
+    );
+    let (gl, gr) = (f32::from(grab.origin.x), f32::from(grab.origin.x) + f32::from(grab.size.width));
+    let (al, ar) = (
+        f32::from(address.origin.x),
+        f32::from(address.origin.x) + f32::from(address.size.width),
+    );
+    assert!(
+        gl >= ar - 0.5 || gr <= al + 0.5,
+        "the address covers the grab region again: grab {gl}..{gr}, address {al}..{ar}"
+    );
+}
+
+/// **A split can hold a split, and the well draws it.** §1: *"exist in
+/// combinations of horizontal and vertical splits"* — and §24's
+/// acceptance scenario OPENS on one, so before this the operator could
+/// not even set their own test up.
+#[gpui::test]
+fn a_pane_can_sit_beside_a_stack(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tabs = || {
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ]
+    };
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            // …and now the cross axis, against the pane on the right.
+            shell.split_tabs("p3", "p2", crate::ui::DropEdge::Bottom, cx);
+        })
+        .unwrap();
+    strip_tabs(&h, vcx, tabs(), Some("p3"));
+    vcx.run_until_parked();
+    let sketch = h
+        .window
+        .read_with(vcx, |shell, _| {
+            shell.splits.first().map(|s| s.root.sketch())
+        })
+        .unwrap();
+    assert_eq!(sketch.as_deref(), Some("(p1 | (p2 / p3))"), "{sketch:?}");
+
+    // Three panes on screen, and the stack really is stacked: p2 and p3
+    // share a column and p1 runs the full height beside them.
+    let a = vcx.debug_bounds("split-pane-left").expect("p1");
+    let b = vcx.debug_bounds("split-pane-mid-1").expect("p2");
+    let c = vcx.debug_bounds("split-pane-right").expect("p3");
+    assert!(f32::from(b.origin.x) > f32::from(a.origin.x), "{a:?} {b:?}");
+    assert!(
+        (f32::from(b.origin.x) - f32::from(c.origin.x)).abs() < 2.0,
+        "the stack is not a column: {b:?} {c:?}"
+    );
+    assert!(
+        f32::from(c.origin.y) > f32::from(b.origin.y) + 10.0,
+        "the second pane of the stack is not under the first: {b:?} {c:?}"
+    );
+    assert!(
+        f32::from(a.size.height) > f32::from(b.size.height) + 10.0,
+        "p1 did not take the full height beside the stack: {a:?} {b:?}"
+    );
+
+    // One divider per split, addressed by its branch — two dividers in
+    // different branches must never hear each other.
+    let root = vcx.debug_bounds("split-handle-0").expect("the root divider");
+    let inner = vcx
+        .debug_bounds("split-handle-1-0")
+        .expect("the stack's own divider");
+    assert!(
+        f32::from(root.size.height) > f32::from(inner.size.height),
+        "the root seam should run the whole well: {root:?} {inner:?}"
+    );
+}
+
+/// **§24, the operator's acceptance scenario, end to end.**
+///
+/// `A | (B / C)`; grab `C`; let it go at the FAR RIGHT of the workspace.
+/// The answer is three columns — not `C` nested beside `B`, which is what
+/// a drop on `B`'s right edge gives and what eave had no way to tell
+/// apart before [`crate::dock::DockTarget::Workspace`] existed.
+#[gpui::test]
+fn the_far_right_of_the_workspace_is_a_third_column(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tabs = || {
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ]
+    };
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("p3", "p2", crate::ui::DropEdge::Bottom, cx);
+        })
+        .unwrap();
+    strip_tabs(&h, vcx, tabs(), Some("p3"));
+    vcx.run_until_parked();
+
+    // The pointer is hard against the well's right-hand edge, deep inside
+    // the pane it is over. The outer target must win.
+    let well = h
+        .window
+        .read_with(vcx, |shell, _| shell.well_rect.get())
+        .unwrap()
+        .expect("the well painted no rectangle to dock against");
+    let target = h
+        .window
+        .read_with(vcx, |shell, cx| {
+            shell.dock_at(well.right() - 4.0, well.y + well.h * 0.75, cx)
+        })
+        .unwrap()
+        .map(|d| d.target);
+    assert_eq!(
+        target,
+        Some(crate::dock::DockTarget::Workspace {
+            edge: crate::ui::DropEdge::Right
+        }),
+        "a pane under the pointer stole a drag aimed past everything"
+    );
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p3", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    strip_tabs(&h, vcx, tabs(), Some("p3"));
+    vcx.run_until_parked();
+    let sketch = h
+        .window
+        .read_with(vcx, |shell, _| {
+            shell.splits.first().map(|s| s.root.sketch())
+        })
+        .unwrap();
+    assert_eq!(
+        sketch.as_deref(),
+        Some("(p1 | p2 | p3)"),
+        "the far right did not make a third column: {sketch:?}"
+    );
+    let c = vcx.debug_bounds("split-pane-right").expect("p3");
+    let a = vcx.debug_bounds("split-pane-left").expect("p1");
+    assert!(
+        (f32::from(c.size.height) - f32::from(a.size.height)).abs() < 2.0,
+        "the moved pane is still stacked: {a:?} {c:?}"
+    );
+}
+
+/// **The seam you can hit is wider than the seam you can see.** §3:
+/// *"visible divider: about 1–2px, interactive hit area: about 8–12px …
+/// This prevents users from having to precisely target a 1px line."*
+#[gpui::test]
+fn a_divider_answers_further_out_than_it_draws(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let hit = vcx.debug_bounds("split-handle-0").expect("the divider");
+    let left = vcx.debug_bounds("split-pane-left").expect("p1");
+    let right = vcx.debug_bounds("split-pane-right").expect("p2");
+    let seam = f32::from(right.origin.x) - (f32::from(left.origin.x) + f32::from(left.size.width));
+    assert!(
+        (seam - crate::theme::SPLIT_HANDLE_W).abs() < 1.0,
+        "the gap between panes is not the seam: {seam}"
+    );
+    assert!(
+        f32::from(hit.size.width) >= seam + 2.0 * crate::theme::SPLIT_GRAB_PAD - 0.5,
+        "the target is no bigger than the line: {hit:?} vs a {seam} point seam"
+    );
+    assert!(
+        f32::from(hit.size.width) <= 12.0,
+        "a forgiving target is not a wide one: {hit:?}"
+    );
+}
+
+/// **Escape puts a carried pane down and changes nothing.** §14: because
+/// the source pane never left its place (§5), cancelling is a state
+/// clear, not an undo — there is nothing to animate back.
+#[gpui::test]
+fn escape_puts_a_carried_pane_down_and_changes_nothing(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tabs = || {
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ]
+    };
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    strip_tabs(&h, vcx, tabs(), Some("p2"));
+    vcx.run_until_parked();
+    let before = h
+        .window
+        .read_with(vcx, |shell, _| shell.splits.clone())
+        .unwrap();
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.dock = Some(crate::dock::Dock {
+                target: crate::dock::DockTarget::Workspace {
+                    edge: crate::ui::DropEdge::Left,
+                },
+                anchor: (0.0, 0.0),
+            });
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "well-insert-line"), "precondition: a landing is drawn");
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        h.window.read_with(vcx, |shell, _| shell.dock.is_none()).unwrap(),
+        "escape left the landing on screen"
+    );
+    assert!(!shown(vcx, "well-insert-line"));
+    let after = h
+        .window
+        .read_with(vcx, |shell, _| shell.splits.clone())
+        .unwrap();
+    assert_eq!(before, after, "escape rearranged the well");
+}
+
+/// **A landing that was never dropped on does not stay on screen.** §21
+/// names *"insertion indicator does not remain behind"* as a failure
+/// mode, and the case it happens in is the one no drop door hears: the
+/// pointer leaves the well and the button comes up over the rail, or off
+/// the window entirely.
+///
+/// The clear is on `shell-root` and NOT on the well, and the reason is an
+/// ordering rule worth pinning: a `on_mouse_up` and an `on_drop` on the
+/// SAME element run in reverse registration order, so a clear next to the
+/// drop would fire first and take away the target the drop is about to
+/// read — turning every successful drop into a re-derivation from the
+/// pointer.
+#[gpui::test]
+fn a_landing_nobody_dropped_on_does_not_stay_behind(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.dock = Some(crate::dock::Dock {
+                target: crate::dock::DockTarget::Workspace {
+                    edge: crate::ui::DropEdge::Left,
+                },
+                anchor: (0.0, 0.0),
+            });
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "well-insert-line"), "precondition: a landing is drawn");
+
+    // A release over the rail — nowhere near a drop door.
+    let rail = vcx.debug_bounds("rail").or_else(|| vcx.debug_bounds("shell-root"));
+    let at = rail
+        .map(|b| gpui::point(b.origin.x + gpui::px(8.), b.origin.y + gpui::px(8.)))
+        .expect("somewhere to release");
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: at,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    assert!(
+        h.window.read_with(vcx, |shell, _| shell.dock.is_none()).unwrap(),
+        "the landing survived a release that dropped on nothing"
+    );
+    assert!(!shown(vcx, "well-insert-line"));
+}
+
+/// **A divider inside a branch moves that branch and nothing else.** §3:
+/// *"other unrelated panes should remain stable"*, and §25's *"only panes
+/// controlled by that divider should respond."*
+#[gpui::test]
+fn a_nested_divider_moves_only_its_own_branch(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let tabs = || {
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+            page_tab("p3", Some("https://c.test/"), Some("C")),
+        ]
+    };
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("p3", "p2", crate::ui::DropEdge::Bottom, cx);
+        })
+        .unwrap();
+    strip_tabs(&h, vcx, tabs(), Some("p3"));
+    vcx.run_until_parked();
+    let root_before = h
+        .window
+        .read_with(vcx, |shell, _| {
+            shell.splits[0].root.share_at(&[], 0).unwrap_or(0.0)
+        })
+        .unwrap();
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.splits[0].root.set_share(&[1], 0, 0.75);
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let (root_after, inner) = h
+        .window
+        .read_with(vcx, |shell, _| {
+            (
+                shell.splits[0].root.share_at(&[], 0).unwrap_or(0.0),
+                shell.splits[0].root.share_at(&[1], 0).unwrap_or(0.0),
+            )
+        })
+        .unwrap();
+    assert!((inner - 0.75).abs() < 1e-4, "the stack's divider did not move");
+    assert!(
+        (root_after - root_before).abs() < 1e-4,
+        "the root divider moved too: {root_before} -> {root_after}"
+    );
+    let b = vcx.debug_bounds("split-pane-mid-1").expect("p2");
+    let c = vcx.debug_bounds("split-pane-right").expect("p3");
+    assert!(
+        f32::from(b.size.height) > f32::from(c.size.height) * 2.0,
+        "the paint did not follow the share: {b:?} {c:?}"
     );
 }
 
@@ -18504,18 +18901,23 @@ fn hovering_a_pane_lights_its_rim(cx: &mut TestAppContext) {
     assert_eq!(crate::motion::hover_t("pane-rim-left"), 0.0, "the other pane lit too");
 }
 
-/// **The landing is drawn while the tab is still in the air.** Ruled on
-/// 2026-09-10 with four shots of the reference doing it: *"and arrange
-/// able like so."* eave had decided the edge on drop since that morning
-/// and drew nothing on the way there, so arranging a well was a thing you
-/// found out about afterwards.
+/// **The landing is drawn while the pane is still in the air, as ONE
+/// line.** Ruled on 2026-09-10 with four shots of the reference doing it
+/// (*"and arrange able like so"*) and pinned down on 2026-09-11 by §9:
+/// *"render a single bright accent insertion line … Do NOT show several
+/// insertion indicators simultaneously."*
+///
+/// The first build of this drew a dashed rectangle over the HALF the pane
+/// would take, which read as a region rather than a seam and — after a
+/// drop against the workspace's own edge — described a space the pane did
+/// not get.
 ///
 /// Driven by writing the state rather than by dragging: gpui's drag
 /// machinery does not run under a synthetic pointer (CV2's rig note), so
 /// the gesture cannot be driven here — the wiring is pinned structurally
 /// instead, which is the documented fallback.
 #[gpui::test]
-fn a_tab_in_the_air_shows_the_half_it_would_take(cx: &mut TestAppContext) {
+fn a_pane_in_the_air_shows_the_one_seam_it_would_land_on(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     strip_tabs(
         &h,
@@ -18533,32 +18935,63 @@ fn a_tab_in_the_air_shows_the_half_it_would_take(cx: &mut TestAppContext) {
         .unwrap();
     vcx.run_until_parked();
     assert!(shown(vcx, "split-well"), "precondition: the well is split");
-    assert!(!shown(vcx, "well-drop-hint"), "nothing is being dragged yet");
+    assert!(!shown(vcx, "well-insert-line"), "nothing is being dragged yet");
 
+    // The right pane's LEFT edge — the seam between the two panes.
     h.window
         .update(vcx, |shell, _, cx| {
-            shell.tab_drop = Some(("left".into(), crate::ui::DropEdge::Left));
+            shell.dock = Some(crate::dock::Dock {
+                target: crate::dock::DockTarget::Pane {
+                    id: "p2".into(),
+                    edge: crate::ui::DropEdge::Left,
+                },
+                anchor: (0.0, 0.0),
+            });
             cx.notify();
         })
         .unwrap();
     vcx.run_until_parked();
-    let hint = vcx.debug_bounds("well-drop-hint").expect("the hint is drawn");
-    let pane = vcx.debug_bounds("split-pane-left").expect("left pane");
-    // In the pane it names, on the edge it names, and half of it — the
-    // three things the drop is about to do.
-    // Inside the pane's own one-point rim, which is where it belongs —
-    // the hint marks the content, not the border.
+    let line = vcx.debug_bounds("well-insert-line").expect("the line is drawn");
+    let right = vcx.debug_bounds("split-pane-right").expect("right pane");
     assert!(
-        (f32::from(hint.origin.x) - f32::from(pane.origin.x)).abs() <= 2.0,
-        "the left edge: {hint:?} in {pane:?}"
+        f32::from(line.size.width) <= 4.0,
+        "an insertion line is a seam, not a region: {line:?}"
     );
     assert!(
-        (f32::from(hint.size.width) - f32::from(pane.size.width) / 2.0).abs() < 2.0,
-        "half the pane: {hint:?} in {pane:?}"
+        (f32::from(line.origin.x) - f32::from(right.origin.x)).abs() <= 3.0,
+        "the line is not on the edge it names: {line:?} vs {right:?}"
+    );
+    assert!(
+        (f32::from(line.size.height) - f32::from(right.size.height)).abs() <= 3.0,
+        "it must span the whole edge: {line:?} vs {right:?}"
+    );
+
+    // A workspace target is the other kind, and it spans the WELL.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.dock = Some(crate::dock::Dock {
+                target: crate::dock::DockTarget::Workspace {
+                    edge: crate::ui::DropEdge::Right,
+                },
+                anchor: (0.0, 0.0),
+            });
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let outer = vcx.debug_bounds("well-insert-line").expect("the outer line");
+    let well = vcx.debug_bounds("split-well").expect("the well");
+    assert!(
+        f32::from(outer.origin.x) > f32::from(right.origin.x),
+        "the workspace's right edge is outside every pane: {outer:?}"
+    );
+    assert!(
+        (f32::from(outer.size.height) - f32::from(well.size.height)).abs() <= 3.0,
+        "an outer target spans the whole well: {outer:?} vs {well:?}"
     );
 
     // And it is transient: the drop that consumes it clears it, so no
-    // dashed rectangle can be left behind on a well nobody is dragging on.
+    // line can be left behind on a well nobody is dragging on.
     h.window
         .update(vcx, |shell, _, cx| {
             shell.drop_tab_on_well("p2", crate::ui::DropEdge::Right, cx);
@@ -18566,9 +18999,10 @@ fn a_tab_in_the_air_shows_the_half_it_would_take(cx: &mut TestAppContext) {
         .unwrap();
     vcx.run_until_parked();
     assert!(
-        h.window.read_with(vcx, |shell, _| shell.tab_drop.is_none()).unwrap(),
-        "the hint outlived the drag"
+        h.window.read_with(vcx, |shell, _| shell.dock.is_none()).unwrap(),
+        "the line outlived the drag"
     );
+    assert!(!shown(vcx, "well-insert-line"));
 }
 
 #[gpui::test]
@@ -18586,7 +19020,7 @@ fn a_drop_on_the_bottom_edge_stacks_the_panes(cx: &mut TestAppContext) {
     );
     let axis = |h: &Harness, vcx: &mut VisualTestContext| {
         h.window
-            .read_with(vcx, |shell, _| shell.splits.first().map(|s| s.vertical))
+            .read_with(vcx, |shell, _| shell.splits.first().map(|s| s.vertical()))
             .unwrap()
     };
     h.window
@@ -19024,7 +19458,7 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
     strip_tabs(&h, vcx, tabs(), Some("p4"));
     let panes = h
         .window
-        .update(vcx, |shell, _, _| shell.splits[0].panes.clone())
+        .update(vcx, |shell, _, _| shell.splits[0].panes())
         .unwrap();
     assert_eq!(panes, ["p4", "p1", "p2", "p3"]);
     assert!(
@@ -19054,7 +19488,7 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
     strip_tabs(&h, vcx, tabs(), Some("p4"));
     let panes = h
         .window
-        .update(vcx, |shell, _, _| shell.splits[0].panes.clone())
+        .update(vcx, |shell, _, _| shell.splits[0].panes())
         .unwrap();
     assert_eq!(panes, ["p4", "p1", "p2", "p3"], "a fifth pane got in");
     let pill = vcx.debug_bounds("split-tabs").expect("pill");
@@ -19074,7 +19508,7 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let panes = h
         .window
-        .update(vcx, |shell, _, _| shell.splits[0].panes.clone())
+        .update(vcx, |shell, _, _| shell.splits[0].panes())
         .unwrap();
     assert_eq!(panes.len(), 4, "the menu added a fifth pane: {panes:?}");
 }
@@ -19107,8 +19541,8 @@ fn two_splits_keep_apart_and_a_tab_is_in_one_at_a_time(cx: &mut TestAppContext) 
         .update(vcx, |shell, _, _| shell.splits.clone())
         .unwrap();
     assert_eq!(splits.len(), 2, "{splits:?}");
-    assert_eq!(splits[0].panes, ["p1", "p2"]);
-    assert_eq!(splits[1].panes, ["p3", "p4"]);
+    assert_eq!(splits[0].panes(), ["p1", "p2"]);
+    assert_eq!(splits[1].panes(), ["p3", "p4"]);
     // Both pills on the rail, one row each, the second under the first.
     let a = vcx.debug_bounds("tab-p1").expect("tab-p1");
     let b = vcx.debug_bounds("tab-p2").expect("tab-p2");
@@ -19137,7 +19571,7 @@ fn two_splits_keep_apart_and_a_tab_is_in_one_at_a_time(cx: &mut TestAppContext) 
         .update(vcx, |shell, _, _| shell.splits.clone())
         .unwrap();
     assert_eq!(splits.len(), 1, "{splits:?}");
-    assert_eq!(splits[0].panes, ["p3", "p4", "p2"]);
+    assert_eq!(splits[0].panes(), ["p3", "p4", "p2"]);
     let a = vcx.debug_bounds("tab-p1").expect("tab-p1");
     let b = vcx.debug_bounds("tab-p2").expect("tab-p2");
     assert!(
@@ -19187,7 +19621,7 @@ fn closing_or_losing_a_pane_shrinks_the_split(cx: &mut TestAppContext) {
     );
     let panes = h
         .window
-        .update(vcx, |shell, _, _| shell.splits[0].panes.clone())
+        .update(vcx, |shell, _, _| shell.splits[0].panes())
         .unwrap();
     assert_eq!(panes, ["p1", "p2"]);
 
@@ -19249,7 +19683,7 @@ fn a_split_holds_one_session_and_refuses_a_second(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(splits.len(), 1, "{splits:?}");
     assert_eq!(
-        splits[0].panes,
+        splits[0].panes(),
         ["p1", "p2", "s1"],
         "a second session got in"
     );
@@ -23021,7 +23455,7 @@ fn the_split_control_puts_the_popup_beside_the_page_that_opened_it(cx: &mut Test
         .unwrap();
     assert_eq!(splits.len(), 1, "the popup did not land in a split: {splits:?}");
     // The opener keeps its side: nothing the operator was reading moves.
-    assert_eq!(splits[0].panes, ["p1", "p2"]);
+    assert_eq!(splits[0].panes(), ["p1", "p2"]);
 }
 // ── Slice CL1 — Columns mode ─────────────────────────────────────────
 

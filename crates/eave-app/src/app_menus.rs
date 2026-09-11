@@ -146,6 +146,11 @@ fn menus() -> Vec<Menu> {
             name: "View".into(),
             disabled: false,
             items: vec![
+                // The two layouts, named. See `ui::UsePanes` for why this
+                // is a menu item and not a chord.
+                MenuItem::action("Panes", crate::ui::UsePanes),
+                MenuItem::action("Canvas", crate::ui::UseCanvas),
+                MenuItem::separator(),
                 MenuItem::action("Zoom In", crate::ui::ZoomIn),
                 MenuItem::action("Zoom Out", crate::ui::ZoomOut),
                 MenuItem::action("Actual Size", crate::ui::ZoomReset),
