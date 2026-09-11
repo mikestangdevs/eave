@@ -121,6 +121,11 @@ pub mod bookmarks;
 /// The macOS menu bar (Slice Y). Private: it is wiring, not part of the
 /// headless surface the acceptance runs use.
 mod app_menus;
+/// The OS banner (Slice NT1). Lifted out of `web/notify.rs`, where it was
+/// gated behind Chromium for no reason but where it was first written — a
+/// finished session has to reach an operator who is looking elsewhere, and
+/// that is not a browser feature.
+mod os_notify;
 pub mod display;
 pub mod fixture;
 /// Slice AG1 #12 — the jump-to-turn rail in the transcript's left gutter.

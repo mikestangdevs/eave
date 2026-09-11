@@ -8393,16 +8393,44 @@ struct Shell {
     /// about this client rather than about any session — which is why it
     /// is here and not on the wire. See [`unseen_finish`].
     ///
-    /// **In memory only, deliberately.** Persisting it would mean a file
-    /// write from inside the render pass, which is what N4's idle floor
-    /// exists to forbid. The cost is stated rather than hidden: restarting
-    /// eave baselines every session and the rail starts silent again.
+    /// **It PERSISTS since Slice NT1, and the objection it used to carry
+    /// was right about the mechanism rather than the feature.** This map is
+    /// advanced by the render pass — the selected session's mark moves on
+    /// every frame while a turn streams — so writing it on change would be
+    /// a file write per frame, which is exactly what N4's idle floor
+    /// forbids. It is written when the WINDOW DEACTIVATES instead, which is
+    /// the moment the fact is about: "what had I seen when I walked away".
+    /// See [`RAIL_SEEN_KEY`] for the trade that makes and what it costs.
     ///
     /// A session is baselined the FIRST time the rail sees it, so the
     /// feature never opens with fifteen rows shouting about work the
     /// operator already knows about — the same reason the filter note is
-    /// inked amber only when something is really being withheld.
+    /// inked amber only when something is really being withheld. What
+    /// changed with persistence is which sessions are *first* sights: one
+    /// that finished while eave was closed is no longer silently baselined
+    /// away, because its mark is already on disk from before it moved.
     rail_seen: RefCell<HashMap<String, u64>>,
+    /// Slice NT1 — which finishes have already reached Notification Center,
+    /// as the `last_activity_ms` that finish carried.
+    ///
+    /// **`rail_seen` above cannot serve for this, and the reason is the
+    /// whole of why this map exists.** That one is rewritten by the PAINT,
+    /// which runs many times between two engine snapshots, and it is
+    /// deliberately NOT advanced for a session nobody is looking at — so
+    /// `unseen_finish` stays true for as long as the row stays unread.
+    /// A banner keyed off it alone would fire again on every snapshot
+    /// until the operator came back, which is a notification that punishes
+    /// you for being away. One entry per session, holding the finish that
+    /// was already announced.
+    announced: RefCell<HashMap<String, u64>>,
+    /// Slice NT1 — is this window the one the operator is in front of?
+    ///
+    /// Written by `observe_window_activation` in BOTH directions, which is
+    /// why that observer no longer returns early on the inactive edge.
+    /// `Window::is_window_active` needs a `&Window` and the sessions
+    /// observer has none, so the answer is RECORDED when it changes rather
+    /// than asked for at the moment it is needed.
+    window_active: Cell<bool>,
     /// Slice P1 — see [`DemoOverlay`]. No product consumer.
     demo: DemoOverlay,
     /// The rail's inline rename field (Stage AC), when one is open.
@@ -9294,6 +9322,94 @@ fn put_derived_titles(doc: &mut serde_json::Value, titles: &HashMap<String, Stri
     doc[DERIVED_TITLES_KEY] = serde_json::Value::Object(map);
 }
 
+/// The `frame.json` key holding when the operator last LOOKED at each
+/// session (Slice NT1), as the `last_activity_ms` that session carried at
+/// that moment. See [`Shell::rail_seen`].
+///
+/// **This map used to die with the app, and its own doc said why:**
+/// persisting it would mean a file write from inside the render pass,
+/// which N4's idle floor forbids — `rail()` advances the selected
+/// session's mark on EVERY frame while a turn streams, so "write on
+/// change" (the rule [`save_derived_titles`] follows, correctly, because a
+/// derived title never moves) would be a write per frame here.
+///
+/// **The trigger is window DEACTIVATION instead**, which is the moment the
+/// fact is actually about: this map answers "what had I seen when I walked
+/// away", so the write belongs where the walking away is observed. Bounded
+/// by how often a person changes windows, not by the frame rate.
+///
+/// The cost is stated rather than hidden: a crash or a `kill -9` loses
+/// what was read since the last time the window lost focus. That is the
+/// same bargain the dictation mute makes one product over, and it is worth
+/// less than a write per frame.
+const RAIL_SEEN_KEY: &str = "rail_seen";
+
+/// The seen marks saved last run. Unreadable, missing or malformed all
+/// mean none, which is exactly the old in-memory behaviour — the rail
+/// baselines every session on first sight and starts silent.
+fn load_rail_seen() -> HashMap<String, u64> {
+    let Some(path) = frame_prefs_path() else {
+        return Default::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Default::default();
+    };
+    rail_seen_from(&v)
+}
+
+/// The pure half of [`load_rail_seen`]. A value that is not a number is
+/// skipped rather than failing the whole map — the same rule
+/// [`derived_titles_from`] follows, for the same reason: one bad line must
+/// not cost every other session its baseline and light the whole rail up.
+fn rail_seen_from(doc: &serde_json::Value) -> HashMap<String, u64> {
+    doc.get(RAIL_SEEN_KEY)
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the seen marks back, keeping every other key — the merged
+/// read-modify-write every writer of this file uses.
+fn save_rail_seen(seen: &HashMap<String, u64>) {
+    let Some(path) = frame_prefs_path() else {
+        return;
+    };
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    put_rail_seen(&mut doc, seen);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text + "\n") {
+                eprintln!("eave: cannot save seen marks to {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("eave: cannot serialise seen marks: {e}"),
+    }
+}
+
+/// The pure half of [`save_rail_seen`]. Sorted by session id for the
+/// reason [`put_derived_titles`] is: a person reads this file when they
+/// are working out why the rail said something.
+fn put_rail_seen(doc: &mut serde_json::Value, seen: &HashMap<String, u64>) {
+    let mut list: Vec<(&String, &u64)> = seen.iter().collect();
+    list.sort();
+    let map: serde_json::Map<String, serde_json::Value> = list
+        .into_iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::Number((*v).into())))
+        .collect();
+    doc[RAIL_SEEN_KEY] = serde_json::Value::Object(map);
+}
+
 /// The `frame.json` key saying the empty bookmarks zone's hint card was
 /// closed. A bool, not a timestamp: the card has one state to remember.
 const BOOKMARKS_HINT_KEY: &str = "bookmarks_hint_dismissed";
@@ -10154,6 +10270,85 @@ impl Shell {
             .is_some_and(|a| !self.rail_marked.contains(a))
         {
             self.rail_mark_anchor = None;
+        }
+    }
+
+    /// Slice NT1 — say that a session finished, to an operator who is
+    /// somewhere else.
+    ///
+    /// **The channel rule is one row of a table, and the other rows are
+    /// already built.** A banner goes out only when this window is not the
+    /// one in front of the operator. When it IS, the rail's own `finished`
+    /// mark is the notification — and it is the better one, because it
+    /// stays until the row is read where a banner is gone in seconds. Two
+    /// channels for one event is two interruptions for one fact.
+    ///
+    /// **The selected session never announces, and that falls out rather
+    /// than being special-cased.** `rail()` keeps its `rail_seen` mark
+    /// current while it is the one being looked at, so [`unseen_finish`]
+    /// is already false for it. A session you watched finish raises
+    /// nothing, which is the same rule the rail badge follows.
+    ///
+    /// **This runs in the SESSIONS OBSERVER and must never move into the
+    /// paint.** `rail()` computes the same `unseen` set every frame; a
+    /// banner on that path is not a notification, it is a fault. The
+    /// observer fires once per engine snapshot, which is the rate a finish
+    /// actually happens at.
+    fn announce_finishes(&self, cx: &App) {
+        let all = &self.sessions.read(cx).sessions;
+        let mut announced = self.announced.borrow_mut();
+        // A session the engine has stopped reporting cannot finish again.
+        // Pruned here for the same reason `rail_seen` is pruned in the
+        // rail: this is a place that sees the whole list.
+        announced.retain(|id, _| all.iter().any(|s| &s.session_id == id));
+        // Everything below this line is the banner, and the banner is only
+        // for an operator who is not looking. The bookkeeping above still
+        // runs while the window is active so the map cannot grow stale.
+        if self.window_active.get() {
+            return;
+        }
+        let seen = self.rail_seen.borrow();
+        for info in all {
+            let Some(mark) = info.last_activity_ms else {
+                continue;
+            };
+            if !unseen_finish(info, seen.get(&info.session_id).copied()) {
+                continue;
+            }
+            // ONE banner per finish. `unseen_finish` stays true until the
+            // operator looks, and snapshots keep arriving, so without this
+            // a session that ended while you were at lunch would announce
+            // itself for the whole lunch.
+            if announced
+                .get(&info.session_id)
+                .is_some_and(|&already| already >= mark)
+            {
+                continue;
+            }
+            announced.insert(info.session_id.clone(), mark);
+            let (name, _) = self.row_name(info);
+            let where_ = info
+                .project_root
+                .as_deref()
+                .or(info.checkout_root.as_deref())
+                .and_then(|p| p.rsplit('/').next())
+                .unwrap_or_default();
+            // The state word verbatim, never a cheerier one: a session that
+            // stopped because it failed must not be reported as "finished".
+            let what = match info.state.as_str() {
+                "failed" => "failed",
+                "unresponsive" => "stopped responding",
+                _ => "finished",
+            };
+            crate::os_notify::post(
+                where_,
+                &name,
+                what,
+                // Keyed on the SESSION, not the finish, so a session that
+                // finishes twice replaces its own banner instead of
+                // stacking two rows in Notification Center.
+                format!("eave:session:{}", info.session_id),
+            );
         }
     }
 
@@ -34073,7 +34268,19 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     // looking at would be read out of a composer in a
                     // window behind it. They follow the keyboard instead.
                     cx.observe_window_activation(window, |shell: &mut Shell, window, cx| {
+                        // Slice NT1: recorded FIRST and in both directions.
+                        // This used to return early on the inactive edge,
+                        // which is the edge the OS banner cares about — the
+                        // flag has to learn that eave went away, or a
+                        // session finishing behind your editor is silent.
+                        shell.window_active.set(window.is_window_active());
                         if !window.is_window_active() {
+                            // Slice NT1: the seen marks go to disk HERE and
+                            // nowhere else. They are advanced by the paint,
+                            // so writing them on change would be a write per
+                            // frame; walking away is both the right moment
+                            // and a rate a person sets. See `RAIL_SEEN_KEY`.
+                            save_rail_seen(&shell.rail_seen.borrow());
                             return;
                         }
                         set_key_window(&shell.window_key);
@@ -34094,6 +34301,11 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     cx.observe(&sessions, |shell: &mut Shell, _, cx| {
                         shell.release_queued(cx);
                         shell.prune_marks(cx);
+                        // Slice NT1. HERE and not in `rail()`, which
+                        // computes the same unseen set on every frame —
+                        // this observer fires once per engine snapshot,
+                        // which is the rate a session actually finishes at.
+                        shell.announce_finishes(cx);
                         // Slice AG1 #10. BOTH observers, because the gate
                         // reads one fact from each entity: the rail snapshot
                         // carries the provider, the transcript carries whose
@@ -34242,7 +34454,17 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_walk: RefCell::new(Vec::new()),
                         spine_walk: RefCell::new(Vec::new()),
                         rail_scrolled_to: RefCell::new(None),
-                        rail_seen: RefCell::new(HashMap::new()),
+                        // Slice NT1: what this client had seen when it last
+                        // lost focus comes back with it, so a session that
+                        // finished while eave was closed is still unread.
+                        rail_seen: RefCell::new(load_rail_seen()),
+                        announced: RefCell::new(HashMap::new()),
+                        // Starts TRUE. A window is being opened, and the
+                        // inactive edge is what `observe_window_activation`
+                        // corrects — assuming the operator is absent at
+                        // launch would announce every session that had
+                        // already finished before eave started.
+                        window_active: Cell::new(true),
                         // Slice ID2a: the names this client derived last
                         // run come back with it, so a restart does not
                         // turn a work queue back into `untitled` ×N.
@@ -35987,6 +36209,110 @@ mod tests {
         let got = derived_titles_from(&mixed);
         assert_eq!(got.len(), 1);
         assert_eq!(got["ok"], "fine");
+    }
+
+    /// Slice NT1: the seen marks survive a restart through `frame.json`,
+    /// and the round trip keeps every other key — four writers share this
+    /// file now.
+    #[test]
+    fn seen_marks_round_trip_through_frame_json_and_keep_their_neighbours() {
+        let mut doc = serde_json::json!({
+            "rail_w": 228.0,
+            DERIVED_TITLES_KEY: {"aaaa1111": "review the parser"},
+        });
+        let mut seen = HashMap::new();
+        seen.insert("bbbb2222".to_string(), 1_700_000_000_123_u64);
+        seen.insert("aaaa1111".to_string(), 42_u64);
+        put_rail_seen(&mut doc, &seen);
+        assert_eq!(doc["rail_w"], 228.0, "a neighbour was dropped");
+        assert_eq!(
+            doc[DERIVED_TITLES_KEY]["aaaa1111"], "review the parser",
+            "the other map that lives in this file was clobbered"
+        );
+        let keys: Vec<&String> = doc[RAIL_SEEN_KEY].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["aaaa1111", "bbbb2222"], "sorted, so no churn");
+        assert_eq!(rail_seen_from(&doc), seen);
+
+        // A mark is a millisecond timestamp and must survive past the
+        // point an f64 or a u32 would start rounding it.
+        assert_eq!(rail_seen_from(&doc)["bbbb2222"], 1_700_000_000_123);
+
+        // Absent and wrong-typed both read as "no baseline", which is the
+        // old in-memory behaviour: the rail baselines on first sight and
+        // says nothing. One bad line must not light up every other row.
+        assert!(rail_seen_from(&serde_json::json!({})).is_empty());
+        let mixed = serde_json::json!({
+            RAIL_SEEN_KEY: {"ok": 7, "text": "nope", "neg": -1}
+        });
+        let got = rail_seen_from(&mixed);
+        assert_eq!(got.len(), 1, "only the readable entry survives");
+        assert_eq!(got["ok"], 7);
+    }
+
+    /// Slice NT1: a finish is announced to the OS **once**, and the guard
+    /// that makes that true is the `announced` map rather than `rail_seen`.
+    ///
+    /// This pins the reasoning, not the plumbing: `unseen_finish` stays
+    /// true for as long as the row is unread, and a snapshot arrives every
+    /// time anything moves — so a banner keyed off it alone would fire for
+    /// the whole time the operator was away. The test is what refuses that.
+    #[test]
+    fn a_finish_is_only_ever_announced_once() {
+        let mut s = super::SessionInfo {
+            session_id: "aaaa1111".into(),
+            title: None,
+            archived: false,
+            provider: "claude-code".into(),
+            model: None,
+            effort: None,
+            fast: false,
+            cwd: "/w".into(),
+            created_ts_ms: 1,
+            last_activity_ms: Some(200),
+            state: "done".into(),
+            live: false,
+            epoch: 1,
+            last_seq: 0,
+            checkout_root: None,
+            project_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            diff_stat: None,
+            pending_approvals: 0,
+            permission_mode: None,
+            rss_bytes: None,
+        };
+
+        // The operator last looked at 100, so this is a finish they missed.
+        let seen: HashMap<String, u64> = [("aaaa1111".to_string(), 100_u64)].into_iter().collect();
+        assert!(unseen_finish(&s, seen.get(&s.session_id).copied()));
+
+        // It stays unseen across every later snapshot — that is the whole
+        // point of the mark, and the reason a second map is needed.
+        assert!(
+            unseen_finish(&s, seen.get(&s.session_id).copied()),
+            "the rail mark is sticky by design; the banner must not be"
+        );
+
+        let mut announced: HashMap<String, u64> = HashMap::new();
+        let mut posts = 0;
+        for _ in 0..5 {
+            let mark = s.last_activity_ms.unwrap();
+            if announced.get(&s.session_id).is_some_and(|&a| a >= mark) {
+                continue;
+            }
+            announced.insert(s.session_id.clone(), mark);
+            posts += 1;
+        }
+        assert_eq!(posts, 1, "five snapshots of one finish raised {posts} banners");
+
+        // A SECOND, later finish on the same session is news again.
+        s.last_activity_ms = Some(300);
+        let mark = s.last_activity_ms.unwrap();
+        assert!(
+            !announced.get(&s.session_id).is_some_and(|&a| a >= mark),
+            "a later finish must not be swallowed by the earlier one"
+        );
     }
 
     /// Slice SP1: a window's splits round-trip through `frame.json`, keep
