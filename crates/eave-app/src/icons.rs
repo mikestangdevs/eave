@@ -85,7 +85,8 @@ pub enum Class {
     /// eave's own VCS status glyphs. 24-grid, stroke 2.25, drawn heavier
     /// so they hold at the 12 px the file rail gives them.
     Compact,
-    /// A provider's own logo. Fills, not strokes, and no fixed grid.
+    /// A logo — a provider's, or eave's own. Fills, not strokes, and no
+    /// fixed grid.
     Mark,
 }
 
@@ -233,10 +234,21 @@ Compact {
     STATUS_CONFLICTED => "status-conflicted.svg",
 }
 
-// The providers' own logos, used nominatively to name which agent a
-// session runs. gpui keeps only coverage, so each renders as a one-colour
-// silhouette in whatever colour the call site names.
+// Logos. The providers' are used nominatively, to name which agent a
+// session runs; EAVE_MARK is the product's own. gpui keeps only coverage,
+// so each renders as a one-colour silhouette in whatever colour the call
+// site names — which is why the product mark can sit on either appearance
+// without a second file.
 Mark {
+    /// eave's own, from the product artwork's own vector.
+    ///
+    /// It arrived as a light/dark PAIR whose two files differed in one
+    /// byte range — `fill="black"` against `fill="#FEFEFE"`, the same path
+    /// otherwise. Both are here as ONE file wearing `currentColor`, which
+    /// is the whole reason this class takes its colour at the call site:
+    /// two copies of one path are two things to keep in step, and the
+    /// appearance is already a fact the theme holds.
+    EAVE_MARK => "eave-mark.svg",
     /// Anthropic's Claude. Tinted with [`claude_brand`] at the call site.
     CLAUDE_MARK => "claude-mark.svg",
     /// OpenAI — the Codex CLI's vendor.
@@ -515,8 +527,8 @@ mod tests {
         // turned inward — the way back from a maximized column.
         assert_eq!(of(Class::Line).count(), 63, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
-        assert_eq!(of(Class::Mark).count(), 6, "the provider marks");
-        assert_eq!(REGISTRY.len(), 74);
+        assert_eq!(of(Class::Mark).count(), 7, "six provider marks, plus eave");
+        assert_eq!(REGISTRY.len(), 75);
     }
 
     /// Every registered path is a file that exists on disk under exactly

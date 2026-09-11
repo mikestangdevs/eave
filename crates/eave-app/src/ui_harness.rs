@@ -10957,33 +10957,34 @@ fn the_empty_state_announces_orients_and_offers(cx: &mut TestAppContext) {
     }
 }
 
-/// The placeholder is a circle: equal width and height (the round fill is
-/// `rounded_full` on that same box). A square that is not round, or a disc
-/// that is a stretched oval, is not the mock.
+/// The mark's box is square: equal width and height. The svg fits its own
+/// landscape viewBox inside that box, so the box is what the layout is
+/// built on — a slot that has gone oblong is a layout change, not a
+/// drawing change.
 #[gpui::test]
 fn the_empty_states_headline_is_at_the_display_rank(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     empty_session(&h, vcx, "/tmp/eave-harness/repo", None);
 
-    let logo = vcx.debug_bounds("empty-logo").expect("the logo placeholder");
+    let logo = vcx.debug_bounds("empty-logo").expect("the product mark");
     assert_eq!(
         logo.size.width, logo.size.height,
-        "the logo is not circular: {:?} × {:?}",
+        "the logo box is not square: {:?} × {:?}",
         logo.size.width, logo.size.height
     );
     // A 1 px speck or a pane-filling wash would still be square. The
-    // disc is a control-sized mark, not a backdrop — 24 px is smaller
-    // than any control in the composer, 120 px is larger than the
-    // resting composer bar.
+    // mark is control-sized, not a backdrop — 24 px is smaller than any
+    // control in the composer, 120 px is larger than the resting
+    // composer bar.
     assert!(
         logo.size.width > px(24.) && logo.size.width < px(120.),
-        "the logo is {:?} across, which is not a placeholder disc",
+        "the logo is {:?} across, which is not a control-sized mark",
         logo.size.width
     );
 }
 
 /// The composer sits *below* the logo, with a real gap. Stacking them on
-/// top of each other, or putting the card above the disc, is not the mock.
+/// top of each other, or putting the card above the mark, is not the mock.
 #[gpui::test]
 fn the_empty_state_clears_the_composer_it_points_at(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -10995,7 +10996,7 @@ fn the_empty_state_clears_the_composer_it_points_at(cx: &mut TestAppContext) {
     assert!(
         card.origin.y > logo_bottom,
         "the composer starts at {:?} and the logo ends at {logo_bottom:?} — \
-         they overlap or the card is above the disc",
+         they overlap or the card is above the mark",
         card.origin.y
     );
     assert!(
@@ -11098,7 +11099,7 @@ fn the_empty_state_and_the_launcher_are_never_the_same_screen(cx: &mut TestAppCo
     // Slice NC1: the launcher draws the SAME cluster (disc, composer,
     // where-line) — but as its own overlay, never the empty-session view
     // stacked under it.
-    assert!(shown(vcx, "empty-logo"), "the launcher lost the disc");
+    assert!(shown(vcx, "empty-logo"), "the launcher lost the mark");
     assert!(
         !shown(vcx, "transcript-empty"),
         "the launcher and the empty-session cluster must never stack"
@@ -11117,7 +11118,7 @@ fn the_empty_state_and_the_launcher_are_never_the_same_screen(cx: &mut TestAppCo
     let logo = vcx.debug_bounds("empty-logo").expect("the logo");
     assert_eq!(
         logo.size.width, logo.size.height,
-        "the empty-session mark is not a disc — it will be mistaken for the launcher"
+        "the empty-session mark's box is not square — the cluster's layout moved"
     );
 }
 
@@ -11249,7 +11250,7 @@ fn the_empty_cluster_stays_in_the_well_when_the_window_shrinks(cx: &mut TestAppC
     );
     assert!(
         shown(vcx, "empty-logo"),
-        "the min window hid the logo — the disc fits the well leftover at WINDOW_MIN_H"
+        "the min window hid the logo — the mark fits the well leftover at WINDOW_MIN_H"
     );
     let logo = vcx.debug_bounds("empty-logo").expect("logo after resize");
     assert!(

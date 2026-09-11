@@ -217,15 +217,30 @@ fi
 
 # The icon. Assembly, not packaging — it was in package-macos.sh, which meant
 # the release bundle and the bundle boot-smoke runs were not the same artefact.
-# Unlike comet's, this step is OPTIONAL: eave has no app-icon artwork yet
-# (Slice Q1 drew the in-app glyph family, not a 1024 px app mark), and a
-# missing icon must not be the thing that stops us shipping. Drop a pre-masked
-# dist/macos/icon-1024.png in — squircle, margins and shadow baked, because
-# sips cannot alpha-mask — and this starts producing a real icns with no other
-# change. Until then the bundle carries the generic app icon and
+# dist/macos/icon-1024.png is PRE-MASKED and must stay that way: squircle,
+# margins and shadow are baked into the file because sips cannot alpha-mask,
+# so every size below is a straight resize. It is rendered from the SAME
+# vector as the in-app mark (crates/eave-app/assets/icons/eave-mark.svg),
+# through resvg, which is the renderer the app draws that mark with — so
+# the Dock and the composer show one drawing, not two that resemble each
+# other. On the logo's own black ground, fitted to Apple's grid: an 824 px
+# body centred on 1024, the mark 835/1254 of the body as the artwork holds
+# it. Regenerate both from the vector or neither.
+# The step stays OPTIONAL: a missing icon must not be the thing that stops us
+# shipping, and without the file the bundle carries the generic app icon and
 # CFBundleIconFile names a file that isn't there, which is benign.
+#
+# THE DIRECTORY NAME IS LOAD-BEARING. `iconutil` reads the name, not just
+# the contents: a folder called `.iconset` is `Invalid Iconset.` — the
+# extension is the whole basename and there is no stem in front of it — and
+# it exits 1, which under `set -e` took the entire bundle down. That was
+# latent for as long as the artwork was missing, because this branch never
+# ran; the first drop-in of dist/macos/icon-1024.png produced no bundle at
+# all rather than a bundle with no icon. The stem is what fixes it. The
+# directory is still removed straight after, and it is staged inside
+# `.eave.partial`, so nothing survives a failure either way.
 if [[ -n "$ICON_PNG" && -f "$ROOT/$ICON_PNG" ]]; then
-  ICONSET="$STAGE/Contents/Resources/.iconset"
+  ICONSET="$STAGE/Contents/Resources/$BIN.iconset"
   mkdir -p "$ICONSET"
   for size in 16 32 128 256 512; do
     sips -z "$size" "$size" "$ROOT/$ICON_PNG" \

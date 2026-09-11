@@ -2222,13 +2222,16 @@ pub const LAUNCHER_GAP: f32 = SPACE_6;
 /// everything reads as a dashboard, not an invitation.
 pub const LAUNCHER_MAX_W: f32 = 700.0;
 
-/// Placeholder disc above the empty-session composer. Square, then
-/// `rounded_full`, so it is a circle. Equal to [`BAR_HEIGHT`]: the disc
-/// is the same size as the resting composer bar, so the cluster's two
-/// shapes share a measure rather than inventing a third.
+/// The product mark's box above the empty-session composer. A square, and
+/// the mark is fitted inside it. Equal to [`BAR_HEIGHT`]: the box is the
+/// same size as the resting composer bar, so the cluster's two shapes
+/// share a measure rather than inventing a third.
+///
+/// It was a blank `rounded_full` disc before the artwork existed, and the
+/// measure did not move when the drawing arrived.
 pub const EMPTY_LOGO: f32 = BAR_HEIGHT;
 
-/// Gap between the disc and the composer card in the empty-session
+/// Gap between the mark and the composer card in the empty-session
 /// cluster. [`SPACE_6`] is the shell's section gap.
 pub const EMPTY_CLUSTER_GAP: f32 = SPACE_6;
 

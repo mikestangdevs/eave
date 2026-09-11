@@ -30257,16 +30257,28 @@ impl Shell {
     }
 }
 
-/// Circular logo placeholder for an empty session. Equal width and height,
-/// `rounded_full` fill, no mark — the real product mark is a later slice.
+/// The product mark above an empty session's composer.
+///
+/// This slot held a blank `rounded_full` disc until the artwork existed.
+/// The box it occupies is unchanged — still the square [`theme::EMPTY_LOGO`]
+/// the cluster's layout tests measure — because the mark is landscape and
+/// an svg fits its viewBox inside the box it is given: swapping the fill
+/// for the drawing moves nothing around it.
+///
+/// Drawn in [`theme::text`] rather than a brand colour. The artwork is one
+/// silhouette and the theme owns both appearances, which is the whole
+/// reason [`icons::Class::Mark`] takes its colour at the call site.
 fn empty_logo() -> gpui::Stateful<gpui::Div> {
     div()
         .id("empty-logo")
         .debug_selector(|| "empty-logo".into())
         .flex_none()
         .size(px(theme::EMPTY_LOGO))
-        .rounded_full()
-        .bg(theme::overlay_strongest())
+        .child(icons::icon(
+            icons::EAVE_MARK,
+            theme::EMPTY_LOGO,
+            theme::text(),
+        ))
 }
 
 /// What an empty omnibox says.
