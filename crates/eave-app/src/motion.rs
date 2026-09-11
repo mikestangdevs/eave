@@ -1179,6 +1179,34 @@ where
     }
 }
 
+/// `.hover_rim(key, rest, hovered)` — the element's EDGE fades under the
+/// pointer instead of its fill.
+///
+/// Written for SP1's split panes and CV1's cards on 2026-09-10, when the
+/// operator asked that *"all four sides highlight … and are moveable/grab
+/// able"* and then, of the first build, that it be *"a clean sleek border
+/// not going into the screen"*. A pane already lays out a one-point
+/// border at every moment — moving only its colour covers no content and
+/// reflows nothing, where a filled band inside the edge does both.
+///
+/// Same bargain and the same one-call shape as [`HoverFade`]: the blend
+/// and the listener are useless apart, so there is no way to write one
+/// without the other.
+pub trait HoverRim: Sized {
+    fn hover_rim(self, key: impl Into<String>, rest: Hsla, hovered: Hsla) -> Self;
+}
+
+impl<E> HoverRim for E
+where
+    E: Styled + StatefulInteractiveElement,
+{
+    fn hover_rim(self, key: impl Into<String>, rest: Hsla, hovered: Hsla) -> Self {
+        let key = key.into();
+        self.border_color(hover_blend(&key, rest, hovered))
+            .on_hover(hover_listener(key))
+    }
+}
+
 /// `.hover_lift(key, rise, shadow)` — the control RISES under the pointer
 /// instead of changing colour.
 ///

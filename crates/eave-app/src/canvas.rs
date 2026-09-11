@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::columns::{ColumnId, COLUMN_GUTTER, COLUMN_W};
+use crate::columns::{ColumnId, COLUMN_W};
 
 /// A card's default size when the well's size is not known — the only
 /// place CL1's column width still decides anything. **Every live path
@@ -45,7 +45,16 @@ use crate::columns::{ColumnId, COLUMN_GUTTER, COLUMN_W};
 /// the 2026-09-10 ruling: see that function.
 pub const CARD_W: f32 = COLUMN_W;
 /// The gap the grid leaves between cards, and the plane's own margin.
-pub const GUTTER: f32 = COLUMN_GUTTER;
+///
+/// **Widened from CL1's column gutter (12) to 20 on 2026-09-10** —
+/// *"i think we should expand the gaps again so all four sides highlight
+/// … and are moveable/grab able."* The gap is not decoration on a plane
+/// where every card is a window: it is the only place an edge can be
+/// taken hold of with the pointer clear of the card next door, and at
+/// twelve two neighbours left six points each. It is deliberately no
+/// longer `COLUMN_GUTTER` — a strip's gutter is a rhythm, a canvas's is
+/// a target.
+pub const GUTTER: f32 = 20.0;
 /// The smallest a card may be resized to. Below this a chat's composer
 /// and a page's header stop being usable, which is the floor that
 /// matters — not a round number.
@@ -132,8 +141,29 @@ pub const ZOOM_STEP: f32 = 1.35;
 /// nothing on screen says so.
 pub const DOT_SPACING: f32 = 28.0;
 pub const DOT_SIZE: f32 = 2.0;
-/// How wide the resize band inside a card's right and bottom edges is.
-pub const GRIP_BAND: f32 = 7.0;
+/// How wide the grab band along a card's edges is, in WINDOW points —
+/// `Shell::card_grips` divides it by the plane's scale, so it is the
+/// same width to the pointer at every zoom.
+///
+/// **7 → 12 on 2026-09-10**: *"i still cant grab edges."* Seven points
+/// is under half what a pointer needs on an edge it cannot see, and the
+/// two edges that did answer were the two nobody reaches for first.
+pub const GRIP_BAND: f32 = 12.0;
+/// How far along each of its two edges a CORNER reaches, in window
+/// points. A corner takes both axes at once, so it has to be findable
+/// without aiming — it is bigger than the band it interrupts on purpose.
+pub const GRIP_CORNER: f32 = 30.0;
+/// The ceilings on both of those, in CANVAS points.
+///
+/// A target held at a fixed size on SCREEN grows without bound in the
+/// card's own units as the plane zooms out — at the floor, twelve window
+/// points is fifty-five canvas points, which is a band deeper than the
+/// header it sits above, and the move handle disappears under the resize
+/// band. So the constant-size rule gives way at the far end of the range:
+/// an edge that is a little thin at the overview is worth more than a
+/// card that cannot be picked up there at all.
+pub const GRIP_BAND_MAX: f32 = 18.0;
+pub const GRIP_CORNER_MAX: f32 = 48.0;
 /// How long a programmatic pan (tidy, a selection coming into view)
 /// takes. Same curve and duration as the strip's glide, for the same
 /// reason: a move the operator did not make has to be followed by eye.
@@ -537,32 +567,69 @@ pub fn wheel_pan(dx: f32, dy: f32, over_selected: bool) -> Option<(f32, f32)> {
 }
 
 /// Which part of a card a press at this canvas point has taken hold of.
+///
+/// **All eight since 2026-09-10** — *"all four sides highlight … and are
+/// moveable/grab able."* CV1 had three (right, bottom, and the corner
+/// between them) on the argument that a card is anchored top-left and a
+/// grip that moved the origin as well as the size was a gesture nobody
+/// could aim. That argument was about the ARITHMETIC and it was wrong:
+/// dragging the left edge does not move the card, it holds the RIGHT
+/// edge still — which is what every window on this machine does and what
+/// the operator reached for and did not find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Grip {
+    /// The left edge — width only, the right edge held still.
+    Left,
     /// The right edge — width only.
     Right,
+    /// The top edge — height only, the bottom edge held still.
+    Top,
     /// The bottom edge — height only.
     Bottom,
-    /// The bottom-right corner — both.
-    Corner,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
-/// The resize grip under a point, if any. Only the right, bottom and
-/// bottom-right are live: a card is anchored at its top-left, so
-/// resizing from the other two edges would move it as well, and a drag
-/// that both moves and resizes is a gesture nobody can aim. The header
-/// is the move handle and it is a listener, not a hit test.
+impl Grip {
+    /// Which of the card's edges this grip carries: `(l, r, t, b)`. One
+    /// table, read by both the arithmetic and the cursor.
+    pub fn edges(self) -> (bool, bool, bool, bool) {
+        match self {
+            Grip::Left => (true, false, false, false),
+            Grip::Right => (false, true, false, false),
+            Grip::Top => (false, false, true, false),
+            Grip::Bottom => (false, false, false, true),
+            Grip::TopLeft => (true, false, true, false),
+            Grip::TopRight => (false, true, true, false),
+            Grip::BottomLeft => (true, false, false, true),
+            Grip::BottomRight => (false, true, false, true),
+        }
+    }
+}
+
+/// The resize grip under a point, if any. A corner wins over both edges
+/// it belongs to: it is the only target that takes two axes, and the
+/// only one you cannot arrive at by sliding along from somewhere else.
 pub fn grip_at(rect: &CardRect, x: f32, y: f32) -> Option<Grip> {
     if !rect.inflate(GRIP_BAND).contains(x, y) {
         return None;
     }
+    let near_l = x <= rect.x + GRIP_BAND;
     let near_r = x >= rect.right() - GRIP_BAND;
+    let near_t = y <= rect.y + GRIP_BAND;
     let near_b = y >= rect.bottom() - GRIP_BAND;
-    match (near_r, near_b) {
-        (true, true) => Some(Grip::Corner),
-        (true, false) => Some(Grip::Right),
-        (false, true) => Some(Grip::Bottom),
-        (false, false) => None,
+    match (near_l, near_r, near_t, near_b) {
+        (true, _, true, _) => Some(Grip::TopLeft),
+        (_, true, true, _) => Some(Grip::TopRight),
+        (true, _, _, true) => Some(Grip::BottomLeft),
+        (_, true, _, true) => Some(Grip::BottomRight),
+        (true, ..) => Some(Grip::Left),
+        (_, true, ..) => Some(Grip::Right),
+        (_, _, true, _) => Some(Grip::Top),
+        (_, _, _, true) => Some(Grip::Bottom),
+        _ => None,
     }
 }
 
@@ -626,19 +693,32 @@ pub fn moved_free(start: &CardRect, dx: f32, dy: f32) -> CardRect {
     moved(start, dx, dy)
 }
 
-/// A card's size MID-resize: the grip's axes only, clamped to the size
-/// bounds, unsnapped. The origin never moves, which is what makes the
-/// gesture aimable.
+/// A card's rectangle MID-resize: the grip's axes only, clamped to the
+/// size bounds, unsnapped.
+///
+/// **The edge OPPOSITE the one in hand is what stays put.** For the
+/// right and bottom grips that is the origin, which is why CV1 could get
+/// away with never writing `x`/`y`; for the left and top it is the far
+/// edge, and deriving the origin from it (rather than adding `dx` to it)
+/// is what keeps a card from walking sideways once the clamp has taken
+/// hold of its width.
 pub fn resized_free(start: &CardRect, grip: Grip, dx: f32, dy: f32) -> CardRect {
-    let w = match grip {
-        Grip::Right | Grip::Corner => (start.w + dx).clamp(CARD_W_MIN, CARD_W_MAX),
-        Grip::Bottom => start.w,
-    };
-    let h = match grip {
-        Grip::Bottom | Grip::Corner => (start.h + dy).clamp(CARD_H_MIN, CARD_H_MAX),
-        Grip::Right => start.h,
-    };
-    CardRect::new(start.x, start.y, w, h)
+    let (l, r, t, b) = grip.edges();
+    let (mut x, mut w) = (start.x, start.w);
+    if r {
+        w = (start.w + dx).clamp(CARD_W_MIN, CARD_W_MAX);
+    } else if l {
+        w = (start.w - dx).clamp(CARD_W_MIN, CARD_W_MAX);
+        x = start.right() - w;
+    }
+    let (mut y, mut h) = (start.y, start.h);
+    if b {
+        h = (start.h + dy).clamp(CARD_H_MIN, CARD_H_MAX);
+    } else if t {
+        h = (start.h - dy).clamp(CARD_H_MIN, CARD_H_MAX);
+        y = start.bottom() - h;
+    }
+    CardRect::new(x, y, w, h)
 }
 
 /// Where a resized card lands — the same as under the hand, for
@@ -995,13 +1075,19 @@ mod tests {
     }
 
     #[test]
-    fn only_the_right_bottom_and_corner_are_grips() {
+    fn every_edge_and_every_corner_is_a_grip() {
         let r = CardRect::new(100.0, 100.0, 500.0, 400.0);
-        assert_eq!(grip_at(&r, r.right() - 2.0, r.bottom() - 2.0), Some(Grip::Corner));
+        // The four corners, each winning over the two edges it belongs to.
+        assert_eq!(grip_at(&r, r.x + 2.0, r.y + 2.0), Some(Grip::TopLeft));
+        assert_eq!(grip_at(&r, r.right() - 2.0, r.y + 2.0), Some(Grip::TopRight));
+        assert_eq!(grip_at(&r, r.x + 2.0, r.bottom() - 2.0), Some(Grip::BottomLeft));
+        assert_eq!(grip_at(&r, r.right() - 2.0, r.bottom() - 2.0), Some(Grip::BottomRight));
+        // The four edges, clear of the corners.
+        assert_eq!(grip_at(&r, r.x + 2.0, r.y + 200.0), Some(Grip::Left));
         assert_eq!(grip_at(&r, r.right() - 2.0, r.y + 200.0), Some(Grip::Right));
+        assert_eq!(grip_at(&r, r.x + 200.0, r.y + 2.0), Some(Grip::Top));
         assert_eq!(grip_at(&r, r.x + 200.0, r.bottom() - 2.0), Some(Grip::Bottom));
         assert_eq!(grip_at(&r, r.x + 200.0, r.y + 200.0), None, "the body is not a grip");
-        assert_eq!(grip_at(&r, r.x + 2.0, r.y + 2.0), None, "the top-left anchor is not a grip");
         assert_eq!(grip_at(&r, 9000.0, 9000.0), None);
         // The band reaches a little OUTSIDE the card too, so the edge is
         // catchable without landing on the neighbour.
@@ -1018,9 +1104,9 @@ mod tests {
         assert_eq!((m.x, m.y), (137.0, 95.0), "no lattice");
         assert_eq!((m.w, m.h), (500.0, 400.0), "a move is a move");
         assert_eq!(moved_free(&r, 37.0, -5.0), m, "the drop does not move it again");
-        let g = resized(&r, Grip::Corner, 13.0, 7.0);
+        let g = resized(&r, Grip::BottomRight, 13.0, 7.0);
         assert_eq!((g.w, g.h), (513.0, 407.0));
-        assert_eq!(resized_free(&r, Grip::Corner, 13.0, 7.0), g);
+        assert_eq!(resized_free(&r, Grip::BottomRight, 13.0, 7.0), g);
     }
 
     /// The zoom is multiplicative, bounded, and holds the point under the
@@ -1072,13 +1158,38 @@ mod tests {
         let bottom = resized(&r, Grip::Bottom, 900.0, 60.0);
         assert_eq!(bottom.w, 500.0);
         assert!(bottom.h > 400.0);
-        let corner = resized(&r, Grip::Corner, 60.0, 60.0);
+        let corner = resized(&r, Grip::BottomRight, 60.0, 60.0);
         assert!(corner.w > 500.0 && corner.h > 400.0);
         // Dragged past the floor, a card stops at the floor.
-        let tiny = resized(&r, Grip::Corner, -9000.0, -9000.0);
+        let tiny = resized(&r, Grip::BottomRight, -9000.0, -9000.0);
         assert_eq!((tiny.w, tiny.h), (CARD_W_MIN, CARD_H_MIN));
-        let huge = resized(&r, Grip::Corner, 9e9, 9e9);
+        let huge = resized(&r, Grip::BottomRight, 9e9, 9e9);
         assert_eq!((huge.w, huge.h), (CARD_W_MAX, CARD_H_MAX));
+    }
+
+    /// The half CV1 refused to write, and the reason it gave was about
+    /// the arithmetic rather than the gesture: pulling the left edge does
+    /// not move the card, it holds the RIGHT edge still.
+    #[test]
+    fn a_left_or_top_grip_holds_the_far_edge_still() {
+        let r = CardRect::new(100.0, 100.0, 500.0, 400.0);
+        let left = resized(&r, Grip::Left, -60.0, 0.0);
+        assert_eq!(left.w, 560.0, "dragging left widens the card");
+        assert_eq!(left.x, 40.0, "the origin follows");
+        assert_eq!(left.right(), r.right(), "the right edge did not move");
+        assert_eq!((left.y, left.h), (100.0, 400.0), "the other axis is untouched");
+        let top = resized(&r, Grip::Top, 0.0, 50.0);
+        assert_eq!(top.h, 350.0);
+        assert_eq!(top.y, 150.0);
+        assert_eq!(top.bottom(), r.bottom(), "the bottom edge did not move");
+        // **Past the floor the far edge STILL does not move.** Deriving
+        // the origin from the clamped size is what buys that; adding the
+        // delta to `x` would walk the card sideways for as long as the
+        // pointer kept going.
+        let squashed = resized(&r, Grip::TopLeft, 9000.0, 9000.0);
+        assert_eq!((squashed.w, squashed.h), (CARD_W_MIN, CARD_H_MIN));
+        assert_eq!(squashed.right(), r.right());
+        assert_eq!(squashed.bottom(), r.bottom());
     }
 
     /// Minimal, like CL1's — a selection change may not re-centre, or it

@@ -18399,6 +18399,178 @@ fn dropping_a_tab_on_the_well_splits_with_the_page_in_front(cx: &mut TestAppCont
 /// drives the verb that was missing, and it asserts the LAYOUT flag
 /// rather than a pixel, because a geometry assertion here would pass on a
 /// split that merely happened to be narrow.
+/// **A pane can be picked up.** Ruled on 2026-09-10 after three rounds
+/// spent on the edges: *"i still cant drage them or move then around."*
+///
+/// The drop half has worked since SP1 — `split_tabs` reorders a split's
+/// own panes — so nothing about a rearrangement was missing except a way
+/// to START one: a `TabDrag` only ever came from the rail. The handle is
+/// what this pins; gpui's drag machinery does not run under a synthetic
+/// pointer (CV2's rig note), so the gesture itself cannot be driven here
+/// and the reorder is driven through the verb instead.
+#[gpui::test]
+fn a_pane_has_a_handle_and_reorders_when_it_lands(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p2", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let order = |h: &Harness, vcx: &mut VisualTestContext| {
+        h.window
+            .read_with(vcx, |shell, _| shell.splits.first().map(|s| s.panes.clone()))
+            .unwrap()
+    };
+    assert_eq!(order(&h, vcx), Some(vec!["p1".into(), "p2".into()]));
+
+    // Both panes carry a handle, and it sits at the pane's top — over the
+    // header, whose own controls paint above it and keep their hits.
+    for side in ["left", "right"] {
+        let grab = vcx
+            .debug_bounds(if side == "left" { "pane-grab-left" } else { "pane-grab-right" })
+            .unwrap_or_else(|| panic!("the {side} pane has no handle to drag it by"));
+        let pane = vcx
+            .debug_bounds(if side == "left" { "split-pane-left" } else { "split-pane-right" })
+            .expect("pane");
+        assert!(
+            (f32::from(grab.origin.y) - f32::from(pane.origin.y)).abs() <= 2.0,
+            "the {side} handle is not at the pane's top: {grab:?} in {pane:?}"
+        );
+    }
+
+    // And the landing it feeds: the right pane dropped against the left
+    // pane's LEFT edge swaps them, rather than opening anything new.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Left, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        order(&h, vcx),
+        Some(vec!["p2".into(), "p1".into()]),
+        "a pane dropped on its neighbour's far edge did not change places with it"
+    );
+}
+
+/// **The pane under the pointer writes its own hover key.** The defect
+/// this refuses is AG1 #15's, one surface over: a `hover_blend` whose key
+/// nothing registers never moves, and **`debug_bounds` reports geometry
+/// and NEVER colour**, so a rim that does not light passes every
+/// assertion in this file. The listener is the half that can fail in
+/// silence, so the listener is what gets driven.
+#[gpui::test]
+fn hovering_a_pane_lights_its_rim(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p2", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert_eq!(crate::motion::hover_t("pane-rim-right"), 0.0, "nothing is hovered yet");
+
+    let at = vcx.debug_bounds("split-pane-right").expect("right pane").center();
+    vcx.simulate_mouse_move(at, None, Modifiers::none());
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(Duration::from_millis(400));
+    vcx.run_until_parked();
+    assert!(
+        crate::motion::hover_t("pane-rim-right") > 0.5,
+        "the pane the pointer is over did not write its hover key — its rim \
+         cannot light, and no geometry test in this file can see that"
+    );
+    // And it is the pane under the pointer, not every pane: a rim that lit
+    // on all of them would say nothing about which one answers.
+    assert_eq!(crate::motion::hover_t("pane-rim-left"), 0.0, "the other pane lit too");
+}
+
+/// **The landing is drawn while the tab is still in the air.** Ruled on
+/// 2026-09-10 with four shots of the reference doing it: *"and arrange
+/// able like so."* eave had decided the edge on drop since that morning
+/// and drew nothing on the way there, so arranging a well was a thing you
+/// found out about afterwards.
+///
+/// Driven by writing the state rather than by dragging: gpui's drag
+/// machinery does not run under a synthetic pointer (CV2's rig note), so
+/// the gesture cannot be driven here — the wiring is pinned structurally
+/// instead, which is the documented fallback.
+#[gpui::test]
+fn a_tab_in_the_air_shows_the_half_it_would_take(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            page_tab("p2", Some("https://b.test/"), Some("B")),
+        ],
+        Some("p1"),
+    );
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p2", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(shown(vcx, "split-well"), "precondition: the well is split");
+    assert!(!shown(vcx, "well-drop-hint"), "nothing is being dragged yet");
+
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.tab_drop = Some(("left".into(), crate::ui::DropEdge::Left));
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let hint = vcx.debug_bounds("well-drop-hint").expect("the hint is drawn");
+    let pane = vcx.debug_bounds("split-pane-left").expect("left pane");
+    // In the pane it names, on the edge it names, and half of it — the
+    // three things the drop is about to do.
+    // Inside the pane's own one-point rim, which is where it belongs —
+    // the hint marks the content, not the border.
+    assert!(
+        (f32::from(hint.origin.x) - f32::from(pane.origin.x)).abs() <= 2.0,
+        "the left edge: {hint:?} in {pane:?}"
+    );
+    assert!(
+        (f32::from(hint.size.width) - f32::from(pane.size.width) / 2.0).abs() < 2.0,
+        "half the pane: {hint:?} in {pane:?}"
+    );
+
+    // And it is transient: the drop that consumes it clears it, so no
+    // dashed rectangle can be left behind on a well nobody is dragging on.
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.drop_tab_on_well("p2", crate::ui::DropEdge::Right, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(
+        h.window.read_with(vcx, |shell, _| shell.tab_drop.is_none()).unwrap(),
+        "the hint outlived the drag"
+    );
+}
+
 #[gpui::test]
 fn a_drop_on_the_bottom_edge_stacks_the_panes(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
@@ -23627,10 +23799,10 @@ fn a_cards_corner_resizes_it_without_moving_its_origin(cx: &mut TestAppContext) 
     rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     enter_canvas(&h, vcx);
     let before = card_rect(&h, vcx, "aaaa1111");
-    let grip = vcx.debug_bounds("card-grip-corner-aaaa1111").expect("corner grip");
+    let grip = vcx.debug_bounds("card-grip-bottomright-aaaa1111").expect("corner grip");
     let from = grip.center();
 
-    carry(vcx, "card-grip-corner-aaaa1111", point(from.x - px(180.), from.y - px(120.)));
+    carry(vcx, "card-grip-bottomright-aaaa1111", point(from.x - px(180.), from.y - px(120.)));
 
     let after = placed(&h, vcx, "aaaa1111").expect("the resize wrote a placement");
     assert_eq!(after.x, before.x, "the origin never moves");
@@ -23911,7 +24083,7 @@ fn a_corner_dragged_on_a_zoomed_plane_tracks_the_pointer(cx: &mut TestAppContext
     let s = crate::canvas::card_scale(crate::canvas::ZOOM_MIN);
     let before = card_rect(&h, vcx, "aaaa1111");
 
-    carry_drawn(&h, vcx, "card-grip-corner-aaaa1111", -100.0, -60.0);
+    carry_drawn(&h, vcx, "card-grip-bottomright-aaaa1111", -100.0, -60.0);
 
     let after = placed(&h, vcx, "aaaa1111").expect("the resize wrote a placement");
     assert_eq!(after.x, before.x, "the origin never moves");
@@ -23920,16 +24092,24 @@ fn a_corner_dragged_on_a_zoomed_plane_tracks_the_pointer(cx: &mut TestAppContext
     assert!(after.w >= crate::canvas::CARD_W_MIN);
 }
 
-/// **A grip stays the same size on screen.** Everything else on a card is
-/// content and belongs at the card's scale; a grip is a target, and one
-/// scaled to three and a half points at the floor is not one the pointer
-/// can find. *"Seamless dragging and resizing"* is the ask this protects.
+/// **A grip stays the same size on screen — until the ceiling binds.**
+/// Everything else on a card is content and belongs at the card's scale;
+/// a grip is a target, and one scaled to three and a half points at the
+/// floor is not one the pointer can find. *"Seamless dragging and
+/// resizing"* is the ask this protects.
+///
+/// The exception is deliberate and it is the whole of `GRIP_BAND_MAX`:
+/// held at a fixed size on screen, a band is fifty-five CANVAS points at
+/// the zoom floor — deeper than the header it sits above, so the move
+/// handle vanishes under the resize band and a card at the overview
+/// cannot be picked up at all. Past the ceiling the band is the ceiling,
+/// and it draws thinner on screen than it does at 100%.
 #[gpui::test]
 fn a_resize_grip_is_the_same_width_at_every_zoom(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     enter_canvas(&h, vcx);
-    for z in [crate::canvas::ZOOM_MIN, 1.0, crate::canvas::ZOOM_MAX] {
+    for z in [1.0, crate::canvas::ZOOM_MAX] {
         zoom_plane(&h, vcx, z);
         let s = crate::canvas::card_scale(z);
         let grip = vcx.debug_bounds("card-grip-right-aaaa1111").expect("right grip");
@@ -23939,6 +24119,53 @@ fn a_resize_grip_is_the_same_width_at_every_zoom(cx: &mut TestAppContext) {
             "at zoom {z} the grip draws {on_screen} points wide"
         );
     }
+    // At the floor the ceiling has taken over, and it is stated in CANVAS
+    // points — the same number the card is measured in.
+    zoom_plane(&h, vcx, crate::canvas::ZOOM_MIN);
+    let grip = vcx.debug_bounds("card-grip-right-aaaa1111").expect("right grip");
+    assert!(
+        (f32::from(grip.size.width) - crate::canvas::GRIP_BAND_MAX).abs() < 0.5,
+        "the floor takes the ceiling: {grip:?}"
+    );
+    // And it is still deeper than it would have been if it scaled with
+    // the card, which is what the rule is for.
+    assert!(crate::canvas::GRIP_BAND_MAX > crate::canvas::GRIP_BAND);
+}
+
+/// **Every edge and every corner answers.** Ruled on 2026-09-10 — *"i
+/// still cant grab edges … all four sides … are moveable/grab able."*
+/// CV1 drew three, so the two edges an operator reaches for first were
+/// silent; the fixture drives the LEFT edge, which before this slice ran
+/// no handler at all.
+#[gpui::test]
+fn every_edge_of_a_card_can_be_taken_hold_of(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    rail_and_strip(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
+    enter_canvas(&h, vcx);
+    let before = card_rect(&h, vcx, "aaaa1111");
+
+    // The left edge pulled LEFT: the card widens and its right edge does
+    // not move. Both halves matter — a left grip that moved the whole
+    // card is the gesture CV1 refused to write, and rightly.
+    carry_drawn(&h, vcx, "card-grip-left-aaaa1111", -60.0, 0.0);
+    let after = placed(&h, vcx, "aaaa1111").expect("the left edge wrote a placement");
+    assert!(after.w > before.w, "the left edge took the width: {after:?}");
+    assert!(after.x < before.x, "and the origin followed it");
+    assert!(
+        (after.x + after.w - (before.x + before.w)).abs() < 1.0,
+        "the right edge stayed put: {after:?} from {before:?}"
+    );
+    assert_eq!(after.h, before.h, "the other axis is untouched");
+
+    // And the top edge, the other one that answered nothing.
+    let before = card_rect(&h, vcx, "aaaa1111");
+    carry_drawn(&h, vcx, "card-grip-top-aaaa1111", 0.0, 40.0);
+    let after = placed(&h, vcx, "aaaa1111").expect("the top edge wrote a placement");
+    assert!(after.h < before.h, "the top edge took the height: {after:?}");
+    assert!(
+        (after.y + after.h - (before.y + before.h)).abs() < 1.0,
+        "the bottom edge stayed put"
+    );
 }
 
 /// **Every card is mounted at every zoom.** Nothing empties itself because

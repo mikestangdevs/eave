@@ -1399,11 +1399,61 @@ pub fn accent() -> Hsla {
 ///
 /// [`ink`] is achromatic and flips with the appearance — dark ink on a
 /// light ground, light ink on a dark one — so one number is a clear band
-/// in both modes without a second token or a light-mode branch. 0.28 is
-/// three times [`card_border`]'s resting rim, which is what makes it read
-/// as *this pane* rather than as every pane's edge.
+/// in both modes without a second token or a light-mode branch.
+///
+/// **0.28 → 0.55 later the same day**, when [`pane_rim_hover`] arrived
+/// under it and the operator's report of the whole ladder was *"i saw
+/// nothing"*. The three states have to be three DISTANCES apart on a one
+/// point line, and 0.09 / 0.20 / 0.28 was not — the steps were arithmetic
+/// rather than visible. The ladder is spread out now and focus keeps the
+/// top of it, which is the part that must not move: an edge that is as
+/// loud hovered as it is focused has stopped saying which pane has the
+/// keyboard.
 pub fn pane_focus_ring() -> Hsla {
-    ink(0.28)
+    ink(0.55)
+}
+/// A pane's rim at rest — the outline it wears all the time.
+///
+/// **Not [`card_border`], which is the app's quietest hairline.** That is
+/// the right edge for a card sitting alone on a ground; a pane sits
+/// against other panes, and the border is what says where one ends and
+/// the next begins. In the reference canvas the operator has sent four
+/// times, every pane is outlined at rest and the lit ones are steps up
+/// from that — so the resting rim has to be visible on its own before
+/// either of the other two states means anything.
+pub fn pane_rest_rim() -> Hsla {
+    ink(0.18)
+}
+
+/// A pane's rim while the pointer is somewhere on that pane — the edge
+/// saying *this can be taken hold of*.
+///
+/// Ruled on 2026-09-10: *"expand the gaps again so all four sides
+/// highlight … and are moveable/grab able."* An affordance nobody can
+/// see is an affordance nobody uses, and a pane's edges had been silent
+/// targets since SP1.
+///
+/// **It is a RIM and not a band.** The first build of this lit a
+/// twelve-point strip inside each edge and the operator's word for it was
+/// *"very ugly … should be a clean sleek border not going into the
+/// screen"*: a filled band is painted over the content, which makes the
+/// pane look like it has a margin that appears and disappears. The border
+/// is already laid out on every pane at every moment — only its colour
+/// moves, so nothing reflows and nothing is covered.
+///
+/// One step between [`card_border`] at rest and [`pane_focus_ring`], so
+/// the three states read as one ink getting stronger: edge, *reachable*,
+/// *has the keyboard*. [`ink`] for `pane_focus_ring`'s reason — one
+/// number, a clear band in both appearances, no chroma on an edge.
+///
+/// **0.20 → 0.38, on the operator's report of the first build: *"i saw
+/// nothing when we tested."*** 0.09 → 0.20 is a step you can measure and
+/// not one you can see: a rim is ONE POINT of line, so a state change on
+/// it buys none of the area a filled control's wash gets, and it has to
+/// be spent on contrast instead. The ladder under it moved with it —
+/// three states on a hairline need three distances, not three numbers.
+pub fn pane_rim_hover() -> Hsla {
+    ink(0.38)
 }
 /// The armed send button under the pointer — **Tailwind violet-300**,
 /// `oklch(0.811 0.111 293.571)`, one step up the same ramp.
@@ -2367,17 +2417,17 @@ pub const SPLIT_RATIO_MIN: f32 = 0.20;
 pub const RAIL_HANDLE_W: f32 = 8.0;
 
 /// The divider between two split panes — the gap you see and the target
-/// you grab, which are the same element.
+/// you grab, which are deliberately the same band.
 ///
-/// **Halved from [`RAIL_HANDLE_W`] on 2026-09-10** — *"our gab split
-/// inbetween windows needs to be thinner. its too thick right now."* The
-/// split gap had been borrowing the RAIL's seam handle, which is a
-/// different problem: that one straddles a hairline between two surfaces
-/// that meet, where this one IS the space between two panes and reads as
-/// the frame around each. It follows [`CARD_GUTTER`] instead, which moved
-/// the same day and for the same reason, so the air inside the well and
-/// the air around it are one number.
-pub const SPLIT_HANDLE_W: f32 = CARD_GUTTER;
+/// **8 → 4 → 8 across 2026-09-10, and the number came back for a
+/// reason.** It was halved on *"our gab split inbetween windows needs to
+/// be thinner. its too thick right now"* — and then, with the seam that
+/// thin, *"i still cant grab edges."* Four points is a gap; it is not a
+/// control. What made the first eight ugly was that it was a dead band
+/// with nothing in it: it does not say it can be taken hold of, so it
+/// read as slack. It lights under the pointer now, so the width is
+/// carrying something.
+pub const SPLIT_HANDLE_W: f32 = SPACE_2;
 
 /// **The collapsed rail is a SPINE, never nothing (Slice D1).**
 ///
@@ -4283,6 +4333,8 @@ mod tests {
             ("canvas_dot", canvas_dot()),
             ("canvas_card_plate", canvas_card_plate()),
             ("canvas_hud_plate", canvas_hud_plate()),
+            ("pane_rim_hover", pane_rim_hover()),
+            ("pane_rest_rim", pane_rest_rim()),
         ] {
             let c: Rgba = c.into();
             assert_eq!(

@@ -61,7 +61,7 @@ use crate::loaders;
 use crate::markdown::{self, inline_runs, Align, Block, InlineRun, Marker};
 use crate::mentions::{self, ProjectFile};
 use crate::model_picker;
-use crate::motion::{self, HoverFade as _};
+use crate::motion::{self, HoverFade as _, HoverRim as _};
 use crate::omnibox;
 use crate::overlay::{self, MenuItem, Popup};
 use crate::slash::{self, SlashEntry};
@@ -6625,17 +6625,47 @@ const SPLIT_MAX: usize = 4;
 /// no corner — and a pane grew its corners back only when you clicked it,
 /// which reads as the corner being a selection state.
 ///
-/// Two rims, both real: [`theme::card_border`] at rest — the same resting
-/// edge a canvas card wears — and [`theme::pane_focus_ring`], three times
-/// its strength, for the one with the keyboard. Focus is a *step* in the
-/// same neutral, which is why it can be read as focus rather than as
-/// structure.
+/// Three rims, all real, and **the resting one is meant to be SEEN**:
+/// every pane in the reference the operator keeps sending is outlined at
+/// rest, and the pointer and the keyboard are two steps up from there —
+/// [`theme::pane_rest_rim`], [`theme::pane_rim_hover`],
+/// [`theme::pane_focus_ring`]. It was `card_border` at rest, which is the
+/// app's quietest hairline: correct for a card sitting alone on a ground,
+/// wrong for a pane that has to show where it ends and its neighbour
+/// begins.
 fn pane_rim(is_focused: bool) -> gpui::Hsla {
     if is_focused {
         theme::pane_focus_ring()
     } else {
-        theme::card_border()
+        theme::pane_rest_rim()
     }
+}
+
+/// The dashed rectangle showing the half a dropped tab would take.
+///
+/// Ruled on 2026-09-10 with four shots of the reference doing it: *"and
+/// arrange able like so."* eave has decided the edge on drop since this
+/// morning and drew NOTHING while the tab was in the air, so arranging a
+/// well was a thing you found out about afterwards. It is dashed and not
+/// filled for the reason `bookmarks`' drop well is: a dashed edge reads
+/// as *a place for something*, a filled one reads as something already
+/// there.
+fn drop_hint(edge: DropEdge) -> AnyElement {
+    div()
+        .debug_selector(|| "well-drop-hint".into())
+        .absolute()
+        .map(|d| match edge {
+            DropEdge::Left => d.top_0().bottom_0().left_0().w(gpui::relative(0.5)),
+            DropEdge::Right => d.top_0().bottom_0().right_0().w(gpui::relative(0.5)),
+            DropEdge::Top => d.left_0().right_0().top_0().h(gpui::relative(0.5)),
+            DropEdge::Bottom => d.left_0().right_0().bottom_0().h(gpui::relative(0.5)),
+        })
+        .rounded(px(theme::RADIUS_PANEL))
+        .border_2()
+        .border_dashed()
+        .border_color(theme::pane_focus_ring())
+        .bg(theme::overlay())
+        .into_any_element()
 }
 
 /// Which edge of a pane a tab was dropped against.
@@ -6861,6 +6891,12 @@ struct CanvasDrag {
     /// Whether the pointer has moved far enough to be a drag. Until it
     /// has, nothing is written — so a click on a header is still a click.
     moved: bool,
+    /// The last delta handed to the geometry, in CANVAS points. The
+    /// landing is recomputed from it rather than from the live rect's
+    /// size: a left or top grip changes the width by MINUS `dx`, so a
+    /// landing derived from `live.w - start.w` would resize the card a
+    /// second time, in the wrong direction.
+    last: (f32, f32),
 }
 
 /// Payload type for a card drag. Same shape and the same reason as
@@ -8017,6 +8053,15 @@ struct Shell {
     splits: Vec<Split>,
     /// The split-divider drag in progress, or `None`.
     split_drag: Option<SplitDrag>,
+    /// The pane a tab is being dragged over and the edge it would take —
+    /// the placement drawn BEFORE the drop, so arranging is something the
+    /// operator aims rather than something they find out about.
+    ///
+    /// Ruled on 2026-09-10, with four shots of the reference doing it:
+    /// *"and arrange able like so."* Transient by construction — it is
+    /// written by `on_drag_move` and cleared by the drop, so nothing about
+    /// it is persisted and a drag that ends anywhere else leaves no mark.
+    tab_drop: Option<(String, DropEdge)>,
     /// **Slice CL1 — the content area's layout.** Focus is the well as
     /// built; Columns is the strip. Per window, saved in `frame.json`
     /// under [`crate::columns::LAYOUT_KEY`] like the rail's collapse.
@@ -14822,7 +14867,19 @@ impl Shell {
                 })
             })
             .border_1()
-            .border_color(theme::card_border());
+            .border_color(theme::card_border())
+            // The card is a hover GROUP so its whole frame lights at once
+            // — see `Shell::card_grips`. Named per card, because two cards
+            // sharing a group name would light each other.
+            // The rim lights while the pointer is on the card — all four
+            // sides at once, because the ask was *all four sides* and a
+            // single edge glowing under the pointer says *this* edge.
+            // A rim and not a band: see `theme::pane_rim_hover`.
+            .hover_rim(
+                format!("card-rim-{stem}"),
+                theme::card_border(),
+                theme::pane_rim_hover(),
+            );
         if !mounted {
             let empty = slot.into_any_element();
             return if geo.canvas {
@@ -14906,11 +14963,71 @@ impl Shell {
             .into_any_element()
     }
 
-    /// **Slice CV1 — the two resize grips and the corner.** Right, bottom
-    /// and bottom-right only: a card is anchored at its top-left, so a
-    /// left or top grip would move it as well, and a gesture that both
-    /// moves and resizes is one nobody can aim (`canvas::grip_at` states
-    /// the same rule for the arithmetic).
+    /// **A pane you can pick up.** Ruled on 2026-09-10, after three
+    /// rounds of tuning the edges: *"i still cant drage them or move then
+    /// around."*
+    ///
+    /// The missing piece was never the drop — `split_tabs` has reordered
+    /// a split's own panes since SP1 — it was that **nothing in the well
+    /// could START a drag.** A `TabDrag` only ever came from the rail, so
+    /// the panes could receive an arrangement and never make one. This
+    /// mints the SAME payload the rail mints, which is why every drop
+    /// door, every refusal and the dashed hint all work on it unchanged:
+    /// a pane drag is a tab drag whose source happens to be the well.
+    ///
+    /// A band across the pane's top, under its header, and CV1's idiom
+    /// exactly: it goes in FIRST so the header's own controls paint over
+    /// it and keep their hits, and what is left over — the header's inert
+    /// width — is the handle. No new title bar; the operator's ruling
+    /// against one holds here as it does on the plane.
+    fn pane_grab_strip(
+        &self,
+        tab_id: &str,
+        side: &'static str,
+        snapshot: &eave_wire::TabsSnapshot,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        // Through the SAME projection the rail drags from — the ghost has
+        // to read like the row it came from, and `StripTab::label` is
+        // where a chat's own name (ID2a) and a blank page's `New Chat`
+        // are decided. Reaching into `TabInfo::title` here would be a
+        // second naming path, which is how two tabs come to be called
+        // different things in one window.
+        let drag = TabDrag::of(self.strip_tabs_by_id(snapshot, cx).get(tab_id)?);
+        let id = format!("pane-grab-{side}");
+        Some(
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id.clone())
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(theme::PANE_HEADER_H))
+                .cursor_grab()
+                .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
+                .into_any_element(),
+        )
+    }
+
+    /// **The card's frame: eight targets, lit together.** Ruled on
+    /// 2026-09-10 — *"i still cant grab edges … we should expand the gaps
+    /// again so all four sides highlight … and are moveable/grab able."*
+    ///
+    /// CV1 drew three (right, bottom, and the corner between them), seven
+    /// points wide and invisible, on the argument that a card is anchored
+    /// at its top-left. So the two edges an operator reaches for first —
+    /// the left and the top — answered nothing at all, and the two that
+    /// did answer could not be found. All eight are live now
+    /// (`canvas::Grip` carries why the arithmetic was never the problem),
+    /// and every one of them **lights while the pointer is anywhere on
+    /// its card**, which is the half of the ask no geometry could deliver:
+    /// an affordance nobody can see is an affordance nobody uses.
+    ///
+    /// The move handle is still the header, not the top edge — CV1's
+    /// second-run ruling (*"we dont need the extra top bar"*) holds, and
+    /// the header is the thing the hand in the operator's reference shot
+    /// is resting on.
     fn card_grips(
         &self,
         stem: &str,
@@ -14925,47 +15042,120 @@ impl Shell {
         // three and a half points wide at the floor, which is under half
         // the width the pointer needs, and *"seamless dragging and
         // resizing"* was the ask that started this layout. Divided by the
-        // scale in card units, it draws the same width at every zoom.
-        let band = px(crate::canvas::GRIP_BAND / card_s.max(0.01));
-        [Grip::Right, Grip::Bottom, Grip::Corner]
-            .into_iter()
-            .map(|grip| {
-                let name = match grip {
-                    Grip::Right => "right",
-                    Grip::Bottom => "bottom",
-                    Grip::Corner => "corner",
-                };
-                let id = format!("card-grip-{name}-{stem}");
-                let owner = stem.to_string();
-                div()
-                    .id(SharedString::from(id.clone()))
-                    .debug_selector(move || id.clone())
-                    .absolute()
-                    .occlude()
-                    .map(|d| match grip {
-                        Grip::Right => d.top_0().bottom(band).right_0().w(band).cursor_col_resize(),
-                        Grip::Bottom => d.left_0().right(band).bottom_0().h(band).cursor_row_resize(),
-                        Grip::Corner => d
-                            .right_0()
-                            .bottom_0()
-                            .w(band)
-                            .h(band)
-                            .cursor_nwse_resize(),
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                            this.begin_card_drag(&owner, Some(grip), rect, e.position, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_drag(CardDrag, |_, _, _, cx| {
+        // scale in card units, it draws the same width at every zoom —
+        // and it never sits inside the drawn frame, so at 100% the band
+        // you can see and the band you can hit are the same band.
+        let s = card_s.max(0.01);
+        let band = px((crate::canvas::GRIP_BAND / s)
+            .clamp(crate::canvas::GRIP_BAND, crate::canvas::GRIP_BAND_MAX));
+        let corner = px((crate::canvas::GRIP_CORNER / s)
+            .clamp(crate::canvas::GRIP_CORNER, crate::canvas::GRIP_CORNER_MAX));
+        // A corner is an **L**, not a square. A square corner deep enough
+        // to aim at reaches into the header and eats ⛶ and × — which is
+        // exactly what it did on the first build, and the harness caught
+        // it. Two arms of the frame's own thickness stay in the frame,
+        // where every one of these targets belongs.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Part {
+            Edge,
+            ArmH,
+            ArmV,
+        }
+        [
+            (Grip::Left, Part::Edge),
+            (Grip::Right, Part::Edge),
+            (Grip::Top, Part::Edge),
+            (Grip::Bottom, Part::Edge),
+            (Grip::TopLeft, Part::ArmH),
+            (Grip::TopLeft, Part::ArmV),
+            (Grip::TopRight, Part::ArmH),
+            (Grip::TopRight, Part::ArmV),
+            (Grip::BottomLeft, Part::ArmH),
+            (Grip::BottomLeft, Part::ArmV),
+            (Grip::BottomRight, Part::ArmH),
+            (Grip::BottomRight, Part::ArmV),
+        ]
+        .into_iter()
+        .map(|(grip, part)| {
+            let name = match grip {
+                Grip::Left => "left",
+                Grip::Right => "right",
+                Grip::Top => "top",
+                Grip::Bottom => "bottom",
+                Grip::TopLeft => "topleft",
+                Grip::TopRight => "topright",
+                Grip::BottomLeft => "bottomleft",
+                Grip::BottomRight => "bottomright",
+            };
+            let id = if part == Part::ArmV {
+                format!("card-grip-{name}-v-{stem}")
+            } else {
+                format!("card-grip-{name}-{stem}")
+            };
+            let owner = stem.to_string();
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id.clone())
+                .absolute()
+                .occlude()
+                // The edges stop short of the corners rather than running
+                // under them: two DIFFERENT targets that overlap mean the
+                // one painted last silently eats the other's presses, and
+                // a corner is the one target you cannot reach by sliding
+                // along from somewhere else. A corner's two arms overlap
+                // each other, which is harmless — they do the same thing.
+                .map(|d| match (grip, part) {
+                    (Grip::Left, _) => {
+                        d.left_0().top(corner).bottom(corner).w(band).cursor_col_resize()
+                    }
+                    (Grip::Right, _) => {
+                        d.right_0().top(corner).bottom(corner).w(band).cursor_col_resize()
+                    }
+                    (Grip::Top, _) => {
+                        d.top_0().left(corner).right(corner).h(band).cursor_row_resize()
+                    }
+                    (Grip::Bottom, _) => {
+                        d.bottom_0().left(corner).right(corner).h(band).cursor_row_resize()
+                    }
+                    (Grip::TopLeft, Part::ArmH) => {
+                        d.top_0().left_0().w(corner).h(band).cursor_nwse_resize()
+                    }
+                    (Grip::TopLeft, _) => {
+                        d.top_0().left_0().w(band).h(corner).cursor_nwse_resize()
+                    }
+                    (Grip::TopRight, Part::ArmH) => {
+                        d.top_0().right_0().w(corner).h(band).cursor_nesw_resize()
+                    }
+                    (Grip::TopRight, _) => {
+                        d.top_0().right_0().w(band).h(corner).cursor_nesw_resize()
+                    }
+                    (Grip::BottomLeft, Part::ArmH) => {
+                        d.bottom_0().left_0().w(corner).h(band).cursor_nesw_resize()
+                    }
+                    (Grip::BottomLeft, _) => {
+                        d.bottom_0().left_0().w(band).h(corner).cursor_nesw_resize()
+                    }
+                    (Grip::BottomRight, Part::ArmH) => {
+                        d.bottom_0().right_0().w(corner).h(band).cursor_nwse_resize()
+                    }
+                    (Grip::BottomRight, _) => {
+                        d.bottom_0().right_0().w(band).h(corner).cursor_nwse_resize()
+                    }
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                        this.begin_card_drag(&owner, Some(grip), rect, e.position, cx);
                         cx.stop_propagation();
-                        cx.new(|_| CardDrag)
-                    })
-                    .into_any_element()
-            })
-            .collect()
+                    }),
+                )
+                .on_drag(CardDrag, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| CardDrag)
+                })
+                .into_any_element()
+        })
+        .collect()
     }
 
     /// A press on a grab strip or a grip. Nothing is written yet — the
@@ -14985,6 +15175,7 @@ impl Shell {
             grab: (f32::from(at.x), f32::from(at.y)),
             start,
             moved: false,
+            last: (0.0, 0.0),
         });
         cx.notify();
     }
@@ -15008,6 +15199,7 @@ impl Shell {
             return;
         }
         drag.moved = true;
+        drag.last = (dx, dy);
         let next = match drag.grip {
             None => crate::canvas::moved_free(&drag.start, dx, dy),
             Some(g) => crate::canvas::resized_free(&drag.start, g, dx, dy),
@@ -15027,17 +15219,11 @@ impl Shell {
             cx.notify();
             return;
         }
-        let live = self.canvas_placed.borrow().get(&drag.stem).copied();
-        if let Some(live) = live {
-            let (dx, dy) = (live.x - drag.start.x, live.y - drag.start.y);
+        if self.canvas_placed.borrow().contains_key(&drag.stem) {
+            let (dx, dy) = drag.last;
             let landed = match drag.grip {
                 None => crate::canvas::moved(&drag.start, dx, dy),
-                Some(g) => crate::canvas::resized(
-                    &drag.start,
-                    g,
-                    live.w - drag.start.w,
-                    live.h - drag.start.h,
-                ),
+                Some(g) => crate::canvas::resized(&drag.start, g, dx, dy),
             };
             self.canvas_placed.borrow_mut().insert(drag.stem.clone(), landed);
         }
@@ -15429,6 +15615,9 @@ impl Shell {
     /// most one session tab: this shell has one transcript subscription,
     /// and a second session pane would be a caption over an empty log.
     fn split_tabs(&mut self, dragged: &str, host: &str, edge: DropEdge, cx: &mut Context<Self>) {
+        // Any path that consumes a drop clears the dashed hint, so it
+        // cannot outlive the drag that drew it.
+        self.tab_drop = None;
         let dragged_on_right = edge.after();
         if dragged == host {
             return;
@@ -15496,6 +15685,9 @@ impl Shell {
     /// or the active tab when the well is single), so the dropped tab
     /// lands where the pointer let go of it.
     fn drop_tab_on_well(&mut self, dragged: &str, edge: DropEdge, cx: &mut Context<Self>) {
+        // Any path that consumes a drop clears the dashed hint, so it
+        // cannot outlive the drag that drew it.
+        self.tab_drop = None;
         let snapshot = self.strip_snapshot(cx);
         let host = if let Some(s) = self.showing_split(&snapshot) {
             let outermost = if edge.after() {
@@ -16965,6 +17157,9 @@ impl Shell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                    if this.tab_drop.take().is_some() {
+                        cx.notify();
+                    }
                     if this.split_drag.take().is_some() {
                         this.persist_splits();
                         cx.notify();
@@ -16980,11 +17175,23 @@ impl Shell {
     }
 
     /// The divider after pane `ix`.
+    ///
+    /// **The seam is the gap AND the target, and since 2026-09-10 it says
+    /// so.** At four points it was neither — *"i still cant grab edges"* —
+    /// and at eight with nothing in it, it was slack. The handle keeps its
+    /// full width as the hit box and draws a hairline pill down the middle
+    /// of it under the pointer, so what lights is thinner than what
+    /// answers. `theme::SPLIT_HANDLE_W` carries the width's history.
     fn split_handle(&self, vertical: bool, ix: usize, cx: &Context<Self>) -> AnyElement {
+        let group = SharedString::from(format!("split-seam-{ix}"));
         div()
             .id(SharedString::from(format!("split-handle-{ix}")))
             .debug_selector(move || format!("split-handle-{ix}"))
+            .group(group.clone())
             .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
             .when(vertical, |d| {
                 d.h(px(theme::SPLIT_HANDLE_W)).w_full().cursor_row_resize()
             })
@@ -16992,6 +17199,18 @@ impl Shell {
                 d.w(px(theme::SPLIT_HANDLE_W)).h_full().cursor_col_resize()
             })
             .occlude()
+            .child(
+                div()
+                    .rounded_full()
+                    .map(|d| {
+                        if vertical {
+                            d.h(px(theme::HAIRLINE * 2.0)).w_full()
+                        } else {
+                            d.w(px(theme::HAIRLINE * 2.0)).h_full()
+                        }
+                    })
+                    .group_hover(group.clone(), |d| d.bg(theme::pane_rim_hover())),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
@@ -17562,9 +17781,26 @@ impl Shell {
         // the first pane takes it on its left, so both edges are reachable.
         let on_right = side != "left";
         let is_focused = snapshot.active.as_deref() == Some(tab_id);
+        // The pane's own drop edge, decided the same way the DROP decides
+        // it — one rule, so the dashed rectangle cannot promise a landing
+        // the drop does not honour.
+        let edge_of = move |this: &Self, window: &Window, cx: &App| match this
+            .well_drop_edge(window, cx)
+        {
+            vert @ (DropEdge::Top | DropEdge::Bottom) => vert,
+            _ if on_right => DropEdge::Right,
+            _ => DropEdge::Left,
+        };
+        let hint = self
+            .tab_drop
+            .as_ref()
+            .filter(|(host, _)| host == side)
+            .map(|(_, edge)| drop_hint(*edge));
+        let hint_side = side.to_string();
         div()
             .id(SharedString::from(format!("split-pane-{side}")))
             .debug_selector(move || format!("split-pane-{side}"))
+            .relative()
             .flex()
             .flex_col()
             // `flex_basis(0)` so the grow factors ARE the pane sizes.
@@ -17583,26 +17819,46 @@ impl Shell {
             // another WasResized. Same reason the rail's selection rim
             // is an inset shadow rather than a border.
             .border_1()
-            .border_color(pane_rim(is_focused))
+            // **The pane under the pointer says so, on all four sides.**
+            // Ruled on 2026-09-10: *"all four sides highlight … and are
+            // moveable/grab able."* Only the colour of a border that is
+            // already laid out moves, so nothing reflows and nothing is
+            // covered — *"a clean sleek border not going into the
+            // screen"*. The pane with the keyboard keeps the stronger ink:
+            // hover is the step below focus, not a competing one.
+            .hover_rim(
+                format!("pane-rim-{side}"),
+                pane_rim(is_focused),
+                if is_focused { theme::pane_focus_ring() } else { theme::pane_rim_hover() },
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                     this.activate_tab(&activate, cx);
                 }),
             )
+            // **Where it will land, while it is still in the air.** The
+            // listener only fires while a `TabDrag` is over this pane, so
+            // it is both the signal and the position.
+            .on_drag_move(cx.listener(move |this, _: &DragMoveEvent<TabDrag>, window, cx| {
+                let next = Some((hint_side.clone(), edge_of(this, window, cx)));
+                if this.tab_drop != next {
+                    this.tab_drop = next;
+                    cx.notify();
+                }
+            }))
             .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
                 cx.stop_propagation();
                 // The pane's own left/right is kept — it is more precise
                 // than the well's for a reorder inside a split — and the
                 // well is asked only for the AXIS, which no per-pane
                 // fraction can answer.
-                let edge = match this.well_drop_edge(window, cx) {
-                    vert @ (DropEdge::Top | DropEdge::Bottom) => vert,
-                    _ if on_right => DropEdge::Right,
-                    _ => DropEdge::Left,
-                };
+                let edge = edge_of(this, window, cx);
                 this.split_tabs(&drag.id, &drop_id, edge, cx);
             }))
+            // The handle that makes a pane movable — see `pane_grab_strip`.
+            // FIRST, so the header below paints over it and keeps its hits.
+            .children(self.pane_grab_strip(tab_id, side, &snapshot, cx))
             // D10 — the pane's own header goes with the rest of the chrome.
             // Read per TAB rather than from a flag passed down, because
             // that is the honest scope: in a split it is the fullscreen
@@ -17651,6 +17907,7 @@ impl Shell {
                     }))
                     .children(composer),
             )
+            .children(hint)
             .into_any_element()
     }
 
@@ -33348,6 +33605,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         rail_drag: None,
                         splits: load_splits(&window_key),
                         split_drag: None,
+                        tab_drop: None,
                         layout: layout_prefs.mode,
                         columns_scroll: Cell::new(layout_prefs.scroll),
                         columns_scroll_dirty: Cell::new(false),
