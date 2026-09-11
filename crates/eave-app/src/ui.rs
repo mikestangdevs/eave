@@ -2800,25 +2800,30 @@ fn page_globe(id: &str, resident: bool) -> AnyElement {
     .into_any_element()
 }
 
-fn tab_plate(tab: &strip::StripTab, id: &str) -> Option<gpui::Div> {
-    // `about:blank` wears NO mark AND NO slot (operator ruling 2026-08-25,
-    // amended same night): it is eave's own empty page, a globe there
-    // claims a site that does not exist, and an empty reserved slot put
-    // the label a column right of where the operator wanted it — the row
-    // is just its label, starting where New Tab's `+` starts. A page
-    // whose URL the engine has not reported yet gets the same absence:
-    // it IS about:blank until a navigation says otherwise, and drawing
-    // the globe for those first frames is the pop-in-and-vanish flash
-    // the operator saw.
+fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
+    // `about:blank` wears THE PRODUCT MARK (operator ruling 2026-09-11),
+    // and until that artwork existed it wore nothing at all.
+    //
+    // The 2026-08-25 ruling this replaces was two objections, not one: a
+    // globe there **claims a site that does not exist**, and an empty
+    // reserved slot put the label a column right of where the operator
+    // wanted it. The first still stands — the mark is not a globe and
+    // claims nothing; it says the page is eave's own. The second is what
+    // moved: a FILLED slot is Slice D3's rule rather than a hole, and the
+    // references' rails read as one list precisely because the marks line
+    // up. A New Chat row was the only page row breaking that column.
+    //
+    // A page whose URL the engine has not reported yet is blank by the
+    // same predicate, and that is the case this helps most: the old flash
+    // was a globe popping in and vanishing WHILE the label jumped a
+    // column. The slot is now occupied from the first frame to the last,
+    // so the only thing that changes on navigation is what is inside it.
     let blank = matches!(tab.kind, strip::TabKind::Page)
         && tab
             .url
             .as_deref()
             .is_none_or(|u| u.is_empty() || u == "about:blank");
-    if blank && !tab.incognito {
-        return None;
-    }
-    Some(div()
+    div()
         // `RAIL_MARK`, not `PROVIDER_CHIP` (Slice D3). The rail row's leading
         // slot is one size whatever fills it — a provider chip here, a
         // favicon from stage 2 — because the references' rails read as ONE
@@ -2834,16 +2839,33 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> Option<gpui::Div> {
         .child(match &tab.kind {
             // A page's mark is its favicon when Chromium has given us a
             // URL, and the globe when it has not — or when the image fails
-            // to decode. Session rows keep the provider chip. The globe
-            // selector stays on the fallback so an unloaded page still
-            // recedes under `tab-chip-unloaded-*`.
+            // to decode. A page that has been NOWHERE is neither: it wears
+            // eave's own mark. Session rows keep the provider chip. The
+            // globe selector stays on the fallback so an unloaded page
+            // still recedes under `tab-chip-unloaded-*`.
             strip::TabKind::Page => {
                 if tab.incognito {
+                    // Incognito outranks blank: which window you are in is
+                    // the stronger fact about a tab than where it has been.
                     icons::tagged_icon(
                         icons::INCOGNITO,
                         12.0,
                         theme::text(),
                         format!("tab-incognito-{id}"),
+                    )
+                    .into_any_element()
+                } else if blank {
+                    // Its OWN selector, never `tab-chip-*`. The globe
+                    // carries its state in its selector because this
+                    // harness reports geometry and never colour — and one
+                    // name covering both the mark and the globe would let
+                    // a New Chat row grow a globe back with every test
+                    // still green.
+                    icons::tagged_icon(
+                        icons::EAVE_MARK,
+                        12.0,
+                        theme::text_secondary_on_wash(),
+                        format!("tab-eave-mark-{id}"),
                     )
                     .into_any_element()
                 } else {
@@ -2900,7 +2922,7 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> Option<gpui::Div> {
                         .into_any_element(),
                 }
             }
-        }))
+        })
 }
 
 fn provider_identity(provider: &str) -> (String, String) {
@@ -22426,9 +22448,9 @@ impl Shell {
             // The plate is the site mark — a favicon when Chromium has
             // given us one, the globe otherwise. Compact chips keep it:
             // "always display favicons" is the identity of a page tab,
-            // split or not. `about:blank` has no plate AT ALL (see
-            // `tab_plate`), so its label starts on New Tab's `+` column.
-            .children(tab_plate(tab, &id))
+            // split or not. `about:blank` wears the product mark (see
+            // `tab_plate`), so EVERY page row's label starts on one column.
+            .child(tab_plate(tab, &id))
             // C4 — between the site mark and the title, where Chrome, Arc
             // and Safari all put it: the plate says WHICH site, the speaker
             // says what it is doing, and the title is the thing that gives

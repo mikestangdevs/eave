@@ -13170,13 +13170,19 @@ fn page_rows_and_chat_rows_share_one_sidebar(cx: &mut TestAppContext) {
     set_resident_for_test(None);
 }
 
-/// A page tab that has not been anywhere wears no favicon, no unloaded
-/// mark and no plate — and its label starts where New Tab's `+` does,
-/// because nothing is reserved for a mark it does not wear (Slice T1).
-/// ID2b′: back on the rail's PAGES rows, where the pill's `+` column is
-/// the reference again.
+/// A page tab that has not been anywhere wears **eave's own mark** — and
+/// so its label starts on the same column as every other page row's.
+///
+/// This test replaces `a_blank_page_tab_wears_no_mark` and is the same
+/// test inverted, because the ruling under it moved (2026-09-11). What it
+/// still guards is the half that did NOT move: a blank tab must never
+/// wear a favicon or a globe, which would claim a site that does not
+/// exist, and must never wear the unloaded treatment, which would claim
+/// a page was thrown away. The mark carries its own selector for exactly
+/// that reason — `tab-chip-*` on a New Chat row would let the globe come
+/// back with every assertion below still green.
 #[gpui::test]
-fn a_blank_page_tab_wears_no_mark(cx: &mut TestAppContext) {
+fn a_blank_page_tab_wears_the_product_mark(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     rail_with_selected(&h, vcx, vec![session("aaaa1111")], "aaaa1111");
     set_resident_for_test(Some(&["p1", "p2", "p3"]));
@@ -13190,6 +13196,12 @@ fn a_blank_page_tab_wears_no_mark(cx: &mut TestAppContext) {
         ],
         Some("aaaa1111"),
     );
+    // `p1` is `about:blank`; `p3` has no url reported yet and is blank by
+    // the same predicate — the case the mark helps most, because the slot
+    // is now occupied from the first frame rather than popping in.
+    for sel in ["tab-eave-mark-p1", "tab-eave-mark-p3"] {
+        assert!(shown(vcx, sel), "{sel} — a blank tab lost the product mark");
+    }
     for sel in [
         "tab-chip-p1",
         "tab-chip-unloaded-p1",
@@ -13197,23 +13209,33 @@ fn a_blank_page_tab_wears_no_mark(cx: &mut TestAppContext) {
         "tab-chip-p3",
         "tab-chip-unloaded-p3",
     ] {
-        assert!(!shown(vcx, sel), "{sel} — a blank tab grew a mark back");
+        assert!(
+            !shown(vcx, sel),
+            "{sel} — a blank tab grew a globe or a favicon, which claims a site"
+        );
     }
     assert!(
         shown(vcx, "tab-chip-p2") || shown(vcx, "tab-favicon-p2"),
         "the rule leaked onto a real page"
     );
+    assert!(
+        !shown(vcx, "tab-eave-mark-p2"),
+        "a real page wears the product mark instead of its own"
+    );
+    // **The marks line up, which is the whole reason this changed.** The
+    // blank row's label sits where a marked row's does, and no longer on
+    // New Tab's `+` column.
     let x = |vcx: &mut VisualTestContext, sel: &'static str| {
         vcx.debug_bounds(sel).expect(sel).origin.x
     };
     assert_eq!(
         x(vcx, "tab-label-p1"),
-        x(vcx, "tab-new-glyph"),
-        "the blank label does not start on New Tab's + column"
+        x(vcx, "tab-label-p2"),
+        "a New Chat row's label is off the column every other page row uses"
     );
     assert!(
-        x(vcx, "tab-label-p2") > x(vcx, "tab-label-p1"),
-        "the marked row's label lost its column"
+        x(vcx, "tab-label-p1") > x(vcx, "tab-new-glyph"),
+        "the blank label is still on the pill's + column — the slot is empty"
     );
     set_resident_for_test(None);
 }
