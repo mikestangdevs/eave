@@ -151,6 +151,14 @@ pub const RATIO_MIN: f32 = 0.20;
 /// third and everything already there keeps its proportions inside the
 /// rest. A pane docked against ANOTHER pane takes half of that pane
 /// instead, which touches nothing else at all.
+///
+/// **A CEILING, not the share.** [`Node::insert_at_edge`] never gives the
+/// newcomer more than an equal share of the axis it joins, so this binds
+/// for the second and third column — §8's scenario, where a third of the
+/// well IS an equal third — and stops binding after that. Fixed at 0.32 a
+/// fifth column took a third of the well and squeezed four panes into the
+/// rest, which is how *"i should be able to add more than that"* turns
+/// into an arrangement nobody wants.
 pub const EDGE_SHARE: f32 = 0.32;
 
 /// How near the well's outer boundary the pointer has to be for the drop
@@ -160,6 +168,32 @@ pub const EDGE_SHARE: f32 = 0.32;
 /// a drag obviously aimed past everything is not stolen by whichever pane
 /// happens to be in the way.
 pub const EDGE_ZONE: f32 = 26.0;
+
+/// The smallest a pane may be laid out and still be a pane.
+///
+/// **This is what bounds an arrangement now — not a count.** The cap was
+/// `SPLIT_MAX = 4`, and four was the arithmetic of a FLAT row: four panes
+/// at [`RATIO_MIN`] fill 0.8 of one axis and a fifth does not fit. The
+/// tree ended that — panes nest, so a 3 x 3 grid is nine panes at a third
+/// of each axis and the count says nothing about whether they fit. The
+/// operator hit the old cap with four panes on a wide window and said so:
+/// *"i can only fit 4 items on a screen. i should be able to add more
+/// than that."*
+///
+/// So the limit is the one that was always meant: a pane has to be big
+/// enough to be one. Below this a pane is a sliver — its header controls
+/// no longer fit and a page inside it is unreadable — and the drop that
+/// would make it is refused BEFORE the insertion line offers it (§16
+/// puts validity in the hierarchy, ahead of drawing an indicator).
+///
+/// Deliberately low. It is a floor under nonsense, not a layout opinion —
+/// the operator decides how tight their workspace is, and the only thing
+/// this refuses is a pane that has stopped being one. On a 1000 pt well
+/// it still allows seven columns, well past anything four ever did.
+pub const PANE_MIN_W: f32 = 120.0;
+/// The vertical half of [`PANE_MIN_W`]. Smaller, because a pane runs out
+/// of header before it runs out of page.
+pub const PANE_MIN_H: f32 = 90.0;
 
 /// How far the pointer must travel before the insertion line will move to
 /// a different target. §10: *"right → bottom → right → bottom while the
@@ -312,13 +346,22 @@ impl Node {
     /// there. §8's far-right drop, and the reason the scenario ends in
     /// three equal columns rather than C nested beside B.
     pub fn insert_at_edge(&mut self, id: &str, edge: DropEdge, share: f32) {
-        let share = share.clamp(RATIO_MIN, 1.0 - RATIO_MIN);
+        // The low bound is a sliver guard, not [`RATIO_MIN`]: that is the
+        // floor a DIVIDER stops at, and holding an equal share up to it
+        // would put the newcomer above its siblings from the fifth pane on.
+        let share = if share.is_finite() {
+            share.clamp(0.05, 1.0 - RATIO_MIN)
+        } else {
+            EDGE_SHARE
+        };
         match self {
             Node::Split {
                 vertical,
                 kids,
                 shares,
             } if *vertical == edge.vertical() => {
+                // **Never more than an equal share** — see [`EDGE_SHARE`].
+                let share = share.min(1.0 / (kids.len() + 1) as f32);
                 let scale = 1.0 - share;
                 shares.iter_mut().for_each(|s| *s *= scale);
                 let at = if edge.after() { kids.len() } else { 0 };
@@ -406,6 +449,23 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Is every pane in this arrangement still big enough to use?
+    ///
+    /// The replacement for the old four-pane cap — see [`PANE_MIN_W`].
+    /// Laid out rather than reasoned about, so it answers for a nested
+    /// tree exactly as it does for a row, and it is the same `rects` the
+    /// paint uses: a pane that passes here is one that will be drawn at
+    /// the size that passed.
+    pub fn fits(&self, area: Rect, gap: f32) -> bool {
+        // A hair of tolerance, because the shares are f32 and the last
+        // slot takes a remainder: a pane exactly at the floor must not
+        // be refused by a rounding error.
+        const EPS: f32 = 0.5;
+        self.rects(area, gap)
+            .iter()
+            .all(|(_, r)| r.w >= PANE_MIN_W - EPS && r.h >= PANE_MIN_H - EPS)
     }
 
     /// Every divider, with the parent extent its share arithmetic is
@@ -797,6 +857,37 @@ mod tests {
             (shares[0] / shares[1] - 0.4 / 0.6).abs() < 1e-3,
             "a and b kept their proportions: {shares:?}"
         );
+    }
+
+    /// The operator's *"i can only fit 4 items on a screen. i should be
+    /// able to add more than that"*, as arithmetic: a fifth column takes
+    /// a FIFTH, not the third §8's scenario gives the second one, and
+    /// what refuses an arrangement is the well's width rather than a
+    /// count of panes.
+    #[test]
+    fn a_fifth_column_takes_a_fifth_and_the_well_is_what_says_no() {
+        let mut g = Node::pair("a", "b", false);
+        g.insert_at_edge("c", DropEdge::Right, EDGE_SHARE);
+        g.insert_at_edge("d", DropEdge::Right, EDGE_SHARE);
+        assert_eq!(g.sketch(), "(a | b | c | d)");
+        g.insert_at_edge("e", DropEdge::Right, EDGE_SHARE);
+        let Node::Split { shares, .. } = &g else { unreachable!() };
+        assert!(
+            (shares[4] - 0.2).abs() < 1e-5,
+            "a fifth column took more than a fifth: {shares:?}"
+        );
+        assert!((shares.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+
+        // Five columns is a layout on a wide well and a refusal on a
+        // narrow one. The COUNT is the same in both.
+        assert!(g.fits(Rect::new(0., 0., 1600., 900.), 8.0));
+        assert!(g.fits(Rect::new(0., 0., 900., 600.), 8.0));
+        assert!(!g.fits(Rect::new(0., 0., 420., 600.), 8.0));
+        // ...and so is the height: a stack runs out of room its own way.
+        let mut tall = Node::pair("a", "b", true);
+        tall.insert_at_edge("c", DropEdge::Bottom, EDGE_SHARE);
+        assert!(tall.fits(Rect::new(0., 0., 900., 600.), 8.0));
+        assert!(!tall.fits(Rect::new(0., 0., 900., 200.), 8.0));
     }
 
     #[test]

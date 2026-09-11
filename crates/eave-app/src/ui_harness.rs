@@ -18609,7 +18609,7 @@ fn the_far_right_of_the_workspace_is_a_third_column(cx: &mut TestAppContext) {
     let target = h
         .window
         .read_with(vcx, |shell, cx| {
-            shell.dock_at(well.right() - 4.0, well.y + well.h * 0.75, cx)
+            shell.dock_at(well.right() - 4.0, well.y + well.h * 0.75, "p3", cx)
         })
         .unwrap()
         .map(|d| d.target);
@@ -19411,22 +19411,96 @@ fn a_page_tab_paints_its_favicon_when_the_bytes_are_in(cx: &mut TestAppContext) 
     crate::web::set_favicon_for_test("p1", None);
 }
 
-/// Slice SP1 — a split stacks to four panes and refuses a fifth. Each
-/// drop lands beside the pane it was dropped on; the divider count is the
-/// pane count less one; the fifth tab stays a row of its own under the
-/// pill and the pill keeps four chips.
+/// **A New Chat pane draws a New Chat**, 2026-09-11: *"new chat is not
+/// showing anything?"* — three blank panes beside a search result were
+/// three black rectangles.
+///
+/// `blank_page` was written `&& showing_split.is_none()` on the SP1-era
+/// reasoning that the launcher is a well-sized overlay and would cover an
+/// arrangement the operator had just made. It is the pane's content here
+/// rather than an overlay over the well, so it covers nothing — and what
+/// the guard actually did was leave the pane with no page (a blank tab
+/// mounts none), no transcript, no composer and no cluster.
+///
+/// The pane with the keyboard gets the real launcher, because it holds
+/// the one composer; any other blank pane gets the resting look, which is
+/// CL1's rule for an unselected blank column, one surface over.
 #[gpui::test]
-fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
+fn a_blank_pane_in_a_split_is_a_new_chat(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
     let tabs = || {
-        (1..=5)
-            .map(|i| {
-                page_tab(
-                    ["p1", "p2", "p3", "p4", "p5"][i - 1],
-                    Some("https://a.test/"),
-                    Some("A"),
-                )
-            })
+        let mut blank = page_tab("p2", Some("about:blank"), None);
+        blank.history_len = 1;
+        let mut second = page_tab("p3", Some("about:blank"), None);
+        second.history_len = 1;
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            blank,
+            second,
+        ]
+    };
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    h.window
+        .update(vcx, |shell, _, cx| {
+            shell.split_tabs("p2", "p1", crate::ui::DropEdge::Right, cx);
+            shell.split_tabs("p3", "p2", crate::ui::DropEdge::Bottom, cx);
+        })
+        .unwrap();
+
+    // The blank pane that has the keyboard is the launcher, composer and
+    // all — and no `page-absence` note underneath it, which is the two
+    // answers to one question the unsplit path already refuses.
+    strip_tabs(&h, vcx, tabs(), Some("p2"));
+    assert!(
+        shown(vcx, "launcher"),
+        "the blank pane with the keyboard drew nothing at all"
+    );
+    assert!(shown(vcx, "composer-hint"), "and nothing to type into");
+    // No "starting the page" note under it — that would be two answers to
+    // one question, the rule the unsplit path already keeps. The only
+    // absence on screen belongs to the PAGE pane, which has no Chromium
+    // in a test build; `page-absence` is one selector for every pane, so
+    // this is asked by where it is rather than whether it exists.
+    let left = vcx.debug_bounds("split-pane-left").expect("left pane");
+    let absence = vcx.debug_bounds("page-absence").expect("page-absence");
+    assert!(
+        absence.origin.x >= left.origin.x - px(1.)
+            && absence.origin.x + absence.size.width <= left.origin.x + left.size.width + px(1.),
+        "a blank pane drew the page-starting note: absence {absence:?} left {left:?}"
+    );
+    // The OTHER blank pane draws the cluster's look, not a second
+    // composer: there is one, and it belongs to the focused pane.
+    assert!(
+        shown(vcx, "column-new-chat"),
+        "the unfocused blank pane is still a black rectangle"
+    );
+    // The page pane is untouched by any of it.
+    assert!(shown(vcx, "split-pane-left"));
+
+    // Focus back on the page: now BOTH blank panes rest, and neither is
+    // empty.
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    assert!(!shown(vcx, "launcher"), "the launcher followed no pane");
+    assert!(shown(vcx, "column-new-chat"));
+}
+
+/// Slice SP1, re-ruled 2026-09-11 — **a split stacks as far as the well
+/// has room for, and the fifth pane is not special.** Each drop lands
+/// beside the pane it was dropped on; the divider count is the pane count
+/// less one; and what finally refuses a pane is the width of the window,
+/// which is why this fixture asks the window rather than a number.
+///
+/// It used to assert the fifth was refused, on a 1080 pt window where six
+/// columns fit comfortably. The operator hit that on a wide screen: *"i
+/// can only fit 4 items on a screen. i should be able to add more than
+/// that."*
+#[gpui::test]
+fn a_split_stacks_as_far_as_the_well_has_room(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    const IDS: [&str; 9] = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"];
+    let tabs = || {
+        IDS.iter()
+            .map(|id| page_tab(id, Some("https://a.test/"), Some("A")))
             .collect::<Vec<_>>()
     };
     strip_tabs(&h, vcx, tabs(), Some("p1"));
@@ -19478,25 +19552,77 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
         r.size.width
     );
 
-    // The fifth is refused, on every door: the drop, the well, the menu.
-    h.window
-        .update(vcx, |shell, _, cx| {
-            shell.split_tabs("p5", "p2", crate::ui::DropEdge::Right, cx);
-            shell.drop_tab_on_well("p5", crate::ui::DropEdge::Right, cx);
+    // **The fifth is not refused any more**, and neither is the sixth on
+    // a window this wide. Keep dropping columns at the workspace edge
+    // until the arrangement says no.
+    let mut count = 4usize;
+    for id in IDS.iter().skip(4) {
+        h.window
+            .update(vcx, |shell, _, cx| {
+                shell.drop_tab_on_well(id, crate::ui::DropEdge::Right, cx);
+            })
+            .unwrap();
+        strip_tabs(&h, vcx, tabs(), Some(id));
+        let n = h
+            .window
+            .update(vcx, |shell, _, _| shell.splits[0].pane_count())
+            .unwrap();
+        if n == count {
+            break;
+        }
+        count = n;
+    }
+    assert!(
+        count >= 5,
+        "the old four-pane cap is still in force: {count} panes"
+    );
+
+    // Back onto a member, so the well is showing the arrangement again
+    // rather than the refused tab on its own.
+    strip_tabs(&h, vcx, tabs(), Some("p1"));
+    vcx.run_until_parked();
+
+    // And it said no for the honest reason: one more column would be
+    // narrower than a pane is allowed to be. Asked of the well that was
+    // actually painted, so this holds at any window size.
+    let well = h
+        .window
+        .read_with(vcx, |shell, _| shell.well_rect.get())
+        .unwrap()
+        .expect("the well painted no rectangle");
+    let last = *IDS.last().unwrap();
+    let seams = theme::SPLIT_HANDLE_W * count as f32;
+    assert!(
+        (well.w - seams) / ((count + 1) as f32) < crate::dock::PANE_MIN_W,
+        "{count} columns stopped with room for another in {}pt",
+        well.w
+    );
+
+    // §16 ends *"if the drop is invalid, show no indicator"*, so the
+    // preview asks the same question the drop does: with the well full,
+    // a pointer hard against its right edge draws NO line rather than one
+    // that promises a column the drop would decline.
+    let refused_target = h
+        .window
+        .read_with(vcx, |shell, cx| {
+            shell.dock_at(well.right() - 4.0, well.y + well.h * 0.5, last, cx)
         })
         .unwrap();
-    strip_tabs(&h, vcx, tabs(), Some("p4"));
-    let panes = h
-        .window
-        .update(vcx, |shell, _, _| shell.splits[0].panes())
-        .unwrap();
-    assert_eq!(panes, ["p4", "p1", "p2", "p3"], "a fifth pane got in");
-    let pill = vcx.debug_bounds("split-tabs").expect("pill");
-    let p5 = vcx.debug_bounds("tab-p5").expect("tab-p5");
     assert!(
-        p5.origin.y > pill.origin.y + pill.size.height - px(1.),
-        "the refused tab must stay a row under the pill: pill {pill:?} p5 {p5:?}"
+        refused_target.is_none(),
+        "the insertion line offered a landing the drop refuses: {refused_target:?}"
     );
+
+    // The refused tab stays a row of its own under the pill.
+    let pill = vcx.debug_bounds("split-tabs").expect("pill");
+    let refused = vcx.debug_bounds("tab-p9").expect("tab-p9");
+    assert!(
+        refused.origin.y > pill.origin.y + pill.size.height - px(1.),
+        "the refused tab must stay a row under the pill: pill {pill:?} {refused:?}"
+    );
+
+    // The menu reads the same predicate as the drop: with the well full
+    // it refuses too, and it refuses by measuring rather than counting.
     open_tab_strip_menu(&h, vcx, "p2");
     click(vcx, "tab-menu-member");
     vcx.run_until_parked();
@@ -19508,9 +19634,9 @@ fn a_split_stacks_to_four_panes_and_refuses_a_fifth(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let panes = h
         .window
-        .update(vcx, |shell, _, _| shell.splits[0].panes())
+        .update(vcx, |shell, _, _| shell.splits[0].pane_count())
         .unwrap();
-    assert_eq!(panes.len(), 4, "the menu added a fifth pane: {panes:?}");
+    assert_eq!(panes, count, "the menu got past the well's own floor");
 }
 
 /// Slice SP1 — two splits coexist, each keeps its pill, and the well
