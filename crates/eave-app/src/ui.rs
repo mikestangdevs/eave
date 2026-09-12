@@ -359,14 +359,29 @@ enum FeedEvent {
 /// `a_menlo_cell_is_the_width_this_grid_assumes` measures the real font and
 /// fails if the assumption stops holding.
 const TERM_ADVANCE_EM: f32 = 0.60;
+/// The cell Menlo is laid out at — 6.90 px at today's `CODE_SIZE`. Nothing
+/// divides by this: the grid uses [`TERM_CELL_PAINTED`], which is this
+/// rounded up. It is named because it is the fact the panel rests on, and
+/// because the rounding is only legible beside the number being rounded.
+const TERM_CELL_W: f32 = theme::CODE_SIZE * TERM_ADVANCE_EM;
+/// The cell the panel actually PAINTS, and the only width the grid may
+/// divide by.
+///
 /// **Rounded UP, deliberately.** gpui rounds a glyph advance to whole
-/// pixels when it paints, so Menlo's 6.9 px cell occupies 7. Computing the
-/// pty's column count from the unrounded value promises the TUI more
+/// pixels when it paints, so Menlo's 6.90 px cell occupies 7. Computing
+/// the pty's column count from the unrounded value promises the TUI more
 /// columns than the panel can draw, and the overflow is invisible — the
 /// last column simply falls off the right edge. Rounding up under-counts
 /// by less than a column and can only leave a sliver of unused panel.
-const TERM_CELL_W: f32 = theme::CODE_SIZE * TERM_ADVANCE_EM;
-const TERM_CELL_PAINTED: f32 = 7.0;
+///
+/// **Derived rather than written down**, which is the whole of this
+/// change: it was a literal `7.0` and `TERM_CELL_W` had no reader at all,
+/// so `theme::CODE_SIZE` could move and the grid would go on dividing by
+/// the old size's cell — with `a_menlo_cell_is_the_width_this_grid_assumes`
+/// still green, because it measured the font against a formula the grid
+/// was not using. A constant that no code reads is not a statement about
+/// the code.
+const TERM_CELL_PAINTED: f32 = TERM_CELL_W.ceil();
 
 /// Where the terminal panel last painted, in pixels. Written by the
 /// panel's canvas, read when a handover is opened or the window resizes.

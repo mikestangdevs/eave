@@ -25027,12 +25027,19 @@ fn a_closed_tab_does_not_hand_its_hang_to_the_next_one(cx: &mut TestAppContext) 
 
 /// **The terminal grid is arithmetic, and this is what licenses that.**
 ///
-/// `TERM_CELL_W` is `CODE_SIZE × 0.60` because `theme.rs` states Menlo's
-/// advance is a fixed 0.60 em. The panel tells the pty a column count
-/// computed from that number and then paints cells at it, so if the real
-/// font disagrees the last column falls off the edge and every box-drawing
-/// character in every TUI is a fraction out. Measured against the real
-/// macOS text system rather than trusted from the comment it came from.
+/// `TERM_CELL_W` is `CODE_SIZE × TERM_ADVANCE_EM` because `theme.rs` states
+/// Menlo's advance is a fixed 0.60 em. The panel tells the pty a column
+/// count computed from that number and then paints cells at it, so if the
+/// real font disagrees the last column falls off the edge and every
+/// box-drawing character in every TUI is a fraction out. Measured against
+/// the real macOS text system rather than trusted from the comment it came
+/// from.
+///
+/// **It names the constants rather than re-spelling their formula.** The
+/// first version wrote `CODE_SIZE * 0.60` out longhand, which measured the
+/// font against a number the grid did not use — `TERM_CELL_PAINTED` was a
+/// literal `7.0` — so the one move this test exists to catch, changing
+/// `theme::CODE_SIZE`, left it green while every TUI came apart.
 #[test]
 fn a_menlo_cell_is_the_width_this_grid_assumes() {
     // Twenty characters, so a per-glyph rounding error shows up twenty
@@ -25040,14 +25047,25 @@ fn a_menlo_cell_is_the_width_this_grid_assumes() {
     let n = 20;
     let sample = "M".repeat(n);
     let measured = f32::from(real_text_width(&sample, theme::MONO, theme::CODE_SIZE)) / n as f32;
-    let assumed = theme::CODE_SIZE * 0.60;
     assert!(
-        (measured - assumed).abs() < 0.05,
+        (measured - TERM_CELL_W).abs() < 0.05,
         "Menlo's advance at {}px measured {measured} and the grid assumes \
-         {assumed} — the terminal's columns would drift {} px across an \
+         {} — the terminal's columns would drift {} px across an \
          80-column screen",
         theme::CODE_SIZE,
-        (measured - assumed).abs() * 80.,
+        TERM_CELL_W,
+        (measured - TERM_CELL_W).abs() * 80.,
+    );
+    // And the width the grid divides by is that one, rounded the way gpui
+    // rounds it when it paints. A painted cell NARROWER than the advance
+    // is the invisible failure: the pty is promised columns the panel
+    // cannot draw and the rightmost one falls off the edge.
+    assert_eq!(
+        TERM_CELL_PAINTED,
+        measured.ceil(),
+        "the panel paints {TERM_CELL_PAINTED} px cells where the measured \
+         advance {measured} rounds up to {}",
+        measured.ceil(),
     );
 }
 
