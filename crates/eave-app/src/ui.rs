@@ -4315,6 +4315,51 @@ fn unseen_finish(info: &SessionInfo, seen: Option<u64>) -> bool {
     }
 }
 
+/// A session parked on the operator, that they have not looked at since it
+/// parked (Slice NT4).
+///
+/// **Deliberately NOT folded into [`unseen_finish`], which refuses
+/// `awaiting_approval` and is right to.** That function answers a RAIL
+/// question — a row draws one word and the stronger fact wins, so a row
+/// that is asking says `waiting on you` and never `finished`. This one
+/// answers a BANNER question, and a banner is not a row: it is one event
+/// reaching a person who is in another application. Two true things
+/// arriving as one word means choosing which to suppress; two predicates
+/// means each is announced once, on its own clock.
+///
+/// It is also the more urgent of the two. A finish means the work is done
+/// and waiting; an ask means the work is STOPPED and will stay stopped for
+/// exactly as long as nobody looks. Announcing only finishes told the
+/// operator about the case that costs nothing and stayed silent about the
+/// one that costs everything.
+fn unseen_ask(info: &SessionInfo, seen: Option<u64>) -> bool {
+    if info.state != "awaiting_approval" {
+        return false;
+    }
+    match (info.last_activity_ms, seen) {
+        (Some(now), Some(then)) => now > then,
+        // Same rule as `unseen_finish`: no record of a visit is "we do not
+        // know", never "you have not looked".
+        _ => false,
+    }
+}
+
+/// Which of the two things a banner can be about (Slice NT4).
+///
+/// **The dedup map is keyed on the session AND this.** Keying on the
+/// session alone rests on "a session cannot both have finished and be
+/// asking", which is true of `state` at one instant and false across time:
+/// a session that asks, is answered, runs and finishes has produced two
+/// separate pieces of news, and one entry cannot hold both marks. Dray
+/// records paying for exactly this — its notices are keyed on session and
+/// kind for the same reason, found when a CI report arrived while an agent
+/// stood waiting on a permission question.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Announce {
+    Finish,
+    Ask,
+}
+
 #[derive(Clone)]
 struct RailGroup {
     /// The root this header speaks for. The group's IDENTITY — collapse is
@@ -8721,9 +8766,10 @@ struct Shell {
     /// `unseen_finish` stays true for as long as the row stays unread.
     /// A banner keyed off it alone would fire again on every snapshot
     /// until the operator came back, which is a notification that punishes
-    /// you for being away. One entry per session, holding the finish that
-    /// was already announced.
-    announced: RefCell<HashMap<String, u64>>,
+    /// you for being away. One entry per session and KIND, holding the
+    /// `last_activity_ms` that was already announced — see [`Announce`]
+    /// for why the kind is part of the key and not a detail of the value.
+    announced: RefCell<HashMap<(String, Announce), u64>>,
     /// Slice NT1 — is this window the one the operator is in front of?
     ///
     /// Written by `observe_window_activation` in BOTH directions, which is
@@ -10595,7 +10641,14 @@ impl Shell {
     /// banner on that path is not a notification, it is a fault. The
     /// observer fires once per engine snapshot, which is the rate a finish
     /// actually happens at.
-    fn announce_finishes(&self, cx: &App) {
+    ///
+    /// **Named for the decision, not for one of its two answers** (Slice
+    /// NT4). It was `announce_finishes` while a finish was the only thing
+    /// it could say; it now also announces a session parked on the
+    /// operator, which is the more urgent of the two — a finish means the
+    /// work is done, an ask means the work is stopped until somebody
+    /// looks. See [`Announce`] and [`unseen_ask`].
+    fn announce_attention(&self, cx: &App) {
         let all = &self.sessions.read(cx).sessions;
         // **`EAVE_NC_TRACE=<path>` writes this decision out, and it is a rig
         // facility rather than debris.** A banner is invisible to every test
@@ -10620,14 +10673,21 @@ impl Shell {
                 );
                 for s in all {
                     let seen = self.rail_seen.borrow().get(&s.session_id).copied();
+                    // **BOTH predicates, and NT4 is why.** This line
+                    // printed `unseen_finish` alone while the code decided
+                    // on two, so during a live ask it read `unseen=false`
+                    // beside a banner that was correctly firing. A trace
+                    // that shows half a decision is worse than no trace:
+                    // it answers the question a walk is asking, wrongly.
                     let _ = writeln!(
                         f,
-                        "  id={} state={} last_activity={:?} seen={:?} unseen={}",
+                        "  id={} state={} last_activity={:?} seen={:?} finish={} ask={}",
                         &s.session_id[..8.min(s.session_id.len())],
                         s.state,
                         s.last_activity_ms,
                         seen,
-                        unseen_finish(s, seen)
+                        unseen_finish(s, seen),
+                        unseen_ask(s, seen)
                     );
                 }
             }
@@ -10636,7 +10696,7 @@ impl Shell {
         // A session the engine has stopped reporting cannot finish again.
         // Pruned here for the same reason `rail_seen` is pruned in the
         // rail: this is a place that sees the whole list.
-        announced.retain(|id, _| all.iter().any(|s| &s.session_id == id));
+        announced.retain(|(id, _), _| all.iter().any(|s| &s.session_id == id));
         // Everything below this line is the banner, and the banner is only
         // for an operator who is not looking. The bookkeeping above still
         // runs while the window is active so the map cannot grow stale.
@@ -10648,20 +10708,29 @@ impl Shell {
             let Some(mark) = info.last_activity_ms else {
                 continue;
             };
-            if !unseen_finish(info, seen.get(&info.session_id).copied()) {
+            let was = seen.get(&info.session_id).copied();
+            // Two predicates, and at most one of them answers for a given
+            // snapshot — `state` is one word. They are asked in urgency
+            // order for the reader of this loop, not because they can
+            // both be true.
+            let kind = if unseen_ask(info, was) {
+                Announce::Ask
+            } else if unseen_finish(info, was) {
+                Announce::Finish
+            } else {
                 continue;
-            }
-            // ONE banner per finish. `unseen_finish` stays true until the
-            // operator looks, and snapshots keep arriving, so without this
-            // a session that ended while you were at lunch would announce
-            // itself for the whole lunch.
+            };
+            // ONE banner per event. The `unseen_*` predicates stay true
+            // until the operator looks, and snapshots keep arriving, so
+            // without this a session that ended while you were at lunch
+            // would announce itself for the whole lunch.
             if announced
-                .get(&info.session_id)
+                .get(&(info.session_id.clone(), kind))
                 .is_some_and(|&already| already >= mark)
             {
                 continue;
             }
-            announced.insert(info.session_id.clone(), mark);
+            announced.insert((info.session_id.clone(), kind), mark);
             let (name, _) = self.row_name(info);
             let where_ = info
                 .project_root
@@ -10669,21 +10738,53 @@ impl Shell {
                 .or(info.checkout_root.as_deref())
                 .and_then(|p| p.rsplit('/').next())
                 .unwrap_or_default();
-            // The state word verbatim, never a cheerier one: a session that
-            // stopped because it failed must not be reported as "finished".
-            let what = match info.state.as_str() {
-                "failed" => "failed",
-                "unresponsive" => "stopped responding",
-                _ => "finished",
+            let what = match kind {
+                // **A COUNT and never the tool.** This text is built from
+                // a `watch` snapshot, so it inherits watch's isolation
+                // invariant (spec 05 §Watch): the channel may say that a
+                // session is waiting on the operator and how many times,
+                // and may never say which tool or which path, because
+                // those are transcript content. `pending_approvals` is a
+                // count for exactly this reason and `AwaitingApproval`'s
+                // `tool` field does not cross. A banner is the easiest
+                // place in the app to leak one session's transcript onto
+                // another session's channel, because it reads like prose
+                // rather than like a wire frame.
+                Announce::Ask => match info.pending_approvals {
+                    0 | 1 => "waiting on you".to_string(),
+                    n => format!("waiting on you · {n} questions"),
+                },
+                // The state word verbatim, never a cheerier one: a session
+                // that stopped because it failed must not be reported as
+                // "finished".
+                Announce::Finish => match info.state.as_str() {
+                    "failed" => "failed".to_string(),
+                    "unresponsive" => "stopped responding".to_string(),
+                    _ => "finished".to_string(),
+                },
             };
             crate::os_notify::post(
                 where_,
                 &name,
-                what,
-                // Keyed on the SESSION, not the finish, so a session that
-                // finishes twice replaces its own banner instead of
-                // stacking two rows in Notification Center.
+                &what,
+                // Keyed on the SESSION and not on the kind, which is the
+                // opposite of `announced` above and deliberate. That map
+                // answers "has this been said"; this string answers "what
+                // is on screen about this session", and the answer should
+                // be one row carrying the LATEST news. A session that asks
+                // and is then answered and finishes should replace its own
+                // banner, not leave a stale question sitting above the
+                // answer to it.
                 format!("eave:session:{}", info.session_id),
+                // Sound by kind. A question left unanswered holds the
+                // session open indefinitely; a finish is news that keeps.
+                // Dray's rule, and its trap is worth carrying with it: an
+                // EMPTY sound name is not silence, it is the name that
+                // resolves to the system default.
+                match kind {
+                    Announce::Ask => crate::os_notify::Sound::Ask,
+                    Announce::Finish => crate::os_notify::Sound::Default,
+                },
             );
         }
     }
@@ -35083,7 +35184,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // computes the same unseen set on every frame —
                         // this observer fires once per engine snapshot,
                         // which is the rate a session actually finishes at.
-                        shell.announce_finishes(cx);
+                        shell.announce_attention(cx);
                         // Slice AG1 #10. BOTH observers, because the gate
                         // reads one fact from each entity: the rail snapshot
                         // carries the provider, the transcript carries whose
@@ -36748,6 +36849,74 @@ mod tests {
         s.state = "done".into();
         s.last_activity_ms = None;
         assert!(!unseen_finish(&s, Some(100)));
+    }
+
+    /// **The banner's other half, and the one that costs something to miss**
+    /// (Slice NT4).
+    ///
+    /// `unseen_finish` refuses `awaiting_approval` because a RAIL ROW draws
+    /// one word and the stronger fact wins. That left the banner — a
+    /// different surface, answering a different question — announcing only
+    /// the case where the work is DONE and staying silent on the case where
+    /// the work is STOPPED. This pins both halves of the split: the ask
+    /// predicate fires exactly where the finish predicate refuses, and
+    /// neither one answers for the other.
+    #[test]
+    fn a_session_parked_on_the_operator_is_its_own_announcement() {
+        let mut s = SessionInfo {
+            session_id: "s".into(),
+            title: None,
+            archived: false,
+            provider: "claude-code".into(),
+            model: None,
+            effort: None,
+            fast: false,
+            cwd: "/tmp".into(),
+            created_ts_ms: 0,
+            last_activity_ms: Some(200),
+            state: "awaiting_approval".into(),
+            live: true,
+            epoch: 0,
+            last_seq: 0,
+            checkout_root: None,
+            project_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            diff_stat: None,
+            pending_approvals: 1,
+            permission_mode: None,
+            rss_bytes: None,
+        };
+
+        // The two predicates partition the states they care about: this is
+        // the one `unseen_finish` hands back rather than answering for.
+        assert!(unseen_ask(&s, Some(100)), "it parked since the visit");
+        assert!(
+            !unseen_finish(&s, Some(100)),
+            "the finish predicate must keep refusing this — the rail's one \
+             word rule depends on it"
+        );
+
+        // Same clock rules as a finish, and for the same reasons.
+        assert!(!unseen_ask(&s, Some(200)), "the visit is current");
+        assert!(!unseen_ask(&s, Some(300)), "the visit is newer");
+        assert!(
+            !unseen_ask(&s, None),
+            "no record of a visit is 'we do not know', never 'you have not \
+             looked'"
+        );
+
+        // And it answers for nothing else. Every one of these is either a
+        // finish or not news at all, and none of them is a question.
+        for state in ["running", "new", "done", "idle", "failed", "quiet", "terminal"] {
+            s.state = state.into();
+            assert!(!unseen_ask(&s, Some(100)), "{state} is not a question");
+        }
+
+        // A state that never moved has nothing to report either.
+        s.state = "awaiting_approval".into();
+        s.last_activity_ms = None;
+        assert!(!unseen_ask(&s, Some(100)));
     }
 
     #[test]

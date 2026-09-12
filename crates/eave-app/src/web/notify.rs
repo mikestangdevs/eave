@@ -711,6 +711,12 @@ fn show(tab_id: &str, origin: &str, request: Request) {
         } else {
             format!("eave:tag:{}", request.tag)
         },
+        // A page's own notification takes the default sound. The insistent
+        // one (Slice NT4) is reserved for a session parked on the operator,
+        // which is a fact eave establishes; this is a fact a WEB PAGE
+        // asserts about itself, and a page does not get to be louder than
+        // the app's own agents by asking.
+        crate::os_notify::Sound::Default,
     );
     // Only now, and only because it is on screen. This line is the slice.
     let (method, params) = ack_call(seq, Ack::Shown);

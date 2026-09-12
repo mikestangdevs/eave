@@ -62,6 +62,7 @@ mod mac {
         title: String,
         body: String,
         id: String,
+        sound: super::Sound,
     }
 
     /// Where the one authorization ask stands. `Granted` and `Denied` are
@@ -114,7 +115,7 @@ mod mac {
         }))
     }
 
-    pub(super) fn post(origin: &str, title: &str, body: &str, id: String) {
+    pub(super) fn post(origin: &str, title: &str, body: &str, id: String, sound: super::Sound) {
         let Some(bundle) = NSBundle::mainBundle().bundleIdentifier() else {
             if traced() {
                 eprintln!("[nc] skip: no bundle id");
@@ -132,6 +133,7 @@ mod mac {
             title: title.to_string(),
             body: body.to_string(),
             id,
+            sound,
         };
         // Ask once so a notDetermined app gets the system prompt. Do not
         // wait for the answer — see the module doc for the measurement
@@ -193,7 +195,22 @@ mod mac {
         if !pending.origin.is_empty() {
             content.setSubtitle(&NSString::from_str(&pending.origin));
         }
-        content.setSound(Some(&UNNotificationSound::defaultSound()));
+        // **An empty sound name is NOT silence** — it is the name that
+        // resolves to the system default, which is the trap dray records
+        // beside this same decision. Both arms here name a sound on
+        // purpose; neither is "no sound", because this channel only fires
+        // when the operator is in another application and a banner they
+        // cannot hear is a banner they will not get.
+        let sound = match pending.sound {
+            super::Sound::Default => UNNotificationSound::defaultSound(),
+            // A question holds the session open until it is answered, so
+            // it is allowed to be more insistent than news that keeps.
+            // `soundNamed:` takes a system sound by name; an unknown name
+            // falls back to the default rather than failing, which is the
+            // right failure for something this cosmetic.
+            super::Sound::Ask => UNNotificationSound::soundNamed(&NSString::from_str("Ping")),
+        };
+        content.setSound(Some(&sound));
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &NSString::from_str(&pending.id),
             &content,
@@ -247,6 +264,21 @@ mod mac {
     }
 }
 
+/// How loud one banner is allowed to be (Slice NT4).
+///
+/// Two values and no `Silent`, deliberately. This channel fires only when
+/// the operator is in another application — that is the whole gate on it —
+/// so a banner with no sound is one they may never notice, which makes it
+/// indistinguishable from the feature not working. The choice here is
+/// between two kinds of news, not between speaking and not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sound {
+    /// A finish: news that keeps.
+    Default,
+    /// A question: the session is STOPPED until it is answered.
+    Ask,
+}
+
 /// Put one notification on the system's banner list.
 ///
 /// `subtitle` is the third line — the origin for a page, the project or
@@ -258,9 +290,9 @@ mod mac {
 /// no identifier (a loose `cargo run` binary) — both are "there is no
 /// Notification Center to reach", not errors to report.
 #[cfg(target_os = "macos")]
-pub(crate) fn post(subtitle: &str, title: &str, body: &str, id: String) {
-    mac::post(subtitle, title, body, id);
+pub(crate) fn post(subtitle: &str, title: &str, body: &str, id: String, sound: Sound) {
+    mac::post(subtitle, title, body, id, sound);
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn post(_subtitle: &str, _title: &str, _body: &str, _id: String) {}
+pub(crate) fn post(_subtitle: &str, _title: &str, _body: &str, _id: String, _sound: Sound) {}
