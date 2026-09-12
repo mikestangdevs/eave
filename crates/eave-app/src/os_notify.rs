@@ -52,8 +52,8 @@ mod mac {
     use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
     use objc2_user_notifications::{
         UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
-        UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationSound,
-        UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+        UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
+        UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
     };
 
     /// One notification's payload, as it goes to Notification Center.
@@ -92,6 +92,50 @@ mod mac {
         _delegate: SendDelegate,
         center: SendCenter,
         auth: Mutex<Auth>,
+    }
+
+    /// The identifier of a banner the operator clicked, waiting to be
+    /// acted on by the app's own loop.
+    ///
+    /// One slot and not a queue: two clicks before the app has looked mean
+    /// the operator asked for the second one. A queue would take them to
+    /// the first and then move the selection under them.
+    static ACTIVATED: Mutex<Option<String>> = Mutex::new(None);
+
+    /// How this module asks the app to come and look. Installed once at
+    /// startup; absent in any process that never wires one (the harness,
+    /// a bare `cargo run`), where the slot simply fills and is never read.
+    static WAKE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+    pub(super) fn set_waker(f: Box<dyn Fn() + Send + Sync>) {
+        let _ = WAKE.set(f);
+    }
+
+    pub(super) fn take_activation() -> Option<String> {
+        ACTIVATED.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn note_activation(id: String) {
+        if traced() {
+            eprintln!("[nc] activated id={id}");
+        }
+        // **And to `EAVE_NC_TRACE`'s FILE.** A click on a banner is the
+        // one event in this module that cannot be provoked from a test or
+        // a socket — it takes a human hand or a synthetic one — so when it
+        // does not work there is nothing to look at. stderr is not that
+        // thing here: NT1 measured `open --stderr` capturing NOTHING from
+        // a bundle, and a 0-byte log reads exactly like a callback that
+        // never fired.
+        if let Some(p) = std::env::var_os("EAVE_NC_TRACE") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                let _ = writeln!(f, "activated id={id}");
+            }
+        }
+        *ACTIVATED.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        if let Some(wake) = WAKE.get() {
+            wake();
+        }
     }
 
     fn traced() -> bool {
@@ -253,6 +297,38 @@ mod mac {
                         | UNNotificationPresentationOptions::Sound,
                 ));
             }
+
+            /// The operator clicked the banner (Slice NT4b).
+            ///
+            /// **Without this arm the feature LOOKS like it works.** macOS
+            /// raises the app on a banner click by itself, so eave came
+            /// forward and sat on whatever session was already selected —
+            /// which is indistinguishable from "it took me there" when the
+            /// right session happens to be open, and silently wrong the
+            /// rest of the time. Dray records exactly this shape, and the
+            /// lesson it draws is the one worth keeping: **raising the
+            /// window and selecting the session are separate things and
+            /// both are needed.** macOS does the first; this does the
+            /// second.
+            ///
+            /// Nothing is selected on THIS stack. The identifier is put in
+            /// a slot and the app is woken — the same rule
+            /// `evict::note_closed` follows for the same reason, that a
+            /// foreign callback is not a place to reach into the UI from.
+            #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+            fn did_receive(
+                &self,
+                _center: &UNUserNotificationCenter,
+                response: &UNNotificationResponse,
+                completion_handler: &block2::DynBlock<dyn Fn()>,
+            ) {
+                let id = unsafe { response.notification() }.request().identifier();
+                note_activation(id.to_string());
+                // Called unconditionally and last. A delegate that returns
+                // without calling this leaks the system's completion block
+                // and macOS logs a violation.
+                completion_handler.call(());
+            }
         }
     );
 
@@ -296,3 +372,83 @@ pub(crate) fn post(subtitle: &str, title: &str, body: &str, id: String, sound: S
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn post(_subtitle: &str, _title: &str, _body: &str, _id: String, _sound: Sound) {}
+
+/// Install the callback this module uses to ask the app to come and look
+/// after a banner is clicked (Slice NT4b). Called once at startup.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_waker(f: Box<dyn Fn() + Send + Sync>) {
+    mac::set_waker(f);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_waker(_f: Box<dyn Fn() + Send + Sync>) {}
+
+/// The identifier of a banner the operator clicked since this was last
+/// asked, if any. Consumed — asking twice gives it to the first caller.
+#[cfg(target_os = "macos")]
+pub(crate) fn take_activation() -> Option<String> {
+    mac::take_activation()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn take_activation() -> Option<String> {
+    None
+}
+
+/// Put a count on the Dock icon, or clear it (Slice NT5).
+///
+/// **The Dock badge is a promise about what opening the window shows**, so
+/// what it counts is not a free choice: it is the number of rail rows
+/// wearing a mark, and it is computed by the same predicate the rail draws
+/// with. A badge that counted anything else would send the operator to a
+/// window with nothing in it, which teaches them to stop trusting the
+/// number — and a number nobody trusts is worse than no number.
+///
+/// **It needs no clearing path of its own**, which is the test of whether
+/// the predicate was chosen correctly. An unread finish clears when the
+/// row is viewed because `rail_seen` moves; a question clears when it is
+/// answered because the session leaves `awaiting_approval`. Nothing here
+/// has to remember to turn the badge off.
+///
+/// `0` sends `nil`, which is what REMOVES a badge — an empty string is not
+/// the same thing and leaves an empty red dot on the icon.
+///
+/// Raw `msg_send!` rather than a new `objc2-app-kit` dependency: this is
+/// two messages to an object every Cocoa app already has, and the crate
+/// would be carried by every build to reach them.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_dock_badge(count: usize) {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+
+    // No bundle, no Dock tile worth writing to — the same gate `post` uses
+    // and for the same reason.
+    if objc2_foundation::NSBundle::mainBundle()
+        .bundleIdentifier()
+        .is_none()
+    {
+        return;
+    }
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let tile: *mut AnyObject = msg_send![app, dockTile];
+        if tile.is_null() {
+            return;
+        }
+        if count == 0 {
+            let nil: *mut AnyObject = std::ptr::null_mut();
+            let _: () = msg_send![tile, setBadgeLabel: nil];
+        } else {
+            let label: Retained<NSString> = NSString::from_str(&count.to_string());
+            let _: () = msg_send![tile, setBadgeLabel: &*label];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_dock_badge(_count: usize) {}

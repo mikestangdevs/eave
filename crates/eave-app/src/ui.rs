@@ -4360,6 +4360,37 @@ enum Announce {
     Ask,
 }
 
+/// Does this row wear a mark right now — the Dock badge's predicate
+/// (Slice NT5).
+///
+/// **The badge counts what the rail draws, and that is the whole promise
+/// it makes.** Opening the window must show exactly this many rows with
+/// something on them; a badge counting anything else sends the operator to
+/// a window with nothing in it, and a number nobody trusts is worse than
+/// no number at all.
+///
+/// **`awaiting_approval` is UNCONDITIONAL here, and that is not an
+/// oversight beside [`unseen_ask`].** The two answer different questions
+/// and clear on different events:
+///
+/// - A question is cleared by ANSWERING it. Looking at the row does not
+///   make the agent un-blocked, so the rail keeps `waiting on you` lit
+///   however long you stare at it, and so must the count.
+/// - A finish is cleared by LOOKING. `rail_seen` moves and the row's
+///   `finished` mark goes, so the count drops with it.
+///
+/// [`unseen_ask`] is the BANNER's predicate — *has this been announced
+/// since you last looked* — which is a question about what eave has
+/// already said, not about what is currently true. Using it here would
+/// make the badge drop to zero while a session sat blocked.
+///
+/// That split is dray's too, arrived at from the same place: green means
+/// unread and clears on view, yellow means waiting on you and only an
+/// answer clears it, and the badge is that pair counted.
+fn needs_you(info: &SessionInfo, seen: Option<u64>) -> bool {
+    info.state == "awaiting_approval" || unseen_finish(info, seen)
+}
+
 #[derive(Clone)]
 struct RailGroup {
     /// The root this header speaks for. The group's IDENTITY — collapse is
@@ -10697,6 +10728,23 @@ impl Shell {
         // Pruned here for the same reason `rail_seen` is pruned in the
         // rail: this is a place that sees the whole list.
         announced.retain(|(id, _), _| all.iter().any(|s| &s.session_id == id));
+        // **The Dock badge is set ABOVE the window-active gate, and the
+        // banner below it** (Slice NT5). They are not two renderings of one
+        // signal: a banner is an INTERRUPTION and only earns the right to
+        // one when the operator is elsewhere, while the badge is a standing
+        // fact drawn on the icon of the app they are already in. Suppressing
+        // the count while the window is focused would mean the number went
+        // stale in exactly the window where the operator can watch it
+        // change.
+        {
+            let seen = self.rail_seen.borrow();
+            let n = all
+                .iter()
+                .filter(|s| !s.archived)
+                .filter(|s| needs_you(s, seen.get(&s.session_id).copied()))
+                .count();
+            crate::os_notify::set_dock_badge(n);
+        }
         // Everything below this line is the banner, and the banner is only
         // for an operator who is not looking. The bookkeeping above still
         // runs while the window is active so the map cannot grow stale.
@@ -33877,6 +33925,24 @@ pub fn run(data_dir: PathBuf) -> ! {
             let (wake_tx, wake_rx) = futures::channel::mpsc::channel::<()>(1);
             let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
 
+            // Slice NT4b — how a clicked banner reaches this loop. The
+            // delegate fills a slot and calls this; the pump below drains
+            // it on a clean stack. Reusing the existing wake rather than
+            // adding a channel is deliberate: a banner click is one more
+            // reason to come and look, which is all this channel means,
+            // and a `try_send` that fails because a wake is already
+            // pending has lost nothing.
+            {
+                // A `Mutex` because the waker is an `Fn` — Apple may call
+                // the delegate more than once and the sender needs `&mut`.
+                let wake = std::sync::Mutex::new(wake_tx.clone());
+                crate::os_notify::set_waker(Box::new(move || {
+                    if let Ok(mut w) = wake.lock() {
+                        let _ = w.try_send(());
+                    }
+                }));
+            }
+
             // Feed source: live engine, or fixture replay (Stage D acceptance
             // harness) — the pump and entities cannot tell the difference.
             {
@@ -34449,6 +34515,11 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let columns = columns.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
+                // Slice NT4b. First, because a clicked banner is the
+                // operator asking to be somewhere, and every entity update
+                // below is about what is already on screen. It is a cheap
+                // `take()` of an empty slot on every other wake.
+                let _ = cx.update(route_banner_activation);
                 let conn_events: Vec<ConnEvent> = queues.conn.lock().unwrap().drain(..).collect();
                 if let Some(last) = conn_events.into_iter().last() {
                     conn.update(cx, |state, cx| {
@@ -34826,6 +34897,74 @@ impl gpui::Global for ShellDeps {}
 /// This is the `remove_window` path: ⌘W with no tab left to close, and
 /// the Window menu's Close row. See [`Shell::release_tabs_on_close`] for
 /// why it cannot simply be left to `on_window_should_close`.
+/// Which session a banner identifier names, if it names one at all
+/// (Slice NT4b).
+///
+/// eave mints three shapes and only one of them is a session:
+/// `eave:session:<id>` from [`Shell::announce_attention`], and
+/// `eave:<tab>:<seq>` / `eave:tag:<tag>` from a PAGE calling
+/// `Notification()`. A page's banner is about a web page and the honest
+/// answer to "which session is this" for one of those is *none* — so it
+/// falls through and the app simply comes forward, which is what a click
+/// on a page notification should do.
+///
+/// Separated from the routing so the decision can be asserted without a
+/// window, an `App` or Notification Center. The prefix is a wire format
+/// eave writes at one end and reads at the other, and it is exactly the
+/// kind of string that rots silently when one end moves.
+fn session_of_banner(id: &str) -> Option<&str> {
+    id.strip_prefix("eave:session:").filter(|s| !s.is_empty())
+}
+
+/// Act on a banner the operator clicked (Slice NT4b).
+///
+/// **Raising the window and selecting the session are two different
+/// things, and macOS only does the first.** A click on a Notification
+/// Center banner brings the owning app forward by itself, which is why a
+/// banner with no handler at all *looks* like it works: eave comes
+/// forward, and if the session it named happened to be the selected one,
+/// nothing is visibly wrong. The rest of the time the operator is taken to
+/// the app and left on somebody else's conversation. Dray records this
+/// exact shape and the sentence it ends on is the one worth keeping.
+///
+/// The identifier is eave's own (`eave:session:<id>`), minted where the
+/// banner is posted. An identifier that is not one of ours — a PAGE's
+/// `Notification()` carries `eave:<tab>:<seq>` or `eave:tag:<tag>` — is
+/// left alone rather than guessed at, because the honest answer to "which
+/// session is this about" for a page notification is "none".
+///
+/// Runs on the app's own stack, never inside the delegate: the callback
+/// only fills a slot and wakes us. That is `evict::note_closed`'s rule and
+/// it is here for the same reason — a foreign event loop is not a place to
+/// reach into the UI from.
+fn route_banner_activation(cx: &mut App) {
+    let Some(id) = crate::os_notify::take_activation() else {
+        return;
+    };
+    let Some(sid) = session_of_banner(&id) else {
+        return;
+    };
+    let sid = sid.to_string();
+    // The window macOS just brought forward, when that is one of ours, and
+    // otherwise the first shell — the same fallback ladder the Theme and
+    // Import actions use when the key window is not a shell.
+    let handle = cx
+        .active_window()
+        .and_then(|w| w.downcast::<Shell>())
+        .or_else(|| cx.windows().into_iter().find_map(|w| w.downcast::<Shell>()));
+    let Some(handle) = handle else {
+        return;
+    };
+    let _ = handle.update(cx, |shell, window, cx| {
+        // Both halves, in this order. `activate_window` is a no-op when
+        // macOS has already done it and is what makes this work when it
+        // has not (a click on a banner in Notification Center's list,
+        // rather than on the banner itself).
+        window.activate_window();
+        shell.select_session(&sid, cx);
+    });
+}
+
 pub(crate) fn close_active_shell_window(cx: &mut App) -> bool {
     let Some(handle) = cx.active_window().and_then(|w| w.downcast::<Shell>()) else {
         return false;
@@ -36917,6 +37056,101 @@ mod tests {
         s.state = "awaiting_approval".into();
         s.last_activity_ms = None;
         assert!(!unseen_ask(&s, Some(100)));
+    }
+
+    /// **The Dock badge counts what the rail draws, and the two marks
+    /// clear on different events** (Slice NT5).
+    ///
+    /// The tempting implementation reuses `unseen_ask`, since NT4 had just
+    /// written it and it is the other half of the banner. That is wrong in
+    /// a way a screenshot would not show: `unseen_ask` asks *has this been
+    /// announced since you last looked*, so a session sitting blocked that
+    /// eave had already announced would stop being counted, and the badge
+    /// would read zero with an agent waiting. A question is cleared by
+    /// ANSWERING it, never by looking at it.
+    ///
+    /// The finish half is the opposite and must stay that way: looking IS
+    /// what clears it.
+    #[test]
+    fn the_badge_counts_a_question_until_it_is_answered_and_a_finish_until_it_is_seen() {
+        let mut s = SessionInfo {
+            session_id: "s".into(),
+            title: None,
+            archived: false,
+            provider: "claude-code".into(),
+            model: None,
+            effort: None,
+            fast: false,
+            cwd: "/tmp".into(),
+            created_ts_ms: 0,
+            last_activity_ms: Some(200),
+            state: "awaiting_approval".into(),
+            live: true,
+            epoch: 0,
+            last_seq: 0,
+            checkout_root: None,
+            project_root: None,
+            shared_with: Vec::new(),
+            worktree: None,
+            diff_stat: None,
+            pending_approvals: 1,
+            permission_mode: None,
+            rss_bytes: None,
+        };
+
+        // A question stays counted however long you look at it. Every one
+        // of these is a visit at or after the moment it parked.
+        for visit in [Some(100), Some(200), Some(300), None] {
+            assert!(
+                needs_you(&s, visit),
+                "a blocked agent stopped being counted after a visit ({visit:?}) — \
+                 only an ANSWER clears a question"
+            );
+        }
+        // This is the line that would have been wrong: the banner's
+        // predicate has gone quiet by now, and the badge must not.
+        assert!(
+            !unseen_ask(&s, Some(300)),
+            "guard: the banner predicate IS quiet here, which is why \
+             reusing it for the badge would read zero on a blocked agent"
+        );
+
+        // A finish is the other rule: looking is what clears it.
+        s.state = "idle".into();
+        assert!(needs_you(&s, Some(100)), "unseen finish is a mark");
+        assert!(!needs_you(&s, Some(200)), "seen since — the row is bare");
+        assert!(!needs_you(&s, Some(300)), "the visit is newer");
+
+        // And a session doing its work wears nothing at all.
+        for state in ["running", "new"] {
+            s.state = state.into();
+            assert!(!needs_you(&s, Some(100)), "{state} wears no mark");
+        }
+    }
+
+    /// **The banner identifier is a wire format with eave at both ends**
+    /// (Slice NT4b), and the two ends are in different files: it is minted
+    /// in `announce_attention` and read back in `route_banner_activation`
+    /// after a round trip through Notification Center. Nothing but this
+    /// holds them together — a prefix that drifted at one end would leave
+    /// clicks landing on the wrong session, or on none, with everything
+    /// still compiling.
+    #[test]
+    fn only_a_session_banner_names_a_session() {
+        assert_eq!(
+            session_of_banner("eave:session:abc-123"),
+            Some("abc-123"),
+            "this is the string `announce_attention` actually posts"
+        );
+        // A PAGE's own `Notification()`. There is no session behind one,
+        // and guessing at the tab id would take the operator to somebody
+        // else's conversation — worse than the app merely coming forward.
+        assert_eq!(session_of_banner("eave:tab7:12"), None);
+        assert_eq!(session_of_banner("eave:tag:build-done"), None);
+        // Degenerate and foreign shapes answer nothing rather than "".
+        assert_eq!(session_of_banner("eave:session:"), None);
+        assert_eq!(session_of_banner("session:abc"), None);
+        assert_eq!(session_of_banner(""), None);
     }
 
     #[test]

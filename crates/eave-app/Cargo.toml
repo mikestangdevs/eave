@@ -236,6 +236,11 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
     "UNNotification",
     "UNNotificationContent",
     "UNNotificationRequest",
+    # Slice NT4b: the banner's CLICK. Without this the delegate can answer
+    # `willPresent` and nothing else, so macOS raises the app by itself and
+    # the app lands on whatever session was already open — which looks like
+    # the feature working and is not.
+    "UNNotificationResponse",
     "UNNotificationSound",
     "UNNotificationTrigger",
     "UNUserNotificationCenter",
