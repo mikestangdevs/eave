@@ -25,6 +25,7 @@ pub mod session;
 pub mod store;
 pub mod stream;
 pub mod thresholds;
+pub mod time;
 pub mod tool;
 pub mod tuning;
 pub mod turn;

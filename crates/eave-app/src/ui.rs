@@ -174,6 +174,14 @@ actions!(
         /// composer nearly always.
         UsePanes,
         UseCanvas,
+        /// Slice GH1 — View → Pull Requests. Opens the review list for
+        /// the checkout the selected session works in.
+        ///
+        /// A menu item for the same measured reason the two layouts are
+        /// (CV1): the shell's `on_action` chain is not reached while a
+        /// text field has focus, and the composer holds focus most of
+        /// the time.
+        OpenPulls,
         /// Slice C5 — ⌘W. Closes the active TAB, and the WINDOW when there
         /// is no tab to close.
         CloseTab,
@@ -655,6 +663,13 @@ enum Command {
 /// caller doing the engine's round trips from the render thread.
 #[derive(Debug, Clone)]
 enum BrowserCmd {
+    /// Slice GH1 — read the open reviews on the repository `cwd` is in.
+    ///
+    /// Rides the browser command channel rather than the session one
+    /// because it is a fact about a CHECKOUT, not about a session: two
+    /// chats in one worktree ask the same question and must not each
+    /// spend a round trip on it.
+    Pulls { cwd: String },
     /// Make this tab the active one. The single notion of active.
     Activate(String),
     /// Close a tab. For a session tab this closes the **view**; the session
@@ -672,6 +687,11 @@ enum BrowserCmd {
     },
     /// ⌘⇧N: an empty private page tab.
     NewIncognitoTab { window: Option<eave_wire::WindowId> },
+    /// Slice GH1 — a review-list tab for a checkout.
+    OpenPulls {
+        window: Option<eave_wire::WindowId>,
+        cwd: String,
+    },
     /// The omnibox committing on a tab that already exists.
     Navigate { tab_id: String, url: String },
     /// Slice D1 — walk the back/forward stack. `-1` is back, `+1` forward.
@@ -853,6 +873,12 @@ struct Queues {
     /// a query it does not match — the operator types faster than a round
     /// trip, so this is the common case and not the edge one.
     typeahead: Mutex<VecDeque<(String, Vec<eave_wire::HistoryMatch>)>>,
+    /// Slice GH1. One review listing, tagged with the checkout it was
+    /// asked for — the same carry-the-question-with-the-answer rule
+    /// `typeahead` follows, because two panes on two checkouts can have
+    /// reads in flight at once and an untagged answer would land on
+    /// whichever pane drew last.
+    pulls: Mutex<VecDeque<(String, eave_wire::PullsSnapshot)>>,
 }
 
 /// Slice C1: the tab strip, as this shell holds it.
@@ -876,6 +902,25 @@ struct BookmarksState {
     /// An empty default must not be read as "first run" — that would pop
     /// the importer on every harness boot, before any engine existed.
     received: bool,
+}
+
+/// Slice GH1: every review listing this window has read, by checkout.
+///
+/// An entity for [`TypeaheadState`]'s reason — the pump folds it and the
+/// pump is built before the shell is. Keyed on the checkout path rather
+/// than on a repository, because the path is what the pane holds and
+/// resolving it to `owner/name` is the engine's job; two worktrees of one
+/// repository legitimately answer with the same rows and each keeps its
+/// own entry, because each has its own branch and therefore its own
+/// answer to *which of these is mine*.
+///
+/// **Nothing here expires.** A listing is stale the moment it is taken
+/// and the surface says when it was read rather than pretending
+/// otherwise; a timer that dropped rows would leave a pane empty for a
+/// reason the operator did not ask for.
+#[derive(Default)]
+struct PullsStore {
+    by_cwd: HashMap<String, eave_wire::PullsSnapshot>,
 }
 
 /// Slice C5: the last typeahead answer, and the text it answered for.
@@ -948,6 +993,11 @@ impl Plumbing {
         self.queues.typeahead.lock().unwrap().push_back(ev);
         let _ = self.wake.clone().try_send(());
     }
+    /// Slice GH1: one review listing, tagged with the checkout it is for.
+    fn push_pulls(&self, ev: (String, eave_wire::PullsSnapshot)) {
+        self.queues.pulls.lock().unwrap().push_back(ev);
+        let _ = self.wake.clone().try_send(());
+    }
 }
 
 /// Slice C5 — service one strip or omnibox act against the engine.
@@ -972,6 +1022,22 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                 .map(|ok| ok.matches)
                 .unwrap_or_default();
             plumbing.push_typeahead((for_text, matches));
+        }
+        BrowserCmd::Pulls { cwd } => {
+            // A failed read is still an answer and must reach the pane:
+            // swallowing it would leave the spinner up forever, which is
+            // the one state a listing must never be stuck in. The engine
+            // already states its own failures in `PullsState`; this arm
+            // only has to cover the connection itself being gone.
+            let snapshot = client.pulls(&cwd, None).await.unwrap_or_else(|e| {
+                eave_wire::PullsSnapshot::stated(
+                    eave_wire::PullsState::Error {
+                        message: format!("the engine did not answer: {e}"),
+                    },
+                    0,
+                )
+            });
+            plumbing.push_pulls((cwd, snapshot));
         }
         BrowserCmd::Activate(tab_id) => {
             let _ = client
@@ -1026,6 +1092,20 @@ async fn run_browser_cmd(client: &Client, plumbing: &Plumbing, cmd: BrowserCmd) 
                     opener: None,
                     activate: true,
                     incognito: true,
+                })
+                .await;
+        }
+        BrowserCmd::OpenPulls { window, cwd } => {
+            let _ = client
+                .browser_create(eave_wire::Request::TabOpen {
+                    window,
+                    url: None,
+                    group: None,
+                    index: Some(0),
+                    content: eave_wire::TabContent::Pulls { cwd },
+                    opener: None,
+                    activate: true,
+                    incognito: false,
                 })
                 .await;
         }
@@ -3081,6 +3161,17 @@ fn tab_plate(tab: &strip::StripTab, id: &str) -> gpui::Div {
         .items_center()
         .justify_center()
         .child(match &tab.kind {
+            // A review list wears the branch mark — the same family the
+            // reference draws its rows with. It carries no state in its
+            // selector because, unlike a page, it has no loading and no
+            // favicon that could fail to decode.
+            strip::TabKind::Pulls { .. } => icons::tagged_icon(
+                icons::GIT_BRANCH,
+                12.0,
+                theme::text_secondary_on_wash(),
+                format!("tab-pulls-mark-{id}"),
+            )
+            .into_any_element(),
             // A page's mark is its favicon when Chromium has given us a
             // URL, and the globe when it has not — or when the image fails
             // to decode. A page that has been NOWHERE is neither: it wears
@@ -6960,6 +7051,20 @@ enum Tool {
     /// not journaled: a face of the selection, dropped by the next tab
     /// activation — the same durability `Split` has, for the same reason.
     Diff { root: String },
+    /// A repository's open reviews, full-well (Slice GH1).
+    ///
+    /// **Keyed on a path in the checkout, never on a session**, for the
+    /// same reason [`Tool::Diff`] is keyed on a root: several chats in
+    /// one checkout share one working tree and one set of reviews, and a
+    /// list that named the chat it was opened from would go dark when
+    /// that chat closed. Unlike `Diff` this one IS a tab, so it survives
+    /// the next tab activation — a review list is something an operator
+    /// keeps open beside their work rather than a face of the selection.
+    ///
+    /// Carries its tab id as well as the path, the way [`Tool::Page`]
+    /// does: the tab is what the sidebar selects and the strip draws,
+    /// and the path is what the read is made against.
+    Pulls { tab: String, cwd: String },
 }
 
 impl Frame {
@@ -6981,6 +7086,25 @@ impl Frame {
             self.view,
             FrameView::Task {
                 tool: Tool::Diff { .. },
+                ..
+            }
+        )
+    }
+
+    /// The well is a review list's (Slice GH1).
+    ///
+    /// **Found by walking, and it could not have been found any other
+    /// way.** A review list is neither a page nor a chat, so every
+    /// transcript-only surface — the launcher, the composer, eave's own
+    /// mark on an empty well — went on mounting *over* it: the list drew
+    /// correctly and a composer sat across the middle of it. `well_taken`
+    /// is the gate all of them read, and a fourth face of a task has to
+    /// be in it for the same reason the third one is.
+    fn showing_pulls(&self) -> bool {
+        matches!(
+            self.view,
+            FrameView::Task {
+                tool: Tool::Pulls { .. },
                 ..
             }
         )
@@ -8966,6 +9090,32 @@ struct Shell {
     import_auto_shown: bool,
     /// Slice C5 — the last typeahead answer the engine sent.
     typeahead: Entity<TypeaheadState>,
+    /// Slice GH1 — every review listing read in this window.
+    pulls: Entity<PullsStore>,
+    /// A review panel that has been asked for and whose tab the engine
+    /// has not minted yet: `(cwd, the tab it should dock beside)`.
+    ///
+    /// **A note of an intention, consumed when the thing it is about
+    /// shows up** — `settle_popup_split`'s shape exactly, and for the
+    /// same reason: the engine mints tab ids, so the pane cannot be
+    /// placed at the moment it is requested.
+    pending_pulls_dock: RefCell<Option<(String, String)>>,
+    /// Checkouts this window has asked for reviews on, and **when**.
+    ///
+    /// Same shape and same reason as `asked_for_session_tab`: the ask is
+    /// fired from the render pass, which runs many times before the
+    /// answer comes back, and **render-thread state cannot race**. An
+    /// `Entity` could not serve here at all — a render pass holds
+    /// `&Context`, and updating an entity needs `&mut App`.
+    ///
+    /// **The instant is what makes it recoverable, and it was found by
+    /// walking.** A bare "asked" flag makes the ask permanent: the
+    /// command rides a channel that is torn down and rebuilt when the
+    /// selected session changes, so one sent in that gap is simply
+    /// dropped — and the panel then said *reading reviews…* forever,
+    /// which is precisely the state `run_browser_cmd`'s own comment says
+    /// a listing must never be stuck in.
+    asked_pulls: RefCell<HashMap<String, std::time::Instant>>,
     /// Slice C5 — the session this window has already asked to select on
     /// the strip's behalf.
     ///
@@ -10001,7 +10151,17 @@ fn save_splits(window: &str, splits: &[Split]) {
     put_splits(&mut doc, window, splits);
     match serde_json::to_string_pretty(&doc) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(&path, text + "\\n") {
+            // **A real newline, not the two characters `\` and `n`.**
+            // This was `"\\n"` and it is the only one of the nine
+            // writers of this file that was: every save of a split left
+            // `frame.json` INVALID JSON, so the next read fell back to
+            // defaults — splits did not persist (SP1's headline), the
+            // layout mode did not persist (CV1's), and because
+            // `save_splits` re-reads the document before writing it,
+            // each save started from an empty object and dropped every
+            // other key the file held. Found by walking GH1, whose
+            // panel persists as a split.
+            if let Err(e) = std::fs::write(&path, text + "\n") {
                 eprintln!("eave: cannot save splits to {}: {e}", path.display());
             }
         }
@@ -14266,6 +14426,14 @@ impl Shell {
         }
         let view = match active {
             Some(t) => match &t.content {
+                eave_wire::TabContent::Pulls { cwd } => FrameView::Task {
+                    group,
+                    root: Some(cwd.clone()),
+                    tool: Tool::Pulls {
+                        tab: t.id.clone(),
+                        cwd: cwd.clone(),
+                    },
+                },
                 eave_wire::TabContent::Page => match group {
                     Some(g) => {
                         let root = group_root(&g);
@@ -14750,6 +14918,10 @@ impl Shell {
                 tool: Tool::Page { tab },
                 ..
             }
+            | FrameView::Task {
+                tool: Tool::Pulls { tab, .. },
+                ..
+            }
             | FrameView::Browse { tab: Some(tab) } => Some(ColumnId::Tab(tab.clone())),
             FrameView::Browse { tab: None } | FrameView::Empty => None,
         }
@@ -14763,7 +14935,7 @@ impl Shell {
                 let snapshot = self.strip_snapshot(cx);
                 let session = snapshot.tabs.iter().find(|t| &t.id == id).and_then(|t| match &t.content {
                     eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
-                    eave_wire::TabContent::Page => None,
+                    eave_wire::TabContent::Page | eave_wire::TabContent::Pulls { .. } => None,
                 });
                 match session {
                     Some(sid) => self.select_session(&sid, cx),
@@ -15119,7 +15291,7 @@ impl Shell {
             .iter()
             .filter_map(|t| match &t.content {
                 eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
-                eave_wire::TabContent::Page => None,
+                eave_wire::TabContent::Page | eave_wire::TabContent::Pulls { .. } => None,
             })
             .collect();
         self.columns.update(cx, |feeds, _| feeds.prune(&live));
@@ -15278,7 +15450,7 @@ impl Shell {
             .filter_map(|t| {
                 snapshot.tabs.iter().find(|x| x.id == t).and_then(|x| match &x.content {
                     eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
-                    eave_wire::TabContent::Page => None,
+                    eave_wire::TabContent::Page | eave_wire::TabContent::Pulls { .. } => None,
                 })
             })
             .collect()
@@ -16533,7 +16705,10 @@ impl Shell {
                         Some(controls),
                     )
                 });
-                let inner: AnyElement = if frame.active_is_page() {
+                let inner: AnyElement = if let Some(el) = self.pulls_for_tab(id, &snapshot, cx) {
+                    // Slice GH1, in this path as well as the other two.
+                    el
+                } else if frame.active_is_page() {
                     // A tab that has been nowhere is a New Chat in EVERY
                     // column, selected or not (CL1, operator: *"about
                     // blank shows blank until i scroll over it"*): the
@@ -16633,7 +16808,7 @@ impl Shell {
                     // A read-only view of another session: its column feed.
                     let sid = snapshot.tabs.iter().find(|t| &t.id == id).and_then(|t| match &t.content {
                         eave_wire::TabContent::Session { session_id } => Some(session_id.clone()),
-                        eave_wire::TabContent::Page => None,
+                        eave_wire::TabContent::Page | eave_wire::TabContent::Pulls { .. } => None,
                     });
                     let feed = sid.as_deref().and_then(|s| self.columns.read(cx).feed(s));
                     match (sid, feed) {
@@ -17733,7 +17908,8 @@ impl Shell {
         let snapshot = self.strip_snapshot(cx);
         let frame = self.frame_for(&snapshot, None, cx);
         let split = self.showing_split(&snapshot).is_some();
-        let well_taken = split || frame.active_is_page() || frame.showing_diff();
+        let well_taken =
+            split || frame.active_is_page() || frame.showing_diff() || frame.showing_pulls();
         // A blank pane hosts the launcher in a split too, so the composer
         // it holds is reachable there as well — see `Shell::split_pane`.
         let blank = strip::active_is_blank_page(&snapshot);
@@ -19403,7 +19579,9 @@ impl Shell {
                     }))
                     .children(composer)
                     .children(launcher_el)
-                    .children(cluster),
+                    .children(cluster)
+                    // Slice GH1, in this path as well as the other two.
+                    .children(self.pulls_for_tab(tab_id, &snapshot, cx)),
             )
             .into_any_element()
     }
@@ -19834,6 +20012,7 @@ impl Shell {
                 )
                 .children(self.downloads_control(cx))
                 .children(trailing.take())
+                .children(self.pulls_toggle(cx))
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
             }
             // ── a session: the breadcrumb ────────────────────────────────
@@ -19881,7 +20060,53 @@ impl Shell {
                         .child(SharedString::from(m))
                 }))
                 .children(trailing.take())
+                .children(self.pulls_toggle(cx))
                 .when(show_files, |d| d.child(self.files_toggle(cx)))
+            }
+            // ── the review list: which repository, and how many ──────────
+            (
+                FrameView::Task {
+                    tool: Tool::Pulls { cwd, .. },
+                    ..
+                },
+                _,
+            ) => {
+                // The repository, once a read has named it. Before that
+                // the crumb says what the panel IS rather than guessing a
+                // name off the directory — a header that renamed itself a
+                // second after opening reads as a bug.
+                let slug = self
+                    .pulls
+                    .read(cx)
+                    .by_cwd
+                    .get(cwd.as_str())
+                    .and_then(|s| s.repo.as_ref())
+                    .map(|r| r.slug());
+                row.child(
+                    div()
+                        .flex_none()
+                        .pr(px(theme::SPACE_1))
+                        .child(icons::icon(
+                            icons::GIT_PULL_REQUEST,
+                            theme::ICON_SM,
+                            theme::text_secondary(),
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "pane-crumb".into())
+                        .flex_none()
+                        .truncate()
+                        .text_size(px(theme::DETAIL_SIZE))
+                        .line_height(px(theme::DETAIL_LINE))
+                        .font_weight(theme::WEIGHT_LABEL)
+                        .text_color(theme::text_secondary())
+                        .child(SharedString::from(
+                            slug.unwrap_or_else(|| strip::PULLS_TAB_LABEL.to_string()),
+                        )),
+                )
+                .child(div().flex_1())
+                .children(trailing.take())
             }
             // ── the diff tool: what it is, and the files face toggle ──────
             (
@@ -19904,6 +20129,7 @@ impl Shell {
                 )
                 .child(div().flex_1())
                 .children(trailing.take())
+                .children(self.pulls_toggle(cx))
                 .when(show_files, |d| d.child(self.files_toggle(cx))),
             // ── nothing open: the line still exists ───────────────────────
             //
@@ -19914,6 +20140,7 @@ impl Shell {
             _ => row
                 .child(div().flex_1())
                 .children(trailing.take())
+                .children(self.pulls_toggle(cx))
                 .when(show_files, |d| d.child(self.files_toggle(cx))),
         };
         // The card paints one `content_plate` behind this strip AND the
@@ -31882,7 +32109,7 @@ impl Render for Shell {
         // being a page. `well_taken` is the gate every transcript-only
         // surface reads; `showing_page` stays what it says.
         let showing_diff = frame.showing_diff();
-        let well_taken = showing_page || showing_diff;
+        let well_taken = showing_page || showing_diff || frame.showing_pulls();
         let diff_el = showing_diff.then(|| self.diff_tool_el(None, cx));
         // Slice T1 — ⌘T's tab before anything has been typed into it.
         //
@@ -32970,6 +33197,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &UseCanvas, _, cx| {
                 this.set_layout(LayoutMode::Canvas, cx)
             }))
+            .on_action(cx.listener(|this, _: &OpenPulls, _, cx| this.open_pulls_tab(cx)))
             .on_action(cx.listener(|this, _: &TidyCanvas, _, cx| {
                 if this.layout.is_canvas() {
                     this.tidy_canvas(cx);
@@ -33329,6 +33557,23 @@ impl Render for Shell {
                                                 // would dim content the page believes
                                                 // is fully visible.
                                                 .children(page_el)
+                                                // Slice GH1 — the review
+                                                // list, in the unsplit
+                                                // path as well as the
+                                                // split and canvas ones.
+                                                // See `pulls_for_tab`.
+                                                .children(
+                                                    strip_snapshot
+                                                        .active
+                                                        .as_deref()
+                                                        .and_then(|id| {
+                                                            self.pulls_for_tab(
+                                                                id,
+                                                                &strip_snapshot,
+                                                                cx,
+                                                            )
+                                                        }),
+                                                )
                                                 // Slice E1. **Shown over a page,
                                                 // and only over a page** — the
                                                 // occlusion rule, answered at
@@ -34430,6 +34675,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         }),
     });
     let typeahead = cx.new(|_| TypeaheadState::default());
+    let pulls = cx.new(|_| PullsStore::default());
     let web_tabs = cx.new(|_| WebTabsState {
         snapshot: eave_wire::TabsSnapshot::default(),
     });
@@ -34512,6 +34758,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         let web_tabs = web_tabs.clone();
         let bookmarks = bookmarks.clone();
         let typeahead = typeahead.clone();
+        let pulls = pulls.clone();
         let columns = columns.clone();
         cx.spawn(async move |cx| {
             while wake_rx.next().await.is_some() {
@@ -34660,6 +34907,20 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
                     typeahead.update(cx, |state, cx| {
                         state.for_text = for_text;
                         state.matches = matches;
+                        cx.notify();
+                    });
+                }
+                // Slice GH1. Folded by REPLACEMENT per checkout, not by
+                // append: a listing is the whole answer for that
+                // checkout, so a later read supersedes an earlier one
+                // rather than adding to it.
+                let pulls_events: Vec<(String, eave_wire::PullsSnapshot)> =
+                    queues.pulls.lock().unwrap().drain(..).collect();
+                if !pulls_events.is_empty() {
+                    pulls.update(cx, |store, cx| {
+                        for (cwd, snapshot) in pulls_events {
+                            store.by_cwd.insert(cwd, snapshot);
+                        }
                         cx.notify();
                     });
                 }
@@ -34840,6 +35101,7 @@ fn bootstrap(cx: &mut App, feed: Feed) -> WindowHandle<Shell> {
         web_tabs,
         bookmarks,
         typeahead,
+        pulls,
         cmd_tx,
         perf_10k,
     });
@@ -34884,6 +35146,8 @@ struct ShellDeps {
     web_tabs: Entity<WebTabsState>,
     bookmarks: Entity<BookmarksState>,
     typeahead: Entity<TypeaheadState>,
+    /// Slice GH1 — see [`PullsStore`].
+    pulls: Entity<PullsStore>,
     cmd_tx: tokio_mpsc::UnboundedSender<Command>,
     perf_10k: bool,
 }
@@ -35168,6 +35432,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
         web_tabs,
         bookmarks,
         typeahead,
+        pulls,
         cmd_tx,
         perf_10k,
     } = cx.global::<ShellDeps>().clone();
@@ -35372,6 +35637,9 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         // tab arriving is a tabs fact, and the popup's
                         // split control is waiting for exactly one.
                         shell.settle_popup_split(cx);
+                        // Slice GH1: a review panel is waiting for its
+                        // tab in exactly the same way.
+                        shell.settle_pulls_panel(cx);
                         // Slice CL1: same rule, same reason — and the
                         // strip's paint-moved scroll is written here.
                         shell.prune_column_feeds(cx);
@@ -35390,6 +35658,7 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                     })
                     .detach();
                     cx.observe(&typeahead, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&pulls, |_, _, cx| cx.notify()).detach();
                     Shell {
                         focus: cx.focus_handle(),
                         window_key: window_key.clone(),
@@ -35419,6 +35688,9 @@ fn open_shell_window(cx: &mut App, window_key: eave_wire::WindowId) -> WindowHan
                         import_view: None,
                         import_auto_shown: false,
                         typeahead: typeahead.clone(),
+                        pulls: pulls.clone(),
+                        asked_pulls: RefCell::new(HashMap::new()),
+                        pending_pulls_dock: RefCell::new(None),
                         asked_for_session_tab: RefCell::new(HashSet::new()),
                         asked_for_project: RefCell::new(HashSet::new()),
                         launched_from_tab: RefCell::new(None),
@@ -35658,6 +35930,731 @@ fn perf_fill_10k(state: &mut TranscriptState) {
         item_ix: 0,
         offset_in_item: px(0.),
     });
+}
+
+
+// ---------------------------------------------------------------------------
+// Slice GH1 — the review list.
+//
+// A self-contained block: the whole surface is these methods plus
+// `crate::pull_requests`, which decides the grouping and the order. Kept
+// together because every lane in this project edits `ui.rs` and a slice
+// that lands as one contiguous region is a slice the next rebase can
+// move in one piece.
+// ---------------------------------------------------------------------------
+
+impl Shell {
+    /// The review list in the well (Slice GH1).
+    ///
+    /// **Asks for its own data, once.** The read is fired from the render
+    /// pass — the only place that knows the pane is on screen — and
+    /// `PullsStore::asking` is what keeps a redraw from firing it again.
+    /// gpui repaints on every frame, so without that flag this surface
+    /// would spend a network round trip per frame; the same trap
+    /// `provider::resolve_program`'s memo exists for, one cost tier up.
+    fn pulls_el(&self, cwd: &str, cx: &Context<Self>) -> AnyElement {
+        let snapshot = self.pulls.read(cx).by_cwd.get(cwd).cloned();
+        if snapshot.is_none() {
+            self.ask_pulls(cwd);
+        }
+
+        let body = match &snapshot {
+            None => self.pulls_note("reading reviews…", None),
+            Some(snap) => match &snap.state {
+                eave_wire::PullsState::Ok if snap.rows.is_empty() => self.pulls_note(
+                    "No open pull requests.",
+                    snap.repo.as_ref().map(|r| r.slug()),
+                ),
+                eave_wire::PullsState::Ok => self.pulls_rows(snap, cx),
+                other => self.pulls_refusal(other),
+            },
+        };
+
+        div()
+            .debug_selector(|| "pulls".into())
+            .size_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(body)
+            .child(self.pulls_footer(snapshot.as_ref()))
+            .into_any_element()
+    }
+
+    /// **The way in** — a review glyph on the pane header (Slice GH1).
+    ///
+    /// The operator's ruling: *"should probably be an icon to open or
+    /// something"*. A menu item alone is not a way into a surface nobody
+    /// knows is there, and the reference puts its reviews one click from
+    /// every screen.
+    ///
+    /// It is a TOGGLE: open when the panel is shut, and close the panel
+    /// when it is open, because a control that only opens leaves the
+    /// operator hunting for the pane's own ×.
+    ///
+    /// Drawn only where there is a checkout to ask about. eave has no
+    /// reviews to show for a loose page in Browse, and a control that is
+    /// there but does nothing is worse than one that is not there.
+    fn pulls_toggle(&self, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let cwd = self.pulls_cwd(cx)?;
+        let snapshot = self.strip_snapshot(cx);
+        let open = Self::pulls_tab_for(&snapshot, &cwd).is_some();
+        Some(
+            div()
+                .id("pulls-toggle")
+                .debug_selector(|| "pulls-toggle".into())
+                .flex_none()
+                .p(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_SELECT))
+                .hover_fade(
+                    "pulls-toggle",
+                    if open {
+                        theme::overlay()
+                    } else {
+                        theme::wash_rest()
+                    },
+                    theme::overlay(),
+                )
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_pulls_panel(cx)))
+                .child(icons::tagged_icon(
+                    icons::GIT_PULL_REQUEST,
+                    theme::ICON_TOGGLE,
+                    theme::text_secondary(),
+                    "pulls-toggle-glyph",
+                )),
+        )
+    }
+
+    /// Re-read this checkout's reviews. One control, on the panel's own
+    /// header, because a listing states when it was read and the only
+    /// honest way to make it newer is to ask again.
+    fn pulls_refresh(&self, cwd: &str, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let cwd = cwd.to_string();
+        Some(
+            div()
+                .id("pulls-refresh")
+                .debug_selector(|| "pulls-refresh".into())
+                .flex_none()
+                .p(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_SELECT))
+                .hover_fade("pulls-refresh", theme::wash_rest(), theme::overlay())
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // Forget that it was asked, and forget the answer:
+                    // holding the old rows while a new read is in flight
+                    // would leave the footer's "read 4m ago" under rows
+                    // that are about to change.
+                    this.asked_pulls.borrow_mut().remove(&cwd);
+                    this.pulls.update(cx, |store, cx| {
+                        store.by_cwd.remove(&cwd);
+                        cx.notify();
+                    });
+                }))
+                .child(icons::tagged_icon(
+                    icons::REFRESH,
+                    theme::ICON_TOGGLE,
+                    theme::text_secondary(),
+                    "pulls-refresh-glyph",
+                )),
+        )
+    }
+
+    /// Make sure a panel waiting on a read gets **one more paint**.
+    ///
+    /// `ask_pulls`'s retry runs from the render pass, and a render pass
+    /// only happens when something else changed — so a window sitting
+    /// still after a dropped command would stay on *reading reviews…*
+    /// until the operator moved the mouse. **Measured exactly that way
+    /// in the walk**: the panel was stuck until the pointer crossed it,
+    /// and then it filled in.
+    ///
+    /// One timer per tabs change, and it only notifies — the decision to
+    /// re-ask stays in `ask_pulls`, which is the one place that knows
+    /// whether an answer already arrived.
+    fn arm_pulls_wake(&self, snapshot: &eave_wire::TabsSnapshot, cx: &mut Context<Self>) {
+        let waiting = snapshot.tabs.iter().any(|t| {
+            matches!(&t.content, eave_wire::TabContent::Pulls { cwd }
+                if !self.pulls.read(cx).by_cwd.contains_key(cwd))
+        });
+        if !waiting {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(9))
+                .await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    /// The checkout this window would show reviews for.
+    fn pulls_cwd(&self, cx: &Context<Self>) -> Option<String> {
+        let selected = self.transcript.read(cx).session_id.clone();
+        let sessions = &self.sessions.read(cx).sessions;
+        let root_of = |s: &SessionInfo| s.checkout_root.clone().unwrap_or_else(|| s.cwd.clone());
+        selected
+            .as_deref()
+            .and_then(|sid| sessions.iter().find(|s| s.session_id == sid))
+            // **Falls back to the newest live session's checkout.** The
+            // rail is recency-ordered, so the first unarchived entry is
+            // the work most recently in hand.
+            .or_else(|| sessions.iter().find(|s| !s.archived))
+            .map(root_of)
+    }
+
+    /// The open review tab for a checkout, in this window's strip.
+    fn pulls_tab_for(snapshot: &eave_wire::TabsSnapshot, cwd: &str) -> Option<String> {
+        snapshot
+            .tabs
+            .iter()
+            .find(|t| matches!(&t.content, eave_wire::TabContent::Pulls { cwd: c } if c == cwd))
+            .map(|t| t.id.clone())
+    }
+
+    /// Open the review panel, or close it if it is already open.
+    fn toggle_pulls_panel(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.pulls_cwd(cx) else { return };
+        let snapshot = self.strip_snapshot(cx);
+        match Self::pulls_tab_for(&snapshot, &cwd) {
+            Some(tab) => self.close_tab(&tab, cx),
+            None => self.open_pulls_tab(cx),
+        }
+    }
+
+    /// View → Pull Requests: open a review list for the checkout the
+    /// selected session works in (Slice GH1).
+    ///
+    /// **The checkout root, not the session's `cwd`.** A session may be
+    /// started in a subdirectory, and reviews belong to the repository
+    /// rather than to the folder an agent happened to be pointed at —
+    /// the same key `Tool::Diff` uses, for the same reason. The `cwd` is
+    /// the fallback for a session eave has not resolved a root for,
+    /// because the engine resolves the repository from any path inside
+    /// the checkout anyway.
+    ///
+    /// Silently does nothing with no session selected. There is no
+    /// checkout to ask about, and opening an empty pane that says so
+    /// would be answering a question the operator did not ask.
+    fn open_pulls_tab(&mut self, cx: &mut Context<Self>) {
+        let selected = self.transcript.read(cx).session_id.clone();
+        let root_of = |s: &SessionInfo| s.checkout_root.clone().unwrap_or_else(|| s.cwd.clone());
+        let Some(cwd) = ({
+            let sessions = &self.sessions.read(cx).sessions;
+            selected
+                .as_deref()
+                .and_then(|sid| sessions.iter().find(|s| s.session_id == sid))
+                // **Falls back to the newest live session's checkout.**
+                // The rail is recency-ordered, so the first unarchived
+                // entry is the work most recently in hand. A menu item
+                // that silently does nothing is indistinguishable from
+                // one that is broken, and with no session selected the
+                // operator still meant *this repository*.
+                .or_else(|| sessions.iter().find(|s| !s.archived))
+                .map(root_of)
+        }) else {
+            return;
+        };
+        // Already open for this checkout in this window? Bring it
+        // forward instead of minting a second one — two panes reading
+        // one repository is two round trips answering the same question.
+        let snapshot = self.strip_snapshot(cx);
+        if let Some(tab) = snapshot.tabs.iter().find(|t| {
+            matches!(&t.content, eave_wire::TabContent::Pulls { cwd: c } if *c == cwd)
+        }) {
+            let id = tab.id.clone();
+            self.activate_tab(&id, cx);
+            return;
+        }
+        // **It opens as a PANEL, not as the well.** The operator's
+        // ruling: *"we also need to panel it … not just a panel on the
+        // home page"*. The reference keeps reviews in a right-hand
+        // column beside the work, and eave already has that shape — a
+        // pane in the well's tree (Slice DG2) — so the tab is docked
+        // right of whatever is on screen rather than replacing it. That
+        // buys the divider, the resize, the ×, the canvas and the
+        // persistence with no panel code at all.
+        //
+        // The host is read NOW, because by the time the tab arrives the
+        // active tab may be the new one.
+        if let Some(host) = snapshot.active.clone() {
+            *self.pending_pulls_dock.borrow_mut() = Some((cwd.clone(), host));
+        }
+        let _ = self.commands.send(Command::Browser(BrowserCmd::OpenPulls {
+            window: Some(self.window_key.clone()),
+            cwd,
+        }));
+    }
+
+    /// Dock a review tab the engine has just minted, right of the pane it
+    /// was opened from. Runs from the tabs observer beside
+    /// `settle_popup_split`, which is the same problem and the same fix.
+    fn settle_pulls_panel(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.strip_snapshot(cx);
+        if snapshot.tabs.is_empty() {
+            return;
+        }
+        self.arm_pulls_wake(&snapshot, cx);
+        let Some((cwd, host)) = self.pending_pulls_dock.borrow().clone() else {
+            return;
+        };
+        let Some(tab) = Self::pulls_tab_for(&snapshot, &cwd) else {
+            return;
+        };
+        *self.pending_pulls_dock.borrow_mut() = None;
+        if !snapshot.tabs.iter().any(|t| t.id == host) || host == tab {
+            return;
+        }
+        // A well with no room refuses on every door and this is one —
+        // room, not a count (Slice DG3's `split_accepts`). A refused
+        // panel still leaves the tab open and full-well, which is a
+        // worse arrangement than the operator asked for but never a
+        // lost one.
+        if !self.split_accepts(
+            dock::DockTarget::Pane {
+                id: host.clone(),
+                edge: DropEdge::Right,
+            },
+            &tab,
+            cx,
+        ) {
+            return;
+        }
+        match self.split_of(&host) {
+            Some(ix) => {
+                self.splits[ix]
+                    .root
+                    .insert_beside(&host, &tab, DropEdge::Right);
+                self.splits[ix].root.tidy();
+            }
+            None => self.splits.push(Split::pair(host, tab.clone(), false)),
+        }
+        self.persist_splits();
+        self.activate_tab(&tab, cx);
+    }
+
+    /// The review list for `tab_id`, when that tab is one.
+    ///
+    /// **The one place that decides, and all three well paths call it.**
+    /// eave's well has three render paths, not two — `split_pane` when
+    /// the well is split, `column_body` on the canvas, and `render`'s own
+    /// branch when it is neither — and DG2's report records that the
+    /// canvas one was invisible to a whole slice's worth of work because
+    /// nobody counted it. A surface added to one of them is a surface
+    /// that vanishes when the operator changes layout.
+    fn pulls_for_tab(
+        &self,
+        tab_id: &str,
+        snapshot: &eave_wire::TabsSnapshot,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let cwd = snapshot
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| match &t.content {
+                eave_wire::TabContent::Pulls { cwd } => Some(cwd.clone()),
+                _ => None,
+            })?;
+        Some(self.pulls_el(&cwd, cx))
+    }
+
+    /// Fire one listing for this checkout, and again if no answer comes.
+    ///
+    /// The retry is a **floor on how often**, not a poll: it only runs
+    /// from a paint, and a paint only happens when something else has
+    /// already changed. Nothing here spins.
+    fn ask_pulls(&self, cwd: &str) {
+        /// Long enough that a slow network is not re-asked over the top
+        /// of itself, short enough that a dropped command is a pause
+        /// rather than a dead panel.
+        const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+        {
+            let mut asked = self.asked_pulls.borrow_mut();
+            if asked
+                .get(cwd)
+                .is_some_and(|at| at.elapsed() < RETRY_AFTER)
+            {
+                return;
+            }
+            asked.insert(cwd.to_string(), std::time::Instant::now());
+        }
+        let _ = self.commands.send(Command::Browser(BrowserCmd::Pulls {
+            cwd: cwd.to_string(),
+        }));
+    }
+
+    /// The rows, grouped into stacks by [`crate::pull_requests`].
+    fn pulls_rows(&self, snap: &eave_wire::PullsSnapshot, cx: &Context<Self>) -> AnyElement {
+        let lines = crate::pull_requests::lines(&snap.rows);
+        let mine = crate::pull_requests::mine(&snap.rows, snap.checkout_branch.as_deref());
+        div()
+            .id("pulls-list")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .children(lines.into_iter().map(|line| {
+                self.pulls_row(&snap.rows[line.row], &line, mine == Some(line.row), cx)
+            }))
+            .into_any_element()
+    }
+
+    /// A stated absence — never an empty list.
+    fn pulls_note(&self, headline: &str, detail: Option<String>) -> AnyElement {
+        div()
+            .debug_selector(|| "pulls-note".into())
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(theme::SPACE_1))
+            .child(
+                div()
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(theme::text_secondary())
+                    .child(SharedString::from(headline.to_string())),
+            )
+            .children(detail.map(|d| {
+                div()
+                    .text_size(px(theme::DETAIL_SIZE))
+                    .line_height(px(theme::DETAIL_LINE))
+                    .text_color(theme::text_tertiary())
+                    .child(SharedString::from(d))
+            }))
+            .into_any_element()
+    }
+
+    /// Why there is no listing, in the operator's next action.
+    ///
+    /// **Every one of these names what to do.** A pane that says only
+    /// "could not read reviews" has told an operator nothing they could
+    /// not see; the whole point of [`eave_wire::PullsState`] carrying
+    /// separate variants is that each of them has a different answer.
+    fn pulls_refusal(&self, state: &eave_wire::PullsState) -> AnyElement {
+        let (headline, detail) = match state {
+            eave_wire::PullsState::CliMissing { searched } => (
+                "The GitHub CLI is not installed.".to_string(),
+                Some(format!(
+                    "eave looked in {} place{}. Install `gh`, or set EAVE_GH_BIN to where it is.",
+                    searched.len(),
+                    if searched.len() == 1 { "" } else { "s" }
+                )),
+            ),
+            eave_wire::PullsState::SignedOut { host } => (
+                format!("Not signed in to {host}."),
+                Some("Run `gh auth login` and open this again.".to_string()),
+            ),
+            eave_wire::PullsState::NotARepo => (
+                "This folder is not a git checkout.".to_string(),
+                None,
+            ),
+            // The walk's finding: on macOS an app is refused the
+            // Desktop, Documents and Downloads folders until the
+            // operator grants it Files and Folders access, and that
+            // refusal used to be reported as "not a git checkout".
+            eave_wire::PullsState::Unreadable { path, why } => (
+                "eave cannot read this folder.".to_string(),
+                Some(format!(
+                    "{path} — {why}. On macOS this is usually Files and Folders                      access: System Settings → Privacy & Security → Files and Folders."
+                )),
+            ),
+            eave_wire::PullsState::NoRemote => (
+                "This checkout has no GitHub remote.".to_string(),
+                Some("Reviews live on a remote; a local-only repository has none.".to_string()),
+            ),
+            eave_wire::PullsState::UnsupportedHost { host } => (
+                format!("eave cannot read reviews on {host} yet."),
+                Some("Only github.com is wired up so far.".to_string()),
+            ),
+            // The CLI's own sentence, verbatim — a rate limit, an
+            // outage and a repository this account cannot see are three
+            // different problems and `gh` writes all three.
+            eave_wire::PullsState::Error { message } => {
+                ("GitHub did not answer.".to_string(), Some(message.clone()))
+            }
+            eave_wire::PullsState::Ok => ("No open pull requests.".to_string(), None),
+        };
+        self.pulls_note(&headline, detail)
+    }
+
+    /// `4 open · pingdotgg/t3code · read 2m ago`, and the refresh.
+    ///
+    /// **States when it was read rather than claiming to be live.** A
+    /// listing is stale the instant it is taken; the reference's own
+    /// footer says `synced just now` for the same reason.
+    fn pulls_footer(&self, snap: Option<&eave_wire::PullsSnapshot>) -> AnyElement {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = snap {
+            if matches!(s.state, eave_wire::PullsState::Ok) {
+                parts.push(format!(
+                    "{} open",
+                    s.rows.len()
+                ));
+            }
+            if let Some(repo) = &s.repo {
+                parts.push(repo.slug());
+            }
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+                .saturating_sub(s.read_ms);
+            parts.push(match coarse_age(age) {
+                Some(a) => format!("read {a} ago"),
+                None => "read just now".to_string(),
+            });
+        }
+        div()
+            .debug_selector(|| "pulls-footer".into())
+            .flex_none()
+            .h(px(theme::DETAIL_LINE + theme::SPACE_3))
+            .px(px(theme::SPACE_3))
+            .border_t_1()
+            .border_color(theme::card_border())
+            .flex()
+            .items_center()
+            .text_size(px(theme::DETAIL_SIZE))
+            .text_color(theme::text_tertiary())
+            .child(SharedString::from(parts.join(" · ")))
+            .into_any_element()
+    }
+}
+
+/// How far one stack layer steps in, in pixels.
+///
+/// The indent is the only thing that says a review sits ON another one,
+/// so it has to survive a twelve-layer stack without pushing the title
+/// off the row: twelve layers is 132 px of a pane that may be 400 wide.
+/// Ten points reads as a step and leaves the title its room.
+const PULLS_INDENT: f32 = 10.0;
+
+/// The glyph and ink a review's state is drawn in (Slice GH1).
+///
+/// **GitHub's vocabulary, because these rows are GitHub's.** An operator
+/// reading a review list already knows green-open / purple-merged /
+/// red-closed from the site, and a draft reads as unfinished by its
+/// BROKEN SHAFT rather than by a fifth colour. Glyph and ink move
+/// together — the state is legible with no colour at all, which is what
+/// keeps it legible for an operator who cannot separate the two hues.
+fn review_mark(state: eave_wire::PullState) -> (&'static str, gpui::Hsla, &'static str) {
+    match state {
+        eave_wire::PullState::Open => (icons::GIT_PULL_REQUEST, theme::review_open(), "open"),
+        eave_wire::PullState::Draft => {
+            (icons::GIT_PULL_REQUEST_DRAFT, theme::review_draft(), "draft")
+        }
+        eave_wire::PullState::Merged => (icons::GIT_MERGE, theme::review_merged(), "merged"),
+        eave_wire::PullState::Closed => {
+            (icons::GIT_PULL_REQUEST_CLOSED, theme::review_closed(), "closed")
+        }
+    }
+}
+
+impl Shell {
+/// **A review opens as a page** (Slice GH1).
+///
+/// eave is a browser, so the thing a review list is a list OF is already
+/// something this app can show. Until there is a detail panel this is
+/// the whole of "and then what?", and it is not a placeholder for one:
+/// the review on github.com is the authoritative view of a review, and
+/// opening it in a tab beside the panel is what the operator would do
+/// with the link anyway.
+fn open_review(&mut self, url: String, cx: &mut Context<Self>) {
+    let _ = self.commands.send(Command::Browser(BrowserCmd::OpenAt {
+        url,
+        activate: true,
+        incognito: false,
+        window: Some(self.window_key.clone()),
+    }));
+    cx.notify();
+}
+
+/// One review, two lines — the reference's own row.
+fn pulls_row(
+    &self,
+    pr: &eave_wire::PullRequest,
+    line: &crate::pull_requests::Line,
+    mine: bool,
+    cx: &Context<Self>,
+) -> AnyElement {
+    let (glyph, ink, state_tag) = review_mark(pr.state);
+    let number = pr.number;
+
+    // The gutter: the state glyph, indented one step per layer. **The
+    // indent lives here and not on the text**, so a twelve-layer stack
+    // steps its marks across the gutter and every title still starts on
+    // one column — which is what makes the list readable down its left
+    // edge instead of turning into a staircase of prose.
+    let gutter = div()
+        .debug_selector(move || format!("pulls-gutter-{number}"))
+        .flex_none()
+        .ml(px(PULLS_INDENT * line.depth as f32))
+        .pt(px(1.))
+        .child(icons::tagged_icon(
+            glyph,
+            theme::ICON_SM,
+            ink,
+            format!("pulls-mark-{state_tag}-{number}"),
+        ));
+
+    // Line one: the number, the title, the checks, the size of the change.
+    let head = div()
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACE_1))
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme::text_tertiary())
+                .child(SharedString::from(format!("#{number}"))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(theme::text())
+                .font_weight(theme::WEIGHT_LABEL)
+                .child(SharedString::from(pr.title.clone())),
+        )
+        .children(checks_mark(pr.checks))
+        // **The two halves of a diffstat are two colours**, as everywhere
+        // else a diff is drawn in this app and on the site these came
+        // from. `coarse_lines` is the rail's own four-character rule, so
+        // a review with a six-figure diff cannot push the title out.
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme::success())
+                .child(SharedString::from(format!("+{}", coarse_lines(pr.additions)))),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme::danger())
+                .child(SharedString::from(format!("−{}", coarse_lines(pr.deletions)))),
+        );
+
+    // Line two: the stack badge, who, which branches, and how long ago.
+    let age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        .saturating_sub(pr.updated_ms);
+    let mut meta: Vec<String> = Vec::new();
+    if pr.state != eave_wire::PullState::Open {
+        meta.push(pr.state.word().to_string());
+    }
+    if let Some(author) = &pr.author {
+        meta.push(author.clone());
+    }
+    meta.push(format!("{} → {}", pr.head, pr.base));
+
+    let foot = div()
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACE_1))
+        .text_color(theme::text_tertiary())
+        // The stack's size, on its bottom layer and nowhere else — twelve
+        // rows each saying "12" says once-true twelve times.
+        .children(line.stack.map(|stack| {
+            div()
+                .debug_selector(move || format!("pulls-stack-{number}"))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(theme::SPACE_HALF))
+                .child(icons::icon(
+                    icons::LAYERS,
+                    theme::ICON_STATUS,
+                    theme::text_tertiary(),
+                ))
+                .child(SharedString::from(stack.size.to_string()))
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .child(SharedString::from(meta.join(" · "))),
+        )
+        .children(coarse_age(age).map(|a| div().flex_none().child(SharedString::from(a))));
+
+    let body = div()
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .child(head)
+        .child(foot);
+
+    let url = pr.url.clone();
+    div()
+        .id(SharedString::from(format!("pulls-row-{number}")))
+        .debug_selector(move || format!("pulls-row-{number}"))
+        .flex_none()
+        // A row is a control: it says so under the pointer and it opens
+        // the review. `hover_fade`, never the snapping form — this
+        // file's own source guard refuses that one by name, and it
+        // counts the SOURCE TEXT, so even a comment quoting the spelling
+        // it forbids fails the test. (It did.)
+        .cursor_pointer()
+        .hover_fade(
+            format!("pulls-row-{number}"),
+            theme::wash_rest(),
+            theme::overlay(),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.open_review(url.clone(), cx)))
+        .px(px(theme::SPACE_3))
+        .py(px(theme::SPACE_1))
+        .flex()
+        .flex_row()
+        .gap(px(theme::SPACE_2))
+        .items_start()
+        .text_size(px(theme::DETAIL_SIZE))
+        .line_height(px(theme::DETAIL_LINE))
+        // The review for the branch this checkout is on. **A left bar,
+        // not a fill**: the list is read down its left edge, and a wash
+        // behind one row of twelve reads as selection — which this is
+        // not. Nothing here is selected.
+        .when(mine, |d| {
+            d.border_l_2()
+                .border_color(theme::accent_bar())
+                .debug_selector(|| "pulls-row-mine".into())
+        })
+        .child(gutter)
+        .child(body)
+        .into_any_element()
+}
+}
+
+/// The check rollup as one mark.
+///
+/// **[`ChecksState::None`] draws nothing at all**, and that is the whole
+/// point of the variant: a head nobody has run anything against must not
+/// wear the mark of one that passed. Returns an `Option` rather than an
+/// empty box so the row's `gap` does not reserve space for a mark that
+/// is not there.
+fn checks_mark(state: eave_wire::ChecksState) -> Option<AnyElement> {
+    let (glyph, color, tag) = match state {
+        eave_wire::ChecksState::Passing => {
+            (icons::CHECK_CIRCLE, theme::success(), "passing")
+        }
+        eave_wire::ChecksState::Failing => (icons::CLOSE_CIRCLE, theme::danger(), "failing"),
+        // A ring with nothing in it: running, and not yet either answer.
+        eave_wire::ChecksState::Pending => (icons::STATUS_MODIFIED, theme::warning(), "pending"),
+        eave_wire::ChecksState::None => return None,
+    };
+    Some(
+        icons::tagged_icon(glyph, theme::ICON_STATUS, color, format!("pulls-checks-{tag}"))
+            .flex_none()
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]
@@ -37591,6 +38588,44 @@ mod tests {
         assert!(!Left.after() && !Top.after());
         assert!(Top.vertical() && Bottom.vertical());
         assert!(!Left.vertical() && !Right.vertical());
+    }
+
+    /// **Every writer of `frame.json` ends it with a real newline.**
+    ///
+    /// `frame_prefs_path()` answers `None` in every test by construction
+    /// — "nothing when the process never called `run`, which is every
+    /// test" — so the file write itself is unreachable from this suite.
+    /// That is how `save_splits` came to write `text + <an escaped
+    /// newline>`: the two characters `\` and `n`, beside eight siblings
+    /// writing one. The file it produced was **invalid JSON**, and every
+    /// reader of it silently fell back to defaults: splits did not
+    /// persist (SP1's headline), the layout mode did not persist (CV1's),
+    /// and because each writer re-reads the document before writing it,
+    /// every save started from an empty object and dropped every other
+    /// key the file held.
+    ///
+    /// The round-trip test below passed throughout, because it exercises
+    /// `put_splits` and `get_splits` on a `Value` and never the bytes.
+    /// **A test of the pure half is not a test of the writer** — the
+    /// same shape as the terminal cell that was guarded by a re-spelled
+    /// formula rather than by the constant the grid divided by.
+    ///
+    /// The needle is built at runtime, because spelling it out here
+    /// would make this test match itself.
+    #[test]
+    fn nothing_ends_frame_json_with_an_escaped_newline() {
+        let src = include_str!("ui.rs");
+        let bad = format!("text + {:?}", "\\n");
+        assert_eq!(
+            src.matches(&bad).count(),
+            0,
+            "a writer of frame.json is ending it with the characters \\ and n, \
+             which makes the file invalid JSON and silently resets every \
+             preference in it"
+        );
+        // And the good form is still there, so this cannot pass by the
+        // writers having been renamed out from under it.
+        assert!(src.matches("text + \"\\n\"").count() >= 8);
     }
 
     #[test]

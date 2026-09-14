@@ -594,6 +594,18 @@ fn is_executable_file(p: &Path) -> bool {
 /// That is why a launch eave believed would work still gets a stated
 /// refusal from the engine rather than an assumption from the app.
 pub fn resolve_program_uncached(entry: &CatalogEntry) -> ProgramResolution {
+    resolve_spec(&entry.program, &program_override_var(entry.id))
+}
+
+/// [`resolve_program_uncached`] for a binary that is not a provider.
+///
+/// **Extracted rather than copied** (Slice GH1, which needs `gh`). The
+/// order above — override alone, then `PATH`, then the fallbacks — is a
+/// rule about this machine, not about agents, and the reason eave finds
+/// a CLI that a Finder-launched app otherwise cannot is that this
+/// function exists once. A second copy for a second binary is how the
+/// two drift until only one of them knows about `~/.local/bin`.
+pub fn resolve_spec(spec: &ProgramSpec, override_var: &str) -> ProgramResolution {
     let mut searched = Vec::new();
 
     // An override is AUTHORITATIVE, not a first guess. If an operator
@@ -601,13 +613,13 @@ pub fn resolve_program_uncached(entry: &CatalogEntry) -> ProgramResolution {
     // path as missing rather than quietly running a different copy it
     // found on `PATH` — the quiet substitution this codebase refuses
     // everywhere else (`reject_config_change` is the same principle).
-    if let Some(p) = std::env::var_os(program_override_var(entry.id)).filter(|p| !p.is_empty()) {
+    if let Some(p) = std::env::var_os(override_var).filter(|p| !p.is_empty()) {
         let p = PathBuf::from(p);
         return if is_executable_file(&p) {
             ProgramResolution::Found(p)
         } else {
             ProgramResolution::NotInstalled {
-                bin: entry.program.bin,
+                bin: spec.bin,
                 searched: vec![p],
             }
         };
@@ -616,8 +628,7 @@ pub fn resolve_program_uncached(entry: &CatalogEntry) -> ProgramResolution {
     let path_dirs = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
-    let extra = entry
-        .program
+    let extra = spec
         .also_look_in
         .iter()
         .chain(COMMON_BIN_DIRS)
@@ -627,7 +638,7 @@ pub fn resolve_program_uncached(entry: &CatalogEntry) -> ProgramResolution {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = dir.join(entry.program.bin);
+        let candidate = dir.join(spec.bin);
         if searched.contains(&candidate) {
             continue;
         }
@@ -638,7 +649,7 @@ pub fn resolve_program_uncached(entry: &CatalogEntry) -> ProgramResolution {
     }
 
     ProgramResolution::NotInstalled {
-        bin: entry.program.bin,
+        bin: spec.bin,
         searched,
     }
 }

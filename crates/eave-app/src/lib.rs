@@ -64,6 +64,7 @@ mod composer;
 /// `composer`, and for its reason: the pieces that can be named without a
 /// `Shell`, kept out of `ui.rs`.
 mod popup_sheet;
+pub mod pull_requests;
 
 /// The overlay layer (Slice P1): the anchored popover surface, the
 /// `Popup` state machine and the menu-row primitive. Private for the same

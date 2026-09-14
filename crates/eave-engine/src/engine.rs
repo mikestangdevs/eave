@@ -3273,6 +3273,15 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
             Request::HistoryQuery { typed, limit } => {
                 ok_value(&engine.browser.history_query(&typed, limit))
             }
+            // Slice GH1. No engine state is touched and nothing is
+            // journalled: a listing is a question about a remote, and
+            // the answer is stale the moment it is given — caching it in
+            // the engine would mean deciding when to invalidate a fact
+            // eave does not own.
+            Request::Pulls { cwd, limit } => {
+                let limit = limit.unwrap_or(crate::github::DEFAULT_LIMIT);
+                ok_value(&crate::github::pulls(std::path::Path::new(&cwd), limit).await)
+            }
             Request::TabOpen {
                 window,
                 url,

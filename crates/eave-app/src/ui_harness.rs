@@ -6787,6 +6787,47 @@ fn session_tab(session_id: &str) -> TabInfo {
     }
 }
 
+/// One review-list tab (Slice GH1).
+fn pulls_tab(id: &str, cwd: &str) -> TabInfo {
+    TabInfo {
+        id: id.into(),
+        group: None,
+        pinned: false,
+        content: eave_wire::TabContent::Pulls { cwd: cwd.into() },
+        url: None,
+        title: None,
+        favicon_url: None,
+        load: eave_wire::LoadState::Unloaded,
+        pending: None,
+        can_go_back: false,
+        can_go_forward: false,
+        history_len: 0,
+        opener: None,
+        incognito: false,
+        window: None,
+        created_ts_ms: 0,
+    }
+}
+
+/// One review, at the level of detail a row draws.
+fn review(number: u64, head: &str, base: &str, updated_ms: u64) -> eave_wire::PullRequest {
+    eave_wire::PullRequest {
+        number,
+        title: format!("review {number}"),
+        state: eave_wire::PullState::Open,
+        head: head.into(),
+        base: base.into(),
+        author: Some("someone".into()),
+        additions: 10,
+        deletions: 2,
+        changed_files: 1,
+        updated_ms,
+        url: format!("https://github.com/o/r/pull/{number}"),
+        checks: eave_wire::ChecksState::Passing,
+        stack: None,
+    }
+}
+
 /// One page tab.
 fn page_tab(id: &str, url: Option<&str>, title: Option<&str>) -> TabInfo {
     TabInfo {
@@ -25001,6 +25042,218 @@ fn a_hung_pane_in_a_split_says_so_too(cx: &mut TestAppContext) {
 /// A tab going away takes its hang with it. A reused id inheriting one
 /// would draw a danger panel over a page that is perfectly well, and
 /// nothing on screen would explain it.
+
+/// Slice GH1 — the review list draws its rows, and a stack indents.
+///
+/// The whole surface is asserted through the plumbing rather than through
+/// a live `gh`: `push_pulls` is the seam the pump folds, so this is the
+/// same path a real listing takes and needs no network, no GitHub and no
+/// checkout.
+#[gpui::test]
+fn a_review_list_draws_its_stack_bottom_first(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    strip_tabs(&h, vcx, vec![pulls_tab("gh", "/repo")], Some("gh"));
+
+    // Opening the pane asks for the listing exactly once, however many
+    // times it repaints — a paint may not spend a network round trip.
+    let asks = h
+        .drain()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c,
+                crate::ui::Command::Browser(crate::ui::BrowserCmd::Pulls { cwd }) if cwd == "/repo"
+            )
+        })
+        .count();
+    assert_eq!(asks, 1, "the pane asked {asks} times for one listing");
+
+    // A native stack of two, arriving newest-first the way GitHub orders
+    // an updated-at listing: the TOP layer comes back before the one it
+    // sits on.
+    let mut top = review(11696, "docs/standalone", "cli/restart", 900);
+    top.stack = Some(eave_wire::StackRef { number: 11703, size: 2, position: 2 });
+    let mut bottom = review(11702, "cli/restart", "main", 100);
+    bottom.stack = Some(eave_wire::StackRef { number: 11703, size: 2, position: 1 });
+    h.plumbing.push_pulls((
+        "/repo".to_string(),
+        eave_wire::PullsSnapshot {
+            repo: Some(eave_wire::RepoId {
+                host: "github.com".into(),
+                owner: "o".into(),
+                name: "r".into(),
+            }),
+            rows: vec![top, bottom, review(500, "solo", "main", 400)],
+            state: eave_wire::PullsState::Ok,
+            read_ms: 0,
+            checkout_branch: Some("solo".into()),
+        },
+    ));
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "pulls"), "the review pane drew nothing");
+    // The GUTTER is what steps in — the row spans the pane so its hit
+    // area does not shrink with depth, and every title still starts on
+    // one column however deep the stack goes.
+    let bottom_b = vcx.debug_bounds("pulls-gutter-11702").expect("bottom layer");
+    let top_b = vcx.debug_bounds("pulls-gutter-11696").expect("top layer");
+    let solo_b = vcx.debug_bounds("pulls-gutter-500").expect("the unstacked review");
+
+    // **Depth is topology, not time.** The bottom layer is older and sits
+    // FLUSH; the newer layer above it indents. Reading these by y would
+    // pass with the stack upside down, so the x is what is asserted.
+    assert!(
+        top_b.origin.x > bottom_b.origin.x,
+        "the layer above did not indent: top {top_b:?} bottom {bottom_b:?}"
+    );
+    // And the stack outranks a review newer than its own bottom layer,
+    // because a chain is as recent as its most recent layer.
+    assert!(
+        bottom_b.origin.y < solo_b.origin.y,
+        "the stack did not float on its newest layer"
+    );
+    // The checks rollup draws its own mark, and `Passing` is not the
+    // absence of one.
+    assert!(shown(vcx, "pulls-checks-passing"), "no check mark drawn");
+    // Each review wears its own state's glyph, and the stack's size sits
+    // on the bottom layer only.
+    assert!(shown(vcx, "pulls-mark-open-11702"), "no state glyph");
+    assert!(shown(vcx, "pulls-stack-11702"), "no stack badge on the bottom layer");
+    assert!(
+        !shown(vcx, "pulls-stack-11696"),
+        "the layer above repeated the stack's size"
+    );
+    assert!(shown(vcx, "pulls-footer"), "no footer");
+    // The checkout is on `solo`, so that review — and no other — is
+    // marked as this session's own.
+    assert!(
+        shown(vcx, "pulls-row-mine"),
+        "the review for the branch this checkout is on was not marked"
+    );
+}
+
+/// Slice GH1 — the review list opens as a PANEL beside the work.
+///
+/// The operator's ruling after seeing it take the whole well: *"we also
+/// need to panel it … not just a panel on the home page"*. It docks
+/// right of whatever was on screen, which is a pane in the well's tree
+/// (Slice DG2) and therefore resizable, closeable and persisted with no
+/// panel machinery of its own.
+#[gpui::test]
+fn the_review_list_docks_beside_the_work_rather_than_replacing_it(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut info = session("s1");
+    info.checkout_root = Some("/repo".into());
+    h.plumbing.push_rail(vec![info]);
+    strip_tabs(&h, vcx, vec![page_tab("p1", Some("https://a.test/"), Some("A"))], Some("p1"));
+
+    h.window
+        .update(vcx, |shell, _, cx| shell.open_pulls_tab(cx))
+        .unwrap();
+    // The engine mints the id, so nothing can be placed yet — the ask is
+    // a note, and the tab has not arrived.
+    let asked = h.drain().into_iter().any(|c| {
+        matches!(
+            c,
+            crate::ui::Command::Browser(crate::ui::BrowserCmd::OpenPulls { cwd, .. }) if cwd == "/repo"
+        )
+    });
+    assert!(asked, "opening the panel asked for no tab");
+
+    // Now the engine answers with the tab, exactly as the observer sees it.
+    strip_tabs(
+        &h,
+        vcx,
+        vec![
+            page_tab("p1", Some("https://a.test/"), Some("A")),
+            pulls_tab("gh", "/repo"),
+        ],
+        Some("gh"),
+    );
+
+    // Both panes are on screen: the page kept its place and the reviews
+    // took a share beside it. A panel that replaced the well would leave
+    // exactly one of these drawn.
+    h.window
+        .update(vcx, |shell, _, _| {
+            let split = shell
+                .splits
+                .iter()
+                .find(|s| s.panes().iter().any(|p| p == "gh"))
+                .expect("the review tab was never docked");
+            let panes = split.panes();
+            assert!(panes.iter().any(|p| p == "p1"), "the work fell out: {panes:?}");
+            // Right of the work, not left: the operator keeps the
+            // position they were already reading in.
+            assert_eq!(panes.last().map(String::as_str), Some("gh"), "{panes:?}");
+        })
+        .unwrap();
+}
+
+/// Slice GH1 — a review list TAKES the well.
+///
+/// **This is the walk's defect.** A review list is neither a page nor a
+/// chat, so every transcript-only surface went on mounting over it: the
+/// list drew correctly and the composer sat across the middle of it,
+/// with all 1332 tests green. Geometry assertions could not see it
+/// because nothing about the list itself was wrong.
+#[gpui::test]
+fn a_review_list_takes_the_well_from_the_launcher(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(&h, vcx, vec![pulls_tab("gh", "/repo")], Some("gh"));
+    h.plumbing.push_pulls((
+        "/repo".to_string(),
+        eave_wire::PullsSnapshot {
+            repo: None,
+            rows: vec![review(1, "a", "main", 0)],
+            state: eave_wire::PullsState::Ok,
+            read_ms: 0,
+            checkout_branch: None,
+        },
+    ));
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "pulls-row-1"), "the list did not draw");
+    assert!(
+        !shown(vcx, "launcher"),
+        "the launcher mounted over the review list"
+    );
+    assert!(
+        !shown(vcx, "composer-hint"),
+        "the composer mounted over the review list"
+    );
+}
+
+/// Slice GH1 — a refusal says which one it is, and what to do.
+///
+/// The failure this guards is an empty list drawn over a signed-out
+/// `gh`: "no open pull requests" is a sentence about the repository and
+/// would be flatly false.
+#[gpui::test]
+fn a_signed_out_cli_says_so_rather_than_drawing_an_empty_list(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    strip_tabs(&h, vcx, vec![pulls_tab("gh", "/repo")], Some("gh"));
+    h.plumbing.push_pulls((
+        "/repo".to_string(),
+        eave_wire::PullsSnapshot::stated(
+            eave_wire::PullsState::SignedOut {
+                host: "github.com".into(),
+            },
+            0,
+        ),
+    ));
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "pulls"), "the pane vanished on a refusal");
+    assert!(
+        shown(vcx, "pulls-note"),
+        "a refused read drew no note at all"
+    );
+    // Nothing that looks like a listing: no rows, and no check mark that
+    // could read as a green tick over a read that never happened.
+    assert!(!shown(vcx, "pulls-checks-passing"));
+}
+
 #[gpui::test]
 fn a_closed_tab_does_not_hand_its_hang_to_the_next_one(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);

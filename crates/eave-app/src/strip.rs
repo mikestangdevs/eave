@@ -123,6 +123,11 @@ pub struct SessionChip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabKind {
     Page,
+    /// The open reviews on a repository (Slice GH1). `slug` is
+    /// `owner/name` once a read has named it, and `None` before the
+    /// first one answers — a tab that guessed a name off the directory
+    /// would be labelling a repository it has not confirmed.
+    Pulls { slug: Option<String> },
     /// A view onto a session. `chip` is `None` when the rail has no such
     /// session — see [`ORPHAN_SESSION_LABEL`].
     Session {
@@ -140,6 +145,12 @@ pub enum TabKind {
 /// string nobody chose on the strip, which the operator ruled against for
 /// rail rows (Slice AO) and again for session tabs (Slice AS).
 pub const ORPHAN_SESSION_LABEL: &str = "session";
+
+/// What a review-list tab says. Named for what it holds rather than for
+/// the repository, because the repository is not known until the first
+/// read answers and a label that changes under the operator is worse
+/// than one that never claimed to be specific.
+pub const PULLS_TAB_LABEL: &str = "Pull requests";
 
 /// What a page tab says before it has been anywhere.
 pub const NEW_TAB_LABEL: &str = "New Chat";
@@ -426,6 +437,11 @@ fn strip_tab(
             let (label, placeholder) = page_label(info);
             (TabKind::Page, label, placeholder)
         }
+        TabContent::Pulls { .. } => (
+            TabKind::Pulls { slug: None },
+            PULLS_TAB_LABEL.to_string(),
+            false,
+        ),
         TabContent::Session { session_id } => {
             let chip = sessions.get(session_id).cloned();
             let (label, placeholder) = match &chip {
@@ -447,7 +463,9 @@ fn strip_tab(
     // recede every session row in a build with no Chromium in it.
     let resident = match &info.content {
         TabContent::Page => resident(&info.id),
-        TabContent::Session { .. } => true,
+        // Neither a session nor a review list has a browser behind it,
+        // so neither is ever "unloaded".
+        TabContent::Session { .. } | TabContent::Pulls { .. } => true,
     };
     StripTab {
         id: info.id.clone(),
@@ -468,11 +486,11 @@ fn strip_tab(
         pinned: info.pinned,
         favicon_url: match &info.content {
             TabContent::Page => info.favicon_url.clone(),
-            TabContent::Session { .. } => None,
+            TabContent::Session { .. } | TabContent::Pulls { .. } => None,
         },
         url: match &info.content {
             TabContent::Page => info.url.clone(),
-            TabContent::Session { .. } => None,
+            TabContent::Session { .. } | TabContent::Pulls { .. } => None,
         },
         run,
         incognito: info.incognito,
@@ -557,7 +575,7 @@ pub fn sessions_without_tabs(snapshot: &TabsSnapshot, rail_order: &[String]) -> 
         .iter()
         .filter_map(|t| match &t.content {
             TabContent::Session { session_id } => Some((session_id.as_str(), ())),
-            TabContent::Page => None,
+            TabContent::Page | TabContent::Pulls { .. } => None,
         })
         .collect();
     rail_order
@@ -589,7 +607,7 @@ pub fn active_session(snapshot: &TabsSnapshot) -> Option<String> {
         .find(|t| t.id == active)
         .and_then(|t| match &t.content {
             TabContent::Session { session_id } => Some(session_id.clone()),
-            TabContent::Page => None,
+            TabContent::Page | TabContent::Pulls { .. } => None,
         })
 }
 

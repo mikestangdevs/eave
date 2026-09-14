@@ -791,6 +791,22 @@ impl Client {
         .await
     }
 
+    /// Every open review on the repository `cwd` belongs to (Slice GH1).
+    ///
+    /// One call crosses a network, so this is driven by an operator
+    /// asking — opening the pane, or its refresh — and never by a paint.
+    pub async fn pulls(
+        &self,
+        cwd: &str,
+        limit: Option<usize>,
+    ) -> Result<eave_wire::PullsSnapshot, ClientError> {
+        self.request::<eave_wire::PullsSnapshot>(Request::Pulls {
+            cwd: cwd.into(),
+            limit,
+        })
+        .await
+    }
+
     /// File a parsed import from another browser.
     pub async fn browser_import(
         &self,

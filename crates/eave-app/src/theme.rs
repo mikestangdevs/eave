@@ -1548,6 +1548,43 @@ pub fn danger() -> Hsla {
     }
 }
 
+/// A review's state, in **GitHub's own colour language** (Slice GH1):
+/// green open, purple merged, red closed, quiet draft.
+///
+/// **This is not eave deriving alarm.** AG2 #8's rule — that a colour
+/// eave *derives* may never reach into the danger or warning band —
+/// is about identity, where eave would be inventing a meaning. These
+/// four are a state the host reports and names, on rows that came from
+/// that host, in the exact colours the operator already reads them in on
+/// the site. Spelling them in eave's own neutral vocabulary would make
+/// them harder to read, not more tasteful.
+///
+/// Open reuses [`success`] rather than a second green: two greens a step
+/// apart in one list is a difference the eye tries to read a meaning
+/// into. Closed reuses [`danger`] for the same reason.
+pub fn review_open() -> Hsla {
+    success()
+}
+/// **violet-400** (dark) / **violet-600** (light) — GitHub's merged
+/// purple, on this theme's own palette rather than `#a371f7` verbatim, so
+/// it sits with [`accent`] instead of beside it.
+pub fn review_merged() -> Hsla {
+    if is_light() {
+        oklch(0.541, 0.281, 293.009)
+    } else {
+        oklch(0.702, 0.183, 293.541)
+    }
+}
+pub fn review_closed() -> Hsla {
+    danger()
+}
+/// A draft is **not a fifth colour**: it is unfinished, and it recedes.
+/// GitHub draws the difference in the glyph — the shaft is broken — which
+/// is what keeps the state legible without spending another pigment.
+pub fn review_draft() -> Hsla {
+    text_tertiary()
+}
+
 /// The selected row's leading-edge bar. Brighter than [`accent`] because
 /// it is 3 px of pigment on a dark ground with a wash over it: at the
 /// bar's width the eye integrates the stripe rather than reading its

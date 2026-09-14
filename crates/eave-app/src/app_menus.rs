@@ -156,6 +156,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Actual Size", crate::ui::ZoomReset),
                 MenuItem::separator(),
                 MenuItem::action("Tidy Canvas", crate::ui::TidyCanvas),
+                MenuItem::separator(),
+                // Slice GH1. A menu item for the same measured reason
+                // the layouts are — see `ui::OpenPulls`.
+                MenuItem::action("Pull Requests", crate::ui::OpenPulls),
             ],
         },
         Menu {

@@ -162,6 +162,27 @@ Line {
     FOLDER => "folder.svg",
     FOLDER_OPEN => "folder-open.svg",
     GIT_BRANCH => "git-branch.svg",
+    // Slice GH1 — the review set, drawn in house.
+    //
+    // **Same reason the `status-*` glyphs exist**: 55 Solar glyphs have
+    // no word for "pull request", "merged" or "stack", and a review list
+    // that spelled its states with a generic branch glyph would be
+    // saying one word for four facts. Drawn to the family's own
+    // geometry — 24 grid, 1.5 stroke, round caps — so they sit in a row
+    // beside a bought glyph without reading as a different set, and to
+    // GitHub's own shapes, because that is the vocabulary an operator
+    // already knows from the site these rows come from.
+    GIT_PULL_REQUEST => "git-pull-request.svg",
+    GIT_MERGE => "git-merge.svg",
+    GIT_PULL_REQUEST_CLOSED => "git-pull-request-closed.svg",
+    /// Draft: the open shape with its shaft broken, which is how GitHub
+    /// draws "not ready" — not a fifth colour.
+    GIT_PULL_REQUEST_DRAFT => "git-pull-request-draft.svg",
+    /// A stack's layer count.
+    LAYERS => "layers.svg",
+    /// Checks passing. A ring with a tick, because a bare tick at 12 px
+    /// beside a bare dot does not read as the same family.
+    CHECK_CIRCLE => "check-circle.svg",
     GLOBAL => "global.svg",
     INFO_CIRCLE => "info-circle.svg",
     KEYBOARD => "keyboard.svg",
@@ -525,10 +546,14 @@ mod tests {
         // same grid rather than a new one.
         // MINIMIZE_ARROWS (Slice CL1) is `expand-arrows` with the heads
         // turned inward — the way back from a maximized column.
-        assert_eq!(of(Class::Line).count(), 63, "the Line family");
+        // The six review glyphs (Slice GH1) are the `status-*` case
+        // again one domain over: Solar has no word for a pull request,
+        // a merge, a draft or a stack, so they are drawn to the family's
+        // own 24 grid and 1.5 stroke, in GitHub's shapes.
+        assert_eq!(of(Class::Line).count(), 69, "the Line family");
         assert_eq!(of(Class::Compact).count(), 5, "eave's status glyphs");
         assert_eq!(of(Class::Mark).count(), 7, "six provider marks, plus eave");
-        assert_eq!(REGISTRY.len(), 75);
+        assert_eq!(REGISTRY.len(), 81);
     }
 
     /// Every registered path is a file that exists on disk under exactly
