@@ -158,8 +158,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Tidy Canvas", crate::ui::TidyCanvas),
                 MenuItem::separator(),
                 // Slice GH1. A menu item for the same measured reason
-                // the layouts are — see `ui::OpenPulls`.
-                MenuItem::action("Pull Requests", crate::ui::OpenPulls),
+                // the layouts are — see `ui::OpenReviews`.
+                MenuItem::action("Reviews", crate::ui::OpenReviews),
             ],
         },
         Menu {

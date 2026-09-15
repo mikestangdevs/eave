@@ -3278,9 +3278,9 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) {
             // the answer is stale the moment it is given — caching it in
             // the engine would mean deciding when to invalidate a fact
             // eave does not own.
-            Request::Pulls { cwd, limit } => {
+            Request::Reviews { roots, limit } => {
                 let limit = limit.unwrap_or(crate::github::DEFAULT_LIMIT);
-                ok_value(&crate::github::pulls(std::path::Path::new(&cwd), limit).await)
+                ok_value(&crate::github::reviews(&roots, limit).await)
             }
             Request::TabOpen {
                 window,

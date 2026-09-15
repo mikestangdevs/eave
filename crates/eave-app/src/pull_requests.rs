@@ -44,6 +44,32 @@ pub struct Line {
     /// draws no badge; a size on each of twelve rows says twelve times
     /// what is true once.
     pub stack: Option<StackBadge>,
+    /// How many layers this chain has. `1` is a review standing alone.
+    ///
+    /// Carried on **every** line, not just the bottom one, because the
+    /// surface draws the stack as a TREE: each layer has to know whether
+    /// a connector runs up from it, down from it, or both, and a badge
+    /// on the bottom row cannot tell the row above anything.
+    pub chain_size: usize,
+    /// Is this the topmost layer — the one nothing sits on?
+    pub last_in_chain: bool,
+}
+
+impl Line {
+    /// Part of a stack at all?
+    pub fn stacked(&self) -> bool {
+        self.chain_size > 1
+    }
+
+    /// Does a connector run UP from this row to the layer below it?
+    pub fn joins_below(&self) -> bool {
+        self.stacked() && self.depth > 0
+    }
+
+    /// Does a connector run DOWN from this row to the layer above it?
+    pub fn joins_above(&self) -> bool {
+        self.stacked() && !self.last_in_chain
+    }
 }
 
 /// The `⚏ 12` on a stack's bottom row.
@@ -208,26 +234,109 @@ pub fn lines(rows: &[PullRequest]) -> Vec<Line> {
                     size,
                     native: chain.native,
                 }),
+                chain_size: size,
+                last_in_chain: depth + 1 == size,
             });
         }
     }
     out
 }
 
-/// The row whose head branch is the one this checkout is on.
+/// The rows whose head branch is one this operator has checked out.
 ///
-/// **This is the whole session link.** eave knows which checkout a
-/// session works in and what branch that checkout is on, so the review
-/// for the work you are looking at identifies itself. The reference
+/// **This is the whole session link.** eave knows which checkouts a
+/// session works in and what branch each is on, so the review for the
+/// work you are looking at identifies itself. The reference
 /// implementation has an entire linking surface for this — a command,
 /// a right-click, a dialog, an agent tool — because its threads are not
 /// branch-scoped the way eave's sessions are.
-pub fn mine(rows: &[PullRequest], branch: Option<&str>) -> Option<usize> {
-    let branch = branch?;
-    if branch.is_empty() {
-        return None;
+///
+/// **Branches, plural, because checkouts are.** A repository with a
+/// worktree per lane has one branch out per worktree — this project has
+/// six of its own — and marking only the first would pick whichever
+/// checkout the scan happened to reach first. An empty branch name never
+/// matches: a head that failed to decode is empty too, and a blank
+/// matching a blank marks an arbitrary row.
+pub fn mine(rows: &[PullRequest], branches: &[String]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| !r.head.is_empty() && branches.iter().any(|b| *b == r.head))
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+/// What the sidebar is narrowed to (Slice GH1).
+///
+/// **It matches only what the row SHOWS.** That is AG2 #10's rule for
+/// the rail's filter and it is here for the same reason: a filter that
+/// matches a field the operator cannot see answers with rows that look
+/// unrelated, and one that misses a word they CAN see reads as broken.
+/// So a review is matched on its title, its number and its head branch —
+/// the three things its two lines draw — and a repository on its slug.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// Folded to lowercase once, here, rather than per row.
+    pub needle: String,
+    /// Only reviews on a branch this operator has checked out.
+    pub mine_only: bool,
+}
+
+impl Filter {
+    pub fn new(needle: &str, mine_only: bool) -> Self {
+        Filter {
+            needle: needle.trim().to_lowercase(),
+            mine_only,
+        }
     }
-    rows.iter().position(|r| r.head == branch)
+
+    /// Is anything narrowed at all?
+    pub fn is_open(&self) -> bool {
+        self.needle.is_empty() && !self.mine_only
+    }
+
+    /// Does this review survive?
+    pub fn keeps(&self, pr: &PullRequest, branches: &[String]) -> bool {
+        if self.mine_only && !branches.iter().any(|b| *b == pr.head) {
+            return false;
+        }
+        if self.needle.is_empty() {
+            return true;
+        }
+        pr.title.to_lowercase().contains(&self.needle)
+            || pr.head.to_lowercase().contains(&self.needle)
+            || format!("#{}", pr.number).contains(&self.needle)
+    }
+
+    /// Which of `rows` survive, as indices into `rows`.
+    pub fn rows(&self, rows: &[PullRequest], branches: &[String]) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, r)| self.keeps(r, branches))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// Does this repository survive?
+    ///
+    /// **A repository whose NAME matches is kept whole**, reviews and
+    /// all: an operator typing `eave` is asking for that repository, not
+    /// for the reviews whose titles happen to say `eave`. Otherwise it
+    /// is kept only if something inside it survived — which is what
+    /// keeps a filtered list from being a page of empty headings.
+    pub fn keeps_repo(&self, slug: &str, rows: &[PullRequest], branches: &[String]) -> bool {
+        if self.is_open() {
+            return true;
+        }
+        if !self.needle.is_empty() && slug.to_lowercase().contains(&self.needle) {
+            return true;
+        }
+        rows.iter().any(|r| self.keeps(r, branches))
+    }
+
+    /// Is this repository's name what matched, rather than its contents?
+    pub fn matched_name(&self, slug: &str) -> bool {
+        !self.needle.is_empty() && slug.to_lowercase().contains(&self.needle)
+    }
 }
 
 #[cfg(test)]
@@ -386,11 +495,94 @@ mod tests {
     #[test]
     fn the_checkout_branch_names_its_own_review() {
         let rows = vec![pr(1, "a", "main", 100), pr(2, "feature/x", "main", 200)];
-        assert_eq!(mine(&rows, Some("feature/x")), Some(1));
-        assert_eq!(mine(&rows, Some("main")), None, "the base is not a review");
+        let b = |s: &str| vec![s.to_string()];
+        assert_eq!(mine(&rows, &b("feature/x")), vec![1]);
+        assert!(
+            mine(&rows, &b("main")).is_empty(),
+            "the base is not a review"
+        );
         // A detached head, and an empty branch, are both "no answer" —
         // never row 0.
-        assert_eq!(mine(&rows, None), None);
-        assert_eq!(mine(&rows, Some("")), None);
+        assert!(mine(&rows, &[]).is_empty());
+        assert!(mine(&rows, &b("")).is_empty());
+    }
+
+    /// **A worktree per lane is how this project works**, so a
+    /// repository has several branches out at once and each of them can
+    /// have a review.
+    #[test]
+    fn every_branch_this_operator_has_out_marks_its_own_review() {
+        let rows = vec![
+            pr(1, "a", "main", 100),
+            pr(2, "feature/x", "main", 200),
+            pr(3, "feature/y", "main", 300),
+        ];
+        let branches = vec!["feature/y".to_string(), "a".to_string()];
+        assert_eq!(mine(&rows, &branches), vec![0, 2]);
+    }
+
+    /// A head that failed to decode is an empty string, and so is a
+    /// branch eave could not read — matching them to each other marks an
+    /// arbitrary row as the operator's own.
+    #[test]
+    fn an_empty_head_is_never_anybody_s_branch() {
+        let rows = vec![pr(1, "", "main", 100)];
+        assert!(mine(&rows, &["".to_string()]).is_empty());
+    }
+    fn branches() -> Vec<String> {
+        vec!["feature/x".to_string()]
+    }
+
+    #[test]
+    fn a_filter_matches_what_the_row_draws_and_nothing_else() {
+        let mut rows = vec![pr(12, "feature/x", "main", 100), pr(34, "other", "main", 200)];
+        rows[0].title = "Fix the parser".into();
+        rows[1].title = "Add a widget".into();
+
+        // The title, the branch, and the number — the three things the
+        // two lines show.
+        assert_eq!(Filter::new("parser", false).rows(&rows, &branches()), vec![0]);
+        assert_eq!(Filter::new("feature/", false).rows(&rows, &branches()), vec![0]);
+        assert_eq!(Filter::new("#34", false).rows(&rows, &branches()), vec![1]);
+        // Case does not matter, and neither does surrounding space.
+        assert_eq!(Filter::new("  WIDGET ", false).rows(&rows, &branches()), vec![1]);
+        // The BASE branch is not drawn on a row, so it is not matched —
+        // otherwise every review in a repository answers to `main`.
+        assert!(Filter::new("main", false).rows(&rows, &branches()).is_empty());
+    }
+
+    #[test]
+    fn mine_only_keeps_the_branches_this_operator_has_out() {
+        let rows = vec![pr(12, "feature/x", "main", 100), pr(34, "other", "main", 200)];
+        assert_eq!(Filter::new("", true).rows(&rows, &branches()), vec![0]);
+        // With nothing checked out it keeps nothing, rather than
+        // everything — "mine" with no branches is an empty answer, not a
+        // disabled filter.
+        assert!(Filter::new("", true).rows(&rows, &[]).is_empty());
+    }
+
+    /// **A repository whose name matches is kept whole.** An operator
+    /// typing `eave` is asking for that repository, not for the reviews
+    /// whose titles happen to say `eave`.
+    #[test]
+    fn a_repository_named_by_the_filter_keeps_all_its_reviews() {
+        let rows = vec![pr(12, "a", "main", 100), pr(34, "b", "main", 200)];
+        let f = Filter::new("eave", false);
+        assert!(f.keeps_repo("mikestangdevs/eave", &rows, &[]));
+        assert!(f.matched_name("mikestangdevs/eave"));
+        // And one whose name does not match survives only on its
+        // contents, so a filtered list is never a page of empty
+        // headings.
+        assert!(!f.keeps_repo("other/thing", &rows, &[]));
+        assert!(!f.matched_name("other/thing"));
+    }
+
+    #[test]
+    fn an_empty_filter_narrows_nothing() {
+        let rows = vec![pr(12, "a", "main", 100)];
+        let f = Filter::new("   ", false);
+        assert!(f.is_open());
+        assert_eq!(f.rows(&rows, &[]), vec![0]);
+        assert!(f.keeps_repo("any/thing", &[], &[]));
     }
 }

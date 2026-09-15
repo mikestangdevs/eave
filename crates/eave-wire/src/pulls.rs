@@ -180,17 +180,25 @@ pub enum PullsState {
 }
 
 /// One repository's reviews, and what eave could not answer.
+///
+/// **Keyed by the repository, not by a checkout.** eave has five
+/// worktrees of its own repository on this disk and the operator has
+/// forty of another; a list with one row per *folder* would ask GitHub
+/// the same question five times and print the same answer five times. So
+/// the checkouts collapse into [`RepoReviews::roots`] and the repository
+/// is the row — which is also why [`RepoReviews::repo`] is not an
+/// `Option`: a row that names no repository is not a repository, it is a
+/// [`SkippedRoot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PullsSnapshot {
-    /// `None` whenever the repository could not be named, which is every
-    /// state that is not [`PullsState::Ok`] except `Error`.
-    pub repo: Option<RepoId>,
-    pub rows: Vec<PullRequest>,
-    pub state: PullsState,
-    /// When this read completed, epoch ms — the `synced just now` line.
-    pub read_ms: u64,
-    /// The branch the asking checkout is on, or `None` on a detached
-    /// head or when it could not be read.
+pub struct RepoReviews {
+    pub repo: RepoId,
+    /// Every checkout of this repository eave was asked about. More than
+    /// one is ordinary — a worktree per lane is how this project works —
+    /// and the first is the one the read went through.
+    pub roots: Vec<String>,
+    /// The branch each of those checkouts is on. Detached heads are
+    /// skipped rather than blanked, because a blank would match a review
+    /// whose head branch failed to decode.
     ///
     /// **This is the session link.** eave already knows which checkout a
     /// session works in; matching that checkout's branch against a
@@ -200,18 +208,107 @@ pub struct PullsSnapshot {
     /// right-click, an agent tool) because its threads are not branch-
     /// scoped the way eave's are — here the fact is already on hand, so
     /// asking for it would be asking for something eave knows.
-    pub checkout_branch: Option<String>,
+    pub branches: Vec<String>,
+    /// The OPEN reviews, newest first.
+    pub rows: Vec<PullRequest>,
+    /// The most recently settled reviews — merged and closed.
+    ///
+    /// **A second list, not more rows.** The operator asked for *"all
+    /// repos and their history"*, and one list ordered by update time
+    /// answers neither question well: on a busy repository the fifty
+    /// most recently touched reviews are almost all merged, which buries
+    /// the handful that are open. So the engine asks twice in one
+    /// document and the surface draws two sections.
+    ///
+    /// It is also what makes the merged mark REACHABLE. The purple glyph
+    /// was drawn, coloured and tested in the first pass, and the query
+    /// asked `states: OPEN` — a decoder with no producer, which is the
+    /// shape this project refuses everywhere else and shipped here.
+    #[serde(default)]
+    pub recent: Vec<PullRequest>,
+    /// Never `Ok` with no read behind it: an unasked repository and a
+    /// repository with no open reviews are different facts.
+    pub state: PullsState,
 }
 
-impl PullsSnapshot {
-    /// The stated-failure shape: no rows, no repository, one reason.
-    pub fn stated(state: PullsState, read_ms: u64) -> Self {
-        PullsSnapshot {
-            repo: None,
-            rows: Vec::new(),
-            state,
-            read_ms,
-            checkout_branch: None,
-        }
+impl RepoReviews {
+    /// How many open reviews, or `None` when the read did not land.
+    pub fn open_count(&self) -> Option<usize> {
+        matches!(self.state, PullsState::Ok).then(|| self.rows.len())
+    }
+
+    /// Does any checkout of this repository sit on `branch`?
+    pub fn on_branch(&self, branch: &str) -> bool {
+        self.branches.iter().any(|b| b == branch)
+    }
+}
+
+/// A folder eave looked at and got no repository out of.
+///
+/// **Counted, not listed.** Measured on the operator's own disk
+/// 2026-09-14: pointing a scan at `~/Desktop` found 64 folders holding a
+/// `.git`, of which **forty-four were orphaned worktree stubs and gutted
+/// git directories** — a list that drew one row per folder would be nine
+/// parts wreckage to one part repository. So the overview collapses
+/// these into a count it can expand, which is the rail's own
+/// `showing N of M · K hidden` rule: never silently dropped, never
+/// allowed to bury the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedRoot {
+    pub root: String,
+    pub state: PullsState,
+}
+
+impl SkippedRoot {
+    /// The folder's own name — what an operator recognises it by.
+    pub fn name(&self) -> &str {
+        self.root
+            .rsplit('/')
+            .find(|p| !p.is_empty())
+            .unwrap_or(&self.root)
+    }
+}
+
+/// Every repository eave was asked about, in one answer.
+///
+/// **One read, not one per repository.** The engine resolves each
+/// checkout's remote locally, collapses the duplicates, and asks GitHub
+/// for all of them in a single aliased GraphQL document — so an overview
+/// of a dozen repositories costs one network round trip rather than
+/// twelve, and a repository this account cannot see is refused on its
+/// own row instead of failing the list. Measured end to end on the
+/// operator's disk: three roots in 1.0 s, a whole `~/Desktop` scan of 64
+/// checkouts in 1.1 s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReviewsSnapshot {
+    pub repos: Vec<RepoReviews>,
+    /// Folders that held no repository, and why. See [`SkippedRoot`].
+    pub skipped: Vec<SkippedRoot>,
+    /// When this read completed, epoch ms — the `read just now` line.
+    pub read_ms: u64,
+    /// The folders eave was pointed at, before any scan expanded them.
+    ///
+    /// **The overview states its own scope.** A list headed *all
+    /// repositories* that is really "the folders eave happens to know"
+    /// is the empty-list lie one level up: the operator cannot tell a
+    /// repository they have none of from a repository eave never looked
+    /// for.
+    pub roots: Vec<String>,
+    /// The scan stopped at its cap before it ran out of folders.
+    /// **Stated by the surface when true**, because a silently truncated
+    /// list is the same lie as a silently truncated count.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl ReviewsSnapshot {
+    /// The entry for a checkout, if this snapshot covers one.
+    pub fn for_root(&self, root: &str) -> Option<&RepoReviews> {
+        self.repos.iter().find(|r| r.roots.iter().any(|x| x == root))
+    }
+
+    /// Why a checkout has no entry, if eave looked at it and skipped it.
+    pub fn skip_for_root(&self, root: &str) -> Option<&SkippedRoot> {
+        self.skipped.iter().find(|s| s.root == root)
     }
 }

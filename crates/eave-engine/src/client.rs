@@ -791,20 +791,18 @@ impl Client {
         .await
     }
 
-    /// Every open review on the repository `cwd` belongs to (Slice GH1).
+    /// Every open review on every repository under `roots` (Slice GH1).
     ///
     /// One call crosses a network, so this is driven by an operator
-    /// asking — opening the pane, or its refresh — and never by a paint.
-    pub async fn pulls(
+    /// asking — opening the overlay, or its refresh — and never by a
+    /// paint.
+    pub async fn reviews(
         &self,
-        cwd: &str,
+        roots: Vec<String>,
         limit: Option<usize>,
-    ) -> Result<eave_wire::PullsSnapshot, ClientError> {
-        self.request::<eave_wire::PullsSnapshot>(Request::Pulls {
-            cwd: cwd.into(),
-            limit,
-        })
-        .await
+    ) -> Result<eave_wire::ReviewsSnapshot, ClientError> {
+        self.request::<eave_wire::ReviewsSnapshot>(Request::Reviews { roots, limit })
+            .await
     }
 
     /// File a parsed import from another browser.

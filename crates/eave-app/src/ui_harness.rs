@@ -6787,26 +6787,41 @@ fn session_tab(session_id: &str) -> TabInfo {
     }
 }
 
-/// One review-list tab (Slice GH1).
-fn pulls_tab(id: &str, cwd: &str) -> TabInfo {
-    TabInfo {
-        id: id.into(),
-        group: None,
-        pinned: false,
-        content: eave_wire::TabContent::Pulls { cwd: cwd.into() },
-        url: None,
-        title: None,
-        favicon_url: None,
-        load: eave_wire::LoadState::Unloaded,
-        pending: None,
-        can_go_back: false,
-        can_go_forward: false,
-        history_len: 0,
-        opener: None,
-        incognito: false,
-        window: None,
-        created_ts_ms: 0,
+/// One repository's entry, as the engine answers it (Slice GH1).
+fn repo_reviews(owner: &str, name: &str, root: &str) -> eave_wire::RepoReviews {
+    eave_wire::RepoReviews {
+        repo: eave_wire::RepoId {
+            host: "github.com".into(),
+            owner: owner.into(),
+            name: name.into(),
+        },
+        roots: vec![root.into()],
+        branches: Vec::new(),
+        rows: Vec::new(),
+        recent: Vec::new(),
+        state: eave_wire::PullsState::Ok,
     }
+}
+
+/// One whole answer, covering every repository asked about.
+fn reviews_snapshot(repos: Vec<eave_wire::RepoReviews>) -> eave_wire::ReviewsSnapshot {
+    let roots = repos.iter().flat_map(|r| r.roots.clone()).collect();
+    eave_wire::ReviewsSnapshot {
+        repos,
+        skipped: Vec::new(),
+        read_ms: 0,
+        roots,
+        truncated: false,
+    }
+}
+
+/// Open the reviews overlay the way the header glyph and the menu item
+/// both do, and let the ask reach the plumbing.
+fn open_reviews(h: &Harness, vcx: &mut VisualTestContext) {
+    h.window
+        .update(vcx, |shell, _, cx| shell.toggle_reviews(cx))
+        .unwrap();
+    vcx.run_until_parked();
 }
 
 /// One review, at the level of detail a row draws.
@@ -13190,8 +13205,15 @@ fn a_launch_carries_the_tuning_chosen_before_it(cx: &mut TestAppContext) {
         })
         .unwrap();
     vcx.run_until_parked();
+    // Filtered rather than `is_empty`: this test is about TUNING, and
+    // since Slice GH1 the shell fires one background reviews read on its
+    // first paint (`Shell::prime_reviews`), which is an ordinary command
+    // on the same channel and has nothing to do with what is asserted
+    // here.
     assert!(
-        h.drain().is_empty(),
+        !h.drain()
+            .into_iter()
+            .any(|c| matches!(c, crate::ui::Command::Tune { .. })),
         "with no session selected, a tuning is held, not sent"
     );
     // NC1: the launcher is a chat — the send IS the start.
@@ -25045,28 +25067,34 @@ fn a_hung_pane_in_a_split_says_so_too(cx: &mut TestAppContext) {
 
 /// Slice GH1 — the review list draws its rows, and a stack indents.
 ///
-/// The whole surface is asserted through the plumbing rather than through
-/// a live `gh`: `push_pulls` is the seam the pump folds, so this is the
-/// same path a real listing takes and needs no network, no GitHub and no
-/// checkout.
+/// The whole surface is asserted through the plumbing rather than
+/// through a live `gh`: `push_reviews` is the seam the pump folds, so
+/// this is the same path a real listing takes and needs no network, no
+/// GitHub and no checkout.
 #[gpui::test]
 fn a_review_list_draws_its_stack_bottom_first(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    strip_tabs(&h, vcx, vec![pulls_tab("gh", "/repo")], Some("gh"));
+    open_reviews(&h, vcx);
+    // Past the background read's delay, so the one ask counted below is
+    // the one eave makes for itself.
+    vcx.executor().advance_clock(Duration::from_secs(4));
+    vcx.run_until_parked();
 
-    // Opening the pane asks for the listing exactly once, however many
-    // times it repaints — a paint may not spend a network round trip.
+    // One listing is asked for, however many times anything repaints —
+    // a paint may not spend a network round trip. **And the ask came
+    // from the shell's background prime, not from the open**, so opening
+    // the sidebar over a read already in flight adds nothing.
     let asks = h
         .drain()
         .into_iter()
         .filter(|c| {
             matches!(
                 c,
-                crate::ui::Command::Browser(crate::ui::BrowserCmd::Pulls { cwd }) if cwd == "/repo"
+                crate::ui::Command::Browser(crate::ui::BrowserCmd::Reviews { .. })
             )
         })
         .count();
-    assert_eq!(asks, 1, "the pane asked {asks} times for one listing");
+    assert_eq!(asks, 1, "eave asked {asks} times for one listing");
 
     // A native stack of two, arriving newest-first the way GitHub orders
     // an updated-at listing: the TOP layer comes back before the one it
@@ -25075,26 +25103,21 @@ fn a_review_list_draws_its_stack_bottom_first(cx: &mut TestAppContext) {
     top.stack = Some(eave_wire::StackRef { number: 11703, size: 2, position: 2 });
     let mut bottom = review(11702, "cli/restart", "main", 100);
     bottom.stack = Some(eave_wire::StackRef { number: 11703, size: 2, position: 1 });
-    h.plumbing.push_pulls((
-        "/repo".to_string(),
-        eave_wire::PullsSnapshot {
-            repo: Some(eave_wire::RepoId {
-                host: "github.com".into(),
-                owner: "o".into(),
-                name: "r".into(),
-            }),
-            rows: vec![top, bottom, review(500, "solo", "main", 400)],
-            state: eave_wire::PullsState::Ok,
-            read_ms: 0,
-            checkout_branch: Some("solo".into()),
-        },
-    ));
+    let mut repo = repo_reviews("o", "r", "/repo");
+    repo.rows = vec![top, bottom, review(500, "solo", "main", 400)];
+    repo.branches = vec!["solo".into()];
+    h.plumbing.push_reviews(reviews_snapshot(vec![repo]));
     vcx.run_until_parked();
 
-    assert!(shown(vcx, "pulls"), "the review pane drew nothing");
-    // The GUTTER is what steps in — the row spans the pane so its hit
-    // area does not shrink with depth, and every title still starts on
-    // one column however deep the stack goes.
+    assert!(shown(vcx, "reviews"), "the overlay drew nothing");
+    // **The MARK is what steps in.** The row spans the sidebar so its
+    // hit area does not shrink with depth, and the gutter is a
+    // fixed-origin box that the trunk is drawn inside — so the gutter's
+    // own origin is the same on every row and only the mark within it
+    // moves. Measured on the gutter, this assertion passed while the
+    // indent did nothing at all.
+    let bottom_m = vcx.debug_bounds("pulls-mark-open-11702").expect("bottom mark");
+    let top_m = vcx.debug_bounds("pulls-mark-open-11696").expect("top mark");
     let bottom_b = vcx.debug_bounds("pulls-gutter-11702").expect("bottom layer");
     let top_b = vcx.debug_bounds("pulls-gutter-11696").expect("top layer");
     let solo_b = vcx.debug_bounds("pulls-gutter-500").expect("the unstacked review");
@@ -25103,8 +25126,14 @@ fn a_review_list_draws_its_stack_bottom_first(cx: &mut TestAppContext) {
     // FLUSH; the newer layer above it indents. Reading these by y would
     // pass with the stack upside down, so the x is what is asserted.
     assert!(
-        top_b.origin.x > bottom_b.origin.x,
-        "the layer above did not indent: top {top_b:?} bottom {bottom_b:?}"
+        top_m.origin.x > bottom_m.origin.x,
+        "the layer above did not indent: top {top_m:?} bottom {bottom_m:?}"
+    );
+    // And the gutter grew to hold it, which is what leaves room for the
+    // trunk the stack is drawn with.
+    assert!(
+        top_b.size.width > bottom_b.size.width,
+        "the gutter did not widen for the deeper layer: {top_b:?} {bottom_b:?}"
     );
     // And the stack outranks a review newer than its own bottom layer,
     // because a chain is as recent as its most recent layer.
@@ -25132,96 +25161,487 @@ fn a_review_list_draws_its_stack_bottom_first(cx: &mut TestAppContext) {
     );
 }
 
-/// Slice GH1 — the review list opens as a PANEL beside the work.
+/// Slice GH1, second pass — **the answer is in hand before it is
+/// asked for.**
 ///
-/// The operator's ruling after seeing it take the whole well: *"we also
-/// need to panel it … not just a panel on the home page"*. It docks
-/// right of whatever was on screen, which is a pane in the well's tree
-/// (Slice DG2) and therefore resizable, closeable and persisted with no
-/// panel machinery of its own.
+/// The operator's ruling after watching it spin: *"it should just feel
+/// automatic, easy, instant, no effort"* and *"should load in the
+/// background for the user too. first open and it should be good to
+/// go."* The failure this guards is the shape that ruling was about — a
+/// surface that starts its network read when you open it, so every open
+/// costs a spinner however fast the read is.
 #[gpui::test]
-fn the_review_list_docks_beside_the_work_rather_than_replacing_it(cx: &mut TestAppContext) {
+fn the_sidebar_opens_on_an_answer_it_already_had(cx: &mut TestAppContext) {
     let (mut h, vcx) = boot(cx);
-    let mut info = session("s1");
-    info.checkout_root = Some("/repo".into());
-    h.plumbing.push_rail(vec![info]);
-    strip_tabs(&h, vcx, vec![page_tab("p1", Some("https://a.test/"), Some("A"))], Some("p1"));
-
-    h.window
-        .update(vcx, |shell, _, cx| shell.open_pulls_tab(cx))
-        .unwrap();
-    // The engine mints the id, so nothing can be placed yet — the ask is
-    // a note, and the tab has not arrived.
-    let asked = h.drain().into_iter().any(|c| {
-        matches!(
+    // Nobody has opened anything. The shell reads anyway — but not on
+    // the boot path: the read is armed on the first paint and waits for
+    // the window to be up, because a folder scan and a burst of `git`
+    // processes are poor company for a launch.
+    assert!(!shown(vcx, "reviews"), "the sidebar opened by itself");
+    assert!(
+        !h.drain().into_iter().any(|c| matches!(
             c,
-            crate::ui::Command::Browser(crate::ui::BrowserCmd::OpenPulls { cwd, .. }) if cwd == "/repo"
-        )
-    });
-    assert!(asked, "opening the panel asked for no tab");
+            crate::ui::Command::Browser(crate::ui::BrowserCmd::Reviews { .. })
+        )),
+        "the reviews read ran during boot"
+    );
+    vcx.executor().advance_clock(Duration::from_secs(4));
+    vcx.run_until_parked();
+    let primed = h
+        .drain()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c,
+                crate::ui::Command::Browser(crate::ui::BrowserCmd::Reviews { .. })
+            )
+        })
+        .count();
+    assert_eq!(primed, 1, "the shell did not read reviews in the background");
 
-    // Now the engine answers with the tab, exactly as the observer sees it.
+    // The answer lands while the sidebar is still shut.
+    let mut repo = repo_reviews("o", "r", "/repo");
+    repo.rows = vec![review(4, "a", "main", 100)];
+    let mut snap = reviews_snapshot(vec![repo]);
+    snap.read_ms = eave_core::journal::now_ms();
+    h.plumbing.push_reviews(snap);
+    vcx.run_until_parked();
+    h.drain();
+
+    // Now open it: the rows are there on the first frame, and a fresh
+    // answer is not read again.
+    open_reviews(&h, vcx);
+    assert!(
+        shown(vcx, "pulls-row-4"),
+        "the sidebar opened empty and had to go and read"
+    );
+    assert!(
+        !h.drain().into_iter().any(|c| matches!(
+            c,
+            crate::ui::Command::Browser(crate::ui::BrowserCmd::Reviews { .. })
+        )),
+        "opening re-read an answer it already had"
+    );
+}
+
+/// Slice GH1, second pass — **a stale answer refreshes BEHIND its own
+/// rows.**
+///
+/// The first cut cleared the snapshot before re-reading, so every
+/// refresh put a spinner where the list had been. A listing states when
+/// it was read; that is what makes showing an old one honest, and
+/// showing nothing is not the safer choice — it is the one that costs
+/// the operator the answer they already had.
+#[gpui::test]
+fn a_stale_answer_keeps_its_rows_while_the_new_one_is_read(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut repo = repo_reviews("o", "r", "/repo");
+    repo.rows = vec![review(4, "a", "main", 100)];
+    // Read half an hour ago — past the staleness floor, so opening it
+    // freshens.
+    let mut snap = reviews_snapshot(vec![repo]);
+    snap.read_ms = eave_core::journal::now_ms().saturating_sub(30 * 60 * 1000);
+    h.plumbing.push_reviews(snap);
+    vcx.run_until_parked();
+    h.drain();
+
+    open_reviews(&h, vcx);
+    assert!(
+        h.drain().into_iter().any(|c| matches!(
+            c,
+            crate::ui::Command::Browser(crate::ui::BrowserCmd::Reviews { .. })
+        )),
+        "a half-hour-old listing was not freshened"
+    );
+    // And the rows it already had are STILL DRAWN while that runs.
+    assert!(
+        shown(vcx, "pulls-row-4"),
+        "the refresh blanked the list it was refreshing"
+    );
+    assert!(!shown(vcx, "pulls-note"), "a spinner replaced the rows");
+}
+
+/// Slice GH1, second pass — reviews are an OVERLAY, not a pane.
+///
+/// The operator's ruling after walking the panel: *"lets not make a
+/// seperate pain but an overlay on toggle instead."* The failure this
+/// guards is the first pass's whole shape — a review list that took a
+/// share of the well and so had to be arranged, resized and closed like
+/// the work it is about.
+///
+/// So: the page underneath keeps the well, the arrangement is untouched,
+/// and the toggle shuts it again.
+#[gpui::test]
+fn the_reviews_overlay_covers_the_work_rather_than_taking_a_share_of_it(
+    cx: &mut TestAppContext,
+) {
+    let (h, vcx) = boot(cx);
     strip_tabs(
         &h,
         vcx,
-        vec![
-            page_tab("p1", Some("https://a.test/"), Some("A")),
-            pulls_tab("gh", "/repo"),
-        ],
-        Some("gh"),
+        vec![page_tab("p1", Some("https://a.test/"), Some("A"))],
+        Some("p1"),
     );
+    let before = h
+        .window
+        .update(vcx, |shell, _, _| shell.splits.len())
+        .unwrap();
 
-    // Both panes are on screen: the page kept its place and the reviews
-    // took a share beside it. A panel that replaced the well would leave
-    // exactly one of these drawn.
+    open_reviews(&h, vcx);
+    assert!(shown(vcx, "reviews"), "the overlay did not open");
+    // Structural only: `debug_bounds` reports geometry and never
+    // colour, so this pins that the occluding layer is MOUNTED, not that
+    // it is painted dark. Shown the defect and it did not fall: removing
+    // the `bg` leaves the element and its hitbox exactly where they were.
+    assert!(
+        shown(vcx, "reviews-scrim"),
+        "the overlay mounted no occluding layer, so the work under it still takes clicks"
+    );
+    // The work is still there, and still the well's. A pane would have
+    // split it; an overlay is over it.
     h.window
         .update(vcx, |shell, _, _| {
-            let split = shell
-                .splits
-                .iter()
-                .find(|s| s.panes().iter().any(|p| p == "gh"))
-                .expect("the review tab was never docked");
-            let panes = split.panes();
-            assert!(panes.iter().any(|p| p == "p1"), "the work fell out: {panes:?}");
-            // Right of the work, not left: the operator keeps the
-            // position they were already reading in.
-            assert_eq!(panes.last().map(String::as_str), Some("gh"), "{panes:?}");
+            assert_eq!(
+                shell.splits.len(),
+                before,
+                "the overlay arranged the well instead of covering it"
+            );
         })
         .unwrap();
+
+    // The same control shuts it — a control that only opens leaves the
+    // operator hunting for a way out.
+    h.window
+        .update(vcx, |shell, _, cx| shell.toggle_reviews(cx))
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "reviews"), "the toggle did not shut it");
 }
 
-/// Slice GH1 — a review list TAKES the well.
+/// Slice GH1, second pass — **the sidebar can be walked.**
 ///
-/// **This is the walk's defect.** A review list is neither a page nor a
-/// chat, so every transcript-only surface went on mounting over it: the
-/// list drew correctly and the composer sat across the middle of it,
-/// with all 1332 tests green. Geometry assertions could not see it
-/// because nothing about the list itself was wrong.
+/// The operator's ruling after a click-only list: *"the panel is still
+/// not very user friendly i cant easil navigate between trees or
+/// anything at all."* So the arrows walk every row that is DRAWN, enter
+/// opens what is under them, and left backs a review out to the
+/// repository it belongs to.
+///
+/// **Asserted against the walk the PAINT wrote** — AG2 #7's rule — for
+/// two reasons: it is the same value the keys act on, and the cursor's
+/// own mark is a wash, which `debug_bounds` cannot see at all.
 #[gpui::test]
-fn a_review_list_takes_the_well_from_the_launcher(cx: &mut TestAppContext) {
-    let (h, vcx) = boot(cx);
-    strip_tabs(&h, vcx, vec![pulls_tab("gh", "/repo")], Some("gh"));
-    h.plumbing.push_pulls((
-        "/repo".to_string(),
-        eave_wire::PullsSnapshot {
-            repo: None,
-            rows: vec![review(1, "a", "main", 0)],
-            state: eave_wire::PullsState::Ok,
-            read_ms: 0,
-            checkout_branch: None,
-        },
-    ));
+fn the_arrows_walk_every_row_the_sidebar_drew(cx: &mut TestAppContext) {
+    let (mut h, vcx) = boot(cx);
+    let mut first = repo_reviews("o", "first", "/first");
+    first.rows = vec![review(11, "a", "main", 900), review(12, "b", "main", 800)];
+    let second = repo_reviews("o", "second", "/second");
+    open_reviews(&h, vcx);
+    h.plumbing.push_reviews(reviews_snapshot(vec![first, second]));
     vcx.run_until_parked();
 
-    assert!(shown(vcx, "pulls-row-1"), "the list did not draw");
+    let standing = |vcx: &mut VisualTestContext| {
+        h.window
+            .update(vcx, |shell, _, _| shell.reviews_standing_on())
+            .unwrap()
+    };
     assert!(
-        !shown(vcx, "launcher"),
-        "the launcher mounted over the review list"
+        standing(vcx).is_none(),
+        "the sidebar opened with the keyboard already somewhere"
+    );
+
+    // Down lands on the first row and walks from there, into the open
+    // repository's reviews one at a time.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    assert_eq!(standing(vcx), Some(crate::ui::ReviewsStop::Repo(0)));
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    assert_eq!(
+        standing(vcx),
+        Some(crate::ui::ReviewsStop::Review {
+            repo: 0,
+            recent: false,
+            ix: 0
+        }),
+        "down did not reach the first review"
+    );
+
+    // **Left backs out to the repository the review belongs to** — a
+    // review has somewhere to go back TO, which is the half of a tree's
+    // keyboard that is not symmetrical.
+    vcx.simulate_keystrokes("left");
+    vcx.run_until_parked();
+    assert_eq!(standing(vcx), Some(crate::ui::ReviewsStop::Repo(0)));
+
+    // **It clamps.** An arrow is directional; a list that jumps from its
+    // first row to its last has lost the operator's place rather than
+    // kept it (AG2 #7).
+    vcx.simulate_keystrokes("up up up");
+    vcx.run_until_parked();
+    assert_eq!(
+        standing(vcx),
+        Some(crate::ui::ReviewsStop::Repo(0)),
+        "up wrapped instead of clamping"
+    );
+
+    // Enter on a review opens it as a page and gets the sidebar out of
+    // the way — it covers the well the page is about to take.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    h.drain();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    assert!(
+        h.drain().into_iter().any(|c| matches!(
+            c,
+            crate::ui::Command::Browser(crate::ui::BrowserCmd::OpenAt { url, .. })
+                if url.contains("/pull/11")
+        )),
+        "enter on a review opened nothing"
+    );
+    assert!(!shown(vcx, "reviews"), "the sidebar stayed over the page it opened");
+}
+
+/// Slice GH1, second pass — **the sidebar narrows, and says how much.**
+///
+/// The operator's ruling: *"we need a filterer or organizer or toggle or
+/// something as well."* Two, both free. The needle matches only what a
+/// row DRAWS — AG2 #10's rule, because a filter that matches a hidden
+/// field answers with rows that look unrelated — and `mine` keeps the
+/// reviews on a branch this operator has out, which eave computes for
+/// the session link anyway.
+#[gpui::test]
+fn typing_narrows_the_sidebar_and_states_what_it_hid(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut parser = repo_reviews("o", "parser", "/parser");
+    let mut fix = review(11, "fix/lexer", "main", 900);
+    fix.title = "Fix the lexer".into();
+    parser.rows = vec![fix];
+    parser.branches = vec!["fix/lexer".into()];
+    let mut widget = repo_reviews("o", "widget", "/widget");
+    let mut add = review(22, "feat/widget", "main", 100);
+    add.title = "Add a widget".into();
+    widget.rows = vec![add];
+    open_reviews(&h, vcx);
+    h.plumbing.push_reviews(reviews_snapshot(vec![parser, widget]));
+    vcx.run_until_parked();
+    assert!(shown(vcx, "reviews-repo-0") && shown(vcx, "reviews-repo-1"));
+
+    // Typing reaches the sidebar, because it owns the keyboard while it
+    // is up — it occludes everything under it, so a key that fell
+    // through would land somewhere the operator cannot see.
+    vcx.simulate_keystrokes("l e x e r");
+    vcx.run_until_parked();
+    // **And nowhere else.** The walk found this: typing `eave` into the
+    // sidebar narrowed it correctly AND typed `eave` into the composer
+    // behind it, because a focused `TextField` gets a key before the
+    // shell's own handler ever runs. `chrome_holds_keyboard` is the one
+    // list that keeps the two from disagreeing about who is being typed
+    // at, and the sidebar has to be in it.
+    let draft = h
+        .window
+        .update(vcx, |shell, _, cx| {
+            shell.composer.read(cx).field.read(cx).content().to_string()
+        })
+        .unwrap();
+    assert!(
+        draft.is_empty(),
+        "the sidebar's keys landed in the composer behind it: {draft:?}"
+    );
+    assert!(shown(vcx, "reviews-repo-0"), "the matching repository was hidden");
+    assert!(
+        !shown(vcx, "reviews-repo-1"),
+        "a repository with nothing matching was kept"
+    );
+    // **It states the count that is true.** A narrowed list that does
+    // not say so is one the operator reads as the whole answer.
+    assert!(shown(vcx, "reviews-hidden"), "nothing said what was hidden");
+
+    // Escape clears the needle before it closes the surface: a filter is
+    // a thing you back out of.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "reviews"), "escape shut the sidebar on the first press");
+    assert!(shown(vcx, "reviews-repo-1"), "escape did not clear the filter");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!shown(vcx, "reviews"), "escape did not then close it");
+}
+
+/// Slice GH1, second pass — **every repository stays reachable.**
+///
+/// The operator's ruling when the first fix started reserving space so
+/// everything would fit at once: *"we can do drop downs or something.
+/// not everything needs to fit. just needs to be exploreable."* So the
+/// guarantee is not that six repositories are visible beside fifty
+/// reviews — it is that each of them is a row you can open, and opening
+/// one shuts the last.
+#[gpui::test]
+fn every_repository_is_a_row_you_can_open(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut busy = repo_reviews("o", "busy", "/busy");
+    // Three, not fifty: `debug_bounds` reports scroll-CONTENT
+    // coordinates and cannot see clipping, so a click aimed at a row
+    // below the fold lands outside the window and runs no handler —
+    // AG2 #10's documented harness limit. The accordion behaves the same
+    // either way, and this is the part the harness can actually drive.
+    busy.rows = (0..3)
+        .map(|i| review(1000 + i, &format!("b{i}"), "main", 900 - i))
+        .collect();
+    let mut quiet = repo_reviews("o", "quiet", "/quiet");
+    quiet.rows = vec![review(7, "q", "main", 10)];
+    open_reviews(&h, vcx);
+    h.plumbing
+        .push_reviews(reviews_snapshot(vec![busy, quiet]));
+    vcx.run_until_parked();
+
+    // The first is open, fifty reviews deep — and the second is still a
+    // row, drawn after them rather than dropped.
+    assert!(shown(vcx, "pulls-row-1000"), "the open repository drew nothing");
+    assert!(shown(vcx, "reviews-repo-1"), "the second repository vanished");
+    assert!(!shown(vcx, "pulls-row-7"), "both repositories were open at once");
+
+    // Opening the second shuts the first. An accordion, so the column
+    // never holds two repositories' reviews at the same time.
+    click(vcx, "reviews-repo-1");
+    vcx.run_until_parked();
+    assert!(shown(vcx, "pulls-row-7"), "clicking the second opened nothing");
+    assert!(
+        !shown(vcx, "pulls-row-1000"),
+        "the first repository stayed open underneath"
+    );
+}
+
+/// Slice GH1, second pass — **it opens on the repository you are in.**
+///
+/// The operator's ruling: *"when you[']re in agent chat (or focused on
+/// the canvas) lets show that specific one."* The failure this guards is
+/// an overview that opens on row one: with nine repositories listed,
+/// opening on whichever GitHub updated most recently means the operator
+/// has to find their own project every single time.
+///
+/// It is the SECOND repository deliberately, so a fixture that passed by
+/// opening on the first would fail here.
+#[gpui::test]
+fn the_overlay_opens_on_the_repository_the_selected_session_works_in(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    let mut info = session("s1");
+    info.checkout_root = Some("/mine".into());
+    h.plumbing.push_rail(vec![info]);
+    h.plumbing.push_feed(FeedEvent::Session { id: "s1".into() });
+    vcx.run_until_parked();
+
+    let mut other = repo_reviews("other", "thing", "/elsewhere");
+    other.rows = vec![review(1, "a", "main", 900)];
+    let mut mine = repo_reviews("me", "project", "/mine");
+    mine.rows = vec![review(2, "b", "main", 100)];
+    open_reviews(&h, vcx);
+    h.plumbing.push_reviews(reviews_snapshot(vec![other, mine]));
+    vcx.run_until_parked();
+
+    assert!(
+        shown(vcx, "pulls-row-2"),
+        "the overlay did not open on the repository the selected session works in"
     );
     assert!(
-        !shown(vcx, "composer-hint"),
-        "the composer mounted over the review list"
+        !shown(vcx, "pulls-row-1"),
+        "it drew the first repository's reviews instead"
     );
+    // And the checkout is TAGGED, so the operator can see which of the
+    // listed repositories the scope came from.
+    assert!(
+        shown(vcx, "reviews-repo-here"),
+        "nothing said which repository is the one in front of the operator"
+    );
+    // **One click widens.** Every other repository is in the same
+    // surface — a scoped list that cannot be widened makes the operator
+    // guess whether what they want was excluded or absent.
+    assert!(shown(vcx, "reviews-repo-0"), "the other repository was not listed");
+    click(vcx, "reviews-repo-0");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "pulls-row-1"),
+        "clicking the other repository showed nothing"
+    );
+}
+
+/// Slice GH1, second pass — a folder that held no repository is COUNTED.
+///
+/// **Measured on the operator's own disk 2026-09-14**: a scan of
+/// `~/Desktop` found 134 folders holding a `.git`, and seventy of them
+/// were orphaned worktree stubs and gutted git directories. One row each
+/// and the overview is nine parts wreckage; dropped silently and eave is
+/// lying about having looked. So it is the rail's own
+/// `showing N of M · K hidden` rule.
+#[gpui::test]
+fn a_folder_that_held_no_repository_is_counted_rather_than_listed(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_reviews(&h, vcx);
+    let mut snap = reviews_snapshot(vec![repo_reviews("o", "r", "/repo")]);
+    snap.skipped = (0..9)
+        .map(|i| eave_wire::SkippedRoot {
+            root: format!("/wreck-{i}"),
+            state: eave_wire::PullsState::NotARepo,
+        })
+        .collect();
+    h.plumbing.push_reviews(snap);
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "reviews-skipped"), "nine skipped folders said nothing");
+    assert!(
+        !shown(vcx, "reviews-skip-0"),
+        "the skipped folders were listed rather than counted"
+    );
+    // Never silently dropped: the count opens.
+    click(vcx, "reviews-skipped");
+    vcx.run_until_parked();
+    assert!(
+        shown(vcx, "reviews-skip-0"),
+        "the count would not open, so the folders are unreachable"
+    );
+}
+
+/// Slice GH1, second pass — **the history, and the mark that could
+/// never be drawn.**
+///
+/// The operator asked for *"all repos and their history"*, and for
+/// *"purple merge icons"* in the round before that. The purple glyph was
+/// drawn, coloured, and tested — and the query asked `states: OPEN`, so
+/// no read could ever produce a merged review. **A decoder with no
+/// producer**, which is the shape this project refuses everywhere else
+/// and shipped here. The engine asks twice in one document now, and the
+/// settled reviews are their own section rather than more rows: on a
+/// busy repository the most recently touched fifty are almost all
+/// merged, and one list would bury the handful that are open.
+#[gpui::test]
+fn the_history_is_a_second_section_and_the_merged_mark_is_reachable(cx: &mut TestAppContext) {
+    let (h, vcx) = boot(cx);
+    open_reviews(&h, vcx);
+    let mut repo = repo_reviews("o", "r", "/repo");
+    repo.rows = vec![review(7, "open/one", "main", 900)];
+    let mut merged = review(3, "done/one", "main", 100);
+    merged.state = eave_wire::PullState::Merged;
+    let mut closed = review(4, "dropped/one", "main", 50);
+    closed.state = eave_wire::PullState::Closed;
+    repo.recent = vec![merged, closed];
+    h.plumbing.push_reviews(reviews_snapshot(vec![repo]));
+    vcx.run_until_parked();
+
+    assert!(shown(vcx, "pulls-row-7"), "the open review did not draw");
+    assert!(shown(vcx, "pulls-mark-merged-3"), "no merged mark");
+    assert!(shown(vcx, "pulls-mark-closed-4"), "no closed mark");
+    assert!(shown(vcx, "pulls-section"), "the history ran on from the open list");
+    // Open FIRST. The history is the answer to a second question and
+    // must not push the first one's answer down the page.
+    let open = vcx.debug_bounds("pulls-gutter-7").expect("open row");
+    let done = vcx.debug_bounds("pulls-gutter-3").expect("merged row");
+    assert!(
+        open.origin.y < done.origin.y,
+        "the settled reviews were drawn above the open ones: {open:?} {done:?}"
+    );
+    // A settled review is drawn FLAT — a merged stack is a record of
+    // what happened, not an order to review things in.
+    assert_eq!(done.origin.x, open.origin.x, "a settled review was indented");
 }
 
 /// Slice GH1 — a refusal says which one it is, and what to do.
@@ -25232,19 +25652,15 @@ fn a_review_list_takes_the_well_from_the_launcher(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_signed_out_cli_says_so_rather_than_drawing_an_empty_list(cx: &mut TestAppContext) {
     let (h, vcx) = boot(cx);
-    strip_tabs(&h, vcx, vec![pulls_tab("gh", "/repo")], Some("gh"));
-    h.plumbing.push_pulls((
-        "/repo".to_string(),
-        eave_wire::PullsSnapshot::stated(
-            eave_wire::PullsState::SignedOut {
-                host: "github.com".into(),
-            },
-            0,
-        ),
-    ));
+    open_reviews(&h, vcx);
+    let mut repo = repo_reviews("o", "r", "/repo");
+    repo.state = eave_wire::PullsState::SignedOut {
+        host: "github.com".into(),
+    };
+    h.plumbing.push_reviews(reviews_snapshot(vec![repo]));
     vcx.run_until_parked();
 
-    assert!(shown(vcx, "pulls"), "the pane vanished on a refusal");
+    assert!(shown(vcx, "reviews"), "the overlay vanished on a refusal");
     assert!(
         shown(vcx, "pulls-note"),
         "a refused read drew no note at all"

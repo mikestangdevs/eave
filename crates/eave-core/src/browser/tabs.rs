@@ -124,21 +124,6 @@ pub enum TabContent {
     /// crate treats it as an opaque string — the browser store never reads
     /// a session's journal and never writes to its directory.
     Session { session_id: String },
-    /// The open reviews on a repository (Slice GH1).
-    ///
-    /// **A tab, so that it is a pane.** eave's well is a tree of panes
-    /// holding tabs (Slice DG2), so making reviews a kind of tab is what
-    /// puts them beside a page and a chat in one tiled workspace with no
-    /// new layout code — and what keeps them off the fourth render path
-    /// that DG2's report warns about. The reference implementation
-    /// reaches the same arrangement from the other side, with a separate
-    /// right-hand panel that grew its own tab bar.
-    ///
-    /// `cwd` is any path inside the checkout whose remote names the
-    /// repository. The repository itself is deliberately **not** stored:
-    /// a tab that remembered `owner/name` would keep answering for a
-    /// repository after the operator repointed the remote.
-    Pulls { cwd: String },
 }
 
 impl TabContent {

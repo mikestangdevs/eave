@@ -665,20 +665,22 @@ pub enum Request {
     /// Forget every origin's answers.
     PermissionClear,
 
-    /// **Every open review on the repository a checkout belongs to**
+    /// **Every open review on every repository eave was pointed at**
     /// (Slice GH1).
     ///
     /// Answered on the asking connection and **never broadcast**, the
     /// same rule [`Request::HistoryQuery`] follows: this is a read an
-    /// operator asked for about the repository they are in, not a fact
-    /// about a session that other clients are owed. It also crosses a
-    /// network, so a broadcast would make one client's refresh spend
+    /// operator asked for about the repositories they work in, not a
+    /// fact about a session that other clients are owed. It also crosses
+    /// a network, so a broadcast would make one client's refresh spend
     /// every other client's rate limit.
-    Pulls {
-        /// Any path inside the checkout. The engine reads the remote to
-        /// name the repository, so the caller never has to know the
-        /// owner or the host — and cannot name a different one.
-        cwd: String,
+    Reviews {
+        /// The folders to look in. Each is either a checkout — any path
+        /// inside one, since the engine reads the remote to name the
+        /// repository — or a folder holding checkouts, which the engine
+        /// scans. The caller never has to know an owner or a host, and
+        /// cannot name one.
+        roots: Vec<String>,
         /// `#[serde(default)]` so a client that sends none gets the
         /// engine's own page size rather than zero rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
